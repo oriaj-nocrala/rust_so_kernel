@@ -1,0 +1,37 @@
+# Rust build artifacts
+/target/
+/kernel/target/
+
+# Bootloader artifacts
+bootimage-*.bin
+*.img
+
+# QEMU disk images
+*.qcow2
+
+# Debug files
+*.pdb
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# UEFI artifacts
+OVMF*.fd
+*.efi
+
+# Temporary files
+*.tmp
+
+# Test artifacts
+test-*.log

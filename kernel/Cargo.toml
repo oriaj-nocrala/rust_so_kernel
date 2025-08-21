@@ -1,0 +1,36 @@
+[package]
+name = "kernel"  # Este nombre debe coincidir con el usado en CARGO_BIN_FILE_KERNEL_kernel
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.bootimage]
+test-args = ["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-serial", "stdio"]
+test-success-exit-code = 33
+
+
+
+# Configuración para bare metal (sin sistema operativo)
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+
+[dependencies]
+# Dependencias típicas para un kernel básico
+bootloader = "0.9"  # bootimage requiere 0.9, no 0.11
+bootloader_api = "0.11.10"  # mantén esta para la API
+font8x8 = { version = "0.3.1", default-features = false, features = ["unicode"] }
+x86_64 = "0.15.2"
+
+# Para manejo de interrupciones y excepciones
+lazy_static = { version = "1.0", features = ["spin_no_std"] }
+
+[dependencies.linked_list_allocator]
+version = "0.10.5"
+default-features = false
+
+# Configuración para el target bare metal
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
