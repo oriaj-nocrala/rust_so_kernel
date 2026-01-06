@@ -13,6 +13,8 @@ use framebuffer::Framebuffer;
 use lazy_static::lazy_static;
 use interrupts::idt::InterruptDescriptorTable;
 
+use crate::interrupts::exception::ExceptionStackFrame;
+
 lazy_static! {
     static ref IDT: InterruptDescriptorTable = {
         let mut idt = InterruptDescriptorTable::new();
@@ -22,7 +24,7 @@ lazy_static! {
     };
 }
 
-extern "x86-interrupt" fn keyboard_interrupt_handler() {
+extern "x86-interrupt" fn keyboard_interrupt_handler(stack_frame: &mut ExceptionStackFrame) {
     keyboard::process_scancode();
     unsafe {
         interrupts::pic::end_of_interrupt(interrupts::pic::Irq::Keyboard.as_u8());

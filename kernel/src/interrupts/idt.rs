@@ -1,5 +1,7 @@
 use core::marker::PhantomData;
 
+use crate::interrupts::exception::ExceptionStackFrame;
+
 // Atributos de una entrada de la IDT
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
@@ -64,7 +66,7 @@ impl<F> IdtEntry<F> {
     }
 }
 
-pub type HandlerFunc = extern "x86-interrupt" fn();
+pub type HandlerFunc = extern "x86-interrupt" fn(&mut ExceptionStackFrame);
 
 // La IDT. Es un array de 256 entradas.
 #[derive(Debug)]
