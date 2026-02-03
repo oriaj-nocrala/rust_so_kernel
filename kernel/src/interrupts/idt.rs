@@ -1,5 +1,7 @@
-use core::marker::PhantomData;
+// idt.rs
+// Interrupt Descriptor Table
 
+use core::marker::PhantomData;
 use crate::interrupts::exception::ExceptionStackFrame;
 
 // Atributos de una entrada de la IDT
@@ -12,16 +14,18 @@ impl IdtEntryOptions {
     const INTERRUPT_GATE: u16 = 0xE << 8;
     const TRAP_GATE: u16 = 0xF << 8;
 
-    pub fn new() -> Self {
-        // Por defecto, creamos una entrada presente y de tipo interrupt gate
+    // Configuración común para interrupt gates
+    pub fn interrupt_gate() -> Self {
         IdtEntryOptions(Self::PRESENT | Self::INTERRUPT_GATE)
     }
-
-    pub fn set_present(mut self, present: bool) -> Self {
-        self.0 = (self.0 & !Self::PRESENT) | (if present { Self::PRESENT } else { 0 });
-        self
+    
+    // Si en el futuro necesitas trap gates
+    pub fn trap_gate() -> Self {
+        IdtEntryOptions(Self::PRESENT | Self::TRAP_GATE)
     }
-
+    
+    // Mantén este por si acaso lo necesitas después
+    #[allow(dead_code)]
     pub fn set_privilege_level(mut self, dpl: u16) -> Self {
         self.0 = (self.0 & !0x6000) | ((dpl & 0b11) << 13);
         self
@@ -61,18 +65,25 @@ impl<F> IdtEntry<F> {
         self.pointer_high = (addr >> 32) as u32;
         // TODO: Cargar el selector del GDT de forma dinámica
         self.gdt_selector = 8; // Asumimos un selector de código de 8 por ahora
-        self.options = self.options.set_present(true);
+        self.options = IdtEntryOptions::interrupt_gate(); // ⭐ ESTA LÍNEA
         self
     }
 }
 
-pub type HandlerFunc = extern "x86-interrupt" fn(&mut ExceptionStackFrame);
+// Para excepciones que reciben stack frame
+pub type ExceptionHandler = extern "x86-interrupt" fn(&mut ExceptionStackFrame);
+
+// Para excepciones con código de error
+pub type ExceptionHandlerWithErrCode = extern "x86-interrupt" fn(&mut ExceptionStackFrame, error_code: u64);
+
+// En tu idt.rs, agrega este tipo
+pub type DoubleFaultHandler = extern "x86-interrupt" fn(&mut ExceptionStackFrame, error_code: u64) -> !;
 
 // La IDT. Es un array de 256 entradas.
 #[derive(Debug)]
 #[repr(C)]
 pub struct InterruptDescriptorTable {
-    entries: [IdtEntry<HandlerFunc>; 256],
+    pub entries: [IdtEntry<ExceptionHandler>; 256],
 }
 
 impl InterruptDescriptorTable {
@@ -82,9 +93,18 @@ impl InterruptDescriptorTable {
         }
     }
 
-    pub fn add_handler(&mut self, vector: u8, handler: HandlerFunc) {
+    pub fn add_handler(&mut self, vector: u8, handler: ExceptionHandler) {
         self.entries[vector as usize]
             .set_handler_addr(handler as u64);
+    }
+
+    pub fn add_handler_with_error(&mut self, vector: u8, handler: ExceptionHandlerWithErrCode) {
+        self.entries[vector as usize]
+            .set_handler_addr(handler as u64);
+    }
+
+    pub fn add_double_fault_handler(&mut self, vector: u8, handler: DoubleFaultHandler) {
+        self.entries[vector as usize].set_handler_addr(handler as u64);
     }
 
     pub fn load(&'static self) {

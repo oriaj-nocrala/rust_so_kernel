@@ -1,3 +1,6 @@
+// pic.rs
+// Programmable Interrupt Controller
+
 use core::arch::asm;
 
 // Comandos del PIC

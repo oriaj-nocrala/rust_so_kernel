@@ -1,8 +1,12 @@
-use core::arch::asm;
+// use core::arch::asm;
+
+use crate::debug_log;
+
+// TODO: Event driven en vez de POLLED.
 
 // Puertos del teclado PS/2
-const KEYBOARD_DATA_PORT: u16 = 0x60;
-const KEYBOARD_STATUS_PORT: u16 = 0x64;
+// const KEYBOARD_DATA_PORT: u16 = 0x60;
+// const KEYBOARD_STATUS_PORT: u16 = 0x64;
 
 // --- Buffer de Teclado ---
 const BUFFER_SIZE: usize = 128;
@@ -23,47 +27,97 @@ fn add_to_buffer(c: char) {
 
 /// Lee un carácter del buffer del teclado
 pub fn read_from_buffer() -> Option<char> {
-    unsafe {
+    // Deshabilitar interrupciones SOLO durante el acceso.
+    let flags = unsafe {
+        let f: u64;
+        core::arch::asm!("pushfq; pop {}; cli", out(reg) f);
+        f
+    };
+
+    let result = unsafe {
         if BUFFER_READ_INDEX == BUFFER_WRITE_INDEX {
-            return None; // Buffer vacío
+            None // Buffer vacío
+        } else {
+            let key = KEY_BUFFER[BUFFER_READ_INDEX];
+            KEY_BUFFER[BUFFER_READ_INDEX] = None;
+            BUFFER_READ_INDEX = (BUFFER_READ_INDEX + 1) % BUFFER_SIZE;
+            key
         }
-        let key = KEY_BUFFER[BUFFER_READ_INDEX];
-        KEY_BUFFER[BUFFER_READ_INDEX] = None;
-        BUFFER_READ_INDEX = (BUFFER_READ_INDEX + 1) % BUFFER_SIZE;
-        key
+    };
+
+    // Restaurar interrupciones.
+    unsafe {
+        if flags & 0x200 != 0 {
+            core::arch::asm!("sti");
+        }
     }
+
+    result
 }
 
 // --- Lógica del Scancode ---
 
-/// Lee un byte del puerto de estado del teclado
-fn read_status() -> u8 {
-    let value: u8;
-    unsafe {
-        asm!("in al, dx", in("dx") KEYBOARD_STATUS_PORT, out("al") value, options(nomem, nostack, preserves_flags));
-    }
-    value
-}
+// /// Lee un byte del puerto de estado del teclado
+// fn read_status() -> u8 {
+//     let value: u8;
+//     unsafe {
+//         asm!("in al, dx", in("dx") KEYBOARD_STATUS_PORT, out("al") value, options(nomem, nostack, preserves_flags));
+//     }
+//     value
+// }
 
-/// Lee un byte del puerto de datos del teclado
-fn read_data() -> u8 {
-    let value: u8;
-    unsafe {
-        asm!("in al, dx", in("dx") KEYBOARD_DATA_PORT, out("al") value, options(nomem, nostack, preserves_flags));
-    }
-    value
-}
+// /// Lee un byte del puerto de datos del teclado
+// fn read_data() -> u8 {
+//     let value: u8;
+//     unsafe {
+//         asm!("in al, dx", in("dx") KEYBOARD_DATA_PORT, out("al") value, options(nomem, nostack, preserves_flags));
+//     }
+//     value
+// }
 
 /// Procesa el scancode del teclado si hay datos disponibles
 /// Esta función es no bloqueante
-pub fn process_scancode() {
-    if (read_status() & 1) != 0 {
-        let scancode = read_data();
-        if scancode < 0x80 { // Solo procesamos "make codes"
-            if let Some(character) = scancode_to_ascii(scancode) {
-                add_to_buffer(character);
-            }
+pub fn process_scancode(scancode: u8) {
+    debug_log("Scancode received: ");
+    debug_log_hex(scancode);
+    debug_log("\n");
+    
+    if scancode < 0x80 {
+        if let Some(character) = scancode_to_ascii(scancode) {
+            debug_log("Converted to: ");
+            debug_log_char(character);
+            debug_log("\n");
+            
+            add_to_buffer(character);
+            
+            debug_log("Added to buffer\n");
+        } else {
+            debug_log("No ASCII mapping\n");
         }
+    } else {
+        debug_log("Key release, ignored\n");
+    }
+}
+
+fn debug_log_char(c: char) {
+    unsafe {
+        let mut port = x86_64::instructions::port::PortWriteOnly::<u8>::new(0x3F8);
+        if c == '\n' {
+            port.write(b'\\');
+            port.write(b'n');
+        } else if c == '\u{08}' {
+            port.write(b'\\');
+            port.write(b'b');
+        } else {
+            port.write(c as u8);
+        }
+    }
+}
+
+fn debug_log_hex(c: u8) {
+    let mut port = x86_64::instructions::port::PortWriteOnly::<u8>::new(0x3F8);
+    unsafe{
+        port.write(c);
     }
 }
 

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [build-dependencies]
-bootloader = "0.11"
+bootloader = { version = "0.11", default-features = false, features = ["uefi"] }
 kernel = { path = "kernel", artifact = "bin", target = "x86_64-unknown-none" }
 ovmf-prebuilt = "0.2.3"
 
@@ -14,6 +14,12 @@ ovmf-prebuilt = "0.2.3"
 
 [workspace]
 members = ["kernel"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
 
 [package.metadata.bootimage]
 test-args = ["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-serial", "stdio"]

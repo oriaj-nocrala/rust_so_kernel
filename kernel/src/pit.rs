@@ -1,3 +1,4 @@
+// Programmable Interval Timer
 use core::arch::asm;
 
 // Puertos del PIT

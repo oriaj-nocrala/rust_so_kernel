@@ -3,7 +3,6 @@ extern crate ovmf_prebuilt;
 fn main() {
     // read env variables that were set in build script
     let uefi_path = env!("UEFI_PATH");
-    let bios_path = env!("BIOS_PATH");
     let ovmf_code = env!("OVMF_CODE");
     let ovmf_vars = env!("OVMF_VARS");
     
@@ -20,7 +19,7 @@ fn main() {
         cmd.arg("-drive")
            .arg(format!("format=raw,file={}", uefi_path));
     } else {
-        cmd.arg("-drive").arg(format!("format=raw,file={}", bios_path));
+        Err("No se soporta BIOS").unwrap()
     }
     
     // Add some useful QEMU options

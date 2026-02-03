@@ -5,10 +5,10 @@
 use core::panic::PanicInfo;
 
 #[cfg(test)]
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
-}
+// #[panic_handler]
+// fn panic(_info: &PanicInfo) -> ! {
+//     loop {}
+// }
 
 #[test]
 fn test_pit_basic() {
