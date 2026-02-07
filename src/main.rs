@@ -7,10 +7,8 @@ fn main() {
     let ovmf_vars = env!("OVMF_VARS");
     
     // choose whether to start the UEFI or BIOS image
-    let uefi = true;
 
     let mut cmd = std::process::Command::new("qemu-system-x86_64");
-    if uefi {
         // UEFI configuration with proper OVMF setup
         cmd.arg("-drive")
            .arg(format!("if=pflash,format=raw,readonly=on,file={}", ovmf_code));
@@ -18,9 +16,6 @@ fn main() {
            .arg(format!("if=pflash,format=raw,file={}", ovmf_vars));
         cmd.arg("-drive")
            .arg(format!("format=raw,file={}", uefi_path));
-    } else {
-        Err("No se soporta BIOS").unwrap()
-    }
     
     // Add some useful QEMU options
     cmd.arg("-m").arg("256M");  // 256MB RAM

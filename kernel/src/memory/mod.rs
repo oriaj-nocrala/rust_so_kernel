@@ -5,6 +5,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 pub mod paging;
 pub mod frame_allocator;
+pub mod user_pages;
 
 static PHYSICAL_MEMORY_OFFSET: AtomicU64 = AtomicU64::new(0);
 

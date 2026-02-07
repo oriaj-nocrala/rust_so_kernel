@@ -1,4 +1,4 @@
-// kernel/src/serial.rs (nuevo archivo)
+// kernel/src/serial.rs
 
 use core::fmt;
 use x86_64::instructions::port::Port;
@@ -20,6 +20,16 @@ impl Serial {
     fn write_byte(&mut self, byte: u8) {
         unsafe {
             self.port.write(byte);
+        }
+    }
+    
+    /// Escribir string sin allocar (uso directo del puerto)
+    pub fn write_str_raw(s: &str) {
+        unsafe {
+            let mut port = Port::<u8>::new(0x3F8);
+            for byte in s.bytes() {
+                port.write(byte);
+            }
         }
     }
 }
@@ -44,6 +54,14 @@ macro_rules! serial_print {
 macro_rules! serial_println {
     () => ($crate::serial_print!("\n"));
     ($($arg:tt)*) => ($crate::serial_print!("{}\n", format_args!($($arg)*)));
+}
+
+/// ⚠️ Macro SIN allocación - usar SOLO en allocators
+#[macro_export]
+macro_rules! serial_print_raw {
+    ($s:expr) => {
+        $crate::serial::Serial::write_str_raw($s)
+    };
 }
 
 #[doc(hidden)]

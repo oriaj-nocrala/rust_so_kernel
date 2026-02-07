@@ -1,6 +1,6 @@
 // kernel/src/repl.rs
 
-use alloc::string::String;
+use alloc::{string::String, vec};
 use crate::framebuffer::{FRAMEBUFFER, Color};
 
 pub struct Repl {
@@ -48,8 +48,7 @@ impl Repl {
             "alloc" => self.cmd_alloc_test(),
             "help" => self.cmd_help(),
             "clear" => self.cmd_clear(),
-            "heap" => self.cmd_heap(),
-            "paging" => self.cmd_paging(),
+            "slab" => self.cmd_slab(),
             "panic" => panic!("User requested panic"),
             "" => {}, // Enter vacío
             _ if cmd.starts_with("echo ") => {
@@ -64,40 +63,14 @@ impl Repl {
         self.command_buffer.clear();
     }
 
-    fn cmd_alloc_test(&mut self) {
-        use alloc::vec::Vec;
-
-        crate::allocator::expand_heap(65536).ok();
-        
-        // Intentar allocar mucho
-        let mut big_vec: Vec<u8> = Vec::new();
-        
-        for i in 0..200_000 {
-            big_vec.push((i % 256) as u8);
-            
-            if i % 50_000 == 0 {
-                let (used, total) = crate::allocator::bump::heap_stats();
-                self.println(&alloc::format!(
-                    "Allocated {}KB, heap: {}KB / {}KB",
-                    i / 1024,
-                    used / 1024,
-                    total / 1024
-                ));
-            }
-        }
-        
-        self.println("Success! Allocated 200KB");
-    }
-
     fn cmd_help(&mut self) {
         self.println("Available commands:");
-        self.println("  alloc  - Test dynamic allocation");
+        self.println("  alloc - Test the slab allocator");
         self.println("  help  - Show this message");
         self.println("  clear - Clear screen");
-        self.println("  heap  - Show heap stats");
-        self.println("  paging - Show page mappings");
         self.println("  echo <text> - Print text");
         self.println("  panic - Test panic handler");
+        self.println("  slab  - Show slab allocator stats");
     }
 
     fn cmd_clear(&mut self) {
@@ -109,12 +82,46 @@ impl Repl {
         self.y = 10;
     }
 
-    fn cmd_heap(&mut self) {
-        let (used, total) = crate::allocator::bump::heap_stats();
-        let used_kb = used / 1024;
-        let total_kb = total / 1024;
+    fn cmd_alloc_test(&mut self) {
+        self.println("Testing allocator invariants...");
         
-        self.println(&alloc::format!("Heap: {} KB / {} KB used", used_kb, total_kb));
+        use alloc::vec::Vec;
+        
+        // Test 1: Allocar y liberar múltiples tamaños
+        let sizes = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 5000];
+        
+        for &size in &sizes {
+            let mut v: Vec<u8> = Vec::with_capacity(size);
+            v.resize(size, 0xFF);
+            
+            // Verificar escritura
+            assert_eq!(v.len(), size);
+            assert!(v.iter().all(|&b| b == 0xFF));
+            
+            self.println(&alloc::format!("  {}B: OK", size));
+        }
+        
+        // Test 2: Fragmentación
+        let mut vecs: Vec<Vec<u8>> = Vec::new();
+        for i in 0..100 {
+            vecs.push(vec![i as u8; 64]);
+        }
+        
+        // Liberar la mitad
+        vecs.truncate(50);
+        
+        // Re-allocar
+        for i in 0..50 {
+            vecs.push(vec![i as u8; 64]);
+        }
+        
+        self.println("Fragmentation test: OK");
+        self.println("All tests passed!");
+    }
+
+    fn cmd_slab(&mut self) {
+        crate::allocator::slab::slab_stats();
+        self.println("Slab stats printed to serial");
     }
 
     // fn cmd_memory(&mut self) {
@@ -142,42 +149,6 @@ impl Repl {
     //         ));
     //     }
     // }
-
-    fn cmd_paging(&mut self) {
-        use x86_64::VirtAddr;
-        use crate::memory::paging::ActivePageTable;
-        
-        // Accedemos a la dirección REAL de la memoria del heap
-        // Usamos una referencia a HEAP_MEMORY para obtener su puntero
-        let heap_ptr = unsafe { 
-            crate::allocator::bump::HEAP_MEMORY.as_ptr() as u64 
-        };
-
-        unsafe {
-            let phys_offset = crate::memory::physical_memory_offset();
-            let page_table = ActivePageTable::new(phys_offset);
-            
-            let addrs = [
-                0x1000,             // Probablemente Unmapped
-                heap_ptr,           // ¡ESTA DEBERÍA ESTAR MAPEADA!
-                0xb8000,            // Dirección del buffer VGA (si estás en modo texto)
-            ];
-            
-            for &addr in &addrs {
-                let virt = VirtAddr::new(addr);
-                match page_table.translate(virt) {
-                    Some(phys) => {
-                        self.println(&alloc::format!(
-                            "V:{:#x} -> P:{:#x}", addr, phys.as_u64()
-                        ));
-                    }
-                    None => {
-                        self.println(&alloc::format!("V:{:#x} -> Not mapped", addr));
-                    }
-                }
-            }
-        }
-    }
 
     fn println(&mut self, text: &str) {
         {

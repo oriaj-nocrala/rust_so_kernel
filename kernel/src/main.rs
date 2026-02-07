@@ -8,25 +8,33 @@ mod allocator;
 mod framebuffer;
 mod interrupts;
 mod keyboard;
+mod keyboard_buffer;
 mod memory;
 mod panic;
+mod process;
 mod pit;
 mod repl;
 mod serial;
 
-use alloc::{format, vec::Vec};
+use alloc::{boxed::Box, format, vec::Vec};
 // use alloc::{string::ToString, vec::Vec};
 use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point, info::{MemoryRegion, MemoryRegionKind}};
 use framebuffer::Framebuffer;
 use interrupts::idt::InterruptDescriptorTable;
 use spin::Once;
 use x86_64::{VirtAddr, structures::paging::FrameAllocator};
+use process::{Process, Pid, scheduler::SCHEDULER};
+use crate::allocator::FRAME_ALLOCATOR;
 
 use crate::{
-    allocator::buddy_allocator::Buddy, framebuffer::{Color, init_global_framebuffer}, interrupts::exception::ExceptionStackFrame, memory::{frame_allocator::{self, BootInfoFrameAllocator}, paging::ActivePageTable}, repl::Repl
+    framebuffer::{Color, init_global_framebuffer}, interrupts::exception::ExceptionStackFrame, memory::{frame_allocator::{self, BootInfoFrameAllocator}, paging::ActivePageTable}, repl::Repl
 };
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
+
+extern "C" {
+    fn syscall_entry();
+}
 
 fn init_idt() {
     IDT.call_once(|| {
@@ -38,6 +46,7 @@ fn init_idt() {
         idt.add_handler_with_error(14, page_fault_handler);
         idt.add_handler(32, timer_handler);
         idt.add_handler(33, keyboard_interrupt_handler);
+        idt.entries[0x80].set_handler_addr(syscall_entry as u64);
         idt
     });
 }
@@ -47,22 +56,11 @@ fn load_idt() {
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_: &mut ExceptionStackFrame) {
-    // Log serial para debug (no usa framebuffer, no puede causar problemas)
-    debug_log("Keyboard IRQ\n");
-    
-    // Leer scancode
     let scancode = unsafe {
-        debug_log("Reading port...\n");
         x86_64::instructions::port::PortReadOnly::<u8>::new(0x60).read()
     };
-    
-    debug_log("Processing...\n");
     keyboard::process_scancode(scancode);
-    
-    debug_log("Sending EOI...\n");
     interrupts::pic::end_of_interrupt(interrupts::pic::Irq::Keyboard.as_u8());
-    
-    debug_log("Done\n");
 }
 
 // Helper para debug serial
@@ -176,64 +174,79 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     
     allocator::init_allocators(page_table, frame_allocator);
 
-    // --- 3. Inicialización del Heap ---
-    // POR AHORA: Sigue usando tu heap estático (array de 100KB)
-    // Esto te permite seguir usando Box, Vec, etc. mientras aprendes paging.
-    allocator::bump::init_heap();
 
-    // ⭐ Expandir heap dinámicamente (ej: +1MB)
-    // match allocator::expand_heap(&mut page_table, &mut frame_allocator, 256) {
-    //     Ok(_) => {
-    //         // Actualizar el heap_end del bump allocator
-    //         let new_end = allocator::bump::heap_end() + (256 * 4096);
-    //         allocator::bump::expand_heap_size(new_end);
-    //     }
-    //     Err(e) => {
-    //         serial_println!("Failed to expand heap: {}", e);
-    //     }
-    // }
-    
-
-    // panic!("Testing panic handler!");
-
-    let mut total: usize = 0;
-    let mut total_mem: u64 = 0;
-    let mut reg_st: u64 = 0;
-    let mut reg_end: u64 = 0;
-    let mut i = 0;
-    let mut total_regions = 0;
-
-    let mut buddy = Buddy::new();
-    while total < boot_info.memory_regions.len() {
-        let region = &boot_info.memory_regions[total];
+    // --- 2. Inicializar Buddy Allocator ---
+    {
+        let mut buddy = allocator::buddy_allocator::BUDDY.lock();
         
-        if region.kind == MemoryRegionKind::Usable {
-            total_mem += region.end - region.start;
-            total_regions += 1;
-            if i == 0 {
-                // PRIMERA MEMORY REGION.
-                unsafe{
+        for region in boot_info.memory_regions.iter() {
+            if region.kind == MemoryRegionKind::Usable {
+                unsafe {
                     buddy.add_region(region.start, region.end);
-
-                    let test_frame = buddy.allocate(18).unwrap();
-                    serial_println!("Allocated: {:#x}", test_frame.as_u64());
-
-                    let virt = phys_mem_offset + test_frame.as_u64();
-                    let ptr = virt.as_mut_ptr::<u64>();
-                    unsafe {
-                        *ptr = 0xDEAD;
-                        assert_eq!(*ptr, 0xDEAD);
-                    }
-                    serial_println!("Write test: OK");
                 }
             }
         }
-        i += 1;
+    }  // ← LIBERAR LOCK AQUÍ
+
+    serial_println!("Step 8: Printing Buddy stats (lock released)");
+    {
+        let buddy = allocator::buddy_allocator::BUDDY.lock();
+        buddy.debug_print_stats();
+    }  // ← Lock se libera aquí también
+
+    // --- 3. Ahora SÍ podemos usar Slab (String, Vec, format!) ---
+    {
+        use core::alloc::{GlobalAlloc, Layout};
+
+        let layout = Layout::from_size_align(8, 8).unwrap();
+
         
-        total += 1;
+        // ✅ CORRECTO: Usar el GLOBAL_ALLOCATOR directamente
+        let ptr = unsafe {
+            alloc::alloc::alloc(layout)  // ← Esto usa el #[global_allocator]
+        };
+
+        if ptr.is_null() {
+            serial_println!("  FAILED: Got null pointer");
+            panic!("Slab allocation failed");
+        } else {
+            serial_println!("  SUCCESS: Got pointer {:#x}", ptr as u64);
+            
+            // Escribir/leer para verificar
+            unsafe {
+                *(ptr as *mut u64) = 0xDEADBEEF;
+                let val = *(ptr as *const u64);
+                serial_println!("  Write/read test: {:#x}", val);
+                assert_eq!(val, 0xDEADBEEF);
+            }
+            
+            unsafe {
+                alloc::alloc::dealloc(ptr, layout);
+            }
+            serial_println!("  SUCCESS: Deallocation complete");
+        }
     }
 
-    let text = format!("Regiones totales: {} Regiones usables: {} Memoria total: {}", total, total_regions, total_mem);
+    // Vec Test
+    {
+        use alloc::vec::Vec;
+        serial_println!("  Creating Vec...");
+        let mut v: Vec<u8> = Vec::new();
+        serial_println!("  Pushing elements...");
+        v.push(1);
+        v.push(2);
+        v.push(3);
+        serial_println!("  Vec OK: len={}", v.len());
+    }
+
+    {
+        use alloc::string::String;
+        serial_println!("  Creating String...");
+        let s = String::from("Hello Slab!");
+        serial_println!("  String test: {}", s);
+    }
+
+    allocator::slab::slab_stats();
     
      // Limpiar pantalla
     {
@@ -241,8 +254,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         if let Some(fb) = fb.as_mut() {
             fb.clear(Color::rgb(0, 0, 0));
             fb.draw_text(10, 10, "NeoOS v0.1", Color::rgb(0, 200, 255), Color::rgb(0, 0, 0), 2);
-            fb.draw_text(10,770, text.as_str(), Color::rgb(0, 200, 255), Color::rgb(0, 0, 0), 2);
-            // fb.draw_text(10,420, example_region.as_str(), Color::rgb(0, 200, 255), Color::rgb(0, 0, 0), 2);
+            fb.draw_text(10, 770, "Allocator: Ready", Color::rgb(0, 255, 0), Color::rgb(0, 0, 0), 2);
         }
     }
 
@@ -255,18 +267,159 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         core::arch::asm!("sti");
     }
 
+    // Justo después de:
+    // serial_println!("Step 7: Paging initialized");
+
+    serial_println!("Step 7.5: Pre-mapping user stack for Ring 3");
+
+    // Dirección fija para el user stack (usamos una región alta en user space)
+    const USER_STACK_TOP: u64 = 0x0000_7000_0000_2000;  // 2 páginas antes de aquí
+    const USER_STACK_SIZE: u64 = 8192;  // 2 páginas (8KB)
+    const USER_STACK_BASE: u64 = USER_STACK_TOP - USER_STACK_SIZE;
+
+    unsafe {
+        let phys_offset = memory::physical_memory_offset();
+        let mut page_table = memory::paging::ActivePageTable::new(phys_offset);
+        let mut frame_allocator_lock = FRAME_ALLOCATOR.lock();
+        
+        // ✅ Unwrap el Option
+        let frame_allocator = frame_allocator_lock.as_mut()
+            .expect("Frame allocator not initialized");
+        
+        memory::user_pages::map_user_pages(
+            &mut page_table.mapper,
+            frame_allocator,  // ← Ya no es Option
+            VirtAddr::new(USER_STACK_BASE),
+            (USER_STACK_SIZE / 4096) as usize,
+        ).expect("Failed to map user stack");
+        
+        serial_println!(
+            "User stack mapped: {:#x} - {:#x}",
+            USER_STACK_BASE,
+            USER_STACK_TOP
+        );
+    }
+
     // Inicializar el PIT
     pit::init(100); // 100 Hz
 
     let mut repl = Repl::new(10, 50);
     repl.show_prompt();
 
+    serial_println!("Step 9: Initializing TSS and GDT");
+    process::tss::init();
+
+    serial_println!("Step 10: Creating test processes");
+
+    // Proceso idle (kernel space)
+    {
+        let mut scheduler = SCHEDULER.lock();
+        let pid = Pid(0);
+        
+        let page_table = unsafe {
+            let (frame, _) = x86_64::registers::control::Cr3::read();
+            frame
+        };
+        
+        let idle = Box::new(Process::new(
+            pid,
+            VirtAddr::new(idle_task as *const () as u64),
+            page_table,
+        ));
+        
+        scheduler.add_process(idle);
+    }
+
+    // Si activamos esto: Kernel panic! por error de proteccion
+    // (aparentemente falta USER_ACCESSIBLE)
+    // // ✅ NUEVO: Proceso en user space (Ring 3)
+    // {
+    //     let mut scheduler = SCHEDULER.lock();
+    //     let pid = scheduler.allocate_pid();
+        
+    //     let page_table = unsafe {
+    //         let (frame, _) = x86_64::registers::control::Cr3::read();
+    //         frame
+    //     };
+        
+    //     let mut proc = Box::new(Process::new_user(
+    //         pid,
+    //         VirtAddr::new(process::user_test_function as *const () as u64),
+    //         page_table,
+    //     ));
+    //     proc.set_name("user_test")   ;
+        
+    //     scheduler.add_process(proc);
+    // }
+
+    {
+        let mut scheduler = SCHEDULER.lock();
+        let pid = scheduler.allocate_pid();
+        
+        let page_table = unsafe {
+            let (frame, _) = x86_64::registers::control::Cr3::read();
+            frame
+        };
+        
+        let mut proc = Box::new(Process::new(
+            pid,
+            VirtAddr::new(shell_process as *const () as u64),
+            page_table,
+        ));
+        proc.set_name("shell");
+        
+        scheduler.add_process(proc);
+    }
+
+    serial_println!("Processes created!");
+
     loop {
-        if let Some(character) = keyboard::read_from_buffer() {
-            repl.handle_char(character);
-        } else {
-            unsafe { core::arch::asm!("hlt"); }
+        // ✅ Main loop SOLO hace scheduling
+        yield_cpu();
+    }
+}
+
+fn idle_task() -> ! {
+    loop {
+        // Idle siempre cede inmediatamente
+        yield_cpu();
+    }
+}
+
+fn yield_cpu() {
+    use process::context::switch_context;
+    
+    let switch_info = {
+        let mut scheduler = process::scheduler::SCHEDULER.lock();
+        scheduler.switch_to_next()
+    };
+    
+    if let Some((old_ctx, new_ctx)) = switch_info {
+        unsafe {
+            switch_context(old_ctx, new_ctx);
         }
     }
 }
 
+fn shell_process() -> ! {
+    // Crear REPL local (no global)
+    let mut repl = Repl::new(10, 50);
+    repl.show_prompt();
+    
+    loop {
+        // Procesar teclado
+        if let Some(character) = keyboard::read_key() {
+            repl.handle_char(character);
+        }
+        
+        // Ceder control periódicamente
+        static mut SHELL_COUNTER: usize = 0;
+        unsafe {
+            SHELL_COUNTER += 1;
+            if SHELL_COUNTER >= 1000 {
+                SHELL_COUNTER = 0;
+                yield_cpu();
+            }
+        }
+    }
+}

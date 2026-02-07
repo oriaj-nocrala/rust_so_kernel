@@ -24,6 +24,7 @@ x86_64 = "0.15.4"
 # Para manejo de interrupciones y excepciones
 spin = "0.10.0"
 bitflags = "2.10.0"
+lazy_static = { version = "1.4", features = ["spin_no_std"] }
 
 # Configuración para el target bare metal
 [profile.dev]

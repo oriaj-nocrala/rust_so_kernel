@@ -8,7 +8,7 @@ use x86_64::{
 
 /// Mapper activo (usa el CR3 actual)
 pub struct ActivePageTable {
-    mapper: OffsetPageTable<'static>,
+    pub mapper: OffsetPageTable<'static>,
 }
 
 impl ActivePageTable {

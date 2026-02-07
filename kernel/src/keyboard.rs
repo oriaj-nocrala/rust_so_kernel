@@ -1,59 +1,13 @@
 // use core::arch::asm;
 
 use crate::debug_log;
+use crate::keyboard_buffer::KEYBOARD_BUFFER;
 
 // TODO: Event driven en vez de POLLED.
 
 // Puertos del teclado PS/2
 // const KEYBOARD_DATA_PORT: u16 = 0x60;
 // const KEYBOARD_STATUS_PORT: u16 = 0x64;
-
-// --- Buffer de Teclado ---
-const BUFFER_SIZE: usize = 128;
-static mut KEY_BUFFER: [Option<char>; BUFFER_SIZE] = [None; BUFFER_SIZE];
-static mut BUFFER_READ_INDEX: usize = 0;
-static mut BUFFER_WRITE_INDEX: usize = 0;
-
-/// Agrega un carácter al buffer del teclado
-fn add_to_buffer(c: char) {
-    unsafe {
-        let next_write_index = (BUFFER_WRITE_INDEX + 1) % BUFFER_SIZE;
-        if next_write_index != BUFFER_READ_INDEX {
-            KEY_BUFFER[BUFFER_WRITE_INDEX] = Some(c);
-            BUFFER_WRITE_INDEX = next_write_index;
-        }
-    }
-}
-
-/// Lee un carácter del buffer del teclado
-pub fn read_from_buffer() -> Option<char> {
-    // Deshabilitar interrupciones SOLO durante el acceso.
-    let flags = unsafe {
-        let f: u64;
-        core::arch::asm!("pushfq; pop {}; cli", out(reg) f);
-        f
-    };
-
-    let result = unsafe {
-        if BUFFER_READ_INDEX == BUFFER_WRITE_INDEX {
-            None // Buffer vacío
-        } else {
-            let key = KEY_BUFFER[BUFFER_READ_INDEX];
-            KEY_BUFFER[BUFFER_READ_INDEX] = None;
-            BUFFER_READ_INDEX = (BUFFER_READ_INDEX + 1) % BUFFER_SIZE;
-            key
-        }
-    };
-
-    // Restaurar interrupciones.
-    unsafe {
-        if flags & 0x200 != 0 {
-            core::arch::asm!("sti");
-        }
-    }
-
-    result
-}
 
 // --- Lógica del Scancode ---
 
@@ -78,25 +32,16 @@ pub fn read_from_buffer() -> Option<char> {
 /// Procesa el scancode del teclado si hay datos disponibles
 /// Esta función es no bloqueante
 pub fn process_scancode(scancode: u8) {
-    debug_log("Scancode received: ");
-    debug_log_hex(scancode);
-    debug_log("\n");
-    
     if scancode < 0x80 {
         if let Some(character) = scancode_to_ascii(scancode) {
-            debug_log("Converted to: ");
-            debug_log_char(character);
-            debug_log("\n");
-            
-            add_to_buffer(character);
-            
-            debug_log("Added to buffer\n");
-        } else {
-            debug_log("No ASCII mapping\n");
+            // ✅ Escribir al buffer lock-free
+            KEYBOARD_BUFFER.push(character);
         }
-    } else {
-        debug_log("Key release, ignored\n");
     }
+}
+
+pub fn read_key() -> Option<char> {
+    KEYBOARD_BUFFER.pop()
 }
 
 fn debug_log_char(c: char) {
