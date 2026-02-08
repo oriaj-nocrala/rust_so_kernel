@@ -10,6 +10,7 @@ use core::arch::asm;
 /// - `user_stack` debe apuntar a memoria válida
 #[no_mangle]
 pub unsafe extern "C" fn jump_to_userspace(entry_point: VirtAddr, user_stack: VirtAddr) -> ! {
+    crate::serial_println!("funcion jump_to_userspace");
     let (user_cs, user_ds) = super::tss::get_user_selectors();
     
     let user_cs_val = user_cs.0 as u64 | 3;

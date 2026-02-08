@@ -68,6 +68,12 @@ impl<F> IdtEntry<F> {
         self.options = IdtEntryOptions::interrupt_gate(); // ⭐ ESTA LÍNEA
         self
     }
+
+    pub fn set_privilege_level(&mut self, dpl: u16) -> &mut Self {
+        // DPL está en bits 13-14 de options
+        self.options.0 = (self.options.0 & !0x6000) | ((dpl & 0b11) << 13);
+        self
+    }
 }
 
 // Para excepciones que reciben stack frame

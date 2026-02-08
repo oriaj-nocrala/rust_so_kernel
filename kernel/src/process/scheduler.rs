@@ -69,7 +69,7 @@ impl Scheduler {
                 proc.state = ProcessState::Running;
                 self.current = Some(proc.pid);
                 
-                let pid = proc.pid;
+                let _pid = proc.pid;
                 self.processes.push_back(proc);
                 
                 // Retornar referencia mutable
@@ -82,7 +82,7 @@ impl Scheduler {
         None
     }
 
-        /// ✅ NUEVO: Hace context switch y retorna (proceso_anterior, proceso_siguiente)
+    /// ✅ Hace context switch y retorna (proceso_anterior, proceso_siguiente)
     /// Retorna None si no hay cambio de contexto necesario
     pub fn switch_to_next(&mut self) -> Option<(*mut Context, *const Context)> {
         if self.processes.is_empty() {
@@ -157,11 +157,11 @@ impl Scheduler {
         None
     }
 
-    /// Marca el proceso actual como bloqueado
+    /// Marca el proceso actual como bloqueado (sleeping)
     pub fn block_current(&mut self) {
         if let Some(current_pid) = self.current {
             if let Some(proc) = self.processes.iter_mut().find(|p| p.pid == current_pid) {
-                proc.state = ProcessState::Blocked;
+                proc.state = ProcessState::Sleeping;  // ✅ FIX: Blocked -> Sleeping
             }
         }
     }
@@ -169,32 +169,15 @@ impl Scheduler {
     /// Desbloquea un proceso
     pub fn unblock(&mut self, pid: Pid) {
         if let Some(proc) = self.processes.iter_mut().find(|p| p.pid == pid) {
-            if proc.state == ProcessState::Blocked {
+            if proc.state == ProcessState::Sleeping {  // ✅ FIX: Blocked -> Sleeping
                 proc.state = ProcessState::Ready;
             }
         }
     }
 
-    /// Ejecuta el proceso seleccionado
-    /// Si es user space, salta a Ring 3
-    pub unsafe fn run_process(&mut self, process: &mut Process) {
-        match process.privilege {
-            PrivilegeLevel::Kernel => {
-                // Ya está en kernel, solo hacer context switch normal
-                // (esto ya lo manejas con switch_to_next)
-            }
-            PrivilegeLevel::User => {
-                // Saltar a user space
-                if let Some(user_stack) = process.user_stack {
-                    let entry = VirtAddr::new(process.context.rip);
-                    
-                    // Actualizar TSS con el kernel stack de este proceso
-                    crate::process::userspace::jump_to_userspace(entry, user_stack);
-                    
-                    // ⚠️ ESTO NUNCA RETORNA (salta a ring 3)
-                    // super::userspace::jump_to_userspace(entry, user_stack);
-                }
-            }
-        }
-    }
+    // ❌ REMOVIDO: run_process() - Ya no se usa con la nueva arquitectura
+    // El flow correcto es:
+    // 1. switch_context() salta a forkret (primera vez)
+    // 2. forkret llama a trapret
+    // 3. trapret hace IRETQ a user mode
 }

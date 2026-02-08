@@ -2,7 +2,7 @@
 
 use core::arch::global_asm;
 
-// ✅ NUEVO: Assembly correcto que preserva TODOS los registros
+// ✅ Assembly correcto que preserva TODOS los registros
 global_asm!(
     ".global syscall_entry",
     "syscall_entry:",
@@ -52,7 +52,7 @@ global_asm!(
     "iretq",
 );
 
-// ✅ NUEVO: Estructura que representa los registros guardados
+// ✅ Estructura que representa los registros guardados
 #[repr(C)]
 struct SavedRegisters {
     r15: u64,
@@ -72,7 +72,7 @@ struct SavedRegisters {
     rax: u64,
 }
 
-// ✅ NUEVO: Wrapper que lee los registros del stack
+// ✅ Wrapper que lee los registros del stack
 #[no_mangle]
 extern "C" fn syscall_handler_asm(regs: &SavedRegisters) -> i64 {
     syscall_handler(
@@ -85,10 +85,6 @@ extern "C" fn syscall_handler_asm(regs: &SavedRegisters) -> i64 {
         regs.r9,   // arg6
     )
 }
-
-// ❌ BORRAR ESTO (el wrapper viejo):
-// #[no_mangle]
-// extern "C" fn syscall_handler_wrapper(...) { ... }
 
 /// Números de syscall compatibles con Linux x86_64
 #[derive(Debug, Clone, Copy)]
@@ -219,8 +215,20 @@ fn sys_exit(status: i32) -> SyscallResult {
         }
     }
     
+    // ✅ FIX: Hacer yield manualmente en lugar de llamar a yield_cpu()
     loop {
-        super::yield_cpu();
+        use super::context::switch_context;
+        
+        let switch_info = {
+            let mut scheduler = super::scheduler::SCHEDULER.lock();
+            scheduler.switch_to_next()
+        };
+        
+        if let Some((old_ctx, new_ctx)) = switch_info {
+            unsafe {
+                switch_context(old_ctx, new_ctx);
+            }
+        }
     }
 }
 

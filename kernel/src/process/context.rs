@@ -1,25 +1,31 @@
 // kernel/src/process/context.rs
+// Basado en xv6's context
 
 use x86_64::VirtAddr;
 
-/// Contexto del CPU (registros guardados durante context switch)
+use crate::serial_println;
+
+/// Contexto del CPU para context switch en KERNEL MODE
+/// 
+/// Solo contiene registros callee-saved (System V ABI)
+/// NO se usa para saltar a user mode - para eso está TrapFrame
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Context {
-    // Registros de propósito general (callee-saved en System V ABI)
+    // Callee-saved registers (System V ABI)
     pub r15: u64,
     pub r14: u64,
     pub r13: u64,
     pub r12: u64,
     pub rbx: u64,
     pub rbp: u64,
-
-    // Instruction pointer (donde reanudar)
+    
+    // Instruction pointer (donde reanudar en kernel mode)
     pub rip: u64,
 }
 
 impl Context {
-    /// Crea un contexto nuevo apuntando a entry_point
+    /// Crea un contexto que apunta a una función de kernel
     pub fn new(entry_point: VirtAddr, stack: VirtAddr) -> Self {
         Self {
             r15: 0,
@@ -27,12 +33,12 @@ impl Context {
             r13: 0,
             r12: 0,
             rbx: 0,
-            rbp: stack.as_u64(),  // Stack pointer inicial
+            rbp: stack.as_u64(),
             rip: entry_point.as_u64(),
         }
     }
 
-    /// Crea un contexto vacío (para el proceso idle)
+    /// Crea un contexto vacío (para proceso idle)
     pub const fn empty() -> Self {
         Self {
             r15: 0,
@@ -45,16 +51,22 @@ impl Context {
         }
     }
 
-    /// ✅ NUEVO: Contexto para proceso de usuario con trampolín
-    pub fn new_user(entry_point: VirtAddr, kernel_stack: VirtAddr, user_stack: VirtAddr) -> Self {
-        // En lugar de ir directo al entry_point, vamos al trampolín
-        let mut ctx = Self::new(VirtAddr::new(user_trampoline as u64), kernel_stack);
+    /// ✅ NUEVO: Crea un contexto que apunta a forkret
+    /// (primera función que ejecuta un proceso user cuando se schedulea)
+    pub fn new_for_user_process(kernel_stack: VirtAddr) -> Self {
+        extern "C" {
+            fn forkret();
+        }
         
-        // Usamos registros callee-saved para pasar datos al trampolín
-        // switch_context restaurará estos valores antes de que corra el trampolín
-        ctx.r12 = entry_point.as_u64(); // R12 = Dónde saltar en Ring 3
-        ctx.r13 = user_stack.as_u64();  // R13 = Stack de Ring 3
-        ctx
+        Self {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            rbx: 0,
+            rbp: kernel_stack.as_u64(),
+            rip: forkret as u64,
+        }
     }
 }
 
@@ -73,7 +85,7 @@ pub unsafe extern "C" fn switch_context(old: *mut Context, new: *const Context) 
         "mov [rdi + 0x28], rbp",
         
         // Guardar rip (dirección de retorno)
-        "mov rax, [rsp]",        // Leer return address del stack
+        "mov rax, [rsp]",
         "mov [rdi + 0x30], rax",
         
         // Cargar nuevo contexto
@@ -86,28 +98,41 @@ pub unsafe extern "C" fn switch_context(old: *mut Context, new: *const Context) 
         
         // Saltar al nuevo rip
         "mov rax, [rsi + 0x30]",
-        "mov [rsp], rax",        // Poner nuevo rip en el stack
+        "mov [rsp], rax",
         
-        "ret",                   // Saltar al nuevo contexto
-        // options(noreturn)
+        "ret",
     );
 }
 
-/// ✅ NUEVO: Trampolín que lleva de Kernel -> User
-#[unsafe(naked)]
-unsafe extern "C" fn user_trampoline() {
-    core::arch::naked_asm!(
-        // Al llegar aquí, switch_context ya restauró R12 y R13
-        // R12 contiene el entry_point de usuario
-        // R13 contiene el user_stack
+/// forkret: Primera función que ejecuta un proceso user
+/// Hace cleanup y llama a trapret
+#[no_mangle]
+extern "C" fn forkret() {
+    // TODO: Aquí podrías hacer cleanup (como en xv6)
+    // Por ahora, directamente llamamos a trapret
+    
+    unsafe {
+        // Obtener el proceso actual
+        let mut scheduler = crate::process::scheduler::SCHEDULER.lock();
         
-        "mov rdi, r12", // Primer argumento para jump_to_userspace
-        "mov rsi, r13", // Segundo argumento para jump_to_userspace
+        if let Some(pid) = scheduler.current {
+            if let Some(proc) = scheduler.processes.iter_mut().find(|p| p.pid == pid) {
+                crate::serial_println!("forkret: PID {} entering userspace", pid.0);
+                
+                // Obtener puntero al trapframe
+                if let Some(ref tf) = proc.trapframe {
+                    // ✅ FIX: Usar &**tf para obtener &TrapFrame desde &Box<TrapFrame>
+                    let tf_ptr = &**tf as *const super::trapframe::TrapFrame;
+                    
+                    // Liberar el lock antes de IRETQ
+                    drop(scheduler);
+                    
+                    // Nunca retorna
+                    super::trapret::trapret_debug(tf_ptr);
+                }
+            }
+        }
         
-        // Llamar a la función que hace la magia (IRETQ)
-        // Esta función NO retorna
-        "call jump_to_userspace",
-        
-        "ud2" // Trap por si acaso retorna (no debería)
-    );
+        panic!("forkret: No process to return to!");
+    }
 }

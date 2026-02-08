@@ -24,7 +24,7 @@ use interrupts::idt::InterruptDescriptorTable;
 use spin::Once;
 use x86_64::{VirtAddr, structures::paging::FrameAllocator};
 use process::{Process, Pid, scheduler::SCHEDULER};
-use crate::allocator::FRAME_ALLOCATOR;
+use crate::{allocator::FRAME_ALLOCATOR, process::ProcessState};
 
 use crate::{
     framebuffer::{Color, init_global_framebuffer}, interrupts::exception::ExceptionStackFrame, memory::{frame_allocator::{self, BootInfoFrameAllocator}, paging::ActivePageTable}, repl::Repl
@@ -46,7 +46,10 @@ fn init_idt() {
         idt.add_handler_with_error(14, page_fault_handler);
         idt.add_handler(32, timer_handler);
         idt.add_handler(33, keyboard_interrupt_handler);
-        idt.entries[0x80].set_handler_addr(syscall_entry as u64);
+        // ✅ FIX: INT 0x80 necesita DPL=3 para que Ring 3 pueda llamarla
+        idt.entries[0x80]
+            .set_handler_addr(syscall_entry as u64)
+            .set_privilege_level(3);  // ← AGREGAR ESTA LÍNEA
         idt
     });
 }
@@ -114,9 +117,27 @@ extern "x86-interrupt" fn page_fault_handler(
 }
 
 extern "x86-interrupt" fn timer_handler(_sf: &mut ExceptionStackFrame) {
-    // Por ahora, solo reconocer que ocurrió
+    // ✅ AGREGAR: Hacer context switch periódico
+    static mut TICK: usize = 0;
+    unsafe {
+        TICK += 1;
+        if TICK >= 10 {  // Cada 10 ticks (100ms con PIT a 100Hz)
+            TICK = 0;
+            
+            // Hacer context switch
+            use process::context::switch_context;
+            let switch_info = {
+                let mut scheduler = process::scheduler::SCHEDULER.lock();
+                scheduler.switch_to_next()
+            };
+            
+            if let Some((old_ctx, new_ctx)) = switch_info {
+                switch_context(old_ctx, new_ctx);
+            }
+        }
+    }
     
-    // Enviar EOI (End of Interrupt) al PIC
+    // Enviar EOI
     unsafe {
         use x86_64::instructions::port::PortWriteOnly;
         PortWriteOnly::<u8>::new(0x20).write(0x20);
@@ -267,39 +288,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         core::arch::asm!("sti");
     }
 
-    // Justo después de:
-    // serial_println!("Step 7: Paging initialized");
-
-    serial_println!("Step 7.5: Pre-mapping user stack for Ring 3");
-
-    // Dirección fija para el user stack (usamos una región alta en user space)
-    const USER_STACK_TOP: u64 = 0x0000_7000_0000_2000;  // 2 páginas antes de aquí
-    const USER_STACK_SIZE: u64 = 8192;  // 2 páginas (8KB)
-    const USER_STACK_BASE: u64 = USER_STACK_TOP - USER_STACK_SIZE;
-
-    unsafe {
-        let phys_offset = memory::physical_memory_offset();
-        let mut page_table = memory::paging::ActivePageTable::new(phys_offset);
-        let mut frame_allocator_lock = FRAME_ALLOCATOR.lock();
-        
-        // ✅ Unwrap el Option
-        let frame_allocator = frame_allocator_lock.as_mut()
-            .expect("Frame allocator not initialized");
-        
-        memory::user_pages::map_user_pages(
-            &mut page_table.mapper,
-            frame_allocator,  // ← Ya no es Option
-            VirtAddr::new(USER_STACK_BASE),
-            (USER_STACK_SIZE / 4096) as usize,
-        ).expect("Failed to map user stack");
-        
-        serial_println!(
-            "User stack mapped: {:#x} - {:#x}",
-            USER_STACK_BASE,
-            USER_STACK_TOP
-        );
-    }
-
     // Inicializar el PIT
     pit::init(100); // 100 Hz
 
@@ -308,6 +296,60 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     serial_println!("Step 9: Initializing TSS and GDT");
     process::tss::init();
+
+    serial_println!("Step 7.5: Setting up user space memory");
+
+    unsafe {
+        let phys_offset = memory::physical_memory_offset();
+        let mut page_table = memory::paging::ActivePageTable::new(phys_offset);
+        let mut frame_allocator_lock = FRAME_ALLOCATOR.lock();
+        
+        let frame_allocator = frame_allocator_lock.as_mut()
+            .expect("Frame allocator not initialized");
+        
+        // ============ 1. Mapear USER STACK ============
+        const USER_STACK_TOP: u64 = 0x0000_7000_0000_2000;
+        const USER_STACK_SIZE: u64 = 8192;  // 2 páginas
+        const USER_STACK_BASE: u64 = USER_STACK_TOP - USER_STACK_SIZE;
+        
+        memory::user_pages::map_user_pages(
+            &mut page_table.mapper,
+            frame_allocator,
+            VirtAddr::new(USER_STACK_BASE),
+            (USER_STACK_SIZE / 4096) as usize,
+        ).expect("Failed to map user stack");
+        
+        serial_println!(
+            "  User stack: {:#x} - {:#x}",
+            USER_STACK_BASE,
+            USER_STACK_TOP
+        );
+        
+        // ============ 2. Mapear y COPIAR USER CODE ============
+        use memory::user_code;
+        use process::user_test_minimal;
+
+        // ✅ Imprimir tests disponibles
+        user_test_minimal::print_available_tests();
+        
+        // ✅ Elegir test (cambia esto para probar diferentes tests)
+        let test_name = "syscall";  // Opciones: "loop", "hlt", "syscall", "stack", "nop"
+        let test_ptr = user_test_minimal::get_test_ptr(test_name);
+        
+        serial_println!("\n📝 Using test: '{}'", test_name);
+        serial_println!("   Test address: {:#x}", test_ptr as u64);
+        
+        let code_entry = user_code::setup_user_code(
+            &mut page_table.mapper,
+            frame_allocator,
+            test_ptr,
+            4096,  // 1 página suficiente para tests simples
+        ).expect("Failed to setup user code");
+        
+        serial_println!("  ✅ User code copied to: {:#x}\n", code_entry.as_u64());
+    }
+
+    // ============ CREAR PROCESOS (REEMPLAZAR LA SECCIÓN EXISTENTE) ============
 
     serial_println!("Step 10: Creating test processes");
 
@@ -321,37 +363,45 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             frame
         };
         
-        let idle = Box::new(Process::new(
+        let mut idle = Box::new(Process::new(
             pid,
             VirtAddr::new(idle_task as *const () as u64),
             page_table,
         ));
+        idle.state = ProcessState::Ready;  // ← Marcar como Ready
+        idle.set_name("idle");
         
         scheduler.add_process(idle);
     }
 
-    // Si activamos esto: Kernel panic! por error de proteccion
-    // (aparentemente falta USER_ACCESSIBLE)
-    // // ✅ NUEVO: Proceso en user space (Ring 3)
-    // {
-    //     let mut scheduler = SCHEDULER.lock();
-    //     let pid = scheduler.allocate_pid();
+    // ✅ Proceso en user space (Ring 3) - CON DEBUGGING
+    {
+        use memory::user_code::USER_CODE_BASE;
         
-    //     let page_table = unsafe {
-    //         let (frame, _) = x86_64::registers::control::Cr3::read();
-    //         frame
-    //     };
+        let mut scheduler = SCHEDULER.lock();
+        let pid = scheduler.allocate_pid();
         
-    //     let mut proc = Box::new(Process::new_user(
-    //         pid,
-    //         VirtAddr::new(process::user_test_function as *const () as u64),
-    //         page_table,
-    //     ));
-    //     proc.set_name("user_test")   ;
+        let page_table = unsafe {
+            let (frame, _) = x86_64::registers::control::Cr3::read();
+            frame
+        };
         
-    //     scheduler.add_process(proc);
-    // }
+        // ✅ NUEVO: Pasar nombre del test
+        let test_name = "syscall";  // Debe coincidir con el test copiado arriba
+        
+        let mut proc = Box::new(Process::new_user(
+            pid,
+            VirtAddr::new(USER_CODE_BASE),
+            page_table,
+            Some(test_name),  // ← Nuevo parámetro
+        ));
+        proc.state = ProcessState::Ready;
+        proc.set_name("user_test");
+        
+        scheduler.add_process(proc);
+    }
 
+    // Proceso shell (kernel space por ahora)
     {
         let mut scheduler = SCHEDULER.lock();
         let pid = scheduler.allocate_pid();
@@ -366,12 +416,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             VirtAddr::new(shell_process as *const () as u64),
             page_table,
         ));
+        proc.state = ProcessState::Ready;  // ← Marcar como Ready
         proc.set_name("shell");
         
         scheduler.add_process(proc);
     }
 
-    serial_println!("Processes created!");
+    serial_println!("All processes created!");
 
     loop {
         // ✅ Main loop SOLO hace scheduling

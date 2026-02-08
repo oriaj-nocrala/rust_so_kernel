@@ -1,19 +1,20 @@
 // kernel/src/process/mod.rs
+// Arquitectura basada en xv6
 
 use alloc::boxed::Box;
-use x86_64::{
-    VirtAddr,
-    structures::paging::{FrameAllocator, Mapper, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB},
-};
-use crate::memory::user_pages::map_user_pages;
+use x86_64::{VirtAddr, structures::paging::PhysFrame};
 
 pub mod context;
 pub mod syscall;
 pub mod tss;
-pub mod userspace;
+pub mod trapframe;
+pub mod trapret;
 pub mod scheduler;
+pub mod userspace;
+pub mod user_test_minimal;
 
 use context::Context;
+use trapframe::TrapFrame;
 
 /// Process ID
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -22,9 +23,10 @@ pub struct Pid(pub usize);
 /// Estado del proceso
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
+    Embryo,     // En creación
     Ready,      // Listo para ejecutar
     Running,    // Ejecutándose actualmente
-    Blocked,    // Esperando I/O
+    Sleeping,   // Esperando I/O
     Zombie,     // Terminado pero no recolectado
 }
 
@@ -36,14 +38,27 @@ pub enum PrivilegeLevel {
 }
 
 /// Process Control Block (PCB)
+/// 
+/// Arquitectura similar a xv6:
+/// - `context`: Estado del kernel (para context switch)
+/// - `trapframe`: Estado de usuario (guardado en trap/syscall)
+/// - `kernel_stack`: Stack que usa cuando está en kernel mode
 pub struct Process {
     pub pid: Pid,
     pub state: ProcessState,
+    
+    // ============ Context Switching (Kernel Mode) ============
     pub context: Context,
     pub kernel_stack: VirtAddr,
-    pub user_stack: Option<VirtAddr>,
-    pub privilege: PrivilegeLevel, 
+    
+    // ============ User Mode State ============
+    pub trapframe: Option<Box<TrapFrame>>,  // Solo para procesos user
+    pub privilege: PrivilegeLevel,
+    
+    // ============ Memory Management ============
     pub page_table: PhysFrame,
+    
+    // ============ Metadata ============
     pub name: [u8; 32],
 }
 
@@ -56,15 +71,15 @@ impl Process {
             if ptr.is_null() {
                 panic!("Failed to allocate kernel stack");
             }
-            VirtAddr::new(ptr as u64 + 8192)
+            VirtAddr::new(ptr as u64 + 8192)  // Top of stack
         };
 
         Self {
             pid,
-            state: ProcessState::Ready,
+            state: ProcessState::Embryo,
             context: Context::new(entry_point, kernel_stack),
             kernel_stack,
-            user_stack: None,
+            trapframe: None,  // Kernel processes don't need trapframe
             privilege: PrivilegeLevel::Kernel,
             page_table,
             name: [0; 32],
@@ -72,8 +87,16 @@ impl Process {
     }
 
     /// Crea un proceso de user space (Ring 3)
-    pub fn new_user(pid: Pid, entry_point: VirtAddr, page_table: PhysFrame) -> Self {
-        // Kernel stack
+    /// 
+    /// # Arguments
+    /// * `test_name` - Nombre del test: "loop", "hlt", "syscall", "stack", "nop"
+    pub fn new_user(
+        pid: Pid,
+        entry_point: VirtAddr,
+        page_table: PhysFrame,
+        test_name: Option<&str>
+    ) -> Self {
+        // Allocar kernel stack
         let kernel_stack = unsafe {
             let layout = core::alloc::Layout::from_size_align(8192, 4096).unwrap();
             let ptr = alloc::alloc::alloc(layout);
@@ -83,16 +106,49 @@ impl Process {
             VirtAddr::new(ptr as u64 + 8192)
         };
 
-        // ✅ User stack: Usar la dirección que pre-mapeamos en main.rs
+        // ✅ FIX: User stack - RSP debe apuntar DENTRO de la región mapeada
         const USER_STACK_TOP: u64 = 0x0000_7000_0000_2000;
-        let user_stack = VirtAddr::new(USER_STACK_TOP);
+        const USER_STACK_SIZE: u64 = 8192;
+        
+        // ⚠️ IMPORTANTE: Stack crece hacia abajo, RSP debe estar dentro
+        // Si mapeamos [BASE, TOP), RSP debe estar en TOP - 8 (no en TOP)
+        let user_rsp = USER_STACK_TOP - 8;
+        
+        // Obtener selectores
+        let (user_cs, user_ss) = tss::get_user_selectors();
+        
+        // Crear trapframe
+        let trapframe = Box::new(TrapFrame::new_user(
+            entry_point.as_u64(),
+            user_rsp,  // ✅ Ahora apunta a memoria válida
+            user_cs.0 as u64,
+            user_ss.0 as u64,
+        ));
+
+        // Context apunta a forkret
+        let context = Context::new_for_user_process(kernel_stack);
+
+        // Log detallado
+        crate::serial_println!("╔════════════════════════════════════════════════════════╗");
+        crate::serial_println!("║ CREATING USER PROCESS                                  ║");
+        crate::serial_println!("╠════════════════════════════════════════════════════════╣");
+        crate::serial_println!("║ PID:         {}                                         ║", pid.0);
+        crate::serial_println!("║ Entry:       {:#018x}                        ║", entry_point.as_u64());
+        crate::serial_println!("║ User RSP:    {:#018x}                        ║", user_rsp);
+        crate::serial_println!("║ Kernel RSP:  {:#018x}                        ║", kernel_stack.as_u64());
+        crate::serial_println!("║ CS selector: {:#018x} (RPL={})                    ║", user_cs.0, user_cs.0 & 3);
+        crate::serial_println!("║ SS selector: {:#018x} (RPL={})                    ║", user_ss.0, user_ss.0 & 3);
+        if let Some(test) = test_name {
+            crate::serial_println!("║ Test:        {}                                         ║", test);
+        }
+        crate::serial_println!("╚════════════════════════════════════════════════════════╝");
 
         Self {
             pid,
-            state: ProcessState::Ready,
-            context: Context::new_user(entry_point, kernel_stack, user_stack),
+            state: ProcessState::Embryo,
+            context,
             kernel_stack,
-            user_stack: Some(user_stack),
+            trapframe: Some(trapframe),
             privilege: PrivilegeLevel::User,
             page_table,
             name: [0; 32],
@@ -106,46 +162,20 @@ impl Process {
     }
 }
 
-/// Yield CPU para permitir context switch
-pub fn yield_cpu() {
-    use context::switch_context;
-    
-    let switch_info = {
-        let mut scheduler = scheduler::SCHEDULER.lock();
-        scheduler.switch_to_next()
-    };
-    
-    if let Some((old_ctx, new_ctx)) = switch_info {
-        unsafe {
-            switch_context(old_ctx, new_ctx);
-        }
-    }
-}
-
-/// Función de prueba que ejecuta en Ring 3
+/// ❌ DEPRECADO: No usar esto - usa los tests mínimos
 #[no_mangle]
 pub extern "C" fn user_test_function() -> ! {
-    // Obtener PID
-    let pid = userspace::sys_getpid();
+    // Este código puede no funcionar porque:
+    // 1. Usa syscalls que asumen TLS
+    // 2. Puede usar instrucciones privilegiadas
+    // 3. No está diseñado para Ring 3
     
-    // Mensaje de prueba
-    let msg = b"Hello from userspace! PID=";
-    userspace::sys_write(1, msg.as_ptr(), msg.len());
+    crate::serial_println!("⚠️  WARNING: user_test_function() is deprecated");
+    crate::serial_println!("   Use user_test_minimal tests instead");
     
-    // ✅ FIX: Usar array estático o escribir char por char
-    if pid < 10 {
-        let c = b'0' + pid as u8;
-        userspace::sys_write(1, &c as *const u8, 1);
-    } else {
-        let tens = b'0' + (pid / 10) as u8;
-        let ones = b'0' + (pid % 10) as u8;
-        userspace::sys_write(1, &tens as *const u8, 1);
-        userspace::sys_write(1, &ones as *const u8, 1);
+    loop {
+        unsafe {
+            core::arch::asm!("hlt");
+        }
     }
-    
-    let newline = b"\n";
-    userspace::sys_write(1, newline.as_ptr(), newline.len());
-    
-    // Salir con status 0
-    userspace::sys_exit(0);
 }
