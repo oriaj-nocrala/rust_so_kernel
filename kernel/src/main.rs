@@ -44,7 +44,7 @@ fn init_idt() {
         idt.add_double_fault_handler(8, double_fault_handler);
         idt.add_handler_with_error(13, general_protection_fault_handler);
         idt.add_handler_with_error(14, page_fault_handler);
-        idt.add_handler(32, timer_handler);
+        idt.entries[32].set_handler_addr(process::timer_preempt::timer_interrupt_entry as u64);
         idt.add_handler(33, keyboard_interrupt_handler);
         // ✅ FIX: INT 0x80 necesita DPL=3 para que Ring 3 pueda llamarla
         idt.entries[0x80]
@@ -64,16 +64,6 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_: &mut ExceptionStackFrame
     };
     keyboard::process_scancode(scancode);
     interrupts::pic::end_of_interrupt(interrupts::pic::Irq::Keyboard.as_u8());
-}
-
-// Helper para debug serial
-fn debug_log(s: &str) {
-    unsafe {
-        let mut port = x86_64::instructions::port::PortWriteOnly::<u8>::new(0x3F8);
-        for byte in s.bytes() {
-            port.write(byte);
-        }
-    }
 }
 
 extern "x86-interrupt" fn divide_by_zero_handler(sf: &mut ExceptionStackFrame) {
@@ -117,27 +107,9 @@ extern "x86-interrupt" fn page_fault_handler(
 }
 
 extern "x86-interrupt" fn timer_handler(_sf: &mut ExceptionStackFrame) {
-    // ✅ AGREGAR: Hacer context switch periódico
-    static mut TICK: usize = 0;
-    unsafe {
-        TICK += 1;
-        if TICK >= 10 {  // Cada 10 ticks (100ms con PIT a 100Hz)
-            TICK = 0;
-            
-            // Hacer context switch
-            use process::context::switch_context;
-            let switch_info = {
-                let mut scheduler = process::scheduler::SCHEDULER.lock();
-                scheduler.switch_to_next()
-            };
-            
-            if let Some((old_ctx, new_ctx)) = switch_info {
-                switch_context(old_ctx, new_ctx);
-            }
-        }
-    }
+    // ❌ NO hacer yield_cpu aquí
     
-    // Enviar EOI
+    // Solo EOI
     unsafe {
         use x86_64::instructions::port::PortWriteOnly;
         PortWriteOnly::<u8>::new(0x20).write(0x20);
@@ -274,7 +246,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let mut fb = framebuffer::FRAMEBUFFER.lock();
         if let Some(fb) = fb.as_mut() {
             fb.clear(Color::rgb(0, 0, 0));
-            fb.draw_text(10, 10, "NeoOS v0.1", Color::rgb(0, 200, 255), Color::rgb(0, 0, 0), 2);
+            fb.draw_text(10, 10, "ConstanOS v0.1", Color::rgb(0, 200, 255), Color::rgb(0, 0, 0), 2);
             fb.draw_text(10, 770, "Allocator: Ready", Color::rgb(0, 255, 0), Color::rgb(0, 0, 0), 2);
         }
     }
@@ -453,22 +425,20 @@ fn yield_cpu() {
 }
 
 fn shell_process() -> ! {
-    // Crear REPL local (no global)
     let mut repl = Repl::new(10, 50);
     repl.show_prompt();
     
     loop {
-        // Procesar teclado
         if let Some(character) = keyboard::read_key() {
             repl.handle_char(character);
         }
         
-        // Ceder control periódicamente
-        static mut SHELL_COUNTER: usize = 0;
+        // ✅ Yield cada cierto tiempo para dar chance al proceso user
+        static mut COUNTER: usize = 0;
         unsafe {
-            SHELL_COUNTER += 1;
-            if SHELL_COUNTER >= 1000 {
-                SHELL_COUNTER = 0;
+            COUNTER += 1;
+            if COUNTER >= 100000 {  // Ajusta este número
+                COUNTER = 0;
                 yield_cpu();
             }
         }

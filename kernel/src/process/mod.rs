@@ -10,6 +10,7 @@ pub mod tss;
 pub mod trapframe;
 pub mod trapret;
 pub mod scheduler;
+pub mod timer_preempt;
 pub mod userspace;
 pub mod user_test_minimal;
 
@@ -159,23 +160,5 @@ impl Process {
         let bytes = name.as_bytes();
         let len = bytes.len().min(31);
         self.name[..len].copy_from_slice(&bytes[..len]);
-    }
-}
-
-/// ❌ DEPRECADO: No usar esto - usa los tests mínimos
-#[no_mangle]
-pub extern "C" fn user_test_function() -> ! {
-    // Este código puede no funcionar porque:
-    // 1. Usa syscalls que asumen TLS
-    // 2. Puede usar instrucciones privilegiadas
-    // 3. No está diseñado para Ring 3
-    
-    crate::serial_println!("⚠️  WARNING: user_test_function() is deprecated");
-    crate::serial_println!("   Use user_test_minimal tests instead");
-    
-    loop {
-        unsafe {
-            core::arch::asm!("hlt");
-        }
     }
 }

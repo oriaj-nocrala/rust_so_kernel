@@ -57,7 +57,7 @@ impl TrapFrame {
             // IRETQ frame
             rip: entry_point,
             cs: user_cs | 3,  // RPL = 3
-            rflags: 0x202,    // Interrupts enabled
+            rflags: 0x200,    // Interrupts enabled
             rsp: user_stack,
             ss: user_ss | 3,  // RPL = 3
         }

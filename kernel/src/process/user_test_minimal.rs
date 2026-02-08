@@ -43,10 +43,10 @@ global_asm!(
     ".global user_syscall_test",
     ".section .text.user",
     "user_syscall_test:",
-    "    mov rax, 39",     // sys_getpid
-    "    int 0x80",
     "1:",
-    "    jmp 1b",          // Loop después del syscall
+    "    mov rax, 24",     // sys_getpid
+    "    int 0x80",        // Syscall (esto ya cede al kernel)
+    "    jmp 1b",          // Repetir
 );
 
 /// ✅ TEST 4: Write to stack

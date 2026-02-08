@@ -1,33 +1,6 @@
-// use core::arch::asm;
-
-use crate::debug_log;
 use crate::keyboard_buffer::KEYBOARD_BUFFER;
 
 // TODO: Event driven en vez de POLLED.
-
-// Puertos del teclado PS/2
-// const KEYBOARD_DATA_PORT: u16 = 0x60;
-// const KEYBOARD_STATUS_PORT: u16 = 0x64;
-
-// --- Lógica del Scancode ---
-
-// /// Lee un byte del puerto de estado del teclado
-// fn read_status() -> u8 {
-//     let value: u8;
-//     unsafe {
-//         asm!("in al, dx", in("dx") KEYBOARD_STATUS_PORT, out("al") value, options(nomem, nostack, preserves_flags));
-//     }
-//     value
-// }
-
-// /// Lee un byte del puerto de datos del teclado
-// fn read_data() -> u8 {
-//     let value: u8;
-//     unsafe {
-//         asm!("in al, dx", in("dx") KEYBOARD_DATA_PORT, out("al") value, options(nomem, nostack, preserves_flags));
-//     }
-//     value
-// }
 
 /// Procesa el scancode del teclado si hay datos disponibles
 /// Esta función es no bloqueante
@@ -42,28 +15,6 @@ pub fn process_scancode(scancode: u8) {
 
 pub fn read_key() -> Option<char> {
     KEYBOARD_BUFFER.pop()
-}
-
-fn debug_log_char(c: char) {
-    unsafe {
-        let mut port = x86_64::instructions::port::PortWriteOnly::<u8>::new(0x3F8);
-        if c == '\n' {
-            port.write(b'\\');
-            port.write(b'n');
-        } else if c == '\u{08}' {
-            port.write(b'\\');
-            port.write(b'b');
-        } else {
-            port.write(c as u8);
-        }
-    }
-}
-
-fn debug_log_hex(c: u8) {
-    let mut port = x86_64::instructions::port::PortWriteOnly::<u8>::new(0x3F8);
-    unsafe{
-        port.write(c);
-    }
 }
 
 /// Convierte un scancode (Set 1) a un carácter ASCII si es posible

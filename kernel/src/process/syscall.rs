@@ -94,6 +94,7 @@ pub enum SyscallNumber {
     Write = 1,
     Open = 2,
     Close = 3,
+    Yield = 24,
     Exit = 60,
     GetPid = 39,
 }
@@ -105,6 +106,7 @@ impl SyscallNumber {
             1 => Some(Self::Write),
             2 => Some(Self::Open),
             3 => Some(Self::Close),
+            24 => Some(Self::Yield),
             39 => Some(Self::GetPid),
             60 => Some(Self::Exit),
             _ => None,
@@ -145,10 +147,10 @@ pub fn syscall_handler(
     _arg5: u64,
     _arg6: u64,
 ) -> SyscallResult {
-    crate::serial_println!(
-        "SYSCALL: num={}, args=({:#x}, {:#x}, {:#x})",
-        syscall_num, arg1, arg2, arg3
-    );
+    // crate::serial_println!(
+    //     "SYSCALL: num={}, args=({:#x}, {:#x}, {:#x})",
+    //     syscall_num, arg1, arg2, arg3
+    // );
 
     let syscall = match SyscallNumber::from_u64(syscall_num) {
         Some(s) => s,
@@ -165,6 +167,7 @@ pub fn syscall_handler(
         SyscallNumber::GetPid => sys_getpid(),
         SyscallNumber::Open => errno::ENOSYS,
         SyscallNumber::Close => errno::ENOSYS,
+        SyscallNumber::Yield => sys_yield(),
     }
 }
 
@@ -242,4 +245,41 @@ fn sys_getpid() -> SyscallResult {
     } else {
         0
     }
+}
+
+fn sys_yield() -> SyscallResult {
+    // ✅ Reconstruir el TrapFrame desde los registros guardados
+    // El syscall_entry guardó los registros en el stack
+    
+    use super::timer_preempt::timer_preempt_handler;
+    
+    // Obtener el TrapFrame del proceso actual
+    // (está en el heap, en proc.trapframe)
+    let tf_ptr = {
+        let scheduler = super::scheduler::SCHEDULER.lock();
+        if let Some(current_pid) = scheduler.current {
+            scheduler.processes.iter()
+                .find(|p| p.pid == current_pid)
+                .and_then(|p| p.trapframe.as_ref())
+                .map(|tf| &**tf as *const super::trapframe::TrapFrame as *mut _)
+        } else {
+            None
+        }
+    };
+    
+    if let Some(tf_ptr) = tf_ptr {
+        // Llamar al handler de preemption directamente
+        // Esto hará el context switch
+        unsafe {
+            let next_tf = timer_preempt_handler(tf_ptr);
+            
+            // Si cambió de proceso, hacer trapret al nuevo
+            if next_tf != tf_ptr {
+                super::trapret::trapret(next_tf);
+                // Nunca llega aquí
+            }
+        }
+    }
+    
+    0
 }
