@@ -24,7 +24,7 @@ use interrupts::idt::InterruptDescriptorTable;
 use spin::Once;
 use x86_64::{VirtAddr, structures::paging::FrameAllocator};
 use process::{Process, Pid, scheduler::SCHEDULER};
-use crate::{allocator::FRAME_ALLOCATOR, process::ProcessState};
+use crate::{allocator::FRAME_ALLOCATOR, process::{ProcessState, scheduler}};
 
 use crate::{
     framebuffer::{Color, init_global_framebuffer}, interrupts::exception::ExceptionStackFrame, memory::{frame_allocator::{self, BootInfoFrameAllocator}, paging::ActivePageTable}, repl::Repl
@@ -253,7 +253,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // Inicializar interrupciones
     interrupts::pic::initialize();
-    interrupts::pic::enable_irq(1); // Habilitar IRQ1 (teclado)
+    interrupts::pic::enable_irq(0); // ⏰ TIMER
+    interrupts::pic::enable_irq(1); // ⌨ KEYBOARD
     load_idt();
     
     unsafe {
@@ -279,33 +280,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let frame_allocator = frame_allocator_lock.as_mut()
             .expect("Frame allocator not initialized");
         
-        // ============ 1. Mapear USER STACK ============
-        const USER_STACK_TOP: u64 = 0x0000_7000_0000_2000;
-        const USER_STACK_SIZE: u64 = 8192;  // 2 páginas
-        const USER_STACK_BASE: u64 = USER_STACK_TOP - USER_STACK_SIZE;
-        
-        memory::user_pages::map_user_pages(
-            &mut page_table.mapper,
-            frame_allocator,
-            VirtAddr::new(USER_STACK_BASE),
-            (USER_STACK_SIZE / 4096) as usize,
-        ).expect("Failed to map user stack");
-        
-        serial_println!(
-            "  User stack: {:#x} - {:#x}",
-            USER_STACK_BASE,
-            USER_STACK_TOP
-        );
-        
-        // ============ 2. Mapear y COPIAR USER CODE ============
+        // ============ 1. Mapear USER CODE (compartido) ============
         use memory::user_code;
         use process::user_test_minimal;
 
-        // ✅ Imprimir tests disponibles
         user_test_minimal::print_available_tests();
         
-        // ✅ Elegir test (cambia esto para probar diferentes tests)
-        let test_name = "syscall";  // Opciones: "loop", "hlt", "syscall", "stack", "nop"
+        let test_name = "loop";
         let test_ptr = user_test_minimal::get_test_ptr(test_name);
         
         serial_println!("\n📝 Using test: '{}'", test_name);
@@ -315,112 +296,174 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             &mut page_table.mapper,
             frame_allocator,
             test_ptr,
-            4096,  // 1 página suficiente para tests simples
+            4096,
         ).expect("Failed to setup user code");
         
         serial_println!("  ✅ User code copied to: {:#x}\n", code_entry.as_u64());
+        
+        // ============ 2. Mapear MÚLTIPLES USER STACKS (separados) ============
+        // ⚠️ IMPORTANTE: Cada proceso necesita su PROPIO stack
+        
+        const NUM_USER_PROCESSES: usize = 2;
+        
+        for i in 0..NUM_USER_PROCESSES {
+            // Calcular base del stack para este proceso
+            // Separar stacks por 64KB para evitar overlap
+            let stack_base = 0x0000_7100_0000_0000_u64 + (i as u64 * 0x10000);
+            let stack_size = 8192;  // 2 páginas (8KB)
+            
+            serial_println!("Mapping user stack {} at {:#x}", i, stack_base);
+            
+            memory::user_pages::map_user_pages(
+                &mut page_table.mapper,
+                frame_allocator,
+                VirtAddr::new(stack_base),
+                (stack_size / 4096) as usize,
+            ).expect(&format!("Failed to map user stack {}", i));
+            
+            serial_println!(
+                "  ✅ Stack {}: {:#x} - {:#x}",
+                i,
+                stack_base,
+                stack_base + stack_size
+            );
+        }
     }
 
-    // ============ CREAR PROCESOS (REEMPLAZAR LA SECCIÓN EXISTENTE) ============
+    // ============ CREAR PROCESOS ============
 
-    serial_println!("Step 10: Creating test processes");
+    serial_println!("\nStep 10: Creating processes");
 
-    // Proceso idle (kernel space)
+    // ============ 1. PROCESO IDLE (kernel) ============
     {
-        let mut scheduler = SCHEDULER.lock();
-        let pid = Pid(0);
+        use crate::allocator::FRAME_ALLOCATOR;
         
         let page_table = unsafe {
             let (frame, _) = x86_64::registers::control::Cr3::read();
             frame
         };
         
-        let mut idle = Box::new(Process::new(
-            pid,
+        // Allocar kernel stack para idle
+        let kernel_stack = {
+            let mut frame_alloc = FRAME_ALLOCATOR.lock();
+            let frame_alloc = frame_alloc.as_mut().expect("Frame allocator not initialized");
+            
+            let stack_frame = frame_alloc.allocate_frame()
+                .expect("Failed to allocate kernel stack for idle");
+            
+            let phys_addr = stack_frame.start_address();
+            let virt_addr = memory::physical_memory_offset() + phys_addr.as_u64();
+            VirtAddr::new(virt_addr.as_u64() + 4096)  // Tope del stack
+        };
+        
+        let idle = Box::new(Process::new_kernel(
+            Pid(0),
             VirtAddr::new(idle_task as *const () as u64),
+            kernel_stack,
             page_table,
         ));
-        idle.state = ProcessState::Ready;  // ← Marcar como Ready
-        idle.set_name("idle");
         
-        scheduler.add_process(idle);
+        let mut scheduler = SCHEDULER.lock();
+        let mut idle_proc = idle;
+        idle_proc.set_name("idle");
+        idle_proc.set_priority(0);
+        scheduler.add_process(idle_proc);
     }
 
-    // ✅ Proceso en user space (Ring 3) - CON DEBUGGING
+    // ============ 2. PROCESOS USER ============
     {
         use memory::user_code::USER_CODE_BASE;
+        use crate::allocator::FRAME_ALLOCATOR;
         
-        let mut scheduler = SCHEDULER.lock();
-        let pid = scheduler.allocate_pid();
+        const NUM_USER_PROCESSES: usize = 2;
         
-        let page_table = unsafe {
-            let (frame, _) = x86_64::registers::control::Cr3::read();
-            frame
-        };
-        
-        // ✅ NUEVO: Pasar nombre del test
-        let test_name = "syscall";  // Debe coincidir con el test copiado arriba
-        
-        let mut proc = Box::new(Process::new_user(
-            pid,
-            VirtAddr::new(USER_CODE_BASE),
-            page_table,
-            Some(test_name),  // ← Nuevo parámetro
-        ));
-        proc.state = ProcessState::Ready;
-        proc.set_name("user_test");
-        
-        scheduler.add_process(proc);
+        for i in 0..NUM_USER_PROCESSES {
+            let page_table = unsafe {
+                let (frame, _) = x86_64::registers::control::Cr3::read();
+                frame
+            };
+            
+            // Allocar kernel stack para este proceso
+            let kernel_stack = {
+                let mut frame_alloc = FRAME_ALLOCATOR.lock();
+                let frame_alloc = frame_alloc.as_mut().expect("Frame allocator not initialized");
+                
+                let stack_frame = frame_alloc.allocate_frame()
+                    .expect(&format!("Failed to allocate kernel stack for user {}", i));
+                
+                let phys_addr = stack_frame.start_address();
+                let virt_addr = memory::physical_memory_offset() + phys_addr.as_u64();
+                VirtAddr::new(virt_addr.as_u64() + 4096)
+            };
+            
+            // Calcular user stack (cada proceso tiene su propio stack)
+            let user_stack_base = 0x0000_7100_0000_0000_u64 + (i as u64 * 0x10000);
+            let user_stack_size = 8192;
+            let user_stack_top = VirtAddr::new(user_stack_base + user_stack_size - 8);
+            
+            let user_proc = Box::new(Process::new_user(
+                scheduler::SCHEDULER.lock().allocate_pid(),
+                VirtAddr::new(USER_CODE_BASE),
+                user_stack_top,
+                kernel_stack,
+                page_table,
+            ));
+            
+            let mut scheduler = SCHEDULER.lock();
+            let mut proc = user_proc;
+            proc.set_name(&format!("user_{}", i));
+            proc.set_priority(5);
+            scheduler.add_process(proc);
+        }
     }
 
-    // Proceso shell (kernel space por ahora)
+    // ============ 3. PROCESO SHELL (kernel) ============
     {
-        let mut scheduler = SCHEDULER.lock();
-        let pid = scheduler.allocate_pid();
+        use crate::allocator::FRAME_ALLOCATOR;
         
         let page_table = unsafe {
             let (frame, _) = x86_64::registers::control::Cr3::read();
             frame
         };
         
-        let mut proc = Box::new(Process::new(
-            pid,
+        // Allocar kernel stack para shell
+        let kernel_stack = {
+            let mut frame_alloc = FRAME_ALLOCATOR.lock();
+            let frame_alloc = frame_alloc.as_mut().expect("Frame allocator not initialized");
+            
+            let stack_frame = frame_alloc.allocate_frame()
+                .expect("Failed to allocate kernel stack for shell");
+            
+            let phys_addr = stack_frame.start_address();
+            let virt_addr = memory::physical_memory_offset() + phys_addr.as_u64();
+            VirtAddr::new(virt_addr.as_u64() + 4096)
+        };
+        
+        let shell = Box::new(Process::new_kernel(
+            scheduler::SCHEDULER.lock().allocate_pid(),
             VirtAddr::new(shell_process as *const () as u64),
+            kernel_stack,
             page_table,
         ));
-        proc.state = ProcessState::Ready;  // ← Marcar como Ready
-        proc.set_name("shell");
         
-        scheduler.add_process(proc);
+        let mut scheduler = SCHEDULER.lock();
+        let mut shell_proc = shell;
+        shell_proc.set_name("shell");
+        shell_proc.set_priority(8);
+        scheduler.add_process(shell_proc);
     }
 
-    serial_println!("All processes created!");
+    serial_println!("All processes created!\n");
 
-    loop {
-        // ✅ Main loop SOLO hace scheduling
-        yield_cpu();
-    }
+    // ============ 4. ARRANCAR PRIMER PROCESO ============
+    // Después de esto, SOLO el timer hace scheduling
+    process::start_first_process();
 }
 
 fn idle_task() -> ! {
     loop {
-        // Idle siempre cede inmediatamente
-        yield_cpu();
-    }
-}
-
-fn yield_cpu() {
-    use process::context::switch_context;
-    
-    let switch_info = {
-        let mut scheduler = process::scheduler::SCHEDULER.lock();
-        scheduler.switch_to_next()
-    };
-    
-    if let Some((old_ctx, new_ctx)) = switch_info {
-        unsafe {
-            switch_context(old_ctx, new_ctx);
-        }
+        // Solo dormir - el timer lo interrumpirá
+        unsafe { core::arch::asm!("hlt"); }
     }
 }
 
@@ -433,14 +476,8 @@ fn shell_process() -> ! {
             repl.handle_char(character);
         }
         
-        // ✅ Yield cada cierto tiempo para dar chance al proceso user
-        static mut COUNTER: usize = 0;
-        unsafe {
-            COUNTER += 1;
-            if COUNTER >= 100000 {  // Ajusta este número
-                COUNTER = 0;
-                yield_cpu();
-            }
-        }
+        // ❌ NO yield_cpu() - el timer lo interrumpirá
+        // Podemos hacer hlt para ahorrar energía
+        unsafe { core::arch::asm!("pause"); }
     }
 }

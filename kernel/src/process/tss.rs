@@ -1,9 +1,10 @@
 // kernel/src/process/tss.rs
+// Production version - Minimal logging
 
 use x86_64::VirtAddr;
 use x86_64::structures::tss::TaskStateSegment;
 use x86_64::structures::gdt::{GlobalDescriptorTable, Descriptor, SegmentSelector};
-use spin::{Mutex, Once};
+use spin::Once;
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
@@ -15,46 +16,38 @@ struct Selectors {
     tss_selector: SegmentSelector,
 }
 
-// ✅ TSS mutable con Mutex
-static TSS: Mutex<TaskStateSegment> = Mutex::new(TaskStateSegment::new());
-
-// ✅ Puntero estático al TSS (para la GDT)
-static TSS_PTR: Once<usize> = Once::new();
+// TSS estático - ubicación fija en memoria
+static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
 // GDT se inicializa una vez
 static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
 
 /// Inicializa el TSS y GDT
 pub fn init() {
-    // 1. Inicializar TSS con stacks
-    {
-        let mut tss = TSS.lock();
-        
+    // Inicializar TSS con stacks
+    unsafe {
         // Stack para double fault (IST)
-        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
+        TSS.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
             const STACK_SIZE: usize = 4096 * 5;
             static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
             
-            let stack_start = VirtAddr::from_ptr(unsafe { &raw const STACK });
+            let stack_start = VirtAddr::from_ptr(&raw const STACK);
             let stack_end = stack_start + STACK_SIZE as u64;
             stack_end
         };
         
         // Stack de kernel inicial para syscalls (RSP0)
-        tss.privilege_stack_table[0] = {
+        TSS.privilege_stack_table[0] = {
             const STACK_SIZE: usize = 4096 * 5;
             static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
             
-            let stack_start = VirtAddr::from_ptr(unsafe { &raw const STACK });
+            let stack_start = VirtAddr::from_ptr(&raw const STACK);
             let stack_end = stack_start + STACK_SIZE as u64;
             stack_end
         };
-        
-        // ✅ Guardar puntero estático al TSS
-        TSS_PTR.call_once(|| &*tss as *const TaskStateSegment as usize);
     }
     
-    // 2. Crear GDT
+    // Crear GDT
     GDT.call_once(|| {
         let mut gdt = GlobalDescriptorTable::new();
         
@@ -66,13 +59,9 @@ pub fn init() {
         let user_data_selector = gdt.append(Descriptor::user_data_segment());
         let user_code_selector = gdt.append(Descriptor::user_code_segment());
         
-        // ✅ TSS usando el puntero estático
-        let tss_selector = {
-            let tss_ref = unsafe { 
-                let ptr = *TSS_PTR.get().unwrap() as *const TaskStateSegment;
-                &*ptr
-            };
-            gdt.append(Descriptor::tss_segment(tss_ref))
+        // TSS - la GDT apunta directamente a la ubicación estática
+        let tss_selector = unsafe {
+            gdt.append(Descriptor::tss_segment(&TSS))
         };
         
         (gdt, Selectors {
@@ -84,7 +73,7 @@ pub fn init() {
         })
     });
     
-    // 3. Cargar GDT
+    // Cargar GDT
     GDT.get().unwrap().0.load();
     
     unsafe {
@@ -108,10 +97,13 @@ pub fn get_user_selectors() -> (SegmentSelector, SegmentSelector) {
     (selectors.user_code_selector, selectors.user_data_selector)
 }
 
-/// ✅ Actualiza el kernel stack del proceso actual en el TSS
+/// Actualiza el kernel stack del proceso actual en el TSS
+/// 
+/// SAFETY: Solo debe ser llamado con interrupciones deshabilitadas
+/// o desde un contexto donde sabemos que el TSS no está siendo usado
 pub fn set_kernel_stack(stack_top: VirtAddr) {
-    let mut tss = TSS.lock();
-    tss.privilege_stack_table[0] = stack_top;
-    
-    crate::serial_println!("TSS: Updated kernel stack to {:#x}", stack_top.as_u64());
+    unsafe {
+        // Modificación directa del TSS estático
+        TSS.privilege_stack_table[0] = stack_top;
+    }
 }

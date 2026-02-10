@@ -1,4 +1,5 @@
 // kernel/src/process/timer_preempt.rs
+// ✅ TIMER HANDLER CORRECTO: Preempta a TODOS los procesos (kernel y user)
 
 use core::arch::global_asm;
 use super::trapframe::TrapFrame;
@@ -7,7 +8,7 @@ global_asm!(
     ".global timer_interrupt_entry",
     "timer_interrupt_entry:",
     
-    // ============ Guardar TODOS los registros ============
+    // Guardar TODOS los registros
     "push rax",
     "push rbx",
     "push rcx",
@@ -24,20 +25,15 @@ global_asm!(
     "push r14",
     "push r15",
     
-    // Ahora el stack tiene un TrapFrame completo:
-    // [registros] + [RIP, CS, RFLAGS, RSP, SS] (del hardware)
-    
-    // Pasar puntero al TrapFrame como argumento
+    // Llamar al handler con puntero al TrapFrame actual
     "mov rdi, rsp",
     "call timer_preempt_handler",
     
-    // RAX contiene el puntero al TrapFrame del SIGUIENTE proceso
-    // (o el mismo si no hay cambio)
-    
-    // Restaurar desde el TrapFrame retornado
+    // El handler retorna el nuevo TrapFrame en RAX
+    // Cambiar RSP al nuevo TrapFrame
     "mov rsp, rax",
     
-    // ============ Restaurar registros ============
+    // Restaurar registros del NUEVO proceso
     "pop r15",
     "pop r14",
     "pop r13",
@@ -54,7 +50,7 @@ global_asm!(
     "pop rbx",
     "pop rax",
     
-    // IRETQ restaura: RIP, CS, RFLAGS, RSP, SS
+    // IRETQ al NUEVO proceso (puede ser kernel o user)
     "iretq",
 );
 
@@ -62,67 +58,27 @@ extern "C" {
     pub fn timer_interrupt_entry();
 }
 
-/// Handler de preemption - llamado desde assembly
 #[no_mangle]
-pub extern "C" fn timer_preempt_handler(current_tf: *mut TrapFrame) -> *const TrapFrame {
-    // EOI
+pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> *const TrapFrame {
+    // ============ 1. EOI ============
     unsafe {
         use x86_64::instructions::port::PortWriteOnly;
         PortWriteOnly::<u8>::new(0x20).write(0x20);
     }
     
+    // ============ 2. THROTTLE ============
+    // No hacer context switch en cada tick, solo cada 10
     static mut TICK: usize = 0;
     unsafe {
         TICK += 1;
-        if TICK < 10 { return current_tf; }
+        if TICK < 2 {
+            return current_tf;
+        }
         TICK = 0;
     }
     
+    // ============ 3. SCHEDULER ============
+    // El scheduler maneja el context switch
     let mut scheduler = super::scheduler::SCHEDULER.lock();
-    
-    // Guardar estado del proceso actual
-    if let Some(current_pid) = scheduler.current {
-        if let Some(proc) = scheduler.processes.iter_mut().find(|p| p.pid == current_pid) {
-            if proc.privilege == super::PrivilegeLevel::User {
-                if let Some(ref mut tf) = proc.trapframe {
-                    unsafe { **tf = *current_tf; }
-                }
-            }
-            proc.state = super::ProcessState::Ready;
-        }
-    }
-    
-    // Buscar siguiente proceso (round-robin manual)
-    let len = scheduler.processes.len();
-    let mut found = None;
-    
-    // En el loop, cambiar:
-    for _ in 0..len {
-        if let Some(mut proc) = scheduler.processes.pop_front() {
-            if proc.state == super::ProcessState::Ready {
-                proc.state = super::ProcessState::Running;
-                let pid = proc.pid;
-                
-                super::tss::set_kernel_stack(proc.kernel_stack);
-                
-                let result = if proc.privilege == super::PrivilegeLevel::User {
-                    proc.trapframe.as_ref().map(|tf| &**tf as *const TrapFrame)
-                } else {
-                    None
-                };
-                
-                scheduler.current = Some(pid);
-                scheduler.processes.push_back(proc);  // ← Mover primero
-                
-                if let Some(tf) = result {
-                    found = Some(tf);
-                    break;
-                }
-            } else {
-                scheduler.processes.push_back(proc);  // ← También aquí
-            }
-        }
-    }
-    
-    found.unwrap_or(current_tf)
+    scheduler.switch_to_next(current_tf)
 }
