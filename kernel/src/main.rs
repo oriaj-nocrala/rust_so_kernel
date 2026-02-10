@@ -24,7 +24,9 @@ use interrupts::idt::InterruptDescriptorTable;
 use spin::Once;
 use x86_64::{VirtAddr, structures::paging::FrameAllocator};
 use process::{Process, Pid, scheduler::SCHEDULER};
-use crate::{allocator::FRAME_ALLOCATOR, process::{ProcessState, scheduler}};
+use crate::{allocator::FRAME_ALLOCATOR, process::{ProcessState, scheduler, user_test_minimal}};
+
+use process::user_test_fileio;
 
 use crate::{
     framebuffer::{Color, init_global_framebuffer}, interrupts::exception::ExceptionStackFrame, memory::{frame_allocator::{self, BootInfoFrameAllocator}, paging::ActivePageTable}, repl::Repl
@@ -256,10 +258,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     interrupts::pic::enable_irq(0); // ⏰ TIMER
     interrupts::pic::enable_irq(1); // ⌨ KEYBOARD
     load_idt();
-    
-    unsafe {
-        core::arch::asm!("sti");
-    }
 
     // Inicializar el PIT
     pit::init(100); // 100 Hz
@@ -271,6 +269,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     process::tss::init();
 
     serial_println!("Step 7.5: Setting up user space memory");
+
+    // ✅ Declarar code_entry AQUÍ (fuera del unsafe block)
+    let code_entry: VirtAddr;
 
     unsafe {
         let phys_offset = memory::physical_memory_offset();
@@ -286,13 +287,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
         user_test_minimal::print_available_tests();
         
-        let test_name = "loop";
-        let test_ptr = user_test_minimal::get_test_ptr(test_name);
+        let test_name = "write";
+        let test_ptr = user_test_fileio::get_test_ptr(test_name);
         
         serial_println!("\n📝 Using test: '{}'", test_name);
         serial_println!("   Test address: {:#x}", test_ptr as u64);
         
-        let code_entry = user_code::setup_user_code(
+        // ✅ Asignar a la variable declarada arriba
+        code_entry = memory::user_code::setup_user_code(
             &mut page_table.mapper,
             frame_allocator,
             test_ptr,
@@ -330,139 +332,142 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
 
-    // ============ CREAR PROCESOS ============
-
+    // ============ CREAR PROCESOS (SIMPLIFICADO) ============
+    
     serial_println!("\nStep 10: Creating processes");
+    
+    // ✅ Toda la lógica repetida ahora está en 3 funciones
+    init_processes(code_entry);
 
-    // ============ 1. PROCESO IDLE (kernel) ============
+    // Debug de file descriptors
     {
-        use crate::allocator::FRAME_ALLOCATOR;
-        
-        let page_table = unsafe {
-            let (frame, _) = x86_64::registers::control::Cr3::read();
-            frame
-        };
-        
-        // Allocar kernel stack para idle
-        let kernel_stack = {
-            let mut frame_alloc = FRAME_ALLOCATOR.lock();
-            let frame_alloc = frame_alloc.as_mut().expect("Frame allocator not initialized");
-            
-            let stack_frame = frame_alloc.allocate_frame()
-                .expect("Failed to allocate kernel stack for idle");
-            
-            let phys_addr = stack_frame.start_address();
-            let virt_addr = memory::physical_memory_offset() + phys_addr.as_u64();
-            VirtAddr::new(virt_addr.as_u64() + 4096)  // Tope del stack
-        };
-        
-        let idle = Box::new(Process::new_kernel(
-            Pid(0),
-            VirtAddr::new(idle_task as *const () as u64),
-            kernel_stack,
-            page_table,
-        ));
-        
-        let mut scheduler = SCHEDULER.lock();
-        let mut idle_proc = idle;
-        idle_proc.set_name("idle");
-        idle_proc.set_priority(0);
-        scheduler.add_process(idle_proc);
-    }
-
-    // ============ 2. PROCESOS USER ============
-    {
-        use memory::user_code::USER_CODE_BASE;
-        use crate::allocator::FRAME_ALLOCATOR;
-        
-        const NUM_USER_PROCESSES: usize = 2;
-        
-        for i in 0..NUM_USER_PROCESSES {
-            let page_table = unsafe {
-                let (frame, _) = x86_64::registers::control::Cr3::read();
-                frame
-            };
-            
-            // Allocar kernel stack para este proceso
-            let kernel_stack = {
-                let mut frame_alloc = FRAME_ALLOCATOR.lock();
-                let frame_alloc = frame_alloc.as_mut().expect("Frame allocator not initialized");
-                
-                let stack_frame = frame_alloc.allocate_frame()
-                    .expect(&format!("Failed to allocate kernel stack for user {}", i));
-                
-                let phys_addr = stack_frame.start_address();
-                let virt_addr = memory::physical_memory_offset() + phys_addr.as_u64();
-                VirtAddr::new(virt_addr.as_u64() + 4096)
-            };
-            
-            // Calcular user stack (cada proceso tiene su propio stack)
-            let user_stack_base = 0x0000_7100_0000_0000_u64 + (i as u64 * 0x10000);
-            let user_stack_size = 8192;
-            let user_stack_top = VirtAddr::new(user_stack_base + user_stack_size - 8);
-            
-            let user_proc = Box::new(Process::new_user(
-                scheduler::SCHEDULER.lock().allocate_pid(),
-                VirtAddr::new(USER_CODE_BASE),
-                user_stack_top,
-                kernel_stack,
-                page_table,
-            ));
-            
-            let mut scheduler = SCHEDULER.lock();
-            let mut proc = user_proc;
-            proc.set_name(&format!("user_{}", i));
-            proc.set_priority(5);
-            scheduler.add_process(proc);
+        let scheduler = SCHEDULER.lock();
+        for proc in scheduler.processes.iter() {
+            serial_println!("Process {}: open files:", proc.pid.0);
+            proc.files.debug_list();
         }
     }
 
-    // ============ 3. PROCESO SHELL (kernel) ============
-    {
-        use crate::allocator::FRAME_ALLOCATOR;
+    serial_println!("DEBUG: About to start first process");
+
+    // Arrancar primer proceso
+    process::start_first_process();
+}
+
+/// Allocar un kernel stack para un proceso
+fn allocate_kernel_stack() -> VirtAddr {
+    let mut frame_alloc = FRAME_ALLOCATOR.lock();
+    let frame_alloc = frame_alloc.as_mut()
+        .expect("Frame allocator not initialized");
+    
+    let stack_frame = frame_alloc.allocate_frame()
+        .expect("Failed to allocate kernel stack");
+    
+    let phys_addr = stack_frame.start_address();
+    let virt_addr = memory::physical_memory_offset() + phys_addr.as_u64();
+    
+    // Retornar el tope del stack
+    VirtAddr::new(virt_addr.as_u64() + 4096)
+}
+
+/// Obtener el page table frame actual (CR3)
+fn get_current_page_table() -> x86_64::structures::paging::PhysFrame {
+    unsafe {
+        let (frame, _) = x86_64::registers::control::Cr3::read();
+        frame
+    }
+}
+
+/// Crear el proceso idle (PID 0)
+fn create_idle_process() {
+    let page_table = get_current_page_table();
+    let kernel_stack = allocate_kernel_stack();
+    
+    let idle = Box::new(Process::new_kernel(
+        Pid(0),
+        VirtAddr::new(idle_task as *const () as u64),
+        kernel_stack,
+        page_table,
+    ));
+    
+    let mut scheduler = SCHEDULER.lock();
+    let mut idle_proc = idle;
+    idle_proc.set_name("idle");
+    idle_proc.set_priority(0);  // Lowest priority
+    scheduler.add_process(idle_proc);
+    
+    serial_println!("✅ Created idle process (PID 0)");
+}
+
+/// Crear procesos de usuario
+fn create_user_processes(code_entry: VirtAddr, num_processes: usize) {
+    let page_table = get_current_page_table();
+    
+    for i in 0..num_processes {
+        let kernel_stack = allocate_kernel_stack();
         
-        let page_table = unsafe {
-            let (frame, _) = x86_64::registers::control::Cr3::read();
-            frame
-        };
+        // Calcular user stack (cada proceso tiene el suyo)
+        let user_stack_base = 0x0000_7100_0000_0000_u64 + (i as u64 * 0x10000);
+        let user_stack_size = 8192;
+        let user_stack_top = VirtAddr::new(user_stack_base + user_stack_size - 8);
         
-        // Allocar kernel stack para shell
-        let kernel_stack = {
-            let mut frame_alloc = FRAME_ALLOCATOR.lock();
-            let frame_alloc = frame_alloc.as_mut().expect("Frame allocator not initialized");
-            
-            let stack_frame = frame_alloc.allocate_frame()
-                .expect("Failed to allocate kernel stack for shell");
-            
-            let phys_addr = stack_frame.start_address();
-            let virt_addr = memory::physical_memory_offset() + phys_addr.as_u64();
-            VirtAddr::new(virt_addr.as_u64() + 4096)
-        };
-        
-        let shell = Box::new(Process::new_kernel(
+        // Crear proceso
+        let mut user_proc = Box::new(Process::new_user(
             scheduler::SCHEDULER.lock().allocate_pid(),
-            VirtAddr::new(shell_process as *const () as u64),
+            code_entry,
+            user_stack_top,
             kernel_stack,
             page_table,
         ));
         
         let mut scheduler = SCHEDULER.lock();
-        let mut shell_proc = shell;
-        shell_proc.set_name("shell");
-        shell_proc.set_priority(8);
-        scheduler.add_process(shell_proc);
+        user_proc.set_name(&format!("user_{}", i));
+        user_proc.set_priority(5);  // Normal priority
+        let pid = user_proc.pid;
+        scheduler.add_process(user_proc);
+        
+        serial_println!("✅ Created user process {} (PID {})", i, pid.0);
     }
-
-    serial_println!("All processes created!\n");
-
-    // ============ 4. ARRANCAR PRIMER PROCESO ============
-    // Después de esto, SOLO el timer hace scheduling
-    process::start_first_process();
 }
+
+/// Crear el proceso shell (kernel)
+fn create_shell_process() {
+    let page_table = get_current_page_table();
+    let kernel_stack = allocate_kernel_stack();
+    
+    let mut shell = Box::new(Process::new_kernel(
+        scheduler::SCHEDULER.lock().allocate_pid(),
+        VirtAddr::new(shell_process as *const () as u64),
+        kernel_stack,
+        page_table,
+    ));
+    
+    let mut scheduler = SCHEDULER.lock();
+    shell.set_name("shell");
+    shell.set_priority(8);  // High priority
+    let pid = shell.pid;
+    scheduler.add_process(shell);
+    
+    serial_println!("✅ Created shell process (PID {})", pid.0);
+}
+
+/// Inicializar todos los procesos
+fn init_processes(code_entry: VirtAddr) {
+    serial_println!("\n🔧 Creating processes...");
+    
+    create_idle_process();
+    create_user_processes(code_entry, 2);  // 2 user processes
+    create_shell_process();
+    
+    serial_println!("✅ All processes created!\n");
+}
+
+// ============================================================================
+// PROCESS ENTRY POINTS
+// ============================================================================
 
 fn idle_task() -> ! {
     loop {
-        // Solo dormir - el timer lo interrumpirá
         unsafe { core::arch::asm!("hlt"); }
     }
 }
@@ -475,9 +480,6 @@ fn shell_process() -> ! {
         if let Some(character) = keyboard::read_key() {
             repl.handle_char(character);
         }
-        
-        // ❌ NO yield_cpu() - el timer lo interrumpirá
-        // Podemos hacer hlt para ahorrar energía
         unsafe { core::arch::asm!("pause"); }
     }
 }

@@ -1,5 +1,5 @@
 // kernel/src/process/mod.rs
-// ✅ IMPLEMENTACIÓN CORRECTA: Solo TrapFrame, sin Context
+// ✅ IMPLEMENTACIÓN CON FILE DESCRIPTORS
 
 use alloc::boxed::Box;
 use x86_64::{VirtAddr, structures::paging::PhysFrame};
@@ -10,8 +10,11 @@ pub mod timer_preempt;
 pub mod tss;
 pub mod syscall;
 pub mod user_test_minimal;
+pub mod file;  // ← NUEVO
+pub mod user_test_fileio;
 
 pub use trapframe::TrapFrame;
+pub use file::{FileDescriptorTable, FileHandle};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pid(pub usize);
@@ -34,18 +37,16 @@ pub struct Process {
     pub pid: Pid,
     pub state: ProcessState,
     pub privilege: PrivilegeLevel,
-    pub priority: u8,  // ← AÑADIR ESTO (0 = lowest, 10 = highest)
+    pub priority: u8,
     pub name: [u8; 16],
     pub trapframe: Box<TrapFrame>,
     pub kernel_stack: VirtAddr,
     pub page_table: PhysFrame,
+    pub files: FileDescriptorTable,  // ← NUEVO
 }
 
 impl Process {
     /// Crear proceso de KERNEL
-    /// 
-    /// El proceso ejecuta en kernel mode (Ring 0).
-    /// El timer lo puede preemptar como cualquier otro proceso.
     pub fn new_kernel(
         pid: Pid,
         entry: VirtAddr,
@@ -54,14 +55,12 @@ impl Process {
     ) -> Self {
         let mut trapframe = Box::new(TrapFrame::default());
         
-        // ✅ Configurar TrapFrame para kernel mode
         trapframe.rip = entry.as_u64();
-        trapframe.cs = 0x08;       // Kernel code segment (RPL=0)
-        trapframe.rflags = 0x200;  // IF=1 (interrupts enabled)
+        trapframe.cs = 0x08;
+        trapframe.rflags = 0x200;
         trapframe.rsp = kernel_stack.as_u64() - 8;
-        trapframe.ss = 0x10;       // Kernel data segment (RPL=0)
+        trapframe.ss = 0x10;
         
-        // Registros en cero
         trapframe.rax = 0;
         trapframe.rbx = 0;
         trapframe.rcx = 0;
@@ -87,17 +86,16 @@ impl Process {
             pid,
             state: ProcessState::Ready,
             privilege: PrivilegeLevel::Kernel,
-            priority: 5,  // ← Prioridad normal por defecto
+            priority: 5,
             name: [0; 16],
             trapframe,
             kernel_stack,
             page_table,
+            files: FileDescriptorTable::new_with_stdio(),  // ← NUEVO
         }
     }
     
     /// Crear proceso de USER
-    /// 
-    /// El proceso ejecuta en user mode (Ring 3).
     pub fn new_user(
         pid: Pid,
         entry: VirtAddr,
@@ -107,12 +105,11 @@ impl Process {
     ) -> Self {
         let mut trapframe = Box::new(TrapFrame::default());
         
-        // ✅ Configurar TrapFrame para user mode
         trapframe.rip = entry.as_u64();
-        trapframe.cs = 0x23;       // User code segment (RPL=3)
-        trapframe.rflags = 0x200;  // IF=1
+        trapframe.cs = 0x23;
+        trapframe.rflags = 0x200;
         trapframe.rsp = user_stack.as_u64();
-        trapframe.ss = 0x1b;       // User data segment (RPL=3)
+        trapframe.ss = 0x1b;
         
         trapframe.rax = 0;
         trapframe.rbx = 0;
@@ -139,11 +136,12 @@ impl Process {
             pid,
             state: ProcessState::Ready,
             privilege: PrivilegeLevel::User,
-            priority: 5,  // ← Prioridad normal por defecto
+            priority: 5,
             name: [0; 16],
             trapframe,
             kernel_stack,
             page_table,
+            files: FileDescriptorTable::new_with_stdio(),  // ← NUEVO
         }
     }
     
@@ -154,35 +152,35 @@ impl Process {
     }
 
     pub fn set_priority(&mut self, priority: u8) {
-        self.priority = core::cmp::min(priority, 10);  // Max 10
+        self.priority = core::cmp::min(priority, 10);
     }
 }
 
-/// ✅ Iniciar primer proceso
-/// 
-/// Esta función se llama UNA VEZ al inicio para arrancar el primer proceso.
-/// Después de esto, SOLO el timer hace scheduling.
+/// Iniciar primer proceso
 pub fn start_first_process() -> ! {
     let tf_ptr = {
         let mut scheduler = scheduler::SCHEDULER.lock();
         
-        // Buscar primer proceso Ready
         let mut found = None;
         
+        crate::serial_println!("Available processes:");
+
         for proc in scheduler.processes.iter_mut() {
-            if proc.state == ProcessState::Ready {
+            crate::serial_println!("  PID {}: {:?} - {:?}", 
+                proc.pid.0, 
+                core::str::from_utf8(&proc.name).unwrap_or("<?>").trim_end_matches('\0'),
+                proc.privilege
+            );
+            if proc.state == ProcessState::Ready && proc.pid.0 != 0 {
                 proc.state = ProcessState::Running;
                 
-                // ✅ Guardar valores ANTES de la segunda mutación
                 let pid = proc.pid;
                 let kernel_stack = proc.kernel_stack;
                 let tf_ptr = &*proc.trapframe as *const TrapFrame;
                 let name = proc.name;
                 
-                // ✅ AHORA sí podemos mutar scheduler.current
                 scheduler.current = Some(pid);
                 
-                // Actualizar TSS
                 tss::set_kernel_stack(kernel_stack);
                 
                 crate::serial_println!(
@@ -197,8 +195,12 @@ pub fn start_first_process() -> ! {
         }
         
         found.expect("No process to start!")
-    }; // ← Lock se libera aquí
+    };
+
+    // ✅ Habilitar interrupts JUSTO antes del salto
+    unsafe { 
+        core::arch::asm!("sti");
+    }
     
-    // Saltar al primer proceso (lock ya liberado)
     unsafe { trapframe::jump_to_trapframe(tf_ptr) }
 }

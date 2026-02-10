@@ -49,6 +49,7 @@ impl Repl {
             "help" => self.cmd_help(),
             "clear" => self.cmd_clear(),
             "slab" => self.cmd_slab(),
+            "fds" => self.cmd_show_fds(),
             "panic" => panic!("User requested panic"),
             "" => {}, // Enter vacío
             _ if cmd.starts_with("echo ") => {
@@ -178,6 +179,24 @@ impl Repl {
             fb.draw_text(self.x, self.y, self.prompt,
                 Color::rgb(0, 255, 0), Color::rgb(0, 0, 0), 2);
             self.x += 16 * self.prompt.len();
+        }
+    }
+
+    fn cmd_show_fds(&mut self) {
+        use crate::process::scheduler::SCHEDULER;
+        
+        let scheduler = SCHEDULER.lock();
+        
+        self.println("Open File Descriptors:");
+        for proc in scheduler.processes.iter() {
+            let name = core::str::from_utf8(&proc.name)
+                .unwrap_or("<invalid>")
+                .trim_end_matches('\0');
+            
+            self.println(&alloc::format!("Process {} ({}): ", proc.pid.0, name));
+            
+            // Debug print de los FDs
+            proc.files.debug_list();
         }
     }
 
