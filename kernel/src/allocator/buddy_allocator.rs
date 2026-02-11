@@ -4,7 +4,7 @@ use x86_64::PhysAddr;
 use spin::Mutex;
 
 const MIN_ORDER: usize = 12; // 4KB (2^12)
-const MAX_ORDER: usize = 28; // 1MB (2^20) - ajustable según tu RAM
+const MAX_ORDER: usize = 28; // 256MB (2^28) - ajustable según tu RAM
 
 pub struct BuddyAllocator {
     free_lists: [FreeList; MAX_ORDER - MIN_ORDER + 1],

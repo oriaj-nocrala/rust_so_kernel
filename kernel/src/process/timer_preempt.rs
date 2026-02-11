@@ -1,7 +1,7 @@
 // kernel/src/process/timer_preempt.rs
 // ✅ TIMER HANDLER CORRECTO: Preempta a TODOS los procesos (kernel y user)
 
-use core::arch::global_asm;
+use core::{arch::global_asm, sync::atomic::{AtomicUsize, Ordering}};
 use super::trapframe::TrapFrame;
 
 global_asm!(
@@ -68,13 +68,10 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> *const 
     
     // ============ 2. THROTTLE ============
     // No hacer context switch en cada tick, solo cada 10
-    static mut TICK: usize = 0;
-    unsafe {
-        TICK += 1;
-        if TICK < 2 {
-            return current_tf;
-        }
-        TICK = 0;
+    static TICK: AtomicUsize = AtomicUsize::new(0);
+    let tick = TICK.fetch_add(1, Ordering::Relaxed);
+    if tick % 2 != 0 {
+        return current_tf;
     }
     
     // ============ 3. SCHEDULER ============

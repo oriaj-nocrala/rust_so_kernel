@@ -30,21 +30,21 @@ global_asm!(
     
     "mov [rsp], rax",
     
-    "pop rax",
-    "pop rbx",
-    "pop rcx",
-    "pop rdx",
-    "pop rsi",
-    "pop rdi",
-    "pop rbp",
-    "pop r8",
-    "pop r9",
-    "pop r10",
-    "pop r11",
-    "pop r12",
-    "pop r13",
-    "pop r14",
     "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rbp",
+    "pop rdi",
+    "pop rsi",
+    "pop rdx",
+    "pop rcx",
+    "pop rbx",
+    "pop rax",    // ← ahora sí recibe el return value
     
     "iretq",
 );
@@ -207,10 +207,7 @@ fn sys_read(fd: i32, buf: usize, count: usize) -> SyscallResult {
         // Obtener file handle
         let file = match proc.files.get_mut(fd as usize) {
             Ok(f) => f,
-            Err(_) => {
-                unsafe { core::arch::asm!("sti"); }
-                return errno::EBADF;
-            }
+            Err(_) => return errno::EBADF,  // ← retorna del bloque
         };
         
         // Crear slice mutable del buffer de usuario
@@ -221,10 +218,7 @@ fn sys_read(fd: i32, buf: usize, count: usize) -> SyscallResult {
         // Leer del archivo
         match file.read(buffer) {
             Ok(n) => n as i64,
-            Err(_) => {
-                unsafe { core::arch::asm!("sti"); }
-                return errno::EIO;
-            }
+            Err(_) => errno::EIO,
         }
     };
     
@@ -265,10 +259,7 @@ fn sys_write(fd: i32, buf: usize, count: usize) -> SyscallResult {
         // Obtener file handle
         let file = match proc.files.get_mut(fd as usize) {
             Ok(f) => f,
-            Err(_) => {
-                unsafe { core::arch::asm!("sti"); }
-                return errno::EBADF;
-            }
+            Err(_) => return errno::EBADF,  // ← retorna del bloque
         };
         
         // Crear slice del buffer de usuario
@@ -279,10 +270,7 @@ fn sys_write(fd: i32, buf: usize, count: usize) -> SyscallResult {
         // Escribir al archivo
         match file.write(buffer) {
             Ok(n) => n as i64,
-            Err(_) => {
-                unsafe { core::arch::asm!("sti"); }
-                return errno::EIO;
-            }
+            Err(_) => errno::EIO,
         }
     };
     
