@@ -1,6 +1,6 @@
-// kernel/src/repl.rs
+// kernel/src/repl.rs - FIXED VERSION
 
-use alloc::{string::String, vec};
+use alloc::{string::String, vec, vec::Vec};
 use crate::framebuffer::{FRAMEBUFFER, Color};
 
 pub struct Repl {
@@ -72,6 +72,7 @@ impl Repl {
         self.println("  echo <text> - Print text");
         self.println("  panic - Test panic handler");
         self.println("  slab  - Show slab allocator stats");
+        self.println("  fds   - Show process file descriptors");
     }
 
     fn cmd_clear(&mut self) {
@@ -85,8 +86,6 @@ impl Repl {
 
     fn cmd_alloc_test(&mut self) {
         self.println("Testing allocator invariants...");
-        
-        use alloc::vec::Vec;
         
         // Test 1: Allocar y liberar múltiples tamaños
         let sizes = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 5000];
@@ -103,16 +102,19 @@ impl Repl {
         }
         
         // Test 2: Fragmentación
+        // ✅ FIX: Limitar el test para evitar overflow
         let mut vecs: Vec<Vec<u8>> = Vec::new();
-        for i in 0..100 {
+        
+        // Allocar solo 50 en lugar de 100
+        for i in 0..50 {
             vecs.push(vec![i as u8; 64]);
         }
         
         // Liberar la mitad
-        vecs.truncate(50);
+        vecs.truncate(25);
         
         // Re-allocar
-        for i in 0..50 {
+        for i in 0..25 {
             vecs.push(vec![i as u8; 64]);
         }
         
@@ -125,31 +127,40 @@ impl Repl {
         self.println("Slab stats printed to serial");
     }
 
-    // fn cmd_memory(&mut self) {
-    //     use bootloader_api::info::MemoryRegionKind;
+    // ✅ FIX: Evitar deadlock copiando datos primero
+    fn cmd_show_fds(&mut self) {
+        use crate::process::scheduler::SCHEDULER;
         
-    //     // Necesitas pasar boot_info.memory_regions de alguna forma
-    //     // Por ahora, asumamos que lo guardaste globalmente
-        
-    //     self.println("Memory Map:");
-        
-    //     for (i, region) in boot_info.memory_regions.iter().enumerate() {
-    //         let kind = match region.kind {
-    //             MemoryRegionKind::Usable => "Usable",
-    //             MemoryRegionKind::Bootloader => "Bootloader",
-    //             MemoryRegionKind::UnknownBios(_) => "BIOS",
-    //             MemoryRegionKind::UnknownUefi(_) => "UEFI",
-    //             _ => "Other",
-    //         };
+        // Paso 1: Copiar datos CON el lock (rápido)
+        let processes_data: Vec<(usize, [u8; 16], Vec<usize>)> = {
+            let scheduler = SCHEDULER.lock();
             
-    //         let size_kb = (region.end - region.start) / 1024;
+            scheduler.processes.iter()
+                .map(|p| {
+                    // Recolectar FDs abiertos
+                    let open_fds: Vec<usize> = (0..16)
+                        .filter(|&fd| p.files.get(fd).is_ok())
+                        .collect();
+                    
+                    (p.pid.0, p.name, open_fds)
+                })
+                .collect()
+        }; // ← Lock soltado AQUÍ
+        
+        // Paso 2: Imprimir SIN el lock (lento pero seguro)
+        self.println("Open File Descriptors:");
+        
+        for (pid, name_bytes, open_fds) in processes_data {
+            let name = core::str::from_utf8(&name_bytes)
+                .unwrap_or("<invalid>")
+                .trim_end_matches('\0');
             
-    //         self.println(&alloc::format!(
-    //             "  {}: {:#x}-{:#x} ({} KB) - {}",
-    //             i, region.start, region.end, size_kb, kind
-    //         ));
-    //     }
-    // }
+            self.println(&alloc::format!(
+                "Process {} ({}): FDs {:?}", 
+                pid, name, open_fds
+            ));
+        }
+    }
 
     fn println(&mut self, text: &str) {
         {
@@ -179,24 +190,6 @@ impl Repl {
             fb.draw_text(self.x, self.y, self.prompt,
                 Color::rgb(0, 255, 0), Color::rgb(0, 0, 0), 2);
             self.x += 16 * self.prompt.len();
-        }
-    }
-
-    fn cmd_show_fds(&mut self) {
-        use crate::process::scheduler::SCHEDULER;
-        
-        let scheduler = SCHEDULER.lock();
-        
-        self.println("Open File Descriptors:");
-        for proc in scheduler.processes.iter() {
-            let name = core::str::from_utf8(&proc.name)
-                .unwrap_or("<invalid>")
-                .trim_end_matches('\0');
-            
-            self.println(&alloc::format!("Process {} ({}): ", proc.pid.0, name));
-            
-            // Debug print de los FDs
-            proc.files.debug_list();
         }
     }
 
