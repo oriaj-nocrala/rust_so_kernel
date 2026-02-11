@@ -17,19 +17,28 @@ mod repl;
 mod serial;
 
 use alloc::{boxed::Box, format, vec::Vec};
-// use alloc::{string::ToString, vec::Vec};
 use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point, info::{MemoryRegion, MemoryRegionKind}};
 use framebuffer::Framebuffer;
 use interrupts::idt::InterruptDescriptorTable;
 use spin::Once;
 use x86_64::{VirtAddr, structures::paging::FrameAllocator};
 use process::{Process, Pid, scheduler::SCHEDULER};
-use crate::{allocator::FRAME_ALLOCATOR, process::{ProcessState, scheduler, user_test_minimal}};
+use crate::{
+    allocator::FRAME_ALLOCATOR,
+    memory::page_table_manager::OwnedPageTable,
+    process::{ProcessState, scheduler, user_test_minimal},
+};
 
 use process::user_test_fileio;
 
 use crate::{
-    framebuffer::{Color, init_global_framebuffer}, interrupts::exception::ExceptionStackFrame, memory::{frame_allocator::{self, BootInfoFrameAllocator}, paging::ActivePageTable}, repl::Repl
+    framebuffer::{Color, init_global_framebuffer},
+    interrupts::exception::ExceptionStackFrame,
+    memory::{
+        frame_allocator::BootInfoFrameAllocator,
+        paging::ActivePageTable,
+    },
+    repl::Repl,
 };
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
@@ -48,10 +57,9 @@ fn init_idt() {
         idt.add_handler_with_error(14, page_fault_handler);
         idt.entries[32].set_handler_addr(process::timer_preempt::timer_interrupt_entry as u64);
         idt.add_handler(33, keyboard_interrupt_handler);
-        // ✅ FIX: INT 0x80 necesita DPL=3 para que Ring 3 pueda llamarla
         idt.entries[0x80]
             .set_handler_addr(syscall_entry as u64)
-            .set_privilege_level(3);  // ← AGREGAR ESTA LÍNEA
+            .set_privilege_level(3);
         idt
     });
 }
@@ -90,39 +98,49 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     panic!("GENERAL PROTECTION FAULT (error: {}) at {:#x}", error_code, sf.instruction_pointer);
 }
 
+// ✅ Page fault handler — tries demand paging before panicking
 extern "x86-interrupt" fn page_fault_handler(
     sf: &mut ExceptionStackFrame,
     error_code: u64
 ) {
-    // Leer CR2 para ver qué dirección causó el fault
-    let fault_address: u64;
-    unsafe {
-        core::arch::asm!("mov {}, cr2", out(reg) fault_address);
+    use crate::memory::demand_paging;
+
+    // Try demand paging first.
+    // If the fault is in a valid VMA (e.g. lazy stack), a page will be
+    // allocated, mapped, and zeroed.  The CPU retries the instruction on iret.
+    match demand_paging::handle_page_fault(error_code) {
+        Ok(()) => {
+            // Page was mapped successfully — resume execution.
+            return;
+        }
+        Err(reason) => {
+            // Not a demand-pageable fault → unrecoverable
+            let fault_address: u64;
+            unsafe {
+                core::arch::asm!("mov {}, cr2", out(reg) fault_address);
+            }
+
+            panic!(
+                "PAGE FAULT (unhandled)\n  Address: {:#x}\n  Error code: {:#b}\n  Reason: {}\n  RIP: {:#x}",
+                fault_address,
+                error_code,
+                reason,
+                sf.instruction_pointer
+            );
+        }
     }
-    
-    panic!(
-        "PAGE FAULT\nAddress: {:#x}\nError code: {:b}\nRIP: {:#x}",
-        fault_address,
-        error_code,
-        sf.instruction_pointer
-    );
 }
 
 extern "x86-interrupt" fn timer_handler(_sf: &mut ExceptionStackFrame) {
-    // ❌ NO hacer yield_cpu aquí
-    
-    // Solo EOI
     unsafe {
         use x86_64::instructions::port::PortWriteOnly;
         PortWriteOnly::<u8>::new(0x20).write(0x20);
     }
 }
 
-// 1. Definimos la configuración
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
-    // ESTO es lo que hace que el offset no sea None
-    config.mappings.physical_memory = Some(Mapping::Dynamic); 
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
     config
 };
 
@@ -145,32 +163,30 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     init_global_framebuffer(framebuffer);
 
-    // Obtener offset de memoria física
     let phys_mem_offset = VirtAddr::new(
         boot_info.physical_memory_offset.into_option().unwrap()
     );
 
-    // ⭐ Guardar globalmente
+    // ✅ Print the physical memory offset so we can verify PML4 entry
+    serial_println!("Physical memory offset: {:#x} (PML4 entry {})",
+        phys_mem_offset.as_u64(),
+        phys_mem_offset.as_u64() >> 39
+    );
+
     memory::init(phys_mem_offset);
     
-    
-    // --- 2. Inicialización de Memoria Avanzada ---
-    
-    // A. Inicializamos el Frame Allocator con el mapa de memoria REAL del BIOS/UEFI
-    // Esto reemplaza cualquier lógica manual de rangos de memoria que tuvieras antes.
+    // --- Inicialización de Memoria ---
     let frame_allocator = unsafe {
         BootInfoFrameAllocator::init(&boot_info.memory_regions)
     };
     
-    // Crear page table
     let page_table = unsafe {
-        ActivePageTable::new(phys_mem_offset)  // ← Ahora sí recibe parámetro
+        ActivePageTable::new(phys_mem_offset)
     };
     
     allocator::init_allocators(page_table, frame_allocator);
 
-
-    // --- 2. Inicializar Buddy Allocator ---
+    // --- Inicializar Buddy Allocator ---
     {
         let mut buddy = allocator::buddy_allocator::BUDDY.lock();
         
@@ -181,53 +197,41 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 }
             }
         }
-    }  // ← LIBERAR LOCK AQUÍ
+    }
 
     serial_println!("Step 8: Printing Buddy stats (lock released)");
     {
         let buddy = allocator::buddy_allocator::BUDDY.lock();
         buddy.debug_print_stats();
-    }  // ← Lock se libera aquí también
+    }
 
-    // --- 3. Ahora SÍ podemos usar Slab (String, Vec, format!) ---
+    // --- Test Slab ---
     {
         use core::alloc::{GlobalAlloc, Layout};
 
         let layout = Layout::from_size_align(8, 8).unwrap();
-
-        
-        // ✅ CORRECTO: Usar el GLOBAL_ALLOCATOR directamente
-        let ptr = unsafe {
-            alloc::alloc::alloc(layout)  // ← Esto usa el #[global_allocator]
-        };
+        let ptr = unsafe { alloc::alloc::alloc(layout) };
 
         if ptr.is_null() {
             serial_println!("  FAILED: Got null pointer");
             panic!("Slab allocation failed");
         } else {
             serial_println!("  SUCCESS: Got pointer {:#x}", ptr as u64);
-            
-            // Escribir/leer para verificar
             unsafe {
                 *(ptr as *mut u64) = 0xDEADBEEF;
                 let val = *(ptr as *const u64);
                 serial_println!("  Write/read test: {:#x}", val);
                 assert_eq!(val, 0xDEADBEEF);
-            }
-            
-            unsafe {
                 alloc::alloc::dealloc(ptr, layout);
             }
             serial_println!("  SUCCESS: Deallocation complete");
         }
     }
 
-    // Vec Test
     {
         use alloc::vec::Vec;
         serial_println!("  Creating Vec...");
         let mut v: Vec<u8> = Vec::new();
-        serial_println!("  Pushing elements...");
         v.push(1);
         v.push(2);
         v.push(3);
@@ -243,7 +247,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     allocator::slab::slab_stats();
     
-     // Limpiar pantalla
+    // Limpiar pantalla
     {
         let mut fb = framebuffer::FRAMEBUFFER.lock();
         if let Some(fb) = fb.as_mut() {
@@ -255,12 +259,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // Inicializar interrupciones
     interrupts::pic::initialize();
-    interrupts::pic::enable_irq(0); // ⏰ TIMER
-    interrupts::pic::enable_irq(1); // ⌨ KEYBOARD
+    interrupts::pic::enable_irq(0);
+    interrupts::pic::enable_irq(1);
     load_idt();
 
-    // Inicializar el PIT
-    pit::init(100); // 100 Hz
+    pit::init(100);
 
     let mut repl = Repl::new(10, 50);
     repl.show_prompt();
@@ -268,76 +271,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("Step 9: Initializing TSS and GDT");
     process::tss::init();
 
-    serial_println!("Step 7.5: Setting up user space memory");
-
-    // ✅ Declarar code_entry AQUÍ (fuera del unsafe block)
-    let code_entry: VirtAddr;
-
-    unsafe {
-        let phys_offset = memory::physical_memory_offset();
-        let mut page_table = memory::paging::ActivePageTable::new(phys_offset);
-        let mut frame_allocator_lock = FRAME_ALLOCATOR.lock();
-        
-        let frame_allocator = frame_allocator_lock.as_mut()
-            .expect("Frame allocator not initialized");
-        
-        // ============ 1. Mapear USER CODE (compartido) ============
-        use memory::user_code;
-        use process::user_test_minimal;
-
-        user_test_minimal::print_available_tests();
-        
-        let test_name = "write";
-        let test_ptr = user_test_fileio::get_test_ptr(test_name);
-        
-        serial_println!("\n📝 Using test: '{}'", test_name);
-        serial_println!("   Test address: {:#x}", test_ptr as u64);
-        
-        // ✅ Asignar a la variable declarada arriba
-        code_entry = memory::user_code::setup_user_code(
-            &mut page_table.mapper,
-            frame_allocator,
-            test_ptr,
-            4096,
-        ).expect("Failed to setup user code");
-        
-        serial_println!("  ✅ User code copied to: {:#x}\n", code_entry.as_u64());
-        
-        // ============ 2. Mapear MÚLTIPLES USER STACKS (separados) ============
-        // ⚠️ IMPORTANTE: Cada proceso necesita su PROPIO stack
-        
-        const NUM_USER_PROCESSES: usize = 2;
-        
-        for i in 0..NUM_USER_PROCESSES {
-            // Calcular base del stack para este proceso
-            // Separar stacks por 64KB para evitar overlap
-            let stack_base = 0x0000_7100_0000_0000_u64 + (i as u64 * 0x10000);
-            let stack_size = 8192;  // 2 páginas (8KB)
-            
-            serial_println!("Mapping user stack {} at {:#x}", i, stack_base);
-            
-            memory::user_pages::map_user_pages(
-                &mut page_table.mapper,
-                frame_allocator,
-                VirtAddr::new(stack_base),
-                (stack_size / 4096) as usize,
-            ).expect(&format!("Failed to map user stack {}", i));
-            
-            serial_println!(
-                "  ✅ Stack {}: {:#x} - {:#x}",
-                i,
-                stack_base,
-                stack_base + stack_size
-            );
-        }
-    }
-
-    // ============ CREAR PROCESOS (SIMPLIFICADO) ============
-    
     serial_println!("\nStep 10: Creating processes");
     
-    // ✅ Toda la lógica repetida ahora está en 3 funciones
-    init_processes(code_entry);
+    init_processes();
 
     // Debug de file descriptors
     {
@@ -350,113 +286,210 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     serial_println!("DEBUG: About to start first process");
 
-    // Arrancar primer proceso
     process::start_first_process();
 }
 
-/// Allocar un kernel stack para un proceso
+/// Allocar un kernel stack desde el Buddy (4 KiB).
 fn allocate_kernel_stack() -> VirtAddr {
-    let mut frame_alloc = FRAME_ALLOCATOR.lock();
-    let frame_alloc = frame_alloc.as_mut()
-        .expect("Frame allocator not initialized");
+    let phys_addr = unsafe {
+        crate::allocator::buddy_allocator::BUDDY.lock()
+            .allocate(14)
+            .expect("Failed to allocate kernel stack from buddy")
+    };
     
-    let stack_frame = frame_alloc.allocate_frame()
-        .expect("Failed to allocate kernel stack");
+    let virt_addr = crate::memory::physical_memory_offset() + phys_addr.as_u64();
     
-    let phys_addr = stack_frame.start_address();
-    let virt_addr = memory::physical_memory_offset() + phys_addr.as_u64();
-    
-    // Retornar el tope del stack
+    // Stack top (grows downward)
     VirtAddr::new(virt_addr.as_u64() + 4096)
 }
 
-/// Obtener el page table frame actual (CR3)
-fn get_current_page_table() -> x86_64::structures::paging::PhysFrame {
-    unsafe {
-        let (frame, _) = x86_64::registers::control::Cr3::read();
-        frame
-    }
-}
-
-/// Crear el proceso idle (PID 0)
+/// Idle process — uses kernel page table (from_current).
 fn create_idle_process() {
-    let page_table = get_current_page_table();
     let kernel_stack = allocate_kernel_stack();
+    let page_table = OwnedPageTable::from_current();
     
-    let idle = Box::new(Process::new_kernel(
+    let mut idle_proc = Box::new(Process::new_kernel(
         Pid(0),
         VirtAddr::new(idle_task as *const () as u64),
         kernel_stack,
         page_table,
     ));
     
-    let mut scheduler = SCHEDULER.lock();
-    let mut idle_proc = idle;
     idle_proc.set_name("idle");
-    idle_proc.set_priority(0);  // Lowest priority
-    scheduler.add_process(idle_proc);
+    idle_proc.set_priority(0);
+    
+    {
+        let mut scheduler = SCHEDULER.lock();
+        scheduler.add_process(idle_proc);
+    }
     
     serial_println!("✅ Created idle process (PID 0)");
 }
 
-/// Crear procesos de usuario
-fn create_user_processes(code_entry: VirtAddr, num_processes: usize) {
-    let page_table = get_current_page_table();
+/// User processes — each gets its own page table with DEMAND-PAGED stack.
+fn create_user_processes(num_processes: usize) {
+    use crate::memory::vma::{self, Vma, VmaKind};
+
+    let test_name = "write";
+    
+    user_test_fileio::print_available_tests();
+    serial_println!("\n📝 Using test: '{}'", test_name);
     
     for i in 0..num_processes {
         let kernel_stack = allocate_kernel_stack();
         
-        // Calcular user stack (cada proceso tiene el suyo)
+        // ============ 1. CREATE PAGE TABLE (copies kernel entries, skips user PML4s) ============
+        let page_table = unsafe {
+            OwnedPageTable::new_user()
+                .expect("Failed to create user page table")
+        };
+        
+        serial_println!(
+            "Created page table for process {}: PML4 at {:#x}",
+            i,
+            page_table.root_frame().start_address().as_u64()
+        );
+        
+        // ============ 2. MAP USER CODE (eagerly — instructions must be present) ============
+        unsafe {
+            let code_start = 0x0000_0000_0040_0000_u64;
+            let code_size = 4096usize;
+            let num_code_pages = (code_size + 4095) / 4096;
+            
+            let flags = x86_64::structures::paging::PageTableFlags::PRESENT
+                      | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE;
+            
+            serial_println!("  Mapping {} pages of user code at {:#x}", 
+                num_code_pages, code_start);
+            
+            let code_ptr = user_test_fileio::get_test_ptr(test_name);
+            
+            for page_idx in 0..num_code_pages {
+                let page_addr = VirtAddr::new(code_start + (page_idx as u64 * 4096));
+                let page = x86_64::structures::paging::Page::containing_address(page_addr);
+                
+                let frame = page_table.map_user_page(page, flags)
+                    .expect("Failed to map code page");
+                
+                let src = code_ptr.add(page_idx * 4096);
+                let copy_size = code_size.saturating_sub(page_idx * 4096).min(4096);
+                
+                let phys_offset = crate::memory::physical_memory_offset();
+                let dst = (phys_offset + frame.start_address().as_u64()).as_mut_ptr::<u8>();
+                
+                core::ptr::copy_nonoverlapping(src, dst, copy_size);
+                
+                if copy_size < 4096 {
+                    core::ptr::write_bytes(dst.add(copy_size), 0, 4096 - copy_size);
+                }
+                
+                serial_println!("    Page {}: {:#x} -> phys {:#x}", 
+                    page_idx, page_addr.as_u64(), frame.start_address().as_u64());
+            }
+        }
+        
+        // ============ 3. ALLOCATE PID (need it for VMA registration) ============
+        let pid = {
+            let mut scheduler = SCHEDULER.lock();
+            scheduler.allocate_pid()
+        };
+        
+        // ============ 4. REGISTER VMAs ============
+        let code_start = 0x0000_0000_0040_0000_u64;
+        let code_pages = 1usize;
+        
         let user_stack_base = 0x0000_7100_0000_0000_u64 + (i as u64 * 0x10000);
-        let user_stack_size = 8192;
-        let user_stack_top = VirtAddr::new(user_stack_base + user_stack_size - 8);
+        let stack_pages: usize = 16; // 64 KB virtual stack, demand-paged!
         
-        // Crear proceso
-        let mut user_proc = Box::new(Process::new_user(
-            scheduler::SCHEDULER.lock().allocate_pid(),
-            code_entry,
-            user_stack_top,
-            kernel_stack,
-            page_table,
-        ));
+        let stack_flags = x86_64::structures::paging::PageTableFlags::PRESENT
+                        | x86_64::structures::paging::PageTableFlags::WRITABLE
+                        | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE;
         
-        let mut scheduler = SCHEDULER.lock();
-        user_proc.set_name(&format!("user_{}", i));
-        user_proc.set_priority(5);  // Normal priority
-        let pid = user_proc.pid;
-        scheduler.add_process(user_proc);
+        // Register code VMA (for validation — already mapped eagerly)
+        vma::register_vma(pid.0, Vma {
+            start: code_start,
+            size_pages: code_pages,
+            flags: (x86_64::structures::paging::PageTableFlags::PRESENT
+                  | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits(),
+            kind: VmaKind::Code,
+        }).expect("Failed to register code VMA");
+        
+        // ✅ Register stack VMA — NO physical pages allocated yet!
+        // Pages will be allocated on-demand when the process touches the stack.
+        vma::register_vma(pid.0, Vma {
+            start: user_stack_base,
+            size_pages: stack_pages,
+            flags: stack_flags.bits(),
+            kind: VmaKind::Anonymous,
+        }).expect("Failed to register stack VMA");
+        
+        serial_println!(
+            "  Stack VMA: {:#x}..{:#x} ({} pages, demand-paged)",
+            user_stack_base,
+            user_stack_base + (stack_pages as u64 * 4096),
+            stack_pages,
+        );
+        
+        // Debug: show all VMAs for this process
+        vma::dump_vmas(pid.0);
+        
+        // ============ 5. CREATE PROCESS ============
+        {
+            // RSP points to the TOP of the VMA (grows downward)
+            let user_stack_top = VirtAddr::new(
+                user_stack_base + (stack_pages as u64 * 4096) - 8
+            );
+            
+            let mut user_proc = Box::new(Process::new_user(
+                pid,
+                VirtAddr::new(0x0000_0000_0040_0000),
+                user_stack_top,
+                kernel_stack,
+                page_table,
+            ));
+            
+            user_proc.set_name(&format!("user_{}", i));
+            user_proc.set_priority(5);
+            
+            let mut scheduler = SCHEDULER.lock();
+            scheduler.add_process(user_proc);
+        }
         
         serial_println!("✅ Created user process {} (PID {})", i, pid.0);
     }
 }
 
-/// Crear el proceso shell (kernel)
+/// Shell process — kernel, uses kernel page table.
 fn create_shell_process() {
-    let page_table = get_current_page_table();
     let kernel_stack = allocate_kernel_stack();
+    let page_table = OwnedPageTable::from_current();
     
-    let mut shell = Box::new(Process::new_kernel(
-        scheduler::SCHEDULER.lock().allocate_pid(),
-        VirtAddr::new(shell_process as *const () as u64),
-        kernel_stack,
-        page_table,
-    ));
-    
-    let mut scheduler = SCHEDULER.lock();
-    shell.set_name("shell");
-    shell.set_priority(8);  // High priority
-    let pid = shell.pid;
-    scheduler.add_process(shell);
+    let pid = {
+        let mut scheduler = SCHEDULER.lock();
+        let pid = scheduler.allocate_pid();
+        
+        let mut shell = Box::new(Process::new_kernel(
+            pid,
+            VirtAddr::new(shell_process as *const () as u64),
+            kernel_stack,
+            page_table,
+        ));
+        
+        shell.set_name("shell");
+        shell.set_priority(8);
+        
+        scheduler.add_process(shell);
+        pid
+    };
     
     serial_println!("✅ Created shell process (PID {})", pid.0);
 }
 
-/// Inicializar todos los procesos
-fn init_processes(code_entry: VirtAddr) {
-    serial_println!("\n🔧 Creating processes...");
+fn init_processes() {
+    serial_println!("\n🔧 Creating processes with isolated page tables...");
     
     create_idle_process();
-    create_user_processes(code_entry, 2);  // 2 user processes
+    create_user_processes(2);
     create_shell_process();
     
     serial_println!("✅ All processes created!\n");
@@ -473,11 +506,11 @@ fn idle_task() -> ! {
 }
 
 fn shell_process() -> ! {
-    let mut repl = Repl::new(10, 50);
+    let mut repl = crate::repl::Repl::new(10, 50);
     repl.show_prompt();
     
     loop {
-        if let Some(character) = keyboard::read_key() {
+        if let Some(character) = crate::keyboard::read_key() {
             repl.handle_char(character);
         }
         unsafe { core::arch::asm!("pause"); }

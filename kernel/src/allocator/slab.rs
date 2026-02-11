@@ -27,7 +27,7 @@ fn size_to_buddy_order(size: usize) -> usize {
     } else if pages == 1 {
         PAGE_ORDER
     } else {
-        let order_offset = (pages - 1).next_power_of_two().trailing_zeros() as usize;
+        let order_offset = pages.next_power_of_two().trailing_zeros() as usize;
         PAGE_ORDER + order_offset
     }
 }

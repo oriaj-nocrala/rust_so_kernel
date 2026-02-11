@@ -53,7 +53,7 @@ struct FramebufferWriter<'a> {
 
 impl<'a> FramebufferWriter<'a> {
     fn new(fb: &'a mut Framebuffer, x: usize, y: usize) -> Self {
-        Self { fb, x, y, line_height: 20 }
+        Self { fb, x, y, line_height: 10 }
     }
 }
 

@@ -1,8 +1,9 @@
 // kernel/src/process/mod.rs
-// ✅ IMPLEMENTACIÓN CON FILE DESCRIPTORS
+// ✅ IMPLEMENTACIÓN CON PAGE TABLES AISLADAS
 
 use alloc::boxed::Box;
-use x86_64::{VirtAddr, structures::paging::PhysFrame};
+use x86_64::VirtAddr;
+use crate::memory::page_table_manager::OwnedPageTable;
 
 pub mod scheduler;
 pub mod trapframe;
@@ -10,7 +11,7 @@ pub mod timer_preempt;
 pub mod tss;
 pub mod syscall;
 pub mod user_test_minimal;
-pub mod file;  // ← NUEVO
+pub mod file;
 pub mod user_test_fileio;
 
 pub use trapframe::TrapFrame;
@@ -41,17 +42,19 @@ pub struct Process {
     pub name: [u8; 16],
     pub trapframe: Box<TrapFrame>,
     pub kernel_stack: VirtAddr,
-    pub page_table: PhysFrame,
-    pub files: FileDescriptorTable,  // ← NUEVO
+    pub page_table: OwnedPageTable,
+    pub files: FileDescriptorTable,
 }
 
 impl Process {
     /// Crear proceso de KERNEL
+    ///
+    /// Kernel processes share the kernel page table (OwnedPageTable::from_current).
     pub fn new_kernel(
         pid: Pid,
         entry: VirtAddr,
         kernel_stack: VirtAddr,
-        page_table: PhysFrame,
+        page_table: OwnedPageTable,
     ) -> Self {
         let mut trapframe = Box::new(TrapFrame::default());
         
@@ -91,17 +94,19 @@ impl Process {
             trapframe,
             kernel_stack,
             page_table,
-            files: FileDescriptorTable::new_with_stdio(),  // ← NUEVO
+            files: FileDescriptorTable::new_with_stdio(),
         }
     }
     
     /// Crear proceso de USER
+    ///
+    /// Each user process has its OWN page table (OwnedPageTable::new_user).
     pub fn new_user(
         pid: Pid,
         entry: VirtAddr,
         user_stack: VirtAddr,
         kernel_stack: VirtAddr,
-        page_table: PhysFrame,
+        page_table: OwnedPageTable,
     ) -> Self {
         let mut trapframe = Box::new(TrapFrame::default());
         
@@ -141,7 +146,7 @@ impl Process {
             trapframe,
             kernel_stack,
             page_table,
-            files: FileDescriptorTable::new_with_stdio(),  // ← NUEVO
+            files: FileDescriptorTable::new_with_stdio(),
         }
     }
     
@@ -161,17 +166,25 @@ pub fn start_first_process() -> ! {
     let tf_ptr = {
         let mut scheduler = scheduler::SCHEDULER.lock();
         
-        let mut found = None;
-        
         crate::serial_println!("Available processes:");
 
-        for proc in scheduler.processes.iter_mut() {
-            crate::serial_println!("  PID {}: {:?} - {:?}", 
-                proc.pid.0, 
-                core::str::from_utf8(&proc.name).unwrap_or("<?>").trim_end_matches('\0'),
-                proc.privilege
-            );
-            if proc.state == ProcessState::Ready && proc.pid.0 != 0 {
+        // Phase 1: Find first non-idle Ready process (read-only scan)
+        let target_pid = scheduler.processes.iter()
+            .inspect(|proc| {
+                crate::serial_println!("  PID {}: {:?} - {:?}", 
+                    proc.pid.0, 
+                    core::str::from_utf8(&proc.name).unwrap_or("<?>").trim_end_matches('\0'),
+                    proc.privilege
+                );
+            })
+            .find(|proc| proc.state == ProcessState::Ready && proc.pid.0 != 0)
+            .map(|proc| proc.pid)
+            .expect("No process to start!");
+        
+        // Phase 2: Modify the found process
+        let tf_ptr = scheduler.processes.iter_mut()
+            .find(|proc| proc.pid == target_pid)
+            .map(|proc| {
                 proc.state = ProcessState::Running;
                 
                 let pid = proc.pid;
@@ -179,9 +192,12 @@ pub fn start_first_process() -> ! {
                 let tf_ptr = &*proc.trapframe as *const TrapFrame;
                 let name = proc.name;
                 
-                scheduler.current = Some(pid);
-                
                 tss::set_kernel_stack(kernel_stack);
+                
+                // ✅ Activate the process's page table
+                unsafe {
+                    proc.page_table.activate();
+                }
                 
                 crate::serial_println!(
                     "\n🚀 Starting first process: PID {} ({})",
@@ -189,15 +205,16 @@ pub fn start_first_process() -> ! {
                     core::str::from_utf8(&name).unwrap_or("<invalid>").trim_end_matches('\0')
                 );
                 
-                found = Some(tf_ptr);
-                break;
-            }
-        }
+                tf_ptr
+            })
+            .expect("Process disappeared!");
         
-        found.expect("No process to start!")
+        scheduler.current = Some(target_pid);
+        
+        tf_ptr
     };
 
-    // ✅ Habilitar interrupts JUSTO antes del salto
+    // Enable interrupts right before jumping
     unsafe { 
         core::arch::asm!("sti");
     }
