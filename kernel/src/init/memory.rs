@@ -1,47 +1,35 @@
 // kernel/src/init/memory.rs
 //
-// Physical memory offset, frame allocator, page table, buddy, slab.
-// Code moved verbatim from kernel_main.
+// Physical memory offset → buddy → slab.
+//
+// CORRECTED: Removed BootInfoFrameAllocator + ActivePageTable.
+// Previously both the BootInfoFrameAllocator AND the Buddy were initialized
+// over the same usable memory regions.  Both could hand out the same frame.
+// Now the Buddy is the SOLE physical memory allocator after init.
 
 use bootloader_api::info::{MemoryRegions, MemoryRegionKind};
 use x86_64::VirtAddr;
 
 use crate::{
     allocator,
-    memory::{
-        self,
-        frame_allocator::BootInfoFrameAllocator,
-        paging::ActivePageTable,
-    },
+    memory,
     serial_println,
 };
 
 /// Initialize all memory subsystems in order:
-/// phys offset → frame allocator → page table → allocators → buddy.
+/// phys offset → buddy → slab (slab uses buddy internally).
 pub fn init_core(phys_mem_offset: VirtAddr, memory_regions: &'static MemoryRegions) {
-    // ✅ Print the physical memory offset so we can verify PML4 entry
     serial_println!("Physical memory offset: {:#x} (PML4 entry {})",
         phys_mem_offset.as_u64(),
         phys_mem_offset.as_u64() >> 39
     );
 
     memory::init(phys_mem_offset);
-    
-    // --- Inicialización de Memoria ---
-    let frame_allocator = unsafe {
-        BootInfoFrameAllocator::init(memory_regions)
-    };
-    
-    let page_table = unsafe {
-        ActivePageTable::new(phys_mem_offset)
-    };
-    
-    allocator::init_allocators(page_table, frame_allocator);
 
-    // --- Inicializar Buddy Allocator ---
+    // Initialize Buddy allocator — sole owner of all usable physical memory.
     {
         let mut buddy = allocator::buddy_allocator::BUDDY.lock();
-        
+
         for region in memory_regions.iter() {
             if region.kind == MemoryRegionKind::Usable {
                 unsafe {
@@ -51,7 +39,7 @@ pub fn init_core(phys_mem_offset: VirtAddr, memory_regions: &'static MemoryRegio
         }
     }
 
-    serial_println!("Step 8: Printing Buddy stats (lock released)");
+    serial_println!("Buddy stats:");
     {
         let buddy = allocator::buddy_allocator::BUDDY.lock();
         buddy.debug_print_stats();
@@ -60,9 +48,8 @@ pub fn init_core(phys_mem_offset: VirtAddr, memory_regions: &'static MemoryRegio
 
 /// Run allocator smoke tests (slab, Vec, String).
 pub fn test_allocators() {
-    // --- Test Slab ---
     {
-        use core::alloc::{GlobalAlloc, Layout};
+        use core::alloc::Layout;
 
         let layout = Layout::from_size_align(8, 8).unwrap();
         let ptr = unsafe { alloc::alloc::alloc(layout) };

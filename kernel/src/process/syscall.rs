@@ -1,8 +1,24 @@
 // kernel/src/process/syscall.rs
-// ✅ VERSIÓN MEJORADA: Con File Descriptors y validación de memoria
+//
+// CORRECTED: All syscalls use `with_current_process` or `with_scheduler`
+// helpers that guarantee:
+//   1. cli before lock acquisition
+//   2. Lock is ALWAYS dropped before sti
+//   3. No early returns can bypass sti
+//
+// Previous bugs (present in ALL sys_read/write/open/close):
+//
+//   BUG 1 — Deadlock:
+//     unsafe { asm!("sti"); }  // ← re-enables interrupts
+//     return errno::ESRCH;     // ← MutexGuard still alive!
+//     // Timer fires between sti and drop → SCHEDULER.lock() → deadlock
+//
+//   BUG 2 — IRQs disabled forever:
+//     let file = match proc.files.get_mut(fd) {
+//         Err(_) => return errno::EBADF,  // ← exits function, sti never called
+//     };
 
 use core::arch::global_asm;
-
 use crate::serial_println;
 
 global_asm!(
@@ -44,7 +60,7 @@ global_asm!(
     "pop rdx",
     "pop rcx",
     "pop rbx",
-    "pop rax",    // ← ahora sí recibe el return value
+    "pop rax",
     
     "iretq",
 );
@@ -111,38 +127,86 @@ pub mod errno {
 }
 
 // ============================================================================
-// VALIDACIÓN DE MEMORIA
+// SAFE HELPERS: Guarantee correct cli/sti + lock ordering
+// ============================================================================
+//
+// These helpers make the deadlock STRUCTURALLY IMPOSSIBLE:
+//
+//   cli
+//   {
+//       let guard = SCHEDULER.lock();     // lock acquired
+//       result = closure(&mut process);   // closure returns VALUE, not early-return
+//   }                                     // guard drops HERE — unconditionally
+//   sti                                   // sti AFTER lock is gone
+//
+// The closure can `return errno::EBADF` — but that returns from the CLOSURE,
+// not from the outer function.  The value flows through `result`.
+
+/// Execute a closure with the current process, under cli + scheduler lock.
+fn with_current_process<F>(f: F) -> SyscallResult
+where
+    F: FnOnce(&mut super::Process) -> SyscallResult,
+{
+    unsafe { core::arch::asm!("cli"); }
+
+    let result = {
+        let mut scheduler = super::scheduler::SCHEDULER.lock();
+
+        match scheduler.current {
+            Some(pid) => {
+                match scheduler.processes.iter_mut().find(|p| p.pid == pid) {
+                    Some(proc) => f(proc),
+                    None => errno::ESRCH,
+                }
+            }
+            None => errno::ESRCH,
+        }
+        // MutexGuard drops HERE
+    };
+
+    unsafe { core::arch::asm!("sti"); }
+    result
+}
+
+/// Execute a closure with the scheduler locked (for getpid, exit, etc).
+fn with_scheduler<F>(f: F) -> SyscallResult
+where
+    F: FnOnce(&mut super::scheduler::Scheduler) -> SyscallResult,
+{
+    unsafe { core::arch::asm!("cli"); }
+
+    let result = {
+        let mut scheduler = super::scheduler::SCHEDULER.lock();
+        f(&mut scheduler)
+        // MutexGuard drops HERE
+    };
+
+    unsafe { core::arch::asm!("sti"); }
+    result
+}
+
+// ============================================================================
+// MEMORY VALIDATION
 // ============================================================================
 
-/// Valida que un buffer de usuario esté en espacio de usuario
-/// 
-/// En x86_64 canonical addresses:
-/// - User space: 0x0000_0000_0000_0000 - 0x0000_7FFF_FFFF_FFFF
-/// - Kernel space: 0xFFFF_8000_0000_0000 - 0xFFFF_FFFF_FFFF_FFFF
 fn validate_user_buffer(addr: u64, size: usize) -> Result<(), i64> {
-    // 1. Verificar que no es null
     if addr == 0 {
         return Err(errno::EFAULT);
     }
-    
-    // 2. Verificar que no hay overflow
+
     let end = addr.checked_add(size as u64)
         .ok_or(errno::EFAULT)?;
-    
-    // 3. Verificar que está en user space (< 0x0000_8000_0000_0000)
+
     const USER_SPACE_MAX: u64 = 0x0000_8000_0000_0000;
     if addr >= USER_SPACE_MAX || end > USER_SPACE_MAX {
         return Err(errno::EFAULT);
     }
-    
-    // TODO: Verificar que las páginas tienen el bit USER_ACCESSIBLE
-    // Por ahora, solo verificamos el rango de direcciones
-    
+
     Ok(())
 }
 
 // ============================================================================
-// SYSCALL HANDLER
+// SYSCALL DISPATCH
 // ============================================================================
 
 pub fn syscall_handler(
@@ -174,141 +238,74 @@ pub fn syscall_handler(
 // SYSCALL IMPLEMENTATIONS
 // ============================================================================
 
-/// sys_read: Lee de un file descriptor
 fn sys_read(fd: i32, buf: usize, count: usize) -> SyscallResult {
-    // Validar buffer
     if let Err(e) = validate_user_buffer(buf as u64, count) {
         return e;
     }
-    
-    // Deshabilitar interrupciones para acceder al scheduler
-    unsafe { core::arch::asm!("cli"); }
-    
-    let result = {
-        let mut scheduler = super::scheduler::SCHEDULER.lock();
-        
-        // Obtener proceso actual
-        let proc = match scheduler.current {
-            Some(pid) => {
-                match scheduler.processes.iter_mut().find(|p| p.pid == pid) {
-                    Some(p) => p,
-                    None => {
-                        unsafe { core::arch::asm!("sti"); }
-                        return errno::ESRCH;
-                    }
-                }
-            }
-            None => {
-                unsafe { core::arch::asm!("sti"); }
-                return errno::ESRCH;
-            }
-        };
-        
-        // Obtener file handle
+
+    with_current_process(|proc| {
         let file = match proc.files.get_mut(fd as usize) {
             Ok(f) => f,
-            Err(_) => return errno::EBADF,  // ← retorna del bloque
+            Err(_) => return errno::EBADF,
         };
-        
-        // Crear slice mutable del buffer de usuario
+
         let buffer = unsafe {
             core::slice::from_raw_parts_mut(buf as *mut u8, count)
         };
-        
-        // Leer del archivo
+
         match file.read(buffer) {
             Ok(n) => n as i64,
             Err(_) => errno::EIO,
         }
-    };
-    
-    unsafe { core::arch::asm!("sti"); }
-    result
+    })
 }
 
-/// sys_write: Escribe a un file descriptor
 fn sys_write(fd: i32, buf: usize, count: usize) -> SyscallResult {
-    // Validar buffer
-    serial_println!("👀 Sys write llamado!");
     if let Err(e) = validate_user_buffer(buf as u64, count) {
         return e;
     }
-    
-    unsafe { core::arch::asm!("cli"); }
-    
-    let result = {
-        let mut scheduler = super::scheduler::SCHEDULER.lock();
-        
-        // Obtener proceso actual
-        let proc = match scheduler.current {
-            Some(pid) => {
-                match scheduler.processes.iter_mut().find(|p| p.pid == pid) {
-                    Some(p) => p,
-                    None => {
-                        unsafe { core::arch::asm!("sti"); }
-                        return errno::ESRCH;
-                    }
-                }
-            }
-            None => {
-                unsafe { core::arch::asm!("sti"); }
-                return errno::ESRCH;
-            }
-        };
-        
-        // Obtener file handle
+
+    with_current_process(|proc| {
         let file = match proc.files.get_mut(fd as usize) {
             Ok(f) => f,
-            Err(_) => return errno::EBADF,  // ← retorna del bloque
+            Err(_) => return errno::EBADF,
         };
-        
-        // Crear slice del buffer de usuario
+
         let buffer = unsafe {
             core::slice::from_raw_parts(buf as *const u8, count)
         };
-        
-        // Escribir al archivo
+
         match file.write(buffer) {
             Ok(n) => n as i64,
             Err(_) => errno::EIO,
         }
-    };
-    
-    unsafe { core::arch::asm!("sti"); }
-    result
+    })
 }
 
-/// sys_open: Abre un "archivo" (de momento solo dispositivos)
-/// 
-/// arg1: Puntero a string con el path
-/// arg2: Flags (ignorados por ahora)
 fn sys_open(path_ptr: usize, _flags: i32) -> SyscallResult {
     use alloc::boxed::Box;
     use super::file::*;
-    
-    // Validar puntero al path
+
+    // Validation and object creation BEFORE cli — no lock needed
     if let Err(e) = validate_user_buffer(path_ptr as u64, 256) {
         return e;
     }
-    
-    // Leer el path (limitado a 256 bytes)
+
     let path_bytes = unsafe {
         let mut len = 0;
         let ptr = path_ptr as *const u8;
-        
         while len < 256 && *ptr.add(len) != 0 {
             len += 1;
         }
-        
         core::slice::from_raw_parts(ptr, len)
     };
-    
+
     let path = match core::str::from_utf8(path_bytes) {
         Ok(s) => s,
         Err(_) => return errno::EINVAL,
     };
-    
-    // Por ahora, solo soportamos algunos dispositivos
+
+    // Box allocation uses Slab (different lock from SCHEDULER — no conflict)
     let handle: Box<dyn FileHandle> = match path {
         "/dev/null" => Box::new(DevNull),
         "/dev/zero" => Box::new(DevZero),
@@ -316,125 +313,53 @@ fn sys_open(path_ptr: usize, _flags: i32) -> SyscallResult {
         "/dev/fb" => Box::new(FramebufferConsole::new()),
         _ => return errno::ENOENT,
     };
-    
-    unsafe { core::arch::asm!("cli"); }
-    
-    let result = {
-        let mut scheduler = super::scheduler::SCHEDULER.lock();
-        
-        let proc = match scheduler.current {
-            Some(pid) => {
-                match scheduler.processes.iter_mut().find(|p| p.pid == pid) {
-                    Some(p) => p,
-                    None => {
-                        unsafe { core::arch::asm!("sti"); }
-                        return errno::ESRCH;
-                    }
-                }
-            }
-            None => {
-                unsafe { core::arch::asm!("sti"); }
-                return errno::ESRCH;
-            }
-        };
-        
+
+    // Only take scheduler lock for the FD table insertion
+    with_current_process(|proc| {
         match proc.files.allocate(handle) {
             Ok(fd) => fd as i64,
-            Err(_) => {
-                unsafe { core::arch::asm!("sti"); }
-                return errno::EINVAL;
-            }
+            Err(_) => errno::EINVAL,
         }
-    };
-    
-    unsafe { core::arch::asm!("sti"); }
-    result
+    })
 }
 
-/// sys_close: Cierra un file descriptor
 fn sys_close(fd: i32) -> SyscallResult {
-    unsafe { core::arch::asm!("cli"); }
-    
-    let result = {
-        let mut scheduler = super::scheduler::SCHEDULER.lock();
-        
-        let proc = match scheduler.current {
-            Some(pid) => {
-                match scheduler.processes.iter_mut().find(|p| p.pid == pid) {
-                    Some(p) => p,
-                    None => {
-                        unsafe { core::arch::asm!("sti"); }
-                        return errno::ESRCH;
-                    }
-                }
-            }
-            None => {
-                unsafe { core::arch::asm!("sti"); }
-                return errno::ESRCH;
-            }
-        };
-        
+    with_current_process(|proc| {
         match proc.files.close(fd as usize) {
             Ok(_) => 0,
-            Err(_) => {
-                unsafe { core::arch::asm!("sti"); }
-                return errno::EBADF;
-            }
+            Err(_) => errno::EBADF,
         }
-    };
-    
-    unsafe { core::arch::asm!("sti"); }
-    result
+    })
 }
 
-/// sys_yield: Cede voluntariamente el CPU
 fn sys_yield() -> SyscallResult {
-    // TODO: Llamar al scheduler para hacer un context switch voluntario
-    // Por ahora, simplemente retornamos 0
+    // TODO: Trigger voluntary context switch
     0
 }
 
-/// sys_getpid: Obtiene el PID del proceso actual
 fn sys_getpid() -> SyscallResult {
-    unsafe { core::arch::asm!("cli"); }
-    
-    let result = {
-        let scheduler = super::scheduler::SCHEDULER.lock();
+    with_scheduler(|scheduler| {
         scheduler.current.map(|pid| pid.0 as SyscallResult).unwrap_or(0)
-    };
-    
-    unsafe { core::arch::asm!("sti"); }
-    
-    result
+    })
 }
 
-/// sys_exit: Termina el proceso actual
 fn sys_exit(status: i32) -> SyscallResult {
-    unsafe { core::arch::asm!("cli"); }
-    
-    {
-        let mut scheduler = super::scheduler::SCHEDULER.lock();
-        
-        // Marcar como zombie
+    with_scheduler(|scheduler| {
         for proc in scheduler.processes.iter_mut() {
             if proc.state == super::ProcessState::Running {
                 proc.state = super::ProcessState::Zombie;
-                
                 crate::serial_println!(
                     "Process {} exited with status {}",
                     proc.pid.0,
                     status
                 );
-                
                 break;
             }
         }
-    }
-    
-    // Re-habilitar interrupciones
-    unsafe { core::arch::asm!("sti"); }
-    
-    // Dormir hasta que el timer nos saque
+        0
+    });
+
+    // Process is now Zombie. Halt until the timer preempts us.
     loop {
         unsafe { core::arch::asm!("hlt"); }
     }

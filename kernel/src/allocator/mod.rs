@@ -1,24 +1,19 @@
 // kernel/src/allocator/mod.rs
+//
+// CORRECTED: Removed FRAME_ALLOCATOR and PAGE_TABLE globals.
+//
+// Previous bug:
+//   BootInfoFrameAllocator was initialized over the SAME physical memory
+//   regions as the Buddy allocator.  Both could hand out the same frame.
+//   In practice this didn't explode because nothing read FRAME_ALLOCATOR
+//   after init — but the globals were public and accessible, making it a
+//   latent corruption vector.
+//
+// Current design:
+//   - Buddy allocator is the SOLE owner of physical memory after init.
+//   - BootInfoFrameAllocator exists as a type (for potential early-boot use)
+//     but is NOT stored globally.
+//   - Page table operations go through OwnedPageTable (page_table_manager.rs).
 
-// pub mod bump;  // ❌ Comentar o borrar
 pub mod buddy_allocator;
-pub mod slab;  // ✅ Agregar
-
-use spin::Mutex;
-use x86_64::{
-    VirtAddr, structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB}
-};
-use crate::memory::{paging::ActivePageTable, frame_allocator::BootInfoFrameAllocator};
-
-pub static FRAME_ALLOCATOR: Mutex<Option<BootInfoFrameAllocator>> = Mutex::new(None);
-pub static PAGE_TABLE: Mutex<Option<ActivePageTable>> = Mutex::new(None);
-
-pub fn init_allocators(
-    page_table: ActivePageTable,
-    frame_allocator: BootInfoFrameAllocator
-) {
-    *PAGE_TABLE.lock() = Some(page_table);
-    *FRAME_ALLOCATOR.lock() = Some(frame_allocator);
-}
-
-// ❌ expand_heap ya no se necesita con Slab
+pub mod slab;
