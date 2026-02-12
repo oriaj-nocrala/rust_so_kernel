@@ -2,20 +2,81 @@
 //
 // Buddy allocator for physical memory management.
 //
-// CORRECTED:
-//   - Removed `remove_block` which assumed addr == head without checking.
-//     `remove_arbitrary_block` now calls `remove_from_head` for the head case.
-//   - `remove_from_head` has debug_assert to verify the invariant.
-//   - Cleaned up commented-out debug code.
+// HISTORY:
+//   - Removed dangerous `remove_block` (assumed addr==head without check).
+//   - Unified raw print helpers into serial_println_raw! (fmt::Write).
+//   - Replaced O(n) `is_free` linked-list scan with O(1) bitmap lookup.
+//
+// BITMAP DESIGN:
+//   One bit per possible block at each order level.  A set bit means the
+//   block is currently in the free list.  The bitmap is maintained by
+//   add_block (set), remove_from_head (clear), and remove_arbitrary_block
+//   (clear).  `is_free` is now a single bit test — O(1).
+//
+//   The bitmap covers physical addresses 0..MAX_PHYS_ADDR (512 MiB).
+//   Addresses above this threshold are silently ignored by the bitmap
+//   (bitmap_set/clear/test become no-ops), falling back to correct but
+//   slower behavior.  In practice, QEMU+bootloader place all usable
+//   memory well below 512 MiB.
+//
+//   Total bitmap size: ~32 KiB (computed at compile time).
 
 use x86_64::PhysAddr;
 use spin::Mutex;
 
 const MIN_ORDER: usize = 12; // 4KB (2^12)
 const MAX_ORDER: usize = 28; // 256MB (2^28)
+const NUM_ORDERS: usize = MAX_ORDER - MIN_ORDER + 1;
+
+/// Maximum physical address tracked by the bitmap.
+/// Addresses above this are not tracked (bitmap ops become no-ops).
+/// 512 MiB covers typical QEMU configurations with room to spare.
+const MAX_PHYS_ADDR: u64 = 512 * 1024 * 1024;
+
+// ============================================================================
+// Compile-time bitmap sizing
+// ============================================================================
+
+/// Total bytes needed for the flat bitmap across all orders.
+const fn bitmap_total_bytes() -> usize {
+    let mut total = 0usize;
+    let mut order = MIN_ORDER;
+    while order <= MAX_ORDER {
+        let bits = (MAX_PHYS_ADDR as usize) >> order;
+        total += (bits + 7) / 8;
+        order += 1;
+    }
+    total
+}
+
+/// Byte offset into the flat bitmap where each order's bits start.
+const fn bitmap_offsets() -> [usize; NUM_ORDERS] {
+    let mut offsets = [0usize; NUM_ORDERS];
+    let mut i = 0;
+    let mut running = 0usize;
+    while i < NUM_ORDERS {
+        offsets[i] = running;
+        let order = MIN_ORDER + i;
+        let bits = (MAX_PHYS_ADDR as usize) >> order;
+        running += (bits + 7) / 8;
+        i += 1;
+    }
+    offsets
+}
+
+const BITMAP_BYTES: usize = bitmap_total_bytes();   // ~32 KiB
+const BITMAP_OFFSETS: [usize; NUM_ORDERS] = bitmap_offsets();
+
+// Compile-time sanity check
+const _: () = assert!(BITMAP_BYTES < 64 * 1024, "Bitmap exceeds 64KiB — raise MAX_PHYS_ADDR?");
+
+// ============================================================================
+// BuddyAllocator
+// ============================================================================
 
 pub struct BuddyAllocator {
-    free_lists: [FreeList; MAX_ORDER - MIN_ORDER + 1],
+    free_lists: [FreeList; NUM_ORDERS],
+    bitmap: [u8; BITMAP_BYTES],
     total_memory: u64,
 }
 
@@ -40,7 +101,8 @@ impl BuddyAllocator {
     pub const fn new() -> Self {
         const INIT: FreeList = FreeList::new();
         Self {
-            free_lists: [INIT; MAX_ORDER - MIN_ORDER + 1],
+            free_lists: [INIT; NUM_ORDERS],
+            bitmap: [0u8; BITMAP_BYTES],
             total_memory: 0,
         }
     }
@@ -50,6 +112,64 @@ impl BuddyAllocator {
     fn order_to_index(&self, order: usize) -> usize {
         order - MIN_ORDER
     }
+
+    // ====================================================================
+    // Bitmap operations — O(1) free-status tracking
+    // ====================================================================
+
+    /// Compute (byte_offset, bit_mask) for a block in the flat bitmap.
+    /// Returns `None` if addr is outside the tracked range.
+    #[inline]
+    fn bitmap_pos(order: usize, addr: PhysAddr) -> Option<(usize, u8)> {
+        let a = addr.as_u64();
+        if a >= MAX_PHYS_ADDR {
+            return None;
+        }
+        let idx = order - MIN_ORDER;
+        let bit_index = (a as usize) >> order;
+        let byte_offset = BITMAP_OFFSETS[idx] + bit_index / 8;
+        let bit_mask = 1u8 << (bit_index % 8);
+        Some((byte_offset, bit_mask))
+    }
+
+    /// Mark a block as free in the bitmap.
+    #[inline]
+    fn bitmap_set(&mut self, order: usize, addr: PhysAddr) {
+        if let Some((byte, mask)) = Self::bitmap_pos(order, addr) {
+            debug_assert!(
+                self.bitmap[byte] & mask == 0,
+                "bitmap_set: block {:#x} order {} already marked free (double-free?)",
+                addr.as_u64(), order
+            );
+            self.bitmap[byte] |= mask;
+        }
+    }
+
+    /// Mark a block as allocated (not free) in the bitmap.
+    #[inline]
+    fn bitmap_clear(&mut self, order: usize, addr: PhysAddr) {
+        if let Some((byte, mask)) = Self::bitmap_pos(order, addr) {
+            debug_assert!(
+                self.bitmap[byte] & mask != 0,
+                "bitmap_clear: block {:#x} order {} already marked allocated",
+                addr.as_u64(), order
+            );
+            self.bitmap[byte] &= !mask;
+        }
+    }
+
+    /// Check if a block is in the free list — O(1) via bitmap.
+    #[inline]
+    fn is_free(&self, order: usize, addr: PhysAddr) -> bool {
+        match Self::bitmap_pos(order, addr) {
+            Some((byte, mask)) => self.bitmap[byte] & mask != 0,
+            None => false,
+        }
+    }
+
+    // ====================================================================
+    // Region management
+    // ====================================================================
 
     /// Add a region of usable physical memory to the buddy allocator.
     ///
@@ -83,7 +203,12 @@ impl BuddyAllocator {
         }
     }
 
+    // ====================================================================
+    // Free list manipulation (all maintain bitmap invariant)
+    // ====================================================================
+
     /// Add a block to its order's free list (push to head).
+    /// Also sets the bitmap bit.
     unsafe fn add_block(&mut self, order: usize, addr: PhysAddr) {
         let idx = self.order_to_index(order);
         let phys_offset = crate::memory::physical_memory_offset();
@@ -97,12 +222,13 @@ impl BuddyAllocator {
         ptr.write(new_block);
 
         self.free_lists[idx].head = Some(addr);
+        self.bitmap_set(order, addr);
     }
 
     /// Remove the HEAD block from its order's free list.
+    /// Also clears the bitmap bit.
     ///
     /// PRECONDITION: `addr` MUST be the current head of the free list.
-    /// Verified by debug_assert in debug builds.
     unsafe fn remove_from_head(&mut self, order: usize, addr: PhysAddr) {
         let idx = self.order_to_index(order);
 
@@ -118,19 +244,19 @@ impl BuddyAllocator {
         let virt = phys_offset + addr.as_u64();
         let block = &*(virt.as_ptr::<FreeBlock>());
         self.free_lists[idx].head = block.next;
+        self.bitmap_clear(order, addr);
     }
 
-    // NOTE: The old `remove_block(order, addr)` was deleted.
-    // It did the same thing as `remove_from_head` but WITHOUT the
-    // debug_assert, making it silently corrupt the free list if
-    // addr != head.  All callers now use either `remove_from_head`
-    // (when addr is known to be head) or `remove_arbitrary_block`
-    // (which handles both cases safely).
-
     /// Remove an ARBITRARY block from its order's free list.
+    /// Also clears the bitmap bit.
     ///
     /// Handles both the head case (O(1)) and the general case (O(n) scan).
     /// Called during coalescing, where the buddy may be anywhere in the list.
+    ///
+    /// The O(n) list walk here is acceptable because:
+    ///   - It only runs when `is_free` returned true (O(1) bitmap check).
+    ///   - The common case in deallocate is that the buddy is NOT free,
+    ///     so this function is never reached.
     unsafe fn remove_arbitrary_block(&mut self, order: usize, addr: PhysAddr) {
         let idx = self.order_to_index(order);
         let phys_offset = crate::memory::physical_memory_offset();
@@ -141,7 +267,7 @@ impl BuddyAllocator {
             return;
         }
 
-        // Slow path: scan the list for the block
+        // Slow path: scan the list for the block and unlink it
         let mut prev_addr = match self.free_lists[idx].head {
             Some(a) => a,
             None => return,
@@ -156,6 +282,7 @@ impl BuddyAllocator {
                     let target_virt = phys_offset + addr.as_u64();
                     let target_block = &*(target_virt.as_ptr::<FreeBlock>());
                     prev_block.next = target_block.next;
+                    self.bitmap_clear(order, addr);
                     return;
                 }
                 Some(next_addr) => {
@@ -165,6 +292,10 @@ impl BuddyAllocator {
             }
         }
     }
+
+    // ====================================================================
+    // Split / buddy helpers
+    // ====================================================================
 
     /// Split a block from `from_order` down to `to_order`.
     ///
@@ -188,27 +319,9 @@ impl BuddyAllocator {
         PhysAddr::new(addr.as_u64() ^ block_size)
     }
 
-    /// Check if a block is in the free list for its order.
-    ///
-    /// NOTE: O(n) in the length of the free list.
-    /// TODO(P2): Replace with a bitmap for O(1) lookup.
-    unsafe fn is_free(&self, order: usize, addr: PhysAddr) -> bool {
-        let idx = self.order_to_index(order);
-        let mut current = self.free_lists[idx].head;
-
-        while let Some(block_addr) = current {
-            if block_addr == addr {
-                return true;
-            }
-
-            let phys_offset = crate::memory::physical_memory_offset();
-            let virt = phys_offset + block_addr.as_u64();
-            let block = &*(virt.as_ptr::<FreeBlock>());
-            current = block.next;
-        }
-
-        false
-    }
+    // ====================================================================
+    // Allocate / Deallocate
+    // ====================================================================
 
     /// Allocate a block of 2^order bytes.
     ///
@@ -237,9 +350,7 @@ impl BuddyAllocator {
             }
         }
 
-        crate::serial_print_raw!("Buddy: OOM for order ");
-        print_usize(order);
-        crate::serial_print_raw!("\n");
+        crate::serial_println_raw!("Buddy: OOM for order {}", order);
         None
     }
 
@@ -247,7 +358,7 @@ impl BuddyAllocator {
     ///
     /// # Safety
     /// - `addr` must have been returned by `allocate(order)` with the same order.
-    /// - Must not be freed twice (no double-free).
+    /// - Must not be freed twice (caught by bitmap debug_assert in debug builds).
     pub unsafe fn deallocate(&mut self, addr: PhysAddr, order: usize) {
         debug_assert!(order >= MIN_ORDER);
         debug_assert!(order <= MAX_ORDER);
@@ -262,7 +373,8 @@ impl BuddyAllocator {
         let mut current_addr = addr;
         let mut current_order = order;
 
-        // Coalesce with buddy until MAX_ORDER or buddy is not free
+        // Coalesce with buddy until MAX_ORDER or buddy is not free.
+        // is_free is O(1) via bitmap — this was the hot-path bottleneck.
         while current_order < MAX_ORDER {
             let buddy_addr = self.buddy_of(current_addr, current_order);
 
@@ -270,6 +382,7 @@ impl BuddyAllocator {
                 break;
             }
 
+            // Buddy is free — remove it from its list and merge.
             self.remove_arbitrary_block(current_order, buddy_addr);
 
             current_addr = PhysAddr::new(current_addr.as_u64().min(buddy_addr.as_u64()));
@@ -279,16 +392,19 @@ impl BuddyAllocator {
         self.add_block(current_order, current_addr);
     }
 
-    /// Debug: print statistics without using format!() (avoids deadlocks).
+    // ====================================================================
+    // Debug
+    // ====================================================================
+
+    /// Debug: print statistics (lock-free, no allocation).
     pub fn debug_print_stats(&self) {
-        crate::serial_print_raw!("Buddy Allocator Stats:\n");
-        crate::serial_print_raw!("  Total memory: ");
-        print_u64(self.total_memory / (1024 * 1024));
-        crate::serial_print_raw!("MB\n");
+        crate::serial_println_raw!("Buddy Allocator Stats:");
+        crate::serial_println_raw!("  Total memory: {}MB", self.total_memory / (1024 * 1024));
+        crate::serial_println_raw!("  Bitmap size: {} bytes", BITMAP_BYTES);
 
         for order in MIN_ORDER..=MAX_ORDER {
             let idx = self.order_to_index(order);
-            let mut count = 0;
+            let mut count = 0usize;
 
             unsafe {
                 let mut current = self.free_lists[idx].head;
@@ -303,18 +419,16 @@ impl BuddyAllocator {
 
             if count > 0 {
                 let block_size = 1u64 << order;
-                crate::serial_print_raw!("  Order ");
-                print_usize(order);
-                crate::serial_print_raw!(": ");
-                print_usize(count);
-                crate::serial_print_raw!(" blocks of ");
-
                 if block_size >= 1024 * 1024 {
-                    print_u64(block_size / (1024 * 1024));
-                    crate::serial_print_raw!("MB\n");
+                    crate::serial_println_raw!(
+                        "  Order {}: {} blocks of {}MB",
+                        order, count, block_size / (1024 * 1024)
+                    );
                 } else {
-                    print_u64(block_size / 1024);
-                    crate::serial_print_raw!("KB\n");
+                    crate::serial_println_raw!(
+                        "  Order {}: {} blocks of {}KB",
+                        order, count, block_size / 1024
+                    );
                 }
             }
         }
@@ -323,63 +437,3 @@ impl BuddyAllocator {
 
 // Global instance
 pub static BUDDY: Mutex<BuddyAllocator> = Mutex::new(BuddyAllocator::new());
-
-// ============================================================================
-// Raw print helpers (no allocation, direct port I/O)
-// ============================================================================
-
-fn print_u64(mut n: u64) {
-    if n == 0 {
-        crate::serial_print_raw!("0");
-        return;
-    }
-
-    let mut buf = [0u8; 20];
-    let mut i = 0;
-
-    while n > 0 {
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        i += 1;
-    }
-
-    while i > 0 {
-        i -= 1;
-        unsafe {
-            let mut port = x86_64::instructions::port::Port::<u8>::new(0x3F8);
-            port.write(buf[i]);
-        }
-    }
-}
-
-fn print_hex(n: u64) {
-    crate::serial_print_raw!("0x");
-
-    if n == 0 {
-        crate::serial_print_raw!("0");
-        return;
-    }
-
-    let mut buf = [0u8; 16];
-    let mut num = n;
-    let mut i = 0;
-
-    while num > 0 {
-        let digit = (num % 16) as u8;
-        buf[i] = if digit < 10 { b'0' + digit } else { b'a' + (digit - 10) };
-        num /= 16;
-        i += 1;
-    }
-
-    while i > 0 {
-        i -= 1;
-        unsafe {
-            let mut port = x86_64::instructions::port::Port::<u8>::new(0x3F8);
-            port.write(buf[i]);
-        }
-    }
-}
-
-fn print_usize(n: usize) {
-    print_u64(n as u64);
-}

@@ -6,17 +6,8 @@
 //   2. Lock is ALWAYS dropped before sti
 //   3. No early returns can bypass sti
 //
-// Previous bugs (present in ALL sys_read/write/open/close):
-//
-//   BUG 1 — Deadlock:
-//     unsafe { asm!("sti"); }  // ← re-enables interrupts
-//     return errno::ESRCH;     // ← MutexGuard still alive!
-//     // Timer fires between sti and drop → SCHEDULER.lock() → deadlock
-//
-//   BUG 2 — IRQs disabled forever:
-//     let file = match proc.files.get_mut(fd) {
-//         Err(_) => return errno::EBADF,  // ← exits function, sti never called
-//     };
+// UPDATED: with_current_process now uses scheduler.running_mut() for O(1)
+// access to the current process, instead of O(n) find by PID.
 
 use core::arch::global_asm;
 use crate::serial_println;
@@ -138,11 +129,11 @@ pub mod errno {
 //       result = closure(&mut process);   // closure returns VALUE, not early-return
 //   }                                     // guard drops HERE — unconditionally
 //   sti                                   // sti AFTER lock is gone
-//
-// The closure can `return errno::EBADF` — but that returns from the CLOSURE,
-// not from the outer function.  The value flows through `result`.
 
 /// Execute a closure with the current process, under cli + scheduler lock.
+///
+/// Uses `scheduler.running_mut()` for O(1) access to the running process
+/// (no PID lookup needed — the running process is stored directly).
 fn with_current_process<F>(f: F) -> SyscallResult
 where
     F: FnOnce(&mut super::Process) -> SyscallResult,
@@ -152,13 +143,8 @@ where
     let result = {
         let mut scheduler = super::scheduler::SCHEDULER.lock();
 
-        match scheduler.current {
-            Some(pid) => {
-                match scheduler.processes.iter_mut().find(|p| p.pid == pid) {
-                    Some(proc) => f(proc),
-                    None => errno::ESRCH,
-                }
-            }
+        match scheduler.running_mut() {
+            Some(proc) => f(proc),
             None => errno::ESRCH,
         }
         // MutexGuard drops HERE
@@ -339,22 +325,19 @@ fn sys_yield() -> SyscallResult {
 
 fn sys_getpid() -> SyscallResult {
     with_scheduler(|scheduler| {
-        scheduler.current.map(|pid| pid.0 as SyscallResult).unwrap_or(0)
+        scheduler.current_pid().map(|pid| pid.0 as SyscallResult).unwrap_or(0)
     })
 }
 
 fn sys_exit(status: i32) -> SyscallResult {
     with_scheduler(|scheduler| {
-        for proc in scheduler.processes.iter_mut() {
-            if proc.state == super::ProcessState::Running {
-                proc.state = super::ProcessState::Zombie;
-                crate::serial_println!(
-                    "Process {} exited with status {}",
-                    proc.pid.0,
-                    status
-                );
-                break;
-            }
+        if let Some(proc) = scheduler.running_mut() {
+            proc.state = super::ProcessState::Zombie;
+            crate::serial_println!(
+                "Process {} exited with status {}",
+                proc.pid.0,
+                status,
+            );
         }
         0
     });
