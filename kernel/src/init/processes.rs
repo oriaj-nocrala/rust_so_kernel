@@ -38,7 +38,7 @@ pub fn init_all() {
 /// Print open file descriptors for every process (debug).
 pub fn debug_file_descriptors() {
     let scheduler = SCHEDULER.lock();
-    for proc in scheduler.processes.iter() {
+    for proc in scheduler.iter_all() {
         serial_println!("Process {}: open files:", proc.pid.0);
         proc.files.debug_list();
     }

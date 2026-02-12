@@ -37,7 +37,15 @@ pub struct Process {
     pub pid: Pid,
     pub state: ProcessState,
     pub privilege: PrivilegeLevel,
+
+    /// Base priority (set once at creation, never changes).
     pub priority: u8,
+
+    /// Effective priority (used for scheduling decisions).
+    /// Starts equal to `priority`.  Decays when a time slice is consumed.
+    /// Restored toward `priority` by periodic aging.
+    pub effective_priority: u8,
+
     pub name: [u8; 16],
     pub trapframe: Box<TrapFrame>,
     pub kernel_stack: VirtAddr,
@@ -48,8 +56,6 @@ pub struct Process {
 
 impl Process {
     /// Crear proceso de KERNEL
-    ///
-    /// Kernel processes share the kernel page table via AddressSpace::kernel().
     pub fn new_kernel(
         pid: Pid,
         entry: VirtAddr,
@@ -90,6 +96,7 @@ impl Process {
             state: ProcessState::Ready,
             privilege: PrivilegeLevel::Kernel,
             priority: 5,
+            effective_priority: 5,
             name: [0; 16],
             trapframe,
             kernel_stack,
@@ -99,8 +106,6 @@ impl Process {
     }
     
     /// Crear proceso de USER
-    ///
-    /// Each user process has its OWN AddressSpace (page table + VMAs).
     pub fn new_user(
         pid: Pid,
         entry: VirtAddr,
@@ -142,6 +147,7 @@ impl Process {
             state: ProcessState::Ready,
             privilege: PrivilegeLevel::User,
             priority: 5,
+            effective_priority: 5,
             name: [0; 16],
             trapframe,
             kernel_stack,
@@ -157,67 +163,22 @@ impl Process {
     }
 
     pub fn set_priority(&mut self, priority: u8) {
-        self.priority = core::cmp::min(priority, 10);
+        let p = core::cmp::min(priority, 10);
+        self.priority = p;
+        self.effective_priority = p;
     }
 }
 
-/// Iniciar primer proceso
+/// Start the first user process.
 pub fn start_first_process() -> ! {
     let tf_ptr = {
         let mut scheduler = scheduler::SCHEDULER.lock();
-        
-        crate::serial_println!("Available processes:");
-
-        // Phase 1: Find first non-idle Ready process (read-only scan)
-        let target_pid = scheduler.processes.iter()
-            .inspect(|proc| {
-                crate::serial_println!("  PID {}: {:?} - {:?}", 
-                    proc.pid.0, 
-                    core::str::from_utf8(&proc.name).unwrap_or("<?>").trim_end_matches('\0'),
-                    proc.privilege
-                );
-            })
-            .find(|proc| proc.state == ProcessState::Ready && proc.pid.0 != 0)
-            .map(|proc| proc.pid)
-            .expect("No process to start!");
-        
-        // Phase 2: Modify the found process
-        let tf_ptr = scheduler.processes.iter_mut()
-            .find(|proc| proc.pid == target_pid)
-            .map(|proc| {
-                proc.state = ProcessState::Running;
-                
-                let pid = proc.pid;
-                let kernel_stack = proc.kernel_stack;
-                let tf_ptr = &*proc.trapframe as *const TrapFrame;
-                let name = proc.name;
-                
-                tss::set_kernel_stack(kernel_stack);
-                
-                // ✅ Activate the process's address space (page table)
-                unsafe {
-                    proc.address_space.activate();
-                }
-                
-                crate::serial_println!(
-                    "\n🚀 Starting first process: PID {} ({})",
-                    pid.0,
-                    core::str::from_utf8(&name).unwrap_or("<invalid>").trim_end_matches('\0')
-                );
-                
-                tf_ptr
-            })
-            .expect("Process disappeared!");
-        
-        scheduler.current = Some(target_pid);
-        
-        tf_ptr
+        scheduler.start_first()
     };
 
-    // Enable interrupts right before jumping
-    unsafe { 
+    unsafe {
         core::arch::asm!("sti");
     }
-    
+
     unsafe { trapframe::jump_to_trapframe(tf_ptr) }
 }

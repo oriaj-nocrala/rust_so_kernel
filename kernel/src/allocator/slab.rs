@@ -22,9 +22,7 @@ fn size_to_buddy_order(size: usize) -> usize {
     let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     
     // Order = log2(páginas) + PAGE_ORDER
-    if pages == 0 {
-        PAGE_ORDER
-    } else if pages == 1 {
+    if pages <= 1 {
         PAGE_ORDER
     } else {
         let order_offset = pages.next_power_of_two().trailing_zeros() as usize;
@@ -102,7 +100,7 @@ impl SlabAllocator {
         let size = layout.size().max(layout.align());
 
         if size > MAX_SLAB_SIZE {
-            crate::serial_print_raw!(">>> Slab: Large dealloc\n");
+            crate::serial_println_raw!(">>> Slab: Large dealloc");
             self.deallocate_large(ptr, size);
             return;
         }
@@ -121,17 +119,13 @@ impl SlabAllocator {
 
     /// Allocación grande usando Buddy
     unsafe fn allocate_large(&mut self, size: usize, align: usize) -> *mut u8 {
-        crate::serial_print_raw!(">>> allocate_large: start\n");
-        
         // ✅ Considerar alineación
         let total_size = size.max(align);
         
         // ✅ USAR FUNCIÓN CENTRALIZADA
         let order = size_to_buddy_order(total_size);
         
-        crate::serial_print_raw!(">>> allocate_large: order=");
-        print_usize(order);
-        crate::serial_print_raw!("\n");
+        crate::serial_println_raw!(">>> allocate_large: size={} order={}", total_size, order);
 
         let result = BUDDY.lock()
             .allocate(order)
@@ -143,19 +137,19 @@ impl SlabAllocator {
             .unwrap_or(null_mut());
         
         if result.is_null() {
-            crate::serial_print_raw!(">>> allocate_large: FAILED\n");
+            crate::serial_println_raw!(">>> allocate_large: FAILED");
         } else {
-            crate::serial_print_raw!(">>> allocate_large: OK\n");
+            crate::serial_println_raw!(">>> allocate_large: OK at {:#x}", result as u64);
         }
         
         result
     }
 
     unsafe fn deallocate_large(&mut self, ptr: *mut u8, size: usize) {
-        crate::serial_print_raw!(">>> deallocate_large\n");
-        
         // ✅ MISMA FUNCIÓN que allocate_large (simetría crítica)
         let order = size_to_buddy_order(size);
+
+        crate::serial_println_raw!(">>> deallocate_large: size={} order={}", size, order);
 
         let phys_offset = crate::memory::physical_memory_offset();
         let virt = VirtAddr::new(ptr as u64);
@@ -166,47 +160,15 @@ impl SlabAllocator {
 
     /// Debug: estadísticas SIN allocaciones
     pub fn stats(&self) {
-        crate::serial_print_raw!("Slab Allocator Stats:\n");
+        crate::serial_println_raw!("Slab Allocator Stats:");
         for (idx, cache) in self.caches.iter().enumerate() {
             let (total, used) = cache.stats();
             if total > 0 {
-                crate::serial_print_raw!("  ");
-                print_usize(SLAB_SIZES[idx]);
-                crate::serial_print_raw!("B: ");
-                print_usize(used);
-                crate::serial_print_raw!("/");
-                print_usize(total);
-                crate::serial_print_raw!(" objects (");
-                print_usize((used * 100) / total.max(1));
-                crate::serial_print_raw!("% used)\n");
+                crate::serial_println_raw!(
+                    "  {}B: {}/{} objects ({}% used)",
+                    SLAB_SIZES[idx], used, total, (used * 100) / total.max(1)
+                );
             }
-        }
-    }
-}
-
-//HELPER FUNCTION
-
-fn print_usize(n: usize) {
-    if n == 0 {
-        crate::serial_print_raw!("0");
-        return;
-    }
-    
-    let mut buf = [0u8; 20];
-    let mut i = 0;
-    let mut num = n;
-    
-    while num > 0 {
-        buf[i] = b'0' + (num % 10) as u8;
-        num /= 10;
-        i += 1;
-    }
-    
-    while i > 0 {
-        i -= 1;
-        unsafe {
-            let mut port = x86_64::instructions::port::Port::<u8>::new(0x3F8);
-            port.write(buf[i]);
         }
     }
 }
@@ -291,7 +253,7 @@ impl SlabCache {
         let page_phys = match BUDDY.lock().allocate(12) {
             Some(addr) => addr,
             None => {
-                crate::serial_println!("Slab: Failed to expand (OOM)");
+                crate::serial_println_raw!("Slab: Failed to expand {}B cache (OOM)", object_size);
                 return false;
             }
         };
@@ -317,10 +279,9 @@ impl SlabCache {
 
         self.total_objects += objects_per_page;
 
-        crate::serial_println!(
-            "Slab: Expanded {}B cache (+{} objects)",
-            object_size,
-            objects_per_page
+        crate::serial_println_raw!(
+            "Slab: Expanded {}B cache (+{} objects, total {})",
+            object_size, objects_per_page, self.total_objects
         );
 
         true

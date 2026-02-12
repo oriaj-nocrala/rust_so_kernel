@@ -1,7 +1,12 @@
 // kernel/src/init/devices.rs
 //
 // IDT construction, interrupt handlers, PIC/PIT init, boot screen.
-// Code moved verbatim from main.rs.
+//
+// The page fault handler lives here because it bridges the memory and
+// process layers:
+//   - Calls demand_paging (memory layer) for error code filtering + mapping
+//   - Calls scheduler (process layer) for VMA lookup
+// This keeps the dependency one-way: init → {memory, process}.
 
 use spin::Once;
 
@@ -80,37 +85,50 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     panic!("GENERAL PROTECTION FAULT (error: {}) at {:#x}", error_code, sf.instruction_pointer);
 }
 
-// ✅ Page fault handler — tries demand paging before panicking
+// ✅ Page fault handler — bridges memory and process layers.
+//
+// Flow:
+//   1. Pre-filter via demand_paging::is_demand_pageable (memory layer, pure)
+//   2. VMA lookup via scheduler::find_current_vma (process layer)
+//   3. Map page via demand_paging::map_demand_page (memory layer, pure)
+//
+// This is the ONLY place where both layers meet.
 extern "x86-interrupt" fn page_fault_handler(
     sf: &mut ExceptionStackFrame,
     error_code: u64
 ) {
     use crate::memory::demand_paging;
 
-    // Try demand paging first.
-    // If the fault is in a valid VMA (e.g. lazy stack), a page will be
-    // allocated, mapped, and zeroed.  The CPU retries the instruction on iret.
-    match demand_paging::handle_page_fault(error_code) {
-        Ok(()) => {
-            // Page was mapped successfully — resume execution.
-            return;
-        }
-        Err(reason) => {
-            // Not a demand-pageable fault → unrecoverable
-            let fault_address: u64;
-            unsafe {
-                core::arch::asm!("mov {}, cr2", out(reg) fault_address);
-            }
+    let fault_addr = demand_paging::read_cr2();
 
+    // Step 1: Is this fault potentially demand-pageable? (pure memory check)
+    if let Err(reason) = demand_paging::is_demand_pageable(error_code) {
+        panic!(
+            "PAGE FAULT (unhandled)\n  Address: {:#x}\n  Error code: {:#b}\n  Reason: {}\n  RIP: {:#x}",
+            fault_addr, error_code, reason, sf.instruction_pointer
+        );
+    }
+
+    // Step 2: Look up VMA via the scheduler (process layer)
+    let (pid, vma) = match crate::process::scheduler::find_current_vma(fault_addr) {
+        Some(result) => result,
+        None => {
             panic!(
-                "PAGE FAULT (unhandled)\n  Address: {:#x}\n  Error code: {:#b}\n  Reason: {}\n  RIP: {:#x}",
-                fault_address,
-                error_code,
-                reason,
-                sf.instruction_pointer
+                "PAGE FAULT (segmentation fault)\n  Address: {:#x}\n  Error code: {:#b}\n  Reason: no VMA for address\n  RIP: {:#x}",
+                fault_addr, error_code, sf.instruction_pointer
             );
         }
+    };
+
+    // Step 3: Map the page (pure memory operation)
+    if let Err(reason) = demand_paging::map_demand_page(fault_addr, &vma, pid) {
+        panic!(
+            "PAGE FAULT (demand paging failed)\n  Address: {:#x}\n  Error code: {:#b}\n  Reason: {}\n  RIP: {:#x}",
+            fault_addr, error_code, reason, sf.instruction_pointer
+        );
     }
+
+    // Success — CPU will retry the faulting instruction on iret.
 }
 
 extern "x86-interrupt" fn timer_handler(_sf: &mut ExceptionStackFrame) {

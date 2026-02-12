@@ -135,7 +135,7 @@ impl Repl {
         let processes_data: Vec<(usize, [u8; 16], Vec<usize>)> = {
             let scheduler = SCHEDULER.lock();
             
-            scheduler.processes.iter()
+            scheduler.iter_all()
                 .map(|p| {
                     // Recolectar FDs abiertos
                     let open_fds: Vec<usize> = (0..16)

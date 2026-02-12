@@ -1,14 +1,25 @@
 // kernel/src/process/timer_preempt.rs
-// ✅ TIMER HANDLER CORRECTO: Preempta a TODOS los procesos (kernel y user)
+//
+// Timer interrupt handler with time-slice-based preemption.
+//
+// PREVIOUS DESIGN:
+//   Context switch every N ticks (modulo counter).  No concept of
+//   time slices — just a fixed throttle.
+//
+// CURRENT DESIGN:
+//   Every tick: send EOI, call scheduler.tick() which decrements the
+//   running process's remaining time slice and handles aging.
+//   When tick() returns true (slice exhausted): do full context switch.
+//   Otherwise: return immediately (same process continues).
 
-use core::{arch::global_asm, sync::atomic::{AtomicUsize, Ordering}};
+use core::arch::global_asm;
 use super::trapframe::TrapFrame;
 
 global_asm!(
     ".global timer_interrupt_entry",
     "timer_interrupt_entry:",
     
-    // Guardar TODOS los registros
+    // Save ALL registers
     "push rax",
     "push rbx",
     "push rcx",
@@ -25,15 +36,15 @@ global_asm!(
     "push r14",
     "push r15",
     
-    // Llamar al handler con puntero al TrapFrame actual
+    // Call handler with pointer to current TrapFrame
     "mov rdi, rsp",
     "call timer_preempt_handler",
     
-    // El handler retorna el nuevo TrapFrame en RAX
-    // Cambiar RSP al nuevo TrapFrame
+    // Handler returns new TrapFrame pointer in RAX
+    // Switch RSP to new TrapFrame (may be same or different process)
     "mov rsp, rax",
     
-    // Restaurar registros del NUEVO proceso
+    // Restore registers from the (possibly new) process
     "pop r15",
     "pop r14",
     "pop r13",
@@ -50,7 +61,7 @@ global_asm!(
     "pop rbx",
     "pop rax",
     
-    // IRETQ al NUEVO proceso (puede ser kernel o user)
+    // IRETQ to the (possibly new) process
     "iretq",
 );
 
@@ -60,22 +71,24 @@ extern "C" {
 
 #[no_mangle]
 pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> *const TrapFrame {
-    // ============ 1. EOI ============
+    // ── 1. EOI (must be first — acknowledge interrupt) ────────────────
     unsafe {
         use x86_64::instructions::port::PortWriteOnly;
         PortWriteOnly::<u8>::new(0x20).write(0x20);
     }
-    
-    // ============ 2. THROTTLE ============
-    // No hacer context switch en cada tick, solo cada 10
-    static TICK: AtomicUsize = AtomicUsize::new(0);
-    let tick = TICK.fetch_add(1, Ordering::Relaxed);
-    if tick % 2 != 0 {
+
+    // ── 2. Tick the scheduler ─────────────────────────────────────────
+    //
+    // tick() decrements the running process's time slice and handles
+    // periodic aging.  Returns true if the slice is exhausted and a
+    // context switch is needed.
+    let mut scheduler = super::scheduler::SCHEDULER.lock();
+
+    if !scheduler.tick() {
+        // Slice still has ticks remaining — continue current process
         return current_tf;
     }
-    
-    // ============ 3. SCHEDULER ============
-    // El scheduler maneja el context switch
-    let mut scheduler = super::scheduler::SCHEDULER.lock();
+
+    // ── 3. Time slice exhausted — context switch ──────────────────────
     scheduler.switch_to_next(current_tf)
 }
