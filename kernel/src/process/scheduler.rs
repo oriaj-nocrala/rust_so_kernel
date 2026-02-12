@@ -1,53 +1,56 @@
 // kernel/src/process/scheduler.rs
 //
-// Run-queue scheduler with time slices and priority aging.
+// Run-queue scheduler with time slices, priority aging, and wait queue.
 //
-// DESIGN:
-//   - 11 priority levels (0 = idle-only, 1..=10 = normal).
-//   - Per-priority run queues.  Running process is in `running`, not in any queue.
-//   - Each process has a TIME SLICE (ticks).  Higher base_priority → longer slice.
-//   - On each timer tick: decrement running process's remaining ticks.
-//   - When slice exhausted: preempt, lower effective_priority by 1 (decay).
-//   - Every AGING_EPOCH ticks: boost all waiting processes' effective_priority
-//     toward their base_priority (anti-starvation).
+// STRUCTURE:
+//   run_queues[0..=10]  — ONLY Ready processes, indexed by effective_priority
+//   wait_queue           — Blocked and Zombie processes (not scanned by scheduler)
+//   running              — the single currently executing process
 //
-// RESULT:
-//   Shell (pri 8) runs for its slice, then decays to effective pri 7.
-//   After enough decays, user processes (pri 5) get a turn.
-//   Aging eventually restores the shell's effective priority.
-//   Everyone runs.  No starvation.
+// A process moves between these containers:
+//   add_process()   → run_queues[eff_pri]
+//   switch_to_next  → running ↔ run_queues  (Ready processes only)
+//   block_current() → running → wait_queue  (future: I/O wait)
+//   wake(pid)       → wait_queue → run_queues[eff_pri]  (future: I/O complete)
+//   kill_current()  → running → wait_queue as Zombie  (segfault, sys_exit)
 //
-// TIME SLICE FORMULA:
-//   ticks = BASE_QUANTUM + (effective_priority * PRIORITY_QUANTUM_BONUS)
-//   With BASE_QUANTUM=2, BONUS=1: pri 8 → 10 ticks, pri 5 → 7 ticks, pri 0 → 2 ticks.
+// TIME SLICES + AGING:
+//   Each process gets quantum = BASE_QUANTUM + eff_pri * BONUS ticks.
+//   When exhausted: preempt, decay eff_pri by 1.
+//   Every AGING_EPOCH ticks: boost waiting processes' eff_pri toward base.
 
-use alloc::{boxed::Box, collections::VecDeque};
+use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use spin::Mutex;
 use super::{Process, Pid, ProcessState, TrapFrame};
 use crate::memory::vma::Vma;
 
-/// Number of priority levels (0..=10).
 const NUM_PRIORITIES: usize = 11;
 
-/// Base time slice (ticks) for all processes.
+/// Data needed to overwrite an exception stack frame for process switching.
+/// Returned by `kill_and_switch` so the caller (page fault handler) can
+/// redirect `iretq` to the next process without touching scheduler internals.
+pub struct IretFrame {
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
 const BASE_QUANTUM: u32 = 2;
-
-/// Extra ticks per effective priority level.
 const PRIORITY_QUANTUM_BONUS: u32 = 1;
-
-/// Every this many timer ticks, boost starving processes.
 const AGING_EPOCH: u32 = 50;
-
-/// Minimum effective priority (idle excluded — idle is always 0).
 const MIN_EFFECTIVE_PRIORITY: u8 = 1;
 
 pub static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
 
 pub struct Scheduler {
-    /// Per-priority run queues indexed by EFFECTIVE priority.
+    /// Per-priority run queues — ONLY Ready processes.
     run_queues: [VecDeque<Box<Process>>; NUM_PRIORITIES],
 
-    /// Currently executing process — not in any queue.
+    /// Blocked and Zombie processes.  Not scanned during scheduling.
+    wait_queue: VecDeque<Box<Process>>,
+
+    /// Currently executing process.
     running: Option<Box<Process>>,
 
     /// Remaining ticks for the running process.
@@ -69,6 +72,7 @@ impl Scheduler {
                 VecDeque::new(), VecDeque::new(), VecDeque::new(),
                 VecDeque::new(), VecDeque::new(),
             ],
+            wait_queue: VecDeque::new(),
             running: None,
             remaining_ticks: 0,
             global_ticks: 0,
@@ -77,7 +81,7 @@ impl Scheduler {
     }
 
     // ====================================================================
-    // Time slice calculation
+    // Time slice
     // ====================================================================
 
     fn quantum_for(effective_priority: u8) -> u32 {
@@ -98,9 +102,7 @@ impl Scheduler {
     // Process insertion
     // ====================================================================
 
-    /// Add a process to its effective priority queue.
     pub fn add_process(&mut self, mut process: Box<Process>) {
-        // New processes start with effective = base
         process.effective_priority = process.priority;
         let pri = (process.effective_priority as usize).min(NUM_PRIORITIES - 1);
         crate::serial_println!(
@@ -130,66 +132,127 @@ impl Scheduler {
     // Iteration (debug / introspection)
     // ====================================================================
 
+    /// Iterate over ALL processes: running + run queues + wait queue.
     pub fn iter_all(&self) -> impl Iterator<Item = &Process> + '_ {
-        self.running.as_deref().into_iter().chain(
-            self.run_queues
-                .iter()
-                .flat_map(|q| q.iter())
-                .map(|boxed| boxed.as_ref()),
-        )
+        self.running.as_deref().into_iter()
+            .chain(
+                self.run_queues.iter()
+                    .flat_map(|q| q.iter())
+                    .map(|b| b.as_ref())
+            )
+            .chain(
+                self.wait_queue.iter().map(|b| b.as_ref())
+            )
     }
 
     // ====================================================================
-    // Timer tick — called EVERY timer interrupt
+    // Kill current process (user segfault, sys_exit)
     // ====================================================================
 
-    /// Called on every timer tick.  Returns true if the running process's
-    /// time slice is exhausted and a context switch should happen.
+    /// Mark the running process as Zombie and move it to the wait queue.
+    ///
+    /// Returns true if a process was killed, false if nothing was running.
+    /// After calling this, the caller must trigger a context switch
+    /// (the running slot is now empty).
+    pub fn kill_current(&mut self, reason: &str) -> bool {
+        if let Some(mut proc) = self.running.take() {
+            crate::serial_println!(
+                "💀 Killed PID {} ({}): {}",
+                proc.pid.0,
+                core::str::from_utf8(&proc.name)
+                    .unwrap_or("<?>")
+                    .trim_end_matches('\0'),
+                reason,
+            );
+            proc.state = ProcessState::Zombie;
+            self.wait_queue.push_back(proc);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Kill the running process and schedule the next one.
+    ///
+    /// Returns the iret frame fields (rip, cs, rflags, rsp, ss) of the
+    /// next process so the caller can overwrite an exception stack frame.
+    /// Also activates the new address space and updates TSS.
+    ///
+    /// Panics if no Ready process exists (shouldn't happen with idle).
+    pub fn kill_and_switch(&mut self, reason: &str) -> IretFrame {
+        self.kill_current(reason);
+
+        // Find and schedule next Ready process
+        for priority in (0..NUM_PRIORITIES).rev() {
+            if let Some(mut proc) = self.run_queues[priority].pop_front() {
+                proc.state = ProcessState::Running;
+
+                unsafe {
+                    proc.address_space.activate();
+                }
+                super::tss::set_kernel_stack(proc.kernel_stack);
+
+                self.remaining_ticks = Self::quantum_for(proc.effective_priority);
+
+                let frame = IretFrame {
+                    rip: proc.trapframe.rip,
+                    cs: proc.trapframe.cs,
+                    rflags: proc.trapframe.rflags,
+                    rsp: proc.trapframe.rsp,
+                    ss: proc.trapframe.ss,
+                };
+
+                self.running = Some(proc);
+                return frame;
+            }
+        }
+
+        panic!("No process to switch to after killing user process");
+    }
+
+    // ====================================================================
+    // Timer tick
+    // ====================================================================
+
+    /// Called on every timer tick.  Returns true if a context switch
+    /// should happen (time slice exhausted).
     pub fn tick(&mut self) -> bool {
         self.global_ticks = self.global_ticks.wrapping_add(1);
 
-        // Periodic aging: boost starving processes
         if self.global_ticks % AGING_EPOCH == 0 {
             self.age_processes();
         }
 
-        // Decrement running process's slice
         if self.remaining_ticks > 0 {
             self.remaining_ticks -= 1;
         }
 
-        // Slice exhausted → need context switch
         self.remaining_ticks == 0
     }
 
     // ====================================================================
-    // Priority aging (anti-starvation)
+    // Priority aging
     // ====================================================================
 
-    /// Boost effective_priority of all waiting processes toward their
-    /// base_priority.  This ensures that low-priority processes that have
-    /// been waiting a long time eventually get scheduled.
+    /// Boost effective_priority of all Ready processes in run queues
+    /// toward their base_priority.
     fn age_processes(&mut self) {
-        // We need to move processes between queues if their effective
-        // priority changes.  To avoid borrow issues, collect first.
         for pri in 0..NUM_PRIORITIES {
             let mut i = 0;
             while i < self.run_queues[pri].len() {
                 let proc = &self.run_queues[pri][i];
 
-                // Skip idle (always stays at 0)
                 if proc.pid.0 == 0 {
                     i += 1;
                     continue;
                 }
 
-                // Only boost if effective < base (i.e., it was decayed)
                 if proc.effective_priority < proc.priority {
                     let mut proc = self.run_queues[pri].remove(i).unwrap();
                     proc.effective_priority = (proc.effective_priority + 1).min(proc.priority);
                     let new_pri = (proc.effective_priority as usize).min(NUM_PRIORITIES - 1);
                     self.run_queues[new_pri].push_back(proc);
-                    // Don't increment i — the next element shifted into position i
+                    // Don't increment i — next element shifted into position i
                 } else {
                     i += 1;
                 }
@@ -201,62 +264,64 @@ impl Scheduler {
     // Context switch
     // ====================================================================
 
-    /// Save current process, find next, activate, return new TrapFrame.
-    ///
-    /// Called from `timer_preempt_handler` when `tick()` returns true
-    /// (slice exhausted).
+    /// Save current process, find next Ready, activate, return new TrapFrame.
     pub fn switch_to_next(&mut self, current_tf: *const TrapFrame) -> *const TrapFrame {
-        // ── 1. Save current process ───────────────────────────────────
+        // ── 1. Save current process back to its run queue ─────────────
 
         if let Some(mut proc) = self.running.take() {
             unsafe {
                 *proc.trapframe = *current_tf;
             }
 
-            if proc.state == ProcessState::Running {
-                proc.state = ProcessState::Ready;
+            match proc.state {
+                ProcessState::Running => {
+                    // Normal preemption — put back in run queue as Ready
+                    proc.state = ProcessState::Ready;
 
-                // Decay effective priority (unless idle or already at minimum)
-                if proc.pid.0 != 0 && proc.effective_priority > MIN_EFFECTIVE_PRIORITY {
-                    proc.effective_priority -= 1;
+                    // Decay effective priority (not idle)
+                    if proc.pid.0 != 0 && proc.effective_priority > MIN_EFFECTIVE_PRIORITY {
+                        proc.effective_priority -= 1;
+                    }
+
+                    let pri = (proc.effective_priority as usize).min(NUM_PRIORITIES - 1);
+                    self.run_queues[pri].push_back(proc);
+                }
+                ProcessState::Zombie | ProcessState::Blocked => {
+                    // Process was killed or blocked during its slice
+                    // (e.g. kill_current was called but running was already taken)
+                    self.wait_queue.push_back(proc);
+                }
+                ProcessState::Ready => {
+                    // Shouldn't happen, but handle gracefully
+                    let pri = (proc.effective_priority as usize).min(NUM_PRIORITIES - 1);
+                    self.run_queues[pri].push_back(proc);
                 }
             }
-
-            let pri = (proc.effective_priority as usize).min(NUM_PRIORITIES - 1);
-            self.run_queues[pri].push_back(proc);
         }
 
         // ── 2. Find highest effective-priority Ready process ──────────
+        //
+        // Run queues contain ONLY Ready processes, so no need to skip
+        // Blocked/Zombie.  Just pop from front.
 
         for priority in (0..NUM_PRIORITIES).rev() {
-            let queue = &mut self.run_queues[priority];
-            let len = queue.len();
+            if let Some(mut proc) = self.run_queues[priority].pop_front() {
+                proc.state = ProcessState::Running;
 
-            for _ in 0..len {
-                if let Some(mut proc) = queue.pop_front() {
-                    if proc.state == ProcessState::Ready {
-                        proc.state = ProcessState::Running;
-
-                        unsafe {
-                            proc.address_space.activate();
-                        }
-                        super::tss::set_kernel_stack(proc.kernel_stack);
-
-                        // Set time slice for this process
-                        self.remaining_ticks = Self::quantum_for(proc.effective_priority);
-
-                        let tf_ptr = &*proc.trapframe as *const TrapFrame;
-                        self.running = Some(proc);
-                        return tf_ptr;
-                    }
-
-                    // Not Ready (Zombie/Blocked) — put back at tail
-                    queue.push_back(proc);
+                unsafe {
+                    proc.address_space.activate();
                 }
+                super::tss::set_kernel_stack(proc.kernel_stack);
+
+                self.remaining_ticks = Self::quantum_for(proc.effective_priority);
+
+                let tf_ptr = &*proc.trapframe as *const TrapFrame;
+                self.running = Some(proc);
+                return tf_ptr;
             }
         }
 
-        // ── 3. Nothing Ready — stay on current_tf (should not happen) ─
+        // ── 3. Nothing Ready (shouldn't happen if idle exists) ────────
         current_tf
     }
 
@@ -281,7 +346,6 @@ impl Scheduler {
             }
         }
 
-        // Find highest-priority non-idle Ready process
         for priority in (1..NUM_PRIORITIES).rev() {
             let queue = &mut self.run_queues[priority];
 
@@ -317,7 +381,7 @@ impl Scheduler {
 }
 
 // ============================================================================
-// Public API for demand paging + syscalls
+// Public API
 // ============================================================================
 
 pub fn current_pid() -> Option<usize> {

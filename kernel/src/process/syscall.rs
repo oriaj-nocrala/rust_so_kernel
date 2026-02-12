@@ -1,13 +1,9 @@
 // kernel/src/process/syscall.rs
 //
-// CORRECTED: All syscalls use `with_current_process` or `with_scheduler`
-// helpers that guarantee:
-//   1. cli before lock acquisition
-//   2. Lock is ALWAYS dropped before sti
-//   3. No early returns can bypass sti
+// All syscalls use `with_current_process` or `with_scheduler` helpers
+// that guarantee cli before lock, lock dropped before sti.
 //
-// UPDATED: with_current_process now uses scheduler.running_mut() for O(1)
-// access to the current process, instead of O(n) find by PID.
+// with_current_process uses scheduler.running_mut() for O(1) access.
 
 use core::arch::global_asm;
 use crate::serial_println;
@@ -118,22 +114,9 @@ pub mod errno {
 }
 
 // ============================================================================
-// SAFE HELPERS: Guarantee correct cli/sti + lock ordering
+// SAFE HELPERS
 // ============================================================================
-//
-// These helpers make the deadlock STRUCTURALLY IMPOSSIBLE:
-//
-//   cli
-//   {
-//       let guard = SCHEDULER.lock();     // lock acquired
-//       result = closure(&mut process);   // closure returns VALUE, not early-return
-//   }                                     // guard drops HERE — unconditionally
-//   sti                                   // sti AFTER lock is gone
 
-/// Execute a closure with the current process, under cli + scheduler lock.
-///
-/// Uses `scheduler.running_mut()` for O(1) access to the running process
-/// (no PID lookup needed — the running process is stored directly).
 fn with_current_process<F>(f: F) -> SyscallResult
 where
     F: FnOnce(&mut super::Process) -> SyscallResult,
@@ -142,19 +125,16 @@ where
 
     let result = {
         let mut scheduler = super::scheduler::SCHEDULER.lock();
-
         match scheduler.running_mut() {
             Some(proc) => f(proc),
             None => errno::ESRCH,
         }
-        // MutexGuard drops HERE
     };
 
     unsafe { core::arch::asm!("sti"); }
     result
 }
 
-/// Execute a closure with the scheduler locked (for getpid, exit, etc).
 fn with_scheduler<F>(f: F) -> SyscallResult
 where
     F: FnOnce(&mut super::scheduler::Scheduler) -> SyscallResult,
@@ -164,7 +144,6 @@ where
     let result = {
         let mut scheduler = super::scheduler::SCHEDULER.lock();
         f(&mut scheduler)
-        // MutexGuard drops HERE
     };
 
     unsafe { core::arch::asm!("sti"); }
@@ -269,10 +248,7 @@ fn sys_write(fd: i32, buf: usize, count: usize) -> SyscallResult {
 }
 
 fn sys_open(path_ptr: usize, _flags: i32) -> SyscallResult {
-    use alloc::boxed::Box;
-    use super::file::*;
-
-    // Validation and object creation BEFORE cli — no lock needed
+    // Validation BEFORE cli — no lock needed
     if let Err(e) = validate_user_buffer(path_ptr as u64, 256) {
         return e;
     }
@@ -291,13 +267,11 @@ fn sys_open(path_ptr: usize, _flags: i32) -> SyscallResult {
         Err(_) => return errno::EINVAL,
     };
 
-    // Box allocation uses Slab (different lock from SCHEDULER — no conflict)
-    let handle: Box<dyn FileHandle> = match path {
-        "/dev/null" => Box::new(DevNull),
-        "/dev/zero" => Box::new(DevZero),
-        "/dev/console" => Box::new(SerialConsole),
-        "/dev/fb" => Box::new(FramebufferConsole::new()),
-        _ => return errno::ENOENT,
+    // Ask the driver registry for a handle.
+    // Box allocation uses Slab (different lock from SCHEDULER).
+    let handle = match crate::drivers::open_device(path) {
+        Some(h) => h,
+        None => return errno::ENOENT,
     };
 
     // Only take scheduler lock for the FD table insertion
@@ -330,19 +304,17 @@ fn sys_getpid() -> SyscallResult {
 }
 
 fn sys_exit(status: i32) -> SyscallResult {
+    use alloc::format;
+
+    let reason = format!("exit({})", status);
+
     with_scheduler(|scheduler| {
-        if let Some(proc) = scheduler.running_mut() {
-            proc.state = super::ProcessState::Zombie;
-            crate::serial_println!(
-                "Process {} exited with status {}",
-                proc.pid.0,
-                status,
-            );
-        }
+        scheduler.kill_current(&reason);
         0
     });
 
-    // Process is now Zombie. Halt until the timer preempts us.
+    // Process is now Zombie in wait_queue.
+    // Halt until the timer preempts and switches to another process.
     loop {
         unsafe { core::arch::asm!("hlt"); }
     }
