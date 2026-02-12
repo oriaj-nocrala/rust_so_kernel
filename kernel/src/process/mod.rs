@@ -1,16 +1,15 @@
 // kernel/src/process/mod.rs
-// ✅ IMPLEMENTACIÓN CON PAGE TABLES AISLADAS
+// ✅ IMPLEMENTACIÓN CON ADDRESS SPACES AISLADOS
 
 use alloc::boxed::Box;
 use x86_64::VirtAddr;
-use crate::memory::page_table_manager::OwnedPageTable;
+use crate::memory::address_space::AddressSpace;
 
 pub mod scheduler;
 pub mod trapframe;
 pub mod timer_preempt;
 pub mod tss;
 pub mod syscall;
-pub mod user_test_minimal;
 pub mod file;
 pub mod user_test_fileio;
 
@@ -42,19 +41,20 @@ pub struct Process {
     pub name: [u8; 16],
     pub trapframe: Box<TrapFrame>,
     pub kernel_stack: VirtAddr,
-    pub page_table: OwnedPageTable,
+    /// The process's virtual address space (page table + VMAs).
+    pub address_space: AddressSpace,
     pub files: FileDescriptorTable,
 }
 
 impl Process {
     /// Crear proceso de KERNEL
     ///
-    /// Kernel processes share the kernel page table (OwnedPageTable::from_current).
+    /// Kernel processes share the kernel page table via AddressSpace::kernel().
     pub fn new_kernel(
         pid: Pid,
         entry: VirtAddr,
         kernel_stack: VirtAddr,
-        page_table: OwnedPageTable,
+        address_space: AddressSpace,
     ) -> Self {
         let mut trapframe = Box::new(TrapFrame::default());
         
@@ -93,20 +93,20 @@ impl Process {
             name: [0; 16],
             trapframe,
             kernel_stack,
-            page_table,
+            address_space,
             files: FileDescriptorTable::new_with_stdio(),
         }
     }
     
     /// Crear proceso de USER
     ///
-    /// Each user process has its OWN page table (OwnedPageTable::new_user).
+    /// Each user process has its OWN AddressSpace (page table + VMAs).
     pub fn new_user(
         pid: Pid,
         entry: VirtAddr,
         user_stack: VirtAddr,
         kernel_stack: VirtAddr,
-        page_table: OwnedPageTable,
+        address_space: AddressSpace,
     ) -> Self {
         let mut trapframe = Box::new(TrapFrame::default());
         
@@ -145,7 +145,7 @@ impl Process {
             name: [0; 16],
             trapframe,
             kernel_stack,
-            page_table,
+            address_space,
             files: FileDescriptorTable::new_with_stdio(),
         }
     }
@@ -194,9 +194,9 @@ pub fn start_first_process() -> ! {
                 
                 tss::set_kernel_stack(kernel_stack);
                 
-                // ✅ Activate the process's page table
+                // ✅ Activate the process's address space (page table)
                 unsafe {
-                    proc.page_table.activate();
+                    proc.address_space.activate();
                 }
                 
                 crate::serial_println!(

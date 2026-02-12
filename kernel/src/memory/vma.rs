@@ -5,24 +5,20 @@
 // distinguish legitimate faults (allocate a page) from invalid ones
 // (kill the process).
 //
-// Design:
-//   - Fixed-size arrays (no heap allocation in the VMA subsystem itself)
-//   - Global table indexed by PID
-//   - Lock-free reads are NOT needed because the fault handler runs
-//     with interrupts disabled anyway (x86 page fault)
+// ── REFACTOR NOTE ──────────────────────────────────────────────────
+// VMAs now live INSIDE AddressSpace (which lives inside Process).
+// The global VMA_TABLE indexed by PID has been removed.
+// This file only exports the data types and VmaList container.
+// ───────────────────────────────────────────────────────────────────
 
-use spin::Mutex;
 use x86_64::structures::paging::PageTableFlags;
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-/// Maximum number of processes tracked.
-pub const MAX_PROCESSES: usize = 64;
-
 /// Maximum VMAs per process (code + stack + heap + extras).
-const MAX_VMAS_PER_PROCESS: usize = 16;
+pub const MAX_VMAS_PER_PROCESS: usize = 16;
 
 // ============================================================================
 // VMA types
@@ -73,7 +69,7 @@ impl Vma {
 }
 
 // ============================================================================
-// Per-process VMA list
+// Per-process VMA list (owned by AddressSpace)
 // ============================================================================
 
 pub struct VmaList {
@@ -117,86 +113,24 @@ impl VmaList {
     pub fn iter(&self) -> impl Iterator<Item = &Vma> {
         self.entries.iter().filter_map(|v| v.as_ref())
     }
-}
 
-// ============================================================================
-// Global VMA registry
-// ============================================================================
-
-static VMA_TABLE: Mutex<VmaTable> = Mutex::new(VmaTable::new());
-
-struct VmaTable {
-    lists: [VmaList; MAX_PROCESSES],
-}
-
-impl VmaTable {
-    const fn new() -> Self {
-        const INIT: VmaList = VmaList::new();
-        Self {
-            lists: [INIT; MAX_PROCESSES],
+    /// Debug: print all VMAs to serial.
+    /// `label` is typically the PID, used only for the log line.
+    pub fn dump(&self, label: usize) {
+        crate::serial_println!("VMAs for PID {}:", label);
+        for vma in self.iter() {
+            let kind_str = match vma.kind {
+                VmaKind::Anonymous => "anon",
+                VmaKind::Code => "code",
+            };
+            crate::serial_println!(
+                "  {:#x}..{:#x} ({} pages) [{}] flags={:#x}",
+                vma.start,
+                vma.end(),
+                vma.size_pages,
+                kind_str,
+                vma.flags,
+            );
         }
-    }
-}
-
-// ============================================================================
-// Public API
-// ============================================================================
-
-/// Register a VMA for a process.
-///
-/// # Example
-/// ```ignore
-/// register_vma(pid, Vma {
-///     start: 0x7100_0000_0000,
-///     size_pages: 16,
-///     flags: (PRESENT | WRITABLE | USER_ACCESSIBLE).bits(),
-///     kind: VmaKind::Anonymous,
-/// })?;
-/// ```
-pub fn register_vma(pid: usize, vma: Vma) -> Result<(), &'static str> {
-    if pid >= MAX_PROCESSES {
-        return Err("PID out of range for VMA table");
-    }
-    let mut table = VMA_TABLE.lock();
-    table.lists[pid].add(vma)
-}
-
-/// Find the VMA containing `addr` for process `pid`.
-/// Returns a copy (Vma is Copy) to avoid holding the lock.
-pub fn find_vma(pid: usize, addr: u64) -> Option<Vma> {
-    if pid >= MAX_PROCESSES {
-        return None;
-    }
-    let table = VMA_TABLE.lock();
-    table.lists[pid].find(addr).copied()
-}
-
-/// Clear all VMAs for a process (on exit).
-pub fn clear_vmas(pid: usize) {
-    if pid < MAX_PROCESSES {
-        VMA_TABLE.lock().lists[pid].clear();
-    }
-}
-
-/// Debug: print all VMAs for a process.
-pub fn dump_vmas(pid: usize) {
-    if pid >= MAX_PROCESSES {
-        return;
-    }
-    let table = VMA_TABLE.lock();
-    crate::serial_println!("VMAs for PID {}:", pid);
-    for vma in table.lists[pid].iter() {
-        let kind_str = match vma.kind {
-            VmaKind::Anonymous => "anon",
-            VmaKind::Code => "code",
-        };
-        crate::serial_println!(
-            "  {:#x}..{:#x} ({} pages) [{}] flags={:#x}",
-            vma.start,
-            vma.end(),
-            vma.size_pages,
-            kind_str,
-            vma.flags,
-        );
     }
 }

@@ -5,9 +5,15 @@
 // Flow:
 //   1. CPU faults on unmapped page → pushes error code, jumps to vector 14
 //   2. This handler reads CR2 (faulting address)
-//   3. Looks up the current process's VMAs
+//   3. Looks up the current process's VMAs via AddressSpace
 //   4. If address is in a valid Anonymous VMA → allocate frame, map, zero, resume
 //   5. If address is invalid → return Err (caller panics or kills process)
+//
+// ── REFACTOR NOTE ──────────────────────────────────────────────────
+// VMAs are now accessed through:
+//   SCHEDULER → current process → address_space → vmas
+// instead of the old global VMA_TABLE[pid].
+// ───────────────────────────────────────────────────────────────────
 
 use x86_64::{
     VirtAddr,
@@ -18,7 +24,7 @@ use x86_64::{
     },
 };
 
-use crate::memory::vma::{self, VmaKind};
+use crate::memory::vma::VmaKind;
 use crate::memory::page_table_manager::BuddyFrameAllocator;
 
 // Page fault error code bits
@@ -60,17 +66,12 @@ pub fn handle_page_fault(error_code: u64) -> Result<(), &'static str> {
         return Err("Protection violation (page present, future CoW)");
     }
 
-    // ── 2. Look up current process ────────────────────────────────────
+    // ── 2. Look up VMA through the current process's AddressSpace ─────
 
-    let pid = crate::process::scheduler::current_pid()
-        .ok_or("Page fault with no current process")?;
-
-    // ── 3. Find VMA for the faulting address ──────────────────────────
-
-    let vma = vma::find_vma(pid, fault_addr)
+    let (pid, vma) = crate::process::scheduler::find_current_vma(fault_addr)
         .ok_or("Segmentation fault: no VMA for address")?;
 
-    // ── 4. Only demand-page Anonymous regions ─────────────────────────
+    // ── 3. Only demand-page Anonymous regions ─────────────────────────
 
     match vma.kind {
         VmaKind::Anonymous => { /* proceed */ }
@@ -79,7 +80,7 @@ pub fn handle_page_fault(error_code: u64) -> Result<(), &'static str> {
         }
     }
 
-    // ── 5. Allocate a physical frame ──────────────────────────────────
+    // ── 4. Allocate a physical frame ──────────────────────────────────
 
     let mut buddy_alloc = BuddyFrameAllocator;
 
@@ -87,7 +88,7 @@ pub fn handle_page_fault(error_code: u64) -> Result<(), &'static str> {
         .allocate_frame()
         .ok_or("Demand paging: frame allocation failed (OOM)")?;
 
-    // ── 6. Zero the frame (security + correctness) ────────────────────
+    // ── 5. Zero the frame (security + correctness) ────────────────────
 
     unsafe {
         let phys_offset = crate::memory::physical_memory_offset();
@@ -95,7 +96,7 @@ pub fn handle_page_fault(error_code: u64) -> Result<(), &'static str> {
         core::ptr::write_bytes(frame_virt.as_mut_ptr::<u8>(), 0, 4096);
     }
 
-    // ── 7. Map the page in the current page table ─────────────────────
+    // ── 6. Map the page in the current page table ─────────────────────
 
     let page: Page<Size4KiB> = Page::containing_address(
         VirtAddr::new(fault_addr & !0xFFF)
@@ -114,7 +115,7 @@ pub fn handle_page_fault(error_code: u64) -> Result<(), &'static str> {
             .flush();
     }
 
-    // ── 8. Success! ───────────────────────────────────────────────────
+    // ── 7. Success! ───────────────────────────────────────────────────
 
     crate::serial_println!(
         "📄 Demand page: PID {} fault at {:#x} → mapped {:#x} (phys {:#x})",

@@ -10,6 +10,7 @@ pub mod user_code;
 pub mod page_table_manager;
 pub mod vma;
 pub mod demand_paging;
+pub mod address_space;
 
 static PHYSICAL_MEMORY_OFFSET: AtomicU64 = AtomicU64::new(0);
 

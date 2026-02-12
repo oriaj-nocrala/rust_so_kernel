@@ -4,6 +4,7 @@
 use alloc::{boxed::Box, collections::VecDeque};
 use spin::Mutex;
 use super::{Process, Pid, ProcessState, TrapFrame};
+use crate::memory::vma::Vma;
 
 pub static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
 
@@ -85,7 +86,7 @@ impl Scheduler {
                         // so switching between kernel processes (which all
                         // share the kernel page table) is free.
                         unsafe {
-                            proc.page_table.activate();
+                            proc.address_space.activate();
                         }
                         
                         // Update TSS kernel stack for Ring 3 → Ring 0 transitions
@@ -111,7 +112,7 @@ impl Scheduler {
             
             // Activate idle's page table (= kernel page table, likely no-op)
             unsafe {
-                idle.page_table.activate();
+                idle.address_space.activate();
             }
             
             let tf_ptr = &*idle.trapframe as *const TrapFrame;
@@ -128,8 +129,22 @@ impl Scheduler {
 // ============================================================================
 
 /// Returns the PID of the currently running process as a usize.
-/// Called by the page fault handler to look up VMAs.
 pub fn current_pid() -> Option<usize> {
     let scheduler = SCHEDULER.lock();
     scheduler.current.map(|pid| pid.0)
+}
+
+/// Find the VMA containing `addr` in the current process's AddressSpace.
+///
+/// Returns `Some((pid, vma))` if found, `None` otherwise.
+/// The Vma is copied out so the scheduler lock is released immediately.
+///
+/// Called by the page fault handler (interrupts disabled, no contention
+/// with timer_preempt which also takes this lock).
+pub fn find_current_vma(addr: u64) -> Option<(usize, Vma)> {
+    let scheduler = SCHEDULER.lock();
+    let pid = scheduler.current?;
+    let proc = scheduler.processes.iter().find(|p| p.pid == pid)?;
+    let vma = proc.address_space.find_vma(addr)?;
+    Some((pid.0, vma))
 }

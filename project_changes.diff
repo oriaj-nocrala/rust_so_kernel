@@ -1,0 +1,904 @@
+diff --git a/kernel/src/main.rs b/kernel/src/main.rs
+index 96978f7..40e77f1 100644
+--- a/kernel/src/main.rs
++++ b/kernel/src/main.rs
+@@ -6,6 +6,7 @@ extern crate alloc;
+ 
+ mod allocator;
+ mod framebuffer;
++mod init;
+ mod interrupts;
+ mod keyboard;
+ mod keyboard_buffer;
+@@ -16,127 +17,7 @@ mod pit;
+ mod repl;
+ mod serial;
+ 
+-use alloc::{boxed::Box, format, vec::Vec};
+-use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point, info::{MemoryRegion, MemoryRegionKind}};
+-use framebuffer::Framebuffer;
+-use interrupts::idt::InterruptDescriptorTable;
+-use spin::Once;
+-use x86_64::{VirtAddr, structures::paging::FrameAllocator};
+-use process::{Process, Pid, scheduler::SCHEDULER};
+-use crate::{
+-    allocator::FRAME_ALLOCATOR,
+-    memory::page_table_manager::OwnedPageTable,
+-    process::{ProcessState, scheduler, user_test_minimal},
+-};
+-
+-use process::user_test_fileio;
+-
+-use crate::{
+-    framebuffer::{Color, init_global_framebuffer},
+-    interrupts::exception::ExceptionStackFrame,
+-    memory::{
+-        frame_allocator::BootInfoFrameAllocator,
+-        paging::ActivePageTable,
+-    },
+-    repl::Repl,
+-};
+-
+-static IDT: Once<InterruptDescriptorTable> = Once::new();
+-
+-extern "C" {
+-    fn syscall_entry();
+-}
+-
+-fn init_idt() {
+-    IDT.call_once(|| {
+-        let mut idt = InterruptDescriptorTable::new();
+-        idt.add_handler(0, divide_by_zero_handler);
+-        idt.add_handler(6, invalid_opcode_handler);
+-        idt.add_double_fault_handler(8, double_fault_handler);
+-        idt.add_handler_with_error(13, general_protection_fault_handler);
+-        idt.add_handler_with_error(14, page_fault_handler);
+-        idt.entries[32].set_handler_addr(process::timer_preempt::timer_interrupt_entry as u64);
+-        idt.add_handler(33, keyboard_interrupt_handler);
+-        idt.entries[0x80]
+-            .set_handler_addr(syscall_entry as u64)
+-            .set_privilege_level(3);
+-        idt
+-    });
+-}
+-
+-fn load_idt() {
+-    IDT.get().unwrap().load();
+-}
+-
+-extern "x86-interrupt" fn keyboard_interrupt_handler(_: &mut ExceptionStackFrame) {
+-    let scancode = unsafe {
+-        x86_64::instructions::port::PortReadOnly::<u8>::new(0x60).read()
+-    };
+-    keyboard::process_scancode(scancode);
+-    interrupts::pic::end_of_interrupt(interrupts::pic::Irq::Keyboard.as_u8());
+-}
+-
+-extern "x86-interrupt" fn divide_by_zero_handler(sf: &mut ExceptionStackFrame) {
+-    panic!("DIVIDE BY ZERO at {:#x}", sf.instruction_pointer);
+-}
+-
+-extern "x86-interrupt" fn invalid_opcode_handler(sf: &mut ExceptionStackFrame) {
+-    panic!("INVALID OPCODE at {:#x}", sf.instruction_pointer);
+-}
+-
+-extern "x86-interrupt" fn double_fault_handler(
+-    sf: &mut ExceptionStackFrame,
+-    error_code: u64
+-) -> ! {
+-    panic!("DOUBLE FAULT (error: {}) at {:#x}", error_code, sf.instruction_pointer);
+-}
+-
+-extern "x86-interrupt" fn general_protection_fault_handler(
+-    sf: &mut ExceptionStackFrame,
+-    error_code: u64
+-) {
+-    panic!("GENERAL PROTECTION FAULT (error: {}) at {:#x}", error_code, sf.instruction_pointer);
+-}
+-
+-// ✅ Page fault handler — tries demand paging before panicking
+-extern "x86-interrupt" fn page_fault_handler(
+-    sf: &mut ExceptionStackFrame,
+-    error_code: u64
+-) {
+-    use crate::memory::demand_paging;
+-
+-    // Try demand paging first.
+-    // If the fault is in a valid VMA (e.g. lazy stack), a page will be
+-    // allocated, mapped, and zeroed.  The CPU retries the instruction on iret.
+-    match demand_paging::handle_page_fault(error_code) {
+-        Ok(()) => {
+-            // Page was mapped successfully — resume execution.
+-            return;
+-        }
+-        Err(reason) => {
+-            // Not a demand-pageable fault → unrecoverable
+-            let fault_address: u64;
+-            unsafe {
+-                core::arch::asm!("mov {}, cr2", out(reg) fault_address);
+-            }
+-
+-            panic!(
+-                "PAGE FAULT (unhandled)\n  Address: {:#x}\n  Error code: {:#b}\n  Reason: {}\n  RIP: {:#x}",
+-                fault_address,
+-                error_code,
+-                reason,
+-                sf.instruction_pointer
+-            );
+-        }
+-    }
+-}
+-
+-extern "x86-interrupt" fn timer_handler(_sf: &mut ExceptionStackFrame) {
+-    unsafe {
+-        use x86_64::instructions::port::PortWriteOnly;
+-        PortWriteOnly::<u8>::new(0x20).write(0x20);
+-    }
+-}
++use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
+ 
+ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
+     let mut config = BootloaderConfig::new_default();
+@@ -147,372 +28,5 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
+ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
+ 
+ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+-    init_idt();
+-
+-    let fb = boot_info.framebuffer.as_mut().expect("No framebuffer");
+-    let info = fb.info();
+-    let buffer = fb.buffer_mut();
+-
+-    let framebuffer = Framebuffer::new(
+-        buffer,
+-        info.width as usize,
+-        info.height as usize,
+-        info.stride as usize,
+-        info.bytes_per_pixel as usize,
+-    );
+-
+-    init_global_framebuffer(framebuffer);
+-
+-    let phys_mem_offset = VirtAddr::new(
+-        boot_info.physical_memory_offset.into_option().unwrap()
+-    );
+-
+-    // ✅ Print the physical memory offset so we can verify PML4 entry
+-    serial_println!("Physical memory offset: {:#x} (PML4 entry {})",
+-        phys_mem_offset.as_u64(),
+-        phys_mem_offset.as_u64() >> 39
+-    );
+-
+-    memory::init(phys_mem_offset);
+-    
+-    // --- Inicialización de Memoria ---
+-    let frame_allocator = unsafe {
+-        BootInfoFrameAllocator::init(&boot_info.memory_regions)
+-    };
+-    
+-    let page_table = unsafe {
+-        ActivePageTable::new(phys_mem_offset)
+-    };
+-    
+-    allocator::init_allocators(page_table, frame_allocator);
+-
+-    // --- Inicializar Buddy Allocator ---
+-    {
+-        let mut buddy = allocator::buddy_allocator::BUDDY.lock();
+-        
+-        for region in boot_info.memory_regions.iter() {
+-            if region.kind == MemoryRegionKind::Usable {
+-                unsafe {
+-                    buddy.add_region(region.start, region.end);
+-                }
+-            }
+-        }
+-    }
+-
+-    serial_println!("Step 8: Printing Buddy stats (lock released)");
+-    {
+-        let buddy = allocator::buddy_allocator::BUDDY.lock();
+-        buddy.debug_print_stats();
+-    }
+-
+-    // --- Test Slab ---
+-    {
+-        use core::alloc::{GlobalAlloc, Layout};
+-
+-        let layout = Layout::from_size_align(8, 8).unwrap();
+-        let ptr = unsafe { alloc::alloc::alloc(layout) };
+-
+-        if ptr.is_null() {
+-            serial_println!("  FAILED: Got null pointer");
+-            panic!("Slab allocation failed");
+-        } else {
+-            serial_println!("  SUCCESS: Got pointer {:#x}", ptr as u64);
+-            unsafe {
+-                *(ptr as *mut u64) = 0xDEADBEEF;
+-                let val = *(ptr as *const u64);
+-                serial_println!("  Write/read test: {:#x}", val);
+-                assert_eq!(val, 0xDEADBEEF);
+-                alloc::alloc::dealloc(ptr, layout);
+-            }
+-            serial_println!("  SUCCESS: Deallocation complete");
+-        }
+-    }
+-
+-    {
+-        use alloc::vec::Vec;
+-        serial_println!("  Creating Vec...");
+-        let mut v: Vec<u8> = Vec::new();
+-        v.push(1);
+-        v.push(2);
+-        v.push(3);
+-        serial_println!("  Vec OK: len={}", v.len());
+-    }
+-
+-    {
+-        use alloc::string::String;
+-        serial_println!("  Creating String...");
+-        let s = String::from("Hello Slab!");
+-        serial_println!("  String test: {}", s);
+-    }
+-
+-    allocator::slab::slab_stats();
+-    
+-    // Limpiar pantalla
+-    {
+-        let mut fb = framebuffer::FRAMEBUFFER.lock();
+-        if let Some(fb) = fb.as_mut() {
+-            fb.clear(Color::rgb(0, 0, 0));
+-            fb.draw_text(10, 10, "ConstanOS v0.1", Color::rgb(0, 200, 255), Color::rgb(0, 0, 0), 2);
+-            fb.draw_text(10, 770, "Allocator: Ready", Color::rgb(0, 255, 0), Color::rgb(0, 0, 0), 2);
+-        }
+-    }
+-
+-    // Inicializar interrupciones
+-    interrupts::pic::initialize();
+-    interrupts::pic::enable_irq(0);
+-    interrupts::pic::enable_irq(1);
+-    load_idt();
+-
+-    pit::init(100);
+-
+-    let mut repl = Repl::new(10, 50);
+-    repl.show_prompt();
+-
+-    serial_println!("Step 9: Initializing TSS and GDT");
+-    process::tss::init();
+-
+-    serial_println!("\nStep 10: Creating processes");
+-    
+-    init_processes();
+-
+-    // Debug de file descriptors
+-    {
+-        let scheduler = SCHEDULER.lock();
+-        for proc in scheduler.processes.iter() {
+-            serial_println!("Process {}: open files:", proc.pid.0);
+-            proc.files.debug_list();
+-        }
+-    }
+-
+-    serial_println!("DEBUG: About to start first process");
+-
+-    process::start_first_process();
+-}
+-
+-/// Allocar un kernel stack desde el Buddy (4 KiB).
+-fn allocate_kernel_stack() -> VirtAddr {
+-    let phys_addr = unsafe {
+-        crate::allocator::buddy_allocator::BUDDY.lock()
+-            .allocate(14)
+-            .expect("Failed to allocate kernel stack from buddy")
+-    };
+-    
+-    let virt_addr = crate::memory::physical_memory_offset() + phys_addr.as_u64();
+-    
+-    // Stack top (grows downward)
+-    VirtAddr::new(virt_addr.as_u64() + 4096)
+-}
+-
+-/// Idle process — uses kernel page table (from_current).
+-fn create_idle_process() {
+-    let kernel_stack = allocate_kernel_stack();
+-    let page_table = OwnedPageTable::from_current();
+-    
+-    let mut idle_proc = Box::new(Process::new_kernel(
+-        Pid(0),
+-        VirtAddr::new(idle_task as *const () as u64),
+-        kernel_stack,
+-        page_table,
+-    ));
+-    
+-    idle_proc.set_name("idle");
+-    idle_proc.set_priority(0);
+-    
+-    {
+-        let mut scheduler = SCHEDULER.lock();
+-        scheduler.add_process(idle_proc);
+-    }
+-    
+-    serial_println!("✅ Created idle process (PID 0)");
+-}
+-
+-/// User processes — each gets its own page table with DEMAND-PAGED stack.
+-fn create_user_processes(num_processes: usize) {
+-    use crate::memory::vma::{self, Vma, VmaKind};
+-
+-    let test_name = "write";
+-    
+-    user_test_fileio::print_available_tests();
+-    serial_println!("\n📝 Using test: '{}'", test_name);
+-    
+-    for i in 0..num_processes {
+-        let kernel_stack = allocate_kernel_stack();
+-        
+-        // ============ 1. CREATE PAGE TABLE (copies kernel entries, skips user PML4s) ============
+-        let page_table = unsafe {
+-            OwnedPageTable::new_user()
+-                .expect("Failed to create user page table")
+-        };
+-        
+-        serial_println!(
+-            "Created page table for process {}: PML4 at {:#x}",
+-            i,
+-            page_table.root_frame().start_address().as_u64()
+-        );
+-        
+-        // ============ 2. MAP USER CODE (eagerly — instructions must be present) ============
+-        unsafe {
+-            let code_start = 0x0000_0000_0040_0000_u64;
+-            let code_size = 4096usize;
+-            let num_code_pages = (code_size + 4095) / 4096;
+-            
+-            let flags = x86_64::structures::paging::PageTableFlags::PRESENT
+-                      | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE;
+-            
+-            serial_println!("  Mapping {} pages of user code at {:#x}", 
+-                num_code_pages, code_start);
+-            
+-            let code_ptr = user_test_fileio::get_test_ptr(test_name);
+-            
+-            for page_idx in 0..num_code_pages {
+-                let page_addr = VirtAddr::new(code_start + (page_idx as u64 * 4096));
+-                let page = x86_64::structures::paging::Page::containing_address(page_addr);
+-                
+-                let frame = page_table.map_user_page(page, flags)
+-                    .expect("Failed to map code page");
+-                
+-                let src = code_ptr.add(page_idx * 4096);
+-                let copy_size = code_size.saturating_sub(page_idx * 4096).min(4096);
+-                
+-                let phys_offset = crate::memory::physical_memory_offset();
+-                let dst = (phys_offset + frame.start_address().as_u64()).as_mut_ptr::<u8>();
+-                
+-                core::ptr::copy_nonoverlapping(src, dst, copy_size);
+-                
+-                if copy_size < 4096 {
+-                    core::ptr::write_bytes(dst.add(copy_size), 0, 4096 - copy_size);
+-                }
+-                
+-                serial_println!("    Page {}: {:#x} -> phys {:#x}", 
+-                    page_idx, page_addr.as_u64(), frame.start_address().as_u64());
+-            }
+-        }
+-        
+-        // ============ 3. ALLOCATE PID (need it for VMA registration) ============
+-        let pid = {
+-            let mut scheduler = SCHEDULER.lock();
+-            scheduler.allocate_pid()
+-        };
+-        
+-        // ============ 4. REGISTER VMAs ============
+-        let code_start = 0x0000_0000_0040_0000_u64;
+-        let code_pages = 1usize;
+-        
+-        let user_stack_base = 0x0000_7100_0000_0000_u64 + (i as u64 * 0x10000);
+-        let stack_pages: usize = 16; // 64 KB virtual stack, demand-paged!
+-        
+-        let stack_flags = x86_64::structures::paging::PageTableFlags::PRESENT
+-                        | x86_64::structures::paging::PageTableFlags::WRITABLE
+-                        | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE;
+-        
+-        // Register code VMA (for validation — already mapped eagerly)
+-        vma::register_vma(pid.0, Vma {
+-            start: code_start,
+-            size_pages: code_pages,
+-            flags: (x86_64::structures::paging::PageTableFlags::PRESENT
+-                  | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE).bits(),
+-            kind: VmaKind::Code,
+-        }).expect("Failed to register code VMA");
+-        
+-        // ✅ Register stack VMA — NO physical pages allocated yet!
+-        // Pages will be allocated on-demand when the process touches the stack.
+-        vma::register_vma(pid.0, Vma {
+-            start: user_stack_base,
+-            size_pages: stack_pages,
+-            flags: stack_flags.bits(),
+-            kind: VmaKind::Anonymous,
+-        }).expect("Failed to register stack VMA");
+-        
+-        serial_println!(
+-            "  Stack VMA: {:#x}..{:#x} ({} pages, demand-paged)",
+-            user_stack_base,
+-            user_stack_base + (stack_pages as u64 * 4096),
+-            stack_pages,
+-        );
+-        
+-        // Debug: show all VMAs for this process
+-        vma::dump_vmas(pid.0);
+-        
+-        // ============ 5. CREATE PROCESS ============
+-        {
+-            // RSP points to the TOP of the VMA (grows downward)
+-            let user_stack_top = VirtAddr::new(
+-                user_stack_base + (stack_pages as u64 * 4096) - 8
+-            );
+-            
+-            let mut user_proc = Box::new(Process::new_user(
+-                pid,
+-                VirtAddr::new(0x0000_0000_0040_0000),
+-                user_stack_top,
+-                kernel_stack,
+-                page_table,
+-            ));
+-            
+-            user_proc.set_name(&format!("user_{}", i));
+-            user_proc.set_priority(5);
+-            
+-            let mut scheduler = SCHEDULER.lock();
+-            scheduler.add_process(user_proc);
+-        }
+-        
+-        serial_println!("✅ Created user process {} (PID {})", i, pid.0);
+-    }
+-}
+-
+-/// Shell process — kernel, uses kernel page table.
+-fn create_shell_process() {
+-    let kernel_stack = allocate_kernel_stack();
+-    let page_table = OwnedPageTable::from_current();
+-    
+-    let pid = {
+-        let mut scheduler = SCHEDULER.lock();
+-        let pid = scheduler.allocate_pid();
+-        
+-        let mut shell = Box::new(Process::new_kernel(
+-            pid,
+-            VirtAddr::new(shell_process as *const () as u64),
+-            kernel_stack,
+-            page_table,
+-        ));
+-        
+-        shell.set_name("shell");
+-        shell.set_priority(8);
+-        
+-        scheduler.add_process(shell);
+-        pid
+-    };
+-    
+-    serial_println!("✅ Created shell process (PID {})", pid.0);
+-}
+-
+-fn init_processes() {
+-    serial_println!("\n🔧 Creating processes with isolated page tables...");
+-    
+-    create_idle_process();
+-    create_user_processes(2);
+-    create_shell_process();
+-    
+-    serial_println!("✅ All processes created!\n");
+-}
+-
+-// ============================================================================
+-// PROCESS ENTRY POINTS
+-// ============================================================================
+-
+-fn idle_task() -> ! {
+-    loop {
+-        unsafe { core::arch::asm!("hlt"); }
+-    }
+-}
+-
+-fn shell_process() -> ! {
+-    let mut repl = crate::repl::Repl::new(10, 50);
+-    repl.show_prompt();
+-    
+-    loop {
+-        if let Some(character) = crate::keyboard::read_key() {
+-            repl.handle_char(character);
+-        }
+-        unsafe { core::arch::asm!("pause"); }
+-    }
++    init::boot(boot_info)
+ }
+\ No newline at end of file
+diff --git a/kernel/src/memory/demand_paging.rs b/kernel/src/memory/demand_paging.rs
+index 300d066..af53fca 100644
+--- a/kernel/src/memory/demand_paging.rs
++++ b/kernel/src/memory/demand_paging.rs
+@@ -5,9 +5,15 @@
+ // Flow:
+ //   1. CPU faults on unmapped page → pushes error code, jumps to vector 14
+ //   2. This handler reads CR2 (faulting address)
+-//   3. Looks up the current process's VMAs
++//   3. Looks up the current process's VMAs via AddressSpace
+ //   4. If address is in a valid Anonymous VMA → allocate frame, map, zero, resume
+ //   5. If address is invalid → return Err (caller panics or kills process)
++//
++// ── REFACTOR NOTE ──────────────────────────────────────────────────
++// VMAs are now accessed through:
++//   SCHEDULER → current process → address_space → vmas
++// instead of the old global VMA_TABLE[pid].
++// ───────────────────────────────────────────────────────────────────
+ 
+ use x86_64::{
+     VirtAddr,
+@@ -18,7 +24,7 @@ use x86_64::{
+     },
+ };
+ 
+-use crate::memory::vma::{self, VmaKind};
++use crate::memory::vma::VmaKind;
+ use crate::memory::page_table_manager::BuddyFrameAllocator;
+ 
+ // Page fault error code bits
+@@ -60,17 +66,12 @@ pub fn handle_page_fault(error_code: u64) -> Result<(), &'static str> {
+         return Err("Protection violation (page present, future CoW)");
+     }
+ 
+-    // ── 2. Look up current process ────────────────────────────────────
+-
+-    let pid = crate::process::scheduler::current_pid()
+-        .ok_or("Page fault with no current process")?;
+-
+-    // ── 3. Find VMA for the faulting address ──────────────────────────
++    // ── 2. Look up VMA through the current process's AddressSpace ─────
+ 
+-    let vma = vma::find_vma(pid, fault_addr)
++    let (pid, vma) = crate::process::scheduler::find_current_vma(fault_addr)
+         .ok_or("Segmentation fault: no VMA for address")?;
+ 
+-    // ── 4. Only demand-page Anonymous regions ─────────────────────────
++    // ── 3. Only demand-page Anonymous regions ─────────────────────────
+ 
+     match vma.kind {
+         VmaKind::Anonymous => { /* proceed */ }
+@@ -79,7 +80,7 @@ pub fn handle_page_fault(error_code: u64) -> Result<(), &'static str> {
+         }
+     }
+ 
+-    // ── 5. Allocate a physical frame ──────────────────────────────────
++    // ── 4. Allocate a physical frame ──────────────────────────────────
+ 
+     let mut buddy_alloc = BuddyFrameAllocator;
+ 
+@@ -87,7 +88,7 @@ pub fn handle_page_fault(error_code: u64) -> Result<(), &'static str> {
+         .allocate_frame()
+         .ok_or("Demand paging: frame allocation failed (OOM)")?;
+ 
+-    // ── 6. Zero the frame (security + correctness) ────────────────────
++    // ── 5. Zero the frame (security + correctness) ────────────────────
+ 
+     unsafe {
+         let phys_offset = crate::memory::physical_memory_offset();
+@@ -95,7 +96,7 @@ pub fn handle_page_fault(error_code: u64) -> Result<(), &'static str> {
+         core::ptr::write_bytes(frame_virt.as_mut_ptr::<u8>(), 0, 4096);
+     }
+ 
+-    // ── 7. Map the page in the current page table ─────────────────────
++    // ── 6. Map the page in the current page table ─────────────────────
+ 
+     let page: Page<Size4KiB> = Page::containing_address(
+         VirtAddr::new(fault_addr & !0xFFF)
+@@ -114,7 +115,7 @@ pub fn handle_page_fault(error_code: u64) -> Result<(), &'static str> {
+             .flush();
+     }
+ 
+-    // ── 8. Success! ───────────────────────────────────────────────────
++    // ── 7. Success! ───────────────────────────────────────────────────
+ 
+     crate::serial_println!(
+         "📄 Demand page: PID {} fault at {:#x} → mapped {:#x} (phys {:#x})",
+diff --git a/kernel/src/memory/mod.rs b/kernel/src/memory/mod.rs
+index 6141981..dd16812 100644
+--- a/kernel/src/memory/mod.rs
++++ b/kernel/src/memory/mod.rs
+@@ -10,6 +10,7 @@ pub mod user_code;
+ pub mod page_table_manager;
+ pub mod vma;
+ pub mod demand_paging;
++pub mod address_space;
+ 
+ static PHYSICAL_MEMORY_OFFSET: AtomicU64 = AtomicU64::new(0);
+ 
+diff --git a/kernel/src/memory/vma.rs b/kernel/src/memory/vma.rs
+index ff28cdb..8985eb2 100644
+--- a/kernel/src/memory/vma.rs
++++ b/kernel/src/memory/vma.rs
+@@ -5,24 +5,20 @@
+ // distinguish legitimate faults (allocate a page) from invalid ones
+ // (kill the process).
+ //
+-// Design:
+-//   - Fixed-size arrays (no heap allocation in the VMA subsystem itself)
+-//   - Global table indexed by PID
+-//   - Lock-free reads are NOT needed because the fault handler runs
+-//     with interrupts disabled anyway (x86 page fault)
++// ── REFACTOR NOTE ──────────────────────────────────────────────────
++// VMAs now live INSIDE AddressSpace (which lives inside Process).
++// The global VMA_TABLE indexed by PID has been removed.
++// This file only exports the data types and VmaList container.
++// ───────────────────────────────────────────────────────────────────
+ 
+-use spin::Mutex;
+ use x86_64::structures::paging::PageTableFlags;
+ 
+ // ============================================================================
+ // Constants
+ // ============================================================================
+ 
+-/// Maximum number of processes tracked.
+-pub const MAX_PROCESSES: usize = 64;
+-
+ /// Maximum VMAs per process (code + stack + heap + extras).
+-const MAX_VMAS_PER_PROCESS: usize = 16;
++pub const MAX_VMAS_PER_PROCESS: usize = 16;
+ 
+ // ============================================================================
+ // VMA types
+@@ -73,7 +69,7 @@ impl Vma {
+ }
+ 
+ // ============================================================================
+-// Per-process VMA list
++// Per-process VMA list (owned by AddressSpace)
+ // ============================================================================
+ 
+ pub struct VmaList {
+@@ -117,86 +113,24 @@ impl VmaList {
+     pub fn iter(&self) -> impl Iterator<Item = &Vma> {
+         self.entries.iter().filter_map(|v| v.as_ref())
+     }
+-}
+ 
+-// ============================================================================
+-// Global VMA registry
+-// ============================================================================
+-
+-static VMA_TABLE: Mutex<VmaTable> = Mutex::new(VmaTable::new());
+-
+-struct VmaTable {
+-    lists: [VmaList; MAX_PROCESSES],
+-}
+-
+-impl VmaTable {
+-    const fn new() -> Self {
+-        const INIT: VmaList = VmaList::new();
+-        Self {
+-            lists: [INIT; MAX_PROCESSES],
++    /// Debug: print all VMAs to serial.
++    /// `label` is typically the PID, used only for the log line.
++    pub fn dump(&self, label: usize) {
++        crate::serial_println!("VMAs for PID {}:", label);
++        for vma in self.iter() {
++            let kind_str = match vma.kind {
++                VmaKind::Anonymous => "anon",
++                VmaKind::Code => "code",
++            };
++            crate::serial_println!(
++                "  {:#x}..{:#x} ({} pages) [{}] flags={:#x}",
++                vma.start,
++                vma.end(),
++                vma.size_pages,
++                kind_str,
++                vma.flags,
++            );
+         }
+     }
+-}
+-
+-// ============================================================================
+-// Public API
+-// ============================================================================
+-
+-/// Register a VMA for a process.
+-///
+-/// # Example
+-/// ```ignore
+-/// register_vma(pid, Vma {
+-///     start: 0x7100_0000_0000,
+-///     size_pages: 16,
+-///     flags: (PRESENT | WRITABLE | USER_ACCESSIBLE).bits(),
+-///     kind: VmaKind::Anonymous,
+-/// })?;
+-/// ```
+-pub fn register_vma(pid: usize, vma: Vma) -> Result<(), &'static str> {
+-    if pid >= MAX_PROCESSES {
+-        return Err("PID out of range for VMA table");
+-    }
+-    let mut table = VMA_TABLE.lock();
+-    table.lists[pid].add(vma)
+-}
+-
+-/// Find the VMA containing `addr` for process `pid`.
+-/// Returns a copy (Vma is Copy) to avoid holding the lock.
+-pub fn find_vma(pid: usize, addr: u64) -> Option<Vma> {
+-    if pid >= MAX_PROCESSES {
+-        return None;
+-    }
+-    let table = VMA_TABLE.lock();
+-    table.lists[pid].find(addr).copied()
+-}
+-
+-/// Clear all VMAs for a process (on exit).
+-pub fn clear_vmas(pid: usize) {
+-    if pid < MAX_PROCESSES {
+-        VMA_TABLE.lock().lists[pid].clear();
+-    }
+-}
+-
+-/// Debug: print all VMAs for a process.
+-pub fn dump_vmas(pid: usize) {
+-    if pid >= MAX_PROCESSES {
+-        return;
+-    }
+-    let table = VMA_TABLE.lock();
+-    crate::serial_println!("VMAs for PID {}:", pid);
+-    for vma in table.lists[pid].iter() {
+-        let kind_str = match vma.kind {
+-            VmaKind::Anonymous => "anon",
+-            VmaKind::Code => "code",
+-        };
+-        crate::serial_println!(
+-            "  {:#x}..{:#x} ({} pages) [{}] flags={:#x}",
+-            vma.start,
+-            vma.end(),
+-            vma.size_pages,
+-            kind_str,
+-            vma.flags,
+-        );
+-    }
+ }
+\ No newline at end of file
+diff --git a/kernel/src/process/mod.rs b/kernel/src/process/mod.rs
+index a1c157c..5df05c2 100644
+--- a/kernel/src/process/mod.rs
++++ b/kernel/src/process/mod.rs
+@@ -1,9 +1,9 @@
+ // kernel/src/process/mod.rs
+-// ✅ IMPLEMENTACIÓN CON PAGE TABLES AISLADAS
++// ✅ IMPLEMENTACIÓN CON ADDRESS SPACES AISLADOS
+ 
+ use alloc::boxed::Box;
+ use x86_64::VirtAddr;
+-use crate::memory::page_table_manager::OwnedPageTable;
++use crate::memory::address_space::AddressSpace;
+ 
+ pub mod scheduler;
+ pub mod trapframe;
+@@ -42,19 +42,20 @@ pub struct Process {
+     pub name: [u8; 16],
+     pub trapframe: Box<TrapFrame>,
+     pub kernel_stack: VirtAddr,
+-    pub page_table: OwnedPageTable,
++    /// The process's virtual address space (page table + VMAs).
++    pub address_space: AddressSpace,
+     pub files: FileDescriptorTable,
+ }
+ 
+ impl Process {
+     /// Crear proceso de KERNEL
+     ///
+-    /// Kernel processes share the kernel page table (OwnedPageTable::from_current).
++    /// Kernel processes share the kernel page table via AddressSpace::kernel().
+     pub fn new_kernel(
+         pid: Pid,
+         entry: VirtAddr,
+         kernel_stack: VirtAddr,
+-        page_table: OwnedPageTable,
++        address_space: AddressSpace,
+     ) -> Self {
+         let mut trapframe = Box::new(TrapFrame::default());
+         
+@@ -93,20 +94,20 @@ impl Process {
+             name: [0; 16],
+             trapframe,
+             kernel_stack,
+-            page_table,
++            address_space,
+             files: FileDescriptorTable::new_with_stdio(),
+         }
+     }
+     
+     /// Crear proceso de USER
+     ///
+-    /// Each user process has its OWN page table (OwnedPageTable::new_user).
++    /// Each user process has its OWN AddressSpace (page table + VMAs).
+     pub fn new_user(
+         pid: Pid,
+         entry: VirtAddr,
+         user_stack: VirtAddr,
+         kernel_stack: VirtAddr,
+-        page_table: OwnedPageTable,
++        address_space: AddressSpace,
+     ) -> Self {
+         let mut trapframe = Box::new(TrapFrame::default());
+         
+@@ -145,7 +146,7 @@ impl Process {
+             name: [0; 16],
+             trapframe,
+             kernel_stack,
+-            page_table,
++            address_space,
+             files: FileDescriptorTable::new_with_stdio(),
+         }
+     }
+@@ -194,9 +195,9 @@ pub fn start_first_process() -> ! {
+                 
+                 tss::set_kernel_stack(kernel_stack);
+                 
+-                // ✅ Activate the process's page table
++                // ✅ Activate the process's address space (page table)
+                 unsafe {
+-                    proc.page_table.activate();
++                    proc.address_space.activate();
+                 }
+                 
+                 crate::serial_println!(
+diff --git a/kernel/src/process/scheduler.rs b/kernel/src/process/scheduler.rs
+index 1ffb951..3839fa5 100644
+--- a/kernel/src/process/scheduler.rs
++++ b/kernel/src/process/scheduler.rs
+@@ -4,6 +4,7 @@
+ use alloc::{boxed::Box, collections::VecDeque};
+ use spin::Mutex;
+ use super::{Process, Pid, ProcessState, TrapFrame};
++use crate::memory::vma::Vma;
+ 
+ pub static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
+ 
+@@ -85,7 +86,7 @@ impl Scheduler {
+                         // so switching between kernel processes (which all
+                         // share the kernel page table) is free.
+                         unsafe {
+-                            proc.page_table.activate();
++                            proc.address_space.activate();
+                         }
+                         
+                         // Update TSS kernel stack for Ring 3 → Ring 0 transitions
+@@ -111,7 +112,7 @@ impl Scheduler {
+             
+             // Activate idle's page table (= kernel page table, likely no-op)
+             unsafe {
+-                idle.page_table.activate();
++                idle.address_space.activate();
+             }
+             
+             let tf_ptr = &*idle.trapframe as *const TrapFrame;
+@@ -128,8 +129,22 @@ impl Scheduler {
+ // ============================================================================
+ 
+ /// Returns the PID of the currently running process as a usize.
+-/// Called by the page fault handler to look up VMAs.
+ pub fn current_pid() -> Option<usize> {
+     let scheduler = SCHEDULER.lock();
+     scheduler.current.map(|pid| pid.0)
++}
++
++/// Find the VMA containing `addr` in the current process's AddressSpace.
++///
++/// Returns `Some((pid, vma))` if found, `None` otherwise.
++/// The Vma is copied out so the scheduler lock is released immediately.
++///
++/// Called by the page fault handler (interrupts disabled, no contention
++/// with timer_preempt which also takes this lock).
++pub fn find_current_vma(addr: u64) -> Option<(usize, Vma)> {
++    let scheduler = SCHEDULER.lock();
++    let pid = scheduler.current?;
++    let proc = scheduler.processes.iter().find(|p| p.pid == pid)?;
++    let vma = proc.address_space.find_vma(addr)?;
++    Some((pid.0, vma))
+ }
+\ No newline at end of file
