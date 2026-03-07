@@ -29,7 +29,7 @@ use x86_64::{
     registers::control::Cr3,
     structures::paging::{
         FrameAllocator, Mapper, OffsetPageTable, Page, PageTable,
-        PageTableFlags, Size4KiB,
+        PageTableFlags, Size2MiB, Size4KiB,
     },
 };
 
@@ -76,39 +76,74 @@ pub fn is_demand_pageable(error_code: u64) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Build an `OffsetPageTable` over the currently active CR3.
+///
+/// # Safety
+/// The caller must ensure single-CPU access (e.g. interrupts disabled).
+unsafe fn create_cr3_mapper() -> OffsetPageTable<'static> {
+    let phys_offset = crate::memory::physical_memory_offset();
+    let (cr3_frame, _) = Cr3::read();
+    let pml4_virt = phys_offset + cr3_frame.start_address().as_u64();
+    let pml4: &mut PageTable = &mut *pml4_virt.as_mut_ptr::<PageTable>();
+    OffsetPageTable::new(pml4, phys_offset)
+}
+
 /// Allocate a physical frame, zero it, and map it at `fault_addr` using
 /// the flags from `vma`.
 ///
-/// This is a pure memory operation: it touches the Buddy allocator and
-/// the CURRENT page table (CR3).  The caller is responsible for ensuring
-/// that CR3 points to the faulting process's page table (which it does
-/// during a page fault — the CPU doesn't change CR3).
+/// When `is_write` is false and the VMA is Anonymous, the shared zero frame
+/// is mapped read-only instead of allocating a real frame (zero-page trick).
+/// A subsequent write fault will be handled by the COW path, which detects
+/// the zero frame and allocates a private writable copy.
 ///
 /// `pid` is used only for the log message.
 ///
 /// # Errors
-/// - VMA kind is not Anonymous (code pages should be pre-mapped)
+/// - VMA kind is Code (code pages should be pre-mapped)
 /// - Frame allocation failed (OOM)
 /// - Page table mapping failed
-pub fn map_demand_page(fault_addr: u64, vma: &Vma, pid: usize) -> Result<(), &'static str> {
-    // ── 1. Only demand-page Anonymous regions ─────────────────────────
-
+pub fn map_demand_page(
+    fault_addr: u64,
+    vma: &Vma,
+    pid: usize,
+    is_write: bool,
+) -> Result<(), &'static str> {
     match vma.kind {
-        VmaKind::Anonymous => { /* proceed */ }
         VmaKind::Code => {
             return Err("Code page not present (should be pre-mapped)");
         }
+        VmaKind::Huge2M => {
+            return map_demand_page_2m(fault_addr, vma, pid);
+        }
+        VmaKind::Anonymous => { /* fall through */ }
     }
 
-    // ── 2. Allocate a physical frame ──────────────────────────────────
+    let page: Page<Size4KiB> = Page::containing_address(
+        VirtAddr::new(fault_addr & !0xFFF)
+    );
 
+    // ── Zero-page trick: read faults map the shared zero frame ────────
+    if !is_write {
+        let zero = crate::memory::cow::zero_frame();
+        let ro_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        let mut buddy_alloc = BuddyFrameAllocator;
+        unsafe {
+            let mut mapper = create_cr3_mapper();
+            mapper
+                .map_to(page, zero, ro_flags, &mut buddy_alloc)
+                .map_err(|_| "zero-page: map_to failed")?
+                .flush();
+        }
+        return Ok(());
+    }
+
+    // ── Write fault: allocate a real frame, zero-fill, map writable ───
     let mut buddy_alloc = BuddyFrameAllocator;
-
     let frame = buddy_alloc
         .allocate_frame()
         .ok_or("Demand paging: frame allocation failed (OOM)")?;
 
-    // ── 3. Zero the frame (security + correctness) ────────────────────
+    unsafe { crate::memory::cow::set_ref(frame, 1); }
 
     unsafe {
         let phys_offset = crate::memory::physical_memory_offset();
@@ -116,34 +151,43 @@ pub fn map_demand_page(fault_addr: u64, vma: &Vma, pid: usize) -> Result<(), &'s
         core::ptr::write_bytes(frame_virt.as_mut_ptr::<u8>(), 0, 4096);
     }
 
-    // ── 4. Map the page in the current page table ─────────────────────
-
-    let page: Page<Size4KiB> = Page::containing_address(
-        VirtAddr::new(fault_addr & !0xFFF)
-    );
-
     unsafe {
-        let phys_offset = crate::memory::physical_memory_offset();
-        let (cr3_frame, _) = Cr3::read();
-        let pml4_virt = phys_offset + cr3_frame.start_address().as_u64();
-        let pml4: &mut PageTable = &mut *pml4_virt.as_mut_ptr::<PageTable>();
-        let mut mapper = OffsetPageTable::new(pml4, phys_offset);
-
+        let mut mapper = create_cr3_mapper();
         mapper
             .map_to(page, frame, vma.page_table_flags(), &mut buddy_alloc)
             .map_err(|_| "Demand paging: map_to failed")?
             .flush();
     }
 
-    // ── 5. Success! ───────────────────────────────────────────────────
+    Ok(())
+}
 
-    crate::serial_println!(
-        "📄 Demand page: PID {} fault at {:#x} → mapped {:#x} (phys {:#x})",
-        pid,
-        fault_addr,
-        page.start_address().as_u64(),
-        frame.start_address().as_u64(),
-    );
+/// Map a 2 MiB huge page for `fault_addr` inside a `Huge2M` VMA.
+fn map_demand_page_2m(fault_addr: u64, vma: &Vma, _pid: usize) -> Result<(), &'static str> {
+    const PAGE_2M: u64 = 0x200000;
+    let page_start = fault_addr & !(PAGE_2M - 1);
+    let page = Page::<Size2MiB>::containing_address(VirtAddr::new(page_start));
+
+    let mut buddy_alloc = BuddyFrameAllocator;
+    let frame: x86_64::structures::paging::PhysFrame<Size2MiB> = buddy_alloc
+        .allocate_frame()
+        .ok_or("Demand paging 2M: OOM")?;
+
+    // Zero-fill 2 MiB.
+    unsafe {
+        let phys_offset = crate::memory::physical_memory_offset();
+        let virt = (phys_offset + frame.start_address().as_u64()).as_mut_ptr::<u8>();
+        core::ptr::write_bytes(virt, 0, 0x200000);
+    }
+
+    // map_to for Size2MiB sets the HUGE_PAGE bit automatically.
+    unsafe {
+        let mut mapper = create_cr3_mapper();
+        mapper
+            .map_to(page, frame, vma.page_table_flags(), &mut buddy_alloc)
+            .map_err(|_| "map_to 2M failed")?
+            .flush();
+    }
 
     Ok(())
 }

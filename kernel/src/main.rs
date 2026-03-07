@@ -5,18 +5,20 @@
 extern crate alloc;
 
 mod allocator;
+mod cpu;
 mod drivers;
 mod framebuffer;
 mod init;
 mod interrupts;
+mod ipc;
 mod keyboard;
 mod keyboard_buffer;
 mod memory;
 mod panic;
 mod process;
 mod pit;
-mod repl;
 mod serial;
+mod time;
 
 use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
 

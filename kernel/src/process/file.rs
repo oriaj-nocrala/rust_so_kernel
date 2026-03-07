@@ -80,8 +80,8 @@ impl FileDescriptorTable {
         table.files[0] = Some(drivers::open_device("/dev/null")
             .unwrap_or_else(|| Box::new(NullFallback)));
 
-        // FD 1: stdout (serial console)
-        table.files[1] = Some(drivers::open_device("/dev/console")
+        // FD 1: stdout (framebuffer)
+        table.files[1] = Some(drivers::open_device("/dev/fb")
             .unwrap_or_else(|| Box::new(NullFallback)));
 
         // FD 2: stderr (serial console)
@@ -169,7 +169,7 @@ impl Clone for FileDescriptorTable {
             new_table.files[0] = crate::drivers::open_device("/dev/null");
         }
         if self.files[1].is_some() {
-            new_table.files[1] = crate::drivers::open_device("/dev/console");
+            new_table.files[1] = crate::drivers::open_device("/dev/fb");
         }
         if self.files[2].is_some() {
             new_table.files[2] = crate::drivers::open_device("/dev/console");

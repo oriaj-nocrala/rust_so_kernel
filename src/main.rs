@@ -18,7 +18,7 @@ fn main() {
            .arg(format!("format=raw,file={}", uefi_path));
     
     // Add some useful QEMU options
-    cmd.arg("-m").arg("256M");  // 256MB RAM
+    cmd.arg("-m").arg("512M");  // 512MB RAM
     cmd.arg("-serial").arg("stdio");  // Serial output to terminal
     
     let mut child = cmd.spawn().unwrap();

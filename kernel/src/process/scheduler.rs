@@ -18,37 +18,124 @@
 //   Each process gets quantum = BASE_QUANTUM + eff_pri * BONUS ticks.
 //   When exhausted: preempt, decay eff_pri by 1.
 //   Every AGING_EPOCH ticks: boost waiting processes' eff_pri toward base.
+//
+// HISTORY:
+//   - Removed IretFrame and kill_and_switch().  Replaced with
+//     kill_and_switch_tf() which returns a *const TrapFrame, enabling
+//     a FULL context switch (all GPRs restored) via jump_to_trapframe.
+//     The old approach only overwrote the 5-field exception stack frame,
+//     leaking RAX..R15 from the killed process into the next one.
 
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+// ── FS.base save / restore helpers ──────────────────────────────────────────
+// FS.base (MSR 0xC000_0100) is used by mlibc for TLS.  We must save it
+// when context-switching away from a process and restore it for the next one.
+
+const IA32_FS_BASE: u32 = 0xC000_0100;
+
+#[inline(always)]
+fn read_fs_base() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdmsr",
+            in("ecx") IA32_FS_BASE,
+            out("eax") lo,
+            out("edx") hi,
+            options(nostack, preserves_flags),
+        );
+    }
+    (hi as u64) << 32 | lo as u64
+}
+
+#[inline(always)]
+fn write_fs_base(val: u64) {
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") IA32_FS_BASE,
+            in("eax") (val & 0xFFFF_FFFF) as u32,
+            in("edx") (val >> 32) as u32,
+            options(nostack, preserves_flags),
+        );
+    }
+}
 use spin::Mutex;
 use super::{Process, Pid, ProcessState, TrapFrame};
+use crate::memory::address_space::AddressSpace;
 use crate::memory::vma::Vma;
+
+// ============================================================================
+// Per-CPU fast-path pointers (updated on every context switch, IF=0)
+// ============================================================================
+//
+// These let the page fault handler look up the running process's AddressSpace
+// and PID without acquiring the SCHEDULERS Mutex.
+//
+// Safety invariant: a fault handler always runs with IF=0 on a single CPU.
+// Between a context switch updating these atomics and the next switch, no
+// other context can run on the same CPU, so the pointer is always valid.
+
+static CURRENT_AS_PTR: [AtomicUsize; crate::cpu::MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; crate::cpu::MAX_CPUS];
+static CURRENT_PID_FAST: [AtomicUsize; crate::cpu::MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; crate::cpu::MAX_CPUS];
+
+/// Update the per-CPU fast-path pointers to reflect `proc` as the running process.
+/// Called with interrupts disabled, just before storing into `self.running`.
+#[inline]
+fn update_current_fast(proc: &Process) {
+    let cpu = crate::cpu::cpu_id();
+    CURRENT_AS_PTR[cpu].store(
+        &proc.address_space as *const AddressSpace as usize,
+        Ordering::Release,
+    );
+    CURRENT_PID_FAST[cpu].store(proc.pid.0, Ordering::Release);
+}
+
+/// Clear the per-CPU fast-path pointers (no process running on this CPU).
+#[inline]
+fn clear_current_fast() {
+    let cpu = crate::cpu::cpu_id();
+    CURRENT_AS_PTR[cpu].store(0, Ordering::Release);
+    CURRENT_PID_FAST[cpu].store(0, Ordering::Release);
+}
 
 const NUM_PRIORITIES: usize = 11;
 
-/// Data needed to overwrite an exception stack frame for process switching.
-/// Returned by `kill_and_switch` so the caller (page fault handler) can
-/// redirect `iretq` to the next process without touching scheduler internals.
-pub struct IretFrame {
-    pub rip: u64,
-    pub cs: u64,
-    pub rflags: u64,
-    pub rsp: u64,
-    pub ss: u64,
-}
 const BASE_QUANTUM: u32 = 2;
 const PRIORITY_QUANTUM_BONUS: u32 = 1;
 const AGING_EPOCH: u32 = 50;
 const MIN_EFFECTIVE_PRIORITY: u8 = 1;
 
-pub static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
+static SCHEDULERS: [Mutex<Scheduler>; crate::cpu::MAX_CPUS] = [
+    Mutex::new(Scheduler::new()),
+    Mutex::new(Scheduler::new()),
+    Mutex::new(Scheduler::new()),
+    Mutex::new(Scheduler::new()),
+    Mutex::new(Scheduler::new()),
+    Mutex::new(Scheduler::new()),
+    Mutex::new(Scheduler::new()),
+    Mutex::new(Scheduler::new()),
+];
+
+/// Acquires the current CPU's scheduler lock.
+/// CALLER must disable interrupts before calling (cli) and
+/// re-enable after dropping the guard (sti).
+#[inline]
+pub fn local_scheduler() -> spin::MutexGuard<'static, Scheduler> {
+    SCHEDULERS[crate::cpu::cpu_id()].lock()
+}
 
 pub struct Scheduler {
     /// Per-priority run queues — ONLY Ready processes.
     run_queues: [VecDeque<Box<Process>>; NUM_PRIORITIES],
 
     /// Blocked and Zombie processes.  Not scanned during scheduling.
-    wait_queue: VecDeque<Box<Process>>,
+    pub wait_queue: VecDeque<Box<Process>>,
 
     /// Currently executing process.
     running: Option<Box<Process>>,
@@ -174,12 +261,17 @@ impl Scheduler {
 
     /// Kill the running process and schedule the next one.
     ///
-    /// Returns the iret frame fields (rip, cs, rflags, rsp, ss) of the
-    /// next process so the caller can overwrite an exception stack frame.
+    /// Returns a pointer to the next process's FULL TrapFrame (all GPRs
+    /// + iret fields).  The caller must use `jump_to_trapframe` to load
+    /// all registers and iretq into the new process.
+    ///
+    /// This replaces the old `kill_and_switch` which returned only the 5
+    /// iret-frame fields, leaking GPR values from the killed process.
+    ///
     /// Also activates the new address space and updates TSS.
     ///
     /// Panics if no Ready process exists (shouldn't happen with idle).
-    pub fn kill_and_switch(&mut self, reason: &str) -> IretFrame {
+    pub fn kill_and_switch_tf(&mut self, reason: &str) -> *const TrapFrame {
         self.kill_current(reason);
 
         // Find and schedule next Ready process
@@ -194,20 +286,80 @@ impl Scheduler {
 
                 self.remaining_ticks = Self::quantum_for(proc.effective_priority);
 
-                let frame = IretFrame {
-                    rip: proc.trapframe.rip,
-                    cs: proc.trapframe.cs,
-                    rflags: proc.trapframe.rflags,
-                    rsp: proc.trapframe.rsp,
-                    ss: proc.trapframe.ss,
-                };
-
+                let tf_ptr = &*proc.trapframe as *const TrapFrame;
+                update_current_fast(&proc);
                 self.running = Some(proc);
-                return frame;
+                return tf_ptr;
             }
         }
 
         panic!("No process to switch to after killing user process");
+    }
+
+    // ====================================================================
+    // Blocking / wakeup (I/O wait)
+    // ====================================================================
+
+    /// Block the running process (copy TF into Box, move to wait_queue).
+    ///
+    /// Returns the next Ready process's TrapFrame pointer.
+    /// Panics if no Ready process exists (idle must always be ready).
+    pub fn block_current(&mut self, current_tf: *const TrapFrame) -> *const TrapFrame {
+        if let Some(mut proc) = self.running.take() {
+            unsafe { *proc.trapframe = *current_tf; }
+            proc.fs_base = read_fs_base();
+            proc.state = ProcessState::Blocked;
+            self.wait_queue.push_back(proc);
+        }
+        // No process running on this CPU until we schedule the next one.
+        clear_current_fast();
+
+        for priority in (0..NUM_PRIORITIES).rev() {
+            if let Some(mut proc) = self.run_queues[priority].pop_front() {
+                proc.state = ProcessState::Running;
+                unsafe { proc.address_space.activate(); }
+                super::tss::set_kernel_stack(proc.kernel_stack);
+                write_fs_base(proc.fs_base);
+                self.remaining_ticks = Self::quantum_for(proc.effective_priority);
+                let tf_ptr = &*proc.trapframe as *const TrapFrame;
+                update_current_fast(&proc);
+                self.running = Some(proc);
+                return tf_ptr;
+            }
+        }
+
+        panic!("No process to switch to after blocking");
+    }
+
+    /// Wake a Blocked process: move it from wait_queue to its run_queue.
+    pub fn wake(&mut self, pid: usize) {
+        if let Some(pos) = self.wait_queue.iter().position(|p| {
+            p.pid.0 == pid && matches!(p.state, ProcessState::Blocked)
+        }) {
+            if let Some(mut proc) = self.wait_queue.remove(pos) {
+                proc.state = ProcessState::Ready;
+                let pri = (proc.effective_priority as usize).min(NUM_PRIORITIES - 1);
+                self.run_queues[pri].push_back(proc);
+            }
+        }
+    }
+
+    /// Wake a Blocked process and set its syscall return value in one scan.
+    ///
+    /// Combines what was previously two separate operations in the IPC delivery
+    /// path (set trapframe.rax then call wake()) into a single wait_queue scan,
+    /// halving the linear-search overhead for IPC hot paths.
+    pub fn wake_with_retval(&mut self, pid: usize, rax: u64) {
+        if let Some(pos) = self.wait_queue.iter().position(|p| {
+            p.pid.0 == pid && matches!(p.state, ProcessState::Blocked)
+        }) {
+            if let Some(mut proc) = self.wait_queue.remove(pos) {
+                proc.trapframe.rax = rax;
+                proc.state = ProcessState::Ready;
+                let pri = (proc.effective_priority as usize).min(NUM_PRIORITIES - 1);
+                self.run_queues[pri].push_back(proc);
+            }
+        }
     }
 
     // ====================================================================
@@ -272,6 +424,7 @@ impl Scheduler {
             unsafe {
                 *proc.trapframe = *current_tf;
             }
+            proc.fs_base = read_fs_base();
 
             match proc.state {
                 ProcessState::Running => {
@@ -288,11 +441,9 @@ impl Scheduler {
                 }
                 ProcessState::Zombie | ProcessState::Blocked => {
                     // Process was killed or blocked during its slice
-                    // (e.g. kill_current was called but running was already taken)
                     self.wait_queue.push_back(proc);
                 }
                 ProcessState::Ready => {
-                    // Shouldn't happen, but handle gracefully
                     let pri = (proc.effective_priority as usize).min(NUM_PRIORITIES - 1);
                     self.run_queues[pri].push_back(proc);
                 }
@@ -312,10 +463,12 @@ impl Scheduler {
                     proc.address_space.activate();
                 }
                 super::tss::set_kernel_stack(proc.kernel_stack);
+                write_fs_base(proc.fs_base);
 
                 self.remaining_ticks = Self::quantum_for(proc.effective_priority);
 
                 let tf_ptr = &*proc.trapframe as *const TrapFrame;
+                update_current_fast(&proc);
                 self.running = Some(proc);
                 return tf_ptr;
             }
@@ -370,6 +523,7 @@ impl Scheduler {
                     self.remaining_ticks = Self::quantum_for(proc.effective_priority);
 
                     let tf_ptr = &*proc.trapframe as *const TrapFrame;
+                    update_current_fast(&proc);
                     self.running = Some(proc);
                     return tf_ptr;
                 }
@@ -385,13 +539,55 @@ impl Scheduler {
 // ============================================================================
 
 pub fn current_pid() -> Option<usize> {
-    let scheduler = SCHEDULER.lock();
-    scheduler.current_pid().map(|pid| pid.0)
+    local_scheduler().current_pid().map(|pid| pid.0)
 }
 
 pub fn find_current_vma(addr: u64) -> Option<(usize, Vma)> {
-    let scheduler = SCHEDULER.lock();
+    let scheduler = local_scheduler();
     let proc = scheduler.running_ref()?;
     let vma = proc.address_space.find_vma(addr)?;
     Some((proc.pid.0, vma))
+}
+
+/// Fast VMA lookup without acquiring the Scheduler Mutex.
+///
+/// Safe because:
+/// - The fault handler runs with IF=0 (preemption impossible on a single CPU).
+/// - `CURRENT_AS_PTR` always points into the currently-running process's
+///   `Box<Process>`, which is kept alive by `self.running`.
+/// - The pointer is updated before storing into `self.running`, so it is
+///   always consistent with the actual running process.
+///
+/// # Safety
+/// Must be called with interrupts disabled.
+pub unsafe fn find_vma_fast(fault_addr: u64) -> Option<(usize, Vma)> {
+    let cpu = crate::cpu::cpu_id();
+    let as_ptr = CURRENT_AS_PTR[cpu].load(Ordering::Acquire) as *const AddressSpace;
+    if as_ptr.is_null() {
+        return None;
+    }
+    let pid = CURRENT_PID_FAST[cpu].load(Ordering::Acquire);
+    let vma = (*as_ptr).find_vma(fault_addr)?;
+    Some((pid, vma))
+}
+
+/// Fast access to the running process's AddressSpace without the Mutex.
+///
+/// Same safety invariants as `find_vma_fast`.
+///
+/// # Safety
+/// Must be called with interrupts disabled.
+pub unsafe fn current_as_fast() -> Option<&'static AddressSpace> {
+    let cpu = crate::cpu::cpu_id();
+    let as_ptr = CURRENT_AS_PTR[cpu].load(Ordering::Acquire) as *const AddressSpace;
+    if as_ptr.is_null() {
+        None
+    } else {
+        Some(&*as_ptr)
+    }
+}
+
+/// Fast PID read for logging (no Mutex).
+pub fn current_pid_fast() -> usize {
+    CURRENT_PID_FAST[crate::cpu::cpu_id()].load(Ordering::Relaxed)
 }

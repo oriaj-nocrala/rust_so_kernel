@@ -4,52 +4,104 @@
 // that guarantee cli before lock, lock dropped before sti.
 //
 // with_current_process uses scheduler.running_mut() for O(1) access.
+//
+// HISTORY:
+//   - sys_exit now performs an immediate full context switch via
+//     kill_and_switch_tf + jump_to_trapframe, instead of entering
+//     a hlt loop and waiting up to 10ms for the timer to preempt.
 
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicU64, Ordering};
+use spin::Mutex;
 use crate::serial_println;
+use super::TrapFrame;
 
+// Scratch storage for syscall_entry_fast.
+// Single-CPU only; safe because SFMASK clears IF on syscall entry,
+// so this is never re-entered before we switch to the kernel stack.
+#[no_mangle]
+static mut SYSCALL_USER_RFLAGS: u64 = 0;
+
+// syscall_entry_fast — kernel entry point for the `syscall` instruction.
+//
+// On entry (CPU-set):  RCX=user RIP, R11=user RFLAGS, RSP=user RSP, IF=0
+//
+// Strategy:
+//  1. Save R11 (user RFLAGS) to static SYSCALL_USER_RFLAGS.
+//  2. Move user RSP into R11, switch RSP to KERNEL_RSP0.
+//  3. Build a 5-field iretq frame so we reuse the existing TrapFrame
+//     layout and return via iretq (no sysretq complexity).
+//  4. Push 15 GPRs, call handler, restore, iretq.
+//
+// Clobbers: RCX (user RIP) and R11 (user RFLAGS) — identical to what the
+// `syscall` instruction itself clobbers; userspace wrappers already declare both.
+// AT&T syntax so that SYMBOL(%rip) generates R_X86_64_PC32 (PC-relative),
+// required for PIE linking.  Intel-mode bare [SYMBOL] generates R_X86_64_32S.
 global_asm!(
-    ".global syscall_entry",
-    "syscall_entry:",
-    
-    "push rax",
-    "push rbx",
-    "push rcx",
-    "push rdx",
-    "push rsi",
-    "push rdi",
-    "push rbp",
-    "push r8",
-    "push r9",
-    "push r10",
-    "push r11",
-    "push r12",
-    "push r13",
-    "push r14",
-    "push r15",
-    
-    "mov rdi, rsp",
+    ".global syscall_entry_fast",
+    "syscall_entry_fast:",
+
+    // On entry (CPU): %rcx=user RIP, %r11=user RFLAGS, %rsp=user RSP, IF=0.
+
+    // 1. Save user RFLAGS (%r11) before repurposing %r11 for user RSP.
+    "movq %r11, SYSCALL_USER_RFLAGS(%rip)",
+
+    // 2. %r11 ← user RSP; switch %rsp to kernel stack.
+    "movq %rsp, %r11",
+    "movq KERNEL_RSP0(%rip), %rsp",
+
+    // 3. Build 5-field iretq frame: SS, user-RSP, RFLAGS, CS, user-RIP.
+    "pushq $0x1b",                             // user SS  (ring-3 data: 0x18|3)
+    "pushq %r11",                              // user RSP
+    "movq SYSCALL_USER_RFLAGS(%rip), %r11",   // reload user RFLAGS
+    "pushq %r11",                              // user RFLAGS
+    "pushq $0x23",                             // user CS  (ring-3 code: 0x20|3)
+    "pushq %rcx",                              // user RIP
+
+    // 4. Save 15 GPRs — same layout as TrapFrame.
+    //    %rcx=user RIP, %r11=user RFLAGS: both architecturally clobbered by
+    //    `syscall`; userspace wrappers already declare out("rcx")_ / out("r11")_.
+    //    %r10: original user value preserved (never touched above).
+    "pushq %rax",
+    "pushq %rbx",
+    "pushq %rcx",
+    "pushq %rdx",
+    "pushq %rsi",
+    "pushq %rdi",
+    "pushq %rbp",
+    "pushq %r8",
+    "pushq %r9",
+    "pushq %r10",
+    "pushq %r11",
+    "pushq %r12",
+    "pushq %r13",
+    "pushq %r14",
+    "pushq %r15",
+
+    "movq %rsp, %rdi",
     "call syscall_handler_asm",
-    
-    "mov [rsp], rax",
-    
-    "pop r15",
-    "pop r14",
-    "pop r13",
-    "pop r12",
-    "pop r11",
-    "pop r10",
-    "pop r9",
-    "pop r8",
-    "pop rbp",
-    "pop rdi",
-    "pop rsi",
-    "pop rdx",
-    "pop rcx",
-    "pop rbx",
-    "pop rax",
-    
+
+    // Write return value to saved %rax slot: [%rsp+0]=r15 … [%rsp+112]=rax.
+    "movq %rax, 112(%rsp)",
+
+    "popq %r15",
+    "popq %r14",
+    "popq %r13",
+    "popq %r12",
+    "popq %r11",
+    "popq %r10",
+    "popq %r9",
+    "popq %r8",
+    "popq %rbp",
+    "popq %rdi",
+    "popq %rsi",
+    "popq %rdx",
+    "popq %rcx",
+    "popq %rbx",
+    "popq %rax",
+
     "iretq",
+    options(att_syntax),
 );
 
 #[repr(C)]
@@ -60,8 +112,32 @@ struct SavedRegisters {
     rcx: u64, rbx: u64, rax: u64,
 }
 
+// ============================================================================
+// STDIN / WAITPID BLOCKING GLOBALS
+// ============================================================================
+
+/// Address of the full TrapFrame on the kernel stack at syscall entry.
+/// SavedRegisters is the first 15 fields of TrapFrame; the hardware iretq
+/// fields (rip, cs, rflags, rsp, ss) follow immediately in memory.
+/// Single-CPU — safe under cli.
+static CURRENT_SYSCALL_TF: AtomicU64 = AtomicU64::new(0);
+
+struct StdinWaiter {
+    pid: usize,
+    user_buf: u64,
+}
+
+static STDIN_WAITER: Mutex<Option<StdinWaiter>> = Mutex::new(None);
+
+// WAIT_WAITER has been removed — per-process waiting_for field in Process is used instead.
+// This supports multiple concurrent waitpid() callers (e.g. shell + ipc_ping).
+
 #[no_mangle]
 extern "C" fn syscall_handler_asm(regs: &SavedRegisters) -> i64 {
+    // Store the TrapFrame pointer (SavedRegisters shares the same layout as
+    // the first 15 fields of TrapFrame; hardware pushed rip/cs/rflags/rsp/ss
+    // immediately after on the kernel stack).
+    CURRENT_SYSCALL_TF.store(regs as *const SavedRegisters as u64, Ordering::Relaxed);
     syscall_handler(regs.rax, regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9)
 }
 
@@ -72,9 +148,36 @@ pub enum SyscallNumber {
     Write = 1,
     Open = 2,
     Close = 3,
+    Lseek = 8,
+    Mmap = 9,
+    Munmap = 11,
+    Brk = 12,
+    Ioctl = 16,
+    Writev = 20,
+    Poll = 7,
     Yield = 24,
+    Nanosleep = 35,
     GetPid = 39,
+    Socket = 41,
+    Connect = 42,
+    Accept = 43,
+    Sendmsg = 46,
+    Recvmsg = 47,
+    Bind = 49,
+    Fork = 57,
+    Exec = 59,
     Exit = 60,
+    Waitpid = 61,
+    Futex = 202,
+    ArchPrctl = 158,
+    SetTidAddress = 218,
+    EpollCreate = 213,
+    ClockGettime = 228,
+    EpollWait = 232,
+    EpollCtl = 233,
+    // Custom kernel syscalls (above Linux range)
+    UptimeMs = 400,
+    UptimeSec = 401,
 }
 
 impl SyscallNumber {
@@ -84,9 +187,35 @@ impl SyscallNumber {
             1 => Some(Self::Write),
             2 => Some(Self::Open),
             3 => Some(Self::Close),
+            7 => Some(Self::Poll),
+            8 => Some(Self::Lseek),
+            9 => Some(Self::Mmap),
+            11 => Some(Self::Munmap),
+            12 => Some(Self::Brk),
+            16 => Some(Self::Ioctl),
+            20 => Some(Self::Writev),
             24 => Some(Self::Yield),
+            35 => Some(Self::Nanosleep),
             39 => Some(Self::GetPid),
+            41 => Some(Self::Socket),
+            42 => Some(Self::Connect),
+            43 => Some(Self::Accept),
+            46 => Some(Self::Sendmsg),
+            47 => Some(Self::Recvmsg),
+            49 => Some(Self::Bind),
+            57 => Some(Self::Fork),
+            59 => Some(Self::Exec),
             60 => Some(Self::Exit),
+            61 => Some(Self::Waitpid),
+            158 => Some(Self::ArchPrctl),
+            202 => Some(Self::Futex),
+            213 => Some(Self::EpollCreate),
+            218 => Some(Self::SetTidAddress),
+            228 => Some(Self::ClockGettime),
+            232 => Some(Self::EpollWait),
+            233 => Some(Self::EpollCtl),
+            400 => Some(Self::UptimeMs),
+            401 => Some(Self::UptimeSec),
             _ => None,
         }
     }
@@ -110,7 +239,16 @@ pub mod errno {
     pub const EBUSY: i64 = -16;
     pub const EEXIST: i64 = -17;
     pub const EINVAL: i64 = -22;
+    pub const ENOTTY: i64 = -25;
+    pub const ESPIPE: i64 = -29;
     pub const ENOSYS: i64 = -38;
+    pub const EAGAIN: i64 = -11;
+    pub const EWOULDBLOCK: i64 = -11;
+    pub const EPIPE: i64 = -32;
+    pub const ENOTSOCK: i64 = -88;
+    pub const ENOTCONN: i64 = -107;
+    pub const ETIMEDOUT: i64 = -110;
+    pub const ECONNREFUSED: i64 = -111;
 }
 
 // ============================================================================
@@ -124,7 +262,7 @@ where
     unsafe { core::arch::asm!("cli"); }
 
     let result = {
-        let mut scheduler = super::scheduler::SCHEDULER.lock();
+        let mut scheduler = super::scheduler::local_scheduler();
         match scheduler.running_mut() {
             Some(proc) => f(proc),
             None => errno::ESRCH,
@@ -142,7 +280,7 @@ where
     unsafe { core::arch::asm!("cli"); }
 
     let result = {
-        let mut scheduler = super::scheduler::SCHEDULER.lock();
+        let mut scheduler = super::scheduler::local_scheduler();
         f(&mut scheduler)
     };
 
@@ -179,10 +317,18 @@ pub fn syscall_handler(
     arg1: u64,
     arg2: u64,
     arg3: u64,
-    _arg4: u64,
-    _arg5: u64,
+    arg4: u64,
+    arg5: u64,
     _arg6: u64,
 ) -> SyscallResult {
+    // // Debug: log all syscalls from PID >= 2 (ipc_ping + client)
+    // {
+    //     let pid = crate::process::scheduler::current_pid().unwrap_or(0);
+    //     if pid >= 2 {
+    //         serial_println!("[SYSCALL] PID {} nr={}", pid, syscall_num);
+    //     }
+    // }
+
     let syscall = match SyscallNumber::from_u64(syscall_num) {
         Some(s) => s,
         None => return errno::ENOSYS,
@@ -193,9 +339,35 @@ pub fn syscall_handler(
         SyscallNumber::Write => sys_write(arg1 as i32, arg2 as usize, arg3 as usize),
         SyscallNumber::Open => sys_open(arg1 as usize, arg2 as i32),
         SyscallNumber::Close => sys_close(arg1 as i32),
+        SyscallNumber::Lseek => sys_lseek(arg1 as i32, arg2 as i64, arg3 as i32),
+        SyscallNumber::Poll => sys_poll(arg1, arg2 as u32, arg3 as i32),
+        SyscallNumber::Mmap => sys_mmap(arg1, arg2, arg3 as u32, arg4 as u32, arg5 as i32),
+        SyscallNumber::Munmap => sys_munmap(arg1, arg2),
+        SyscallNumber::Brk => sys_brk(arg1),
+        SyscallNumber::Ioctl => sys_ioctl(arg1 as i32, arg2 as u64, arg3),
+        SyscallNumber::Writev => sys_writev(arg1 as i32, arg2, arg3 as usize),
         SyscallNumber::Yield => sys_yield(),
+        SyscallNumber::Nanosleep => sys_nanosleep(arg1),
         SyscallNumber::GetPid => sys_getpid(),
+        SyscallNumber::Socket  => sys_socket_impl(),
+        SyscallNumber::Connect => sys_connect(arg1 as i32, arg2 as usize, arg3 as usize),
+        SyscallNumber::Accept  => sys_accept(arg1 as i32),
+        SyscallNumber::Sendmsg => sys_sendmsg(arg1 as i32, arg2, arg3 as u32),
+        SyscallNumber::Recvmsg => sys_recvmsg(arg1 as i32, arg2, arg3 as u32),
+        SyscallNumber::Bind    => sys_bind_impl(arg1 as i32, arg2 as usize, arg3 as usize),
+        SyscallNumber::Fork => sys_fork(),
+        SyscallNumber::Exec => sys_exec(arg1 as usize),
         SyscallNumber::Exit => sys_exit(arg1 as i32),
+        SyscallNumber::Waitpid => sys_waitpid(arg1 as usize),
+        SyscallNumber::ArchPrctl => sys_arch_prctl(arg1 as i32, arg2),
+        SyscallNumber::Futex => sys_futex(arg1, arg2 as i32, arg3 as i32, arg4),
+        SyscallNumber::SetTidAddress => sys_set_tid_address(arg1),
+        SyscallNumber::EpollCreate => sys_epoll_create(arg1 as i32),
+        SyscallNumber::ClockGettime => sys_clock_gettime(arg1, arg2),
+        SyscallNumber::EpollWait => sys_epoll_wait(arg1 as i32, arg2, arg3 as i32, arg4 as i32),
+        SyscallNumber::EpollCtl => sys_epoll_ctl(arg1 as i32, arg2 as i32, arg3 as i32, arg4),
+        SyscallNumber::UptimeMs => sys_uptime_ms(),
+        SyscallNumber::UptimeSec => sys_uptime_sec(),
     }
 }
 
@@ -204,25 +376,111 @@ pub fn syscall_handler(
 // ============================================================================
 
 fn sys_read(fd: i32, buf: usize, count: usize) -> SyscallResult {
+    if count == 0 {
+        return 0;
+    }
     if let Err(e) = validate_user_buffer(buf as u64, count) {
         return e;
     }
 
-    with_current_process(|proc| {
-        let file = match proc.files.get_mut(fd as usize) {
-            Ok(f) => f,
-            Err(_) => return errno::EBADF,
-        };
+    if fd == 0 {
+        // stdin: try to read from keyboard buffer; block if empty.
+        //
+        // cli prevents a race between the buffer-empty check and setting
+        // STDIN_WAITER — the keyboard ISR could fire between them otherwise.
+        unsafe { core::arch::asm!("cli"); }
 
-        let buffer = unsafe {
-            core::slice::from_raw_parts_mut(buf as *mut u8, count)
-        };
-
-        match file.read(buffer) {
-            Ok(n) => n as i64,
-            Err(_) => errno::EIO,
+        if let Some(c) = crate::keyboard::read_key() {
+            unsafe { core::arch::asm!("sti"); }
+            // Process's page table is active — write directly to user VA.
+            unsafe { *(buf as *mut u8) = c as u8; }
+            return 1;
         }
-    })
+
+        // Buffer empty — register waiter and block.
+        let pid = crate::process::scheduler::current_pid().unwrap_or(0);
+        *STDIN_WAITER.lock() = Some(StdinWaiter { pid, user_buf: buf as u64 });
+        let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame;
+        // cli is still in effect; block_stdin_read never returns.
+        block_stdin_read(tf_ptr)
+    } else {
+        with_current_process(|proc| {
+            let file = match proc.files.get_mut(fd as usize) {
+                Ok(f) => f,
+                Err(_) => return errno::EBADF,
+            };
+
+            let buffer = unsafe {
+                core::slice::from_raw_parts_mut(buf as *mut u8, count)
+            };
+
+            match file.read(buffer) {
+                Ok(n) => n as i64,
+                Err(_) => errno::EIO,
+            }
+        })
+    }
+}
+
+/// Block the calling process waiting for keyboard input.
+///
+/// cli must already be in effect when this is called.
+/// Saves the current TrapFrame into the process Box, moves the process to the
+/// wait_queue, and jumps to the next Ready process.  Never returns.
+fn block_stdin_read(current_tf: *const TrapFrame) -> ! {
+    let next_tf = {
+        let mut sched = super::scheduler::local_scheduler();
+        sched.block_current(current_tf)
+        // Lock dropped here; sti happens via iretq of the next process.
+    };
+    unsafe { super::trapframe::jump_to_trapframe(next_tf) }
+}
+
+/// Called by the keyboard ISR after a key is pushed into the buffer.
+///
+/// If a process is blocked on stdin, delivers the character to its user
+/// buffer (via physical-memory translation), sets rax=1 in its saved
+/// TrapFrame, and moves it back to the run queue.
+pub(crate) fn stdin_wakeup() {
+    // Take the waiter atomically — if no one is waiting, return immediately.
+    let waiter = {
+        let mut w = STDIN_WAITER.lock();
+        w.take()
+    };
+    let Some(waiter) = waiter else { return; };
+
+    // Consume the character that was just pushed by the keyboard ISR.
+    let Some(c) = crate::keyboard::read_key() else {
+        // Shouldn't happen (ISR pushed it just before calling us), but be safe.
+        *STDIN_WAITER.lock() = Some(waiter);
+        return;
+    };
+
+    let phys_offset = crate::memory::physical_memory_offset();
+    let user_buf = waiter.user_buf;
+    let pid = waiter.pid;
+
+    let mut sched = super::scheduler::local_scheduler();
+
+    // Find the blocked process, translate its user buffer to a kernel VA,
+    // write the character, and set rax=1 as the syscall return value.
+    for proc in sched.wait_queue.iter_mut() {
+        if proc.pid.0 == pid && matches!(proc.state, crate::process::ProcessState::Blocked) {
+            use x86_64::{VirtAddr, structures::paging::{Page, Size4KiB}};
+
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(user_buf));
+            let offset = user_buf & 0xFFF;
+
+            if let Some(frame) = unsafe { proc.address_space.translate_page(page) } {
+                let dst = phys_offset + frame.start_address().as_u64() + offset;
+                unsafe { *(dst.as_mut_ptr::<u8>()) = c as u8; }
+                proc.trapframe.rax = 1; // syscall return value: 1 byte read
+            }
+            break;
+        }
+    }
+
+    sched.wake(pid);
 }
 
 fn sys_write(fd: i32, buf: usize, count: usize) -> SyscallResult {
@@ -292,9 +550,269 @@ fn sys_close(fd: i32) -> SyscallResult {
     })
 }
 
+/// mmap(9): void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+///
+/// Only MAP_ANONYMOUS (0x20) is supported.  fd must be -1.
+/// Returns the mapped virtual address on success, or ENOMEM / EINVAL.
+fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32) -> SyscallResult {
+    const MAP_ANONYMOUS: u32 = 0x20;
+    if flags & MAP_ANONYMOUS == 0 || fd != -1 {
+        return errno::EINVAL;
+    }
+    with_current_process(|proc| {
+        match proc.address_space.sys_mmap_anon(addr, length, prot) {
+            Ok(vaddr) => vaddr as i64,
+            Err(_)    => errno::ENOMEM,
+        }
+    })
+}
+
+/// munmap(11): int munmap(void *addr, size_t length)
+///
+/// Removes the VMA at `addr` and frees any demand-paged frames.
+/// Requires exact match on addr and length (no partial unmap).
+fn sys_munmap(addr: u64, length: u64) -> SyscallResult {
+    with_current_process(|proc| {
+        match unsafe { proc.address_space.sys_munmap(addr, length) } {
+            Ok(())  => 0,
+            Err(_)  => errno::EINVAL,
+        }
+    })
+}
+
+// ── lseek(8) ───────────────────────────────────────────────────────────────
+
+/// lseek(8): off_t lseek(int fd, off_t offset, int whence)
+///
+/// Seeking on character devices (console, keyboard) is not meaningful;
+/// return ESPIPE just like Linux does for pipes.  When we have a VFS,
+/// this will delegate to the file's seek method.
+fn sys_lseek(fd: i32, _offset: i64, _whence: i32) -> SyscallResult {
+    if fd < 0 || fd >= 16 { return errno::EBADF; }
+    // All current fds are character devices — not seekable.
+    errno::ESPIPE
+}
+
+// ── brk(12) ────────────────────────────────────────────────────────────────
+
+/// brk(12): int brk(void *addr)
+///
+/// Returning 0 (failure, current break unchanged) tells mlibc to fall
+/// back to mmap(MAP_ANONYMOUS) for heap allocation, which we support.
+fn sys_brk(_addr: u64) -> SyscallResult {
+    0
+}
+
+// ── ioctl(16) ──────────────────────────────────────────────────────────────
+
+/// ioctl(16): int ioctl(int fd, unsigned long request, ...)
+///
+/// Minimal implementation: answer the two queries that mlibc cares about
+/// to make isatty() and terminal-size queries work.
+fn sys_ioctl(fd: i32, request: u64, argp: u64) -> SyscallResult {
+    const TCGETS: u64 = 0x5401;      // "is this a terminal?" probe
+    const TIOCGWINSZ: u64 = 0x5413; // get terminal window size
+
+    if fd < 0 { return errno::EBADF; }
+
+    // fds 0,1,2 are the console — a tty.  All others: not a tty.
+    let is_tty = fd <= 2;
+
+    match request {
+        TCGETS => {
+            if !is_tty { return errno::ENOTTY; }
+            // Write a zeroed termios struct if the caller supplied a pointer.
+            // mlibc only checks the return code for isatty(); it doesn't use
+            // the actual termios fields yet.
+            if argp != 0 && validate_user_buffer(argp, 60).is_ok() {
+                // termios is 60 bytes on x86-64 Linux ABI — zero-fill it.
+                unsafe {
+                    core::ptr::write_bytes(argp as *mut u8, 0, 60);
+                }
+            }
+            0
+        }
+        TIOCGWINSZ => {
+            if argp != 0 && validate_user_buffer(argp, 8).is_ok() {
+                // struct winsize { ws_row, ws_col, ws_xpixel, ws_ypixel }
+                // Use 25 rows × 80 cols as a reasonable default.
+                let ws = argp as *mut u16;
+                unsafe {
+                    *ws.add(0) = 25;  // rows
+                    *ws.add(1) = 80;  // cols
+                    *ws.add(2) = 0;
+                    *ws.add(3) = 0;
+                }
+            }
+            0
+        }
+        _ => errno::EINVAL,
+    }
+}
+
+// ── writev(20) ─────────────────────────────────────────────────────────────
+
+/// writev(20): ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
+///
+/// Loops over the iovec array and calls sys_write for each segment.
+/// struct iovec = { void *iov_base (8 bytes), size_t iov_len (8 bytes) }
+fn sys_writev(fd: i32, iov_ptr: u64, iovcnt: usize) -> SyscallResult {
+    if iovcnt > 1024 { return errno::EINVAL; }
+    if validate_user_buffer(iov_ptr, iovcnt * 16).is_err() {
+        return errno::EFAULT;
+    }
+
+    let mut total: i64 = 0;
+    for i in 0..iovcnt {
+        let entry = (iov_ptr + i as u64 * 16) as *const u64;
+        let (base, len) = unsafe { (*entry, *entry.add(1)) };
+        if len == 0 { continue; }
+        let n = sys_write(fd, base as usize, len as usize);
+        if n < 0 { return n; }
+        total += n;
+    }
+    total
+}
+
+// ── arch_prctl(158) ────────────────────────────────────────────────────────
+
+/// arch_prctl(158): int arch_prctl(int code, unsigned long addr)
+///
+/// Only ARCH_SET_FS (0x1002) is implemented: writes the FS.base MSR so
+/// that TLS (thread-local storage) works.  mlibc calls this via sys_tcb_set.
+fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
+    const ARCH_SET_FS: i32 = 0x1002;
+    const ARCH_GET_FS: i32 = 0x1003;
+    const IA32_FS_BASE: u32 = 0xC000_0100;
+
+    match code {
+        ARCH_SET_FS => {
+            unsafe {
+                core::arch::asm!(
+                    "wrmsr",
+                    in("ecx") IA32_FS_BASE,
+                    in("eax") (addr & 0xFFFF_FFFF) as u32,
+                    in("edx") (addr >> 32) as u32,
+                    options(nostack, preserves_flags),
+                );
+            }
+            // Also persist in the current process's saved state so the
+            // value is restored on every context switch via TSS RSP0 path.
+            // (For now it survives as long as the process keeps running;
+            // full save/restore needs FS.base in TrapFrame — future work.)
+            0
+        }
+        ARCH_GET_FS => {
+            if validate_user_buffer(addr, 8).is_err() { return errno::EFAULT; }
+            let mut lo: u32;
+            let mut hi: u32;
+            unsafe {
+                core::arch::asm!(
+                    "rdmsr",
+                    in("ecx") IA32_FS_BASE,
+                    out("eax") lo,
+                    out("edx") hi,
+                    options(nostack, preserves_flags),
+                );
+                *(addr as *mut u64) = (hi as u64) << 32 | lo as u64;
+            }
+            0
+        }
+        _ => errno::EINVAL,
+    }
+}
+
+// ── futex(202) ─────────────────────────────────────────────────────────────
+
+/// futex(202): long futex(uint32_t *uaddr, int futex_op, uint32_t val,
+///                        const struct timespec *timeout, ...)
+///
+/// Single-threaded stub: WAIT returns immediately if *uaddr != val (spurious
+/// wakeup is permitted by POSIX), and WAKE always succeeds.  This is enough
+/// for mlibc's internal mutexes in a single-process world.
+fn sys_futex(uaddr: u64, futex_op: i32, val: i32, _timeout: u64) -> SyscallResult {
+    const FUTEX_WAIT: i32 = 0;
+    const FUTEX_WAKE: i32 = 1;
+    const FUTEX_PRIVATE_FLAG: i32 = 128;
+
+    let op = futex_op & !FUTEX_PRIVATE_FLAG;
+
+    match op {
+        FUTEX_WAIT => {
+            if validate_user_buffer(uaddr, 4).is_err() { return errno::EFAULT; }
+            let current = unsafe { *(uaddr as *const i32) };
+            if current != val {
+                return errno::EAGAIN;
+            }
+            // Single-threaded: nobody else can wake us; yield and return.
+            // Returning 0 (spurious wake) is valid per POSIX.
+            0
+        }
+        FUTEX_WAKE => {
+            // No waiters in single-threaded mode — report 0 woken.
+            0
+        }
+        _ => errno::ENOSYS,
+    }
+}
+
+// ── set_tid_address(218) ───────────────────────────────────────────────────
+
+/// set_tid_address(218): pid_t set_tid_address(int *tidptr)
+///
+/// Used by mlibc during thread startup to register a clear-child-tid pointer.
+/// In our single-threaded model we just return the current PID.
+fn sys_set_tid_address(_tidptr: u64) -> SyscallResult {
+    sys_getpid()
+}
+
 fn sys_yield() -> SyscallResult {
     // TODO: Trigger voluntary context switch
     0
+}
+
+/// sys_nanosleep — block the calling process for at least `ns` nanoseconds.
+///
+/// Returns 0 when the sleep completes. Returns immediately (0) if ns == 0.
+///
+/// LOCKING (see hrtimer.rs for full analysis):
+///   cli → scheduler lock → QUEUE lock (hrtimer::start) → QUEUE released →
+///   block_current → never returns here.
+fn sys_nanosleep(ns: u64) -> SyscallResult {
+    if ns == 0 {
+        return 0;
+    }
+
+    let now = crate::time::ktime_get();
+    let expiry = now.saturating_add(ns);
+
+    let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame;
+
+    unsafe { core::arch::asm!("cli"); }
+
+    let next_tf = {
+        let mut scheduler = super::scheduler::local_scheduler();
+
+        // Set the wakeup return value in the saved TrapFrame so that when the
+        // process is woken by hrtimer::tick() the syscall returns 0.
+        unsafe {
+            (*(tf_ptr as *mut TrapFrame)).rax = 0;
+        }
+
+        let pid = scheduler.current_pid().map(|p| p.0).unwrap_or(0);
+        serial_println!("[DBG] nanosleep PID {} for {} ns (expiry={})", pid, ns, expiry);
+
+        // Register the hrtimer.  QUEUE lock is acquired and released inside
+        // start(); we still hold the scheduler lock, which is safe because
+        // the ISR path acquires QUEUE first then the scheduler — and ISRs
+        // cannot fire while cli is in effect.
+        crate::time::hrtimer::start(expiry, crate::time::hrtimer::HrTimerAction::WakePid(pid));
+
+        scheduler.block_current(tf_ptr)
+        // scheduler lock dropped here
+    };
+
+    unsafe { super::trapframe::jump_to_trapframe(next_tf) }
 }
 
 fn sys_getpid() -> SyscallResult {
@@ -303,19 +821,1695 @@ fn sys_getpid() -> SyscallResult {
     })
 }
 
+/// sys_exit — terminate the calling process and switch immediately.
+///
+/// Performs an immediate full context switch via kill_and_switch_tf +
+/// jump_to_trapframe.  This restores ALL registers of the next process
+/// and never returns.
 fn sys_exit(status: i32) -> SyscallResult {
     use alloc::format;
 
     let reason = format!("exit({})", status);
 
-    with_scheduler(|scheduler| {
-        scheduler.kill_current(&reason);
-        0
-    });
+    unsafe { core::arch::asm!("cli"); }
 
-    // Process is now Zombie in wait_queue.
-    // Halt until the timer preempts and switches to another process.
-    loop {
-        unsafe { core::arch::asm!("hlt"); }
+    let (dead_pid, tf_ptr) = {
+        let mut scheduler = super::scheduler::local_scheduler();
+        if let Some(proc) = scheduler.running_mut() {
+            proc.exit_status = status;
+        }
+        let dead_pid = scheduler.current_pid().map(|p| p.0).unwrap_or(0);
+        let ptr = scheduler.kill_and_switch_tf(&reason);
+        serial_println!("  → Process exited, switching immediately (full TrapFrame restore)");
+        (dead_pid, ptr)
+    };
+
+    // Wake any parent waiting via waitpid
+    waitpid_wakeup(dead_pid);
+
+    // Cancel any pending poll/epoll wait and clear side tables
+    poll_cancel_waiter(dead_pid);
+    clear_epoll_fd_all(dead_pid);
+
+    unsafe {
+        core::arch::asm!("sti");
+        crate::process::trapframe::jump_to_trapframe(tf_ptr);
     }
 }
+
+fn sys_fork() -> SyscallResult {
+    let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame;
+
+    unsafe { core::arch::asm!("cli"); }
+
+    // Collect what we need from the running process
+    let (child_as, parent_pid, parent_fs_base, files, child_tf) = {
+        let scheduler = super::scheduler::local_scheduler();
+        match scheduler.running_ref() {
+            Some(proc) => {
+                // Build child TrapFrame: same as parent but rax=0 (fork returns 0 in child)
+                let mut tf_copy = unsafe { *tf_ptr };
+                tf_copy.rax = 0;
+
+                match unsafe { proc.address_space.fork() } {
+                    Ok(child_as) => (child_as, proc.pid, proc.fs_base, proc.files.clone(), tf_copy),
+                    Err(e) => {
+                        serial_println!("fork: address_space.fork() failed: {}", e);
+                        unsafe { core::arch::asm!("sti"); }
+                        return errno::ENOMEM;
+                    }
+                }
+            }
+            None => {
+                unsafe { core::arch::asm!("sti"); }
+                return errno::ESRCH;
+            }
+        }
+    };
+
+    let kernel_stack = crate::init::processes::allocate_kernel_stack();
+
+    let child_pid = {
+        let mut scheduler = super::scheduler::local_scheduler();
+        let pid = scheduler.allocate_pid();
+
+        let mut child = alloc::boxed::Box::new(
+            super::Process::new_user_from_fork(
+                pid, parent_pid, alloc::boxed::Box::new(child_tf),
+                kernel_stack, child_as, files,
+            )
+        );
+        child.fs_base = parent_fs_base; // inherit TLS base from parent
+        child.set_name("child");
+        scheduler.add_process(child);
+        pid.0 as SyscallResult
+    };
+
+    unsafe { core::arch::asm!("sti"); }
+    child_pid  // parent sees child PID
+}
+
+fn sys_exec(path_ptr: usize) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(path_ptr as u64, 64) {
+        return e;
+    }
+
+    // Read the program name from user memory (process page table still active)
+    let name_bytes = unsafe {
+        let ptr = path_ptr as *const u8;
+        let mut len = 0usize;
+        while len < 64 {
+            if *ptr.add(len) == 0 { break; }
+            len += 1;
+        }
+        core::slice::from_raw_parts(ptr, len)
+    };
+
+    let name = match core::str::from_utf8(name_bytes) {
+        Ok(s) => s,
+        Err(_) => return errno::EINVAL,
+    };
+
+    serial_println!("sys_exec: loading '{}'", name);
+
+    let elf_bytes = match find_program_elf(name) {
+        Some(b) => b,
+        None => {
+            serial_println!("sys_exec: '{}' not found", name);
+            return errno::ENOENT;
+        }
+    };
+
+    // Load ELF without any lock — may take time and allocates frames
+    let loaded = match unsafe { crate::memory::elf_loader::load_elf(elf_bytes, 0) } {
+        Ok(l) => l,
+        Err(e) => {
+            serial_println!("sys_exec: load_elf failed: {}", e);
+            return errno::ENOMEM;
+        }
+    };
+
+    crate::serial_println_raw!("[EXEC] load_elf done, going cli");
+    unsafe { core::arch::asm!("cli"); }
+    crate::serial_println_raw!("[EXEC] cli done, taking scheduler lock");
+
+    let next_tf = {
+        let mut scheduler = super::scheduler::local_scheduler();
+        crate::serial_println_raw!("[EXEC] scheduler locked, swapping address space");
+        match scheduler.running_mut() {
+            Some(proc) => {
+                crate::serial_println_raw!("[EXEC] dropping old AS");
+                // Replace address space with freshly loaded one
+                proc.address_space = loaded.address_space;
+                crate::serial_println_raw!("[EXEC] old AS dropped, new AS in place");
+
+                // Reset TrapFrame to new entry point
+                proc.trapframe.rip    = loaded.entry_point.as_u64();
+                proc.trapframe.rsp    = loaded.user_stack_top.as_u64();
+                proc.trapframe.cs     = 0x23;
+                proc.trapframe.ss     = 0x1b;
+                proc.trapframe.rflags = 0x200;
+                proc.trapframe.rax = 0; proc.trapframe.rbx = 0; proc.trapframe.rcx = 0;
+                proc.trapframe.rdx = 0; proc.trapframe.rsi = 0; proc.trapframe.rdi = 0;
+                proc.trapframe.rbp = 0; proc.trapframe.r8  = 0; proc.trapframe.r9  = 0;
+                proc.trapframe.r10 = 0; proc.trapframe.r11 = 0; proc.trapframe.r12 = 0;
+                proc.trapframe.r13 = 0; proc.trapframe.r14 = 0; proc.trapframe.r15 = 0;
+
+                // Reset TLS — the new image will set it via arch_prctl if needed.
+                proc.fs_base = 0;
+                unsafe {
+                    core::arch::asm!(
+                        "wrmsr",
+                        in("ecx") 0xC000_0100u32,
+                        in("eax") 0u32,
+                        in("edx") 0u32,
+                        options(nostack, preserves_flags),
+                    );
+                }
+
+                crate::serial_println_raw!("[EXEC] activating new CR3");
+                unsafe { proc.address_space.activate(); }
+                crate::serial_println_raw!("[EXEC] CR3 active, jumping to entry={:#x}", proc.trapframe.rip);
+                &*proc.trapframe as *const TrapFrame
+            }
+            None => {
+                unsafe { core::arch::asm!("sti"); }
+                return errno::ESRCH;
+            }
+        }
+    };
+
+    crate::serial_println_raw!("[EXEC] jump_to_trapframe");
+    // Jump to the new program — never returns
+    unsafe { super::trapframe::jump_to_trapframe(next_tf) }
+}
+
+fn find_program_elf(name: &str) -> Option<&'static [u8]> {
+    use crate::process::user_programs::{list_programs, ProgramSource};
+    for (prog_name, source) in list_programs() {
+        if *prog_name == name {
+            if let ProgramSource::Elf(b) = source {
+                return Some(b);
+            }
+        }
+    }
+    None
+}
+
+fn sys_waitpid(child_pid: usize) -> SyscallResult {
+    let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame;
+
+    unsafe { core::arch::asm!("cli"); }
+
+    let next_tf = {
+        let mut scheduler = super::scheduler::local_scheduler();
+
+        // Check if child is already a zombie — collect it immediately.
+        if let Some(pos) = scheduler.wait_queue.iter().position(|p| {
+            p.pid.0 == child_pid && matches!(p.state, super::ProcessState::Zombie)
+        }) {
+            scheduler.wait_queue.remove(pos);
+            unsafe { core::arch::asm!("sti"); }
+            return child_pid as SyscallResult;
+        }
+
+        // Not a zombie yet — record what we are waiting for in the Process struct
+        // (supports multiple concurrent waitpid callers: shell + ipc_ping etc.)
+        // and block until the child exits and calls waitpid_wakeup().
+        if let Some(proc) = scheduler.running_mut() {
+            proc.waiting_for = Some(child_pid);
+        }
+
+        scheduler.block_current(tf_ptr)
+    };
+    unsafe { super::trapframe::jump_to_trapframe(next_tf) }
+}
+
+fn sys_uptime_ms() -> SyscallResult {
+    crate::cpu::tsc::uptime_ms() as SyscallResult
+}
+
+/// sys_uptime_sec (custom #202) — seconds elapsed since kernel boot.
+///
+/// Uses the active clocksource (TSC when available).
+fn sys_uptime_sec() -> SyscallResult {
+    (crate::time::ktime_get() / 1_000_000_000) as SyscallResult
+}
+
+/// sys_clock_gettime (Linux #228) — write a `struct timespec` to user memory.
+///
+/// Supported clock IDs:
+///   0 = CLOCK_REALTIME   — returns monotonic uptime (no RTC; boot = epoch)
+///   1 = CLOCK_MONOTONIC  — same as REALTIME for now
+///   7 = CLOCK_BOOTTIME   — same; included for glibc compatibility
+///
+/// `struct timespec { i64 tv_sec; i64 tv_nsec; }` (16 bytes, 8-byte aligned).
+///
+/// The process's own page table is active during the syscall, so we can
+/// write directly to the user virtual address without physical translation.
+fn sys_clock_gettime(clk_id: u64, tp_ptr: u64) -> SyscallResult {
+    // Validate the user pointer (16 bytes = 2 × i64)
+    if let Err(e) = validate_user_buffer(tp_ptr, 16) {
+        return e;
+    }
+
+    // Accept only the clock IDs we can serve meaningfully.
+    match clk_id {
+        0 | 1 | 7 => {}
+        _ => return errno::EINVAL,
+    }
+
+    let uptime_ns = crate::time::ktime_get();
+    let tv_sec  = (uptime_ns / 1_000_000_000) as i64;
+    let tv_nsec = (uptime_ns % 1_000_000_000) as i64;
+
+    // Direct write into user VA — safe because:
+    //   1. validate_user_buffer confirmed it is in user-space range.
+    //   2. The running process's CR3 is still active (we're in the kernel
+    //      but the user page tables haven't been switched away).
+    //   3. If the page isn't mapped yet, the write faults and the page-fault
+    //      handler demand-pages it (same as any user store instruction).
+    unsafe {
+        let ptr = tp_ptr as *mut i64;
+        ptr.write(tv_sec);
+        ptr.add(1).write(tv_nsec);
+    }
+
+    0
+}
+
+/// Called from sys_exit after the process is killed.
+///
+/// Scans the wait_queue for any process whose waiting_for == dead_pid.
+/// Supports multiple concurrent waiters (shell + ipc_ping etc.) because
+/// the wait info lives in each Process rather than a single global slot.
+pub(crate) fn waitpid_wakeup(dead_pid: usize) {
+    let mut sched = super::scheduler::local_scheduler();
+
+    // Find the parent blocked in waitpid for dead_pid.
+    let mut parent_pid_to_wake: Option<usize> = None;
+    for proc in sched.wait_queue.iter_mut() {
+        if proc.waiting_for == Some(dead_pid)
+            && matches!(proc.state, super::ProcessState::Blocked)
+        {
+            proc.trapframe.rax = dead_pid as u64;
+            proc.waiting_for = None;
+            parent_pid_to_wake = Some(proc.pid.0);
+            break;
+        }
+    }
+
+    if let Some(pid) = parent_pid_to_wake {
+        sched.wake(pid);
+    }
+}
+
+// ============================================================================
+// IPC SYSCALLS: socket / bind / connect / accept / sendmsg / recvmsg
+// ============================================================================
+//
+// Each process stores its open channel FDs in its FileDescriptorTable using
+// a thin SocketHandle wrapper that implements FileHandle.  The actual Channel
+// state lives in ipc::CHANNELS (global table, protected by its own Mutex).
+//
+// LOCKING ORDER (must never be inverted):
+//   cli → SCHEDULER → CHANNELS
+//
+// The ISR path only touches the SCHEDULER, not CHANNELS, so this is safe.
+
+use crate::ipc::channel::{ChannelId, Message as IpcMessage, ServerState, CHANNELS};
+
+// ============================================================================
+// IPC BLOCKING WAITERS
+// ============================================================================
+//
+// Pattern: same as STDIN_WAITER / WAIT_WAITER.
+//   1. Syscall saves waiter info (pid + data pointers) in a global slot.
+//   2. Syscall calls block_current + jump_to_trapframe → never returns here.
+//   3. Wakeup code (from another process's syscall) writes the result directly
+//      into the blocked process's trapframe.rax (and into the user buffer when
+//      needed, via physical address translation).
+//   4. sched.wake() makes the process runnable; it returns from the syscall
+//      via iretq with rax already set to the correct value.
+
+struct AcceptWaiter {
+    pid:               usize,
+    server_channel_id: ChannelId,
+}
+static ACCEPT_WAITER: Mutex<Option<AcceptWaiter>> = Mutex::new(None);
+
+struct RecvWaiter {
+    pid:        usize,
+    channel_id: ChannelId,
+    /// Physical address of the 64-byte Message buffer (pre-translated at
+    /// block time so that delivery in sys_sendmsg skips the page-table walk).
+    phys_buf:   u64,
+}
+static RECV_WAITER: Mutex<Option<RecvWaiter>> = Mutex::new(None);
+
+// ——— SocketHandle — FileHandle wrapper around a channel ————————————————————
+
+/// A FileHandle wrapper around a ChannelId.
+/// `read`  ↔  recvmsg (returns one message; blocks if empty)
+/// `write` ↔  sendmsg (sends one message to the peer)
+///
+/// Blocking inside read/write is not used here — callers use
+/// sys_recvmsg / sys_sendmsg directly.  The handle is only kept in the FD
+/// table so that close() frees the channel.
+struct SocketHandle {
+    channel_id: ChannelId,
+}
+
+impl crate::process::file::FileHandle for SocketHandle {
+    fn read(&mut self, buf: &mut [u8]) -> crate::process::file::FileResult<usize> {
+        let msg = CHANNELS.lock().get_mut(self.channel_id)
+            .and_then(|ch| ch.dequeue());
+        match msg {
+            Some(m) => {
+                let n = core::cmp::min(buf.len(), m.len as usize);
+                buf[..n].copy_from_slice(&m.data[..n]);
+                Ok(n)
+            }
+            None => Ok(0),   // non-blocking: no data yet
+        }
+    }
+
+    fn write(&mut self, buf: &[u8]) -> crate::process::file::FileResult<usize> {
+        let msg = IpcMessage::new(0, buf);
+        let ok = {
+            let mut tbl = CHANNELS.lock();
+            let peer_id = tbl.get(self.channel_id).and_then(|ch| ch.peer);
+            if let Some(pid) = peer_id {
+                tbl.get_mut(pid).map(|ch| ch.enqueue(msg)).unwrap_or(false)
+            } else {
+                false
+            }
+        };
+        if ok { Ok(buf.len()) } else { Err(crate::process::file::FileError::IOError) }
+    }
+
+    fn close(&mut self) -> crate::process::file::FileResult<()> {
+        CHANNELS.lock().free(self.channel_id);
+        Ok(())
+    }
+
+    fn name(&self) -> &str { "socket" }
+}
+
+// ——— fd → channel_id side table ———————————————————————————————————————————
+//
+// FileHandle is a trait object; we can't downcast to SocketHandle in no_std
+// (no Any).  Solution: maintain a per-process fd→channel_id side table here.
+//
+// The challenge: FileHandle is a trait object; we can't downcast to SocketHandle
+// in no_std (no Any).  Solution: maintain a per-process fd→channel_id side table
+// in the IPC layer rather than in the FileDescriptorTable.
+//
+// We use a global array indexed by (pid * MAX_FILES + fd).
+
+const MAX_PROCS: usize = 32;
+const MAX_FILES_PER_PROC: usize = 16;
+
+/// fd → channel_id mapping.  0 means "not a socket fd".
+static FD_CHANNEL_MAP: Mutex<[[ChannelId; MAX_FILES_PER_PROC]; MAX_PROCS]> =
+    Mutex::new([[0usize; MAX_FILES_PER_PROC]; MAX_PROCS]);
+
+fn set_fd_channel(pid: usize, fd: usize, channel_id: ChannelId) {
+    if pid < MAX_PROCS && fd < MAX_FILES_PER_PROC {
+        FD_CHANNEL_MAP.lock()[pid][fd] = channel_id;
+    }
+}
+
+fn get_fd_channel(pid: usize, fd: usize) -> Option<ChannelId> {
+    if pid < MAX_PROCS && fd < MAX_FILES_PER_PROC {
+        let id = FD_CHANNEL_MAP.lock()[pid][fd];
+        if id != 0 { Some(id) } else { None }
+    } else {
+        None
+    }
+}
+
+fn clear_fd_channel(pid: usize, fd: usize) {
+    if pid < MAX_PROCS && fd < MAX_FILES_PER_PROC {
+        FD_CHANNEL_MAP.lock()[pid][fd] = 0;
+    }
+}
+
+// ——— sys_socket (revised) — store mapping ——————————————————————————————————
+
+/// Internal helper: open a socket and record the fd→channel mapping.
+fn sys_socket_impl() -> SyscallResult {
+    let pid_dbg = crate::process::scheduler::current_pid().unwrap_or(0);
+    serial_println!("[DBG] sys_socket PID {}", pid_dbg);
+    let id = match CHANNELS.lock().alloc() {
+        Some(id) => id,
+        None => return errno::ENOMEM,
+    };
+
+    let handle = alloc::boxed::Box::new(SocketHandle { channel_id: id });
+
+    unsafe { core::arch::asm!("cli"); }
+    let result = {
+        let mut sched = super::scheduler::local_scheduler();
+        match sched.running_mut() {
+            Some(proc) => {
+                let pid = proc.pid.0;
+                match proc.files.allocate(handle) {
+                    Ok(fd) => {
+                        drop(sched);
+                        set_fd_channel(pid, fd, id);
+                        fd as i64
+                    }
+                    Err(_) => {
+                        CHANNELS.lock().free(id);
+                        errno::EINVAL
+                    }
+                }
+            }
+            None => {
+                CHANNELS.lock().free(id);
+                errno::ESRCH
+            }
+        }
+    };
+    unsafe { core::arch::asm!("sti"); }
+    result
+}
+
+// ——— sys_bind (proper implementation) ————————————————————————————————————
+
+fn sys_bind_impl(fd: i32, path_ptr: usize, _addrlen: usize) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(path_ptr as u64, 64) {
+        return e;
+    }
+
+    let mut path_buf = [0u8; 64];
+    let path_len = unsafe {
+        let ptr = path_ptr as *const u8;
+        let mut len = 0usize;
+        while len < 63 && *ptr.add(len) != 0 {
+            path_buf[len] = *ptr.add(len);
+            len += 1;
+        }
+        len
+    };
+    if path_len == 0 { return errno::EINVAL; }
+
+    let pid = crate::process::scheduler::current_pid().unwrap_or(0);
+
+    let channel_id = match get_fd_channel(pid, fd as usize) {
+        Some(id) => id,
+        None => return ENOTSOCK,
+    };
+
+    let mut tbl = CHANNELS.lock();
+    let ch = match tbl.get_mut(channel_id) {
+        Some(c) => c,
+        None => return errno::EBADF,
+    };
+
+    ch.bound_path = Some(path_buf);
+    ch.server_state = Some(ServerState::Listening);
+    0
+}
+
+// ——— sys_connect ——————————————————————————————————————————————————————————
+
+/// sys_connect (#42) — connect a socket fd to a named server endpoint.
+///
+/// If no server is listening yet: returns -ENOENT.
+/// If a server is listening: creates a channel pair and returns 0.
+///
+/// The server must subsequently call accept() to get the peer fd.
+fn sys_connect(fd: i32, path_ptr: usize, _addrlen: usize) -> SyscallResult {
+    let pid_dbg = crate::process::scheduler::current_pid().unwrap_or(0);
+    serial_println!("[DBG] sys_connect PID {} fd={}", pid_dbg, fd);
+    if let Err(e) = validate_user_buffer(path_ptr as u64, 64) {
+        return e;
+    }
+
+    let path_bytes = unsafe {
+        let ptr = path_ptr as *const u8;
+        let mut len = 0usize;
+        while len < 63 && *ptr.add(len) != 0 { len += 1; }
+        core::slice::from_raw_parts(ptr, len)
+    };
+
+    let pid = crate::process::scheduler::current_pid().unwrap_or(0);
+
+    let client_channel_id = match get_fd_channel(pid, fd as usize) {
+        Some(id) => id,
+        None => return ENOTSOCK,
+    };
+
+    let mut tbl = CHANNELS.lock();
+
+    // Find the server channel bound to this path
+    let server_channel_id = match tbl.find_by_path(path_bytes) {
+        Some(id) => id,
+        None => return errno::ENOENT,
+    };
+
+    // Check it is actually listening
+    let is_listening = tbl.get(server_channel_id)
+        .map(|ch| ch.server_state == Some(ServerState::Listening))
+        .unwrap_or(false);
+    if !is_listening {
+        return ECONNREFUSED;
+    }
+
+    // Allocate a server-side peer channel for this connection
+    let server_peer_id = match tbl.alloc() {
+        Some(id) => id,
+        None => return errno::ENOMEM,
+    };
+
+    // Wire up the bidirectional pair:
+    //   client_channel ↔ server_peer
+    if let Some(ch) = tbl.get_mut(client_channel_id) {
+        ch.peer = Some(server_peer_id);
+    }
+    if let Some(ch) = tbl.get_mut(server_peer_id) {
+        ch.peer = Some(client_channel_id);
+    }
+
+    // Set server channel to PendingConnect; clear any stale accept waiter list
+    if let Some(ch) = tbl.get_mut(server_channel_id) {
+        ch.server_state = Some(ServerState::PendingConnect(server_peer_id));
+    }
+
+    drop(tbl);
+
+    // If a process is blocked in sys_accept() for this server channel, wake it
+    // and allocate the peer fd directly in its file table.
+    let accept_waiter = {
+        let mut aw = ACCEPT_WAITER.lock();
+        if aw.as_ref().map(|w| w.server_channel_id == server_channel_id).unwrap_or(false) {
+            aw.take()
+        } else {
+            None
+        }
+    };
+
+    if let Some(waiter) = accept_waiter {
+        serial_println!("[DBG] connect: waking accept waiter PID {}", waiter.pid);
+        // Allocate the peer fd inside the blocked process.
+        // cli prevents the timer ISR from preempting while we hold SCHEDULER.
+        unsafe { core::arch::asm!("cli"); }
+
+        let handle = alloc::boxed::Box::new(SocketHandle { channel_id: server_peer_id });
+        let mut new_fd: i64 = errno::EINVAL;
+
+        {
+            let mut sched = super::scheduler::local_scheduler();
+            // Reset PendingConnect now that accept() is being satisfied
+            CHANNELS.lock().get_mut(server_channel_id)
+                .map(|ch| ch.server_state = Some(ServerState::Listening));
+
+            for proc in sched.wait_queue.iter_mut() {
+                if proc.pid.0 == waiter.pid
+                    && matches!(proc.state, super::ProcessState::Blocked)
+                {
+                    match proc.files.allocate(handle) {
+                        Ok(fd) => {
+                            new_fd = fd as i64;
+                            proc.trapframe.rax = fd as u64;
+                        }
+                        Err(_) => {
+                            proc.trapframe.rax = (-22i64) as u64; // EINVAL
+                        }
+                    }
+                    break;
+                }
+            }
+            // Set the fd→channel mapping BEFORE wake() so the process
+            // can never call recvmsg() with an unmapped fd.
+            if new_fd >= 0 {
+                set_fd_channel(waiter.pid, new_fd as usize, server_peer_id);
+            }
+            sched.wake(waiter.pid);
+        }
+
+        unsafe { core::arch::asm!("sti"); }
+    }
+
+    0
+}
+
+// ——— sys_accept ——————————————————————————————————————————————————————————
+
+/// sys_accept (#43) — accept the next incoming connection on a server socket.
+///
+/// Blocks until a client calls connect().
+/// Returns a new fd for the server-side peer channel.
+fn sys_accept(fd: i32) -> SyscallResult {
+    let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame;
+    let pid = crate::process::scheduler::current_pid().unwrap_or(0);
+
+    let server_channel_id = match get_fd_channel(pid, fd as usize) {
+        Some(id) => id,
+        None => return ENOTSOCK,
+    };
+
+    unsafe { core::arch::asm!("cli"); }
+
+    // Fast path: connection already pending from a previous connect().
+    let pending = {
+        let mut tbl = CHANNELS.lock();
+        match tbl.get_mut(server_channel_id) {
+            Some(ch) => {
+                if let Some(ServerState::PendingConnect(peer_id)) = ch.server_state {
+                    ch.server_state = Some(ServerState::Listening);
+                    Some(peer_id)
+                } else {
+                    None
+                }
+            }
+            None => {
+                unsafe { core::arch::asm!("sti"); }
+                return errno::EBADF;
+            }
+        }
+    };
+
+    if let Some(peer_channel_id) = pending {
+        let handle = alloc::boxed::Box::new(SocketHandle { channel_id: peer_channel_id });
+        let new_fd = {
+            let mut sched = super::scheduler::local_scheduler();
+            match sched.running_mut() {
+                Some(proc) => match proc.files.allocate(handle) {
+                    Ok(fd) => fd as i64,
+                    Err(_) => errno::EINVAL,
+                },
+                None => errno::ESRCH,
+            }
+        };
+        if new_fd >= 0 { set_fd_channel(pid, new_fd as usize, peer_channel_id); }
+        unsafe { core::arch::asm!("sti"); }
+        return new_fd;
+    }
+
+    // Slow path: register as waiter, block.
+    // sys_connect() will allocate the fd for us and set trapframe.rax before
+    // calling sched.wake().  We return from the syscall via iretq with rax
+    // already set to the correct fd number — no code here runs after blocking.
+    *ACCEPT_WAITER.lock() = Some(AcceptWaiter { pid, server_channel_id });
+
+    let next_tf = {
+        let mut sched = super::scheduler::local_scheduler();
+        sched.block_current(tf_ptr)
+    };
+    unsafe { super::trapframe::jump_to_trapframe(next_tf) }
+}
+
+// ——— sys_sendmsg ——————————————————————————————————————————————————————————
+
+/// sys_sendmsg (#46) — send a message on a connected socket.
+///
+/// `msg_ptr` points to a user `IpcUserMsg { tag: u32, len: u32, data: [u8; 56] }`.
+/// `tag`   — application-defined message type.
+/// `len`   — how many bytes of `data` are valid (0..=56).
+fn sys_sendmsg(fd: i32, msg_ptr: u64, _flags: u32) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(msg_ptr, 64) {
+        return e;
+    }
+
+    // Read the IpcUserMsg from user memory (user page table active)
+    let (tag, len, data) = unsafe {
+        let ptr = msg_ptr as *const u8;
+        let tag  = u32::from_le_bytes([*ptr, *ptr.add(1), *ptr.add(2), *ptr.add(3)]);
+        let len  = u32::from_le_bytes([*ptr.add(4), *ptr.add(5), *ptr.add(6), *ptr.add(7)]);
+        let len  = core::cmp::min(len, 56) as usize;
+        let mut data = [0u8; 56];
+        core::ptr::copy_nonoverlapping(ptr.add(8), data.as_mut_ptr(), len);
+        (tag, len as u32, data)
+    };
+
+    let msg = IpcMessage { tag, len, data };
+
+    let pid = crate::process::scheduler::current_pid().unwrap_or(0);
+
+    let channel_id = match get_fd_channel(pid, fd as usize) {
+        Some(id) => id,
+        None => return ENOTSOCK,
+    };
+
+    // Check if a process is blocked in recvmsg() on the peer channel.
+    // If so, deliver the message directly to its user buffer (zero-copy from
+    // the kernel's point of view) and wake it — no need to enqueue.
+    let peer_id = {
+        let tbl = CHANNELS.lock();
+        match tbl.get(channel_id).and_then(|ch| ch.peer) {
+            Some(id) => id,
+            None => return ENOTCONN,
+        }
+    };
+
+    let recv_waiter = {
+        let mut rw = RECV_WAITER.lock();
+        if rw.as_ref().map(|w| w.channel_id == peer_id).unwrap_or(false) {
+            rw.take()
+        } else {
+            None
+        }
+    };
+
+    if let Some(waiter) = recv_waiter {
+        // Fast delivery: write directly to the pre-translated physical address
+        // stored in the waiter — no page-table walk needed.
+        let phys_offset = crate::memory::physical_memory_offset().as_u64();
+        if waiter.phys_buf != 0 {
+            let dst = (phys_offset + waiter.phys_buf) as *mut u8;
+            unsafe {
+                core::ptr::write_bytes(dst, 0, 64);
+                core::ptr::copy_nonoverlapping(msg.tag.to_le_bytes().as_ptr(), dst,       4);
+                core::ptr::copy_nonoverlapping(msg.len.to_le_bytes().as_ptr(), dst.add(4), 4);
+                core::ptr::copy_nonoverlapping(msg.data.as_ptr(),              dst.add(8), msg.len as usize);
+            }
+        }
+
+        // Wake the receiver, setting its syscall return value — single scan
+        // of the wait_queue (previously: separate write-rax loop + wake scan).
+        unsafe { core::arch::asm!("cli"); }
+        {
+            let mut sched = super::scheduler::local_scheduler();
+            sched.wake_with_retval(waiter.pid, 64);
+        }
+        unsafe { core::arch::asm!("sti"); }
+        return 64;
+    }
+
+    // No waiter — enqueue for future recvmsg().
+    let enqueued = {
+        let mut tbl = CHANNELS.lock();
+        match tbl.get_mut(peer_id) {
+            Some(ch) => ch.enqueue(msg),
+            None => return EPIPE,
+        }
+    };
+    if !enqueued { return EAGAIN; }
+
+    // Wake any poll/epoll waiter watching peer_id for POLLIN.
+    // Called after CHANNELS lock is released.
+    poll_wakeup_for_channel(peer_id);
+
+    64
+}
+
+/// Write a Message into a user buffer using physical address translation.
+///
+/// Used by sys_sendmsg to deliver a message to a blocked sys_recvmsg without
+/// going through the queue (same technique as stdin_wakeup).
+fn write_msg_to_user(
+    addr_space: &crate::memory::address_space::AddressSpace,
+    user_buf: u64,
+    msg: &IpcMessage,
+    phys_offset: x86_64::VirtAddr,
+) {
+    use x86_64::{VirtAddr, structures::paging::{Page, Size4KiB}};
+
+    // The Message is 64 bytes; it might straddle a page boundary (unlikely for
+    // aligned allocations, but we handle it field-by-field for safety).
+    // For simplicity, assume the 64-byte Message is within a single 4K page
+    // (the compiler aligns Message to 64 bytes, so it never crosses a page).
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(user_buf));
+    let offset = user_buf & 0xFFF;
+
+    if let Some(frame) = unsafe { addr_space.translate_page(page) } {
+        let dst_va = phys_offset + frame.start_address().as_u64() + offset;
+        let dst = dst_va.as_mut_ptr::<u8>();
+        unsafe {
+            // Zero the 64-byte slot
+            core::ptr::write_bytes(dst, 0, 64);
+            // tag (4 bytes)
+            core::ptr::copy_nonoverlapping(msg.tag.to_le_bytes().as_ptr(), dst, 4);
+            // len (4 bytes)
+            core::ptr::copy_nonoverlapping(msg.len.to_le_bytes().as_ptr(), dst.add(4), 4);
+            // data
+            core::ptr::copy_nonoverlapping(msg.data.as_ptr(), dst.add(8), msg.len as usize);
+        }
+    }
+}
+
+// (sys_recvmsg follows)
+
+// ——— sys_recvmsg ——————————————————————————————————————————————————————————
+
+/// sys_recvmsg (#47) — receive a message from a connected socket.
+///
+/// `msg_ptr` points to a user buffer (64 bytes) that will receive the message.
+/// Blocks if no message is available.
+fn sys_recvmsg(fd: i32, msg_ptr: u64, _flags: u32) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(msg_ptr, 64) {
+        return e;
+    }
+
+    let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame;
+    let pid = crate::process::scheduler::current_pid().unwrap_or(0);
+
+    let channel_id = match get_fd_channel(pid, fd as usize) {
+        Some(id) => id,
+        None => return ENOTSOCK,
+    };
+
+    unsafe { core::arch::asm!("cli"); }
+
+    // Fast path: message already queued.
+    let queued = CHANNELS.lock().get_mut(channel_id).and_then(|ch| ch.dequeue());
+
+    if let Some(m) = queued {
+        unsafe { core::arch::asm!("sti"); }
+        unsafe {
+            let ptr = msg_ptr as *mut u8;
+            ptr.write_bytes(0, 64);
+            core::ptr::copy_nonoverlapping(m.tag.to_le_bytes().as_ptr(), ptr,       4);
+            core::ptr::copy_nonoverlapping(m.len.to_le_bytes().as_ptr(), ptr.add(4), 4);
+            core::ptr::copy_nonoverlapping(m.data.as_ptr(),              ptr.add(8), m.len as usize);
+        }
+        return 64;
+    }
+
+    // Slow path: block.
+    // Pre-translate the user buffer VA → physical address so that the sender
+    // (sys_sendmsg) can write directly to physical memory without a page-table
+    // walk on the delivery fast path.
+    let phys_buf = {
+        use x86_64::{VirtAddr, structures::paging::{Page, Size4KiB}};
+        let page   = Page::<Size4KiB>::containing_address(VirtAddr::new(msg_ptr));
+        let offset = msg_ptr & 0xFFF;
+        // cli is already set; safe to acquire scheduler read-only.
+        let sched = super::scheduler::local_scheduler();
+        sched.running_ref()
+            .and_then(|proc| unsafe { proc.address_space.translate_page(page) })
+            .map(|frame| frame.start_address().as_u64() + offset)
+            .unwrap_or(0)
+        // sched guard dropped here
+    };
+
+    *RECV_WAITER.lock() = Some(RecvWaiter { pid, channel_id, phys_buf });
+
+    let next_tf = {
+        let mut sched = super::scheduler::local_scheduler();
+        sched.block_current(tf_ptr)
+    };
+    unsafe { super::trapframe::jump_to_trapframe(next_tf) }
+}
+
+use errno::*;
+
+// ============================================================================
+// POLL / EPOLL SYSCALLS
+// ============================================================================
+//
+// poll(7), epoll_create(213), epoll_ctl(233), epoll_wait(232)
+//
+// Architecture:
+//   - `fd_check_ready(pid, fd, events)` checks FD readiness without consuming data.
+//   - `POLL_WAITERS[pid]` stores a blocked process's buffer info for wakeup delivery.
+//   - `EPOLL_INSTANCES` holds per-epoll-fd watch lists.
+//   - `EPOLL_FD_MAP[pid][fd]` maps epoll FDs to EpollInstanceIds (same pattern as FD_CHANNEL_MAP).
+//   - Wakeup hooks: `poll_wakeup_for_fd0` (keyboard ISR) and
+//     `poll_wakeup_for_channel` (sys_sendmsg).
+//
+// LOCKING ORDER (cli must be held):
+//   POLL_WAITERS → EPOLL_INSTANCES → FD_CHANNEL_MAP → CHANNELS → (release) → SCHEDULER
+//   SCHEDULER is always acquired last.
+
+// ── Poll bitmasks (POSIX ABI) ──────────────────────────────────────────────
+
+const POLLIN:   i16 = 0x0001;
+const POLLOUT:  i16 = 0x0004;
+const POLLERR:  i16 = 0x0008;
+#[allow(dead_code)]
+const POLLHUP:  i16 = 0x0010;
+const POLLNVAL: i16 = 0x0020;
+
+// ── Epoll bitmasks / ops (Linux ABI) ──────────────────────────────────────
+
+const EPOLLIN:       u32 = 0x0000_0001;
+const EPOLLOUT:      u32 = 0x0000_0004;
+const EPOLLERR:      u32 = 0x0000_0008;
+const EPOLLET:       u32 = 0x8000_0000;
+
+const EPOLL_CTL_ADD: i32 = 1;
+const EPOLL_CTL_DEL: i32 = 2;
+const EPOLL_CTL_MOD: i32 = 3;
+
+// ── Structures ──────────────────────────────────────────────────────────────
+
+/// POSIX `struct pollfd` — 8 bytes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PollFd {
+    fd:      i32,
+    events:  i16,
+    revents: i16,
+}
+
+/// Linux `struct epoll_event` (packed, 12 bytes on x86_64).
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct EpollEvent {
+    events: u32,
+    data:   u64,
+}
+
+/// One watched FD inside an epoll instance.
+#[derive(Clone, Copy)]
+struct EpollWatch {
+    fd:             i32,
+    events:         u32,   // EPOLLIN | EPOLLOUT | …
+    data:           u64,   // opaque user data returned in events
+    edge_triggered: bool,
+    #[allow(dead_code)]
+    et_delivered:   bool,
+}
+
+/// A single epoll instance (the object behind an epoll FD).
+#[derive(Clone, Copy)]
+struct EpollInstance {
+    watches:   [Option<EpollWatch>; 16],
+    owner_pid: usize,
+}
+
+pub type EpollInstanceId = usize; // 0 = invalid
+
+struct EpollInstanceTable {
+    slots: [Option<EpollInstance>; 16],
+}
+
+impl EpollInstanceTable {
+    const fn new() -> Self {
+        Self { slots: [None; 16] }
+    }
+
+    fn alloc(&mut self, owner_pid: usize) -> Option<EpollInstanceId> {
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(EpollInstance { watches: [None; 16], owner_pid });
+                return Some(i + 1); // 1-based IDs; 0 = invalid
+            }
+        }
+        None
+    }
+
+    fn free(&mut self, id: EpollInstanceId) {
+        if id >= 1 && id <= 16 {
+            self.slots[id - 1] = None;
+        }
+    }
+
+    fn get(&self, id: EpollInstanceId) -> Option<&EpollInstance> {
+        if id >= 1 && id <= 16 { self.slots[id - 1].as_ref() } else { None }
+    }
+
+    fn get_mut(&mut self, id: EpollInstanceId) -> Option<&mut EpollInstance> {
+        if id >= 1 && id <= 16 { self.slots[id - 1].as_mut() } else { None }
+    }
+}
+
+static EPOLL_INSTANCES: Mutex<EpollInstanceTable> = Mutex::new(EpollInstanceTable::new());
+
+/// pid×fd → EpollInstanceId side table (0 = not an epoll fd).
+static EPOLL_FD_MAP: Mutex<[[EpollInstanceId; MAX_FILES_PER_PROC]; MAX_PROCS]> =
+    Mutex::new([[0; MAX_FILES_PER_PROC]; MAX_PROCS]);
+
+/// FileHandle marker stored in the FD table for epoll FDs.
+struct EpollHandle {
+    epoll_id: EpollInstanceId,
+}
+
+impl crate::process::file::FileHandle for EpollHandle {
+    fn read(&mut self, _buf: &mut [u8]) -> crate::process::file::FileResult<usize> {
+        Err(crate::process::file::FileError::NotSupported)
+    }
+    fn write(&mut self, _buf: &[u8]) -> crate::process::file::FileResult<usize> {
+        Err(crate::process::file::FileError::NotSupported)
+    }
+    fn close(&mut self) -> crate::process::file::FileResult<()> {
+        EPOLL_INSTANCES.lock().free(self.epoll_id);
+        Ok(())
+    }
+    fn name(&self) -> &str { "epoll" }
+}
+
+// ── EPOLL_FD_MAP helpers ───────────────────────────────────────────────────
+
+fn get_epoll_fd(pid: usize, fd: usize) -> EpollInstanceId {
+    if pid < MAX_PROCS && fd < MAX_FILES_PER_PROC {
+        EPOLL_FD_MAP.lock()[pid][fd]
+    } else {
+        0
+    }
+}
+
+fn set_epoll_fd(pid: usize, fd: usize, epoll_id: EpollInstanceId) {
+    if pid < MAX_PROCS && fd < MAX_FILES_PER_PROC {
+        EPOLL_FD_MAP.lock()[pid][fd] = epoll_id;
+    }
+}
+
+fn clear_epoll_fd_all(pid: usize) {
+    if pid < MAX_PROCS {
+        let mut map = EPOLL_FD_MAP.lock();
+        map[pid] = [0; MAX_FILES_PER_PROC];
+    }
+}
+
+// ── Poll waiter ────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+enum PollWaiterKind {
+    Poll      { nfds: u32 },
+    EpollWait { epoll_id: EpollInstanceId, maxevents: usize },
+}
+
+/// Describes a process blocked in poll() or epoll_wait().
+#[derive(Clone, Copy)]
+struct PollWaiter {
+    pid:      usize,
+    /// Physical address of the user result buffer (pre-translated at block time).
+    phys_buf: u64,
+    #[allow(dead_code)]
+    phys_len: usize,
+    kind:     PollWaiterKind,
+    /// hrtimer ID for timeout; None = wait forever.
+    timer_id: Option<u32>,
+}
+
+/// One slot per PID — a process can only have one outstanding poll/epoll_wait.
+static POLL_WAITERS: Mutex<[Option<PollWaiter>; MAX_PROCS]> =
+    Mutex::new([None; MAX_PROCS]);
+
+// ── FD readiness ───────────────────────────────────────────────────────────
+
+/// Check which requested events are currently ready for `fd`.
+///
+/// cli must be in effect when called (called from blocking paths where cli
+/// is already set, and from ISR/wakeup context).
+///
+/// Rules:
+///   - IPC channel fd: POLLIN if rx has messages; POLLOUT if peer's rx is not full.
+///   - stdin (fd=0): POLLIN if keyboard buffer has data.
+///   - All other device fds: always ready for the requested events.
+fn fd_check_ready(pid: usize, fd: i32, events: i16) -> i16 {
+    if fd < 0 { return POLLNVAL; }
+    let fd_usize = fd as usize;
+
+    // IPC channel?
+    if fd_usize < MAX_FILES_PER_PROC && pid < MAX_PROCS {
+        let channel_id = FD_CHANNEL_MAP.lock()[pid][fd_usize];
+        if channel_id != 0 {
+            let tbl = CHANNELS.lock();
+            let mut rev: i16 = 0;
+            if events & POLLIN != 0 {
+                if tbl.get(channel_id).map(|ch| ch.has_messages()).unwrap_or(false) {
+                    rev |= POLLIN;
+                }
+            }
+            if events & POLLOUT != 0 {
+                // POLLOUT ready if peer's rx buffer is not full
+                let peer_not_full = tbl.get(channel_id)
+                    .and_then(|ch| ch.peer)
+                    .and_then(|peer_id| tbl.get(peer_id))
+                    .map(|peer| !peer.is_rx_full())
+                    .unwrap_or(false);
+                if peer_not_full { rev |= POLLOUT; }
+            }
+            return rev;
+        }
+    }
+
+    // stdin
+    if fd_usize == 0 {
+        let mut rev: i16 = 0;
+        if events & POLLIN != 0 && crate::keyboard::read_key_peek() {
+            rev |= POLLIN;
+        }
+        return rev;
+    }
+
+    // All other device FDs (always ready)
+    events & (POLLIN | POLLOUT)
+}
+
+// ── deliver_poll_result_phys ───────────────────────────────────────────────
+
+/// Write poll/epoll results into the pre-translated physical buffer.
+///
+/// For Poll: updates revents fields in the PollFd array at phys_buf.
+/// For EpollWait: writes ready EpollEvent structs starting at phys_buf.
+/// Returns the number of ready fds/events.
+///
+/// Called with cli held, after POLL_WAITERS has been released.
+fn deliver_poll_result_phys(waiter: &PollWaiter, phys_offset: u64) -> usize {
+    let pid = waiter.pid;
+    match waiter.kind {
+        PollWaiterKind::Poll { nfds } => {
+            // phys_buf → array of PollFd structs (8 bytes each)
+            let base = (phys_offset + waiter.phys_buf) as *mut PollFd;
+            let mut ready = 0usize;
+            for i in 0..nfds as usize {
+                let pfd = unsafe { *base.add(i) };
+                let rev = fd_check_ready(pid, pfd.fd, pfd.events);
+                unsafe { (*base.add(i)).revents = rev; }
+                if rev != 0 { ready += 1; }
+            }
+            ready
+        }
+        PollWaiterKind::EpollWait { epoll_id, maxevents } => {
+            // phys_buf → array of EpollEvent structs (12 bytes each, packed)
+            let base = phys_offset + waiter.phys_buf;
+            let instances = EPOLL_INSTANCES.lock();
+            let inst = match instances.get(epoll_id) {
+                Some(i) => i,
+                None => return 0,
+            };
+            let mut written = 0usize;
+            for watch_opt in inst.watches.iter() {
+                if written >= maxevents { break; }
+                if let Some(watch) = watch_opt {
+                    let mut poll_ev: i16 = 0;
+                    if watch.events & EPOLLIN  != 0 { poll_ev |= POLLIN; }
+                    if watch.events & EPOLLOUT != 0 { poll_ev |= POLLOUT; }
+                    let rev = fd_check_ready(pid, watch.fd, poll_ev);
+                    let mut epoll_rev: u32 = 0;
+                    if rev & POLLIN  != 0 { epoll_rev |= EPOLLIN; }
+                    if rev & POLLOUT != 0 { epoll_rev |= EPOLLOUT; }
+                    if rev & POLLERR != 0 { epoll_rev |= EPOLLERR; }
+                    if epoll_rev != 0 {
+                        let ev = EpollEvent { events: epoll_rev, data: watch.data };
+                        let dst = (base + written as u64 * 12) as *mut EpollEvent;
+                        unsafe { core::ptr::write_unaligned(dst, ev); }
+                        written += 1;
+                    }
+                }
+            }
+            written
+        }
+    }
+}
+
+// ── Waiter-scan helpers ────────────────────────────────────────────────────
+
+/// Check if a poll waiter is watching fd=0 (stdin) for POLLIN.
+/// Called while POLL_WAITERS is held (poll_waiter is borrowed from it).
+fn poll_waiter_watches_stdin(waiter: &PollWaiter, phys_offset: u64) -> bool {
+    match waiter.kind {
+        PollWaiterKind::Poll { nfds } => {
+            let base = (phys_offset + waiter.phys_buf) as *const PollFd;
+            for i in 0..nfds as usize {
+                let pfd = unsafe { *base.add(i) };
+                if pfd.fd == 0 && (pfd.events & POLLIN) != 0 {
+                    return true;
+                }
+            }
+            false
+        }
+        PollWaiterKind::EpollWait { epoll_id, .. } => {
+            // POLL_WAITERS → EPOLL_INSTANCES is the allowed nesting
+            let instances = EPOLL_INSTANCES.lock();
+            if let Some(inst) = instances.get(epoll_id) {
+                for watch in inst.watches.iter().flatten() {
+                    if watch.fd == 0 && (watch.events & EPOLLIN) != 0 {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Check if a poll waiter is watching a specific IPC channel for POLLIN.
+/// Called while POLL_WAITERS is held.
+fn poll_waiter_watches_channel(
+    waiter: &PollWaiter,
+    channel_id: ChannelId,
+    phys_offset: u64,
+) -> bool {
+    let pid = waiter.pid;
+    if pid >= MAX_PROCS { return false; }
+    match waiter.kind {
+        PollWaiterKind::Poll { nfds } => {
+            let map = FD_CHANNEL_MAP.lock();
+            let base = (phys_offset + waiter.phys_buf) as *const PollFd;
+            for i in 0..nfds as usize {
+                let pfd = unsafe { *base.add(i) };
+                if pfd.fd >= 0 && (pfd.fd as usize) < MAX_FILES_PER_PROC {
+                    if map[pid][pfd.fd as usize] == channel_id && (pfd.events & POLLIN) != 0 {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        PollWaiterKind::EpollWait { epoll_id, .. } => {
+            // POLL_WAITERS → EPOLL_INSTANCES → FD_CHANNEL_MAP
+            let instances = EPOLL_INSTANCES.lock();
+            let map = FD_CHANNEL_MAP.lock();
+            if let Some(inst) = instances.get(epoll_id) {
+                for watch in inst.watches.iter().flatten() {
+                    if watch.fd >= 0 && (watch.fd as usize) < MAX_FILES_PER_PROC {
+                        if map[pid][watch.fd as usize] == channel_id
+                            && (watch.events & EPOLLIN) != 0
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+    }
+}
+
+// ── Wakeup hooks ───────────────────────────────────────────────────────────
+
+/// Called by the keyboard ISR (after stdin_wakeup) with IF=0.
+///
+/// Delivers POLLIN on fd=0 to any process blocked in poll/epoll_wait that
+/// is watching stdin.
+pub(crate) fn poll_wakeup_for_fd0() {
+    let phys_offset = crate::memory::physical_memory_offset().as_u64();
+
+    // Take the waiter (if any) watching fd=0 for POLLIN.
+    let waiter = {
+        let mut waiters = POLL_WAITERS.lock();
+        let mut found = None;
+        for (i, slot) in waiters.iter().enumerate() {
+            if let Some(w) = slot {
+                if poll_waiter_watches_stdin(w, phys_offset) {
+                    found = Some(i);
+                    break;
+                }
+            }
+        }
+        found.and_then(|i| waiters[i].take())
+    };
+
+    let Some(waiter) = waiter else { return; };
+
+    // Cancel timeout timer (if any)
+    if let Some(tid) = waiter.timer_id {
+        crate::time::hrtimer::cancel(tid);
+    }
+
+    // Compute and write results to physical buffer; then wake
+    let count = deliver_poll_result_phys(&waiter, phys_offset);
+    let mut sched = super::scheduler::local_scheduler();
+    sched.wake_with_retval(waiter.pid, count as u64);
+    // sched guard dropped; caller (keyboard ISR) still holds IF=0
+}
+
+/// Called from sys_sendmsg after enqueuing a message (CHANNELS released).
+///
+/// Wakes any process blocked in poll/epoll_wait watching `channel_id` for POLLIN.
+pub(crate) fn poll_wakeup_for_channel(channel_id: ChannelId) {
+    unsafe { core::arch::asm!("cli"); }
+
+    let phys_offset = crate::memory::physical_memory_offset().as_u64();
+
+    let waiter = {
+        let mut waiters = POLL_WAITERS.lock();
+        let mut found = None;
+        for (i, slot) in waiters.iter().enumerate() {
+            if let Some(w) = slot {
+                if poll_waiter_watches_channel(w, channel_id, phys_offset) {
+                    found = Some(i);
+                    break;
+                }
+            }
+        }
+        found.and_then(|i| waiters[i].take())
+    };
+
+    let Some(waiter) = waiter else {
+        unsafe { core::arch::asm!("sti"); }
+        return;
+    };
+
+    if let Some(tid) = waiter.timer_id {
+        crate::time::hrtimer::cancel(tid);
+    }
+
+    let count = deliver_poll_result_phys(&waiter, phys_offset);
+    {
+        let mut sched = super::scheduler::local_scheduler();
+        sched.wake_with_retval(waiter.pid, count as u64);
+    }
+    unsafe { core::arch::asm!("sti"); }
+}
+
+/// Cancel a pending poll/epoll waiter for a process (called on exit).
+fn poll_cancel_waiter(pid: usize) {
+    if pid >= MAX_PROCS { return; }
+    let waiter = {
+        let mut waiters = POLL_WAITERS.lock();
+        waiters[pid].take()
+    };
+    if let Some(w) = waiter {
+        if let Some(tid) = w.timer_id {
+            crate::time::hrtimer::cancel(tid);
+        }
+    }
+}
+
+/// Clear the POLL_WAITERS slot after an hrtimer timeout woke the process.
+///
+/// Called from the timer ISR (timer_preempt) AFTER the scheduler lock is
+/// released, satisfying the lock order: POLL_WAITERS → SCHEDULER.
+/// The timer has already fired so there is nothing to cancel.
+pub(crate) fn poll_clear_on_timeout(pid: usize) {
+    if pid >= MAX_PROCS { return; }
+    POLL_WAITERS.lock()[pid] = None;
+}
+
+// ── Helper: translate user VA → phys + page-boundary check ────────────────
+
+/// Translate a user virtual address to a physical address and verify the
+/// buffer fits within a single 4K page (required for our single-page pre-translation).
+///
+/// cli must be held.  Returns None on error (EFAULT).
+fn translate_user_buf_phys(user_va: u64, size: usize) -> Option<u64> {
+    use x86_64::{VirtAddr, structures::paging::{Page, Size4KiB}};
+    let page   = Page::<Size4KiB>::containing_address(VirtAddr::new(user_va));
+    let offset = user_va & 0xFFF;
+    // Reject buffers that straddle a page boundary
+    if offset + size as u64 > 0x1000 { return None; }
+    let sched = super::scheduler::local_scheduler();
+    sched.running_ref()
+        .and_then(|proc| unsafe { proc.address_space.translate_page(page) })
+        .map(|frame| frame.start_address().as_u64() + offset)
+}
+
+// ── Helper: check epoll readiness and write directly to user VA ───────────
+
+fn check_epoll_ready_uva(
+    epoll_id: EpollInstanceId,
+    pid: usize,
+    events_ptr: u64,
+    maxevents: usize,
+) -> usize {
+    let instances = EPOLL_INSTANCES.lock();
+    let inst = match instances.get(epoll_id) {
+        Some(i) => i,
+        None    => return 0,
+    };
+    let mut written = 0usize;
+    for watch_opt in inst.watches.iter() {
+        if written >= maxevents { break; }
+        if let Some(watch) = watch_opt {
+            let mut poll_ev: i16 = 0;
+            if watch.events & EPOLLIN  != 0 { poll_ev |= POLLIN; }
+            if watch.events & EPOLLOUT != 0 { poll_ev |= POLLOUT; }
+            let rev = fd_check_ready(pid, watch.fd, poll_ev);
+            let mut epoll_rev: u32 = 0;
+            if rev & POLLIN  != 0 { epoll_rev |= EPOLLIN; }
+            if rev & POLLOUT != 0 { epoll_rev |= EPOLLOUT; }
+            if rev & POLLERR != 0 { epoll_rev |= EPOLLERR; }
+            if epoll_rev != 0 {
+                let ev = EpollEvent { events: epoll_rev, data: watch.data };
+                unsafe {
+                    core::ptr::write_unaligned(
+                        (events_ptr + written as u64 * 12) as *mut EpollEvent,
+                        ev,
+                    );
+                }
+                written += 1;
+            }
+        }
+    }
+    written
+}
+
+// ── sys_poll ───────────────────────────────────────────────────────────────
+
+/// poll(7) — wait for events on a set of file descriptors.
+///
+/// `fds_ptr`   — user pointer to array of `struct pollfd`.
+/// `nfds`      — number of entries (max 16).
+/// `timeout_ms`— milliseconds to wait (-1 = forever, 0 = non-blocking).
+fn sys_poll(fds_ptr: u64, nfds: u32, timeout_ms: i32) -> SyscallResult {
+    if nfds > 16 { return errno::EINVAL; }
+    let buf_size = nfds as usize * 8; // sizeof(PollFd)
+    if buf_size > 0 {
+        if let Err(e) = validate_user_buffer(fds_ptr, buf_size) { return e; }
+    }
+
+    // Read PollFd array from user memory (user page table active)
+    let mut fds = [PollFd { fd: -1, events: 0, revents: 0 }; 16];
+    for i in 0..nfds as usize {
+        fds[i] = unsafe { *((fds_ptr + i as u64 * 8) as *const PollFd) };
+    }
+
+    unsafe { core::arch::asm!("cli"); }
+
+    let pid = crate::process::scheduler::current_pid().unwrap_or(0);
+
+    // Fast path: check all fds for immediate readiness
+    let mut ready = 0i32;
+    for i in 0..nfds as usize {
+        let rev = fd_check_ready(pid, fds[i].fd, fds[i].events);
+        fds[i].revents = rev;
+        if rev != 0 { ready += 1; }
+    }
+
+    if ready > 0 || timeout_ms == 0 {
+        unsafe { core::arch::asm!("sti"); }
+        // Write revents back to user memory
+        for i in 0..nfds as usize {
+            unsafe { *((fds_ptr + i as u64 * 8) as *mut PollFd) = fds[i]; }
+        }
+        return ready as SyscallResult;
+    }
+
+    // ── Slow path: block ──────────────────────────────────────────────────
+    let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame;
+
+    // Pre-translate user buffer to physical address
+    let phys_buf = match translate_user_buf_phys(fds_ptr, buf_size) {
+        Some(pa) => pa,
+        None => {
+            unsafe { core::arch::asm!("sti"); }
+            return errno::EFAULT;
+        }
+    };
+
+    // Pre-set rax=0 (timeout return value)
+    unsafe { (*(tf_ptr as *mut TrapFrame)).rax = 0; }
+
+    // Register hrtimer if timeout_ms > 0
+    let timer_id = if timeout_ms > 0 {
+        let expiry = crate::time::ktime_get() + timeout_ms as u64 * 1_000_000;
+        Some(crate::time::hrtimer::start(
+            expiry,
+            crate::time::hrtimer::HrTimerAction::WakePid(pid),
+        ))
+    } else {
+        None // timeout_ms < 0 → wait forever
+    };
+
+    // Store waiter
+    if pid < MAX_PROCS {
+        POLL_WAITERS.lock()[pid] = Some(PollWaiter {
+            pid,
+            phys_buf,
+            phys_len: buf_size,
+            kind: PollWaiterKind::Poll { nfds },
+            timer_id,
+        });
+    }
+
+    let next_tf = {
+        let mut sched = super::scheduler::local_scheduler();
+        sched.block_current(tf_ptr)
+    };
+    unsafe { super::trapframe::jump_to_trapframe(next_tf) }
+}
+
+// ── sys_epoll_create ───────────────────────────────────────────────────────
+
+/// epoll_create(213) — create an epoll instance.
+///
+/// `size` is ignored (Linux ≥ 2.6.8 ignores it too, kept for ABI).
+/// Returns a file descriptor referring to the new epoll instance.
+fn sys_epoll_create(_size: i32) -> SyscallResult {
+    let epoll_id = {
+        let pid = crate::process::scheduler::current_pid().unwrap_or(0);
+        let mut instances = EPOLL_INSTANCES.lock();
+        match instances.alloc(pid) {
+            Some(id) => id,
+            None => return errno::ENOMEM,
+        }
+    };
+
+    let handle = alloc::boxed::Box::new(EpollHandle { epoll_id });
+
+    unsafe { core::arch::asm!("cli"); }
+    let result = {
+        let mut sched = super::scheduler::local_scheduler();
+        match sched.running_mut() {
+            Some(proc) => {
+                let pid = proc.pid.0;
+                match proc.files.allocate(handle) {
+                    Ok(fd) => {
+                        drop(sched);
+                        set_epoll_fd(pid, fd, epoll_id);
+                        fd as i64
+                    }
+                    Err(_) => {
+                        drop(sched);
+                        EPOLL_INSTANCES.lock().free(epoll_id);
+                        errno::EINVAL
+                    }
+                }
+            }
+            None => {
+                drop(sched);
+                EPOLL_INSTANCES.lock().free(epoll_id);
+                errno::ESRCH
+            }
+        }
+    };
+    unsafe { core::arch::asm!("sti"); }
+    result
+}
+
+// ── sys_epoll_ctl ──────────────────────────────────────────────────────────
+
+/// epoll_ctl(233) — modify an epoll instance's interest list.
+fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> SyscallResult {
+    let pid = crate::process::scheduler::current_pid().unwrap_or(0);
+    if pid >= MAX_PROCS { return errno::ESRCH; }
+    if epfd < 0 || (epfd as usize) >= MAX_FILES_PER_PROC { return errno::EBADF; }
+
+    let epoll_id = get_epoll_fd(pid, epfd as usize);
+    if epoll_id == 0 { return errno::EBADF; }
+
+    // Read EpollEvent from user memory (not needed for EPOLL_CTL_DEL)
+    let event = if op != EPOLL_CTL_DEL {
+        if let Err(e) = validate_user_buffer(event_ptr, 12) { return e; }
+        Some(unsafe { core::ptr::read_unaligned(event_ptr as *const EpollEvent) })
+    } else {
+        None
+    };
+
+    let mut instances = EPOLL_INSTANCES.lock();
+    let inst = match instances.get_mut(epoll_id) {
+        Some(i) => i,
+        None    => return errno::EBADF,
+    };
+
+    match op {
+        EPOLL_CTL_ADD => {
+            match inst.watches.iter_mut().find(|s| s.is_none()) {
+                Some(slot) => {
+                    let ev = event.unwrap();
+                    *slot = Some(EpollWatch {
+                        fd,
+                        events: ev.events,
+                        data:   ev.data,
+                        edge_triggered: (ev.events & EPOLLET) != 0,
+                        et_delivered:   false,
+                    });
+                    0
+                }
+                None => errno::ENOMEM,
+            }
+        }
+        EPOLL_CTL_DEL => {
+            match inst.watches.iter_mut().find(|s| s.as_ref().map(|w| w.fd == fd).unwrap_or(false)) {
+                Some(slot) => { *slot = None; 0 }
+                None       => errno::ENOENT,
+            }
+        }
+        EPOLL_CTL_MOD => {
+            match inst.watches.iter_mut().find(|s| s.as_ref().map(|w| w.fd == fd).unwrap_or(false)) {
+                Some(slot) => {
+                    let ev = event.unwrap();
+                    if let Some(w) = slot {
+                        w.events         = ev.events;
+                        w.data           = ev.data;
+                        w.edge_triggered = (ev.events & EPOLLET) != 0;
+                    }
+                    0
+                }
+                None => errno::ENOENT,
+            }
+        }
+        _ => errno::EINVAL,
+    }
+}
+
+// ── sys_epoll_wait ─────────────────────────────────────────────────────────
+
+/// epoll_wait(232) — wait for events on an epoll instance.
+///
+/// `epfd`       — epoll file descriptor.
+/// `events_ptr` — user pointer to array of `struct epoll_event`.
+/// `maxevents`  — max events to return (1..=16).
+/// `timeout_ms` — -1 = forever, 0 = non-blocking, >0 = ms.
+fn sys_epoll_wait(epfd: i32, events_ptr: u64, maxevents: i32, timeout_ms: i32) -> SyscallResult {
+    if maxevents <= 0 || maxevents > 16 { return errno::EINVAL; }
+    let buf_size = maxevents as usize * 12; // sizeof(EpollEvent)
+    if let Err(e) = validate_user_buffer(events_ptr, buf_size) { return e; }
+
+    let pid = crate::process::scheduler::current_pid().unwrap_or(0);
+    if pid >= MAX_PROCS { return errno::ESRCH; }
+    if epfd < 0 || (epfd as usize) >= MAX_FILES_PER_PROC { return errno::EBADF; }
+
+    let epoll_id = get_epoll_fd(pid, epfd as usize);
+    if epoll_id == 0 { return errno::EBADF; }
+
+    unsafe { core::arch::asm!("cli"); }
+
+    // Fast path: check readiness now
+    let ready = check_epoll_ready_uva(epoll_id, pid, events_ptr, maxevents as usize);
+
+    if ready > 0 || timeout_ms == 0 {
+        unsafe { core::arch::asm!("sti"); }
+        return ready as SyscallResult;
+    }
+
+    // ── Slow path: block ──────────────────────────────────────────────────
+    let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame;
+
+    let phys_buf = match translate_user_buf_phys(events_ptr, buf_size) {
+        Some(pa) => pa,
+        None => {
+            unsafe { core::arch::asm!("sti"); }
+            return errno::EFAULT;
+        }
+    };
+
+    // Pre-set rax=0 (timeout)
+    unsafe { (*(tf_ptr as *mut TrapFrame)).rax = 0; }
+
+    let timer_id = if timeout_ms > 0 {
+        let expiry = crate::time::ktime_get() + timeout_ms as u64 * 1_000_000;
+        Some(crate::time::hrtimer::start(
+            expiry,
+            crate::time::hrtimer::HrTimerAction::WakePid(pid),
+        ))
+    } else {
+        None
+    };
+
+    if pid < MAX_PROCS {
+        POLL_WAITERS.lock()[pid] = Some(PollWaiter {
+            pid,
+            phys_buf,
+            phys_len: buf_size,
+            kind: PollWaiterKind::EpollWait { epoll_id, maxevents: maxevents as usize },
+            timer_id,
+        });
+    }
+
+    let next_tf = {
+        let mut sched = super::scheduler::local_scheduler();
+        sched.block_current(tf_ptr)
+    };
+    unsafe { super::trapframe::jump_to_trapframe(next_tf) }
+}
+

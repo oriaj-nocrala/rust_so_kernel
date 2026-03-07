@@ -12,6 +12,7 @@ pub mod tss;
 pub mod syscall;
 pub mod file;
 pub mod user_test_fileio;
+pub mod user_programs;
 
 pub use trapframe::TrapFrame;
 pub use file::{FileDescriptorTable, FileHandle};
@@ -35,6 +36,8 @@ pub enum PrivilegeLevel {
 
 pub struct Process {
     pub pid: Pid,
+    pub parent_pid: Option<Pid>,
+    pub exit_status: i32,
     pub state: ProcessState,
     pub privilege: PrivilegeLevel,
 
@@ -52,6 +55,14 @@ pub struct Process {
     /// The process's virtual address space (page table + VMAs).
     pub address_space: AddressSpace,
     pub files: FileDescriptorTable,
+
+    /// Set while this process is blocked in waitpid(), waiting for a child.
+    /// Stored here (not in a global) so multiple processes can wait concurrently.
+    pub waiting_for: Option<usize>,
+
+    /// FS segment base (used for TLS via arch_prctl ARCH_SET_FS).
+    /// Saved/restored on every context switch so mlibc's TLS works correctly.
+    pub fs_base: u64,
 }
 
 impl Process {
@@ -93,6 +104,8 @@ impl Process {
         
         Process {
             pid,
+            parent_pid: None,
+            exit_status: 0,
             state: ProcessState::Ready,
             privilege: PrivilegeLevel::Kernel,
             priority: 5,
@@ -102,9 +115,11 @@ impl Process {
             kernel_stack,
             address_space,
             files: FileDescriptorTable::new_with_stdio(),
+            waiting_for: None,
+            fs_base: 0,
         }
     }
-    
+
     /// Crear proceso de USER
     pub fn new_user(
         pid: Pid,
@@ -144,6 +159,8 @@ impl Process {
         
         Process {
             pid,
+            parent_pid: None,
+            exit_status: 0,
             state: ProcessState::Ready,
             privilege: PrivilegeLevel::User,
             priority: 5,
@@ -153,9 +170,45 @@ impl Process {
             kernel_stack,
             address_space,
             files: FileDescriptorTable::new_with_stdio(),
+            waiting_for: None,
+            fs_base: 0,
         }
     }
-    
+
+    /// Create a forked child process.
+    ///
+    /// The child gets the parent's TrapFrame (with rax=0 so fork() returns 0
+    /// in the child), a copy of the address space, and cloned file descriptors.
+    pub fn new_user_from_fork(
+        pid: Pid,
+        parent_pid: Pid,
+        trapframe: Box<TrapFrame>,
+        kernel_stack: VirtAddr,
+        address_space: AddressSpace,
+        files: FileDescriptorTable,
+    ) -> Self {
+        crate::serial_println!(
+            "Creating FORKED process PID {} (parent PID {})",
+            pid.0, parent_pid.0,
+        );
+        Process {
+            pid,
+            parent_pid: Some(parent_pid),
+            exit_status: 0,
+            state: ProcessState::Ready,
+            privilege: PrivilegeLevel::User,
+            priority: 5,
+            effective_priority: 5,
+            name: [0; 16],
+            trapframe,
+            kernel_stack,
+            address_space,
+            files,
+            waiting_for: None,
+            fs_base: 0,
+        }
+    }
+
     pub fn set_name(&mut self, name: &str) {
         let bytes = name.as_bytes();
         let len = core::cmp::min(bytes.len(), 15);
@@ -172,7 +225,7 @@ impl Process {
 /// Start the first user process.
 pub fn start_first_process() -> ! {
     let tf_ptr = {
-        let mut scheduler = scheduler::SCHEDULER.lock();
+        let mut scheduler = scheduler::local_scheduler();
         scheduler.start_first()
     };
 

@@ -5,7 +5,6 @@ use core::ptr::{self, null_mut, NonNull};
 use spin::Mutex;
 use x86_64::{PhysAddr, VirtAddr};
 
-use super::buddy_allocator::BUDDY;
 
 // Tamaños de slab: 8, 16, 32, 64, 128, 256, 512, 1024, 2048 bytes
 const SLAB_SIZES: &[usize] = &[8, 16, 32, 64, 128, 256, 512, 1024, 2048];
@@ -127,8 +126,7 @@ impl SlabAllocator {
         
         crate::serial_println_raw!(">>> allocate_large: size={} order={}", total_size, order);
 
-        let result = BUDDY.lock()
-            .allocate(order)
+        let result = crate::allocator::phys_alloc(order)
             .map(|phys_addr| {
                 let phys_offset = crate::memory::physical_memory_offset();
                 let virt = phys_offset + phys_addr.as_u64();
@@ -149,13 +147,19 @@ impl SlabAllocator {
         // ✅ MISMA FUNCIÓN que allocate_large (simetría crítica)
         let order = size_to_buddy_order(size);
 
-        crate::serial_println_raw!(">>> deallocate_large: size={} order={}", size, order);
-
         let phys_offset = crate::memory::physical_memory_offset();
         let virt = VirtAddr::new(ptr as u64);
         let phys = PhysAddr::new(virt.as_u64() - phys_offset.as_u64());
 
-        BUDDY.lock().deallocate(phys, order);
+        crate::serial_println_raw!(
+            "[SLAB] deallocate_large: virt={:#x} phys={:#x} size={} order={}",
+            ptr as u64, phys.as_u64(), size, order
+        );
+        if (phys.as_u64() & !0x3FFF) == 0x1ecb0000 {
+            crate::serial_println_raw!("[SLAB]   ^^^ THIS IS IN THE HOT RANGE!");
+        }
+
+        crate::allocator::phys_free(phys, order);
     }
 
     /// Debug: estadísticas SIN allocaciones
@@ -250,7 +254,7 @@ impl SlabCache {
     /// Expandir el cache allocando una nueva página del Buddy
     unsafe fn expand(&mut self, object_size: usize) -> bool {
         // Allocar una página de 4KB del Buddy
-        let page_phys = match BUDDY.lock().allocate(12) {
+        let page_phys = match crate::allocator::phys_alloc(12) {
             Some(addr) => addr,
             None => {
                 crate::serial_println_raw!("Slab: Failed to expand {}B cache (OOM)", object_size);

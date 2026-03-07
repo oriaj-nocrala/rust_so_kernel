@@ -25,12 +25,12 @@ use x86_64::{
     registers::control::Cr3,
     structures::paging::{
         FrameAllocator, Mapper, OffsetPageTable, Page, PageTable,
-        PageTableFlags, PhysFrame, Size4KiB,
+        PageTableFlags, PhysFrame, Size2MiB, Size4KiB,
+        page_table::FrameError,
         mapper::MapToError,
     },
 };
 
-use crate::allocator::buddy_allocator::BUDDY;
 
 // ============================================================================
 // User address layout — which PML4 entries user processes own
@@ -42,6 +42,9 @@ const USER_CODE_BASE: u64 = 0x0000_0000_0040_0000;
 /// User stack base address (0x710000000000).  Falls in PML4 entry 226.
 const USER_STACK_BASE: u64 = 0x0000_7100_0000_0000;
 
+/// Base address for anonymous mmap allocations (0x4000_0000_0000). Falls in PML4 entry 128.
+pub const USER_MMAP_BASE: u64 = 0x0000_4000_0000_0000;
+
 /// Convert a virtual address to its PML4 index (bits 47:39).
 #[inline]
 const fn pml4_index(va: u64) -> usize {
@@ -50,9 +53,11 @@ const fn pml4_index(va: u64) -> usize {
 
 /// PML4 indices that belong to user processes.
 /// These must NOT be copied from the kernel — each process builds its own.
-const USER_PML4_ENTRIES: [usize; 2] = [
-    pml4_index(USER_CODE_BASE),   // 0  — user code
+/// Adding the mmap entry ensures `release_user_pages` frees mmap frames on exit.
+const USER_PML4_ENTRIES: [usize; 3] = [
+    pml4_index(USER_CODE_BASE),   // 0   — user code
     pml4_index(USER_STACK_BASE),  // 226 — user stack
+    pml4_index(USER_MMAP_BASE),   // 128 — anonymous mmap region
 ];
 
 /// Returns true if `index` is a PML4 entry reserved for user space.
@@ -70,8 +75,16 @@ pub struct BuddyFrameAllocator;
 unsafe impl FrameAllocator<Size4KiB> for BuddyFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
         unsafe {
-            BUDDY.lock()
-                .allocate(12)
+            crate::allocator::phys_alloc(12)
+                .map(|addr| PhysFrame::containing_address(addr))
+        }
+    }
+}
+
+unsafe impl FrameAllocator<Size2MiB> for BuddyFrameAllocator {
+    fn allocate_frame(&mut self) -> Option<PhysFrame<Size2MiB>> {
+        unsafe {
+            crate::allocator::phys_alloc(21)
                 .map(|addr| PhysFrame::containing_address(addr))
         }
     }
@@ -119,9 +132,7 @@ impl OwnedPageTable {
 
         // 1. Allocate PML4 frame from the Buddy
         let new_frame = {
-            let mut buddy = BUDDY.lock();
-            let phys_addr = buddy
-                .allocate(12)
+            let phys_addr = crate::allocator::phys_alloc(12)
                 .ok_or("Failed to allocate PML4 frame from buddy")?;
             PhysFrame::containing_address(phys_addr)
         };
@@ -225,7 +236,15 @@ impl OwnedPageTable {
         OffsetPageTable::new(pml4, phys_offset)
     }
 
+    /// Look up the physical frame backing an already-mapped page.
+    /// Returns `None` if the page is not present in this page table.
+    pub unsafe fn translate_page(&self, page: Page<Size4KiB>) -> Option<PhysFrame> {
+        let mapper = self.create_mapper();
+        mapper.translate_page(page).ok()
+    }
+
     /// Map one user page.  Allocates data + intermediate frames from Buddy.
+    /// Sets the frame's COW refcount to 1 (single owner).
     pub unsafe fn map_user_page(
         &self,
         page: Page<Size4KiB>,
@@ -237,6 +256,9 @@ impl OwnedPageTable {
             .allocate_frame()
             .ok_or(MapToError::FrameAllocationFailed)?;
 
+        // Track as single owner (COW refcount = 1).
+        crate::memory::cow::set_ref(frame, 1);
+
         let mut mapper = self.create_mapper();
 
         mapper
@@ -244,6 +266,229 @@ impl OwnedPageTable {
             .flush();
 
         Ok(frame)
+    }
+
+    /// Map an existing physical frame into a page without allocating a new data frame.
+    /// Only intermediate PT frames (PDPT/PD/PT) are allocated from the Buddy.
+    /// Used for COW fork: child shares the parent's frame.
+    ///
+    /// IMPORTANT: intermediate tables are always created with PRESENT|WRITABLE|USER_ACCESSIBLE
+    /// even when `flags` (the leaf PTE) is read-only.  This is required so that the COW fault
+    /// handler can later restore WRITABLE on just the leaf entry: the CPU checks R/W on ALL
+    /// page table levels, so if any intermediate entry lacks WRITABLE the page stays read-only
+    /// even after the leaf is updated.
+    pub unsafe fn map_existing_frame(
+        &self,
+        page: Page<Size4KiB>,
+        frame: PhysFrame,
+        flags: PageTableFlags,
+    ) -> Result<(), &'static str> {
+        let mut mapper = self.create_mapper();
+        let mut buddy_alloc = BuddyFrameAllocator;
+        // Always use fully-permissive flags for intermediate tables.
+        let parent_flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE;
+        mapper
+            .map_to_with_table_flags(page, frame, flags, parent_flags, &mut buddy_alloc)
+            .map_err(|_| "map_existing_frame: map_to failed")?
+            .flush();
+        Ok(())
+    }
+
+    /// Update the flags of an already-mapped page without changing its physical frame.
+    /// Flushes the TLB entry via invlpg.
+    /// Used for COW fork: mark parent's writable pages as read-only.
+    pub unsafe fn update_page_flags(
+        &self,
+        page: Page<Size4KiB>,
+        flags: PageTableFlags,
+    ) -> Result<(), &'static str> {
+        let mut mapper = self.create_mapper();
+        mapper
+            .update_flags(page, flags)
+            .map_err(|_| "update_page_flags: failed")?
+            .flush();
+        Ok(())
+    }
+
+    /// Unmap a page then remap it to a new physical frame with new flags.
+    /// Used in COW fault resolution: replace a shared read-only frame with
+    /// a private writable copy.
+    /// Intermediate PT frames are preserved (unmap does not free them).
+    pub unsafe fn unmap_and_remap(
+        &self,
+        page: Page<Size4KiB>,
+        new_frame: PhysFrame,
+        flags: PageTableFlags,
+    ) -> Result<(), &'static str> {
+        let mut mapper = self.create_mapper();
+
+        // Clear the leaf PT entry; intermediate tables remain intact.
+        let (_, flush) = mapper
+            .unmap(page)
+            .map_err(|_| "unmap_and_remap: unmap failed")?;
+        flush.flush();
+
+        // Remap with new frame; intermediate tables are reused.
+        let mut buddy_alloc = BuddyFrameAllocator;
+        mapper
+            .map_to(page, new_frame, flags, &mut buddy_alloc)
+            .map_err(|_| "unmap_and_remap: map_to failed")?
+            .flush();
+
+        Ok(())
+    }
+
+    /// Unmap a single user page and free its backing physical frame.
+    ///
+    /// If the page is not mapped (not yet demand-paged), this is a no-op.
+    /// Decrements the COW refcount; if it reaches zero, returns the frame
+    /// to the Buddy allocator.  Intermediate page table frames are preserved.
+    ///
+    /// # Safety
+    /// Must be called with interrupts disabled (cli).
+    pub unsafe fn unmap_page_and_free(&self, page: Page<Size4KiB>) -> Result<(), &'static str> {
+        let frame = match self.translate_page(page) {
+            Some(f) => f,
+            None => return Ok(()),  // never demand-paged; nothing to free
+        };
+
+        let mut mapper = self.create_mapper();
+        let (_, flush) = mapper
+            .unmap(page)
+            .map_err(|_| "unmap_page_and_free: unmap failed")?;
+        flush.flush();
+
+        // Zero-frame is permanent — it has no refcount entry, never free it.
+        if !crate::memory::cow::is_zero_frame(frame) {
+            if crate::memory::cow::dec_ref(frame) == 0 {
+                crate::allocator::phys_free(frame.start_address(), 12);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Unmap a single 2 MiB huge page and free its backing physical frame.
+    ///
+    /// If the page is not mapped, this is a no-op.
+    /// Huge frames are freed with order=21 directly (no COW refcount).
+    ///
+    /// # Safety
+    /// Must be called with interrupts disabled (cli).
+    pub unsafe fn unmap_page_and_free_2m(
+        &self,
+        page: Page<Size2MiB>,
+    ) -> Result<(), &'static str> {
+        let mut mapper = self.create_mapper();
+        let (frame, flush) = match mapper.unmap(page) {
+            Ok(r) => r,
+            Err(_) => return Ok(()),  // not mapped — nothing to free
+        };
+        flush.flush();
+        crate::allocator::phys_free(frame.start_address(), 21);
+        Ok(())
+    }
+
+    /// Walk all user-owned PML4 entries (indices 0, 226, and 128) and free:
+    ///   - Data frames (leaf PT entries): dec_ref; if → 0, deallocate to Buddy.
+    ///   - Intermediate frames (PT/PD/PDPT): deallocate directly (no refcount).
+    ///   - PML4 frame itself: deallocated at the end.
+    ///
+    /// Called only for owned (user) page tables from `Drop`.
+    unsafe fn release_user_pages(&self) {
+        use x86_64::structures::paging::PageTable;
+
+        crate::serial_println_raw!("[RPU] start PML4={:#x}", self.pml4_frame.start_address().as_u64());
+
+        let phys_offset = crate::memory::physical_memory_offset();
+        let pml4_virt = phys_offset + self.pml4_frame.start_address().as_u64();
+        let pml4: &PageTable = &*pml4_virt.as_ptr::<PageTable>();
+
+        for &pml4_idx in &USER_PML4_ENTRIES {
+            let pml4_entry = &pml4[pml4_idx];
+            if !pml4_entry.flags().contains(PageTableFlags::PRESENT) {
+                continue;
+            }
+            let pdpt_frame = match pml4_entry.frame() {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+
+            crate::serial_println_raw!("[RPU] PML4[{}] → PDPT={:#x}", pml4_idx, pdpt_frame.start_address().as_u64());
+
+            let pdpt_virt = phys_offset + pdpt_frame.start_address().as_u64();
+            let pdpt: &PageTable = &*pdpt_virt.as_ptr::<PageTable>();
+
+            for pdpt_entry in pdpt.iter() {
+                if !pdpt_entry.flags().contains(PageTableFlags::PRESENT) {
+                    continue;
+                }
+                let pd_frame = match pdpt_entry.frame() {
+                    Ok(f) => f,
+                    Err(_) => continue, // huge page — skip
+                };
+                crate::serial_println_raw!("[RPU]   PDPT entry → PD={:#x}", pd_frame.start_address().as_u64());
+
+                let pd_virt = phys_offset + pd_frame.start_address().as_u64();
+                let pd: &PageTable = &*pd_virt.as_ptr::<PageTable>();
+
+                for (pd_idx, pd_entry) in pd.iter().enumerate() {
+                    if !pd_entry.flags().contains(PageTableFlags::PRESENT) {
+                        continue;
+                    }
+                    let pt_frame = match pd_entry.frame() {
+                        Ok(f) => f,
+                        Err(FrameError::HugeFrame) => {
+                            crate::serial_println_raw!("[RPU]     PD[{}] huge={:#x} free order=21", pd_idx, pd_entry.addr().as_u64());
+                            unsafe { crate::allocator::phys_free(pd_entry.addr(), 21); }
+                            continue;
+                        }
+                        Err(_) => continue,
+                    };
+
+                    crate::serial_println_raw!("[RPU]     PD[{}] → PT={:#x}", pd_idx, pt_frame.start_address().as_u64());
+
+                    let pt_virt = phys_offset + pt_frame.start_address().as_u64();
+                    let pt: &PageTable = &*pt_virt.as_ptr::<PageTable>();
+
+                    for pt_entry in pt.iter() {
+                        if !pt_entry.flags().contains(PageTableFlags::PRESENT) {
+                            continue;
+                        }
+                        if let Ok(data_frame) = pt_entry.frame() {
+                            // Zero-frame is permanent — never free it.
+                            if !crate::memory::cow::is_zero_frame(data_frame) {
+                                let ref_after = crate::memory::cow::dec_ref(data_frame);
+                                if ref_after == 0 {
+                                    unsafe { crate::allocator::phys_free(data_frame.start_address(), 12); }
+                                }
+                            }
+                        }
+                    }
+
+                    crate::serial_println_raw!("[RPU]     PT={:#x} done, freeing PT frame", pt_frame.start_address().as_u64());
+                    unsafe { crate::allocator::phys_free(pt_frame.start_address(), 12); }
+                    crate::serial_println_raw!("[RPU]     PT frame freed");
+                }
+
+                // PD is an intermediate frame — free directly.
+                crate::serial_println_raw!("[RPU]   freeing PD={:#x}", pd_frame.start_address().as_u64());
+                unsafe { crate::allocator::phys_free(pd_frame.start_address(), 12); }
+                crate::serial_println_raw!("[RPU]   PD freed");
+            }
+
+            // PDPT is an intermediate frame — free directly.
+            crate::serial_println_raw!("[RPU] freeing PDPT={:#x}", pdpt_frame.start_address().as_u64());
+            unsafe { crate::allocator::phys_free(pdpt_frame.start_address(), 12); }
+            crate::serial_println_raw!("[RPU] PDPT freed");
+        }
+
+        // Free the PML4 frame itself.
+        crate::serial_println_raw!("[RPU] freeing PML4={:#x}", self.pml4_frame.start_address().as_u64());
+        unsafe { crate::allocator::phys_free(self.pml4_frame.start_address(), 12); }
+        crate::serial_println_raw!("[RPU] done");
     }
 
     /// Map `num_pages` contiguous user pages starting at `start`.
@@ -276,5 +521,48 @@ impl OwnedPageTable {
         let phys_offset = crate::memory::physical_memory_offset();
         let virt = phys_offset + frame.start_address().as_u64();
         core::ptr::write_bytes(virt.as_mut_ptr::<u8>(), 0, 4096);
+    }
+
+    /// Read the raw 64-bit PTE for `page` by manually walking this page table.
+    /// Returns [pml4_e, pdpt_e, pd_e, pt_e].  Any level missing → 0 for that
+    /// and all subsequent entries.  Used for COW diagnostics only.
+    pub unsafe fn get_pte_all_levels(&self, page: Page<Size4KiB>) -> [u64; 4] {
+        let phys_offset = crate::memory::physical_memory_offset();
+        let virt = page.start_address().as_u64();
+        let pml4_idx = ((virt >> 39) & 0x1FF) as usize;
+        let pdpt_idx = ((virt >> 30) & 0x1FF) as usize;
+        let pd_idx   = ((virt >> 21) & 0x1FF) as usize;
+        let pt_idx   = ((virt >> 12) & 0x1FF) as usize;
+
+        let pml4 = &*(phys_offset + self.pml4_phys().as_u64()).as_ptr::<[u64; 512]>();
+        let e4 = pml4[pml4_idx];
+        if e4 & 1 == 0 { return [e4, 0, 0, 0]; }
+
+        let pdpt = &*((phys_offset + (e4 & 0x000F_FFFF_FFFF_F000)).as_ptr::<[u64; 512]>());
+        let e3 = pdpt[pdpt_idx];
+        if e3 & 1 == 0 { return [e4, e3, 0, 0]; }
+
+        let pd = &*((phys_offset + (e3 & 0x000F_FFFF_FFFF_F000)).as_ptr::<[u64; 512]>());
+        let e2 = pd[pd_idx];
+        if e2 & 1 == 0 { return [e4, e3, e2, 0]; }
+
+        let pt = &*((phys_offset + (e2 & 0x000F_FFFF_FFFF_F000)).as_ptr::<[u64; 512]>());
+        let e1 = pt[pt_idx];
+        [e4, e3, e2, e1]
+    }
+
+    /// Convenience wrapper: return only the leaf PTE.
+    pub unsafe fn get_pte_raw(&self, page: Page<Size4KiB>) -> u64 {
+        self.get_pte_all_levels(page)[3]
+    }
+}
+
+impl Drop for OwnedPageTable {
+    fn drop(&mut self) {
+        if !self.owned {
+            // Kernel page table (from_current) — never free, it belongs to the kernel.
+            return;
+        }
+        unsafe { self.release_user_pages(); }
     }
 }

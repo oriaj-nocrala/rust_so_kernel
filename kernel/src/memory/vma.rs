@@ -18,7 +18,7 @@ use x86_64::structures::paging::PageTableFlags;
 // ============================================================================
 
 /// Maximum VMAs per process (code + stack + heap + extras).
-pub const MAX_VMAS_PER_PROCESS: usize = 16;
+pub const MAX_VMAS_PER_PROCESS: usize = 64;
 
 // ============================================================================
 // VMA types
@@ -32,6 +32,9 @@ pub enum VmaKind {
     /// Pre-loaded code/data — tracked for validation but NOT demand-paged.
     /// If a code page faults, something is wrong.
     Code,
+    /// Demand-paged anonymous region backed by 2 MiB huge pages.
+    /// `size_pages` is still in 4 KiB units; each huge page covers 512 entries.
+    Huge2M,
 }
 
 /// A single virtual memory area.
@@ -72,6 +75,7 @@ impl Vma {
 // Per-process VMA list (owned by AddressSpace)
 // ============================================================================
 
+#[derive(Clone)]
 pub struct VmaList {
     entries: [Option<Vma>; MAX_VMAS_PER_PROCESS],
 }
@@ -102,6 +106,30 @@ impl VmaList {
             .find(|v| v.contains(addr))
     }
 
+    /// Remove the VMA that starts exactly at `start`.
+    /// Returns the removed VMA, or `Err` if not found.
+    pub fn remove(&mut self, start: u64) -> Result<Vma, &'static str> {
+        for slot in self.entries.iter_mut() {
+            if let Some(v) = slot {
+                if v.start == start {
+                    let vma = *v;
+                    *slot = None;
+                    return Ok(vma);
+                }
+            }
+        }
+        Err("VMA not found")
+    }
+
+    /// Returns true if any existing VMA overlaps [start, start + size_pages * 4096).
+    pub fn overlaps(&self, start: u64, size_pages: usize) -> bool {
+        let end = start + size_pages as u64 * 4096;
+        self.entries
+            .iter()
+            .filter_map(|v| v.as_ref())
+            .any(|v| v.start < end && v.end() > start)
+    }
+
     /// Remove all VMAs (for process exit).
     pub fn clear(&mut self) {
         for slot in self.entries.iter_mut() {
@@ -122,6 +150,7 @@ impl VmaList {
             let kind_str = match vma.kind {
                 VmaKind::Anonymous => "anon",
                 VmaKind::Code => "code",
+                VmaKind::Huge2M => "huge2m",
             };
             crate::serial_println!(
                 "  {:#x}..{:#x} ({} pages) [{}] flags={:#x}",

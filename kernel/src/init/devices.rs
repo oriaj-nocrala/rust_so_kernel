@@ -5,6 +5,12 @@
 // The page fault handler lives here because it bridges memory and
 // process layers.  User-mode segfaults kill the process; only
 // kernel-mode faults panic.
+//
+// HISTORY:
+//   - kill_current_user_process now performs a FULL context switch
+//     via jump_to_trapframe (restores all GPRs + iretq).
+//     Previously it only overwrote the 5-field ExceptionStackFrame,
+//     leaking RAX..R15 from the killed process into the next one.
 
 use spin::Once;
 
@@ -24,10 +30,6 @@ use crate::{
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
 
-extern "C" {
-    fn syscall_entry();
-}
-
 pub fn init_idt() {
     IDT.call_once(|| {
         let mut idt = InterruptDescriptorTable::new();
@@ -44,9 +46,8 @@ pub fn init_idt() {
         idt.add_handler_with_error(14, page_fault_handler);
         idt.entries[32].set_handler_addr(crate::process::timer_preempt::timer_interrupt_entry as u64);
         idt.add_handler(33, keyboard_interrupt_handler);
-        idt.entries[0x80]
-            .set_handler_addr(syscall_entry as u64)
-            .set_privilege_level(3);
+        // Syscalls are now handled via the `syscall` instruction (LSTAR MSR),
+        // not via int 0x80.  No IDT entry needed.
         idt
     });
 }
@@ -59,7 +60,10 @@ fn load_idt() {
 // Page fault error code bits
 // ============================================================================
 
-const PF_USER: u64 = 1 << 2;
+const PF_PRESENT:  u64 = 1 << 0;   // 1 = protection violation, 0 = not present
+const PF_WRITE:    u64 = 1 << 1;   // 1 = write fault
+const PF_USER:     u64 = 1 << 2;   // 1 = user mode
+const PF_RESERVED: u64 = 1 << 3;   // 1 = reserved PTE bit set
 
 // ============================================================================
 // INTERRUPT HANDLERS
@@ -70,21 +74,25 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_: &mut ExceptionStackFrame
         x86_64::instructions::port::PortReadOnly::<u8>::new(0x60).read()
     };
     keyboard::process_scancode(scancode);
+    // Wake any process blocked on stdin read.
+    crate::process::syscall::stdin_wakeup();
+    // Wake any process blocked in poll/epoll_wait watching stdin for POLLIN.
+    crate::process::syscall::poll_wakeup_for_fd0();
     crate::interrupts::pic::end_of_interrupt(crate::interrupts::pic::Irq::Keyboard.as_u8());
 }
 
 extern "x86-interrupt" fn divide_by_zero_handler(sf: &mut ExceptionStackFrame) {
     if sf.code_segment & 0x3 != 0 {
-        kill_current_user_process("DIVIDE BY ZERO", sf);
-        return;
+        kill_current_user_process("DIVIDE BY ZERO");
+        // unreachable — kill_current_user_process diverges
     }
     panic!("DIVIDE BY ZERO at {:#x}", sf.instruction_pointer);
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(sf: &mut ExceptionStackFrame) {
     if sf.code_segment & 0x3 != 0 {
-        kill_current_user_process("INVALID OPCODE", sf);
-        return;
+        kill_current_user_process("INVALID OPCODE");
+        // unreachable — kill_current_user_process diverges
     }
     panic!("INVALID OPCODE at {:#x}", sf.instruction_pointer);
 }
@@ -101,8 +109,8 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     error_code: u64
 ) {
     if sf.code_segment & 0x3 != 0 {
-        kill_current_user_process("GENERAL PROTECTION FAULT", sf);
-        return;
+        kill_current_user_process("GENERAL PROTECTION FAULT");
+        // unreachable — kill_current_user_process diverges
     }
     panic!("GENERAL PROTECTION FAULT (error: {}) at {:#x}", error_code, sf.instruction_pointer);
 }
@@ -122,6 +130,43 @@ extern "x86-interrupt" fn page_fault_handler(
 
     let fault_addr = demand_paging::read_cr2();
     let is_user = error_code & PF_USER != 0;
+    let is_write = error_code & PF_WRITE != 0;
+
+    let _ = sf; // ExceptionStackFrame values unreliable for user-mode PFs
+
+    // ── COW write fault: page present + user write, no reserved bit ───
+    //
+    // This must be checked BEFORE is_demand_pageable, which returns Err
+    // for present pages (treating them as protection violations).
+    //
+    // Uses the lock-free fast path: find_vma_fast + current_as_fast.
+    // Safe because the fault handler runs with IF=0 (no preemption).
+    if (error_code & (PF_PRESENT | PF_WRITE | PF_USER)) == (PF_PRESENT | PF_WRITE | PF_USER)
+        && (error_code & PF_RESERVED) == 0
+    {
+        let handled = unsafe {
+            if let Some((_, vma)) = crate::process::scheduler::find_vma_fast(fault_addr) {
+                let vma_flags = vma.page_table_flags();
+                crate::process::scheduler::current_as_fast()
+                    .map(|as_| as_.handle_cow_fault(fault_addr, vma_flags))
+                    .unwrap_or(Err("no AS"))
+                    .is_ok()
+            } else {
+                false
+            }
+        };
+
+        if handled {
+            return;
+        }
+
+        serial_println!(
+            "⚠️  COW fault failed at {:#x} (error {:#b})",
+            fault_addr, error_code
+        );
+        kill_current_user_process("COW FAULT FAILED");
+        // unreachable
+    }
 
     // Step 1: Is this fault potentially demand-pageable?
     if let Err(reason) = demand_paging::is_demand_pageable(error_code) {
@@ -130,8 +175,8 @@ extern "x86-interrupt" fn page_fault_handler(
                 "⚠️  User page fault at {:#x} (error {:#b}): {}",
                 fault_addr, error_code, reason
             );
-            kill_current_user_process("PAGE FAULT (not demand-pageable)", sf);
-            return;
+            kill_current_user_process("PAGE FAULT (not demand-pageable)");
+            // unreachable — kill_current_user_process diverges
         }
         panic!(
             "PAGE FAULT (kernel)\n  Address: {:#x}\n  Error: {:#b}\n  Reason: {}\n  RIP: {:#x}",
@@ -139,17 +184,17 @@ extern "x86-interrupt" fn page_fault_handler(
         );
     }
 
-    // Step 2: VMA lookup
-    let (pid, vma) = match crate::process::scheduler::find_current_vma(fault_addr) {
+    // Step 2: VMA lookup — lock-free fast path.
+    let (pid, vma) = match unsafe { crate::process::scheduler::find_vma_fast(fault_addr) } {
         Some(result) => result,
         None => {
             if is_user {
                 serial_println!(
-                    "⚠️  Segfault: PID ? accessed {:#x} (no VMA)",
-                    fault_addr
+                    "⚠️  Segfault: PID {} accessed {:#x} (no VMA)",
+                    crate::process::scheduler::current_pid_fast(), fault_addr
                 );
-                kill_current_user_process("SEGFAULT (no VMA for address)", sf);
-                return;
+                kill_current_user_process("SEGFAULT (no VMA for address)");
+                // unreachable — kill_current_user_process diverges
             }
             panic!(
                 "PAGE FAULT (kernel, no VMA)\n  Address: {:#x}\n  Error: {:#b}\n  RIP: {:#x}",
@@ -158,15 +203,15 @@ extern "x86-interrupt" fn page_fault_handler(
         }
     };
 
-    // Step 3: Map the page
-    if let Err(reason) = demand_paging::map_demand_page(fault_addr, &vma, pid) {
+    // Step 3: Map the page (passes is_write for zero-page optimisation).
+    if let Err(reason) = demand_paging::map_demand_page(fault_addr, &vma, pid, is_write) {
         if is_user {
             serial_println!(
                 "⚠️  Demand paging failed for PID {}: {} (addr {:#x})",
                 pid, reason, fault_addr
             );
-            kill_current_user_process("DEMAND PAGING FAILED", sf);
-            return;
+            kill_current_user_process("DEMAND PAGING FAILED");
+            // unreachable — kill_current_user_process diverges
         }
         panic!(
             "PAGE FAULT (kernel, map failed)\n  Address: {:#x}\n  Reason: {}\n  RIP: {:#x}",
@@ -178,28 +223,38 @@ extern "x86-interrupt" fn page_fault_handler(
 }
 
 // ============================================================================
-// Kill user process and schedule next
+// Kill user process and perform FULL context switch
 // ============================================================================
 
-/// Kill the current user process and switch to the next Ready process.
+/// Kill the current user process and jump to the next Ready process.
 ///
 /// Called from exception handlers when the fault originated in user mode
-/// (Ring 3).  Overwrites the exception stack frame so `iretq` lands on
-/// the next process.
-fn kill_current_user_process(reason: &str, sf: &mut ExceptionStackFrame) {
-    use crate::process::scheduler::SCHEDULER;
+/// (Ring 3).  Uses `jump_to_trapframe` to perform a FULL context switch
+/// that restores ALL registers (RAX..R15 + iret fields).
+///
+/// This function DIVERGES — it never returns to the calling exception
+/// handler.  The `jump_to_trapframe` assembly does its own `iretq`
+/// into the next process.
+///
+/// PREVIOUS BUG: The old implementation overwrote only the 5-field
+/// ExceptionStackFrame (RIP, CS, RFLAGS, RSP, SS) and returned normally.
+/// This leaked GPR values (RAX..R15) from the killed process into the
+/// next process, causing data corruption and unpredictable behavior.
+fn kill_current_user_process(reason: &str) -> ! {
+    let tf_ptr = {
+        let mut scheduler = crate::process::scheduler::local_scheduler();
+        let ptr = scheduler.kill_and_switch_tf(reason);
 
-    let mut scheduler = SCHEDULER.lock();
-    let frame = scheduler.kill_and_switch(reason);
+        serial_println!("  → Switching to next process (full TrapFrame restore)");
+        ptr
+        // Lock is dropped here before we jump
+    };
 
-    // Overwrite exception frame → iretq jumps to next process
-    sf.instruction_pointer = frame.rip;
-    sf.code_segment = frame.cs;
-    sf.cpu_flags = frame.rflags;
-    sf.stack_pointer = frame.rsp;
-    sf.stack_segment = frame.ss;
-
-    serial_println!("  → Switched to next process");
+    // Perform FULL context switch: loads all GPRs + iretq.
+    // This never returns.
+    unsafe {
+        crate::process::trapframe::jump_to_trapframe(tf_ptr);
+    }
 }
 
 extern "x86-interrupt" fn timer_handler(_sf: &mut ExceptionStackFrame) {

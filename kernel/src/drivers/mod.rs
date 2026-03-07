@@ -8,6 +8,7 @@
 // This replaces the hardcoded `match path` in sys_open.
 // Adding a new device driver = add a module + one line in DEVICES.
 
+pub mod dev_kbd;
 pub mod dev_null;
 pub mod dev_zero;
 pub mod serial_console;
@@ -25,6 +26,7 @@ struct DeviceEntry {
 /// Static device registry.  Order doesn't matter.
 /// To add a new device: create the module, add one line here.
 static DEVICES: &[DeviceEntry] = &[
+    DeviceEntry { path: "/dev/kbd",     open: dev_kbd::open },
     DeviceEntry { path: "/dev/null",    open: dev_null::open },
     DeviceEntry { path: "/dev/zero",    open: dev_zero::open },
     DeviceEntry { path: "/dev/console", open: serial_console::open },

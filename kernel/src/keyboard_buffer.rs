@@ -32,6 +32,11 @@ impl KeyboardBuffer {
         }
     }
     
+    /// Non-consuming readiness check: true if at least one character is buffered.
+    pub fn peek(&self) -> bool {
+        self.read.load(Ordering::Acquire) != self.write.load(Ordering::Acquire)
+    }
+
     pub fn pop(&self) -> Option<char> {
         let read = self.read.load(Ordering::Acquire);
         let write = self.write.load(Ordering::Acquire);

@@ -109,6 +109,20 @@ impl Framebuffer {
         }
     }
 
+    /// Desplaza el contenido de la pantalla `line_height` píxeles hacia arriba.
+    /// Las filas inferiores vacías se ponen a cero.
+    pub fn scroll_up(&mut self, line_height: usize) {
+        let row_bytes = self.stride * self.bytes_per_pixel;
+        let total = self.height * row_bytes;
+        let skip = line_height * row_bytes;
+        if skip >= total { return; }
+        let buffer = unsafe {
+            core::slice::from_raw_parts_mut(self.buffer.as_ptr(), total)
+        };
+        buffer.copy_within(skip..total, 0);
+        for byte in &mut buffer[(total - skip)..] { *byte = 0; }
+    }
+
     /// Obtiene las dimensiones del framebuffer
     //1280 x 800 en qemu
     pub fn dimensions(&self) -> (usize, usize) {

@@ -17,3 +17,15 @@
 
 pub mod buddy_allocator;
 pub mod slab;
+
+use x86_64::PhysAddr;
+
+/// Allocate 2^order bytes of physical memory from the global buddy allocator.
+pub unsafe fn phys_alloc(order: usize) -> Option<PhysAddr> {
+    buddy_allocator::BUDDY.lock().allocate(order)
+}
+
+/// Return 2^order bytes of physical memory to the buddy allocator.
+pub unsafe fn phys_free(addr: PhysAddr, order: usize) {
+    buddy_allocator::BUDDY.lock().deallocate(addr, order);
+}

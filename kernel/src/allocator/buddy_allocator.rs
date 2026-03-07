@@ -136,11 +136,15 @@ impl BuddyAllocator {
     #[inline]
     fn bitmap_set(&mut self, order: usize, addr: PhysAddr) {
         if let Some((byte, mask)) = Self::bitmap_pos(order, addr) {
-            debug_assert!(
-                self.bitmap[byte] & mask == 0,
-                "bitmap_set: block {:#x} order {} already marked free (double-free?)",
-                addr.as_u64(), order
-            );
+            if self.bitmap[byte] & mask != 0 {
+                crate::serial_println_raw!(
+                    "[BUDDY] DOUBLE-FREE: block {:#x} order {} already marked free!",
+                    addr.as_u64(), order
+                );
+                // Cannot panic here — we may be called while BUDDY is locked,
+                // and the panic handler would deadlock trying to allocate.
+                loop { unsafe { core::arch::asm!("hlt"); } }
+            }
             self.bitmap[byte] |= mask;
         }
     }
@@ -250,30 +254,50 @@ impl BuddyAllocator {
     /// Remove an ARBITRARY block from its order's free list.
     /// Also clears the bitmap bit.
     ///
+    /// Returns `true` if the block was found and removed, `false` if the bitmap
+    /// had a phantom entry (block not actually in the free list). In the `false`
+    /// case the phantom bitmap bit is cleared so future coalescing won't loop.
+    ///
     /// Handles both the head case (O(1)) and the general case (O(n) scan).
     /// Called during coalescing, where the buddy may be anywhere in the list.
-    ///
-    /// The O(n) list walk here is acceptable because:
-    ///   - It only runs when `is_free` returned true (O(1) bitmap check).
-    ///   - The common case in deallocate is that the buddy is NOT free,
-    ///     so this function is never reached.
-    unsafe fn remove_arbitrary_block(&mut self, order: usize, addr: PhysAddr) {
+    unsafe fn remove_arbitrary_block(&mut self, order: usize, addr: PhysAddr) -> bool {
         let idx = self.order_to_index(order);
         let phys_offset = crate::memory::physical_memory_offset();
 
         // Fast path: block is the head
         if self.free_lists[idx].head == Some(addr) {
             self.remove_from_head(order, addr);
-            return;
+            return true;
         }
 
         // Slow path: scan the list for the block and unlink it
         let mut prev_addr = match self.free_lists[idx].head {
             Some(a) => a,
-            None => return,
+            None => {
+                // Phantom bitmap entry — free list is completely empty.
+                // Clear the phantom bit so future coalescing won't see it again.
+                crate::serial_println_raw!(
+                    "[BUDDY] phantom: block {:#x} order {} in bitmap but free_list[{}] EMPTY — clearing",
+                    addr.as_u64(), order, idx
+                );
+                self.bitmap_clear(order, addr);
+                return false;
+            }
         };
 
+        let mut iters: usize = 0;
         loop {
+            iters += 1;
+            if iters > 4096 {
+                // Pathological list — treat as phantom, clear bitmap, abort.
+                crate::serial_println_raw!(
+                    "[BUDDY] phantom: infinite loop free_list[{}] for {:#x} — clearing",
+                    idx, addr.as_u64()
+                );
+                self.bitmap_clear(order, addr);
+                return false;
+            }
+
             let prev_virt = phys_offset + prev_addr.as_u64();
             let prev_block = &mut *(prev_virt.as_mut_ptr::<FreeBlock>());
 
@@ -283,12 +307,20 @@ impl BuddyAllocator {
                     let target_block = &*(target_virt.as_ptr::<FreeBlock>());
                     prev_block.next = target_block.next;
                     self.bitmap_clear(order, addr);
-                    return;
+                    return true;
                 }
                 Some(next_addr) => {
                     prev_addr = next_addr;
                 }
-                None => return,
+                None => {
+                    // Block not found in list — phantom entry. Clear and abort.
+                    crate::serial_println_raw!(
+                        "[BUDDY] phantom: {:#x} NOT FOUND in free_list[{}] — clearing",
+                        addr.as_u64(), order
+                    );
+                    self.bitmap_clear(order, addr);
+                    return false;
+                }
             }
         }
     }
@@ -383,7 +415,12 @@ impl BuddyAllocator {
             }
 
             // Buddy is free — remove it from its list and merge.
-            self.remove_arbitrary_block(current_order, buddy_addr);
+            // If remove returns false the bitmap had a phantom entry; abort
+            // coalescing so we don't create a merged block that includes
+            // memory that was never actually freed.
+            if !self.remove_arbitrary_block(current_order, buddy_addr) {
+                break;
+            }
 
             current_addr = PhysAddr::new(current_addr.as_u64().min(buddy_addr.as_u64()));
             current_order += 1;

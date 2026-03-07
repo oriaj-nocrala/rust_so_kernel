@@ -19,6 +19,13 @@ struct Selectors {
 // TSS estático - ubicación fija en memoria
 static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
+/// Top of the current process's kernel stack.
+/// Mirrored from TSS.privilege_stack_table[0] so that syscall_entry_fast
+/// can load it without parsing the TSS structure.
+/// Single-CPU only — safe because syscall entry always runs with IF=0.
+#[no_mangle]
+pub static mut KERNEL_RSP0: u64 = 0;
+
 // GDT se inicializa una vez
 static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
 
@@ -103,7 +110,69 @@ pub fn get_user_selectors() -> (SegmentSelector, SegmentSelector) {
 /// o desde un contexto donde sabemos que el TSS no está siendo usado
 pub fn set_kernel_stack(stack_top: VirtAddr) {
     unsafe {
-        // Modificación directa del TSS estático
         TSS.privilege_stack_table[0] = stack_top;
+        KERNEL_RSP0 = stack_top.as_u64();
     }
+}
+
+/// Configure MSRs so that the `syscall` instruction enters the kernel via
+/// `syscall_entry_fast` (defined in syscall.rs).
+///
+/// GDT layout assumed (matches the append order in `init()`):
+///   0x08 = kernel CS,  0x10 = kernel SS
+///   0x1b = user SS,    0x23 = user CS
+///
+/// STAR[47:32] = 0x0008 → syscall sets CS=0x08, SS=0x10
+/// STAR[63:48] = 0x0010 → sysretq would set CS=0x23, SS=0x1b  (we use iretq)
+/// LSTAR       = address of syscall_entry_fast
+/// SFMASK      = clear IF (bit 9) so we enter with interrupts disabled
+pub fn init_syscall_msrs() {
+    extern "C" { fn syscall_entry_fast(); }
+
+    const IA32_EFER:  u32 = 0xC000_0080;
+    const IA32_STAR:  u32 = 0xC000_0081;
+    const IA32_LSTAR: u32 = 0xC000_0082;
+    const IA32_FMASK: u32 = 0xC000_0084;
+
+    unsafe {
+        // Enable SCE (System Call Extensions) in EFER
+        let efer = rdmsr(IA32_EFER);
+        wrmsr(IA32_EFER, efer | 1);
+
+        // STAR: kernel selectors for syscall, user selectors for sysretq
+        wrmsr(IA32_STAR, (0x0010u64 << 48) | (0x0008u64 << 32));
+
+        // LSTAR: 64-bit kernel entry point
+        wrmsr(IA32_LSTAR, syscall_entry_fast as u64);
+
+        // SFMASK: clear IF on entry (bit 9)
+        wrmsr(IA32_FMASK, 1 << 9);
+    }
+
+    crate::serial_println!("syscall MSRs configured (LSTAR={:#x})", syscall_entry_fast as u64);
+}
+
+#[inline]
+unsafe fn wrmsr(msr: u32, value: u64) {
+    core::arch::asm!(
+        "wrmsr",
+        in("ecx") msr,
+        in("eax") value as u32,
+        in("edx") (value >> 32) as u32,
+        options(nostack, nomem),
+    );
+}
+
+#[inline]
+unsafe fn rdmsr(msr: u32) -> u64 {
+    let lo: u32;
+    let hi: u32;
+    core::arch::asm!(
+        "rdmsr",
+        in("ecx") msr,
+        out("eax") lo,
+        out("edx") hi,
+        options(nostack, nomem),
+    );
+    lo as u64 | ((hi as u64) << 32)
 }

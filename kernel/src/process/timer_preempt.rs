@@ -13,7 +13,10 @@
 //   Otherwise: return immediately (same process continues).
 
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 use super::trapframe::TrapFrame;
+
+static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 
 global_asm!(
     ".global timer_interrupt_entry",
@@ -77,18 +80,58 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> *const 
         PortWriteOnly::<u8>::new(0x20).write(0x20);
     }
 
-    // ── 2. Tick the scheduler ─────────────────────────────────────────
-    //
-    // tick() decrements the running process's time slice and handles
-    // periodic aging.  Returns true if the slice is exhausted and a
-    // context switch is needed.
-    let mut scheduler = super::scheduler::SCHEDULER.lock();
+    // ── 2. Advance jiffies counter ────────────────────────────────────
+    // crate::time::clockevent::tick();
 
-    if !scheduler.tick() {
-        // Slice still has ticks remaining — continue current process
-        return current_tf;
+    // let tick_n = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    // if tick_n % 50 == 0 {
+    //     crate::serial_println!("[TICK] {}", tick_n);
+    // }
+
+    // ── 3. Fire expired hrtimers ──────────────────────────────────────
+    //
+    // tick() acquires QUEUE, drains expired timers, releases QUEUE, then
+    // returns a list of PIDs to wake.  QUEUE is always released before we
+    // acquire the scheduler lock below (ABBA-deadlock prevention).
+    let mut wake_pids = [0usize; 8];
+    let wake_count = {
+        let now_ns = crate::time::ktime_get();
+        crate::time::hrtimer::tick(now_ns, &mut wake_pids)
+    };
+
+    // ── 4. Scheduler: wake hrtimer PIDs + tick time slice ────────────
+    //
+    // Acquire scheduler lock once for all wakeups + the tick decision.
+    // Release it before clearing POLL_WAITERS to obey lock order:
+    //   POLL_WAITERS → SCHEDULER (never the reverse).
+    let next_tf = {
+        let mut scheduler = super::scheduler::local_scheduler();
+
+        for &pid in &wake_pids[..wake_count] {
+            crate::serial_println!("[ISR] hrtimer waking PID {}", pid);
+            scheduler.wake(pid);
+        }
+
+        if !scheduler.tick() {
+            // Slice still has ticks remaining — continue current process.
+            // Still clear poll waiters for any pids woken by hrtimer.
+            drop(scheduler);
+            for &pid in &wake_pids[..wake_count] {
+                crate::process::syscall::poll_clear_on_timeout(pid);
+            }
+            return current_tf;
+        }
+
+        // ── 5. Time slice exhausted — context switch ──────────────────
+        scheduler.switch_to_next(current_tf)
+        // scheduler lock released here
+    };
+
+    // Clear stale POLL_WAITERS slots for PIDs woken by hrtimer timeout.
+    // Must happen after the scheduler lock is released (lock-order rule).
+    for &pid in &wake_pids[..wake_count] {
+        crate::process::syscall::poll_clear_on_timeout(pid);
     }
 
-    // ── 3. Time slice exhausted — context switch ──────────────────────
-    scheduler.switch_to_next(current_tf)
+    next_tf
 }

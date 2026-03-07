@@ -11,9 +11,8 @@ use bootloader_api::BootInfo;
 use x86_64::VirtAddr;
 
 use crate::{
-    framebuffer::{self, Color, Framebuffer, init_global_framebuffer},
+    framebuffer::{Framebuffer, init_global_framebuffer},
     process,
-    repl::Repl,
     serial_println,
 };
 
@@ -45,6 +44,10 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     );
 
     memory::init_core(phys_mem_offset, &boot_info.memory_regions);
+
+    // Allocate and zero-fill the shared zero frame (used by the zero-page trick).
+    unsafe { crate::memory::cow::init_zero_frame(); }
+
     memory::test_allocators();
 
     // ── Boot screen ────────────────────────────────────────────────
@@ -53,13 +56,19 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     // ── Hardware interrupts ────────────────────────────────────────
     devices::init_hardware_interrupts();
 
-    // ── Repl (initial prompt, will be replaced by shell process) ───
-    let mut repl = Repl::new(10, 50);
-    repl.show_prompt();
+    // ── TSC calibration ────────────────────────────────────────────
+    // PIT is now running; interrupts still masked — safe to busy-poll.
+    crate::cpu::tsc::init();
+    serial_println!("TSC: {} MHz", crate::cpu::tsc::freq_hz() / 1_000_000);
+
+    // ── Time subsystem ─────────────────────────────────────────────
+    crate::time::init();
+    serial_println!("clocksource: {}", crate::time::clocksource::clocksource_name());
 
     // ── TSS + GDT ──────────────────────────────────────────────────
     serial_println!("Step 9: Initializing TSS and GDT");
     process::tss::init();
+    process::tss::init_syscall_msrs();
 
     // ── Processes ──────────────────────────────────────────────────
     serial_println!("\nStep 10: Creating processes");
