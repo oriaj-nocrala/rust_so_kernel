@@ -525,9 +525,9 @@ fn sys_open(path_ptr: usize, _flags: i32) -> SyscallResult {
         Err(_) => return errno::EINVAL,
     };
 
-    // Ask the driver registry for a handle.
+    // Resolve through VFS: /dev/* → drivers, /bin/* → initramfs, …
     // Box allocation uses Slab (different lock from SCHEDULER).
-    let handle = match crate::drivers::open_device(path) {
+    let handle = match crate::fs::open(path) {
         Some(h) => h,
         None => return errno::ENOENT,
     };
@@ -1005,15 +1005,7 @@ fn sys_exec(path_ptr: usize) -> SyscallResult {
 }
 
 fn find_program_elf(name: &str) -> Option<&'static [u8]> {
-    use crate::process::user_programs::{list_programs, ProgramSource};
-    for (prog_name, source) in list_programs() {
-        if *prog_name == name {
-            if let ProgramSource::Elf(b) = source {
-                return Some(b);
-            }
-        }
-    }
-    None
+    crate::fs::initramfs::bytes(name)
 }
 
 fn sys_waitpid(child_pid: usize) -> SyscallResult {

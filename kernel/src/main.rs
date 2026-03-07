@@ -8,6 +8,7 @@ mod allocator;
 mod cpu;
 mod drivers;
 mod framebuffer;
+mod fs;
 mod init;
 mod interrupts;
 mod ipc;
