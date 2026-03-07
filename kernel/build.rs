@@ -22,6 +22,7 @@ const RUST_PROGRAMS: &[(&str, &str)] = &[
     ("ipc_ping",   "ipc_ping.elf"),
     ("mmap_test",  "mmap_test.elf"),
     ("poll_test",  "poll_test.elf"),
+    ("ls",         "ls.elf"),
 ];
 
 /// C binaries: (source file stem, embedded filename)
@@ -43,6 +44,8 @@ fn main() {
         userspace_dir.join("linker.ld"),
         userspace_dir.join("src"),
         c_dir.clone(),
+        sysroot_dir.join("usr/lib/libc.a"),
+        sysroot_dir.join("usr/lib/crt1.o"),
     ] {
         println!("cargo:rerun-if-changed={}", entry.display());
     }
