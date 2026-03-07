@@ -40,3 +40,18 @@ pub fn open_device(path: &str) -> Option<Box<dyn FileHandle>> {
         .find(|d| d.path == path)
         .map(|d| (d.open)())
 }
+
+/// Check if a device path is registered.
+pub fn has_device(path: &str) -> bool {
+    DEVICES.iter().any(|d| d.path == path)
+}
+
+/// Return the index of a device in the registry, for stable inode numbers.
+pub fn device_index(path: &str) -> Option<usize> {
+    DEVICES.iter().position(|d| d.path == path)
+}
+
+/// Return the path of the device at `index`, for `readdir`.
+pub fn device_by_index(index: usize) -> Option<&'static str> {
+    DEVICES.get(index).map(|d| d.path)
+}

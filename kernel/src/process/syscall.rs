@@ -148,13 +148,16 @@ pub enum SyscallNumber {
     Write = 1,
     Open = 2,
     Close = 3,
+    Stat = 4,
+    Fstat = 5,
+    Lstat = 6,
+    Poll = 7,
     Lseek = 8,
     Mmap = 9,
     Munmap = 11,
     Brk = 12,
     Ioctl = 16,
     Writev = 20,
-    Poll = 7,
     Yield = 24,
     Nanosleep = 35,
     GetPid = 39,
@@ -168,10 +171,11 @@ pub enum SyscallNumber {
     Exec = 59,
     Exit = 60,
     Waitpid = 61,
-    Futex = 202,
     ArchPrctl = 158,
-    SetTidAddress = 218,
+    Futex = 202,
     EpollCreate = 213,
+    GetDents64 = 217,
+    SetTidAddress = 218,
     ClockGettime = 228,
     EpollWait = 232,
     EpollCtl = 233,
@@ -183,13 +187,16 @@ pub enum SyscallNumber {
 impl SyscallNumber {
     pub fn from_u64(n: u64) -> Option<Self> {
         match n {
-            0 => Some(Self::Read),
-            1 => Some(Self::Write),
-            2 => Some(Self::Open),
-            3 => Some(Self::Close),
-            7 => Some(Self::Poll),
-            8 => Some(Self::Lseek),
-            9 => Some(Self::Mmap),
+            0  => Some(Self::Read),
+            1  => Some(Self::Write),
+            2  => Some(Self::Open),
+            3  => Some(Self::Close),
+            4  => Some(Self::Stat),
+            5  => Some(Self::Fstat),
+            6  => Some(Self::Lstat),
+            7  => Some(Self::Poll),
+            8  => Some(Self::Lseek),
+            9  => Some(Self::Mmap),
             11 => Some(Self::Munmap),
             12 => Some(Self::Brk),
             16 => Some(Self::Ioctl),
@@ -210,6 +217,7 @@ impl SyscallNumber {
             158 => Some(Self::ArchPrctl),
             202 => Some(Self::Futex),
             213 => Some(Self::EpollCreate),
+            217 => Some(Self::GetDents64),
             218 => Some(Self::SetTidAddress),
             228 => Some(Self::ClockGettime),
             232 => Some(Self::EpollWait),
@@ -292,6 +300,22 @@ where
 // MEMORY VALIDATION
 // ============================================================================
 
+/// Read a null-terminated C string from user space (max 255 chars).
+///
+/// Caller must have already validated `ptr` via `validate_user_buffer`.
+/// Returns an empty string slice on encoding errors (safe fallback).
+fn read_user_str(ptr: usize) -> &'static str {
+    unsafe {
+        let mut len = 0usize;
+        let p = ptr as *const u8;
+        while len < 255 && *p.add(len) != 0 {
+            len += 1;
+        }
+        let bytes = core::slice::from_raw_parts(p, len);
+        core::str::from_utf8(bytes).unwrap_or("")
+    }
+}
+
 fn validate_user_buffer(addr: u64, size: usize) -> Result<(), i64> {
     if addr == 0 {
         return Err(errno::EFAULT);
@@ -339,8 +363,11 @@ pub fn syscall_handler(
         SyscallNumber::Write => sys_write(arg1 as i32, arg2 as usize, arg3 as usize),
         SyscallNumber::Open => sys_open(arg1 as usize, arg2 as i32),
         SyscallNumber::Close => sys_close(arg1 as i32),
-        SyscallNumber::Lseek => sys_lseek(arg1 as i32, arg2 as i64, arg3 as i32),
+        SyscallNumber::Stat => sys_stat(arg1 as usize, arg2 as usize),
+        SyscallNumber::Fstat => sys_fstat(arg1 as i32, arg2 as usize),
+        SyscallNumber::Lstat => sys_stat(arg1 as usize, arg2 as usize), // no symlinks yet
         SyscallNumber::Poll => sys_poll(arg1, arg2 as u32, arg3 as i32),
+        SyscallNumber::Lseek => sys_lseek(arg1 as i32, arg2 as i64, arg3 as i32),
         SyscallNumber::Mmap => sys_mmap(arg1, arg2, arg3 as u32, arg4 as u32, arg5 as i32),
         SyscallNumber::Munmap => sys_munmap(arg1, arg2),
         SyscallNumber::Brk => sys_brk(arg1),
@@ -363,6 +390,7 @@ pub fn syscall_handler(
         SyscallNumber::Futex => sys_futex(arg1, arg2 as i32, arg3 as i32, arg4),
         SyscallNumber::SetTidAddress => sys_set_tid_address(arg1),
         SyscallNumber::EpollCreate => sys_epoll_create(arg1 as i32),
+        SyscallNumber::GetDents64 => sys_getdents64(arg1 as i32, arg2 as usize, arg3 as usize),
         SyscallNumber::ClockGettime => sys_clock_gettime(arg1, arg2),
         SyscallNumber::EpollWait => sys_epoll_wait(arg1 as i32, arg2, arg3 as i32, arg4 as i32),
         SyscallNumber::EpollCtl => sys_epoll_ctl(arg1 as i32, arg2 as i32, arg3 as i32, arg4),
@@ -505,31 +533,20 @@ fn sys_write(fd: i32, buf: usize, count: usize) -> SyscallResult {
     })
 }
 
-fn sys_open(path_ptr: usize, _flags: i32) -> SyscallResult {
+fn sys_open(path_ptr: usize, flags: i32) -> SyscallResult {
     // Validation BEFORE cli — no lock needed
     if let Err(e) = validate_user_buffer(path_ptr as u64, 256) {
         return e;
     }
 
-    let path_bytes = unsafe {
-        let mut len = 0;
-        let ptr = path_ptr as *const u8;
-        while len < 256 && *ptr.add(len) != 0 {
-            len += 1;
-        }
-        core::slice::from_raw_parts(ptr, len)
-    };
-
-    let path = match core::str::from_utf8(path_bytes) {
-        Ok(s) => s,
-        Err(_) => return errno::EINVAL,
-    };
+    let path = read_user_str(path_ptr);
+    if path.is_empty() { return errno::EINVAL; }
 
     // Resolve through VFS: /dev/* → drivers, /bin/* → initramfs, …
     // Box allocation uses Slab (different lock from SCHEDULER).
-    let handle = match crate::fs::open(path) {
-        Some(h) => h,
-        None => return errno::ENOENT,
+    let handle = match crate::fs::vfs::open(path, crate::fs::types::OpenFlags(flags)) {
+        Ok(h)  => h,
+        Err(e) => return e.as_i64(),
     };
 
     // Only take scheduler lock for the FD table insertion
@@ -537,6 +554,59 @@ fn sys_open(path_ptr: usize, _flags: i32) -> SyscallResult {
         match proc.files.allocate(handle) {
             Ok(fd) => fd as i64,
             Err(_) => errno::EINVAL,
+        }
+    })
+}
+
+fn sys_stat(path_ptr: usize, stat_ptr: usize) -> SyscallResult {
+    use crate::fs::types::Stat;
+    if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
+    if let Err(e) = validate_user_buffer(stat_ptr as u64, core::mem::size_of::<Stat>()) { return e; }
+
+    let path = read_user_str(path_ptr);
+    match crate::fs::vfs::stat(path) {
+        Err(e)   => e.as_i64(),
+        Ok(stat) => {
+            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            0
+        }
+    }
+}
+
+fn sys_fstat(fd: i32, stat_ptr: usize) -> SyscallResult {
+    use crate::fs::types::Stat;
+    if let Err(e) = validate_user_buffer(stat_ptr as u64, core::mem::size_of::<Stat>()) { return e; }
+
+    // Retrieve stat outside with_current_process to avoid holding the scheduler lock
+    // while doing a potentially expensive write.
+    let stat_result: Option<Stat> = {
+        let mut sched = super::scheduler::local_scheduler();
+        sched.running_mut().and_then(|proc| {
+            proc.files.get(fd as usize).ok().and_then(|f| f.stat())
+        })
+    };
+
+    match stat_result {
+        None       => errno::EBADF,
+        Some(stat) => {
+            unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
+            0
+        }
+    }
+}
+
+fn sys_getdents64(fd: i32, buf_ptr: usize, count: usize) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(buf_ptr as u64, count) { return e; }
+
+    with_current_process(|proc| {
+        match proc.files.get_mut(fd as usize) {
+            Err(_) => errno::EBADF,
+            Ok(f)  => {
+                let buf = unsafe {
+                    core::slice::from_raw_parts_mut(buf_ptr as *mut u8, count)
+                };
+                f.getdents64(buf)
+            }
         }
     })
 }

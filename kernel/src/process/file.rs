@@ -30,7 +30,10 @@ pub type FileResult<T> = Result<T, FileError>;
 /// Trait representing any "file" in the system.
 ///
 /// Implementations include device drivers (/dev/null, /dev/console, etc.),
-/// and in the future: pipes, sockets, real files on disk.
+/// VFS-opened files (initramfs, future ext2), pipes, sockets, etc.
+///
+/// Optional VFS extensions (`stat`, `getdents64`) have default implementations
+/// that are safe to ignore by device drivers.
 pub trait FileHandle: Send {
     /// Read up to `buf.len()` bytes.  Returns bytes read.
     fn read(&mut self, buf: &mut [u8]) -> FileResult<usize>;
@@ -41,6 +44,20 @@ pub trait FileHandle: Send {
     /// Close the file (optional, default no-op).
     fn close(&mut self) -> FileResult<()> {
         Ok(())
+    }
+
+    /// Return file metadata.  `None` for handles that don't support stat
+    /// (e.g. legacy device handles opened before the VFS was initialised).
+    fn stat(&self) -> Option<crate::fs::types::Stat> {
+        None
+    }
+
+    /// Fill `buf` with `linux_dirent64` records.  Returns bytes written, or a
+    /// negative errno on error.  Default returns `-ENOTDIR` (not a directory).
+    ///
+    /// Directory handles opened via the VFS override this.
+    fn getdents64(&mut self, _buf: &mut [u8]) -> i64 {
+        crate::fs::types::Errno::ENOTDIR.as_i64()
     }
 
     /// Name for debugging.

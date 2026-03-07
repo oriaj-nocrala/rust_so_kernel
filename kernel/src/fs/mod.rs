@@ -1,41 +1,48 @@
 // kernel/src/fs/mod.rs
 //
-// Virtual File System (VFS) — Phase 1: initramfs + devfs
+// VFS public API.
 //
-// Path resolution rules:
-//   /dev/*  → driver registry (crate::drivers)
-//   /bin/*  → initramfs (embedded ELF bytes)
+// MODULES
+//   types      — Stat, Errno, DirEntry, FileType, OpenFlags
+//   vfs        — Inode + Filesystem traits, MountTable, path resolution
+//   initramfs  — /bin/*  backed by embedded ELF bytes
+//   devfs      — /dev/*  backed by the driver registry
 //
-// Future mounts (ext2, tmpfs) will be added here without touching syscalls.
+// MOUNT LAYOUT (after init())
+//   /dev  → DevFs
+//   /bin  → InitramfsFs  (mounted at /bin so sys_exec uses "/bin/<name>")
+//   /     → InitramfsFs  (fallback root, also serves plain-name exec)
 
+pub mod devfs;
 pub mod initramfs;
+pub mod types;
+pub mod vfs;
 
-use alloc::boxed::Box;
-use crate::process::file::FileHandle;
+pub use types::{DirEntry, Errno, FileType, OpenFlags, Stat};
+
+use alloc::sync::Arc;
+
+/// Initialise the VFS: register all built-in filesystems.
+///
+/// Must be called once, after the memory allocator is ready, before any
+/// process opens a file.
+pub fn init() {
+    // /dev — character devices from the driver registry
+    vfs::mount("/dev", Arc::new(devfs::DevFs));
+    // /bin — user-space ELF binaries from initramfs
+    vfs::mount("/bin", Arc::new(initramfs::InitramfsFs));
+    // /   — root (fallback; also exposes binaries without /bin prefix)
+    vfs::mount("/", Arc::new(initramfs::InitramfsFs));
+}
 
 /// Open a file by absolute path.
 ///
-/// Returns a `FileHandle` ready for read/write, or `None` if not found.
-/// This is the single entry point used by `sys_open`.
-pub fn open(path: &str) -> Option<Box<dyn FileHandle>> {
-    if path.starts_with("/dev/") {
-        return crate::drivers::open_device(path);
-    }
-
-    if let Some(name) = path.strip_prefix("/bin/") {
-        return initramfs::open(name);
-    }
-
-    None
+/// Delegates to the VFS mount table.  Used by `sys_open`.
+pub fn open(path: &str, flags: OpenFlags) -> Result<alloc::boxed::Box<dyn crate::process::file::FileHandle>, Errno> {
+    vfs::open(path, flags)
 }
 
-/// Return raw bytes for a file — used by `sys_exec` to feed the ELF loader.
-///
-/// Returns `&'static [u8]` because initramfs data is embedded at compile time.
-/// For future on-disk filesystems this will change to an owned buffer.
-pub fn read_bytes(path: &str) -> Option<&'static [u8]> {
-    if let Some(name) = path.strip_prefix("/bin/") {
-        return initramfs::bytes(name);
-    }
-    None
+/// Stat a file by absolute path.  Used by `sys_stat` / `sys_lstat`.
+pub fn stat(path: &str) -> Result<Stat, Errno> {
+    vfs::stat(path)
 }

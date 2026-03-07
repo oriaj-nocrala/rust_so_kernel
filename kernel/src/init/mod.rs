@@ -65,6 +65,10 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     crate::time::init();
     serial_println!("clocksource: {}", crate::time::clocksource::clocksource_name());
 
+    // ── VFS ────────────────────────────────────────────────────────
+    crate::fs::init();
+    serial_println!("VFS: initramfs @ /bin, devfs @ /dev");
+
     // ── TSS + GDT ──────────────────────────────────────────────────
     serial_println!("Step 9: Initializing TSS and GDT");
     process::tss::init();
