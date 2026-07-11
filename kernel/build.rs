@@ -28,6 +28,7 @@ const RUST_PROGRAMS: &[(&str, &str)] = &[
 /// C binaries: (source file stem, embedded filename)
 const C_PROGRAMS: &[(&str, &str)] = &[
     ("hello", "hello.elf"),
+    ("pthread_test", "pthread_test.elf"),
 ];
 
 fn main() {

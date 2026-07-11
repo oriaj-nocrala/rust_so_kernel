@@ -84,13 +84,29 @@ static CURRENT_AS_PTR: [AtomicUsize; crate::cpu::MAX_CPUS] =
 static CURRENT_PID_FAST: [AtomicUsize; crate::cpu::MAX_CPUS] =
     [const { AtomicUsize::new(0) }; crate::cpu::MAX_CPUS];
 
+/// Re-sync the per-CPU fast-path pointers for the already-running process.
+///
+/// Needed after anything replaces `proc.address_space` with a new `Arc`
+/// in place (e.g. `sys_exec`'s image swap) — the page fault handler's
+/// `find_vma_fast`/`current_as_fast` read a cached `Arc::as_ptr` that a plain
+/// field assignment does not update, so without this call every fault in the
+/// new address space would look up VMAs in the old (dropped or otherwise
+/// unrelated) one and spuriously report "no VMA".
+pub fn refresh_current_fast(proc: &Process) {
+    update_current_fast(proc);
+}
+
 /// Update the per-CPU fast-path pointers to reflect `proc` as the running process.
 /// Called with interrupts disabled, just before storing into `self.running`.
 #[inline]
 fn update_current_fast(proc: &Process) {
     let cpu = crate::cpu::cpu_id();
+    // Arc::as_ptr gives a stable pointer to the shared AddressSpace's heap
+    // allocation — valid as long as *any* Arc reference is alive, which
+    // `proc.address_space` itself guarantees for as long as `proc` is the
+    // running process on this CPU.
     CURRENT_AS_PTR[cpu].store(
-        &proc.address_space as *const AddressSpace as usize,
+        alloc::sync::Arc::as_ptr(&proc.address_space) as usize,
         Ordering::Release,
     );
     CURRENT_PID_FAST[cpu].store(proc.pid.0, Ordering::Release);

@@ -13,6 +13,7 @@
 #include <mlibc/debug.hpp>
 #include <mlibc/all-sysdeps.hpp>
 #include <mlibc/thread-entry.hpp>
+#include <mlibc/tcb.hpp>
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -44,6 +45,7 @@ constexpr long SYS_munmap = 11;
 constexpr long SYS_ioctl = 16;
 constexpr long SYS_nanosleep = 35;
 constexpr long SYS_getpid = 39;
+constexpr long SYS_clone = 56;
 constexpr long SYS_fork = 57;
 constexpr long SYS_execve = 59;
 constexpr long SYS_exit = 60;
@@ -189,13 +191,21 @@ int sys_futex_wake(int *pointer) {
 // All remaining functions are disabled in ldso.
 #ifndef MLIBC_BUILDING_RTLD
 
-// This kernel has no clone()/real threading syscall — mlibc's generic
-// thread.cpp is compiled in unconditionally (see meson.build) but
-// pthread_create() is never exercised by our userspace programs, so a
-// clean ENOSYS stub is sufficient (and correct: it correctly fails any
-// attempted thread creation rather than silently misbehaving).
-int sys_clone(void *, pid_t *, void *) {
-	return ENOSYS;
+// This kernel's clone(56) is a custom ABI, not Linux's real clone(2):
+// long clone(void *entry, void *stack, void *tcb). It creates a new
+// schedulable thread sharing the caller's AddressSpace, starting execution
+// at `entry` with RSP=`stack`; `tcb` is passed through unused by the kernel
+// (see kernel/src/process/syscall.rs::sys_clone) — __mlibc_enter_thread
+// below sets FS itself via sys_tcb_set() once the new thread actually runs.
+// `stack` here is the value thread.cpp's sys_prepare_stack() already built
+// (entry/user_arg/tcb pushed on it for __mlibc_start_thread to pop).
+int sys_clone(void *tcb, pid_t *tid_out, void *stack) {
+	long ret = raw_syscall(SYS_clone, (long)__mlibc_start_thread,
+			(long)stack, (long)tcb);
+	if (ret < 0)
+		return (int)-ret;
+	*tid_out = (pid_t)ret;
+	return 0;
 }
 
 void sys_thread_exit() {

@@ -6,6 +6,8 @@
 // This is the only structural addition of the refactor.  Everything
 // else is wiring changes.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+use spin::Mutex;
 use x86_64::{
     VirtAddr,
     structures::paging::{Page, PageTableFlags, PhysFrame, Size2MiB, Size4KiB, mapper::MapToError},
@@ -14,13 +16,27 @@ use x86_64::{
 use super::page_table_manager::{OwnedPageTable, USER_MMAP_BASE};
 use super::vma::{Vma, VmaKind, VmaList};
 
+/// `vmas` and `mmap_base` use interior mutability (`Mutex`/`AtomicU64`
+/// instead of requiring `&mut self`) so that `AddressSpace` can be shared
+/// via `Arc` between multiple `Process`es (real threads created by
+/// `clone()`, which all run in the same address space). Everything else
+/// here already only needs `&self` — page-table mutation goes through raw
+/// pointer writes into the physical-offset-mapped page table memory itself,
+/// not through Rust-level `&mut`.
 pub struct AddressSpace {
     pub page_table: OwnedPageTable,
-    pub vmas: VmaList,
+    vmas: Mutex<VmaList>,
     /// Bump pointer for kernel-assigned anonymous mmap addresses.
     /// Starts at USER_MMAP_BASE; advances on each mmap allocation.
-    pub mmap_base: u64,
+    mmap_base: AtomicU64,
 }
+
+// SAFETY: same invariant as the existing `Send` impl below — this kernel is
+// single-CPU with cli-discipline around every scheduler/address-space
+// mutation, so there is never true concurrent access. `Sync` is required so
+// `Arc<AddressSpace>` (used to share an address space between the Processes
+// that make up a real thread group created by clone()) is itself `Send`.
+unsafe impl Sync for AddressSpace {}
 
 unsafe impl Send for AddressSpace {}
 
@@ -34,8 +50,8 @@ impl AddressSpace {
     pub fn kernel() -> Self {
         Self {
             page_table: OwnedPageTable::from_current(),
-            vmas: VmaList::new(),
-            mmap_base: USER_MMAP_BASE,
+            vmas: Mutex::new(VmaList::new()),
+            mmap_base: AtomicU64::new(USER_MMAP_BASE),
         }
     }
 
@@ -48,8 +64,8 @@ impl AddressSpace {
         let page_table = OwnedPageTable::new_user()?;
         Ok(Self {
             page_table,
-            vmas: VmaList::new(),
-            mmap_base: USER_MMAP_BASE,
+            vmas: Mutex::new(VmaList::new()),
+            mmap_base: AtomicU64::new(USER_MMAP_BASE),
         })
     }
 
@@ -58,19 +74,19 @@ impl AddressSpace {
     // ====================================================================
 
     /// Register a virtual memory area.
-    pub fn add_vma(&mut self, vma: Vma) -> Result<(), &'static str> {
-        self.vmas.add(vma)
+    pub fn add_vma(&self, vma: Vma) -> Result<(), &'static str> {
+        self.vmas.lock().add(vma)
     }
 
     /// Find the VMA containing `addr`, if any.
     /// Returns a copy (Vma is Copy).
     pub fn find_vma(&self, addr: u64) -> Option<Vma> {
-        self.vmas.find(addr).copied()
+        self.vmas.lock().find(addr).copied()
     }
 
     /// Debug: print all VMAs (uses serial, no allocation).
     pub fn dump_vmas(&self, label: usize) {
-        self.vmas.dump(label);
+        self.vmas.lock().dump(label);
     }
 
     // ====================================================================
@@ -130,11 +146,12 @@ impl AddressSpace {
     /// # Safety
     /// Buddy allocator must be initialized.  Call with interrupts disabled.
     pub unsafe fn fork(&self) -> Result<Self, &'static str> {
-        let mut child = Self::new_user()?;
-        child.vmas = self.vmas.clone();
-        child.mmap_base = self.mmap_base;
+        let child = Self::new_user()?;
+        let vmas_snapshot = self.vmas.lock().clone();
+        *child.vmas.lock() = vmas_snapshot.clone();
+        child.mmap_base.store(self.mmap_base.load(Ordering::Relaxed), Ordering::Relaxed);
 
-        for vma in self.vmas.iter() {
+        for vma in vmas_snapshot.iter() {
             let orig_flags = vma.page_table_flags();
             // Shared mapping is always read-only regardless of original flags.
             let shared_flags = orig_flags & !PageTableFlags::WRITABLE;
@@ -303,7 +320,7 @@ impl AddressSpace {
     /// No physical frames are allocated here; the demand paging fault handler
     /// handles first-touch allocation for Anonymous VMAs.
     pub fn sys_mmap_anon(
-        &mut self,
+        &self,
         addr: u64,
         length: u64,
         prot: u32,
@@ -326,15 +343,15 @@ impl AddressSpace {
 
             let vaddr = if addr == 0 {
                 // Align bump pointer up to 2 MiB boundary.
-                let base = (self.mmap_base + HUGE_2M - 1) & !(HUGE_2M - 1);
+                let base = (self.mmap_base.load(Ordering::Relaxed) + HUGE_2M - 1) & !(HUGE_2M - 1);
                 // Advance past the allocation + one 2 MiB guard region.
-                self.mmap_base = base + length_aligned + HUGE_2M;
+                self.mmap_base.store(base + length_aligned + HUGE_2M, Ordering::Relaxed);
                 base
             } else {
                 if addr & (HUGE_2M - 1) != 0 {
                     return Err("mmap: huge page addr not 2MB-aligned");
                 }
-                if self.vmas.overlaps(addr, size_pages) {
+                if self.vmas.lock().overlaps(addr, size_pages) {
                     return Err("mmap: MAP_FIXED conflict with existing VMA");
                 }
                 addr
@@ -346,7 +363,7 @@ impl AddressSpace {
                 flags: flags.bits(),
                 kind: VmaKind::Huge2M,
             };
-            self.vmas.add(vma).map_err(|_| "mmap: VMA list full")?;
+            self.vmas.lock().add(vma).map_err(|_| "mmap: VMA list full")?;
             return Ok(vaddr);
         }
 
@@ -354,15 +371,15 @@ impl AddressSpace {
         let size_pages = ((length + 4095) / 4096) as usize;
 
         let vaddr = if addr == 0 {
-            let base = self.mmap_base;
+            let base = self.mmap_base.load(Ordering::Relaxed);
             // Advance bump pointer; add one guard page between allocations.
-            self.mmap_base = base + size_pages as u64 * 4096 + 4096;
+            self.mmap_base.store(base + size_pages as u64 * 4096 + 4096, Ordering::Relaxed);
             base
         } else {
             if addr & 0xFFF != 0 {
                 return Err("mmap: addr not page-aligned");
             }
-            if self.vmas.overlaps(addr, size_pages) {
+            if self.vmas.lock().overlaps(addr, size_pages) {
                 return Err("mmap: MAP_FIXED conflict with existing VMA");
             }
             addr
@@ -378,7 +395,7 @@ impl AddressSpace {
             flags: flags.bits(),
             kind: VmaKind::Anonymous,
         };
-        self.vmas.add(vma).map_err(|_| "mmap: VMA list full")?;
+        self.vmas.lock().add(vma).map_err(|_| "mmap: VMA list full")?;
 
         Ok(vaddr)
     }
@@ -394,7 +411,7 @@ impl AddressSpace {
     ///
     /// # Safety
     /// Must be called with interrupts disabled (cli).
-    pub unsafe fn sys_munmap(&mut self, addr: u64, length: u64) -> Result<(), &'static str> {
+    pub unsafe fn sys_munmap(&self, addr: u64, length: u64) -> Result<(), &'static str> {
         if addr & 0xFFF != 0 {
             return Err("munmap: addr not page-aligned");
         }
@@ -403,11 +420,11 @@ impl AddressSpace {
         }
 
         let size_pages = ((length + 4095) / 4096) as usize;
-        let vma = self.vmas.remove(addr).map_err(|_| "munmap: VMA not found")?;
+        let vma = self.vmas.lock().remove(addr).map_err(|_| "munmap: VMA not found")?;
 
         if vma.size_pages != size_pages {
             // Re-insert and signal partial munmap is unsupported.
-            let _ = self.vmas.add(vma);
+            let _ = self.vmas.lock().add(vma);
             return Err("munmap: partial unmap not supported");
         }
 

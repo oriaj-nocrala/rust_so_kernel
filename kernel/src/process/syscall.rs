@@ -167,6 +167,7 @@ pub enum SyscallNumber {
     Sendmsg = 46,
     Recvmsg = 47,
     Bind = 49,
+    Clone = 56,
     Fork = 57,
     Exec = 59,
     Exit = 60,
@@ -210,6 +211,7 @@ impl SyscallNumber {
             46 => Some(Self::Sendmsg),
             47 => Some(Self::Recvmsg),
             49 => Some(Self::Bind),
+            56 => Some(Self::Clone),
             57 => Some(Self::Fork),
             59 => Some(Self::Exec),
             60 => Some(Self::Exit),
@@ -382,6 +384,7 @@ pub fn syscall_handler(
         SyscallNumber::Sendmsg => sys_sendmsg(arg1 as i32, arg2, arg3 as u32),
         SyscallNumber::Recvmsg => sys_recvmsg(arg1 as i32, arg2, arg3 as u32),
         SyscallNumber::Bind    => sys_bind_impl(arg1 as i32, arg2 as usize, arg3 as usize),
+        SyscallNumber::Clone => sys_clone(arg1, arg2, arg3),
         SyscallNumber::Fork => sys_fork(),
         SyscallNumber::Exec => sys_exec(arg1 as usize),
         SyscallNumber::Exit => sys_exit(arg1 as i32),
@@ -1078,6 +1081,69 @@ fn sys_fork() -> SyscallResult {
     child_pid  // parent sees child PID
 }
 
+// ── clone(56) ──────────────────────────────────────────────────────────────
+
+/// clone(56): long clone(void *entry, void *stack, void *tcb)
+///
+/// Real threading: creates a new schedulable Process that SHARES the
+/// caller's AddressSpace (same `Arc`, no COW page-table clone at all —
+/// unlike fork()) instead of getting its own. The new thread starts
+/// executing at `entry` with RSP=`stack`.
+///
+/// This is a custom ABI (not Linux's real `clone(2)` flags/signature) —
+/// it matches exactly what this kernel's mlibc port's `sys_clone` calls
+/// with: `entry` = `__mlibc_start_thread`, `stack` = the already-prepared
+/// stack `sys_prepare_stack` built in userspace (carrying the real
+/// entry/arg/tcb the assembly trampoline pops off it), `tcb` unused here —
+/// mlibc's own `__mlibc_enter_thread` calls `sys_tcb_set(tcb)` itself once
+/// the new thread actually starts running.
+///
+/// Returns the new thread's pid (used as its tid) to the caller.
+///
+/// KNOWN SIMPLIFICATIONS (see README):
+///   - The new thread gets its own FileDescriptorTable (stdio only) rather
+///     than sharing the caller's — real POSIX threads share one fd table.
+///   - A thread that becomes a Zombie (sys_thread_exit -> sys_exit) is never
+///     reaped: nothing calls waitpid() on a tid (pthread_join is entirely
+///     futex-based, see mlibc's __mlibc_enter_thread), so its Process
+///     struct — and its Arc<AddressSpace> reference — sits in wait_queue
+///     until... something reaps it. Fine for short-lived demos/tests; a
+///     long-running program that spawns many threads would slowly leak
+///     zombie Process structs (each ~64KiB kernel stack). Real fix needs a
+///     "detached thread" self-reap path.
+fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
+    let (parent_pid, address_space) = {
+        let sched = super::scheduler::local_scheduler();
+        match sched.running_ref() {
+            Some(proc) => (proc.pid, proc.address_space.clone()),
+            None => return errno::ESRCH,
+        }
+    };
+
+    let kernel_stack = crate::init::processes::allocate_kernel_stack();
+
+    unsafe { core::arch::asm!("cli"); }
+
+    let tid = {
+        let mut scheduler = super::scheduler::local_scheduler();
+        let pid = scheduler.allocate_pid();
+
+        let mut thread = alloc::boxed::Box::new(
+            super::Process::new_thread(
+                pid, parent_pid,
+                x86_64::VirtAddr::new(entry), x86_64::VirtAddr::new(stack),
+                kernel_stack, address_space,
+            )
+        );
+        thread.set_name("thread");
+        scheduler.add_process(thread);
+        pid.0 as SyscallResult
+    };
+
+    unsafe { core::arch::asm!("sti"); }
+    tid
+}
+
 fn sys_exec(path_ptr: usize) -> SyscallResult {
     if let Err(e) = validate_user_buffer(path_ptr as u64, 64) {
         return e;
@@ -1128,9 +1194,20 @@ fn sys_exec(path_ptr: usize) -> SyscallResult {
         match scheduler.running_mut() {
             Some(proc) => {
                 crate::serial_println_raw!("[EXEC] dropping old AS");
-                // Replace address space with freshly loaded one
-                proc.address_space = loaded.address_space;
+                // Replace address space with freshly loaded one. This drops
+                // this Process's Arc reference to whatever it had before —
+                // if that was a shared (thread) address space, the actual
+                // page table/pages are only freed once every other thread
+                // sharing it has also exited (Arc refcount reaches 0).
+                proc.address_space = alloc::sync::Arc::new(loaded.address_space);
                 crate::serial_println_raw!("[EXEC] old AS dropped, new AS in place");
+
+                // The page-fault fast path caches a raw pointer to the
+                // process's AddressSpace (see scheduler::refresh_current_fast);
+                // it must be re-synced now that the field above points at a
+                // brand-new Arc allocation, or every fault after this exec()
+                // will look up VMAs in the stale pre-exec address space.
+                super::scheduler::refresh_current_fast(proc);
 
                 // Reset TrapFrame to new entry point
                 proc.trapframe.rip    = loaded.entry_point.as_u64();

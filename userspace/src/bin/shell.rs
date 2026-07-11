@@ -61,6 +61,7 @@ fn print_help() {
     println!("  mmap_test   - mmap/munmap demo");
     println!("  poll_test   - poll demo");
     println!("  hello       - hello world demo");
+    println!("  pthread_test - pthread_create/join smoke test");
 }
 
 fn run_program(name: &str) {
