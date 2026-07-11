@@ -7,9 +7,32 @@ use crate::framebuffer::{Color, Framebuffer};
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    let mut fb_lock = crate::framebuffer::FRAMEBUFFER.lock();
     unsafe { core::arch::asm!("cli"); }
-    
+
+    // Lock-free serial output FIRST: safe from any context (including
+    // panics that originate inside an interrupt handler or while the
+    // framebuffer lock is already held, which would otherwise deadlock
+    // trying to draw the panic screen below).
+    crate::serial_println_raw!("\n=== KERNEL PANIC ===");
+    if let Some(location) = info.location() {
+        crate::serial_println_raw!(
+            "  at {}:{}:{}",
+            location.file(), location.line(), location.column()
+        );
+    }
+    crate::serial_println_raw!("  {}", info.message());
+
+    // Best-effort: the framebuffer lock may already be held by whatever
+    // code paniced (e.g. a fault inside a framebuffer-holding critical
+    // section) — try_lock so we never deadlock the panic handler itself.
+    let mut fb_lock = match crate::framebuffer::FRAMEBUFFER.try_lock() {
+        Some(guard) => guard,
+        None => {
+            crate::serial_println_raw!("  (framebuffer locked — skipping panic screen)");
+            loop { unsafe { core::arch::asm!("hlt"); } }
+        }
+    };
+
     if let Some(fb) = fb_lock.as_mut()  {
 
         fb.clear(Color::rgb(0, 0, 170));

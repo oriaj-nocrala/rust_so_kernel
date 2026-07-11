@@ -51,17 +51,28 @@ pub fn debug_file_descriptors() {
 // HELPERS
 // ============================================================================
 
-/// Allocate a kernel stack from the Buddy (16 KiB, order 14).
+/// Kernel stack size order. 16 = 64 KiB.
+///
+/// Was order 14 (16 KiB) — too small for debug builds: `sys_exec`'s call
+/// chain (syscall_handler_asm -> syscall_handler -> sys_exec -> load_elf ->
+/// load_segment) has large unoptimized stack frames, and kernel stacks are
+/// plain physical-offset-mapped regions with NO guard page, so an overflow
+/// doesn't fault — it silently corrupts whatever physical memory sits just
+/// below, which later crashes as an unrelated-looking kernel page fault
+/// once a clobbered return address gets used.
+pub const KERNEL_STACK_ORDER: usize = 16;
+
+/// Allocate a kernel stack from the Buddy.
 pub fn allocate_kernel_stack() -> VirtAddr {
     let phys_addr = unsafe {
-        crate::allocator::phys_alloc(14)
+        crate::allocator::phys_alloc(KERNEL_STACK_ORDER)
             .expect("Failed to allocate kernel stack from buddy")
     };
 
     let virt_addr = crate::memory::physical_memory_offset() + phys_addr.as_u64();
 
     // Stack top (grows downward)
-    VirtAddr::new(virt_addr.as_u64() + (1 << 14))
+    VirtAddr::new(virt_addr.as_u64() + (1 << KERNEL_STACK_ORDER))
 }
 
 // ============================================================================

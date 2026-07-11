@@ -46,8 +46,28 @@ fn main() {
         c_dir.clone(),
         sysroot_dir.join("usr/lib/libc.a"),
         sysroot_dir.join("usr/lib/crt1.o"),
+        workspace_root.join("mlibc-port"),
+        workspace_root.join("mlibc-cross.ini"),
+        workspace_root.join("scripts/setup-mlibc.sh"),
     ] {
         println!("cargo:rerun-if-changed={}", entry.display());
+    }
+
+    // ── Build the mlibc sysroot if missing ──────────────────────────────────
+    //
+    // The mlibc git submodule (.gitmodules) points at upstream managarm/mlibc,
+    // which has no support for this kernel's syscall ABI. mlibc-port/ in this
+    // repo holds our own out-of-tree sysdeps port; scripts/setup-mlibc.sh
+    // copies it into the submodule checkout, registers it in mlibc's
+    // meson.build, and builds crt1.o + libc.a + headers into sysroot/.
+    if !sysroot_dir.join("usr/lib/libc.a").exists() {
+        println!("cargo:warning=sysroot missing — building mlibc (this can take a minute)...");
+        let status = Command::new("bash")
+            .arg(workspace_root.join("scripts/setup-mlibc.sh"))
+            .current_dir(workspace_root)
+            .status()
+            .expect("Failed to spawn scripts/setup-mlibc.sh");
+        assert!(status.success(), "scripts/setup-mlibc.sh failed");
     }
 
     // ── Create embedded dir ───────────────────────────────────────────────

@@ -178,9 +178,12 @@ extern "x86-interrupt" fn page_fault_handler(
             kill_current_user_process("PAGE FAULT (not demand-pageable)");
             // unreachable — kill_current_user_process diverges
         }
+        let (cr3, _) = x86_64::registers::control::Cr3::read();
         panic!(
-            "PAGE FAULT (kernel)\n  Address: {:#x}\n  Error: {:#b}\n  Reason: {}\n  RIP: {:#x}",
-            fault_addr, error_code, reason, sf.instruction_pointer
+            "PAGE FAULT (kernel)\n  Address: {:#x}\n  Error: {:#b}\n  Reason: {}\n  RIP: {:#x}\n  CS: {:#x}\n  RSP: {:#x}\n  CR3: {:#x}\n  running PID: {}",
+            fault_addr, error_code, reason, sf.instruction_pointer, sf.code_segment, sf.stack_pointer,
+            cr3.start_address().as_u64(),
+            crate::process::scheduler::current_pid_fast()
         );
     }
 

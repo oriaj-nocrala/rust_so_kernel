@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "userspace"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "userspace"
+path = "src/lib.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
