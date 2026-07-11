@@ -797,9 +797,18 @@ fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
 /// futex(202): long futex(uint32_t *uaddr, int futex_op, uint32_t val,
 ///                        const struct timespec *timeout, ...)
 ///
-/// Single-threaded stub: WAIT returns immediately if *uaddr != val (spurious
-/// wakeup is permitted by POSIX), and WAKE always succeeds.  This is enough
-/// for mlibc's internal mutexes in a single-process world.
+/// WAIT blocks the caller if `*uaddr == val` until a matching WAKE (timeouts
+/// are not supported — `_timeout` is ignored, matching the previous stub).
+/// WAKE wakes up to `val` waiters registered on the same `uaddr`.
+///
+/// Waiters are scoped by (uaddr, address space) — not raw uaddr alone —
+/// because every process's anonymous mmap region starts at the same fixed
+/// base (see USER_MMAP_BASE), so two unrelated processes can easily end up
+/// with numerically identical uaddrs for e.g. mlibc's internal malloc lock.
+/// Without this scoping a WAKE in one process could wake a waiter in a
+/// completely unrelated one. There is no real thread-sharing yet (sys_clone
+/// is ENOSYS), so today this is one-waiter-per-address-space in practice,
+/// but the scoping is what makes it correct once real threads land.
 fn sys_futex(uaddr: u64, futex_op: i32, val: i32, _timeout: u64) -> SyscallResult {
     const FUTEX_WAIT: i32 = 0;
     const FUTEX_WAKE: i32 = 1;
@@ -814,15 +823,86 @@ fn sys_futex(uaddr: u64, futex_op: i32, val: i32, _timeout: u64) -> SyscallResul
             if current != val {
                 return errno::EAGAIN;
             }
-            // Single-threaded: nobody else can wake us; yield and return.
-            // Returning 0 (spurious wake) is valid per POSIX.
-            0
+
+            let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame;
+
+            unsafe { core::arch::asm!("cli"); }
+
+            let (pid, as_id) = {
+                let sched = super::scheduler::local_scheduler();
+                match sched.running_ref() {
+                    Some(proc) => (proc.pid.0, proc.address_space.root_frame().start_address().as_u64()),
+                    None => { unsafe { core::arch::asm!("sti"); } return errno::ESRCH; }
+                }
+            };
+
+            if pid < MAX_PROCS {
+                FUTEX_WAITERS.lock()[pid] = Some(FutexWaiter { uaddr, as_id });
+            }
+
+            let next_tf = {
+                let mut scheduler = super::scheduler::local_scheduler();
+                unsafe { (*(tf_ptr as *mut TrapFrame)).rax = 0; }
+                scheduler.block_current(tf_ptr)
+            };
+            unsafe { super::trapframe::jump_to_trapframe(next_tf) }
         }
         FUTEX_WAKE => {
-            // No waiters in single-threaded mode — report 0 woken.
-            0
+            unsafe { core::arch::asm!("cli"); }
+
+            let as_id = {
+                let sched = super::scheduler::local_scheduler();
+                match sched.running_ref() {
+                    Some(proc) => proc.address_space.root_frame().start_address().as_u64(),
+                    None => { unsafe { core::arch::asm!("sti"); } return errno::ESRCH; }
+                }
+            };
+
+            let max_wake = if val <= 0 { i32::MAX } else { val };
+            let mut woken_pids = [0usize; 8];
+            let mut woken_count = 0usize;
+            {
+                let mut waiters = FUTEX_WAITERS.lock();
+                for (pid, slot) in waiters.iter_mut().enumerate() {
+                    if woken_count >= woken_pids.len() || woken_count as i32 >= max_wake {
+                        break;
+                    }
+                    if let Some(w) = slot {
+                        if w.uaddr == uaddr && w.as_id == as_id {
+                            woken_pids[woken_count] = pid;
+                            woken_count += 1;
+                            *slot = None;
+                        }
+                    }
+                }
+            }
+
+            if woken_count > 0 {
+                let mut sched = super::scheduler::local_scheduler();
+                for &pid in &woken_pids[..woken_count] {
+                    sched.wake_with_retval(pid, 0);
+                }
+            }
+            unsafe { core::arch::asm!("sti"); }
+            woken_count as i64
         }
         _ => errno::ENOSYS,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FutexWaiter {
+    uaddr: u64,
+    as_id: u64,
+}
+
+/// One outstanding FUTEX_WAIT per PID — mirrors POLL_WAITERS/RECV_WAITER.
+static FUTEX_WAITERS: Mutex<[Option<FutexWaiter>; MAX_PROCS]> = Mutex::new([None; MAX_PROCS]);
+
+/// Clear a pending futex wait for a process (called on exit).
+fn futex_cancel_waiter(pid: usize) {
+    if pid < MAX_PROCS {
+        FUTEX_WAITERS.lock()[pid] = None;
     }
 }
 
@@ -836,9 +916,27 @@ fn sys_set_tid_address(_tidptr: u64) -> SyscallResult {
     sys_getpid()
 }
 
+/// sys_yield — voluntary context switch.
+///
+/// Reuses the same `switch_to_next` the timer ISR uses for preemption: puts
+/// the caller back at the tail of its run queue (as Ready) and switches to
+/// the next Ready process. If nothing else is Ready, `switch_to_next`
+/// returns the caller's own TrapFrame unchanged and this is a no-op.
 fn sys_yield() -> SyscallResult {
-    // TODO: Trigger voluntary context switch
-    0
+    let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame;
+
+    unsafe { core::arch::asm!("cli"); }
+
+    let next_tf = {
+        let mut scheduler = super::scheduler::local_scheduler();
+        // Pre-set rax=0 in the on-stack frame *before* switch_to_next copies
+        // it into the process's saved TrapFrame, so that whenever this
+        // process runs again, the syscall returns 0.
+        unsafe { (*(tf_ptr as *mut TrapFrame)).rax = 0; }
+        scheduler.switch_to_next(tf_ptr)
+    };
+
+    unsafe { super::trapframe::jump_to_trapframe(next_tf) }
 }
 
 /// sys_nanosleep — block the calling process for at least `ns` nanoseconds.
@@ -920,6 +1018,7 @@ fn sys_exit(status: i32) -> SyscallResult {
     // Cancel any pending poll/epoll wait and clear side tables
     poll_cancel_waiter(dead_pid);
     clear_epoll_fd_all(dead_pid);
+    futex_cancel_waiter(dead_pid);
 
     unsafe {
         core::arch::asm!("sti");

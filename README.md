@@ -81,8 +81,7 @@ Lo que falta o está a medias, mirando el propio código:
 
 - ⏳ **Sin linker dinámico**: `exec()` solo carga binarios estáticos, no hay `.so`/relocations.
 - ⏳ **Un solo core real**: la infraestructura para SMP existe (arrays por-CPU, `MAX_CPUS=8`) pero `cpu_id()` siempre devuelve 0.
-- ⏳ **Threads**: `futex`/`clone` son stubs de un solo hilo, no hay pthreads reales todavía.
-- ⏳ **`sys_yield`**: no dispara un context switch de verdad (no-op).
+- ⏳ **Threads reales**: `sys_clone` es `ENOSYS` — no hay `pthread_create` todavía. `sys_yield` y `futex` (`WAIT`/`WAKE`) sí son reales (context switch voluntario y bloqueo/despertar correctos, con scoping por address space), quedan listos para cuando haya threads que los usen de verdad.
 - ⏳ **Filesystem persistente**: el VFS es sólido pero todo vive en un initramfs de solo lectura — no hay nada escribible en disco.
 
 ---
