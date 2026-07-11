@@ -14,7 +14,8 @@ Empezó como un proyecto de aprendizaje ("SO2") para explorar desarrollo de sist
 - **Memoria**: buddy allocator físico (bitmap O(1)) + slab allocator para el heap del kernel; paginación por proceso con demand paging y VMAs.
 - **Multitarea preemptiva**: scheduler de prioridades multinivel, quantum dinámico, aging anti-starvation.
 - **Procesos**: `fork()` con copy-on-write real, `exec()` vía loader de ELF64, `waitpid()`, aislamiento completo de tablas de páginas por proceso.
-- **Syscalls** con números compatibles con Linux (`read`, `write`, `open`, `mmap`, `fork`, `exec`, `futex`, `arch_prctl`, `poll`/`epoll`, `clock_gettime`, ...) entradas por la instrucción `syscall` (MSR LSTAR).
+- **Threads reales**: `clone()` crea un `Process` que comparte el `AddressSpace` del padre (`Arc<AddressSpace>`, sin COW) en vez de aislarlo — soporta `pthread_create`/`pthread_join` de mlibc de punta a punta (mutex + futex de por medio).
+- **Syscalls** con números compatibles con Linux (`read`, `write`, `open`, `mmap`, `fork`, `clone`, `exec`, `futex`, `arch_prctl`, `poll`/`epoll`, `clock_gettime`, ...) entradas por la instrucción `syscall` (MSR LSTAR).
 - **VFS propio**: initramfs + devfs (`/dev/null`, `/dev/zero`, `/dev/console`, `/dev/fb`, `/dev/kbd`), `stat`/`getdents64`.
 - **IPC**: canales tipo socket (`socket`/`bind`/`connect`/`accept`/`sendmsg`/`recvmsg`) con `poll`/`epoll`.
 - **Tiempo**: TSC calibrado contra el PIT, hrtimer, `nanosleep`, `clock_gettime`.
@@ -35,6 +36,7 @@ Un pequeño shell interactivo (`shell`) hace `fork`+`exec` de estos binarios:
 | `ipc_ping` | Demo de IPC: fork + servidor + cliente, 100 round-trips por canal |
 | `mmap_test` / `poll_test` | Ejercitan `mmap`/`munmap` y `poll` end-to-end |
 | `hello` | Programa en **C real**, compilado y linkeado contra mlibc — `printf("Hello from user!\n")` pasando por todo el stack de stdio de libc |
+| `pthread_test` | Programa en **C real**: 3 threads (`pthread_create`) incrementando un contador bajo mutex, `pthread_join`, verifica el resultado — ejercita `clone()` de punta a punta |
 
 ## 🏗️ Estructura del workspace
 
@@ -81,8 +83,8 @@ Lo que falta o está a medias, mirando el propio código:
 
 - ⏳ **Sin linker dinámico**: `exec()` solo carga binarios estáticos, no hay `.so`/relocations.
 - ⏳ **Un solo core real**: la infraestructura para SMP existe (arrays por-CPU, `MAX_CPUS=8`) pero `cpu_id()` siempre devuelve 0.
-- ⏳ **Threads reales**: `sys_clone` es `ENOSYS` — no hay `pthread_create` todavía. `sys_yield` y `futex` (`WAIT`/`WAKE`) sí son reales (context switch voluntario y bloqueo/despertar correctos, con scoping por address space), quedan listos para cuando haya threads que los usen de verdad.
 - ⏳ **Filesystem persistente**: el VFS es sólido pero todo vive en un initramfs de solo lectura — no hay nada escribible en disco.
+- ⏳ **Threads: simplificaciones conocidas**. Cada thread tiene su propia `FileDescriptorTable` (solo stdio) en vez de compartir la del proceso; un thread que sale (`pthread_exit`/`return`) queda como zombie sin reaper automático (nada llama `waitpid()` sobre un tid) — ok para demos cortas, pero un programa long-running que crea muchos threads iría filtrando `Process` structs.
 
 ---
 
