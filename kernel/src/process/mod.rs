@@ -3,6 +3,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use spin::Mutex;
 use x86_64::VirtAddr;
 use crate::memory::address_space::AddressSpace;
 
@@ -62,7 +63,12 @@ pub struct Process {
     /// `AddressSpace`'s `Drop` (which frees the page table and all mapped
     /// pages) only runs once the last thread sharing it exits.
     pub address_space: Arc<AddressSpace>,
-    pub files: FileDescriptorTable,
+    /// `Arc<Mutex<..>>` for the same reason as `address_space`: threads
+    /// created via `clone()` (see `syscall::sys_clone`) share one fd table
+    /// with the process that spawned them, matching POSIX thread semantics
+    /// (a file one thread opens is visible to its siblings). `fork()` still
+    /// gets its own independent table (a fresh `Arc` around a cloned copy).
+    pub files: Arc<Mutex<FileDescriptorTable>>,
 
     /// Set while this process is blocked in waitpid(), waiting for a child.
     /// Stored here (not in a global) so multiple processes can wait concurrently.
@@ -71,6 +77,19 @@ pub struct Process {
     /// FS segment base (used for TLS via arch_prctl ARCH_SET_FS).
     /// Saved/restored on every context switch so mlibc's TLS works correctly.
     pub fs_base: u64,
+
+    /// True for a `Process` created by `new_thread` (i.e. `clone()`, POSIX
+    /// thread), false for a normal process (fork/exec).
+    ///
+    /// mlibc's `pthread_join()` (`mlibc/options/internal/generic/threads.cpp`
+    /// — upstream, shared by every sysdeps port, not something this port can
+    /// override) is entirely futex-based: it waits on the TCB's `didExit`
+    /// flag and never calls `waitpid()` on the tid. So unlike a fork()ed
+    /// child, nothing will ever collect a thread's zombie from the
+    /// scheduler's `wait_queue`. The scheduler uses this flag to reap a
+    /// thread's `Process` immediately on exit instead of zombie-parking it
+    /// forever — see `Scheduler::kill_current`.
+    pub is_thread: bool,
 }
 
 impl Process {
@@ -122,9 +141,10 @@ impl Process {
             trapframe,
             kernel_stack,
             address_space: Arc::new(address_space),
-            files: FileDescriptorTable::new_with_stdio(),
+            files: Arc::new(Mutex::new(FileDescriptorTable::new_with_stdio())),
             waiting_for: None,
             fs_base: 0,
+            is_thread: false,
         }
     }
 
@@ -177,9 +197,10 @@ impl Process {
             trapframe,
             kernel_stack,
             address_space: Arc::new(address_space),
-            files: FileDescriptorTable::new_with_stdio(),
+            files: Arc::new(Mutex::new(FileDescriptorTable::new_with_stdio())),
             waiting_for: None,
             fs_base: 0,
+            is_thread: false,
         }
     }
 
@@ -211,9 +232,10 @@ impl Process {
             trapframe,
             kernel_stack,
             address_space: Arc::new(address_space),
-            files,
+            files: Arc::new(Mutex::new(files)),
             waiting_for: None,
             fs_base: 0,
+            is_thread: false,
         }
     }
 
@@ -225,6 +247,10 @@ impl Process {
     /// mlibc port, `entry` is `__mlibc_start_thread` and `stack` is the
     /// pre-built stack `sys_prepare_stack` set up in userspace (already
     /// carrying the real entry/arg/tcb the assembly trampoline expects).
+    ///
+    /// `files` is the caller's own `Arc<Mutex<FileDescriptorTable>>`, passed
+    /// in (not built fresh) so the new thread shares fd space with its
+    /// siblings — POSIX threads see each other's open files.
     pub fn new_thread(
         pid: Pid,
         parent_pid: Pid,
@@ -232,6 +258,7 @@ impl Process {
         stack: VirtAddr,
         kernel_stack: VirtAddr,
         address_space: Arc<AddressSpace>,
+        files: Arc<Mutex<FileDescriptorTable>>,
     ) -> Self {
         let mut trapframe = Box::new(TrapFrame::default());
 
@@ -274,15 +301,10 @@ impl Process {
             trapframe,
             kernel_stack,
             address_space,
-            // A real POSIX thread should share its FD table with siblings
-            // too (files opened by one are visible to all). We don't do
-            // that yet — each thread gets its own table pre-opened to the
-            // same stdio devices, which is enough for stdout/stderr-only
-            // programs but not for e.g. a thread opening a file that a
-            // sibling then reads.
-            files: FileDescriptorTable::new_with_stdio(),
+            files,
             waiting_for: None,
             fs_base: 0,
+            is_thread: true,
         }
     }
 

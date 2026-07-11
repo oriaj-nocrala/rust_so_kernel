@@ -252,7 +252,17 @@ impl Scheduler {
     // Kill current process (user segfault, sys_exit)
     // ====================================================================
 
-    /// Mark the running process as Zombie and move it to the wait queue.
+    /// Mark the running process as Zombie and move it to the wait queue —
+    /// unless it's a thread (`is_thread`), in which case it's reaped
+    /// immediately instead (dropped here and now).
+    ///
+    /// Threads never get an explicit `waitpid()` call collecting them:
+    /// mlibc's `pthread_join()` (upstream, shared by every sysdeps port —
+    /// see `Process::is_thread`'s doc comment) is purely futex-based and
+    /// never issues one. Zombie-parking a thread the normal way would leak
+    /// its `Process` struct (and kernel stack) forever, since nothing will
+    /// ever remove it from `wait_queue`. So this is the thread-exit
+    /// equivalent of an implicit, always-successful `waitpid()`.
     ///
     /// Returns true if a process was killed, false if nothing was running.
     /// After calling this, the caller must trigger a context switch
@@ -267,8 +277,14 @@ impl Scheduler {
                     .trim_end_matches('\0'),
                 reason,
             );
-            proc.state = ProcessState::Zombie;
-            self.wait_queue.push_back(proc);
+            if proc.is_thread {
+                crate::serial_println!("  → thread, reaped immediately (no waitpid() will ever collect it)");
+                // `proc` drops here: releases its kernel stack slot and its
+                // Arc references to the shared AddressSpace/FileDescriptorTable.
+            } else {
+                proc.state = ProcessState::Zombie;
+                self.wait_queue.push_back(proc);
+            }
             true
         } else {
             false

@@ -43,7 +43,7 @@ pub fn debug_file_descriptors() {
     let scheduler = crate::process::scheduler::local_scheduler();
     for proc in scheduler.iter_all() {
         serial_println!("Process {}: open files:", proc.pid.0);
-        proc.files.debug_list();
+        proc.files.lock().debug_list();
     }
 }
 

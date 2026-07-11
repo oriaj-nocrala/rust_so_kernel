@@ -29,6 +29,7 @@ const RUST_PROGRAMS: &[(&str, &str)] = &[
 const C_PROGRAMS: &[(&str, &str)] = &[
     ("hello", "hello.elf"),
     ("pthread_test", "pthread_test.elf"),
+    ("producer_consumer", "producer_consumer.elf"),
 ];
 
 fn main() {

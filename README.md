@@ -14,7 +14,7 @@ Empezó como un proyecto de aprendizaje ("SO2") para explorar desarrollo de sist
 - **Memoria**: buddy allocator físico (bitmap O(1)) + slab allocator para el heap del kernel; paginación por proceso con demand paging y VMAs.
 - **Multitarea preemptiva**: scheduler de prioridades multinivel, quantum dinámico, aging anti-starvation.
 - **Procesos**: `fork()` con copy-on-write real, `exec()` vía loader de ELF64, `waitpid()`, aislamiento completo de tablas de páginas por proceso.
-- **Threads reales**: `clone()` crea un `Process` que comparte el `AddressSpace` del padre (`Arc<AddressSpace>`, sin COW) en vez de aislarlo — soporta `pthread_create`/`pthread_join` de mlibc de punta a punta (mutex + futex de por medio).
+- **Threads reales**: `clone()` crea un `Process` que comparte el `AddressSpace` (`Arc<AddressSpace>`, sin COW) *y* la `FileDescriptorTable` (`Arc<Mutex<..>>`) del padre en vez de aislarlos — soporta `pthread_create`/`pthread_join`/`pthread_cond_*` de mlibc de punta a punta. Un thread que sale se reap-ea inmediatamente en el kernel (no queda zombie: `pthread_join` de mlibc es 100% futex-based y nunca llama `waitpid()` sobre el tid).
 - **Syscalls** con números compatibles con Linux (`read`, `write`, `open`, `mmap`, `fork`, `clone`, `exec`, `futex`, `arch_prctl`, `poll`/`epoll`, `clock_gettime`, ...) entradas por la instrucción `syscall` (MSR LSTAR).
 - **VFS propio**: initramfs + devfs (`/dev/null`, `/dev/zero`, `/dev/console`, `/dev/fb`, `/dev/kbd`), `stat`/`getdents64`.
 - **IPC**: canales tipo socket (`socket`/`bind`/`connect`/`accept`/`sendmsg`/`recvmsg`) con `poll`/`epoll`.
@@ -37,6 +37,7 @@ Un pequeño shell interactivo (`shell`) hace `fork`+`exec` de estos binarios:
 | `mmap_test` / `poll_test` | Ejercitan `mmap`/`munmap` y `poll` end-to-end |
 | `hello` | Programa en **C real**, compilado y linkeado contra mlibc — `printf("Hello from user!\n")` pasando por todo el stack de stdio de libc |
 | `pthread_test` | Programa en **C real**: 3 threads (`pthread_create`) incrementando un contador bajo mutex, `pthread_join`, verifica el resultado — ejercita `clone()` de punta a punta |
+| `producer_consumer` | Programa en **C real**: productor/consumidor con `pthread_cond_t` (`pthread_cond_wait`/`broadcast`) sobre un ring buffer — ejercita el path de condvars (dos futex words por hilo) |
 
 ## 🏗️ Estructura del workspace
 
@@ -84,7 +85,7 @@ Lo que falta o está a medias, mirando el propio código:
 - ⏳ **Sin linker dinámico**: `exec()` solo carga binarios estáticos, no hay `.so`/relocations.
 - ⏳ **Un solo core real**: la infraestructura para SMP existe (arrays por-CPU, `MAX_CPUS=8`) pero `cpu_id()` siempre devuelve 0.
 - ⏳ **Filesystem persistente**: el VFS es sólido pero todo vive en un initramfs de solo lectura — no hay nada escribible en disco.
-- ⏳ **Threads: simplificaciones conocidas**. Cada thread tiene su propia `FileDescriptorTable` (solo stdio) en vez de compartir la del proceso; un thread que sale (`pthread_exit`/`return`) queda como zombie sin reaper automático (nada llama `waitpid()` sobre un tid) — ok para demos cortas, pero un programa long-running que crea muchos threads iría filtrando `Process` structs.
+- ⏳ **`kernel_stack` nunca se libera** al matar un proceso (thread, fork child, o el que sea) — leak conocido y preexistente, no es específico de threads.
 
 ---
 

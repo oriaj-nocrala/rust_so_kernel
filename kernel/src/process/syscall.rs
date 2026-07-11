@@ -436,7 +436,8 @@ fn sys_read(fd: i32, buf: usize, count: usize) -> SyscallResult {
         block_stdin_read(tf_ptr)
     } else {
         with_current_process(|proc| {
-            let file = match proc.files.get_mut(fd as usize) {
+            let mut files = proc.files.lock();
+            let file = match files.get_mut(fd as usize) {
                 Ok(f) => f,
                 Err(_) => return errno::EBADF,
             };
@@ -520,7 +521,8 @@ fn sys_write(fd: i32, buf: usize, count: usize) -> SyscallResult {
     }
 
     with_current_process(|proc| {
-        let file = match proc.files.get_mut(fd as usize) {
+        let mut files = proc.files.lock();
+        let file = match files.get_mut(fd as usize) {
             Ok(f) => f,
             Err(_) => return errno::EBADF,
         };
@@ -554,7 +556,7 @@ fn sys_open(path_ptr: usize, flags: i32) -> SyscallResult {
 
     // Only take scheduler lock for the FD table insertion
     with_current_process(|proc| {
-        match proc.files.allocate(handle) {
+        match proc.files.lock().allocate(handle) {
             Ok(fd) => fd as i64,
             Err(_) => errno::EINVAL,
         }
@@ -585,7 +587,7 @@ fn sys_fstat(fd: i32, stat_ptr: usize) -> SyscallResult {
     let stat_result: Option<Stat> = {
         let mut sched = super::scheduler::local_scheduler();
         sched.running_mut().and_then(|proc| {
-            proc.files.get(fd as usize).ok().and_then(|f| f.stat())
+            proc.files.lock().get(fd as usize).ok().and_then(|f| f.stat())
         })
     };
 
@@ -602,7 +604,7 @@ fn sys_getdents64(fd: i32, buf_ptr: usize, count: usize) -> SyscallResult {
     if let Err(e) = validate_user_buffer(buf_ptr as u64, count) { return e; }
 
     with_current_process(|proc| {
-        match proc.files.get_mut(fd as usize) {
+        match proc.files.lock().get_mut(fd as usize) {
             Err(_) => errno::EBADF,
             Ok(f)  => {
                 let buf = unsafe {
@@ -616,7 +618,7 @@ fn sys_getdents64(fd: i32, buf_ptr: usize, count: usize) -> SyscallResult {
 
 fn sys_close(fd: i32) -> SyscallResult {
     with_current_process(|proc| {
-        match proc.files.close(fd as usize) {
+        match proc.files.lock().close(fd as usize) {
             Ok(_) => 0,
             Err(_) => errno::EBADF,
         }
@@ -1044,7 +1046,7 @@ fn sys_fork() -> SyscallResult {
                 tf_copy.rax = 0;
 
                 match unsafe { proc.address_space.fork() } {
-                    Ok(child_as) => (child_as, proc.pid, proc.fs_base, proc.files.clone(), tf_copy),
+                    Ok(child_as) => (child_as, proc.pid, proc.fs_base, proc.files.lock().clone(), tf_copy),
                     Err(e) => {
                         serial_println!("fork: address_space.fork() failed: {}", e);
                         unsafe { core::arch::asm!("sti"); }
@@ -1100,22 +1102,18 @@ fn sys_fork() -> SyscallResult {
 ///
 /// Returns the new thread's pid (used as its tid) to the caller.
 ///
-/// KNOWN SIMPLIFICATIONS (see README):
-///   - The new thread gets its own FileDescriptorTable (stdio only) rather
-///     than sharing the caller's — real POSIX threads share one fd table.
-///   - A thread that becomes a Zombie (sys_thread_exit -> sys_exit) is never
-///     reaped: nothing calls waitpid() on a tid (pthread_join is entirely
-///     futex-based, see mlibc's __mlibc_enter_thread), so its Process
-///     struct — and its Arc<AddressSpace> reference — sits in wait_queue
-///     until... something reaps it. Fine for short-lived demos/tests; a
-///     long-running program that spawns many threads would slowly leak
-///     zombie Process structs (each ~64KiB kernel stack). Real fix needs a
-///     "detached thread" self-reap path.
+/// The new thread shares the caller's `FileDescriptorTable` (`Arc<Mutex<..>>`,
+/// see `Process::files`) — files one thread opens are visible to its
+/// siblings, matching POSIX semantics. It also never zombie-parks on exit:
+/// see `Process::is_thread` / `Scheduler::kill_current` for why (mlibc's
+/// `pthread_join()` never calls `waitpid()` on a tid, so the kernel reaps a
+/// thread's `Process` immediately instead of waiting for a collector that
+/// will never come).
 fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
-    let (parent_pid, address_space) = {
+    let (parent_pid, address_space, files) = {
         let sched = super::scheduler::local_scheduler();
         match sched.running_ref() {
-            Some(proc) => (proc.pid, proc.address_space.clone()),
+            Some(proc) => (proc.pid, proc.address_space.clone(), proc.files.clone()),
             None => return errno::ESRCH,
         }
     };
@@ -1132,7 +1130,7 @@ fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
             super::Process::new_thread(
                 pid, parent_pid,
                 x86_64::VirtAddr::new(entry), x86_64::VirtAddr::new(stack),
-                kernel_stack, address_space,
+                kernel_stack, address_space, files,
             )
         );
         thread.set_name("thread");
@@ -1512,7 +1510,13 @@ fn sys_socket_impl() -> SyscallResult {
         match sched.running_mut() {
             Some(proc) => {
                 let pid = proc.pid.0;
-                match proc.files.allocate(handle) {
+                // `.lock()`'s guard must not outlive this statement — it
+                // borrows (transitively) from `sched`, which the Ok arm
+                // below drops, so the Result is computed and the guard
+                // dropped first via a `let`, not a bare match scrutinee
+                // (which would extend the guard's lifetime across all arms).
+                let alloc_result = proc.files.lock().allocate(handle);
+                match alloc_result {
                     Ok(fd) => {
                         drop(sched);
                         set_fd_channel(pid, fd, id);
@@ -1668,7 +1672,7 @@ fn sys_connect(fd: i32, path_ptr: usize, _addrlen: usize) -> SyscallResult {
                 if proc.pid.0 == waiter.pid
                     && matches!(proc.state, super::ProcessState::Blocked)
                 {
-                    match proc.files.allocate(handle) {
+                    match proc.files.lock().allocate(handle) {
                         Ok(fd) => {
                             new_fd = fd as i64;
                             proc.trapframe.rax = fd as u64;
@@ -1735,7 +1739,7 @@ fn sys_accept(fd: i32) -> SyscallResult {
         let new_fd = {
             let mut sched = super::scheduler::local_scheduler();
             match sched.running_mut() {
-                Some(proc) => match proc.files.allocate(handle) {
+                Some(proc) => match proc.files.lock().allocate(handle) {
                     Ok(fd) => fd as i64,
                     Err(_) => errno::EINVAL,
                 },
@@ -2590,7 +2594,10 @@ fn sys_epoll_create(_size: i32) -> SyscallResult {
         match sched.running_mut() {
             Some(proc) => {
                 let pid = proc.pid.0;
-                match proc.files.allocate(handle) {
+                // See sys_socket's comment: the lock guard must not outlive
+                // this `let`, since the arms below drop `sched`.
+                let alloc_result = proc.files.lock().allocate(handle);
+                match alloc_result {
                     Ok(fd) => {
                         drop(sched);
                         set_epoll_fd(pid, fd, epoll_id);

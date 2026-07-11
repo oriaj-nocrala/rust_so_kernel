@@ -62,6 +62,7 @@ fn print_help() {
     println!("  poll_test   - poll demo");
     println!("  hello       - hello world demo");
     println!("  pthread_test - pthread_create/join smoke test");
+    println!("  producer_consumer - pthread_cond_t producer/consumer test");
 }
 
 fn run_program(name: &str) {
