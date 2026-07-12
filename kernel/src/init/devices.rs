@@ -46,6 +46,7 @@ pub fn init_idt() {
         idt.add_handler_with_error(14, page_fault_handler);
         idt.entries[32].set_handler_addr(crate::process::timer_preempt::timer_interrupt_entry as u64);
         idt.add_handler(33, keyboard_interrupt_handler);
+        idt.add_handler(36, serial_interrupt_handler);
         // Syscalls are now handled via the `syscall` instruction (LSTAR MSR),
         // not via int 0x80.  No IDT entry needed.
         idt
@@ -79,6 +80,33 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_: &mut ExceptionStackFrame
     // Wake any process blocked in poll/epoll_wait watching stdin for POLLIN.
     crate::process::syscall::poll_wakeup_for_fd0();
     crate::interrupts::pic::end_of_interrupt(crate::interrupts::pic::Irq::Keyboard.as_u8());
+}
+
+/// COM1 receive interrupt — lets serial input act as stdin, alongside the
+/// PS/2 keyboard.  Bytes are pushed into the same ring buffer the keyboard
+/// ISR feeds (`keyboard_buffer::KEYBOARD_BUFFER`) and the same wakeup path
+/// is used, so fd 0 (hardcoded to that buffer in `sys_read`) doesn't care
+/// which physical source a byte came from.  This is what lets `qemu
+/// -serial stdio` be used to type/pipe input into the shell instead of the
+/// QEMU-monitor `sendkey` workaround.
+extern "x86-interrupt" fn serial_interrupt_handler(_: &mut ExceptionStackFrame) {
+    use x86_64::instructions::port::Port;
+    const LSR: u16 = 0x3FD;
+    const RBR: u16 = 0x3F8;
+    const DATA_READY: u8 = 0x01;
+
+    unsafe {
+        let mut lsr: Port<u8> = Port::new(LSR);
+        let mut rbr: Port<u8> = Port::new(RBR);
+        // The 16550 FIFO may hold several bytes by the time we get to run.
+        while lsr.read() & DATA_READY != 0 {
+            let byte = rbr.read();
+            crate::keyboard_buffer::KEYBOARD_BUFFER.push(byte as char);
+            crate::process::syscall::stdin_wakeup();
+            crate::process::syscall::poll_wakeup_for_fd0();
+        }
+    }
+    crate::interrupts::pic::end_of_interrupt(crate::interrupts::pic::Irq::Com1.as_u8());
 }
 
 extern "x86-interrupt" fn divide_by_zero_handler(sf: &mut ExceptionStackFrame) {
@@ -286,7 +314,9 @@ pub fn init_hardware_interrupts() {
     crate::interrupts::pic::initialize();
     crate::interrupts::pic::enable_irq(0);
     crate::interrupts::pic::enable_irq(1);
+    crate::interrupts::pic::enable_irq(4); // COM1 (serial stdin)
     load_idt();
 
+    crate::serial::init_interrupts();
     crate::pit::init(100);
 }

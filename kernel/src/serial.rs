@@ -130,3 +130,35 @@ macro_rules! serial_println_raw {
         let _ = writeln!($crate::serial::RawSerialWriter, $($arg)*);
     }};
 }
+
+// ============================================================================
+// UART RX interrupt setup (COM1 → IRQ4)
+// ============================================================================
+
+/// Program the 16550 UART for interrupt-driven receive and enable the
+/// "data available" interrupt.  Must be called before the IRQ4 line is
+/// unmasked at the PIC (see `init::devices::init_hardware_interrupts`).
+///
+/// Only configures the RX side. TX (`write_byte` / `RawSerialWriter`)
+/// already works against QEMU's default post-reset UART state without
+/// any setup, so it's left untouched here to avoid regressing
+/// `serial_println!` output that every other subsystem depends on for
+/// diagnostics.
+pub fn init_interrupts() {
+    unsafe {
+        let mut ier: Port<u8> = Port::new(0x3F9); // interrupt enable (DLAB=0) / divisor hi (DLAB=1)
+        let mut lcr: Port<u8> = Port::new(0x3FB); // line control (holds DLAB)
+        let mut dll: Port<u8> = Port::new(0x3F8); // divisor latch low (DLAB=1)
+        let mut fcr: Port<u8> = Port::new(0x3FA); // FIFO control
+        let mut mcr: Port<u8> = Port::new(0x3FC); // modem control
+
+        ier.write(0x00); // disable interrupts while reconfiguring
+        lcr.write(0x80); // DLAB=1, expose the baud rate divisor latch
+        dll.write(0x01); // divisor = 1 → 115200 baud
+        ier.write(0x00); // divisor hi byte = 0 (aliases IER while DLAB=1)
+        lcr.write(0x03); // DLAB=0, 8 bits / no parity / 1 stop bit
+        fcr.write(0xC7); // enable FIFO, clear RX+TX, 14-byte trigger level
+        mcr.write(0x0B); // DTR, RTS, OUT2 (OUT2 gates the IRQ line on a real 8250/16550)
+        ier.write(0x01); // enable "received data available" interrupt
+    }
+}

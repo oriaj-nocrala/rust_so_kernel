@@ -22,6 +22,7 @@ pub const PIC2_OFFSET: u8 = PIC1_OFFSET + 8;
 pub enum Irq {
     Timer = PIC1_OFFSET,
     Keyboard, // 33
+    Com1 = PIC1_OFFSET + 4, // 36 — serial (COM1) receive
 }
 
 impl Irq {
