@@ -64,3 +64,23 @@ global_asm!(
 extern "C" {
     pub fn jump_to_trapframe(tf: *const TrapFrame) -> !;
 }
+
+/// Every "about to iretq into a process" call site in this kernel should
+/// call this instead of `jump_to_trapframe` directly (the one exception is
+/// `start_first_process`, which runs before any process could possibly
+/// have a pending signal). Delivers pending signals via
+/// `Scheduler::resolve_signals` — see its doc comment — then jumps.
+///
+/// # Safety
+/// `tf` must point at the TrapFrame of whichever process is currently
+/// `Scheduler::running` on this CPU — true at every existing call site,
+/// since it's always the direct return value of `switch_to_next`,
+/// `block_current`, `kill_and_switch_tf`, or `start_first`.
+pub unsafe fn jump_to_user(tf: *const TrapFrame) -> ! {
+    unsafe { core::arch::asm!("cli"); }
+    let tf = {
+        let mut sched = super::scheduler::local_scheduler();
+        sched.resolve_signals(tf)
+    };
+    unsafe { jump_to_trapframe(tf) }
+}

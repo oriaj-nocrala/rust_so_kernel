@@ -14,6 +14,7 @@ pub mod demand_paging;
 pub mod address_space;
 pub mod elf;
 pub mod elf_loader;
+pub mod signal_trampoline;
 
 static PHYSICAL_MEMORY_OFFSET: AtomicU64 = AtomicU64::new(0);
 

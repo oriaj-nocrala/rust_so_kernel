@@ -23,6 +23,8 @@ const RUST_PROGRAMS: &[(&str, &str)] = &[
     ("mmap_test",  "mmap_test.elf"),
     ("poll_test",  "poll_test.elf"),
     ("ls",         "ls.elf"),
+    ("pipe_test",  "pipe_test.elf"),
+    ("signal_test", "signal_test.elf"),
 ];
 
 /// C binaries: (source file stem, embedded filename)
@@ -30,6 +32,7 @@ const C_PROGRAMS: &[(&str, &str)] = &[
     ("hello", "hello.elf"),
     ("pthread_test", "pthread_test.elf"),
     ("producer_consumer", "producer_consumer.elf"),
+    ("mlibc_signal_test", "mlibc_signal_test.elf"),
 ];
 
 fn main() {

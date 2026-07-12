@@ -248,6 +248,67 @@ impl Scheduler {
             )
     }
 
+    /// Check the currently-`running` process's pending signals against `tf`
+    /// (must point at that same process's live TrapFrame — see callers)
+    /// and act on the outcome: a caught signal redirects `tf` in place and
+    /// is returned unchanged; an uncaught default-terminate signal kills
+    /// the process via `kill_and_switch_tf` and repeats against whatever
+    /// gets scheduled next, so the final returned pointer always belongs to
+    /// a process that's either signal-clean or non-existent-and-replaced.
+    ///
+    /// Centralizes the same three-line loop that both `trapframe::
+    /// jump_to_user` and `syscall_handler_asm`'s tail need — the latter
+    /// has no `jump_to_trapframe` call of its own to hang the check off of,
+    /// so it calls this directly instead of going through `jump_to_user`.
+    pub fn resolve_signals(&mut self, mut tf: *const TrapFrame) -> *const TrapFrame {
+        // Ring-3 code segment selector (see Process::new_user's trapframe.cs).
+        const USER_CS: u64 = 0x23;
+        loop {
+            // Only attempt delivery when `tf` genuinely represents a
+            // user-mode return point. A kernel-mode-interrupted trapframe's
+            // `rsp` is a *kernel* stack address, not a user one — treating
+            // it as user (as signal delivery must, to push a handler frame)
+            // would corrupt whatever that kernel rsp actually pointed at.
+            // Pending signals just stay pending and get retried the next
+            // time this process genuinely returns to user mode. Found via
+            // `sys_close` briefly running with interrupts enabled and no
+            // held lock, letting a timer tick preempt mid-syscall and save
+            // exactly this kind of kernel-mode trapframe (now fixed there
+            // too, but this check is what makes the class of mistake safe
+            // wherever else it might still be lurking).
+            if unsafe { (*tf).cs } != USER_CS {
+                return tf;
+            }
+
+            let terminate = match self.running_mut() {
+                Some(proc) if proc.privilege == crate::process::PrivilegeLevel::User => {
+                    matches!(
+                        super::signal::deliver_pending(proc, tf as *mut TrapFrame),
+                        super::signal::SignalOutcome::Terminate(_)
+                    )
+                }
+                _ => false,
+            };
+            if !terminate {
+                return tf;
+            }
+            tf = self.kill_and_switch_tf("uncaught signal");
+        }
+    }
+
+    /// Find a Ready (run_queues) or Blocked/Zombie (wait_queue) process by
+    /// pid — i.e. everything *except* the currently running one, which
+    /// callers (e.g. `sys_kill`) handle separately via `running_mut()`.
+    /// Used to deliver a signal to a process other than the caller itself.
+    pub fn find_process_mut(&mut self, pid: usize) -> Option<&mut Process> {
+        for queue in self.run_queues.iter_mut() {
+            if let Some(proc) = queue.iter_mut().find(|p| p.pid.0 == pid) {
+                return Some(proc.as_mut());
+            }
+        }
+        self.wait_queue.iter_mut().find(|p| p.pid.0 == pid).map(|p| p.as_mut())
+    }
+
     // ====================================================================
     // Kill current process (user segfault, sys_exit)
     // ====================================================================

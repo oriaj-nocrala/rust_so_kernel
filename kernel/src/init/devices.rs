@@ -256,7 +256,7 @@ fn kill_current_user_process(reason: &str) -> ! {
     // Perform FULL context switch: loads all GPRs + iretq.
     // This never returns.
     unsafe {
-        crate::process::trapframe::jump_to_trapframe(tf_ptr);
+        crate::process::trapframe::jump_to_user(tf_ptr);
     }
 }
 

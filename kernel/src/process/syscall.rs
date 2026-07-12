@@ -122,6 +122,13 @@ struct SavedRegisters {
 /// Single-CPU — safe under cli.
 static CURRENT_SYSCALL_TF: AtomicU64 = AtomicU64::new(0);
 
+/// The current syscall's on-stack TrapFrame pointer — for blocking file
+/// implementations (e.g. `pipe.rs`) that need it outside this module,
+/// mirroring how `sys_futex`/`sys_nanosleep` use it internally.
+pub(crate) fn current_tf_ptr() -> *const TrapFrame {
+    CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame
+}
+
 struct StdinWaiter {
     pid: usize,
     user_buf: u64,
@@ -138,7 +145,31 @@ extern "C" fn syscall_handler_asm(regs: &SavedRegisters) -> i64 {
     // the first 15 fields of TrapFrame; hardware pushed rip/cs/rflags/rsp/ss
     // immediately after on the kernel stack).
     CURRENT_SYSCALL_TF.store(regs as *const SavedRegisters as u64, Ordering::Relaxed);
-    syscall_handler(regs.rax, regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9)
+    let ret = syscall_handler(regs.rax, regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9);
+
+    // Deliver pending signals before returning to user mode. This is the
+    // one "about to iretq into a process" point with no natural
+    // `jump_to_trapframe` call to hang the check off of (the asm caller
+    // just pops registers and `iretq`s directly), so it's handled here
+    // instead of via `trapframe::jump_to_user` — see that function's doc
+    // comment for the general design this mirrors.
+    let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *mut TrapFrame;
+    unsafe { (*tf_ptr).rax = ret as u64; }
+
+    unsafe { core::arch::asm!("cli"); }
+    let resolved_tf = {
+        let mut sched = super::scheduler::local_scheduler();
+        sched.resolve_signals(tf_ptr as *const TrapFrame)
+    };
+
+    if resolved_tf != tf_ptr as *const TrapFrame {
+        // A default-terminate signal was pending: `resolve_signals` already
+        // killed this process and picked a different one to run instead.
+        unsafe { super::trapframe::jump_to_trapframe(resolved_tf) }
+    }
+
+    unsafe { core::arch::asm!("sti"); }
+    ret
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -151,9 +182,13 @@ pub enum SyscallNumber {
     Stat = 4,
     Fstat = 5,
     Lstat = 6,
+    Sigaction = 13,
+    Sigprocmask = 14,
+    Sigreturn = 15,
     Poll = 7,
     Lseek = 8,
     Mmap = 9,
+    Pipe = 22,
     Munmap = 11,
     Brk = 12,
     Ioctl = 16,
@@ -172,6 +207,7 @@ pub enum SyscallNumber {
     Exec = 59,
     Exit = 60,
     Waitpid = 61,
+    Kill = 62,
     ArchPrctl = 158,
     Futex = 202,
     EpollCreate = 213,
@@ -195,9 +231,13 @@ impl SyscallNumber {
             4  => Some(Self::Stat),
             5  => Some(Self::Fstat),
             6  => Some(Self::Lstat),
+            13 => Some(Self::Sigaction),
+            14 => Some(Self::Sigprocmask),
+            15 => Some(Self::Sigreturn),
             7  => Some(Self::Poll),
             8  => Some(Self::Lseek),
             9  => Some(Self::Mmap),
+            22 => Some(Self::Pipe),
             11 => Some(Self::Munmap),
             12 => Some(Self::Brk),
             16 => Some(Self::Ioctl),
@@ -216,6 +256,7 @@ impl SyscallNumber {
             59 => Some(Self::Exec),
             60 => Some(Self::Exit),
             61 => Some(Self::Waitpid),
+            62 => Some(Self::Kill),
             158 => Some(Self::ArchPrctl),
             202 => Some(Self::Futex),
             213 => Some(Self::EpollCreate),
@@ -368,9 +409,13 @@ pub fn syscall_handler(
         SyscallNumber::Stat => sys_stat(arg1 as usize, arg2 as usize),
         SyscallNumber::Fstat => sys_fstat(arg1 as i32, arg2 as usize),
         SyscallNumber::Lstat => sys_stat(arg1 as usize, arg2 as usize), // no symlinks yet
+        SyscallNumber::Sigaction => sys_sigaction(arg1 as u32, arg2, arg3),
+        SyscallNumber::Sigprocmask => sys_sigprocmask(arg1 as i32, arg2, arg3),
+        SyscallNumber::Sigreturn => sys_sigreturn(),
         SyscallNumber::Poll => sys_poll(arg1, arg2 as u32, arg3 as i32),
         SyscallNumber::Lseek => sys_lseek(arg1 as i32, arg2 as i64, arg3 as i32),
         SyscallNumber::Mmap => sys_mmap(arg1, arg2, arg3 as u32, arg4 as u32, arg5 as i32),
+        SyscallNumber::Pipe => sys_pipe(arg1),
         SyscallNumber::Munmap => sys_munmap(arg1, arg2),
         SyscallNumber::Brk => sys_brk(arg1),
         SyscallNumber::Ioctl => sys_ioctl(arg1 as i32, arg2 as u64, arg3),
@@ -389,6 +434,7 @@ pub fn syscall_handler(
         SyscallNumber::Exec => sys_exec(arg1 as usize),
         SyscallNumber::Exit => sys_exit(arg1 as i32),
         SyscallNumber::Waitpid => sys_waitpid(arg1 as usize),
+        SyscallNumber::Kill => sys_kill(arg1 as usize, arg2 as u32),
         SyscallNumber::ArchPrctl => sys_arch_prctl(arg1 as i32, arg2),
         SyscallNumber::Futex => sys_futex(arg1, arg2 as i32, arg3 as i32, arg4),
         SyscallNumber::SetTidAddress => sys_set_tid_address(arg1),
@@ -435,22 +481,50 @@ fn sys_read(fd: i32, buf: usize, count: usize) -> SyscallResult {
         // cli is still in effect; block_stdin_read never returns.
         block_stdin_read(tf_ptr)
     } else {
-        with_current_process(|proc| {
-            let mut files = proc.files.lock();
-            let file = match files.get_mut(fd as usize) {
-                Ok(f) => f,
-                Err(_) => return errno::EBADF,
-            };
+        // Continuous cli from before the fd lookup through either the fast
+        // return or the block — same shape as sys_futex's FUTEX_WAIT. This
+        // matters because a pipe's `read()` may return WouldBlock, at which
+        // point this function does the actual block_current/jump_to_trapframe
+        // itself; that must never happen while SCHEDULER or the fd table are
+        // still held (SCHEDULER: self-deadlock, spin::Mutex isn't reentrant;
+        // fd table: jump_to_trapframe diverges, so a guard alive across it
+        // would never run its Drop and stays locked forever — see sys_close's
+        // doc comment for the same class of hazard).
+        unsafe { core::arch::asm!("cli"); }
 
-            let buffer = unsafe {
-                core::slice::from_raw_parts_mut(buf as *mut u8, count)
-            };
-
-            match file.read(buffer) {
-                Ok(n) => n as i64,
-                Err(_) => errno::EIO,
+        let files = {
+            let scheduler = super::scheduler::local_scheduler();
+            match scheduler.running_ref() {
+                Some(proc) => proc.files.clone(),
+                None => { unsafe { core::arch::asm!("sti"); } return errno::ESRCH; }
             }
-        })
+        };
+
+        let result = {
+            let mut files_guard = files.lock();
+            match files_guard.get_mut(fd as usize) {
+                Ok(file) => {
+                    let buffer = unsafe {
+                        core::slice::from_raw_parts_mut(buf as *mut u8, count)
+                    };
+                    file.read(buffer)
+                }
+                Err(_) => { unsafe { core::arch::asm!("sti"); } return errno::EBADF; }
+            }
+        };
+
+        match result {
+            Ok(n) => { unsafe { core::arch::asm!("sti"); } n as i64 }
+            Err(super::file::FileError::WouldBlock) => {
+                let tf_ptr = current_tf_ptr();
+                let next_tf = {
+                    let mut scheduler = super::scheduler::local_scheduler();
+                    scheduler.block_current(tf_ptr)
+                };
+                unsafe { super::trapframe::jump_to_user(next_tf) }
+            }
+            Err(_) => { unsafe { core::arch::asm!("sti"); } errno::EIO }
+        }
     }
 }
 
@@ -465,7 +539,7 @@ fn block_stdin_read(current_tf: *const TrapFrame) -> ! {
         sched.block_current(current_tf)
         // Lock dropped here; sti happens via iretq of the next process.
     };
-    unsafe { super::trapframe::jump_to_trapframe(next_tf) }
+    unsafe { super::trapframe::jump_to_user(next_tf) }
 }
 
 /// Called by the keyboard ISR after a key is pushed into the buffer.
@@ -515,27 +589,52 @@ pub(crate) fn stdin_wakeup() {
     sched.wake(pid);
 }
 
+/// sys_write — same non-reentrant shape as sys_read's fd>0 branch (see its
+/// comment): the fd-table lock must be released before any potential block,
+/// since `file.write()` (e.g. a full pipe) may need to register a waiter and
+/// return `WouldBlock`, at which point *this* function does the actual
+/// cli/block_current/jump_to_trapframe dance itself.
 fn sys_write(fd: i32, buf: usize, count: usize) -> SyscallResult {
     if let Err(e) = validate_user_buffer(buf as u64, count) {
         return e;
     }
 
-    with_current_process(|proc| {
-        let mut files = proc.files.lock();
-        let file = match files.get_mut(fd as usize) {
-            Ok(f) => f,
-            Err(_) => return errno::EBADF,
-        };
+    unsafe { core::arch::asm!("cli"); }
 
-        let buffer = unsafe {
-            core::slice::from_raw_parts(buf as *const u8, count)
-        };
-
-        match file.write(buffer) {
-            Ok(n) => n as i64,
-            Err(_) => errno::EIO,
+    let files = {
+        let scheduler = super::scheduler::local_scheduler();
+        match scheduler.running_ref() {
+            Some(proc) => proc.files.clone(),
+            None => { unsafe { core::arch::asm!("sti"); } return errno::ESRCH; }
         }
-    })
+    };
+
+    let result = {
+        let mut files_guard = files.lock();
+        match files_guard.get_mut(fd as usize) {
+            Ok(file) => {
+                let buffer = unsafe {
+                    core::slice::from_raw_parts(buf as *const u8, count)
+                };
+                file.write(buffer)
+            }
+            Err(_) => { unsafe { core::arch::asm!("sti"); } return errno::EBADF; }
+        }
+    };
+
+    match result {
+        Ok(n) => { unsafe { core::arch::asm!("sti"); } n as i64 }
+        Err(super::file::FileError::BrokenPipe) => { unsafe { core::arch::asm!("sti"); } errno::EPIPE }
+        Err(super::file::FileError::WouldBlock) => {
+            let tf_ptr = current_tf_ptr();
+            let next_tf = {
+                let mut scheduler = super::scheduler::local_scheduler();
+                scheduler.block_current(tf_ptr)
+            };
+            unsafe { super::trapframe::jump_to_user(next_tf) }
+        }
+        Err(_) => { unsafe { core::arch::asm!("sti"); } errno::EIO }
+    }
 }
 
 fn sys_open(path_ptr: usize, flags: i32) -> SyscallResult {
@@ -616,12 +715,86 @@ fn sys_getdents64(fd: i32, buf_ptr: usize, count: usize) -> SyscallResult {
     })
 }
 
+/// sys_close — close a file descriptor.
+///
+/// Deliberately does NOT use `with_current_process`: that helper holds the
+/// SCHEDULER lock across the whole closure, but closing a pipe end can drop
+/// a `Box<dyn FileHandle>` whose `Drop` impl needs to wake a peer blocked on
+/// the other end of the pipe (via `local_scheduler()` + `wake()`). Dropping
+/// the handle while SCHEDULER is already held would self-deadlock (spin
+/// locks aren't reentrant). Instead: clone the `Arc<Mutex<FileDescriptorTable>>`
+/// under a short scheduler-lock scope, release it, then close outside any
+/// scheduler lock — same shape sys_fork/sys_exec use for lock-crossing work.
 fn sys_close(fd: i32) -> SyscallResult {
+    let files = {
+        unsafe { core::arch::asm!("cli"); }
+        let scheduler = super::scheduler::local_scheduler();
+        let result = match scheduler.running_ref() {
+            Some(proc) => proc.files.clone(),
+            None => { unsafe { core::arch::asm!("sti"); } return errno::ESRCH; }
+        };
+        unsafe { core::arch::asm!("sti"); }
+        result
+    };
+
+    // cli here too: closing a pipe end can run its Drop impl (deallocating,
+    // possibly waking a peer via a fresh, independent SCHEDULER lock/unlock
+    // — safe, since no lock is already held across this). Without cli, nothing
+    // stops a timer tick from preempting mid-close, saving this process's
+    // trapframe with cs = kernel (0x08) instead of user (0x23) — and later
+    // treating that stale kernel-mode snapshot as a live user context (e.g.
+    // for signal delivery, which needs a genuine user rsp/rip) corrupts
+    // whatever that kernel rsp actually pointed at.
+    unsafe { core::arch::asm!("cli"); }
+    let result = files.lock().close(fd as usize);
+    unsafe { core::arch::asm!("sti"); }
+    match result {
+        Ok(_) => 0,
+        Err(_) => errno::EBADF,
+    }
+}
+
+/// pipe(22): long pipe(int pipefd[2])
+///
+/// pipefd[0] = read end, pipefd[1] = write end (matches Linux). Both fds
+/// start with one open reference; `fork()` duplicates them (see
+/// `FileHandle::dup` / `FileDescriptorTable::clone`), `clone()` (threads)
+/// shares them automatically via the shared fd table.
+fn sys_pipe(pipefd_ptr: u64) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(pipefd_ptr, 8) {
+        return e;
+    }
+
+    let (read_end, write_end) = super::pipe::create();
+
     with_current_process(|proc| {
-        match proc.files.lock().close(fd as usize) {
-            Ok(_) => 0,
-            Err(_) => errno::EBADF,
+        let mut files = proc.files.lock();
+        let rfd = match files.allocate(alloc::boxed::Box::new(read_end)) {
+            Ok(fd) => fd,
+            Err(_) => return errno::EINVAL,
+        };
+        let wfd = match files.allocate(alloc::boxed::Box::new(write_end)) {
+            Ok(fd) => fd,
+            Err(_) => {
+                // Rolling back by dropping the read end here (while SCHEDULER
+                // is held via with_current_process) is safe ONLY because this
+                // pipe was just created in this same call and has never been
+                // exposed to another process — its write_waiter is always
+                // None, so PipeReadEnd::drop() cannot reach the wake path
+                // that would need to re-lock SCHEDULER. Don't reuse this
+                // pattern for closing an fd a process has actually had open.
+                let _ = files.close(rfd);
+                return errno::EINVAL;
+            }
+        };
+        drop(files);
+
+        unsafe {
+            let ptr = pipefd_ptr as *mut i32;
+            ptr.write(rfd as i32);
+            ptr.add(1).write(wfd as i32);
         }
+        0
     })
 }
 
@@ -850,7 +1023,7 @@ fn sys_futex(uaddr: u64, futex_op: i32, val: i32, _timeout: u64) -> SyscallResul
                 unsafe { (*(tf_ptr as *mut TrapFrame)).rax = 0; }
                 scheduler.block_current(tf_ptr)
             };
-            unsafe { super::trapframe::jump_to_trapframe(next_tf) }
+            unsafe { super::trapframe::jump_to_user(next_tf) }
         }
         FUTEX_WAKE => {
             unsafe { core::arch::asm!("cli"); }
@@ -941,7 +1114,7 @@ fn sys_yield() -> SyscallResult {
         scheduler.switch_to_next(tf_ptr)
     };
 
-    unsafe { super::trapframe::jump_to_trapframe(next_tf) }
+    unsafe { super::trapframe::jump_to_user(next_tf) }
 }
 
 /// sys_nanosleep — block the calling process for at least `ns` nanoseconds.
@@ -985,7 +1158,7 @@ fn sys_nanosleep(ns: u64) -> SyscallResult {
         // scheduler lock dropped here
     };
 
-    unsafe { super::trapframe::jump_to_trapframe(next_tf) }
+    unsafe { super::trapframe::jump_to_user(next_tf) }
 }
 
 fn sys_getpid() -> SyscallResult {
@@ -1006,16 +1179,67 @@ fn sys_exit(status: i32) -> SyscallResult {
 
     unsafe { core::arch::asm!("cli"); }
 
-    let (dead_pid, tf_ptr) = {
+    let (dead_pid, parent_to_notify, tf_ptr, old_files) = {
         let mut scheduler = super::scheduler::local_scheduler();
-        if let Some(proc) = scheduler.running_mut() {
+        // Swap in a fresh, empty fd table *before* the process becomes a
+        // zombie (or gets reaped immediately, if it's a thread) — this
+        // closes any pipe ends it held right now instead of leaving them
+        // open until some future waitpid() reaps the zombie. The old Arc
+        // is returned out of this block (not dropped here): dropping it
+        // can run a pipe end's Drop impl, which needs to lock SCHEDULER to
+        // wake a peer — doing that while this scope's `scheduler` guard is
+        // still held would self-deadlock (spin::Mutex isn't reentrant).
+        //
+        // Only a real process (not a pthread) exiting notifies its parent
+        // via SIGCHLD — matches POSIX (individual thread exits are not a
+        // waitpid()/SIGCHLD event, only the process as a whole exiting is).
+        let (old_files, parent_to_notify) = if let Some(proc) = scheduler.running_mut() {
             proc.exit_status = status;
-        }
+            let parent = if proc.is_thread { None } else { proc.parent_pid };
+            let old = core::mem::replace(
+                &mut proc.files,
+                alloc::sync::Arc::new(Mutex::new(super::file::FileDescriptorTable::new())),
+            );
+            (old, parent)
+        } else {
+            (alloc::sync::Arc::new(Mutex::new(super::file::FileDescriptorTable::new())), None)
+        };
         let dead_pid = scheduler.current_pid().map(|p| p.0).unwrap_or(0);
         let ptr = scheduler.kill_and_switch_tf(&reason);
         serial_println!("  → Process exited, switching immediately (full TrapFrame restore)");
-        (dead_pid, ptr)
+        (dead_pid, parent_to_notify, ptr, old_files)
     };
+
+    // Safe to drop now: SCHEDULER is released, cli is still in effect (we
+    // haven't called sti yet), so any pipe-end wake this triggers can lock
+    // SCHEDULER without racing anything else on this single core.
+    drop(old_files);
+
+    // Queue SIGCHLD on the parent (default action Ignore — purely additive,
+    // no observable change unless the parent installed a handler). Not
+    // combined with a wake(): a parent actually blocked in waitpid() for
+    // this pid is already correctly woken with the right return value by
+    // waitpid_wakeup() below; waking it a second time here for an unrelated
+    // block (futex/pipe/nanosleep/...) would risk resuming it with a stale
+    // return value in a register nothing recomputed — see sys_kill's doc
+    // comment for the same tradeoff.
+    if let Some(parent_pid) = parent_to_notify {
+        unsafe { core::arch::asm!("cli"); }
+        let mut sched = super::scheduler::local_scheduler();
+        // `find_process_mut` only searches run_queues/wait_queue (deliberately
+        // excludes `running` — see its doc comment); the parent may already
+        // *be* `running` here if `kill_and_switch_tf` above just picked it as
+        // the next process to schedule, so that case needs its own check.
+        if sched.current_pid() == Some(parent_pid) {
+            if let Some(parent) = sched.running_mut() {
+                super::signal::queue_signal(parent, super::signal::SIGCHLD);
+            }
+        } else if let Some(parent) = sched.find_process_mut(parent_pid.0) {
+            super::signal::queue_signal(parent, super::signal::SIGCHLD);
+        }
+        drop(sched);
+        unsafe { core::arch::asm!("sti"); }
+    }
 
     // Wake any parent waiting via waitpid
     waitpid_wakeup(dead_pid);
@@ -1027,7 +1251,7 @@ fn sys_exit(status: i32) -> SyscallResult {
 
     unsafe {
         core::arch::asm!("sti");
-        crate::process::trapframe::jump_to_trapframe(tf_ptr);
+        crate::process::trapframe::jump_to_user(tf_ptr);
     }
 }
 
@@ -1245,7 +1469,7 @@ fn sys_exec(path_ptr: usize) -> SyscallResult {
 
     crate::serial_println_raw!("[EXEC] jump_to_trapframe");
     // Jump to the new program — never returns
-    unsafe { super::trapframe::jump_to_trapframe(next_tf) }
+    unsafe { super::trapframe::jump_to_user(next_tf) }
 }
 
 fn find_program_elf(name: &str) -> Option<&'static [u8]> {
@@ -1257,28 +1481,48 @@ fn sys_waitpid(child_pid: usize) -> SyscallResult {
 
     unsafe { core::arch::asm!("cli"); }
 
+    // `already_zombie` is checked *after* the block below ends (guard
+    // dropped) so `sti` never runs while `scheduler` is still locked — a
+    // guard alive past `sti` leaves a window where a timer tick can land
+    // inside the critical section and spin on `local_scheduler()` forever,
+    // since the only thing that could release it (this call, mid-return)
+    // can't resume until that spin gives up, which it never does. The
+    // previous version called `sti` then `return`ed from inside the same
+    // block that still owned the guard — same bug class as `sys_kill`'s
+    // (see its doc comment), just pre-existing here instead of newly
+    // introduced. Found via the `signal_test`/`pipe_test` programs, which
+    // are the first to combine heavy `yield_now()`-driven preemption with
+    // a `waitpid()` on an already-exited child.
+    let already_zombie;
     let next_tf = {
         let mut scheduler = super::scheduler::local_scheduler();
 
-        // Check if child is already a zombie — collect it immediately.
         if let Some(pos) = scheduler.wait_queue.iter().position(|p| {
             p.pid.0 == child_pid && matches!(p.state, super::ProcessState::Zombie)
         }) {
             scheduler.wait_queue.remove(pos);
-            unsafe { core::arch::asm!("sti"); }
-            return child_pid as SyscallResult;
-        }
+            already_zombie = true;
+            core::ptr::null()
+        } else {
+            already_zombie = false;
 
-        // Not a zombie yet — record what we are waiting for in the Process struct
-        // (supports multiple concurrent waitpid callers: shell + ipc_ping etc.)
-        // and block until the child exits and calls waitpid_wakeup().
-        if let Some(proc) = scheduler.running_mut() {
-            proc.waiting_for = Some(child_pid);
-        }
+            // Not a zombie yet — record what we are waiting for in the
+            // Process struct (supports multiple concurrent waitpid callers:
+            // shell + ipc_ping etc.) and block until the child exits and
+            // calls waitpid_wakeup().
+            if let Some(proc) = scheduler.running_mut() {
+                proc.waiting_for = Some(child_pid);
+            }
 
-        scheduler.block_current(tf_ptr)
+            scheduler.block_current(tf_ptr)
+        }
     };
-    unsafe { super::trapframe::jump_to_trapframe(next_tf) }
+
+    if already_zombie {
+        unsafe { core::arch::asm!("sti"); }
+        return child_pid as SyscallResult;
+    }
+    unsafe { super::trapframe::jump_to_user(next_tf) }
 }
 
 fn sys_uptime_ms() -> SyscallResult {
@@ -1358,6 +1602,174 @@ pub(crate) fn waitpid_wakeup(dead_pid: usize) {
     if let Some(pid) = parent_pid_to_wake {
         sched.wake(pid);
     }
+}
+
+// ============================================================================
+// SIGNALS: kill / sigaction / sigprocmask / sigreturn
+// ============================================================================
+
+/// kill(62): long kill(pid_t pid, int sig)
+///
+/// Only single-pid targets (no process-group/broadcast forms). Only queues
+/// the signal — never force-wakes a Blocked target; see the doc comment
+/// inside for why.
+fn sys_kill(target_pid: usize, sig: u32) -> SyscallResult {
+    if sig == 0 || sig as usize >= super::signal::NUM_SIGNALS {
+        return errno::EINVAL;
+    }
+
+    unsafe { core::arch::asm!("cli"); }
+
+    // `sched` MUST be dropped before `sti` on every path — scoping it to
+    // this inner block (instead of holding it for the whole function, as
+    // an earlier version of this code did) guarantees that. Holding a
+    // spin::Mutex guard past `sti` opens a window where a timer tick can
+    // land inside it and spin forever on `local_scheduler()`, since the
+    // interrupted code (the only thing that could ever release the lock)
+    // can't resume until that same spin gives up — it never does. Every
+    // other syscall in this file already follows this shape; this one
+    // didn't, and deadlocked the first time a signal landed on a Ready
+    // (not self, not Blocked) target during testing.
+    let result = {
+        let mut sched = super::scheduler::local_scheduler();
+
+        let is_self = sched.current_pid().map(|p| p.0) == Some(target_pid);
+        if is_self {
+            if let Some(proc) = sched.running_mut() {
+                super::signal::queue_signal(proc, sig);
+            }
+            0
+        } else {
+            // Just queue the signal — never force-wake a Blocked target.
+            // Whatever it's actually blocked on (pipe data, a futex, a
+            // timer) has its own wakeup path that sets a *correct* return
+            // value for that specific wait; a generic wake() here would
+            // resume it with whatever stale rax was live before it blocked
+            // (pipe/futex reads never preset one, unlike nanosleep), and —
+            // worse — removes it from wait_queue before its real wakeup
+            // gets a chance to find it there, silently losing whatever
+            // that wakeup was about to deliver. Confirmed by
+            // mlibc_signal_test.c: a kill()-woken pipe reader raced its
+            // sibling's write() and read back "" instead of the message,
+            // because deliver_and_wake's wait_queue scan found nothing —
+            // kill() had already moved it to Ready. The tradeoff (no
+            // instant SIGKILL for something blocked forever on a condition
+            // that will never occur) is accepted for this minimal
+            // implementation — delivery still happens the next time this
+            // process wakes for its own real reason and passes through a
+            // jump_to_user checkpoint.
+            match sched.find_process_mut(target_pid) {
+                Some(proc) => { super::signal::queue_signal(proc, sig); 0 }
+                None => errno::ESRCH,
+            }
+        }
+    };
+
+    unsafe { core::arch::asm!("sti"); }
+    result
+}
+
+const SIG_DFL: u64 = 0;
+const SIG_IGN: u64 = 1;
+
+/// rt_sigaction(13): int sigaction(int sig, const struct sigaction *act, struct sigaction *oldact)
+///
+/// Simplified ABI: `act`/`oldact` are read/written as a single `u64`
+/// handler address at offset 0 (matches `sa_handler`'s position in the
+/// real `struct sigaction`; `sa_mask`/`sa_flags`/`sa_restorer` are ignored)
+/// rather than the full struct — this kernel's userspace test programs use
+/// a matching minimal ABI (see `userspace/src/syscall.rs::sigaction`).
+fn sys_sigaction(sig: u32, act_ptr: u64, oldact_ptr: u64) -> SyscallResult {
+    if sig == 0 || sig as usize >= super::signal::NUM_SIGNALS || sig == super::signal::SIGKILL {
+        return errno::EINVAL;
+    }
+    if act_ptr != 0 {
+        if let Err(e) = validate_user_buffer(act_ptr, 8) { return e; }
+    }
+    if oldact_ptr != 0 {
+        if let Err(e) = validate_user_buffer(oldact_ptr, 8) { return e; }
+    }
+
+    with_current_process(|proc| {
+        let old = proc.signal_handlers[sig as usize];
+        if act_ptr != 0 {
+            let handler_addr = unsafe { *(act_ptr as *const u64) };
+            proc.signal_handlers[sig as usize] = match handler_addr {
+                SIG_DFL => super::SignalAction::Default,
+                SIG_IGN => super::SignalAction::Ignore,
+                addr => super::SignalAction::Handler(addr),
+            };
+        }
+        if oldact_ptr != 0 {
+            let old_addr = match old {
+                super::SignalAction::Default => SIG_DFL,
+                super::SignalAction::Ignore => SIG_IGN,
+                super::SignalAction::Handler(addr) => addr,
+            };
+            unsafe { *(oldact_ptr as *mut u64) = old_addr; }
+        }
+        0
+    })
+}
+
+const SIG_BLOCK: i32 = 0;
+const SIG_UNBLOCK: i32 = 1;
+const SIG_SETMASK: i32 = 2;
+
+/// rt_sigprocmask(14): int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
+///
+/// `sigset_t` here is a single `u64` bitmask (this kernel supports 32
+/// signals, so no wider representation is needed).
+fn sys_sigprocmask(how: i32, set_ptr: u64, oldset_ptr: u64) -> SyscallResult {
+    if set_ptr != 0 {
+        if let Err(e) = validate_user_buffer(set_ptr, 8) { return e; }
+    }
+    if oldset_ptr != 0 {
+        if let Err(e) = validate_user_buffer(oldset_ptr, 8) { return e; }
+    }
+
+    with_current_process(|proc| {
+        let old_mask = proc.blocked_signals;
+        if set_ptr != 0 {
+            let set = unsafe { *(set_ptr as *const u64) };
+            // SIGKILL can never be blocked.
+            let set = set & !(1u64 << super::signal::SIGKILL);
+            proc.blocked_signals = match how {
+                SIG_BLOCK => old_mask | set,
+                SIG_UNBLOCK => old_mask & !set,
+                SIG_SETMASK => set,
+                _ => return errno::EINVAL,
+            };
+        }
+        if oldset_ptr != 0 {
+            unsafe { *(oldset_ptr as *mut u64) = old_mask; }
+        }
+        0
+    })
+}
+
+/// rt_sigreturn(15): only ever reached via the trampoline page a caught
+/// signal redirects execution through — never called directly by normal
+/// userspace code. Restores the TrapFrame `deliver_pending` saved before
+/// redirecting to the handler; see `signal::pop_signal_frame` and
+/// `signal.rs`'s module doc comment for the full frame layout/rationale.
+fn sys_sigreturn() -> SyscallResult {
+    let tf_ptr = current_tf_ptr() as *mut TrapFrame;
+    let user_rsp = unsafe { (*tf_ptr).rsp };
+
+    unsafe { core::arch::asm!("cli"); }
+    let ret = {
+        let mut scheduler = super::scheduler::local_scheduler();
+        match scheduler.running_mut() {
+            Some(proc) => {
+                unsafe { super::signal::pop_signal_frame(proc, tf_ptr, user_rsp) };
+                unsafe { (*tf_ptr).rax as i64 }
+            }
+            None => errno::ESRCH,
+        }
+    };
+    unsafe { core::arch::asm!("sti"); }
+    ret
 }
 
 // ============================================================================
@@ -1761,7 +2173,7 @@ fn sys_accept(fd: i32) -> SyscallResult {
         let mut sched = super::scheduler::local_scheduler();
         sched.block_current(tf_ptr)
     };
-    unsafe { super::trapframe::jump_to_trapframe(next_tf) }
+    unsafe { super::trapframe::jump_to_user(next_tf) }
 }
 
 // ——— sys_sendmsg ——————————————————————————————————————————————————————————
@@ -1954,7 +2366,7 @@ fn sys_recvmsg(fd: i32, msg_ptr: u64, _flags: u32) -> SyscallResult {
         let mut sched = super::scheduler::local_scheduler();
         sched.block_current(tf_ptr)
     };
-    unsafe { super::trapframe::jump_to_trapframe(next_tf) }
+    unsafe { super::trapframe::jump_to_user(next_tf) }
 }
 
 use errno::*;
@@ -2567,7 +2979,7 @@ fn sys_poll(fds_ptr: u64, nfds: u32, timeout_ms: i32) -> SyscallResult {
         let mut sched = super::scheduler::local_scheduler();
         sched.block_current(tf_ptr)
     };
-    unsafe { super::trapframe::jump_to_trapframe(next_tf) }
+    unsafe { super::trapframe::jump_to_user(next_tf) }
 }
 
 // ── sys_epoll_create ───────────────────────────────────────────────────────
@@ -2755,6 +3167,6 @@ fn sys_epoll_wait(epfd: i32, events_ptr: u64, maxevents: i32, timeout_ms: i32) -
         let mut sched = super::scheduler::local_scheduler();
         sched.block_current(tf_ptr)
     };
-    unsafe { super::trapframe::jump_to_trapframe(next_tf) }
+    unsafe { super::trapframe::jump_to_user(next_tf) }
 }
 

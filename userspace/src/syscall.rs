@@ -84,7 +84,23 @@ const SYS_ACCEPT: u64 = 43;
 const SYS_SENDMSG: u64 = 46;
 const SYS_RECVMSG: u64 = 47;
 const SYS_BIND: u64 = 49;
+const SYS_PIPE: u64 = 22;
+const SYS_SIGACTION: u64 = 13;
+const SYS_SIGPROCMASK: u64 = 14;
 const SYS_FORK: u64 = 57;
+const SYS_KILL: u64 = 62;
+
+pub const SIGKILL: u32 = 9;
+pub const SIGUSR1: u32 = 10;
+pub const SIGSEGV: u32 = 11;
+pub const SIGUSR2: u32 = 12;
+pub const SIGPIPE: u32 = 13;
+pub const SIGTERM: u32 = 15;
+pub const SIGCHLD: u32 = 17;
+
+pub const SIG_BLOCK: i32 = 0;
+pub const SIG_UNBLOCK: i32 = 1;
+pub const SIG_SETMASK: i32 = 2;
 const SYS_EXEC: u64 = 59;
 const SYS_EXIT: u64 = 60;
 const SYS_WAITPID: u64 = 61;
@@ -121,6 +137,13 @@ pub fn open(path_cstr: &[u8], flags: i32) -> i64 {
 
 pub fn close(fd: i32) -> i64 {
     unsafe { syscall1(SYS_CLOSE, fd as u64) }
+}
+
+/// Returns `(read_fd, write_fd)` on success, or the negative errno.
+pub fn pipe() -> Result<(i32, i32), i64> {
+    let mut fds: [i32; 2] = [0, 0];
+    let r = unsafe { syscall1(SYS_PIPE, fds.as_mut_ptr() as u64) };
+    if r < 0 { Err(r) } else { Ok((fds[0], fds[1])) }
 }
 
 /// `struct stat` — Linux x86-64 ABI layout (144 bytes), matches
@@ -231,6 +254,33 @@ pub fn exec(name_cstr: &[u8]) -> i64 {
 
 pub fn waitpid(child_pid: i64) -> i64 {
     unsafe { syscall1(SYS_WAITPID, child_pid as u64) }
+}
+
+/// Sends `sig` to `pid`. Only single-pid targets (no process groups).
+pub fn kill(pid: i64, sig: u32) -> i64 {
+    unsafe { syscall2(SYS_KILL, pid as u64, sig as u64) }
+}
+
+/// Installs `handler` (an `extern "C" fn(i32)`, cast to a function-pointer
+/// bit pattern) for `sig`. Pass `0` for the default action or `1` to
+/// ignore. Simplified ABI: the kernel reads/writes a single `u64` handler
+/// address, not the full `struct sigaction` (see `kernel/src/process/
+/// syscall.rs::sys_sigaction`'s doc comment) — hence the pointer-to-local
+/// indirection here.
+pub fn sigaction(sig: u32, handler: u64) -> i64 {
+    let act: u64 = handler;
+    unsafe { syscall3(SYS_SIGACTION, sig as u64, &act as *const u64 as u64, 0) }
+}
+
+/// `how` is one of `SIG_BLOCK`/`SIG_UNBLOCK`/`SIG_SETMASK`; `mask` is a
+/// bitmask (bit N = signal N). Returns the previous mask via `old_mask`.
+pub fn sigprocmask(how: i32, mask: u64, old_mask: Option<&mut u64>) -> i64 {
+    let set: u64 = mask;
+    let old_ptr = match old_mask {
+        Some(r) => r as *mut u64 as u64,
+        None => 0,
+    };
+    unsafe { syscall3(SYS_SIGPROCMASK, how as u64, &set as *const u64 as u64, old_ptr) }
 }
 
 // ── Time ─────────────────────────────────────────────────────────────────

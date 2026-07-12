@@ -191,6 +191,35 @@ pub unsafe fn load_elf(
         rsp_va, phdr_vaddr, elf.ph_count(),
     );
 
+    // ── 5b. Map the sigreturn trampoline ──────────────────────────────
+    //
+    // One fixed page, read+exec only, identical in every process — see
+    // `process::signal` module doc comment. Mapped here (once, at process
+    // creation) rather than lazily so `fork()`'s existing COW-share loop
+    // (which walks every VMA with an already-mapped page) picks it up for
+    // children automatically, and `clone()` (threads) gets it for free by
+    // sharing the whole `AddressSpace`.
+    {
+        use super::signal_trampoline::{TRAMPOLINE_VA, TRAMPOLINE_CODE};
+
+        let tramp_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        let tramp_page = Page::<Size4KiB>::containing_address(VirtAddr::new(TRAMPOLINE_VA));
+        let tramp_frame = address_space
+            .map_user_page(tramp_page, tramp_flags)
+            .map_err(|_| "ELF loader: failed to map sigreturn trampoline")?;
+
+        let tramp_virt = (phys_offset + tramp_frame.start_address().as_u64()).as_mut_ptr::<u8>();
+        core::ptr::write_bytes(tramp_virt, 0, 4096);
+        core::ptr::copy_nonoverlapping(TRAMPOLINE_CODE.as_ptr(), tramp_virt, TRAMPOLINE_CODE.len());
+
+        address_space.add_vma(Vma {
+            start: TRAMPOLINE_VA,
+            size_pages: 1,
+            flags: tramp_flags.bits(),
+            kind: VmaKind::Code,
+        }).map_err(|_| "ELF loader: failed to register trampoline VMA")?;
+    }
+
     // ── 6. Done ───────────────────────────────────────────────────────
 
     Ok(LoadedElf {

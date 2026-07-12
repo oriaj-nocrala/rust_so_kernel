@@ -13,8 +13,12 @@ pub mod timer_preempt;
 pub mod tss;
 pub mod syscall;
 pub mod file;
+pub mod pipe;
+pub mod signal;
 pub mod user_test_fileio;
 pub mod user_programs;
+
+pub use signal::SignalAction;
 
 pub use trapframe::TrapFrame;
 pub use file::{FileDescriptorTable, FileHandle};
@@ -90,6 +94,15 @@ pub struct Process {
     /// thread's `Process` immediately on exit instead of zombie-parking it
     /// forever — see `Scheduler::kill_current`.
     pub is_thread: bool,
+
+    /// Bitmask of pending (not yet delivered) signals — bit N = signal N.
+    pub pending_signals: u64,
+    /// Bitmask of currently blocked signals (`sigprocmask`).
+    pub blocked_signals: u64,
+    /// Per-signal disposition; index = signal number. Not inherited across
+    /// `fork()` in this implementation (every new `Process` starts with all
+    /// `Default` — a simplification vs. real POSIX, which does inherit).
+    pub signal_handlers: [SignalAction; signal::NUM_SIGNALS],
 }
 
 impl Process {
@@ -145,6 +158,9 @@ impl Process {
             waiting_for: None,
             fs_base: 0,
             is_thread: false,
+            signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
+            blocked_signals: 0,
+            pending_signals: 0,
         }
     }
 
@@ -201,6 +217,9 @@ impl Process {
             waiting_for: None,
             fs_base: 0,
             is_thread: false,
+            signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
+            blocked_signals: 0,
+            pending_signals: 0,
         }
     }
 
@@ -236,6 +255,9 @@ impl Process {
             waiting_for: None,
             fs_base: 0,
             is_thread: false,
+            signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
+            blocked_signals: 0,
+            pending_signals: 0,
         }
     }
 
@@ -305,6 +327,9 @@ impl Process {
             waiting_for: None,
             fs_base: 0,
             is_thread: true,
+            signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
+            blocked_signals: 0,
+            pending_signals: 0,
         }
     }
 
@@ -318,6 +343,36 @@ impl Process {
         let p = core::cmp::min(priority, 10);
         self.priority = p;
         self.effective_priority = p;
+    }
+}
+
+/// Ensure every page in `[addr, addr+len)` is mapped in `proc`'s address
+/// space, demand-paging any that aren't yet.
+///
+/// Needed before any *kernel-mode* code writes directly to a user address
+/// (signal frame construction in `signal.rs`, cross-process pipe delivery in
+/// `pipe.rs`) — a page fault on a kernel-mode instruction is never
+/// demand-paged by this kernel's fault handler (`init/devices.rs` panics on
+/// it instead; only user-mode faults get mapped on the fly), so a write to
+/// a legitimately-valid-but-never-yet-touched user page (e.g. a deeper
+/// stack slot than anything the process itself has used) would otherwise
+/// crash the kernel instead of just transparently mapping it the way the
+/// same write *would* have if the user process had issued it itself.
+pub fn ensure_user_pages_mapped(proc: &Process, addr: u64, len: u64) {
+    let first_page = addr & !0xFFF;
+    let last_page = addr.saturating_add(len.saturating_sub(1)) & !0xFFF;
+    let mut page_addr = first_page;
+    while page_addr <= last_page {
+        let page = x86_64::structures::paging::Page::<x86_64::structures::paging::Size4KiB>::containing_address(
+            VirtAddr::new(page_addr),
+        );
+        let mapped = unsafe { proc.address_space.translate_page(page).is_some() };
+        if !mapped {
+            if let Some(vma) = proc.address_space.find_vma(page_addr) {
+                let _ = crate::memory::demand_paging::map_demand_page(page_addr, &vma, proc.pid.0, true);
+            }
+        }
+        page_addr += 0x1000;
     }
 }
 

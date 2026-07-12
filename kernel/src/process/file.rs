@@ -19,6 +19,14 @@ pub enum FileError {
     IOError,
     NotSupported,
     EndOfFile,
+    /// Write to a pipe with no open read ends (maps to EPIPE, and the
+    /// caller additionally raises SIGPIPE — see `pipe.rs`/`sys_write`).
+    BrokenPipe,
+    /// The operation would block (empty pipe on read, full pipe on write).
+    /// `sys_read`/`sys_write` catch this, drop the fd-table lock, and
+    /// perform the actual block_current/jump_to_trapframe themselves — see
+    /// their doc comments for why this can't happen inside `read`/`write`.
+    WouldBlock,
 }
 
 pub type FileResult<T> = Result<T, FileError>;
@@ -63,6 +71,18 @@ pub trait FileHandle: Send {
     /// Name for debugging.
     fn name(&self) -> &str {
         "<unknown>"
+    }
+
+    /// Duplicate this handle for inheritance across `fork()`.
+    ///
+    /// Default `None` means "not inheritable" — matches today's behavior
+    /// for device handles (fork only special-cases stdio, see
+    /// `FileDescriptorTable::clone`). Handles backed by shared state (e.g.
+    /// pipe ends) override this to clone their `Arc` and bump the relevant
+    /// refcount, so both parent and child end up sharing the same
+    /// underlying buffer — required for pipe semantics across fork.
+    fn dup(&self) -> Option<Box<dyn FileHandle>> {
+        None
     }
 }
 
@@ -177,7 +197,9 @@ impl FileHandle for NullFallback {
     fn name(&self) -> &str { "<fallback>" }
 }
 
-// Clone creates fresh stdio handles (same as fork would)
+// fds 0-2 get fresh stdio handles (same as before); fds 3+ are inherited via
+// `dup()` when the underlying handle supports it (e.g. pipe ends) — needed
+// so a pipe created before `fork()` is usable by both parent and child.
 impl Clone for FileDescriptorTable {
     fn clone(&self) -> Self {
         let mut new_table = Self::new();
@@ -190,6 +212,12 @@ impl Clone for FileDescriptorTable {
         }
         if self.files[2].is_some() {
             new_table.files[2] = crate::drivers::open_device("/dev/console");
+        }
+
+        for i in 3..MAX_FILES {
+            if let Some(ref handle) = self.files[i] {
+                new_table.files[i] = handle.dup();
+            }
         }
 
         new_table

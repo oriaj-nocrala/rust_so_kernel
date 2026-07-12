@@ -63,6 +63,9 @@ fn print_help() {
     println!("  hello       - hello world demo");
     println!("  pthread_test - pthread_create/join smoke test");
     println!("  producer_consumer - pthread_cond_t producer/consumer test");
+    println!("  pipe_test   - pipe(2) fork/read/write/EOF test");
+    println!("  signal_test - kill/sigaction/sigreturn/SIGCHLD test");
+    println!("  mlibc_signal_test - same, via real mlibc pipe/kill/sigaction");
 }
 
 fn run_program(name: &str) {

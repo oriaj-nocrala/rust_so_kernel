@@ -18,6 +18,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <sys/mman.h>
 
 namespace {
@@ -39,8 +40,16 @@ constexpr long SYS_read = 0;
 constexpr long SYS_write = 1;
 constexpr long SYS_open = 2;
 constexpr long SYS_close = 3;
+constexpr long SYS_sigaction = 13;
+constexpr long SYS_sigprocmask = 14;
+// SYS_sigreturn(15) is never called directly by userspace — only the
+// kernel-mapped trampoline page uses it (see kernel/src/memory/
+// signal_trampoline.rs); mlibc's sigaction() doesn't need to know it
+// exists, since this kernel injects the trampoline transparently instead
+// of relying on a userspace-supplied sa_restorer.
 constexpr long SYS_lseek = 8;
 constexpr long SYS_mmap = 9;
+constexpr long SYS_pipe = 22;
 constexpr long SYS_munmap = 11;
 constexpr long SYS_ioctl = 16;
 constexpr long SYS_nanosleep = 35;
@@ -49,6 +58,7 @@ constexpr long SYS_clone = 56;
 constexpr long SYS_fork = 57;
 constexpr long SYS_execve = 59;
 constexpr long SYS_exit = 60;
+constexpr long SYS_kill = 62;
 constexpr long SYS_arch_prctl = 158;
 constexpr long SYS_futex = 202;
 constexpr long SYS_clock_gettime = 228;
@@ -126,6 +136,16 @@ int sys_open(const char *path, int flags, mode_t, int *fd) {
 
 int sys_close(int fd) {
 	long ret = raw_syscall(SYS_close, fd);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+// This kernel's pipe(22) takes only `int pipefd[2]` — no pipe2() flags
+// (O_NONBLOCK/O_CLOEXEC aren't supported). Anything other than 0 in `flags`
+// would silently be ignored by the kernel, so reject it here instead.
+int sys_pipe(int *fds, int flags) {
+	if (flags != 0)
+		return EINVAL;
+	long ret = raw_syscall(SYS_pipe, (long)fds);
 	return ret < 0 ? (int)-ret : 0;
 }
 
@@ -242,6 +262,35 @@ pid_t sys_getpid() {
 pid_t sys_getppid() {
 	// Not tracked by this kernel; harmless placeholder.
 	return 1;
+}
+
+int sys_kill(int pid, int sig) {
+	long ret = raw_syscall(SYS_kill, pid, sig);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+// This kernel's sigaction(13) reads/writes a single `u64` handler address
+// at offset 0 of `act`/`oldact` (SIG_DFL=0, SIG_IGN=1, or a handler
+// pointer) rather than the full ABI struct — but `sa_handler` (a
+// `void (*)(int)`) already IS `struct sigaction`'s first member (see
+// include/abi-bits/signal.h), so the raw struct pointer is binary-
+// compatible as-is. `sa_mask`/`sa_flags`/`sa_restorer` are silently
+// ignored: this kernel injects its own sigreturn trampoline transparently
+// (see kernel/src/process/signal.rs), so no restorer needs to be supplied,
+// and per-handler blocking during delivery is unconditional rather than
+// configurable via sa_mask.
+int sys_sigaction(int sig, const struct sigaction *__restrict act,
+		struct sigaction *__restrict oldact) {
+	long ret = raw_syscall(SYS_sigaction, sig, (long)act, (long)oldact);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+// sigset_t is already a plain uint64_t in this port (abi-bits/signal.h) —
+// matches this kernel's 32-signal bitmask directly, no conversion needed.
+int sys_sigprocmask(int how, const sigset_t *__restrict set,
+		sigset_t *__restrict old) {
+	long ret = raw_syscall(SYS_sigprocmask, how, (long)set, (long)old);
+	return ret < 0 ? (int)-ret : 0;
 }
 
 #endif // MLIBC_BUILDING_RTLD

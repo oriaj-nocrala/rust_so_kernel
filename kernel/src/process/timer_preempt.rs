@@ -113,17 +113,22 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> *const 
         }
 
         if !scheduler.tick() {
-            // Slice still has ticks remaining — continue current process.
-            // Still clear poll waiters for any pids woken by hrtimer.
+            // Slice still has ticks remaining — continue current process,
+            // but it may have just been sent a signal (e.g. by another
+            // process's kill() while this one was running) — check before
+            // resuming it. Still clear poll waiters for any pids woken by
+            // hrtimer either way.
+            let tf = scheduler.resolve_signals(current_tf);
             drop(scheduler);
             for &pid in &wake_pids[..wake_count] {
                 crate::process::syscall::poll_clear_on_timeout(pid);
             }
-            return current_tf;
+            return tf;
         }
 
         // ── 5. Time slice exhausted — context switch ──────────────────
-        scheduler.switch_to_next(current_tf)
+        let tf = scheduler.switch_to_next(current_tf);
+        scheduler.resolve_signals(tf)
         // scheduler lock released here
     };
 
