@@ -566,3 +566,185 @@ impl Drop for OwnedPageTable {
         unsafe { self.release_user_pages(); }
     }
 }
+
+// ============================================================================
+// Kernel stack guard pages
+// ============================================================================
+//
+// Kernel stacks are plain physmap addresses (physical_memory_offset() +
+// phys_addr from a Buddy allocation) — see init::processes::allocate_kernel_stack.
+// The physmap itself is built by the `bootloader` crate before our code runs,
+// using 2MiB pages, so an overflow doesn't fault: it silently corrupts
+// whatever Buddy block happens to sit at the next-lower address, which is
+// exactly what init::processes::KERNEL_STACK_ORDER's doc comment describes.
+//
+// `unmap_kernel_guard_page` fixes this for real: it splits the 2MiB page
+// covering a given address into 4KiB pages (if not already split) and
+// clears the leaf entry for that one page, so any access to it faults
+// instead of reading/writing real memory.
+
+/// Split the 2MiB huge page in the KERNEL's page table covering `virt_addr`
+/// into 4KiB pages. No-op if it's already split (by an earlier call covering
+/// a different stack in the same 2MiB region).
+///
+/// # Why this is safe to do once, globally, from the kernel's own table
+/// `OwnedPageTable::new_user` copies kernel PML4 entries by *cloning the
+/// entry itself* (a pointer to a PDPT frame), not by deep-copying the
+/// PDPT/PD/PT chain underneath it. So every process's page table shares the
+/// exact same PD/PT frames for the physmap region — splitting it once here
+/// (via the kernel's own unowned table, from `Cr3::read()`) is immediately
+/// visible to every process, current and future, with no per-process work
+/// needed.
+///
+/// # Safety
+/// Caller must ensure `virt_addr` falls within the physmap (i.e. is
+/// `physical_memory_offset() + some_phys_addr`), and that no other CPU
+/// could be concurrently walking/modifying this same PD (true here: single
+/// core, and this only ever runs with a Buddy block freshly allocated by
+/// the caller, before it's handed to anyone else).
+unsafe fn split_physmap_2m(virt_addr: VirtAddr) -> Result<(), &'static str> {
+    let phys_offset = crate::memory::physical_memory_offset();
+    let (kernel_frame, _) = Cr3::read();
+
+    let va = virt_addr.as_u64();
+    let pml4_idx = ((va >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((va >> 30) & 0x1FF) as usize;
+    let pd_idx   = ((va >> 21) & 0x1FF) as usize;
+
+    let pml4_virt = phys_offset + kernel_frame.start_address().as_u64();
+    let pml4: &PageTable = &*pml4_virt.as_ptr::<PageTable>();
+    let pml4_entry = &pml4[pml4_idx];
+    if !pml4_entry.flags().contains(PageTableFlags::PRESENT) {
+        return Err("split_physmap_2m: PML4 entry not present");
+    }
+    let pdpt_frame = pml4_entry.frame().map_err(|_| "split_physmap_2m: bad PML4 entry")?;
+
+    let pdpt_virt = phys_offset + pdpt_frame.start_address().as_u64();
+    let pdpt: &PageTable = &*pdpt_virt.as_ptr::<PageTable>();
+    let pdpt_entry = &pdpt[pdpt_idx];
+    if !pdpt_entry.flags().contains(PageTableFlags::PRESENT) {
+        return Err("split_physmap_2m: PDPT entry not present");
+    }
+    let pd_frame = pdpt_entry.frame()
+        .map_err(|_| "split_physmap_2m: PDPT entry is a 1GiB huge page (unsupported)")?;
+
+    let pd_virt = phys_offset + pd_frame.start_address().as_u64();
+    let pd: &mut PageTable = &mut *pd_virt.as_mut_ptr::<PageTable>();
+    let pd_entry = &mut pd[pd_idx];
+
+    if !pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        return Ok(()); // already split by an earlier call — nothing to do
+    }
+
+    let huge_phys_base = pd_entry.addr();
+    let huge_flags = pd_entry.flags();
+    let leaf_flags = huge_flags & !PageTableFlags::HUGE_PAGE;
+
+    let new_pt_phys = crate::allocator::phys_alloc(12)
+        .ok_or("split_physmap_2m: OOM allocating replacement PT")?;
+    let new_pt_virt = phys_offset + new_pt_phys.as_u64();
+    let new_pt: &mut PageTable = &mut *new_pt_virt.as_mut_ptr::<PageTable>();
+    new_pt.zero();
+
+    for i in 0..512u64 {
+        let frame: PhysFrame = PhysFrame::containing_address(huge_phys_base + i * 4096);
+        new_pt[i as usize].set_frame(frame, leaf_flags);
+    }
+
+    // Table-descriptor entry: PRESENT|WRITABLE regardless of leaf
+    // permissions (same convention as map_existing_frame's parent_flags —
+    // restriction belongs on the leaf, not the pointer to it). GLOBAL is
+    // leaf-only, dropped here; USER_ACCESSIBLE carried over defensively
+    // even though physmap is never user-mapped in practice.
+    let parent_flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | (huge_flags & PageTableFlags::USER_ACCESSIBLE);
+    pd_entry.set_frame(PhysFrame::containing_address(new_pt_phys), parent_flags);
+
+    // Cold, rare, structural change — a full flush is simpler and safer
+    // than invlpg-ing 512 individual addresses one at a time.
+    x86_64::instructions::tlb::flush_all();
+
+    Ok(())
+}
+
+/// Walk the kernel's own page table down to the 4KiB-granular PT covering
+/// `virt_addr`, returning `(PT, pt_idx)`. Requires the covering 2MiB region
+/// to already be split (see `split_physmap_2m`) — errors if it's still a
+/// huge page.
+unsafe fn walk_to_pt(virt_addr: VirtAddr) -> Result<(&'static mut PageTable, usize), &'static str> {
+    let phys_offset = crate::memory::physical_memory_offset();
+    let (kernel_frame, _) = Cr3::read();
+
+    let va = virt_addr.as_u64();
+    let pml4_idx = ((va >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((va >> 30) & 0x1FF) as usize;
+    let pd_idx   = ((va >> 21) & 0x1FF) as usize;
+    let pt_idx   = ((va >> 12) & 0x1FF) as usize;
+
+    let pml4_virt = phys_offset + kernel_frame.start_address().as_u64();
+    let pml4: &PageTable = &*pml4_virt.as_ptr::<PageTable>();
+    let pdpt_frame = pml4[pml4_idx].frame().map_err(|_| "walk_to_pt: bad PML4 entry")?;
+
+    let pdpt_virt = phys_offset + pdpt_frame.start_address().as_u64();
+    let pdpt: &PageTable = &*pdpt_virt.as_ptr::<PageTable>();
+    let pd_frame = pdpt[pdpt_idx].frame().map_err(|_| "walk_to_pt: bad PDPT entry")?;
+
+    let pd_virt = phys_offset + pd_frame.start_address().as_u64();
+    let pd: &PageTable = &*pd_virt.as_ptr::<PageTable>();
+    let pt_frame = pd[pd_idx].frame().map_err(|_| "walk_to_pt: PD entry not a 4KiB PT")?;
+
+    let pt_virt = phys_offset + pt_frame.start_address().as_u64();
+    let pt: &mut PageTable = &mut *pt_virt.as_mut_ptr::<PageTable>();
+    Ok((pt, pt_idx))
+}
+
+/// Unmap the single 4KiB page at `virt_addr` in the physmap, turning any
+/// access to it into a page fault. Splits the covering 2MiB page first if
+/// needed (see `split_physmap_2m`).
+///
+/// # Safety
+/// `virt_addr` must be the base of a Buddy block the caller exclusively
+/// owns (e.g. the bottom of a freshly `phys_alloc`'d kernel stack) — see
+/// `split_physmap_2m`'s doc comment for why that ownership is what makes
+/// this safe to do process-table-wide instead of just locally.
+pub unsafe fn unmap_kernel_guard_page(virt_addr: VirtAddr) -> Result<(), &'static str> {
+    split_physmap_2m(virt_addr)?;
+    let (pt, pt_idx) = walk_to_pt(virt_addr)?;
+    pt[pt_idx].set_unused();
+    x86_64::instructions::tlb::flush(virt_addr);
+    Ok(())
+}
+
+/// Undo `unmap_kernel_guard_page`: restore a normal present mapping for
+/// `virt_addr` (identity within the physmap: this VA maps its own
+/// `virt_addr - physical_memory_offset()` physical frame).
+///
+/// MUST be called before returning a kernel stack's block to the Buddy
+/// allocator. Buddy's free lists are intrusive — `add_block` writes the
+/// linked-list node directly into the freed block's first bytes via the
+/// physmap, at exactly the address this guard page unmapped. Skipping this
+/// call turns the next `free_kernel_stack`/`try_free_kernel_stack` into a
+/// guaranteed kernel-mode page fault (a write to a page we ourselves just
+/// made not-present).
+///
+/// Takes its flags from `virt_addr`'s immediate neighbour (`pt_idx + 1`,
+/// the next page of the same stack block) rather than hardcoding
+/// PRESENT|WRITABLE|GLOBAL — that neighbour was never unmapped (the guard
+/// is always the block's *first* page, and Buddy's minimum block here is
+/// 16 pages), so its flags are exactly what this page had before it became
+/// a guard.
+///
+/// # Safety
+/// `virt_addr` must be a page previously unmapped by `unmap_kernel_guard_page`.
+pub unsafe fn remap_kernel_guard_page(virt_addr: VirtAddr) -> Result<(), &'static str> {
+    let phys_offset = crate::memory::physical_memory_offset();
+    let (pt, pt_idx) = walk_to_pt(virt_addr)?;
+
+    let template_flags = pt[pt_idx + 1].flags();
+    let phys = PhysAddr::new(virt_addr.as_u64() - phys_offset.as_u64());
+    pt[pt_idx].set_frame(PhysFrame::containing_address(phys), template_flags);
+
+    x86_64::instructions::tlb::flush(virt_addr);
+    Ok(())
+}

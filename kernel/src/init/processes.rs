@@ -51,18 +51,30 @@ pub fn debug_file_descriptors() {
 // HELPERS
 // ============================================================================
 
-/// Kernel stack size order. 16 = 64 KiB.
+/// Kernel stack size order. 16 = 64 KiB (60 KiB usable — the lowest page is
+/// a guard page, see `allocate_kernel_stack`).
 ///
 /// Was order 14 (16 KiB) — too small for debug builds: `sys_exec`'s call
 /// chain (syscall_handler_asm -> syscall_handler -> sys_exec -> load_elf ->
-/// load_segment) has large unoptimized stack frames, and kernel stacks are
-/// plain physical-offset-mapped regions with NO guard page, so an overflow
-/// doesn't fault — it silently corrupts whatever physical memory sits just
-/// below, which later crashes as an unrelated-looking kernel page fault
-/// once a clobbered return address gets used.
+/// load_segment) has large unoptimized stack frames, and at the time kernel
+/// stacks had no guard page, so the overflow didn't fault — it silently
+/// corrupted whatever physical memory sat just below, which later crashed
+/// as an unrelated-looking kernel page fault once a clobbered return
+/// address got used. The guard page now added makes overflow fault
+/// immediately instead, but the bigger size stays: still cheap, and no
+/// reason to go back to margins that were already shown to be too tight.
 pub const KERNEL_STACK_ORDER: usize = 16;
 
 /// Allocate a kernel stack from the Buddy.
+///
+/// The lowest 4 KiB page of the block is left permanently unmapped as a
+/// guard page (`page_table_manager::unmap_kernel_guard_page`) — the stack
+/// grows downward from the returned top, so an overflow runs into it and
+/// faults immediately instead of silently corrupting whatever Buddy block
+/// happens to sit at the next-lower physical address. Safe to carve out of
+/// the allocation itself (not extra memory): Buddy already treats this
+/// whole order-16 block as exclusively owned by this stack, so no other
+/// allocation can ever be handed that physical frame while it's alive.
 pub fn allocate_kernel_stack() -> VirtAddr {
     let phys_addr = unsafe {
         crate::allocator::phys_alloc(KERNEL_STACK_ORDER)
@@ -71,15 +83,21 @@ pub fn allocate_kernel_stack() -> VirtAddr {
 
     let virt_addr = crate::memory::physical_memory_offset() + phys_addr.as_u64();
 
+    unsafe {
+        crate::memory::page_table_manager::unmap_kernel_guard_page(virt_addr)
+            .expect("Failed to install kernel stack guard page");
+    }
+
     // Stack top (grows downward)
     VirtAddr::new(virt_addr.as_u64() + (1 << KERNEL_STACK_ORDER))
 }
 
-/// `stack_top` (what `allocate_kernel_stack` returned) back to the
-/// physical base Buddy actually allocated.
-fn kernel_stack_phys_base(stack_top: VirtAddr) -> x86_64::PhysAddr {
+/// `stack_top` (what `allocate_kernel_stack` returned) back to the base
+/// VirtAddr/PhysAddr of the Buddy block — the guard page's own address.
+fn kernel_stack_base(stack_top: VirtAddr) -> (VirtAddr, x86_64::PhysAddr) {
     let virt_base = stack_top - (1u64 << KERNEL_STACK_ORDER);
-    x86_64::PhysAddr::new(virt_base.as_u64() - crate::memory::physical_memory_offset().as_u64())
+    let phys_base = x86_64::PhysAddr::new(virt_base.as_u64() - crate::memory::physical_memory_offset().as_u64());
+    (virt_base, phys_base)
 }
 
 /// Return a kernel stack (as returned by `allocate_kernel_stack`) to the Buddy.
@@ -87,8 +105,14 @@ fn kernel_stack_phys_base(stack_top: VirtAddr) -> x86_64::PhysAddr {
 /// Callers must make sure the CPU isn't still executing on this stack —
 /// see `Scheduler::pending_stack_frees` for the one place that matters.
 pub fn free_kernel_stack(stack_top: VirtAddr) {
+    let (virt_base, phys_base) = kernel_stack_base(stack_top);
     unsafe {
-        crate::allocator::phys_free(kernel_stack_phys_base(stack_top), KERNEL_STACK_ORDER);
+        // MUST happen before phys_free: see remap_kernel_guard_page's doc
+        // comment — Buddy's intrusive free list writes into this exact
+        // address, which is still unmapped (the guard page) otherwise.
+        crate::memory::page_table_manager::remap_kernel_guard_page(virt_base)
+            .expect("Failed to remove kernel stack guard page before freeing");
+        crate::allocator::phys_free(phys_base, KERNEL_STACK_ORDER);
     }
 }
 
@@ -108,9 +132,16 @@ pub fn free_kernel_stack(stack_top: VirtAddr) {
 /// solid (idle task never reached its `hlt`, vCPU pegged at ~25% CPU)
 /// within a second or two of boot.
 pub fn try_free_kernel_stack(stack_top: VirtAddr) -> bool {
+    let (virt_base, phys_base) = kernel_stack_base(stack_top);
     match crate::allocator::buddy_allocator::BUDDY.try_lock() {
         Some(mut buddy) => {
-            unsafe { buddy.deallocate(kernel_stack_phys_base(stack_top), KERNEL_STACK_ORDER); }
+            unsafe {
+                // Page-table-only, no locks involved — safe to do
+                // unconditionally before the try_lock'd deallocate below.
+                crate::memory::page_table_manager::remap_kernel_guard_page(virt_base)
+                    .expect("Failed to remove kernel stack guard page before freeing");
+                buddy.deallocate(phys_base, KERNEL_STACK_ORDER);
+            }
             true
         }
         None => false,
