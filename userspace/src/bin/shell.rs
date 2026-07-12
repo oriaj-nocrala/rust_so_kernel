@@ -69,6 +69,8 @@ fn print_help() {
     println!("  write <path> - capture lines from stdin into a /tmp file (end with '.')");
     println!("  sh <path>   - run each line of a file as a shell command (batch mode)");
     println!("  meminfo     - show free physical memory (KiB)");
+    println!("  cat <path>  - print a file's contents");
+    println!("  ls <path>   - list any directory (plain 'ls' still lists /)");
 }
 
 fn run_program(name: &str) {
@@ -158,6 +160,78 @@ fn cmd_sh(path: &str) {
     }
 }
 
+/// `cat <path>`: prints a file's contents to stdout. Mainly exists to
+/// exercise/verify fs::ext2's read path from the shell (`ls <path>` shows
+/// entries exist; this proves the actual bytes come back right too) —
+/// `ls`/other embedded programs don't take argv (see README: "no argv/envp
+/// support"), so this and `ls <path>` below are shell built-ins instead of
+/// real programs.
+fn cmd_cat(path: &str) {
+    if path.is_empty() {
+        eprintln!("cat: usage: cat <path>");
+        return;
+    }
+    let fd = syscall::with_cstr(path, |p| syscall::open(p, syscall::O_RDONLY));
+    if fd < 0 {
+        eprintln!("cat: cannot open {} ({})", path, fd);
+        return;
+    }
+    let fd = fd as i32;
+    let mut buf = [0u8; 256];
+    loop {
+        let n = syscall::read(fd, &mut buf);
+        if n <= 0 {
+            break;
+        }
+        syscall::write(1, &buf[..n as usize]);
+    }
+    syscall::close(fd);
+}
+
+fn dirent_type_marker(d_type: u8) -> &'static str {
+    match d_type {
+        4 => "/", // DT_DIR
+        2 => "@", // DT_CHR
+        8 => "",  // DT_REG
+        _ => "?",
+    }
+}
+
+/// `ls <path>`: same getdents64 loop as the standalone `ls` program, just
+/// able to target an arbitrary path (e.g. `ls /mnt`) since built-ins get
+/// the raw command tail as an argument and real programs don't.
+fn cmd_ls(path: &str) {
+    let fd = syscall::with_cstr(path, |p| syscall::open(p, 0));
+    if fd < 0 {
+        eprintln!("ls: cannot open {}: {}", path, fd);
+        return;
+    }
+    let fd = fd as i32;
+    let mut buf = [0u8; 512];
+    loop {
+        let n = syscall::getdents64(fd, &mut buf);
+        if n <= 0 {
+            break;
+        }
+        let n = n as usize;
+        let mut off = 0usize;
+        while off < n {
+            match syscall::parse_dirent(&buf[off..n]) {
+                Some(entry) => {
+                    let name = core::str::from_utf8(entry.name).unwrap_or("?");
+                    println!("{}{}", name, dirent_type_marker(entry.d_type));
+                    if entry.record_len == 0 {
+                        break;
+                    }
+                    off += entry.record_len;
+                }
+                None => break,
+            }
+        }
+    }
+    syscall::close(fd);
+}
+
 fn dispatch(cmd: &str) {
     if cmd.is_empty() {
         return;
@@ -171,6 +245,10 @@ fn dispatch(cmd: &str) {
         cmd_sh(trim(path));
     } else if cmd == "meminfo" {
         println!("free: {} KiB", syscall::meminfo_kb());
+    } else if let Some(path) = cmd.strip_prefix("cat ") {
+        cmd_cat(trim(path));
+    } else if let Some(path) = cmd.strip_prefix("ls ") {
+        cmd_ls(trim(path));
     } else {
         run_program(cmd);
     }

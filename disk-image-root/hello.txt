@@ -1,0 +1,4 @@
+Hola desde /mnt — este archivo vive en un ext2 real en disco,
+no en el initramfs embebido ni en el ramfs de /tmp.
+
+Sobrevive a un reboot de QEMU porque el .img queda en el host.

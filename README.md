@@ -18,7 +18,7 @@ Empezó como un proyecto de aprendizaje ("SO2") para explorar desarrollo de sist
 - **Pipes** (`pipe(2)`): IPC anónima con ring buffer, lectura/escritura bloqueante, `EOF`/`EPIPE`, fds heredados por `fork()` (refcount por extremo vía `FileHandle::dup()`).
 - **Señales POSIX**: `kill`, `sigaction`, `sigprocmask`, `sigreturn` — `SIGKILL`/`SIGTERM`/`SIGSEGV`/`SIGPIPE`/`SIGUSR1`/`SIGUSR2` (default: terminar) y `SIGCHLD` (default: ignorar). El kernel arma el frame de la señal en la propia pila de usuario y lo redirige a través de una página trampolín mapeada de forma transparente (mlibc no necesita instalar `sa_restorer`). La entrega se engancha en cada retorno a modo usuario: fin de syscall, preempción por timer, y cada wakeup de una syscall bloqueante.
 - **Syscalls** con números compatibles con Linux (`read`, `write`, `open`, `mmap`, `fork`, `clone`, `exec`, `futex`, `arch_prctl`, `poll`/`epoll`, `clock_gettime`, `pipe`, `kill`, `sigaction`, `sigprocmask`, `sigreturn`, ...) entradas por la instrucción `syscall` (MSR LSTAR).
-- **VFS propio**: initramfs + devfs (`/dev/null`, `/dev/zero`, `/dev/console`, `/dev/fb`, `/dev/kbd`), `stat`/`getdents64`.
+- **VFS propio**: initramfs + devfs (`/dev/null`, `/dev/zero`, `/dev/console`, `/dev/fb`, `/dev/kbd`) + ramfs escribible en `/tmp` + **ext2 de solo lectura en `/mnt`**, sobre un driver ATA PIO propio (canal secundario IDE) — el disco (`disk.img`, sembrado con `mke2fs -d`) sobrevive entre corridas de `cargo run`. `stat`/`getdents64`.
 - **IPC**: canales tipo socket (`socket`/`bind`/`connect`/`accept`/`sendmsg`/`recvmsg`) con `poll`/`epoll`.
 - **Tiempo**: TSC calibrado contra el PIT, hrtimer, `nanosleep`, `clock_gettime`.
 - **Consola con framebuffer** con soporte de escapes ANSI (colores, posicionamiento de cursor).
@@ -52,8 +52,9 @@ Un pequeño shell interactivo (`shell`) hace `fork`+`exec` de estos binarios:
 │   ├── src/
 │   │   ├── memory/       # Buddy/slab allocators, paginación, ELF loader, demand paging
 │   │   ├── process/      # Scheduler, syscalls, fork/exec, trapframes
-│   │   ├── fs/           # VFS: initramfs, devfs, tipos compartidos
+│   │   ├── fs/           # VFS: initramfs, devfs, ramfs, ext2 (RO), tipos compartidos
 │   │   ├── ipc/          # Canales tipo socket
+│   │   ├── block/        # Driver ATA PIO (canal secundario IDE)
 │   │   ├── drivers/      # /dev/null, /dev/zero, /dev/console, /dev/fb, /dev/kbd
 │   │   └── time/         # TSC, hrtimer, clocksource
 │   └── embedded/         # ELFs de userspace embebidos vía include_bytes!
@@ -61,7 +62,8 @@ Un pequeño shell interactivo (`shell`) hace `fork`+`exec` de estos binarios:
 ├── mlibc/                # Submódulo git: mlibc upstream (managarm/mlibc)
 ├── mlibc-port/           # Puerto propio de mlibc a este kernel (sysdeps "constanos")
 ├── scripts/setup-mlibc.sh # Reconstruye el sysroot de mlibc automáticamente
-└── build.rs / src/main.rs # Host: arma la imagen UEFI y lanza QEMU
+├── disk-image-root/      # Contenido semilla del disco ext2 (/mnt) — mke2fs -d
+└── build.rs / src/main.rs # Host: arma la imagen UEFI + disk.img, lanza QEMU
 ```
 
 ## 🚀 Cómo correrlo
@@ -70,10 +72,11 @@ Requisitos:
 - Toolchain de Rust **nightly** (fijado en `rust-toolchain.toml`, se instala solo con `rustup`).
 - `qemu-system-x86_64`.
 - `clang`, `llvm` (para `llvm-ar`/`llvm-strip`/`llvm-objcopy`), `meson`, `ninja` — para compilar el sysroot de mlibc la primera vez.
+- `e2fsprogs` (`mke2fs`) — para armar `disk.img` (el ext2 que se monta en `/mnt`) la primera vez. Opcional: sin esto el build sigue, simplemente no hay `/mnt`.
 
 En Arch:
 ```bash
-sudo pacman -S qemu-system-x86 qemu-img qemu-ui-gtk edk2-ovmf clang llvm meson ninja lld
+sudo pacman -S qemu-system-x86 qemu-img qemu-ui-gtk edk2-ovmf clang llvm meson ninja lld e2fsprogs
 ```
 
 Y listo:
@@ -89,8 +92,8 @@ Lo que falta o está a medias, mirando el propio código:
 
 - ⏳ **Sin linker dinámico**: `exec()` solo carga binarios estáticos, no hay `.so`/relocations.
 - ⏳ **Un solo core real**: la infraestructura para SMP existe (arrays por-CPU, `MAX_CPUS=8`) pero `cpu_id()` siempre devuelve 0.
-- ⏳ **Filesystem persistente**: el VFS es sólido pero todo vive en un initramfs de solo lectura — no hay nada escribible en disco.
-- ⏳ **`kernel_stack` nunca se libera** al matar un proceso (thread, fork child, o el que sea) — leak conocido y preexistente, no es específico de threads.
+- ⏳ **ext2 sin escritura**: `/mnt` lee de un disco real (ATA PIO), pero no hay allocation de bloques/inodos ni bitmaps — crear/escribir archivos ahí todavía no anda. `/tmp` (ramfs) sigue siendo lo único escribible, pero no persiste entre reboots.
+- ⏳ **Leak de mmap/TLS por hilo**: cada `pthread_create`+exit parece perder varios MB (visible con el comando `meminfo` del shell) — no es el leak de `kernel_stack` (ya arreglado, con guard page real incluido), huele a los `mmap()` de pila/TLS de mlibc no liberándose al morir un thread.
 
 ---
 

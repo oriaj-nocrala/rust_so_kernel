@@ -36,10 +36,69 @@ fn main() {
     let uefi_path = out_dir.join("uefi.img");
     bootloader::UefiBoot::new(&kernel).create_disk_image(&uefi_path).unwrap();
 
+    let disk_image = ensure_ext2_disk_image();
+
     // pass the disk image paths as env variables to the `main.rs`
     println!("cargo:rustc-env=UEFI_PATH={}", uefi_path.display());
     println!("cargo:rustc-env=OVMF_CODE={}", ovmf_code.display());
     println!("cargo:rustc-env=OVMF_VARS={}", ovmf_vars.display());
+    println!("cargo:rustc-env=EXT2_DISK_PATH={}", disk_image.display());
+}
+
+/// Create `disk.img` (repo root) — a small ext2 filesystem, seeded from
+/// `disk-image-root/` — if it doesn't already exist. Attached by
+/// `src/main.rs` to QEMU's secondary IDE channel; read by the kernel's
+/// `fs::ext2` driver, mounted at `/mnt`.
+///
+/// Deliberately created ONCE, never regenerated: the whole point is a disk
+/// that persists across separate `cargo run` invocations (today: to prove
+/// the read path works against a real, persistent image; later, once
+/// write support exists, to actually keep written data). Delete the file
+/// yourself to reset it.
+fn ensure_ext2_disk_image() -> PathBuf {
+    let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let disk_path = manifest_dir.join("disk.img");
+    let seed_dir = manifest_dir.join("disk-image-root");
+
+    if disk_path.exists() {
+        return disk_path;
+    }
+
+    println!("cargo:warning=disk.img missing — creating a 16MiB ext2 image seeded from disk-image-root/...");
+
+    let status = Command::new("dd")
+        .args(["if=/dev/zero", "bs=1M", "count=16"])
+        .arg(format!("of={}", disk_path.display()))
+        .status()
+        .expect("Failed to spawn dd for disk.img");
+    assert!(status.success(), "dd failed to create disk.img");
+
+    // -O ^resize_inode,^dir_index: keep the on-disk layout as close to
+    // "vanilla" ext2 as possible — this kernel's fs::ext2 reader is a
+    // from-scratch minimal implementation, not a full ext2 stack, and
+    // there's no reason to exercise features it doesn't need to.
+    let status = Command::new("mke2fs")
+        .args(["-q", "-t", "ext2", "-b", "1024", "-O", "^resize_inode,^dir_index"])
+        .arg("-d").arg(&seed_dir)
+        .arg(&disk_path)
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(_) | Err(_) => {
+            // Don't fail the whole build over this — /mnt just won't be
+            // there (fs::ext2::init() logs and continues). Remove the
+            // half-formed image so the next build retries cleanly instead
+            // of picking up a zeroed, non-ext2 file forever.
+            let _ = std::fs::remove_file(&disk_path);
+            println!(
+                "cargo:warning=mke2fs not found or failed — /mnt won't be available. \
+                 Install e2fsprogs (e.g. `sudo pacman -S e2fsprogs`) and rebuild to get it."
+            );
+        }
+    }
+
+    disk_path
 }
 
 /// Builds the kernel crate for the bare-metal `x86_64-unknown-none` target
