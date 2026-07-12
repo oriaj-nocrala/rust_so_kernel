@@ -2,7 +2,9 @@
 
 Un kernel de sistema operativo x86_64 escrito en Rust desde cero, con multitarea preemptiva, aislamiento de memoria por proceso, un VFS propio, IPC, y soporte para binarios C reales vía un puerto propio de [mlibc](https://github.com/managarm/mlibc).
 
-![ConstanOS shell corriendo en QEMU](docs/screenshot.png)
+![ConstanOS: comando `demo` corriendo en QEMU — uname, VFS con ext2 real, threads, IPC, mmap y condvars en una sola sesión](docs/screenshot.png)
+
+*Captura del comando `demo` (`userspace/src/bin/demo.rs`) — un recorrido guiado por varias capacidades del kernel en una sola corrida real, no texto estático.*
 
 ## 📋 Descripción
 
@@ -30,7 +32,8 @@ Un pequeño shell interactivo (`shell`) hace `fork`+`exec` de estos binarios:
 
 | Programa | Qué hace |
 |---|---|
-| `shell` | REPL con `help`, y despacho de comandos a los demás binarios |
+| `shell` | REPL con `help`, y despacho de comandos a los demás binarios. También trae `cat`/`ls <path>`/`write <path>`/`sh <path>` (batch) y `meminfo` como built-ins |
+| `demo` | Recorrido guiado por varias capacidades en una corrida: VFS (initramfs/devfs/ramfs/**ext2 real**), threads con `meminfo` antes/después, IPC, mmap, condvars — la captura de arriba |
 | `ls` | Lista archivos vía `getdents64` real sobre el VFS |
 | `uname` | Info del sistema |
 | `uptime` / `sleep` / `tsc` | Demos de tiempo (hrtimer, `nanosleep`, TSC) |

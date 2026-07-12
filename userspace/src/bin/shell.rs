@@ -71,6 +71,7 @@ fn print_help() {
     println!("  meminfo     - show free physical memory (KiB)");
     println!("  cat <path>  - print a file's contents");
     println!("  ls <path>   - list any directory (plain 'ls' still lists /)");
+    println!("  demo        - guided tour: VFS/ext2, threads, IPC, pipes, signals");
 }
 
 fn run_program(name: &str) {

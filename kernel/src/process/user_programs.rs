@@ -56,7 +56,7 @@ pub enum ProgramSource {
 /// To add an ELF program:
 ///   1. Build it (see workflow above)
 ///   2. Add: ("name", ProgramSource::Elf(include_bytes!("../../embedded/name.elf")))
-static PROGRAMS: [(&str, ProgramSource); 16] = [
+static PROGRAMS: [(&str, ProgramSource); 17] = [
     ("uname",     ProgramSource::Elf(include_bytes!("../../embedded/uname.elf"))),
     ("shell",     ProgramSource::Elf(include_bytes!("../../embedded/shell.elf"))),
     ("snake",     ProgramSource::Elf(include_bytes!("../../embedded/snake.elf"))),
@@ -73,6 +73,7 @@ static PROGRAMS: [(&str, ProgramSource); 16] = [
     ("pipe_test", ProgramSource::Elf(include_bytes!("../../embedded/pipe_test.elf"))),
     ("signal_test", ProgramSource::Elf(include_bytes!("../../embedded/signal_test.elf"))),
     ("mlibc_signal_test", ProgramSource::Elf(include_bytes!("../../embedded/mlibc_signal_test.elf"))),
+    ("demo",      ProgramSource::Elf(include_bytes!("../../embedded/demo.elf"))),
 ];
 
 /// Print available programs to serial.

@@ -25,6 +25,7 @@ const RUST_PROGRAMS: &[(&str, &str)] = &[
     ("ls",         "ls.elf"),
     ("pipe_test",  "pipe_test.elf"),
     ("signal_test", "signal_test.elf"),
+    ("demo",       "demo.elf"),
 ];
 
 /// C binaries: (source file stem, embedded filename)
