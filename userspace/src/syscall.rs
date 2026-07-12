@@ -135,6 +135,17 @@ pub fn open(path_cstr: &[u8], flags: i32) -> i64 {
     unsafe { syscall2(SYS_OPEN, path_cstr.as_ptr() as u64, flags as u64) }
 }
 
+// ── open() flags (must match kernel/src/fs/types.rs::OpenFlags) ────────────
+
+pub const O_RDONLY: i32 = 0;
+pub const O_WRONLY: i32 = 1;
+#[allow(dead_code)]
+pub const O_RDWR: i32 = 2;
+pub const O_CREAT: i32 = 0o100;
+pub const O_TRUNC: i32 = 0o1000;
+#[allow(dead_code)]
+pub const O_APPEND: i32 = 0o2000;
+
 pub fn close(fd: i32) -> i64 {
     unsafe { syscall1(SYS_CLOSE, fd as u64) }
 }

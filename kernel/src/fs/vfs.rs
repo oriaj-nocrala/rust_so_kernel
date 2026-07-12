@@ -58,6 +58,16 @@ pub trait Inode: Send + Sync {
     fn readdir(&self, _offset: u64) -> Result<Option<DirEntry>, Errno> {
         Err(Errno::ENOTDIR)
     }
+
+    /// Create a new child `name` under this (directory) inode and return it.
+    ///
+    /// Called by `vfs::open` when `O_CREAT` is set and the target path
+    /// doesn't exist yet. Read-only filesystems (initramfs, devfs) keep the
+    /// default, which rejects with `EROFS`; writable ones (ramfs) override
+    /// it.
+    fn create(&self, _name: &str) -> Result<Arc<dyn Inode>, Errno> {
+        Err(Errno::EROFS)
+    }
 }
 
 // ── Filesystem ───────────────────────────────────────────────────────────────
@@ -144,8 +154,27 @@ pub fn resolve(path: &str) -> Result<Arc<dyn Inode>, Errno> {
 }
 
 /// Resolve `path` and open it, returning an FD-ready `FileHandle`.
+///
+/// If `path` doesn't exist and `O_CREAT` is set, resolves the *parent*
+/// directory instead and asks it to `create()` the leaf component.
 pub fn open(path: &str, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
-    resolve(path)?.open(flags)
+    match resolve(path) {
+        Ok(inode) => inode.open(flags),
+        Err(Errno::ENOENT) if flags.0 & OpenFlags::CREAT.0 != 0 => create_and_open(path, flags),
+        Err(e) => Err(e),
+    }
+}
+
+fn create_and_open(path: &str, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+    let idx = path.rfind('/').ok_or(Errno::EINVAL)?;
+    let leaf = &path[idx + 1..];
+    if leaf.is_empty() {
+        return Err(Errno::EINVAL);
+    }
+    let dir_path = if idx == 0 { "/" } else { &path[..idx] };
+    let dir = resolve(dir_path)?;
+    let inode = dir.create(leaf)?;
+    inode.open(flags)
 }
 
 /// Resolve `path` and return its metadata.

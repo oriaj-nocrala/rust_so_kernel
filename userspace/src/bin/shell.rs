@@ -66,6 +66,8 @@ fn print_help() {
     println!("  pipe_test   - pipe(2) fork/read/write/EOF test");
     println!("  signal_test - kill/sigaction/sigreturn/SIGCHLD test");
     println!("  mlibc_signal_test - same, via real mlibc pipe/kill/sigaction");
+    println!("  write <path> - capture lines from stdin into a /tmp file (end with '.')");
+    println!("  sh <path>   - run each line of a file as a shell command (batch mode)");
 }
 
 fn run_program(name: &str) {
@@ -84,6 +86,93 @@ fn run_program(name: &str) {
     }
 }
 
+/// `write <path>`: captures lines typed at the prompt into a file (created
+/// fresh each time — O_CREAT|O_TRUNC) until a line containing just "." is
+/// entered. Meant for /tmp (the only writable mount) — e.g. build up a
+/// batch script once, then replay it instantly with `sh` instead of
+/// re-typing/piping the same commands over serial every time.
+fn cmd_write(path: &str) {
+    if path.is_empty() {
+        eprintln!("write: usage: write <path>");
+        return;
+    }
+    let flags = syscall::O_CREAT | syscall::O_WRONLY | syscall::O_TRUNC;
+    let fd = syscall::with_cstr(path, |p| syscall::open(p, flags));
+    if fd < 0 {
+        eprintln!("write: cannot create {} ({})", path, fd);
+        return;
+    }
+    let fd = fd as i32;
+    println!("Writing to {} — a line with just '.' ends it.", path);
+
+    let mut line_buf = [0u8; 128];
+    loop {
+        print!("> ");
+        let len = read_line(&mut line_buf);
+        let raw = core::str::from_utf8(&line_buf[..len]).unwrap_or("");
+        if trim(raw) == "." {
+            break;
+        }
+        syscall::write(fd, raw.as_bytes());
+        syscall::write(fd, b"\n");
+    }
+    syscall::close(fd);
+    println!("OK");
+}
+
+/// `sh <path>`: batch mode — reads the whole file, then dispatches each
+/// non-empty line the same way the interactive prompt would, echoing "$
+/// <line>" first so the transcript reads the same either way.
+fn cmd_sh(path: &str) {
+    if path.is_empty() {
+        eprintln!("sh: usage: sh <path>");
+        return;
+    }
+    let fd = syscall::with_cstr(path, |p| syscall::open(p, syscall::O_RDONLY));
+    if fd < 0 {
+        eprintln!("sh: cannot open {} ({})", path, fd);
+        return;
+    }
+    let fd = fd as i32;
+
+    let mut content = [0u8; 4096];
+    let mut total = 0usize;
+    while total < content.len() {
+        let n = syscall::read(fd, &mut content[total..]);
+        if n <= 0 {
+            break;
+        }
+        total += n as usize;
+    }
+    syscall::close(fd);
+
+    let text = core::str::from_utf8(&content[..total]).unwrap_or("");
+    for line in text.split('\n') {
+        let line = trim(line);
+        if line.is_empty() {
+            continue;
+        }
+        println!("$ {}", line);
+        dispatch(line);
+    }
+}
+
+fn dispatch(cmd: &str) {
+    if cmd.is_empty() {
+        return;
+    } else if cmd == "help" {
+        print_help();
+    } else if cmd == "exit" {
+        syscall::exit(0);
+    } else if let Some(path) = cmd.strip_prefix("write ") {
+        cmd_write(trim(path));
+    } else if let Some(path) = cmd.strip_prefix("sh ") {
+        cmd_sh(trim(path));
+    } else {
+        run_program(cmd);
+    }
+}
+
 #[no_mangle]
 extern "C" fn _start() -> ! {
     println!("ConstanOS shell");
@@ -94,16 +183,6 @@ extern "C" fn _start() -> ! {
         print!("$ ");
         let len = read_line(&mut line_buf);
         let raw = core::str::from_utf8(&line_buf[..len]).unwrap_or("");
-        let cmd = trim(raw);
-
-        if cmd.is_empty() {
-            continue;
-        } else if cmd == "help" {
-            print_help();
-        } else if cmd == "exit" {
-            syscall::exit(0);
-        } else {
-            run_program(cmd);
-        }
+        dispatch(trim(raw));
     }
 }

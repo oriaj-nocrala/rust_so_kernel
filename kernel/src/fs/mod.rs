@@ -7,14 +7,17 @@
 //   vfs        — Inode + Filesystem traits, MountTable, path resolution
 //   initramfs  — /bin/*  backed by embedded ELF bytes
 //   devfs      — /dev/*  backed by the driver registry
+//   ramfs      — /tmp/*  writable, in-memory scratch space
 //
 // MOUNT LAYOUT (after init())
 //   /dev  → DevFs
 //   /bin  → InitramfsFs  (mounted at /bin so sys_exec uses "/bin/<name>")
+//   /tmp  → RamFs        (writable scratch — e.g. shell `write`/`sh` scripts)
 //   /     → InitramfsFs  (fallback root, also serves plain-name exec)
 
 pub mod devfs;
 pub mod initramfs;
+pub mod ramfs;
 pub mod types;
 pub mod vfs;
 
@@ -31,6 +34,8 @@ pub fn init() {
     vfs::mount("/dev", Arc::new(devfs::DevFs));
     // /bin — user-space ELF binaries from initramfs
     vfs::mount("/bin", Arc::new(initramfs::InitramfsFs));
+    // /tmp — writable scratch space (ramfs)
+    vfs::mount("/tmp", Arc::new(ramfs::RamFs::new()));
     // /   — root (fallback; also exposes binaries without /bin prefix)
     vfs::mount("/", Arc::new(initramfs::InitramfsFs));
 }
