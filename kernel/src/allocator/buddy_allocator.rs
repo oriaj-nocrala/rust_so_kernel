@@ -433,6 +433,31 @@ impl BuddyAllocator {
     // Debug
     // ====================================================================
 
+    /// Total free physical memory, in bytes — same free-list traversal as
+    /// `debug_print_stats`, just summed instead of printed. Cheap enough to
+    /// call from a syscall (e.g. a shell `meminfo` command): each order's
+    /// free list is normally short, and there are only `NUM_ORDERS` (17) of
+    /// them.
+    pub fn free_bytes(&self) -> u64 {
+        let mut total = 0u64;
+        for order in MIN_ORDER..=MAX_ORDER {
+            let idx = self.order_to_index(order);
+            let mut count = 0u64;
+            unsafe {
+                let mut current = self.free_lists[idx].head;
+                while let Some(addr) = current {
+                    count += 1;
+                    let phys_offset = crate::memory::physical_memory_offset();
+                    let virt = phys_offset + addr.as_u64();
+                    let block = &*(virt.as_ptr::<FreeBlock>());
+                    current = block.next;
+                }
+            }
+            total += count * (1u64 << order);
+        }
+        total
+    }
+
     /// Debug: print statistics (lock-free, no allocation).
     pub fn debug_print_stats(&self) {
         crate::serial_println_raw!("Buddy Allocator Stats:");

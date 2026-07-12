@@ -75,6 +75,48 @@ pub fn allocate_kernel_stack() -> VirtAddr {
     VirtAddr::new(virt_addr.as_u64() + (1 << KERNEL_STACK_ORDER))
 }
 
+/// `stack_top` (what `allocate_kernel_stack` returned) back to the
+/// physical base Buddy actually allocated.
+fn kernel_stack_phys_base(stack_top: VirtAddr) -> x86_64::PhysAddr {
+    let virt_base = stack_top - (1u64 << KERNEL_STACK_ORDER);
+    x86_64::PhysAddr::new(virt_base.as_u64() - crate::memory::physical_memory_offset().as_u64())
+}
+
+/// Return a kernel stack (as returned by `allocate_kernel_stack`) to the Buddy.
+///
+/// Callers must make sure the CPU isn't still executing on this stack —
+/// see `Scheduler::pending_stack_frees` for the one place that matters.
+pub fn free_kernel_stack(stack_top: VirtAddr) {
+    unsafe {
+        crate::allocator::phys_free(kernel_stack_phys_base(stack_top), KERNEL_STACK_ORDER);
+    }
+}
+
+/// Like `free_kernel_stack`, but never blocks — returns `false` instead of
+/// waiting if the Buddy lock is currently held elsewhere.
+///
+/// Needed from timer-interrupt context (`Scheduler::tick`'s
+/// `pending_stack_frees` drain): that ISR can interrupt *any* kernel code,
+/// including a heap allocation that's mid-way through a slab→Buddy refill
+/// with the Buddy lock already held and interrupts still enabled (nothing
+/// before this ever called `BUDDY.lock()` from an ISR, so ordinary heap
+/// allocations were never written to guard against that reentrancy). A
+/// blocking `.lock()` there spins forever: the interrupted code can't run
+/// again to release the lock until this same ISR returns, which it never
+/// does. Confirmed live — the very first version of this code (calling
+/// `free_kernel_stack` unconditionally from `tick()`) froze the kernel
+/// solid (idle task never reached its `hlt`, vCPU pegged at ~25% CPU)
+/// within a second or two of boot.
+pub fn try_free_kernel_stack(stack_top: VirtAddr) -> bool {
+    match crate::allocator::buddy_allocator::BUDDY.try_lock() {
+        Some(mut buddy) => {
+            unsafe { buddy.deallocate(kernel_stack_phys_base(stack_top), KERNEL_STACK_ORDER); }
+            true
+        }
+        None => false,
+    }
+}
+
 // ============================================================================
 // PROCESS CREATORS
 // ============================================================================

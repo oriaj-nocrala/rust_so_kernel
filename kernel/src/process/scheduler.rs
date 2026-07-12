@@ -64,6 +64,7 @@ fn write_fs_base(val: u64) {
     }
 }
 use spin::Mutex;
+use x86_64::VirtAddr;
 use super::{Process, Pid, ProcessState, TrapFrame};
 use crate::memory::address_space::AddressSpace;
 use crate::memory::vma::Vma;
@@ -164,6 +165,18 @@ pub struct Scheduler {
 
     /// Monotonic PID counter (0 is reserved for idle).
     next_pid: usize,
+
+    /// Kernel stacks awaiting `phys_free` — populated by `kill_current`'s
+    /// thread-reap path, which runs *on the dying thread's own kernel
+    /// stack* (called mid-syscall/exception, before the switch-away has
+    /// actually happened via `jump_to_trapframe`/`iretq`). Freeing those
+    /// physical frames immediately would let the Buddy allocator hand them
+    /// out to something else while this CPU is still executing on them.
+    /// Drained by `tick()` instead, which only ever runs once we're
+    /// guaranteed to be on a different process's stack (interrupts stay
+    /// off, hence no nested `tick()`, from the moment `kill_current` runs
+    /// until the new process's `iretq` re-enables them).
+    pending_stack_frees: Vec<VirtAddr>,
 }
 
 impl Scheduler {
@@ -180,6 +193,7 @@ impl Scheduler {
             remaining_ticks: 0,
             global_ticks: 0,
             next_pid: 1,
+            pending_stack_frees: Vec::new(),
         }
     }
 
@@ -340,8 +354,13 @@ impl Scheduler {
             );
             if proc.is_thread {
                 crate::serial_println!("  → thread, reaped immediately (no waitpid() will ever collect it)");
-                // `proc` drops here: releases its kernel stack slot and its
-                // Arc references to the shared AddressSpace/FileDescriptorTable.
+                // Defer the kernel stack's phys_free — see pending_stack_frees'
+                // doc comment for why it can't happen right here.
+                self.pending_stack_frees.push(proc.kernel_stack);
+                // `proc` drops here: releases the Process struct itself and its
+                // Arc references to the shared AddressSpace/FileDescriptorTable
+                // (safe immediately — unlike the kernel stack, that's ordinary
+                // kernel-heap memory, not the stack this code is executing on).
             } else {
                 proc.state = ProcessState::Zombie;
                 self.wait_queue.push_back(proc);
@@ -463,6 +482,21 @@ impl Scheduler {
     /// should happen (time slice exhausted).
     pub fn tick(&mut self) -> bool {
         self.global_ticks = self.global_ticks.wrapping_add(1);
+
+        // Safe w.r.t. *which* stacks these are: reaching a new timer tick
+        // means the CPU already executed some process's iretq since any
+        // pending_stack_frees entry was queued (interrupts are off from
+        // kill_current through that iretq, so no tick can land in between)
+        // — so none of these can be the stack we're currently running on.
+        //
+        // Still must use try_free (non-blocking): this runs inside the
+        // timer ISR, which can interrupt code that already holds the
+        // Buddy lock without having disabled interrupts (nothing before
+        // this ever called into Buddy from an ISR). Entries that lose the
+        // race just stay queued for the next tick.
+        self.pending_stack_frees.retain(|&stack_top| {
+            !crate::init::processes::try_free_kernel_stack(stack_top)
+        });
 
         if self.global_ticks % AGING_EPOCH == 0 {
             self.age_processes();

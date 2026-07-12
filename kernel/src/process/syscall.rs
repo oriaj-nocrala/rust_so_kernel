@@ -219,6 +219,7 @@ pub enum SyscallNumber {
     // Custom kernel syscalls (above Linux range)
     UptimeMs = 400,
     UptimeSec = 401,
+    MemInfoKb = 402,
 }
 
 impl SyscallNumber {
@@ -267,6 +268,7 @@ impl SyscallNumber {
             233 => Some(Self::EpollCtl),
             400 => Some(Self::UptimeMs),
             401 => Some(Self::UptimeSec),
+            402 => Some(Self::MemInfoKb),
             _ => None,
         }
     }
@@ -445,6 +447,7 @@ pub fn syscall_handler(
         SyscallNumber::EpollCtl => sys_epoll_ctl(arg1 as i32, arg2 as i32, arg3 as i32, arg4),
         SyscallNumber::UptimeMs => sys_uptime_ms(),
         SyscallNumber::UptimeSec => sys_uptime_sec(),
+        SyscallNumber::MemInfoKb => sys_meminfo_kb(),
     }
 }
 
@@ -1500,7 +1503,12 @@ fn sys_waitpid(child_pid: usize) -> SyscallResult {
         if let Some(pos) = scheduler.wait_queue.iter().position(|p| {
             p.pid.0 == child_pid && matches!(p.state, super::ProcessState::Zombie)
         }) {
-            scheduler.wait_queue.remove(pos);
+            // Safe to free the zombie's kernel stack immediately: we're
+            // running on the *parent's* stack here (this is its own
+            // waitpid() syscall), never the dead child's.
+            if let Some(proc) = scheduler.wait_queue.remove(pos) {
+                crate::init::processes::free_kernel_stack(proc.kernel_stack);
+            }
             already_zombie = true;
             core::ptr::null()
         } else {
@@ -1527,6 +1535,16 @@ fn sys_waitpid(child_pid: usize) -> SyscallResult {
 
 fn sys_uptime_ms() -> SyscallResult {
     crate::cpu::tsc::uptime_ms() as SyscallResult
+}
+
+/// sys_meminfo_kb (custom #402) — free physical memory, in KiB.
+///
+/// Mainly a debugging aid: run something in a loop (e.g. `sh` a script that
+/// spawns/kills threads or processes many times) and watch this between
+/// runs to catch a leak — see kernel_stack's `pending_stack_frees` /
+/// `free_kernel_stack` for the leak this was added to verify.
+fn sys_meminfo_kb() -> SyscallResult {
+    (crate::allocator::buddy_allocator::BUDDY.lock().free_bytes() / 1024) as SyscallResult
 }
 
 /// sys_uptime_sec (custom #202) — seconds elapsed since kernel boot.

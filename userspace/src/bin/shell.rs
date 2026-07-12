@@ -68,6 +68,7 @@ fn print_help() {
     println!("  mlibc_signal_test - same, via real mlibc pipe/kill/sigaction");
     println!("  write <path> - capture lines from stdin into a /tmp file (end with '.')");
     println!("  sh <path>   - run each line of a file as a shell command (batch mode)");
+    println!("  meminfo     - show free physical memory (KiB)");
 }
 
 fn run_program(name: &str) {
@@ -168,6 +169,8 @@ fn dispatch(cmd: &str) {
         cmd_write(trim(path));
     } else if let Some(path) = cmd.strip_prefix("sh ") {
         cmd_sh(trim(path));
+    } else if cmd == "meminfo" {
+        println!("free: {} KiB", syscall::meminfo_kb());
     } else {
         run_program(cmd);
     }

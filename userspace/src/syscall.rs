@@ -114,6 +114,7 @@ const SYS_EPOLL_WAIT: u64 = 232;
 const SYS_EPOLL_CTL: u64 = 233;
 const SYS_UPTIME_MS: u64 = 400;
 const SYS_UPTIME_SEC: u64 = 401;
+const SYS_MEMINFO_KB: u64 = 402;
 
 // ── File I/O ─────────────────────────────────────────────────────────────
 
@@ -310,6 +311,11 @@ pub fn uptime_ms() -> i64 {
 
 pub fn uptime_sec() -> i64 {
     unsafe { syscall0(SYS_UPTIME_SEC) }
+}
+
+/// Free physical memory, in KiB.
+pub fn meminfo_kb() -> i64 {
+    unsafe { syscall0(SYS_MEMINFO_KB) }
 }
 
 /// `struct timespec { i64 tv_sec; i64 tv_nsec; }`
