@@ -381,13 +381,30 @@ impl OwnedPageTable {
         &self,
         page: Page<Size2MiB>,
     ) -> Result<(), &'static str> {
+        let mut buddy = crate::allocator::buddy_allocator::BUDDY.lock();
+        self.unmap_page_and_free_2m_with_buddy(page, &mut buddy)
+    }
+
+    /// Same as `unmap_page_and_free_2m`, but takes an already-locked Buddy
+    /// instead of locking it itself — lets a caller that obtained the lock
+    /// via `try_lock()` (because blocking isn't safe in its context, e.g.
+    /// ISR/tick — see `AddressSpace::try_free_huge_vma`) reuse this without
+    /// a second, nested `lock()` call.
+    ///
+    /// # Safety
+    /// Must be called with interrupts disabled (cli).
+    pub unsafe fn unmap_page_and_free_2m_with_buddy(
+        &self,
+        page: Page<Size2MiB>,
+        buddy: &mut crate::allocator::buddy_allocator::BuddyAllocator,
+    ) -> Result<(), &'static str> {
         let mut mapper = self.create_mapper();
         let (frame, flush) = match mapper.unmap(page) {
             Ok(r) => r,
             Err(_) => return Ok(()),  // not mapped — nothing to free
         };
         flush.flush();
-        crate::allocator::phys_free(frame.start_address(), 21);
+        buddy.deallocate(frame.start_address(), 21);
         Ok(())
     }
 

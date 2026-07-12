@@ -177,6 +177,14 @@ pub struct Scheduler {
     /// off, hence no nested `tick()`, from the moment `kill_current` runs
     /// until the new process's `iretq` re-enables them).
     pending_stack_frees: Vec<VirtAddr>,
+
+    /// Same deferral, for a dying thread's `owned_stack_vma` (its mlibc
+    /// `mmap()`-allocated user-mode stack — see `Process::owned_stack_vma`).
+    /// The `AddressSpace` is kept alive via this `Arc` for as long as the
+    /// entry is queued, even if the `Process` that referenced it has
+    /// already been dropped — it may otherwise be the last reference if the
+    /// thread's parent process has also exited.
+    pending_vma_frees: Vec<(alloc::sync::Arc<AddressSpace>, u64, usize)>,
 }
 
 impl Scheduler {
@@ -194,6 +202,7 @@ impl Scheduler {
             global_ticks: 0,
             next_pid: 1,
             pending_stack_frees: Vec::new(),
+            pending_vma_frees: Vec::new(),
         }
     }
 
@@ -357,6 +366,11 @@ impl Scheduler {
                 // Defer the kernel stack's phys_free — see pending_stack_frees'
                 // doc comment for why it can't happen right here.
                 self.pending_stack_frees.push(proc.kernel_stack);
+                // Same deferral for the thread's own mmap'd user stack, if
+                // sys_clone found one — see pending_vma_frees' doc comment.
+                if let Some((start, size_pages)) = proc.owned_stack_vma {
+                    self.pending_vma_frees.push((proc.address_space.clone(), start, size_pages));
+                }
                 // `proc` drops here: releases the Process struct itself and its
                 // Arc references to the shared AddressSpace/FileDescriptorTable
                 // (safe immediately — unlike the kernel stack, that's ordinary
@@ -496,6 +510,11 @@ impl Scheduler {
         // race just stay queued for the next tick.
         self.pending_stack_frees.retain(|&stack_top| {
             !crate::init::processes::try_free_kernel_stack(stack_top)
+        });
+        // Same reasoning as pending_stack_frees above — see try_free_huge_vma's
+        // doc comment for why this specific free needs the try_lock treatment.
+        self.pending_vma_frees.retain(|(address_space, start, size_pages)| {
+            !unsafe { address_space.try_free_huge_vma(*start, *size_pages) }
         });
 
         if self.global_ticks % AGING_EPOCH == 0 {

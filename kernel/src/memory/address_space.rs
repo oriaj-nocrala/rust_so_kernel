@@ -449,4 +449,35 @@ impl AddressSpace {
 
         Ok(())
     }
+
+    /// Non-blocking munmap of a Huge2M VMA — used to free a dead thread's
+    /// stack (see `Process::owned_stack_vma`) from `Scheduler::tick`'s
+    /// `pending_vma_frees` drain, which runs in timer-ISR context and can't
+    /// block on the Buddy lock for the same reason `kernel_stack`'s
+    /// deferred free can't — see `init::processes::try_free_kernel_stack`'s
+    /// doc comment for the full story (an ISR blocking on a lock some
+    /// interrupted code already holds deadlocks the whole single core).
+    ///
+    /// Returns `false` (try again next tick) if the Buddy lock is
+    /// contended, instead of the `Result` `sys_munmap` uses — there's no
+    /// caller here to hand an error to.
+    ///
+    /// Only handles Huge2M (what `sys_clone` only ever records — see its
+    /// doc comment) — no COW refcount involved, unlike the 4 KiB Anonymous
+    /// path `sys_munmap` also supports.
+    pub unsafe fn try_free_huge_vma(&self, start: u64, size_pages: usize) -> bool {
+        let mut buddy = match crate::allocator::buddy_allocator::BUDDY.try_lock() {
+            Some(b) => b,
+            None => return false,
+        };
+
+        let n_huge = size_pages / 512;
+        for i in 0..n_huge {
+            let va = start + i as u64 * 0x200_000;
+            let page = Page::<Size2MiB>::containing_address(VirtAddr::new(va));
+            let _ = self.page_table.unmap_page_and_free_2m_with_buddy(page, &mut buddy);
+        }
+        let _ = self.vmas.lock().remove(start);
+        true
+    }
 }

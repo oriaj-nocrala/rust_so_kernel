@@ -95,6 +95,23 @@ pub struct Process {
     /// forever — see `Scheduler::kill_current`.
     pub is_thread: bool,
 
+    /// For a thread (`is_thread == true`) whose stack `sys_clone` found to
+    /// be a private `mmap()`-backed VMA (as opposed to a caller-supplied
+    /// one via `pthread_attr_setstack`): `(vma_start, size_pages)`, freed
+    /// automatically when this thread dies. `None` for every other process
+    /// and for threads given an explicit stack. See `Scheduler::kill_current`
+    /// and `pending_vma_frees` for why the actual free is deferred rather
+    /// than happening inline.
+    ///
+    /// Exists because upstream mlibc never frees a thread's stack itself —
+    /// `pthread_exit()`/`thread_join()` both have explicit TODO/FIXME
+    /// comments admitting the leak (see `mlibc/options/posix/generic/
+    /// pthread.cpp` and `mlibc/options/internal/generic/threads.cpp`). The
+    /// kernel doing it is the only fix that doesn't require patching mlibc
+    /// itself, and reuses the exact same "runs on the exiting thread's own
+    /// stack, can't free anything inline" logic as `kernel_stack`.
+    pub owned_stack_vma: Option<(u64, usize)>,
+
     /// Bitmask of pending (not yet delivered) signals — bit N = signal N.
     pub pending_signals: u64,
     /// Bitmask of currently blocked signals (`sigprocmask`).
@@ -158,6 +175,7 @@ impl Process {
             waiting_for: None,
             fs_base: 0,
             is_thread: false,
+            owned_stack_vma: None,
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
             pending_signals: 0,
@@ -217,6 +235,7 @@ impl Process {
             waiting_for: None,
             fs_base: 0,
             is_thread: false,
+            owned_stack_vma: None,
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
             pending_signals: 0,
@@ -255,6 +274,7 @@ impl Process {
             waiting_for: None,
             fs_base: 0,
             is_thread: false,
+            owned_stack_vma: None,
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
             pending_signals: 0,
@@ -281,6 +301,7 @@ impl Process {
         kernel_stack: VirtAddr,
         address_space: Arc<AddressSpace>,
         files: Arc<Mutex<FileDescriptorTable>>,
+        owned_stack_vma: Option<(u64, usize)>,
     ) -> Self {
         let mut trapframe = Box::new(TrapFrame::default());
 
@@ -327,6 +348,7 @@ impl Process {
             waiting_for: None,
             fs_base: 0,
             is_thread: true,
+            owned_stack_vma,
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
             pending_signals: 0,

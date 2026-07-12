@@ -1345,6 +1345,21 @@ fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
         }
     };
 
+    // If `stack` falls inside a VMA that mlibc's sys_prepare_stack mmap'd
+    // just for this thread (the common case — Huge2M, since mlibc's
+    // default_stacksize is exactly 2 MiB, which sys_mmap_anon always backs
+    // with a huge page), record it so the kernel can free it when this
+    // thread dies. mlibc itself never does (see Process::owned_stack_vma's
+    // doc comment) — a caller-supplied stack (pthread_attr_setstack) has no
+    // matching VMA here and is correctly left alone.
+    let owned_stack_vma = address_space.find_vma(stack).and_then(|vma| {
+        if vma.kind == crate::memory::vma::VmaKind::Huge2M {
+            Some((vma.start, vma.size_pages))
+        } else {
+            None
+        }
+    });
+
     let kernel_stack = crate::init::processes::allocate_kernel_stack();
 
     unsafe { core::arch::asm!("cli"); }
@@ -1357,7 +1372,7 @@ fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
             super::Process::new_thread(
                 pid, parent_pid,
                 x86_64::VirtAddr::new(entry), x86_64::VirtAddr::new(stack),
-                kernel_stack, address_space, files,
+                kernel_stack, address_space, files, owned_stack_vma,
             )
         );
         thread.set_name("thread");
