@@ -56,7 +56,7 @@ pub enum ProgramSource {
 /// To add an ELF program:
 ///   1. Build it (see workflow above)
 ///   2. Add: ("name", ProgramSource::Elf(include_bytes!("../../embedded/name.elf")))
-static PROGRAMS: [(&str, ProgramSource); 19] = [
+static PROGRAMS: [(&str, ProgramSource); 20] = [
     ("uname",     ProgramSource::Elf(include_bytes!("../../embedded/uname.elf"))),
     ("shell",     ProgramSource::Elf(include_bytes!("../../embedded/shell.elf"))),
     ("snake",     ProgramSource::Elf(include_bytes!("../../embedded/snake.elf"))),
@@ -76,6 +76,13 @@ static PROGRAMS: [(&str, ProgramSource); 19] = [
     ("demo",      ProgramSource::Elf(include_bytes!("../../embedded/demo.elf"))),
     ("stat_test", ProgramSource::Elf(include_bytes!("../../embedded/stat_test.elf"))),
     ("argv_test", ProgramSource::Elf(include_bytes!("../../embedded/argv_test.elf"))),
+    // Manually vendored (not built by kernel/build.rs — no Makefile-based
+    // C_PROGRAMS support yet): busybox-1.36.1 built out-of-tree against
+    // sysroot/ with CONFIG_TRUE=y (only the `true` applet) as a first
+    // smoke test. See the busybox-readiness memory / session notes for
+    // the exact cross-compile recipe and every sysroot header gap it took
+    // to get this far.
+    ("busybox",   ProgramSource::Elf(include_bytes!("../../embedded/busybox.elf"))),
 ];
 
 /// Print available programs to serial.

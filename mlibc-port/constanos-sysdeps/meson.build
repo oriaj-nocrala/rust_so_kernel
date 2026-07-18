@@ -26,6 +26,7 @@ if not no_headers
 		'include/abi-bits/signal.h',
 		'include/abi-bits/socket.h',
 		'include/abi-bits/termios.h',
+		'include/abi-bits/time.h',
 		'include/abi-bits/blkcnt_t.h',
 		'include/abi-bits/blksize_t.h',
 		'include/abi-bits/dev_t.h',
@@ -61,6 +62,19 @@ if not no_headers
 		'include/abi-bits/sigval.h',
 		'include/abi-bits/sigevent.h',
 		subdir: 'abi-bits',
+		follow_symlinks: true
+	)
+
+	install_headers(
+		'include/sys/sysmacros.h',
+		'include/sys/statfs.h',
+		subdir: 'sys',
+		follow_symlinks: true
+	)
+
+	install_headers(
+		'include/mntent.h',
+		'include/malloc.h',
 		follow_symlinks: true
 	)
 endif

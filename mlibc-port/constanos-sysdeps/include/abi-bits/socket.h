@@ -48,14 +48,22 @@ struct cmsghdr {
 
 #define SCM_CREDENTIALS 0x02
 
-#define SOCK_DGRAM 1
-#define SOCK_RAW 2
-#define SOCK_SEQPACKET 3
-#define SOCK_STREAM 4
-#define SOCK_DCCP 5
-#define SOCK_NONBLOCK 0x10000
-#define SOCK_CLOEXEC 0x20000
-#define SOCK_RDM 0x40000
+// Real Linux x86-64 values — this kernel's own socket()/connect()/etc.
+// (kernel/src/process/syscall.rs) don't take a `type` argument at all (no
+// domain/type/protocol like real Linux socket(2)), so these constants
+// never cross the syscall boundary; the old dripos-template values here
+// (SOCK_STREAM=4, SOCK_RDM=0x40000, ...) were purely a latent correctness
+// bug waiting for userspace code that ORs or bounds-checks them together,
+// which is exactly what BusyBox's libbb.h does (a `<= 127` static assert
+// over `SOCK_STREAM | SOCK_DGRAM | SOCK_RDM | SOCK_SEQPACKET | SOCK_RAW`).
+#define SOCK_STREAM 1
+#define SOCK_DGRAM 2
+#define SOCK_RAW 3
+#define SOCK_RDM 4
+#define SOCK_SEQPACKET 5
+#define SOCK_DCCP 6
+#define SOCK_NONBLOCK 0004000
+#define SOCK_CLOEXEC 02000000
 
 #define SOL_SOCKET 1
 #define SOL_IPV6 41

@@ -4,9 +4,10 @@
 // the resulting ELF binaries into kernel/embedded/ so that include_bytes!
 // can embed them.
 //
-// Two families:
-//   Rust — built with cargo in userspace/
-//   C    — built with clang+mlibc from userspace/c/; sysroot at ../sysroot/
+// Three families:
+//   Rust     — built with cargo in userspace/
+//   C        — built with clang+mlibc from userspace/c/; sysroot at ../sysroot/
+//   BusyBox  — external `make`-based build, see scripts/build-busybox.sh
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -38,6 +39,11 @@ const C_PROGRAMS: &[(&str, &str)] = &[
     ("argv_test", "argv_test.elf"),
 ];
 
+/// Not built here at all — see the busybox.elf handling below, which
+/// shells out to scripts/build-busybox.sh (a `make`-based external build,
+/// nothing like the Rust/C recipes above) only when the output is missing.
+const BUSYBOX_ELF: &str = "busybox.elf";
+
 fn main() {
     let kernel_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let workspace_root = kernel_dir.parent().unwrap();
@@ -57,6 +63,8 @@ fn main() {
         workspace_root.join("mlibc-port"),
         workspace_root.join("mlibc-cross.ini"),
         workspace_root.join("scripts/setup-mlibc.sh"),
+        workspace_root.join("scripts/build-busybox.sh"),
+        workspace_root.join("busybox-config/minimal.config"),
     ] {
         println!("cargo:rerun-if-changed={}", entry.display());
     }
@@ -140,5 +148,25 @@ fn main() {
 
         assert!(status.success(), "C userspace build failed for {}", stem);
         println!("cargo:warning=userspace(c): {}.c -> {}", stem, elf_name);
+    }
+
+    // ── Build BusyBox if missing ────────────────────────────────────────────
+    //
+    // A `make`-based external build (BusyBox's own Kconfig+Makefile system),
+    // nothing like the Rust/clang recipes above — scripts/build-busybox.sh
+    // owns the whole recipe (cross-compiler wrapper, config, build, copy).
+    // Only invoked when the output is missing: unlike the fast Rust/C
+    // rebuilds above, this takes real time, and BusyBox's own Makefile
+    // already does its own incremental rebuilds if re-run, so there's
+    // nothing gained by unconditionally shelling out to it every time.
+    let busybox_elf = embedded_dir.join(BUSYBOX_ELF);
+    if !busybox_elf.exists() {
+        println!("cargo:warning=busybox.elf missing — building BusyBox (this can take a minute)...");
+        let status = Command::new("bash")
+            .arg(workspace_root.join("scripts/build-busybox.sh"))
+            .current_dir(workspace_root)
+            .status()
+            .expect("Failed to spawn scripts/build-busybox.sh");
+        assert!(status.success(), "scripts/build-busybox.sh failed");
     }
 }

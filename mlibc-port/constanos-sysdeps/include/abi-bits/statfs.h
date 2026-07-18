@@ -1,11 +1,14 @@
 #ifndef _ABIBITS_STATFS_H
 #define _ABIBITS_STATFS_H
 
+// Upstream mlibc gates this whole header behind __MLIBC_LINUX_OPTION
+// ("statfs() is inherently Linux specific, enable the Linux option or
+// don't use this header") — this port deliberately does the latter: pulls
+// in just this one struct (via sys/statfs.h, itself copied from mlibc's
+// disabled "linux" option) without the rest of that option's machinery.
+// The struct layout below has no actual Linux-kernel dependency, just a
+// name upstream associated with one.
 #include <mlibc-config.h>
-
-#if !__MLIBC_LINUX_OPTION
-#  error "statfs() is inherently Linux specific. Enable the Linux option or do not use this header."
-#endif /* !__MLIBC_LINUX_OPTION */
 
 #include <abi-bits/fsblkcnt_t.h>
 #include <abi-bits/fsfilcnt_t.h>
