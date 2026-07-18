@@ -102,6 +102,35 @@ static FB_STATE: Mutex<FbState> = Mutex::new(FbState {
 });
 static FB_CLEARED: AtomicBool = AtomicBool::new(false);
 
+// ── Serial mirror ──────────────────────────────────────────────────────────
+//
+// User-process stdout (fd 1) is bound to this driver, so it's only ever
+// visible on the framebuffer — invisible in headless runs (`-display none`)
+// short of a `screendump`. Mirror every byte written here out over COM1 too
+// (raw port I/O, same as SerialConsole::write — no shared lock, so no
+// deadlock risk against the FB_STATE/FRAMEBUFFER locks already held by the
+// caller), tagged with a `[stdout] ` prefix at the start of each line so
+// it's greppable/distinguishable from the kernel's own `serial_println!`
+// diagnostics in the same log.
+static STDOUT_AT_LINE_START: AtomicBool = AtomicBool::new(true);
+
+fn mirror_to_serial(buf: &[u8]) {
+    use x86_64::instructions::port::Port;
+    let mut port = Port::<u8>::new(0x3F8);
+    for &byte in buf {
+        if STDOUT_AT_LINE_START.load(Ordering::Relaxed) {
+            for &b in b"[stdout] " {
+                unsafe { port.write(b); }
+            }
+            STDOUT_AT_LINE_START.store(false, Ordering::Relaxed);
+        }
+        unsafe { port.write(byte); }
+        if byte == b'\n' {
+            STDOUT_AT_LINE_START.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 // ── Parse CSI parameter string ────────────────────────────────────────────────
 
 fn parse_params(buf: &[u8]) -> ([u32; 16], usize) {
@@ -281,6 +310,8 @@ impl FileHandle for FramebufferConsole {
     }
 
     fn write(&mut self, buf: &[u8]) -> FileResult<usize> {
+        mirror_to_serial(buf);
+
         let mut state = FB_STATE.lock();
         let mut fb_guard = FRAMEBUFFER.lock();
         let Some(fb) = fb_guard.as_mut() else { return Ok(buf.len()); };
