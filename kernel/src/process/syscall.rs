@@ -409,6 +409,20 @@ fn current_cwd() -> alloc::string::String {
     cwd
 }
 
+/// Read the running process's `exe_name` (see `Process::exe_name`'s doc
+/// comment) — same cli/sti discipline as `current_cwd`.
+fn current_exe_name() -> alloc::string::String {
+    unsafe { core::arch::asm!("cli"); }
+    let name = {
+        let mut scheduler = super::scheduler::local_scheduler();
+        scheduler.running_mut()
+            .map(|p| p.exe_name.clone())
+            .unwrap_or_default()
+    };
+    unsafe { core::arch::asm!("sti"); }
+    name
+}
+
 /// Normalize a raw user-supplied path against the current process's cwd.
 /// Every syscall taking a filesystem path must route it through here so
 /// relative paths (and `.`/`..` inside absolute ones, e.g. `/a/../b`) work —
@@ -1587,7 +1601,7 @@ fn sys_fork() -> SyscallResult {
     unsafe { core::arch::asm!("cli"); }
 
     // Collect what we need from the running process
-    let (child_as, parent_pid, parent_fs_base, files, child_tf, parent_cwd, parent_pgid) = {
+    let (child_as, parent_pid, parent_fs_base, files, child_tf, parent_cwd, parent_pgid, parent_exe_name) = {
         let scheduler = super::scheduler::local_scheduler();
         match scheduler.running_ref() {
             Some(proc) => {
@@ -1596,7 +1610,7 @@ fn sys_fork() -> SyscallResult {
                 tf_copy.rax = 0;
 
                 match unsafe { proc.address_space.fork() } {
-                    Ok(child_as) => (child_as, proc.pid, proc.fs_base, proc.files.lock().clone(), tf_copy, proc.cwd.clone(), proc.pgid),
+                    Ok(child_as) => (child_as, proc.pid, proc.fs_base, proc.files.lock().clone(), tf_copy, proc.cwd.clone(), proc.pgid, proc.exe_name.clone()),
                     Err(e) => {
                         serial_println!("fork: address_space.fork() failed: {}", e);
                         unsafe { core::arch::asm!("sti"); }
@@ -1620,7 +1634,7 @@ fn sys_fork() -> SyscallResult {
         let mut child = alloc::boxed::Box::new(
             super::Process::new_user_from_fork(
                 pid, parent_pid, alloc::boxed::Box::new(child_tf),
-                kernel_stack, child_as, files, parent_cwd, parent_pgid,
+                kernel_stack, child_as, files, parent_cwd, parent_pgid, parent_exe_name,
             )
         );
         child.fs_base = parent_fs_base; // inherit TLS base from parent
@@ -1660,10 +1674,10 @@ fn sys_fork() -> SyscallResult {
 /// thread's `Process` immediately instead of waiting for a collector that
 /// will never come).
 fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
-    let (parent_pid, address_space, files, parent_cwd, parent_pgid) = {
+    let (parent_pid, address_space, files, parent_cwd, parent_pgid, parent_exe_name) = {
         let sched = super::scheduler::local_scheduler();
         match sched.running_ref() {
-            Some(proc) => (proc.pid, proc.address_space.clone(), proc.files.clone(), proc.cwd.clone(), proc.pgid),
+            Some(proc) => (proc.pid, proc.address_space.clone(), proc.files.clone(), proc.cwd.clone(), proc.pgid, proc.exe_name.clone()),
             None => return errno::ESRCH,
         }
     };
@@ -1695,7 +1709,7 @@ fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
             super::Process::new_thread(
                 pid, parent_pid,
                 x86_64::VirtAddr::new(entry), x86_64::VirtAddr::new(stack),
-                kernel_stack, address_space, files, owned_stack_vma, parent_cwd, parent_pgid,
+                kernel_stack, address_space, files, owned_stack_vma, parent_cwd, parent_pgid, parent_exe_name,
             )
         );
         thread.set_name("thread");
@@ -1792,7 +1806,8 @@ fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> SyscallResult 
 
     serial_println!("sys_exec: loading '{}' (argc={}, envc={})", name, argv.len(), envp.len());
 
-    let elf_bytes = match find_program_elf(name) {
+    let resolved_name = resolve_exec_name(name);
+    let elf_bytes = match crate::fs::initramfs::bytes(&resolved_name) {
         Some(b) => b,
         None => {
             serial_println!("sys_exec: '{}' not found", name);
@@ -1822,6 +1837,7 @@ fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> SyscallResult 
         crate::serial_println_raw!("[EXEC] scheduler locked, swapping address space");
         match scheduler.running_mut() {
             Some(proc) => {
+                proc.exe_name = resolved_name;
                 crate::serial_println_raw!("[EXEC] dropping old AS");
                 // Replace address space with freshly loaded one. This drops
                 // this Process's Arc reference to whatever it had before —
@@ -1880,8 +1896,10 @@ fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> SyscallResult 
 }
 
 /// Resolves `name` (whatever `exec()`'s caller passed as the program path —
-/// a bareword, a `./`-relative path, or an absolute path like `/bin/ls`)
-/// against the flat `PROGRAMS` table in `user_programs.rs`.
+/// a bareword, a `./`-relative path, or an absolute path like `/bin/ls`) to
+/// the `PROGRAMS` registry name (see `user_programs.rs`) that should serve
+/// it, so the caller can both look up the ELF bytes and record it as
+/// `Process::exe_name`.
 ///
 /// This kernel has no real `/bin`, `/usr/bin`, etc. — every registered
 /// program is exposed flat at initramfs root (see `user_programs.rs`'s doc
@@ -1895,10 +1913,23 @@ fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> SyscallResult 
 /// cwd-normalization every other path-taking syscall already gets via
 /// `resolve_path()`, then match on the basename — consistent with the
 /// initramfs directory listing already being flat.
-fn find_program_elf(name: &str) -> Option<&'static [u8]> {
+///
+/// `/proc/self/exe` is special-cased: this kernel has no real `/proc`
+/// inode for it (no symlinks, no per-process `/proc/<pid>` directories at
+/// all — see `fs::procfs`, which only serves `/proc/meminfo`). BusyBox's
+/// `ash` (`FEATURE_SH_STANDALONE`) re-execs exactly this path for any
+/// applet that isn't `NOFORK`/`NOEXEC` (most of them — `echo`/`ls` are
+/// exceptions, `cat` is not), relying on it resolving to "whatever ELF is
+/// currently running in this process" the same way a real `/proc/self/exe`
+/// symlink would. `Process::exe_name` tracks exactly that (set on every
+/// successful exec, inherited across fork/clone), so re-resolve against it
+/// instead of doing a real path lookup.
+fn resolve_exec_name(name: &str) -> alloc::string::String {
     let resolved = resolve_path(name);
-    let basename = resolved.rsplit('/').next().unwrap_or(&resolved);
-    crate::fs::initramfs::bytes(basename)
+    if resolved == "/proc/self/exe" {
+        return current_exe_name();
+    }
+    alloc::string::String::from(resolved.rsplit('/').next().unwrap_or(&resolved))
 }
 
 /// waitpid(61): long waitpid(pid_t pid, int *status, int options)

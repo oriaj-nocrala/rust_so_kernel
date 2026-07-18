@@ -9,17 +9,20 @@
 //   devfs      — /dev/*  backed by the driver registry
 //   ramfs      — /tmp/*  writable, in-memory scratch space
 //   ext2       — /mnt/*  read-only, backed by the ATA disk (persists across reboots)
+//   procfs     — /proc/* read-only, generated on open() (currently just meminfo)
 //
 // MOUNT LAYOUT (after init())
-//   /dev  → DevFs
-//   /bin  → InitramfsFs  (mounted at /bin so sys_exec uses "/bin/<name>")
-//   /tmp  → RamFs        (writable scratch — e.g. shell `write`/`sh` scripts)
-//   /mnt  → Ext2Fs        (read-only; only mounted if the ATA disk is present)
-//   /     → InitramfsFs  (fallback root, also serves plain-name exec)
+//   /dev   → DevFs
+//   /bin   → InitramfsFs  (mounted at /bin so sys_exec uses "/bin/<name>")
+//   /tmp   → RamFs        (writable scratch — e.g. shell `write`/`sh` scripts)
+//   /mnt   → Ext2Fs        (read-only; only mounted if the ATA disk is present)
+//   /proc  → ProcFs        (read-only, synthetic — /proc/meminfo)
+//   /      → InitramfsFs  (fallback root, also serves plain-name exec)
 
 pub mod devfs;
 pub mod ext2;
 pub mod initramfs;
+pub mod procfs;
 pub mod ramfs;
 pub mod types;
 pub mod vfs;
@@ -48,6 +51,8 @@ pub fn init() {
         }
         Err(e) => crate::serial_println!("ext2: not mounted ({})", e),
     }
+    // /proc — synthetic, read-only (meminfo today)
+    vfs::mount("/proc", Arc::new(procfs::ProcFs));
     // /   — root (fallback; also exposes binaries without /bin prefix)
     vfs::mount("/", Arc::new(initramfs::InitramfsFs));
 }

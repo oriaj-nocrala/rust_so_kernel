@@ -185,6 +185,16 @@ pub struct Process {
     /// `signal_handlers` not being inherited across `fork()`.
     pub cwd: alloc::string::String,
 
+    /// The `PROGRAMS` registry name (see `user_programs.rs`) that resolved
+    /// the ELF currently running in this process — set on every successful
+    /// `exec()`, inherited across `fork()`/`clone()` like `cwd`. Exists so
+    /// `execve("/proc/self/exe", ...)` (BusyBox's `FEATURE_SH_STANDALONE`
+    /// re-exec trick for any applet that isn't `NOFORK`/`NOEXEC`, e.g.
+    /// `cat`) can resolve to "whatever ELF this process is currently
+    /// running", the same thing a real `/proc/self/exe` symlink would
+    /// point at — see `syscall::find_program_elf`.
+    pub exe_name: alloc::string::String,
+
     /// Bitmask of pending (not yet delivered) signals — bit N = signal N.
     pub pending_signals: u64,
     /// Bitmask of currently blocked signals (`sigprocmask`).
@@ -257,6 +267,7 @@ impl Process {
             is_thread: false,
             owned_stack_vma: None,
             cwd: alloc::string::String::from("/"),
+            exe_name: alloc::string::String::new(),
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
             pending_signals: 0,
@@ -325,6 +336,7 @@ impl Process {
             is_thread: false,
             owned_stack_vma: None,
             cwd: alloc::string::String::from("/"),
+            exe_name: alloc::string::String::new(),
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
             pending_signals: 0,
@@ -344,6 +356,7 @@ impl Process {
         files: FileDescriptorTable,
         cwd: alloc::string::String,
         parent_pgid: u32,
+        exe_name: alloc::string::String,
     ) -> Self {
         crate::serial_println!(
             "Creating FORKED process PID {} (parent PID {})",
@@ -374,6 +387,7 @@ impl Process {
             is_thread: false,
             owned_stack_vma: None,
             cwd,
+            exe_name,
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
             pending_signals: 0,
@@ -403,6 +417,7 @@ impl Process {
         owned_stack_vma: Option<(u64, usize)>,
         cwd: alloc::string::String,
         parent_pgid: u32,
+        exe_name: alloc::string::String,
     ) -> Self {
         let mut trapframe = Box::new(TrapFrame::default());
 
@@ -458,6 +473,7 @@ impl Process {
             is_thread: true,
             owned_stack_vma,
             cwd,
+            exe_name,
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
             pending_signals: 0,

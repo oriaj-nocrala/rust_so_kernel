@@ -116,7 +116,7 @@ Implemented syscalls (Linux-compatible numbers — see `SyscallNumber` enum for 
 | 61 | `waitpid` | Real POSIX pid overloads (`>0` exact/`0` own pgid/`-1` any child/`<-1` group), `WNOHANG`/`WUNTRACED`, real exit status incl. `WIFSIGNALED` |
 | 62 | `kill` | Send a signal (single pid, no process groups) |
 | 72 | `fcntl` | Only `F_DUPFD`/`F_DUPFD_CLOEXEC` do something; rest are validity-checked stubs |
-| 82/83/84/87 | `rename`/`mkdir`/`rmdir`/`unlink` | VFS mutation — only ramfs (`/tmp`) supports these, ext2/devfs/initramfs are read-only |
+| 82/83/84/87 | `rename`/`mkdir`/`rmdir`/`unlink` | VFS mutation — only ramfs (`/tmp`) supports these, ext2/devfs/initramfs/procfs are read-only |
 | 158 | `arch_prctl` | `ARCH_SET_FS` (TLS base) |
 | 202 | `futex` | Wait/wake, backs mlibc mutexes/condvars |
 | 213/232/233 | `epoll_create`/`epoll_wait`/`epoll_ctl` | Epoll |
@@ -137,6 +137,8 @@ Register a new driver by:
 
 Current devices: `/dev/null`, `/dev/zero`, `/dev/console` (serial), `/dev/fb` (framebuffer), `/dev/kbd` (non-blocking keyboard).
 
+VFS mounts (`kernel/src/fs/mod.rs`): `/dev` (devfs), `/bin` + `/` (initramfs, embedded ELFs), `/tmp` (ramfs, writable), `/mnt` (ext2, read-only, best-effort), `/proc` (procfs, read-only, synthetic — currently just `/proc/meminfo`, generated fresh on every `open()` from the live Buddy allocator stats).
+
 The `FileDescriptorTable` per process holds up to 16 open files. FDs 0/1/2 are pre-opened to `/dev/console` (stdin/stdout/stderr).
 
 ## Userspace Programs (`kernel/src/process/user_programs.rs`)
@@ -153,7 +155,9 @@ Only the embedded/*.elf → `PROGRAMS` registration step is manual:
 2. Register it in the relevant `build.rs` list (skip this for BusyBox-style external builds).
 3. Add `("name", ProgramSource::Elf(include_bytes!("../../embedded/name.elf")))` to `PROGRAMS` in `user_programs.rs` — this alone makes it runnable both via `sys_exec`/the shell (any typed command not matching a shell builtin falls through to `fork()`+`exec_argv()`) and visible in `/` under initramfs (`ls`, `opendir`).
 
-Only `shell` is spawned automatically at boot (`init/processes.rs`); everything else is launched on demand from the shell.
+Only `shell` is spawned automatically at boot (`init/processes.rs`). It immediately `fork()`s and execs `busybox ash` as its first action — real BusyBox `ash` (job control, line editing, `FEATURE_SH_STANDALONE`+`FEATURE_SH_NOFORK` applet dispatch, see `busybox-config/minimal.config`) is the default interactive shell. If `ash` ever exits (its own `exit`, Ctrl-D, a crash), `shell`'s own hand-rolled REPL takes over as a fallback instead of leaving the system with no way to type anything — see `userspace/src/bin/shell.rs::_start`. Everything else is launched on demand, from either shell.
+
+`sys_exec`'s program resolution (`resolve_exec_name` in `process/syscall.rs`) normalizes the requested path against cwd and matches on **basename** against the flat `PROGRAMS` table — this kernel has no real `/bin`, `/usr/bin` directories, so `/bin/hello` (from a real `$PATH` search), `./ls` (explicit relative path), and a bare `hello` all resolve the same way. `/proc/self/exe` is special-cased to resolve to whatever ELF the *calling* process is currently running (`Process::exe_name`, set on every successful exec, inherited across `fork()`/`clone()`) — this is what lets `ash` re-exec itself for any BusyBox applet that isn't `NOFORK`/`NOEXEC` (most of them; `echo`/`ls` are the exceptions).
 
 The fallback `ProgramSource::RawCode` embeds inline assembly tests from `process/user_test_fileio.rs` and is used for bootstrapping when no ELF exists.
 

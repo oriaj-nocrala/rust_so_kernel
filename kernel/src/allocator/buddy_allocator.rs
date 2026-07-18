@@ -458,6 +458,12 @@ impl BuddyAllocator {
         total
     }
 
+    /// Total physical memory this allocator owns, in bytes (sum of every
+    /// region handed to it at boot via `add_region`/init — see `total_memory`).
+    pub fn total_bytes(&self) -> u64 {
+        self.total_memory
+    }
+
     /// Debug: print statistics (lock-free, no allocation).
     pub fn debug_print_stats(&self) {
         crate::serial_println_raw!("Buddy Allocator Stats:");

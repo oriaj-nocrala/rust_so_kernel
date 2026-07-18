@@ -388,6 +388,16 @@ fn dispatch(cmd: &str) {
 
 #[no_mangle]
 extern "C" fn _start() -> ! {
+    // BusyBox ash (real job control, line editing, standalone/nofork applet
+    // dispatch — see the busybox-readiness session notes for how it got
+    // there) is the default interactive shell now. This process (PID 1)
+    // stays alive as ash's parent/waitpid()er and, if ash ever exits (its
+    // own `exit`, Ctrl-D, or a crash), falls back into this hand-rolled
+    // REPL below instead of leaving the system with no way to type
+    // anything — same fork/exec/waitpid path as any other `run_program`
+    // call, just invoked once up front instead of from typed input.
+    run_program("busybox ash");
+
     println!("ConstanOS shell");
     println!("Type 'help' for a list of commands.");
 
