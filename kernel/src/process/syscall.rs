@@ -1879,8 +1879,26 @@ fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> SyscallResult 
     unsafe { super::trapframe::jump_to_user(next_tf) }
 }
 
+/// Resolves `name` (whatever `exec()`'s caller passed as the program path —
+/// a bareword, a `./`-relative path, or an absolute path like `/bin/ls`)
+/// against the flat `PROGRAMS` table in `user_programs.rs`.
+///
+/// This kernel has no real `/bin`, `/usr/bin`, etc. — every registered
+/// program is exposed flat at initramfs root (see `user_programs.rs`'s doc
+/// comment). The hand-rolled shell always passed the bare typed word
+/// straight through, which happened to line up with that flat layout by
+/// coincidence. A real shell doing its own `$PATH` search (e.g. BusyBox
+/// `ash` with `FEATURE_SH_STANDALONE`) tries candidates like `/bin/hello`
+/// and `/usr/bin/hello`; an explicit relative path like `./ls` is also
+/// legitimate and common. Both used to fail here with a raw exact-string
+/// match against the bare registered name. Fix: run the same
+/// cwd-normalization every other path-taking syscall already gets via
+/// `resolve_path()`, then match on the basename — consistent with the
+/// initramfs directory listing already being flat.
 fn find_program_elf(name: &str) -> Option<&'static [u8]> {
-    crate::fs::initramfs::bytes(name)
+    let resolved = resolve_path(name);
+    let basename = resolved.rsplit('/').next().unwrap_or(&resolved);
+    crate::fs::initramfs::bytes(basename)
 }
 
 /// waitpid(61): long waitpid(pid_t pid, int *status, int options)
