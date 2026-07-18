@@ -8,9 +8,10 @@
 # `cargo build`, which does it automatically) first.
 #
 # busybox-config/minimal.config is the tracked starting point (currently:
-# CONFIG_STATIC + CONFIG_TRUE + CONFIG_ECHO only — a deliberately tiny
-# smoke-test set, see the busybox-readiness memory/session notes for how
-# it was arrived at and what broke getting here). `make oldconfig` fills
+# CONFIG_STATIC + CONFIG_TRUE + CONFIG_ECHO + CONFIG_LS + ash w/ job control,
+# line editing, and standalone/nofork applet dispatch — a deliberately small
+# set, see the busybox-readiness memory/session notes for how it was arrived
+# at and what broke getting here). `make oldconfig` fills
 # in anything new the pinned BusyBox version added since with defaults, so
 # this keeps working across submodule bumps without hand-editing again.
 #

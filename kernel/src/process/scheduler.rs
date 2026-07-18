@@ -735,8 +735,15 @@ impl Scheduler {
         let Some(proc) = self.running_mut() else { return; };
         let Some(status) = proc.pending_wait_status.take() else { return; };
         if proc.waiting_status_ptr != 0 {
+            // write_unaligned: this pointer only passed the coarse
+            // in-canonical-range check in `validate_user_buffer` when
+            // waitpid() first blocked — not an alignment or mapping check.
+            // A misaligned-but-in-range value (e.g. from a caller that
+            // forgot to zero this syscall arg — see the userspace shell's
+            // waitpid() wrapper bug this was found from) must not be able
+            // to panic the kernel via `write`'s UB precondition here.
             unsafe {
-                core::ptr::write(proc.waiting_status_ptr as *mut i32, status);
+                core::ptr::write_unaligned(proc.waiting_status_ptr as *mut i32, status);
             }
         }
         proc.waiting_status_ptr = 0;

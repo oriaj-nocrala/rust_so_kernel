@@ -315,7 +315,14 @@ pub fn exec_argv(path_cstr: &[u8], args: &[&[u8]], envp: &[&[u8]]) -> i64 {
 }
 
 pub fn waitpid(child_pid: i64) -> i64 {
-    unsafe { syscall1(SYS_WAITPID, child_pid as u64) }
+    // Must be syscall3, not syscall1: sys_waitpid reads status_ptr/options
+    // from rsi/rdx regardless of how many args this wrapper "intends" to
+    // pass. syscall1's asm leaves those registers unconstrained, so a
+    // syscall1 call here previously handed the kernel whatever garbage was
+    // sitting in rsi at the call site as a real user pointer, which the
+    // kernel later wrote through — crashing on Rust's alignment/non-null
+    // UB check the moment that garbage wasn't a valid aligned address.
+    unsafe { syscall3(SYS_WAITPID, child_pid as u64, 0, 0) }
 }
 
 /// Sends `sig` to `pid`. Only single-pid targets (no process groups).

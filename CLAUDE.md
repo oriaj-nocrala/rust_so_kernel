@@ -19,6 +19,18 @@ cd kernel && cargo build --target x86_64-unknown-none
 
 The top-level `cargo run` builds the kernel ELF (via artifact dependency), wraps it in a UEFI disk image via the `bootloader` crate, then spawns `qemu-system-x86_64`. Serial output appears in the terminal.
 
+### Headless interactive debugging (no display/keyboard)
+
+For non-interactive sessions (agents, CI) that need to type into the shell and read output — not just watch `cargo run`'s serial stream — use `scripts/qemu-debug.sh` instead of hand-building a `qemu-system-x86_64` command line or a one-off key-sending script. It wraps the whole flow: headless boot (`-display none`, serial to a log file, monitor over a unix socket, `-d int` exception trace), a `sendkey`-based `send "text"` that maps characters to QEMU keynames (including shift-combos) and paces them so the PS/2 ISR doesn't drop events, plus `screendump`/`log`/`wait-for`. See the script's header comment for the full subcommand list and an example session. Background/monitor-socket gotchas are recorded in the `debugging-technique-qemu-monitor` memory.
+
+```bash
+scripts/qemu-debug.sh start                                    # cargo build + launch headless
+scripts/qemu-debug.sh wait-for "About to start first process"  # poll serial.log instead of a blind sleep
+scripts/qemu-debug.sh send "busybox ash" && scripts/qemu-debug.sh enter
+scripts/qemu-debug.sh log 50                                   # tail serial.log
+scripts/qemu-debug.sh stop
+```
+
 There is no test framework wired up; `cargo test` is not used.
 
 ## Two-Crate Workspace
@@ -101,7 +113,7 @@ Implemented syscalls (Linux-compatible numbers — see `SyscallNumber` enum for 
 | 56/57 | `clone`/`fork` | Threads (shared AddressSpace+fds) / COW process fork |
 | 59 | `exec` | `(path, argv, envp)` — real argc/argv/envp built onto the new stack, see `memory/elf_loader.rs::build_initial_stack` |
 | 60 | `exit` | Terminate process (immediate switch) |
-| 61 | `waitpid` | Reap a specific child pid (no `-1`/"any child"; exit status always reported as 0 — see `sys_waitpid`'s doc comment for why that's not trivial to fix) |
+| 61 | `waitpid` | Real POSIX pid overloads (`>0` exact/`0` own pgid/`-1` any child/`<-1` group), `WNOHANG`/`WUNTRACED`, real exit status incl. `WIFSIGNALED` |
 | 62 | `kill` | Send a signal (single pid, no process groups) |
 | 72 | `fcntl` | Only `F_DUPFD`/`F_DUPFD_CLOEXEC` do something; rest are validity-checked stubs |
 | 82/83/84/87 | `rename`/`mkdir`/`rmdir`/`unlink` | VFS mutation — only ramfs (`/tmp`) supports these, ext2/devfs/initramfs are read-only |

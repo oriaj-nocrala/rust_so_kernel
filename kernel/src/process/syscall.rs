@@ -1962,7 +1962,16 @@ fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> SyscallResult {
             let pid = proc.pid.0;
             crate::init::processes::free_kernel_stack(proc.kernel_stack);
             if status_ptr != 0 {
-                unsafe { core::ptr::write(status_ptr as *mut i32, status); }
+                // write_unaligned, not write: `validate_user_buffer` only
+                // checks that this pointer falls inside the user canonical
+                // range, not that it's actually 4-byte aligned or even
+                // mapped — a buggy/malicious caller can hand us anything
+                // that passes that check. `write` panics via Rust's
+                // alignment UB precondition on a misaligned pointer, which
+                // takes the whole kernel down; `write_unaligned` doesn't
+                // care about alignment and degrades to (at worst) a page
+                // fault the demand-paging handler can still route sanely.
+                unsafe { core::ptr::write_unaligned(status_ptr as *mut i32, status); }
             }
             Outcome::Return(pid as SyscallResult)
         } else if let Some(pos) = stopped_pos {
@@ -1970,7 +1979,8 @@ fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> SyscallResult {
             let pid = scheduler.wait_queue[pos].pid.0;
             scheduler.wait_queue[pos].stop_reported = true;
             if status_ptr != 0 {
-                unsafe { core::ptr::write(status_ptr as *mut i32, status); }
+                // write_unaligned: see the zombie_pos branch above for why.
+                unsafe { core::ptr::write_unaligned(status_ptr as *mut i32, status); }
             }
             Outcome::Return(pid as SyscallResult)
         } else if options & WNOHANG != 0 {
@@ -3332,6 +3342,21 @@ fn poll_waiter_watches_channel(
 ///
 /// Delivers POLLIN on fd=0 to any process blocked in poll/epoll_wait that
 /// is watching stdin.
+///
+/// Unlike the serial ISR (which only calls this when `tty::feed_input` says
+/// a byte was really queued), the PS/2 keyboard ISR calls this on *every*
+/// raw scancode — including key-release codes and modifier presses, which
+/// push nothing into `KEYBOARD_BUFFER` (see `keyboard::process_scancode`).
+/// A real keypress is always followed by its release scancode shortly
+/// after; if that release lands while a process is already blocked in a
+/// *fresh* `poll()` call (e.g. waiting for the *next* keystroke), this must
+/// not wake it with a spurious "0 fds ready" — that's indistinguishable
+/// from a real timeout to the caller (confirmed root cause of BusyBox
+/// ash's line editor exiting after ~2 keystrokes: `poll()` returning 0 is
+/// read as EOF by `libbb/read_key.c`). So: only actually wake the process
+/// once `deliver_poll_result_phys` finds something genuinely ready; put an
+/// otherwise-untouched waiter back so a real future event or its own
+/// timeout still wakes it normally.
 pub(crate) fn poll_wakeup_for_fd0() {
     let phys_offset = crate::memory::physical_memory_offset().as_u64();
 
@@ -3352,13 +3377,19 @@ pub(crate) fn poll_wakeup_for_fd0() {
 
     let Some(waiter) = waiter else { return; };
 
+    let count = deliver_poll_result_phys(&waiter, phys_offset);
+    if count == 0 {
+        if waiter.pid < MAX_PROCS {
+            POLL_WAITERS.lock()[waiter.pid] = Some(waiter);
+        }
+        return;
+    }
+
     // Cancel timeout timer (if any)
     if let Some(tid) = waiter.timer_id {
         crate::time::hrtimer::cancel(tid);
     }
 
-    // Compute and write results to physical buffer; then wake
-    let count = deliver_poll_result_phys(&waiter, phys_offset);
     let mut sched = super::scheduler::local_scheduler();
     sched.wake_with_retval(waiter.pid, count as u64);
     // sched guard dropped; caller (keyboard ISR) still holds IF=0
