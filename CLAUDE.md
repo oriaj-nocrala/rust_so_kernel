@@ -96,7 +96,7 @@ Implemented syscalls (Linux-compatible numbers — see `SyscallNumber` enum for 
 | 1 | `write` | Write to fd |
 | 2 | `open` | Open device/file by path |
 | 3 | `close` | Close fd |
-| 4/5/6 | `stat`/`fstat`/`lstat` | File metadata (`lstat` aliases `stat` — no symlinks yet) |
+| 4/5/6 | `stat`/`fstat`/`lstat` | File metadata; `lstat` genuinely doesn't follow a symlink at the final path component (real symlink support, see below) |
 | 7 | `poll` | Wait for events on up to 16 fds |
 | 8 | `lseek` | Reposition file offset |
 | 9/11 | `mmap`/`munmap` | Anonymous memory mapping |
@@ -117,6 +117,7 @@ Implemented syscalls (Linux-compatible numbers — see `SyscallNumber` enum for 
 | 62 | `kill` | Send a signal (single pid, no process groups) |
 | 72 | `fcntl` | Only `F_DUPFD`/`F_DUPFD_CLOEXEC` do something; rest are validity-checked stubs |
 | 82/83/84/87 | `rename`/`mkdir`/`rmdir`/`unlink` | VFS mutation — only ramfs (`/tmp`) supports these, ext2/devfs/initramfs/procfs are read-only |
+| 89 | `readlink` | Real symlink target read (`fs::vfs::resolve_no_follow` + `Inode::readlink`) |
 | 158 | `arch_prctl` | `ARCH_SET_FS` (TLS base) |
 | 202 | `futex` | Wait/wake, backs mlibc mutexes/condvars |
 | 213/232/233 | `epoll_create`/`epoll_wait`/`epoll_ctl` | Epoll |
@@ -137,7 +138,9 @@ Register a new driver by:
 
 Current devices: `/dev/null`, `/dev/zero`, `/dev/console` (serial), `/dev/fb` (framebuffer), `/dev/kbd` (non-blocking keyboard).
 
-VFS mounts (`kernel/src/fs/mod.rs`): `/dev` (devfs), `/bin` + `/` (initramfs, embedded ELFs), `/tmp` (ramfs, writable), `/mnt` (ext2, read-only, best-effort), `/proc` (procfs, read-only, synthetic — currently just `/proc/meminfo`, generated fresh on every `open()` from the live Buddy allocator stats).
+VFS mounts (`kernel/src/fs/mod.rs`): `/dev` (devfs), `/bin` + `/` (initramfs, embedded ELFs), `/tmp` (ramfs, writable), `/mnt` (ext2, read-only, best-effort), `/proc` (procfs, read-only, synthetic — `/proc/meminfo` generated fresh on every `open()` from the live Buddy allocator stats; `/proc/self` and `/proc/<pid>/exe` are real symlinks, see `fs::procfs`).
+
+**Real symlinks** (`fs/vfs.rs`): `Inode::readlink()`, `resolve()` (follows a symlink at every path component including the final one — `open`/`stat` semantics) vs `resolve_no_follow()` (leaf left alone — `lstat`/`readlink` semantics), both with an 8-hop `ELOOP` guard. Only `fs::procfs` currently produces symlinks (nothing creates them from userspace — no `symlink()` syscall).
 
 The `FileDescriptorTable` per process holds up to 16 open files. FDs 0/1/2 are pre-opened to `/dev/console` (stdin/stdout/stderr).
 
@@ -157,7 +160,7 @@ Only the embedded/*.elf → `PROGRAMS` registration step is manual:
 
 Only `shell` is spawned automatically at boot (`init/processes.rs`). It immediately `fork()`s and execs `busybox ash` as its first action — real BusyBox `ash` (job control, line editing, `FEATURE_SH_STANDALONE`+`FEATURE_SH_NOFORK` applet dispatch, see `busybox-config/minimal.config`) is the default interactive shell. If `ash` ever exits (its own `exit`, Ctrl-D, a crash), `shell`'s own hand-rolled REPL takes over as a fallback instead of leaving the system with no way to type anything — see `userspace/src/bin/shell.rs::_start`. Everything else is launched on demand, from either shell.
 
-`sys_exec`'s program resolution (`resolve_exec_name` in `process/syscall.rs`) normalizes the requested path against cwd and matches on **basename** against the flat `PROGRAMS` table — this kernel has no real `/bin`, `/usr/bin` directories, so `/bin/hello` (from a real `$PATH` search), `./ls` (explicit relative path), and a bare `hello` all resolve the same way. `/proc/self/exe` is special-cased to resolve to whatever ELF the *calling* process is currently running (`Process::exe_name`, set on every successful exec, inherited across `fork()`/`clone()`) — this is what lets `ash` re-exec itself for any BusyBox applet that isn't `NOFORK`/`NOEXEC` (most of them; `echo`/`ls` are the exceptions).
+`sys_exec` (`process/syscall.rs`) resolves the requested path through the **real VFS**, not a special-cased table lookup: `resolve_exec_path` cwd-normalizes the path, then manually walks symlinks (`fs::vfs::resolve_no_follow` + `Inode::readlink`, up to 8 hops, `ELOOP` beyond that) to a canonical absolute path, which is then `fs::vfs::open()`'d and read fully into an owned buffer for the ELF loader — no more flat `PROGRAMS`-table-only fast path. This is what makes `/bin/hello` (a real `$PATH` search candidate), `./ls` (explicit relative path), a bare `hello`, and `/proc/self/exe` (a real symlink, see below) all resolve through one uniform mechanism instead of three different ones agreeing by coincidence. The canonical resolved path is recorded as `Process::exe_name` (inherited across `fork()`/`clone()`) — this is what `/proc/<pid>/exe` reports.
 
 The fallback `ProgramSource::RawCode` embeds inline assembly tests from `process/user_test_fileio.rs` and is used for bootstrapping when no ELF exists.
 

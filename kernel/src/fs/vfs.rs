@@ -117,6 +117,14 @@ pub trait Inode: Send + Sync {
     fn insert_child(&self, _name: &str, _node: Arc<dyn Inode>) -> Result<(), Errno> {
         Err(Errno::EROFS)
     }
+
+    /// Read this inode's symlink target — a path string, either absolute
+    /// or relative to the symlink's own containing directory. Only
+    /// meaningful on `Symlink`-type inodes (see `file_type`); the default
+    /// matches `readlink(2)` on a non-symlink.
+    fn readlink(&self) -> Result<alloc::string::String, Errno> {
+        Err(Errno::EINVAL)
+    }
 }
 
 // ── Filesystem ───────────────────────────────────────────────────────────────
@@ -161,13 +169,35 @@ pub fn mount(prefix: &'static str, fs: Arc<dyn Filesystem>) {
 
 // ── Path resolution ──────────────────────────────────────────────────────────
 
-/// Resolve an absolute path to its inode.
+/// Symlink chains longer than this are rejected with `ELOOP`, same spirit
+/// as real Linux's (much larger) `MAXSYMLINKS` — this kernel only ever
+/// produces short, deliberately-built chains (procfs), so a small bound
+/// is enough to catch a real cycle without being a meaningful limitation.
+const MAX_SYMLINK_HOPS: u32 = 8;
+
+/// Resolve an absolute path to its inode, following symlinks — including
+/// one at the final path component (matches `open()`/`stat()` semantics).
+/// Use `resolve_no_follow` for `lstat`/`readlink`, which must see the
+/// symlink itself rather than whatever it points to.
 ///
 /// # Errors
 /// - `EINVAL`  — path does not start with `/`
 /// - `ENOENT`  — no mount found or a path component doesn't exist
 /// - `ENOTDIR` — a non-terminal component is not a directory
+/// - `ELOOP`   — more than `MAX_SYMLINK_HOPS` symlinks chained together
 pub fn resolve(path: &str) -> Result<Arc<dyn Inode>, Errno> {
+    resolve_inner(path, true, MAX_SYMLINK_HOPS)
+}
+
+/// Like `resolve`, but never follows a symlink at the *final* path
+/// component — intermediate components are still always followed (real
+/// `lstat(2)`/`readlink(2)` behavior: `/a/link/b` still requires `link` to
+/// be a real, followable directory, only the leaf is left alone).
+pub fn resolve_no_follow(path: &str) -> Result<Arc<dyn Inode>, Errno> {
+    resolve_inner(path, false, MAX_SYMLINK_HOPS)
+}
+
+fn resolve_inner(path: &str, follow_final: bool, hops_left: u32) -> Result<Arc<dyn Inode>, Errno> {
     if !path.starts_with('/') {
         return Err(Errno::EINVAL);
     }
@@ -190,12 +220,38 @@ pub fn resolve(path: &str) -> Result<Arc<dyn Inode>, Errno> {
     };
 
     let mut node: Arc<dyn Inode> = entry.fs.root();
+    drop(table); // don't hold the mount table locked across a recursive resolve()
 
-    for component in rel.split('/').filter(|s| !s.is_empty()) {
-        match component {
+    let components: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    let last_idx = components.len().checked_sub(1);
+
+    for (i, component) in components.iter().enumerate() {
+        match *component {
             "."  => { /* stay at current directory */ }
             ".." => { /* parent not implemented yet — stay put */ }
-            name => { node = node.lookup(name)?; }
+            name => {
+                node = node.lookup(name)?;
+                let is_final = Some(i) == last_idx;
+                if node.file_type() == FileType::Symlink && (!is_final || follow_final) {
+                    if hops_left == 0 {
+                        return Err(Errno::ELOOP);
+                    }
+                    let target = node.readlink()?;
+                    // Targets this kernel's own synthetic symlinks (procfs)
+                    // ever produce are always absolute; a relative target
+                    // is approximated by normalizing against root, since
+                    // Inode has no notion of "my containing directory" to
+                    // resolve against properly. Nothing here creates
+                    // relative symlinks today, so this is untested but
+                    // harmless dead weight rather than a real gap.
+                    let abs_target = if target.starts_with('/') {
+                        target
+                    } else {
+                        normalize_path("/", &target)
+                    };
+                    node = resolve_inner(&abs_target, follow_final, hops_left - 1)?;
+                }
+            }
         }
     }
 

@@ -227,7 +227,7 @@ fn create_user_processes() {
 
             user_proc.set_name(name);
             user_proc.set_priority(5);
-            user_proc.exe_name = alloc::string::String::from(*name);
+            user_proc.exe_name = alloc::format!("/{}", name);
 
             // The shell is the only process spawned at boot (everything
             // else is exec'd on demand from it) — it becomes the tty's

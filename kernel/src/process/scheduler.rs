@@ -950,6 +950,33 @@ pub fn current_pid() -> Option<usize> {
     local_scheduler().current_pid().map(|pid| pid.0)
 }
 
+/// Same as `current_pid()`, but self-contained (`cli`/`sti` around the
+/// lock) — safe to call from anywhere, not just from inside an
+/// already-`cli`'d syscall body like `current_pid()` requires (see the
+/// module doc's "Interrupt safety" note: holding `SCHEDULER` with
+/// interrupts enabled can deadlock against the timer ISR). Used by
+/// `fs::procfs`, which isn't part of the syscall dispatch path and so
+/// has no surrounding `cli` to rely on.
+pub fn current_pid_safe() -> Option<usize> {
+    unsafe { core::arch::asm!("cli"); }
+    let pid = local_scheduler().current_pid().map(|p| p.0);
+    unsafe { core::arch::asm!("sti"); }
+    pid
+}
+
+/// Look up an arbitrary process's `exe_name` by pid — checked against
+/// `running` plus every run queue and the wait queue (see `iter_all`).
+/// Self-contained `cli`/`sti`, same reasoning as `current_pid_safe`.
+/// Backs `/proc/<pid>/exe`'s `readlink()` (`fs::procfs`).
+pub fn exe_name_for_pid(pid: usize) -> Option<alloc::string::String> {
+    unsafe { core::arch::asm!("cli"); }
+    let name = local_scheduler().iter_all()
+        .find(|p| p.pid.0 == pid)
+        .map(|p| p.exe_name.clone());
+    unsafe { core::arch::asm!("sti"); }
+    name
+}
+
 pub fn find_current_vma(addr: u64) -> Option<(usize, Vma)> {
     let scheduler = local_scheduler();
     let proc = scheduler.running_ref()?;

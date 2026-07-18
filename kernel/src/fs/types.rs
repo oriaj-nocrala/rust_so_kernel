@@ -31,6 +31,7 @@ impl Errno {
     pub const ERANGE:  Self = Self(34);
     pub const ENOSYS:  Self = Self(38);
     pub const ENOTEMPTY: Self = Self(39);
+    pub const ELOOP:   Self = Self(40);
 
     /// Syscall return value for this error (negative i64).
     #[inline]
@@ -159,6 +160,23 @@ impl Stat {
             st_uid: 0, st_gid: 0, _pad0: 0, st_rdev: 0,
             st_size: size, st_blksize: 4096,
             st_blocks: (size + 511) / 512,
+            st_atime: 0, st_atime_nsec: 0,
+            st_mtime: 0, st_mtime_nsec: 0,
+            st_ctime: 0, st_ctime_nsec: 0,
+            _reserved: [0; 3],
+        }
+    }
+
+    /// Construct a symlink stat. `target_len` is the byte length of the
+    /// link target string — real `stat()` reports a symlink's `st_size`
+    /// as the length of the path it points to, not the size of any real
+    /// backing storage (there isn't one).
+    pub fn symlink(ino: u64, target_len: i64) -> Self {
+        Self {
+            st_dev: 1, st_ino: ino, st_nlink: 1,
+            st_mode: FileType::Symlink.as_mode_bits() | 0o777,
+            st_uid: 0, st_gid: 0, _pad0: 0, st_rdev: 0,
+            st_size: target_len, st_blksize: 4096, st_blocks: 0,
             st_atime: 0, st_atime_nsec: 0,
             st_mtime: 0, st_mtime_nsec: 0,
             st_ctime: 0, st_ctime_nsec: 0,

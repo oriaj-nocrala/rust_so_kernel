@@ -66,6 +66,8 @@ constexpr long SYS_rename = 82;
 constexpr long SYS_mkdir = 83;
 constexpr long SYS_rmdir = 84;
 constexpr long SYS_unlink = 87;
+constexpr long SYS_lstat = 6;
+constexpr long SYS_readlink = 89;
 constexpr long SYS_dup = 32;
 constexpr long SYS_dup2 = 33;
 constexpr long SYS_fcntl = 72;
@@ -276,20 +278,21 @@ void convert_stat(const KernelStat &in, struct stat *out) {
 } // namespace
 
 // Backs stat()/lstat()/fstat() alike (mlibc funnels all three through this
-// one entry point, discriminated by `fsfdt`). This kernel doesn't resolve
-// symlinks at all yet (there's no symlink support), so lstat's fsfd_target
-// ends up here as plain `path` too — same as stat(), no behavioral
-// difference until the kernel grows symlinks. fd_path/none (the *at()
-// directory-relative forms) aren't wired up: this kernel's stat/fstat only
-// take an absolute-ish path or a bare fd, no dirfd+relative-path syscall.
+// one entry point, discriminated by `fsfdt`). `lstat()` is `fsfd_target::path`
+// with `AT_SYMLINK_NOFOLLOW` set in `flags` — real symlink support now
+// exists kernel-side (see kernel/src/fs/vfs.rs's `resolve`/`resolve_no_follow`),
+// so this now genuinely routes to the no-follow SYS_lstat instead of aliasing
+// plain stat(). fd_path/none (the *at() directory-relative forms) aren't
+// wired up: this kernel's stat/fstat only take an absolute-ish path or a
+// bare fd, no dirfd+relative-path syscall.
 int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags,
 		struct stat *statbuf) {
-	(void)flags;
 	KernelStat ks{};
 	long ret;
 	switch (fsfdt) {
 		case fsfd_target::path:
-			ret = raw_syscall(SYS_stat, (long)path, (long)&ks);
+			ret = raw_syscall((flags & AT_SYMLINK_NOFOLLOW) ? SYS_lstat : SYS_stat,
+					(long)path, (long)&ks);
 			break;
 		case fsfd_target::fd:
 			ret = raw_syscall(SYS_fstat, fd, (long)&ks);
@@ -300,6 +303,18 @@ int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags,
 	if (ret < 0)
 		return (int)-ret;
 	convert_stat(ks, statbuf);
+	return 0;
+}
+
+// readlink(): this kernel's SYS_readlink(89) returns the byte count written
+// (never NUL-terminated, truncated silently if `max_size` is too small) —
+// same convention as real Linux, so no post-processing needed beyond
+// converting the raw return value into mlibc's (errno, *length) pair.
+int sys_readlink(const char *path, void *buffer, size_t max_size, ssize_t *length) {
+	long ret = raw_syscall(SYS_readlink, (long)path, (long)buffer, (long)max_size);
+	if (ret < 0)
+		return (int)-ret;
+	*length = (ssize_t)ret;
 	return 0;
 }
 

@@ -200,6 +200,7 @@ pub enum SyscallNumber {
     Mkdir = 83,
     Rmdir = 84,
     Unlink = 87,
+    Readlink = 89,
     Dup = 32,
     Dup2 = 33,
     Fcntl = 72,
@@ -262,6 +263,7 @@ impl SyscallNumber {
             83 => Some(Self::Mkdir),
             84 => Some(Self::Rmdir),
             87 => Some(Self::Unlink),
+            89 => Some(Self::Readlink),
             32 => Some(Self::Dup),
             33 => Some(Self::Dup2),
             72 => Some(Self::Fcntl),
@@ -329,6 +331,7 @@ pub mod errno {
     pub const ESPIPE: i64 = -29;
     pub const ERANGE: i64 = -34;
     pub const ENOSYS: i64 = -38;
+    pub const ELOOP: i64 = -40;
     pub const EAGAIN: i64 = -11;
     pub const EWOULDBLOCK: i64 = -11;
     pub const EPIPE: i64 = -32;
@@ -409,20 +412,6 @@ fn current_cwd() -> alloc::string::String {
     cwd
 }
 
-/// Read the running process's `exe_name` (see `Process::exe_name`'s doc
-/// comment) — same cli/sti discipline as `current_cwd`.
-fn current_exe_name() -> alloc::string::String {
-    unsafe { core::arch::asm!("cli"); }
-    let name = {
-        let mut scheduler = super::scheduler::local_scheduler();
-        scheduler.running_mut()
-            .map(|p| p.exe_name.clone())
-            .unwrap_or_default()
-    };
-    unsafe { core::arch::asm!("sti"); }
-    name
-}
-
 /// Normalize a raw user-supplied path against the current process's cwd.
 /// Every syscall taking a filesystem path must route it through here so
 /// relative paths (and `.`/`..` inside absolute ones, e.g. `/a/../b`) work —
@@ -480,7 +469,7 @@ pub fn syscall_handler(
         SyscallNumber::Close => sys_close(arg1 as i32),
         SyscallNumber::Stat => sys_stat(arg1 as usize, arg2 as usize),
         SyscallNumber::Fstat => sys_fstat(arg1 as i32, arg2 as usize),
-        SyscallNumber::Lstat => sys_stat(arg1 as usize, arg2 as usize), // no symlinks yet
+        SyscallNumber::Lstat => sys_lstat(arg1 as usize, arg2 as usize),
         SyscallNumber::Sigaction => sys_sigaction(arg1 as u32, arg2, arg3),
         SyscallNumber::Sigprocmask => sys_sigprocmask(arg1 as i32, arg2, arg3),
         SyscallNumber::Sigreturn => sys_sigreturn(),
@@ -493,6 +482,7 @@ pub fn syscall_handler(
         SyscallNumber::Mkdir => sys_mkdir(arg1 as usize),
         SyscallNumber::Rmdir => sys_rmdir(arg1 as usize),
         SyscallNumber::Unlink => sys_unlink(arg1 as usize),
+        SyscallNumber::Readlink => sys_readlink(arg1 as usize, arg2 as usize, arg3 as usize),
         SyscallNumber::Dup => sys_dup(arg1 as i32),
         SyscallNumber::Dup2 => sys_dup2(arg1 as i32, arg2 as i32),
         SyscallNumber::Fcntl => sys_fcntl(arg1 as i32, arg2 as i32, arg3),
@@ -757,13 +747,27 @@ fn sys_open(path_ptr: usize, flags: i32) -> SyscallResult {
 }
 
 fn sys_stat(path_ptr: usize, stat_ptr: usize) -> SyscallResult {
+    stat_impl(path_ptr, stat_ptr, true)
+}
+
+/// lstat(6): like `stat`, but doesn't follow a symlink at the final path
+/// component — reports the link itself (`FileType::Symlink`, `st_size` =
+/// target length). Used to just alias `sys_stat` outright ("no symlinks
+/// yet"); now that `fs::vfs` has real symlink support (see `fs::procfs`),
+/// this is the genuine no-follow lookup.
+fn sys_lstat(path_ptr: usize, stat_ptr: usize) -> SyscallResult {
+    stat_impl(path_ptr, stat_ptr, false)
+}
+
+fn stat_impl(path_ptr: usize, stat_ptr: usize, follow: bool) -> SyscallResult {
     use crate::fs::types::Stat;
     if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
     if let Err(e) = validate_user_buffer(stat_ptr as u64, core::mem::size_of::<Stat>()) { return e; }
 
     let path = read_user_str(path_ptr);
     let path = resolve_path(path);
-    match crate::fs::vfs::stat(&path) {
+    let result = if follow { crate::fs::stat(&path) } else { crate::fs::lstat(&path) };
+    match result {
         Err(e)   => e.as_i64(),
         Ok(stat) => {
             unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
@@ -830,6 +834,30 @@ fn sys_unlink(path_ptr: usize) -> SyscallResult {
     match crate::fs::vfs::unlink(&path) {
         Ok(())  => 0,
         Err(e)  => e.as_i64(),
+    }
+}
+
+/// readlink(89): long readlink(const char *path, char *buf, size_t bufsiz)
+///
+/// Returns the number of bytes written into `buf` (never NUL-terminated,
+/// matching real `readlink(2)`) — truncated silently to `bufsiz` if the
+/// target is longer, same as real POSIX.
+fn sys_readlink(path_ptr: usize, buf_ptr: usize, bufsiz: usize) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
+    if let Err(e) = validate_user_buffer(buf_ptr as u64, bufsiz) { return e; }
+    let path = read_user_str(path_ptr);
+    if path.is_empty() { return errno::EINVAL; }
+    let path = resolve_path(path);
+    match crate::fs::readlink(&path) {
+        Ok(target) => {
+            let bytes = target.as_bytes();
+            let n = bytes.len().min(bufsiz);
+            unsafe {
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr as *mut u8, n);
+            }
+            n as SyscallResult
+        }
+        Err(e) => e.as_i64(),
     }
 }
 
@@ -1806,17 +1834,37 @@ fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> SyscallResult 
 
     serial_println!("sys_exec: loading '{}' (argc={}, envc={})", name, argv.len(), envp.len());
 
-    let resolved_name = resolve_exec_name(name);
-    let elf_bytes = match crate::fs::initramfs::bytes(&resolved_name) {
-        Some(b) => b,
-        None => {
+    let resolved_path = match resolve_exec_path(name) {
+        Ok(p) => p,
+        Err(e) => {
             serial_println!("sys_exec: '{}' not found", name);
-            return errno::ENOENT;
+            return e;
         }
+    };
+    serial_println!("sys_exec: resolved '{}' -> '{}'", name, resolved_path);
+
+    let elf_owned = {
+        let mut handle = match crate::fs::vfs::open(&resolved_path, crate::fs::types::OpenFlags::RDONLY) {
+            Ok(h) => h,
+            Err(e) => {
+                serial_println!("sys_exec: '{}' not found", name);
+                return e.as_i64();
+            }
+        };
+        let mut buf = alloc::vec::Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match handle.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => return errno::EIO,
+            }
+        }
+        buf
     };
 
     // Load ELF without any lock — may take time and allocates frames
-    let loaded = match unsafe { crate::memory::elf_loader::load_elf(elf_bytes, 0, &argv, &envp) } {
+    let loaded = match unsafe { crate::memory::elf_loader::load_elf(&elf_owned, 0, &argv, &envp) } {
         Ok(l) => l,
         Err(e) => {
             serial_println!("sys_exec: load_elf failed: {}", e);
@@ -1837,7 +1885,7 @@ fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> SyscallResult 
         crate::serial_println_raw!("[EXEC] scheduler locked, swapping address space");
         match scheduler.running_mut() {
             Some(proc) => {
-                proc.exe_name = resolved_name;
+                proc.exe_name = resolved_path;
                 crate::serial_println_raw!("[EXEC] dropping old AS");
                 // Replace address space with freshly loaded one. This drops
                 // this Process's Arc reference to whatever it had before —
@@ -1897,39 +1945,41 @@ fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> SyscallResult 
 
 /// Resolves `name` (whatever `exec()`'s caller passed as the program path —
 /// a bareword, a `./`-relative path, or an absolute path like `/bin/ls`) to
-/// the `PROGRAMS` registry name (see `user_programs.rs`) that should serve
-/// it, so the caller can both look up the ELF bytes and record it as
-/// `Process::exe_name`.
+/// its canonical, fully symlink-resolved absolute path — real VFS
+/// traversal, not a special-cased string match.
 ///
-/// This kernel has no real `/bin`, `/usr/bin`, etc. — every registered
-/// program is exposed flat at initramfs root (see `user_programs.rs`'s doc
-/// comment). The hand-rolled shell always passed the bare typed word
-/// straight through, which happened to line up with that flat layout by
-/// coincidence. A real shell doing its own `$PATH` search (e.g. BusyBox
-/// `ash` with `FEATURE_SH_STANDALONE`) tries candidates like `/bin/hello`
-/// and `/usr/bin/hello`; an explicit relative path like `./ls` is also
-/// legitimate and common. Both used to fail here with a raw exact-string
-/// match against the bare registered name. Fix: run the same
-/// cwd-normalization every other path-taking syscall already gets via
-/// `resolve_path()`, then match on the basename — consistent with the
-/// initramfs directory listing already being flat.
+/// This kernel has no real `/bin`, `/usr/bin`, etc. as *separate mounts*,
+/// but `/bin` and `/` are both mounted to the same flat `InitramfsFs` (see
+/// `fs::mod`'s doc comment) — so a real shell's own `$PATH` search (e.g.
+/// BusyBox `ash` with `FEATURE_SH_STANDALONE`, trying `/bin/hello` before
+/// giving up) resolves correctly through the ordinary VFS mount table,
+/// same as a bareword `hello` (cwd-normalized to `/hello`) or an explicit
+/// `./ls`. `/proc/self/exe` — which `ash` re-execs for any applet that
+/// isn't `NOFORK`/`NOEXEC` (most of them; `echo`/`ls` are exceptions) —
+/// is just another symlink under this same mechanism now (see
+/// `fs::procfs::ProcExeInode`, backed by `Process::exe_name`): no
+/// special-casing left here at all, any symlink anywhere gets followed
+/// the same way.
 ///
-/// `/proc/self/exe` is special-cased: this kernel has no real `/proc`
-/// inode for it (no symlinks, no per-process `/proc/<pid>` directories at
-/// all — see `fs::procfs`, which only serves `/proc/meminfo`). BusyBox's
-/// `ash` (`FEATURE_SH_STANDALONE`) re-execs exactly this path for any
-/// applet that isn't `NOFORK`/`NOEXEC` (most of them — `echo`/`ls` are
-/// exceptions, `cat` is not), relying on it resolving to "whatever ELF is
-/// currently running in this process" the same way a real `/proc/self/exe`
-/// symlink would. `Process::exe_name` tracks exactly that (set on every
-/// successful exec, inherited across fork/clone), so re-resolve against it
-/// instead of doing a real path lookup.
-fn resolve_exec_name(name: &str) -> alloc::string::String {
-    let resolved = resolve_path(name);
-    if resolved == "/proc/self/exe" {
-        return current_exe_name();
+/// Manual loop (not `fs::vfs::resolve`'s own internal following) because
+/// the *canonical path string* is what needs to survive to become the new
+/// `Process::exe_name` — an `Inode` alone doesn't carry the path that
+/// reached it.
+fn resolve_exec_path(name: &str) -> Result<alloc::string::String, i64> {
+    let mut path = resolve_path(name);
+    for _ in 0..8 {
+        let inode = crate::fs::vfs::resolve_no_follow(&path).map_err(|e| e.as_i64())?;
+        if inode.file_type() != crate::fs::types::FileType::Symlink {
+            return Ok(path);
+        }
+        let target = inode.readlink().map_err(|e| e.as_i64())?;
+        path = if target.starts_with('/') {
+            target
+        } else {
+            crate::fs::vfs::normalize_path(&path, &target)
+        };
     }
-    alloc::string::String::from(resolved.rsplit('/').next().unwrap_or(&resolved))
+    Err(errno::ELOOP)
 }
 
 /// waitpid(61): long waitpid(pid_t pid, int *status, int options)

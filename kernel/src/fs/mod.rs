@@ -64,7 +64,20 @@ pub fn open(path: &str, flags: OpenFlags) -> Result<alloc::boxed::Box<dyn crate:
     vfs::open(path, flags)
 }
 
-/// Stat a file by absolute path.  Used by `sys_stat` / `sys_lstat`.
+/// Stat a file by absolute path, following a symlink at the final
+/// component.  Used by `sys_stat` / `sys_fstat`.
 pub fn stat(path: &str) -> Result<Stat, Errno> {
     vfs::stat(path)
+}
+
+/// Stat a file by absolute path *without* following a symlink at the
+/// final component — the file/symlink itself, not its target.  Used by
+/// `sys_lstat`.
+pub fn lstat(path: &str) -> Result<Stat, Errno> {
+    Ok(vfs::resolve_no_follow(path)?.stat())
+}
+
+/// Read a symlink's target.  Used by `sys_readlink`.
+pub fn readlink(path: &str) -> Result<alloc::string::String, Errno> {
+    vfs::resolve_no_follow(path)?.readlink()
 }
