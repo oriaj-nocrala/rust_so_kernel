@@ -10,6 +10,7 @@
 // Intended for game loops and other polling consumers.
 
 use alloc::boxed::Box;
+use crate::fs::types::Stat;
 use crate::process::file::{FileHandle, FileResult};
 
 pub struct KbdDevice;
@@ -30,6 +31,10 @@ impl FileHandle for KbdDevice {
 
     fn write(&mut self, buf: &[u8]) -> FileResult<usize> {
         Ok(buf.len()) // writes are ignored
+    }
+
+    fn stat(&self) -> Option<Stat> {
+        Some(Stat::chardev(0))
     }
 
     fn name(&self) -> &str {

@@ -12,14 +12,19 @@
 #include <bits/ensure.h>
 #include <mlibc/debug.hpp>
 #include <mlibc/all-sysdeps.hpp>
+#include <mlibc/fsfd_target.hpp>
 #include <mlibc/thread-entry.hpp>
 #include <mlibc/tcb.hpp>
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
+#include <stdint.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
 
 namespace {
 
@@ -40,6 +45,9 @@ constexpr long SYS_read = 0;
 constexpr long SYS_write = 1;
 constexpr long SYS_open = 2;
 constexpr long SYS_close = 3;
+constexpr long SYS_stat = 4;
+constexpr long SYS_fstat = 5;
+constexpr long SYS_getdents64 = 217;
 constexpr long SYS_sigaction = 13;
 constexpr long SYS_sigprocmask = 14;
 // SYS_sigreturn(15) is never called directly by userspace — only the
@@ -47,6 +55,7 @@ constexpr long SYS_sigprocmask = 14;
 // signal_trampoline.rs); mlibc's sigaction() doesn't need to know it
 // exists, since this kernel injects the trampoline transparently instead
 // of relying on a userspace-supplied sa_restorer.
+constexpr long SYS_poll = 7;
 constexpr long SYS_lseek = 8;
 constexpr long SYS_mmap = 9;
 constexpr long SYS_pipe = 22;
@@ -58,6 +67,7 @@ constexpr long SYS_clone = 56;
 constexpr long SYS_fork = 57;
 constexpr long SYS_execve = 59;
 constexpr long SYS_exit = 60;
+constexpr long SYS_waitpid = 61;
 constexpr long SYS_kill = 62;
 constexpr long SYS_arch_prctl = 158;
 constexpr long SYS_futex = 202;
@@ -139,6 +149,115 @@ int sys_close(int fd) {
 	return ret < 0 ? (int)-ret : 0;
 }
 
+namespace {
+
+// Mirrors kernel/src/fs/types.rs::Stat exactly (144 bytes, field order and
+// all) — this is NOT the same layout as mlibc's own `struct stat` (see
+// include/abi-bits/stat.h: field order differs and it packs times into
+// `struct timespec` triplets instead of separate sec/nsec pairs), so a
+// syscall result has to land here first and get field-by-field converted
+// below rather than being read directly into the caller's `struct stat *`.
+struct KernelStat {
+	uint64_t st_dev;
+	uint64_t st_ino;
+	uint64_t st_nlink;
+	uint32_t st_mode;
+	uint32_t st_uid;
+	uint32_t st_gid;
+	uint32_t _pad0;
+	uint64_t st_rdev;
+	int64_t  st_size;
+	int64_t  st_blksize;
+	int64_t  st_blocks;
+	// Named *_sec (not st_atime/st_mtime/st_ctime) because <sys/stat.h>
+	// #defines those exact identifiers as legacy `st_atim.tv_sec`-style
+	// macros for BSD source compatibility — using them here as plain field
+	// names would silently rewrite this struct's declaration via macro
+	// substitution and fail to compile.
+	uint64_t st_atime_sec;
+	uint64_t st_atime_nsec;
+	uint64_t st_mtime_sec;
+	uint64_t st_mtime_nsec;
+	uint64_t st_ctime_sec;
+	uint64_t st_ctime_nsec;
+	int64_t  _reserved[3];
+};
+static_assert(sizeof(KernelStat) == 144, "KernelStat must match kernel's Stat layout");
+
+void convert_stat(const KernelStat &in, struct stat *out) {
+	out->st_dev = in.st_dev;
+	out->st_ino = in.st_ino;
+	out->st_mode = in.st_mode;
+	out->st_nlink = in.st_nlink;
+	out->st_uid = in.st_uid;
+	out->st_gid = in.st_gid;
+	out->st_rdev = in.st_rdev;
+	out->st_size = in.st_size;
+	out->st_atim.tv_sec = (time_t)in.st_atime_sec;
+	out->st_atim.tv_nsec = (long)in.st_atime_nsec;
+	out->st_mtim.tv_sec = (time_t)in.st_mtime_sec;
+	out->st_mtim.tv_nsec = (long)in.st_mtime_nsec;
+	out->st_ctim.tv_sec = (time_t)in.st_ctime_sec;
+	out->st_ctim.tv_nsec = (long)in.st_ctime_nsec;
+	out->st_blksize = in.st_blksize;
+	out->st_blocks = in.st_blocks;
+}
+
+} // namespace
+
+// Backs stat()/lstat()/fstat() alike (mlibc funnels all three through this
+// one entry point, discriminated by `fsfdt`). This kernel doesn't resolve
+// symlinks at all yet (there's no symlink support), so lstat's fsfd_target
+// ends up here as plain `path` too — same as stat(), no behavioral
+// difference until the kernel grows symlinks. fd_path/none (the *at()
+// directory-relative forms) aren't wired up: this kernel's stat/fstat only
+// take an absolute-ish path or a bare fd, no dirfd+relative-path syscall.
+int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags,
+		struct stat *statbuf) {
+	(void)flags;
+	KernelStat ks{};
+	long ret;
+	switch (fsfdt) {
+		case fsfd_target::path:
+			ret = raw_syscall(SYS_stat, (long)path, (long)&ks);
+			break;
+		case fsfd_target::fd:
+			ret = raw_syscall(SYS_fstat, fd, (long)&ks);
+			break;
+		default:
+			return EINVAL;
+	}
+	if (ret < 0)
+		return (int)-ret;
+	convert_stat(ks, statbuf);
+	return 0;
+}
+
+// A "directory handle" is just a regular fd here — this kernel's open()
+// already returns a readable fd for directories (see DevDirInode/
+// InitramfsDirInode's `open()` impls), there's no separate directory-fd
+// namespace to allocate.
+int sys_open_dir(const char *path, int *handle) {
+	long ret = raw_syscall(SYS_open, (long)path, 0);
+	if (ret < 0)
+		return (int)-ret;
+	*handle = (int)ret;
+	return 0;
+}
+
+// This kernel's getdents64(217) already writes `linux_dirent64`-shaped
+// records (see kernel/src/fs/types.rs::DirEntry::write_dirent64: ino(8) +
+// off(8) + reclen(2) + type(1) + name), which is byte-for-byte the same
+// layout as mlibc's own `struct dirent` (options/posix/include/dirent.h) —
+// no per-field conversion needed here, unlike sys_stat above.
+int sys_read_entries(int handle, void *buffer, size_t max_size, size_t *bytes_read) {
+	long ret = raw_syscall(SYS_getdents64, handle, (long)buffer, (long)max_size);
+	if (ret < 0)
+		return (int)-ret;
+	*bytes_read = (size_t)ret;
+	return 0;
+}
+
 // This kernel's pipe(22) takes only `int pipefd[2]` — no pipe2() flags
 // (O_NONBLOCK/O_CLOEXEC aren't supported). Anything other than 0 in `flags`
 // would silently be ignored by the kernel, so reject it here instead.
@@ -179,6 +298,20 @@ int sys_seek(int fd, off_t offset, int whence, off_t *new_offset) {
 	if (ret < 0)
 		return (int)-ret;
 	*new_offset = ret;
+	return 0;
+}
+
+// `struct pollfd { int fd; short events; short revents; }` is already the
+// exact layout kernel/src/process/syscall.rs::PollFd uses (8 bytes, no
+// padding) — passed straight through, no conversion. This kernel caps
+// nfds at 16 and returns EINVAL above that (see sys_poll's `if nfds > 16`
+// check); that limit isn't enforced here too, the kernel's own -EINVAL
+// return covers it.
+int sys_poll(struct pollfd *fds, nfds_t count, int timeout, int *num_events) {
+	long ret = raw_syscall(SYS_poll, (long)fds, (long)count, (long)timeout);
+	if (ret < 0)
+		return (int)-ret;
+	*num_events = (int)ret;
 	return 0;
 }
 
@@ -253,6 +386,44 @@ int sys_execve(const char *path, char *const[], char *const[]) {
 	// This kernel's exec() only takes a program name — no argv/envp.
 	long ret = raw_syscall(SYS_execve, (long)path);
 	return ret < 0 ? (int)-ret : 0;
+}
+
+// This kernel's waitpid(61) takes only a specific child pid — no -1/0/
+// process-group forms (i.e. no "wait for any child") — and no `flags`
+// (WNOHANG always blocks until the target exits). Reject anything this
+// kernel can't honor up front instead of silently hanging or waiting on
+// the wrong thing.
+//
+// It also has no out-param for the exit status: `Process::exit_status` is
+// tracked kernel-side (see kernel/src/process/syscall.rs::sys_exit) but
+// there's no ABI to read it back here, so every reaped child is reported
+// as if it called `exit(0)` regardless of what it actually passed. Fixing
+// this needs the kernel syscall to grow a status-out pointer — and even
+// then, only the "child already a zombie" path can safely write straight
+// into the caller's memory; the "block, then get woken by the child's
+// sys_exit" path resumes via a raw trapframe restore (jump_to_trapframe)
+// with no return back into this function, and waitpid_wakeup() itself
+// runs in the *dying child's* address space, not the parent's — so it
+// can't just core::ptr::write into a parent-space status_ptr either.
+int sys_waitpid(pid_t pid, int *status, int flags, struct rusage *ru,
+		pid_t *ret_pid) {
+	(void)flags;
+	if (ru)
+		__builtin_memset(ru, 0, sizeof(*ru));
+	if (pid <= 0)
+		return ECHILD;
+	long ret = raw_syscall(SYS_waitpid, pid);
+	if (ret < 0)
+		return (int)-ret;
+	// abi-bits/wait.h uses the dripos-style encoding (WIFEXITED = bit
+	// 0x200, not Linux's "WTERMSIG == 0"), so plain 0 would make
+	// WIFEXITED() false. 0x200 alone reports "exited normally with
+	// code 0" — always 0 since (as above) the real code isn't tracked.
+	if (status)
+		*status = 0x200;
+	if (ret_pid)
+		*ret_pid = (pid_t)ret;
+	return 0;
 }
 
 pid_t sys_getpid() {

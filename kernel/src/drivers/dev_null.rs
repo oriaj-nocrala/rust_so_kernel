@@ -3,6 +3,7 @@
 // /dev/null — discards all writes, reads return EOF.
 
 use alloc::boxed::Box;
+use crate::fs::types::Stat;
 use crate::process::file::{FileHandle, FileResult};
 
 pub struct DevNull;
@@ -14,6 +15,10 @@ impl FileHandle for DevNull {
 
     fn write(&mut self, buf: &[u8]) -> FileResult<usize> {
         Ok(buf.len()) // Pretend everything was written
+    }
+
+    fn stat(&self) -> Option<Stat> {
+        Some(Stat::chardev(0))
     }
 
     fn name(&self) -> &str {

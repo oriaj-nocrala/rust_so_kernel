@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     framebuffer::{FRAMEBUFFER, Color, Framebuffer},
+    fs::types::Stat,
     process::file::{FileHandle, FileError, FileResult},
 };
 
@@ -359,6 +360,10 @@ impl FileHandle for FramebufferConsole {
         }
 
         Ok(buf.len())
+    }
+
+    fn stat(&self) -> Option<Stat> {
+        Some(Stat::chardev(0))
     }
 
     fn name(&self) -> &str {

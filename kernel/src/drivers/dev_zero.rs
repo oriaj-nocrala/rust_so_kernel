@@ -3,6 +3,7 @@
 // /dev/zero — reads return infinite zeros, writes are discarded.
 
 use alloc::boxed::Box;
+use crate::fs::types::Stat;
 use crate::process::file::{FileHandle, FileResult};
 
 pub struct DevZero;
@@ -17,6 +18,10 @@ impl FileHandle for DevZero {
 
     fn write(&mut self, buf: &[u8]) -> FileResult<usize> {
         Ok(buf.len())
+    }
+
+    fn stat(&self) -> Option<Stat> {
+        Some(Stat::chardev(0))
     }
 
     fn name(&self) -> &str {

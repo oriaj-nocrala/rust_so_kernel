@@ -34,6 +34,7 @@ const C_PROGRAMS: &[(&str, &str)] = &[
     ("pthread_test", "pthread_test.elf"),
     ("producer_consumer", "producer_consumer.elf"),
     ("mlibc_signal_test", "mlibc_signal_test.elf"),
+    ("stat_test", "stat_test.elf"),
 ];
 
 fn main() {

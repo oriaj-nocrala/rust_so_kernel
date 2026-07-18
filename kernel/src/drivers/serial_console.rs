@@ -3,6 +3,7 @@
 // Serial console (COM1, 0x3F8).
 
 use alloc::boxed::Box;
+use crate::fs::types::Stat;
 use crate::process::file::{FileHandle, FileResult};
 
 pub struct SerialConsole;
@@ -42,6 +43,10 @@ impl FileHandle for SerialConsole {
         }
 
         Ok(buf.len())
+    }
+
+    fn stat(&self) -> Option<Stat> {
+        Some(Stat::chardev(0))
     }
 
     fn name(&self) -> &str {
