@@ -327,6 +327,12 @@ impl Scheduler {
 
                     tf = self.kill_and_switch_tf("uncaught signal");
                     self.notify_child_death(dead_pid, parent_pid);
+                    // Same side-table cleanup `sys_exit` does for a normal
+                    // exit — see `syscall::cancel_all_waiters`'s doc comment
+                    // for why skipping this here specifically caused a
+                    // stale poll waiter to leak and later spuriously affect
+                    // an unrelated process.
+                    super::syscall::cancel_all_waiters(dead_pid);
                 }
                 super::signal::SignalOutcome::Stop(sig) => {
                     // Same shape as Terminate above, but parks the process

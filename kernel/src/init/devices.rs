@@ -300,6 +300,9 @@ fn kill_current_user_process(reason: &str) -> ! {
 
         let ptr = scheduler.kill_and_switch_tf(reason);
         scheduler.notify_child_death(dead_pid, parent_pid);
+        // Same side-table cleanup `sys_exit`/the uncaught-signal path do —
+        // see `process::syscall::cancel_all_waiters`'s doc comment.
+        crate::process::syscall::cancel_all_waiters(dead_pid);
 
         serial_println!("  → Switching to next process (full TrapFrame restore)");
         ptr

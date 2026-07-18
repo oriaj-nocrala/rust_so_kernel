@@ -113,8 +113,17 @@ impl FileDescriptorTable {
 
         let mut table = Self::new();
 
-        // FD 0: stdin (for now, /dev/null)
-        table.files[0] = Some(drivers::open_device("/dev/null")
+        // FD 0: stdin — bound to the console (serial), same device as
+        // stderr. `sys_read`'s fd==0 branch hardcodes reading straight from
+        // the keyboard buffer regardless of which handle sits here, so this
+        // choice never affected *reading* — but it does matter for
+        // isatty()/tcgetattr()/ioctl(TCGETS): a real interactive shell
+        // (e.g. BusyBox ash) checks `isatty(0) && isatty(1)` to decide
+        // whether to consider itself interactive at all (print a banner,
+        // prompt, enable job control...). Binding this to `/dev/null` (the
+        // previous "for now" placeholder) made that check permanently
+        // false, silently forcing every shell into non-interactive mode.
+        table.files[0] = Some(drivers::open_device("/dev/console")
             .unwrap_or_else(|| Box::new(NullFallback)));
 
         // FD 1: stdout (framebuffer)
@@ -244,7 +253,7 @@ impl Clone for FileDescriptorTable {
         let mut new_table = Self::new();
 
         if self.files[0].is_some() {
-            new_table.files[0] = crate::drivers::open_device("/dev/null");
+            new_table.files[0] = crate::drivers::open_device("/dev/console");
         }
         if self.files[1].is_some() {
             new_table.files[1] = crate::drivers::open_device("/dev/fb");

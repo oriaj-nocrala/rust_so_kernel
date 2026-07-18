@@ -617,6 +617,15 @@ pid_t sys_getppid() {
 	return 1;
 }
 
+// No real user/group model exists — this kernel is single-user, everything
+// runs as an implicit root (uid==euid==gid==egid==0). ash's startup (and
+// anything else calling getuid()/geteuid()) needs these to not be missing
+// sysdeps, not for the value to mean anything beyond "not a setuid binary".
+uid_t sys_getuid() { return 0; }
+uid_t sys_geteuid() { return 0; }
+gid_t sys_getgid() { return 0; }
+gid_t sys_getegid() { return 0; }
+
 // `pid` passes through unconverted — the kernel itself now understands the
 // real POSIX overloads (`0` own process group, `<-1` group `-pid`; `-1`
 // broadcast is rejected with EINVAL, no permission model to bound it by).

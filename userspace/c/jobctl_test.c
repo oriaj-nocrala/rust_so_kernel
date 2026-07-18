@@ -14,6 +14,8 @@ static void sleep_ms(long ms) {
 }
 
 int main(void) {
+    printf("isatty(0)=%d isatty(1)=%d isatty(2)=%d\n", isatty(0), isatty(1), isatty(2));
+
     // ── termios: tcgetattr/tcsetattr round-trip ─────────────────────────
     struct termios t;
     if (tcgetattr(0, &t) != 0) {

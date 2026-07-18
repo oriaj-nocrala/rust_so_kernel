@@ -1142,8 +1142,28 @@ fn sys_ioctl(fd: i32, request: u64, argp: u64) -> SyscallResult {
 
     if fd < 0 { return errno::EBADF; }
 
-    // fds 0,1,2 are the console — a tty.  All others: not a tty.
-    let is_tty = fd <= 2;
+    // A handle counts as a tty if it's actually backed by the console
+    // driver (serial or framebuffer) — checked by the handle's identity,
+    // not by fd number. A fixed "fd <= 2" check breaks the moment a tty fd
+    // gets dup'd to something higher, which is exactly what real job
+    // control setup does: ash's `setjobctl()` (shell/ash.c) opens/falls
+    // back to the console, then `fcntl(fd, F_DUPFD_CLOEXEC, 10)`s it to a
+    // fd >= 10 before calling `tcgetpgrp()` on *that* fd — confirmed live,
+    // this was silently sending ash down its "can't access tty, job
+    // control turned off" fallback path.
+    let is_tty = {
+        unsafe { core::arch::asm!("cli"); }
+        let result = {
+            let mut sched = super::scheduler::local_scheduler();
+            sched.running_mut().map(|proc| {
+                proc.files.lock().get(fd as usize).ok()
+                    .map(|f| matches!(f.name(), "serial" | "fb"))
+                    .unwrap_or(false)
+            }).unwrap_or(false)
+        };
+        unsafe { core::arch::asm!("sti"); }
+        result
+    };
 
     match request {
         TCGETS => {
@@ -1532,14 +1552,33 @@ fn sys_exit(status: i32) -> SyscallResult {
     unsafe { core::arch::asm!("sti"); }
 
     // Cancel any pending poll/epoll wait and clear side tables
-    poll_cancel_waiter(dead_pid);
-    clear_epoll_fd_all(dead_pid);
-    futex_cancel_waiter(dead_pid);
+    cancel_all_waiters(dead_pid);
 
     unsafe {
         core::arch::asm!("sti");
         crate::process::trapframe::jump_to_user(tf_ptr);
     }
+}
+
+/// Cancel every side-table registration a dying process might be holding
+/// (pending poll/epoll waits, futex waiters). Must run for *every* death
+/// path, not just `sys_exit`'s: `resolve_signals`'s uncaught-signal
+/// Terminate path (`Scheduler::kill_and_switch_tf`, driven by hardware
+/// faults and now routinely by job-control signals like `kill(-pgid,
+/// SIGTERM)`) used to skip this entirely, leaking a stale `POLL_WAITERS`/
+/// `EPOLL_FD_MAP`/`FUTEX_WAITERS` slot for that pid forever — harmless by
+/// itself (pids are never reused), but a real hazard whenever any of those
+/// tables index by a small fixed slot number rather than pid: enough leaked
+/// entries can spuriously wake or otherwise affect a *different*, later,
+/// completely unrelated process that happens to land in the same slot.
+/// Found via `kill(-pgid, SIGTERM)` on a process busy-nanosleeping in a
+/// nanosleep loop (`jobctl_test.c`'s group-kill test) followed immediately
+/// by starting an interactive `ash` — its own `poll()`-based input loop
+/// intermittently died after 1-2 characters, traced back to exactly this.
+pub(crate) fn cancel_all_waiters(pid: usize) {
+    poll_cancel_waiter(pid);
+    clear_epoll_fd_all(pid);
+    futex_cancel_waiter(pid);
 }
 
 fn sys_fork() -> SyscallResult {

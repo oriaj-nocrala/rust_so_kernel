@@ -43,6 +43,8 @@ pub const SIGCHLD: u32 = 17;
 pub const SIGCONT: u32 = 18;
 pub const SIGSTOP: u32 = 19;
 pub const SIGTSTP: u32 = 20;
+pub const SIGTTIN: u32 = 21;
+pub const SIGTTOU: u32 = 22;
 
 // 64, not 32: `pending_signals`/`blocked_signals` are `u64` bitmasks, so 64
 // is the natural width — and mlibc's pthread subsystem unconditionally
@@ -115,7 +117,17 @@ pub fn deliver_pending(proc: &mut Process, tf: *mut TrapFrame) -> SignalOutcome 
         _ if sig == SIGSTOP => SignalOutcome::Stop(sig),
         SignalAction::Ignore => SignalOutcome::None,
         SignalAction::Default => {
-            if sig == SIGTSTP {
+            if sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU {
+                // Real POSIX default action for all three is to stop the
+                // process — not terminate it. This matters concretely: a
+                // job-control shell's own tty negotiation (e.g. ash's
+                // `setjobctl()`) calls `killpg(0, SIGTTIN)` on *itself*
+                // whenever it isn't yet the foreground process group, fully
+                // expecting to just be stopped (then later resumed via
+                // SIGCONT once it becomes foreground) — treating this as
+                // Terminate would silently kill an interactive shell the
+                // first time its own job-control setup ever raced with the
+                // foreground group not matching yet.
                 SignalOutcome::Stop(sig)
             } else if default_terminates(sig) {
                 SignalOutcome::Terminate(sig)
