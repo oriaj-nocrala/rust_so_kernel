@@ -151,7 +151,6 @@ struct cmsghdr {
 #define AF_ISDN PF_ISDN
 #define AF_SNA PF_SNA
 #define AF_PACKET PF_PACKET
-#define AF_PACKET PF_PACKET
 #define AF_AX25 PF_AX25
 #define AF_NETROM PF_NETROM
 #define AF_ROSE PF_ROSE
