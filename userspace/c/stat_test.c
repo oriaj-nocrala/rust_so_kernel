@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <poll.h>
+#include <errno.h>
 
 int main(void) {
     struct stat st;
@@ -86,5 +87,77 @@ int main(void) {
     close(pfd[0]);
     close(pfd[1]);
     printf("poll_test: OK\n");
+
+    if (mkdir("/tmp/mkdir_test", 0755) != 0) {
+        printf("mkdir FAILED\n");
+        return 1;
+    }
+    if (mkdir("/tmp/mkdir_test", 0755) == 0 || errno != EEXIST) {
+        printf("mkdir(dup) should have failed EEXIST, errno=%d\n", errno);
+        return 1;
+    }
+
+    int afd = open("/tmp/mkdir_test/a.txt", O_CREAT | O_WRONLY, 0644);
+    if (afd < 0) {
+        printf("open(a.txt, O_CREAT) FAILED\n");
+        return 1;
+    }
+    write(afd, "hi", 2);
+    close(afd);
+
+    if (mkdir("/tmp/mkdir_test/sub", 0755) != 0) {
+        printf("mkdir(nested) FAILED\n");
+        return 1;
+    }
+
+    DIR *td = opendir("/tmp/mkdir_test");
+    if (!td) {
+        printf("opendir(mkdir_test) FAILED\n");
+        return 1;
+    }
+    int tcount = 0;
+    struct dirent *tent;
+    while ((tent = readdir(td)) != NULL) {
+        printf("  mkdir_test/: %s (type=%d)\n", tent->d_name, tent->d_type);
+        tcount++;
+    }
+    closedir(td);
+    if (tcount != 4) { // . .. a.txt sub
+        printf("mkdir_test dir listing FAILED: count=%d\n", tcount);
+        return 1;
+    }
+
+    if (rmdir("/tmp/mkdir_test") == 0 || errno != ENOTEMPTY) {
+        printf("rmdir(non-empty) should have failed ENOTEMPTY, errno=%d\n", errno);
+        return 1;
+    }
+
+    if (rename("/tmp/mkdir_test/a.txt", "/tmp/mkdir_test/b.txt") != 0) {
+        printf("rename FAILED\n");
+        return 1;
+    }
+    struct stat rst;
+    if (stat("/tmp/mkdir_test/a.txt", &rst) == 0 || stat("/tmp/mkdir_test/b.txt", &rst) != 0) {
+        printf("rename didn't actually move the file\n");
+        return 1;
+    }
+
+    if (unlink("/tmp/mkdir_test/b.txt") != 0) {
+        printf("unlink FAILED\n");
+        return 1;
+    }
+    if (rmdir("/tmp/mkdir_test/sub") != 0) {
+        printf("rmdir(sub) FAILED\n");
+        return 1;
+    }
+    if (rmdir("/tmp/mkdir_test") != 0) {
+        printf("rmdir(mkdir_test, now empty) FAILED\n");
+        return 1;
+    }
+    if (stat("/tmp/mkdir_test", &rst) == 0) {
+        printf("mkdir_test still exists after rmdir!\n");
+        return 1;
+    }
+    printf("mkdir_test: OK\n");
     return 0;
 }

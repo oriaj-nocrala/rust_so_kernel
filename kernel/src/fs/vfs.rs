@@ -25,7 +25,7 @@
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use spin::{Mutex, Once};
 
-use crate::fs::types::{DirEntry, Errno, OpenFlags, Stat};
+use crate::fs::types::{DirEntry, Errno, FileType, OpenFlags, Stat};
 use crate::process::file::FileHandle;
 
 // ── Inode ────────────────────────────────────────────────────────────────────
@@ -66,6 +66,55 @@ pub trait Inode: Send + Sync {
     /// default, which rejects with `EROFS`; writable ones (ramfs) override
     /// it.
     fn create(&self, _name: &str) -> Result<Arc<dyn Inode>, Errno> {
+        Err(Errno::EROFS)
+    }
+
+    /// This inode's type, derived from `stat().st_mode`'s type bits.
+    ///
+    /// Lets directory implementations that store heterogeneous children as
+    /// `Arc<dyn Inode>` (files and subdirectories side by side, e.g. ramfs)
+    /// tell them apart without needing a parallel enum or downcasting.
+    fn file_type(&self) -> FileType {
+        match self.stat().st_mode & 0o170000 {
+            0o040000 => FileType::Directory,
+            0o020000 => FileType::CharDevice,
+            0o060000 => FileType::BlockDevice,
+            0o120000 => FileType::Symlink,
+            _        => FileType::Regular,
+        }
+    }
+
+    /// Create a new subdirectory `name` under this (directory) inode.
+    ///
+    /// Same read-only-by-default convention as `create()`.
+    fn mkdir(&self, _name: &str) -> Result<Arc<dyn Inode>, Errno> {
+        Err(Errno::EROFS)
+    }
+
+    /// Remove a non-directory child `name`. Must fail with `EISDIR` if
+    /// `name` refers to a directory (use `rmdir` for those instead).
+    fn unlink(&self, _name: &str) -> Result<(), Errno> {
+        Err(Errno::EROFS)
+    }
+
+    /// Remove an empty directory child `name`. Must fail with `ENOTDIR` if
+    /// `name` isn't a directory, or `ENOTEMPTY` if it has entries.
+    fn rmdir(&self, _name: &str) -> Result<(), Errno> {
+        Err(Errno::EROFS)
+    }
+
+    /// Detach and return child `name` (file or directory, empty or not) —
+    /// the "remove" half of a rename. Unlike `unlink`/`rmdir`, this never
+    /// checks emptiness: POSIX `rename()` allows moving non-empty
+    /// directories, only `rmdir()` requires them empty.
+    fn take_child(&self, _name: &str) -> Result<Arc<dyn Inode>, Errno> {
+        Err(Errno::EROFS)
+    }
+
+    /// Insert an already-existing inode under a new name — the "attach"
+    /// half of a rename. Fails with `EEXIST` if `name` is already taken
+    /// (this VFS doesn't support rename-clobbering an existing target).
+    fn insert_child(&self, _name: &str, _node: Arc<dyn Inode>) -> Result<(), Errno> {
         Err(Errno::EROFS)
     }
 }
@@ -166,12 +215,7 @@ pub fn open(path: &str, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> 
 }
 
 fn create_and_open(path: &str, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
-    let idx = path.rfind('/').ok_or(Errno::EINVAL)?;
-    let leaf = &path[idx + 1..];
-    if leaf.is_empty() {
-        return Err(Errno::EINVAL);
-    }
-    let dir_path = if idx == 0 { "/" } else { &path[..idx] };
+    let (dir_path, leaf) = split_parent(path)?;
     let dir = resolve(dir_path)?;
     let inode = dir.create(leaf)?;
     inode.open(flags)
@@ -180,4 +224,54 @@ fn create_and_open(path: &str, flags: OpenFlags) -> Result<Box<dyn FileHandle>, 
 /// Resolve `path` and return its metadata.
 pub fn stat(path: &str) -> Result<Stat, Errno> {
     Ok(resolve(path)?.stat())
+}
+
+/// Split `path` into (parent directory path, leaf component name).
+///
+/// `"/tmp/sub/file"` → `("/tmp/sub", "file")`; `"/file"` → `("/", "file")`.
+fn split_parent(path: &str) -> Result<(&str, &str), Errno> {
+    let idx = path.rfind('/').ok_or(Errno::EINVAL)?;
+    let leaf = &path[idx + 1..];
+    if leaf.is_empty() {
+        return Err(Errno::EINVAL);
+    }
+    let dir_path = if idx == 0 { "/" } else { &path[..idx] };
+    Ok((dir_path, leaf))
+}
+
+/// Create a new directory at `path`.
+pub fn mkdir(path: &str) -> Result<(), Errno> {
+    let (dir_path, leaf) = split_parent(path)?;
+    resolve(dir_path)?.mkdir(leaf)?;
+    Ok(())
+}
+
+/// Remove the file at `path` (fails with `EISDIR` on directories).
+pub fn unlink(path: &str) -> Result<(), Errno> {
+    let (dir_path, leaf) = split_parent(path)?;
+    resolve(dir_path)?.unlink(leaf)
+}
+
+/// Remove the empty directory at `path`.
+pub fn rmdir(path: &str) -> Result<(), Errno> {
+    let (dir_path, leaf) = split_parent(path)?;
+    resolve(dir_path)?.rmdir(leaf)
+}
+
+/// Move/rename `old_path` to `new_path`. Both must resolve to directories
+/// on the same mounted filesystem (no cross-filesystem support — the
+/// target parent's `insert_child` will fail with `EROFS`/`ENOSYS` if not).
+pub fn rename(old_path: &str, new_path: &str) -> Result<(), Errno> {
+    let (old_dir, old_leaf) = split_parent(old_path)?;
+    let (new_dir, new_leaf) = split_parent(new_path)?;
+    let old_parent = resolve(old_dir)?;
+    let new_parent = resolve(new_dir)?;
+
+    let node = old_parent.take_child(old_leaf)?;
+    if let Err(e) = new_parent.insert_child(new_leaf, node.clone()) {
+        // Best-effort rollback so a failed rename doesn't just lose the file.
+        let _ = old_parent.insert_child(old_leaf, node);
+        return Err(e);
+    }
+    Ok(())
 }

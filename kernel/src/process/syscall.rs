@@ -188,6 +188,10 @@ pub enum SyscallNumber {
     Poll = 7,
     Lseek = 8,
     Mmap = 9,
+    Rename = 82,
+    Mkdir = 83,
+    Rmdir = 84,
+    Unlink = 87,
     Pipe = 22,
     Munmap = 11,
     Brk = 12,
@@ -238,6 +242,10 @@ impl SyscallNumber {
             7  => Some(Self::Poll),
             8  => Some(Self::Lseek),
             9  => Some(Self::Mmap),
+            82 => Some(Self::Rename),
+            83 => Some(Self::Mkdir),
+            84 => Some(Self::Rmdir),
+            87 => Some(Self::Unlink),
             22 => Some(Self::Pipe),
             11 => Some(Self::Munmap),
             12 => Some(Self::Brk),
@@ -417,6 +425,10 @@ pub fn syscall_handler(
         SyscallNumber::Poll => sys_poll(arg1, arg2 as u32, arg3 as i32),
         SyscallNumber::Lseek => sys_lseek(arg1 as i32, arg2 as i64, arg3 as i32),
         SyscallNumber::Mmap => sys_mmap(arg1, arg2, arg3 as u32, arg4 as u32, arg5 as i32),
+        SyscallNumber::Rename => sys_rename(arg1 as usize, arg2 as usize),
+        SyscallNumber::Mkdir => sys_mkdir(arg1 as usize),
+        SyscallNumber::Rmdir => sys_rmdir(arg1 as usize),
+        SyscallNumber::Unlink => sys_unlink(arg1 as usize),
         SyscallNumber::Pipe => sys_pipe(arg1),
         SyscallNumber::Munmap => sys_munmap(arg1, arg2),
         SyscallNumber::Brk => sys_brk(arg1),
@@ -699,6 +711,55 @@ fn sys_fstat(fd: i32, stat_ptr: usize) -> SyscallResult {
             unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
             0
         }
+    }
+}
+
+/// mkdir(83): long mkdir(const char *path) — no `mode` param, matching
+/// this kernel's `open()` (which also drops the POSIX `mode` argument):
+/// nothing here enforces permission bits, so there's nothing to store it
+/// in.
+fn sys_mkdir(path_ptr: usize) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
+    let path = read_user_str(path_ptr);
+    if path.is_empty() { return errno::EINVAL; }
+    match crate::fs::vfs::mkdir(path) {
+        Ok(())  => 0,
+        Err(e)  => e.as_i64(),
+    }
+}
+
+/// rmdir(84): long rmdir(const char *path)
+fn sys_rmdir(path_ptr: usize) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
+    let path = read_user_str(path_ptr);
+    if path.is_empty() { return errno::EINVAL; }
+    match crate::fs::vfs::rmdir(path) {
+        Ok(())  => 0,
+        Err(e)  => e.as_i64(),
+    }
+}
+
+/// unlink(87): long unlink(const char *path)
+fn sys_unlink(path_ptr: usize) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
+    let path = read_user_str(path_ptr);
+    if path.is_empty() { return errno::EINVAL; }
+    match crate::fs::vfs::unlink(path) {
+        Ok(())  => 0,
+        Err(e)  => e.as_i64(),
+    }
+}
+
+/// rename(82): long rename(const char *old_path, const char *new_path)
+fn sys_rename(old_path_ptr: usize, new_path_ptr: usize) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(old_path_ptr as u64, 1) { return e; }
+    if let Err(e) = validate_user_buffer(new_path_ptr as u64, 1) { return e; }
+    let old_path = read_user_str(old_path_ptr);
+    let new_path = read_user_str(new_path_ptr);
+    if old_path.is_empty() || new_path.is_empty() { return errno::EINVAL; }
+    match crate::fs::vfs::rename(old_path, new_path) {
+        Ok(())  => 0,
+        Err(e)  => e.as_i64(),
     }
 }
 

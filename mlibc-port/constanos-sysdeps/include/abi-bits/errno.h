@@ -53,7 +53,12 @@
 
 /* ipc/network software -- argument errors */
 #define	ENOTSOCK	38		/* Socket operation on non-socket */
-#define	EDESTADDRREQ	39		/* Destination address required */
+// Moved from 39 to the slot ENOTEMPTY vacated below (66): 39 needs to be
+// ENOTEMPTY alone now (matching the kernel) — mlibc's strerror()-style
+// switches enumerate every macro as a distinct `case`, so two macros
+// sharing one value isn't just "harmless aliasing", it's a duplicate-case
+// compile error.
+#define	EDESTADDRREQ	66		/* Destination address required */
 #define	EMSGSIZE	40		/* Message too long */
 #define	EPROTOTYPE	41		/* Protocol wrong type for socket */
 #define	ENOPROTOOPT	42		/* Protocol not available */
@@ -86,7 +91,13 @@
 /* should be rearranged */
 #define	EHOSTDOWN	64		/* Host is down */
 #define	EHOSTUNREACH	65		/* No route to host */
-#define	ENOTEMPTY	66		/* Directory not empty */
+// This whole file is otherwise BSD-numbered (kept as-is: the kernel never
+// returns any of the BSD-only codes below, so their exact values are
+// inert). ENOTEMPTY is the one this port's rmdir()/rename() wiring
+// actually needs to match: kernel/src/fs/types.rs::Errno::ENOTEMPTY uses
+// the real Linux value (39), not BSD's 66 — EDESTADDRREQ (which used to
+// sit at 39) was moved up to the now-vacant 66 to make room.
+#define	ENOTEMPTY	39		/* Directory not empty */
 
 /* quotas & mush */
 #define	EPROCLIM	67		/* Too many processes */

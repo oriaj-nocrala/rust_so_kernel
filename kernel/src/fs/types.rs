@@ -30,6 +30,7 @@ impl Errno {
     pub const EPIPE:   Self = Self(32);
     pub const ERANGE:  Self = Self(34);
     pub const ENOSYS:  Self = Self(38);
+    pub const ENOTEMPTY: Self = Self(39);
 
     /// Syscall return value for this error (negative i64).
     #[inline]

@@ -58,6 +58,10 @@ constexpr long SYS_sigprocmask = 14;
 constexpr long SYS_poll = 7;
 constexpr long SYS_lseek = 8;
 constexpr long SYS_mmap = 9;
+constexpr long SYS_rename = 82;
+constexpr long SYS_mkdir = 83;
+constexpr long SYS_rmdir = 84;
+constexpr long SYS_unlink = 87;
 constexpr long SYS_pipe = 22;
 constexpr long SYS_munmap = 11;
 constexpr long SYS_ioctl = 16;
@@ -256,6 +260,39 @@ int sys_read_entries(int handle, void *buffer, size_t max_size, size_t *bytes_re
 		return (int)-ret;
 	*bytes_read = (size_t)ret;
 	return 0;
+}
+
+// This kernel's mkdir(83) has no `mode` parameter (nothing enforces
+// permission bits, same reasoning as open()'s missing mode arg) — accept
+// and silently drop it, matching mkdir(2)'s signature so callers don't
+// need special-casing.
+int sys_mkdir(const char *path, mode_t) {
+	long ret = raw_syscall(SYS_mkdir, (long)path);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+int sys_rmdir(const char *path) {
+	long ret = raw_syscall(SYS_rmdir, (long)path);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+int sys_rename(const char *path, const char *new_path) {
+	long ret = raw_syscall(SYS_rename, (long)path, (long)new_path);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+// mlibc's unlink()/rmdir() call through here (unlinkat(AT_FDCWD, path, 0)
+// and, for some callers, unlinkat(AT_FDCWD, path, AT_REMOVEDIR)) rather
+// than a plain sys_unlink — there's no `[[gnu::weak]] int sys_unlink(...)`
+// declared in posix-sysdeps.hpp at all, only this *at() form. This kernel
+// has no directory-fd concept (no openat family), so only AT_FDCWD is
+// honored; any other `fd` means the caller wants a syscall relative to an
+// open directory descriptor, which doesn't exist here.
+int sys_unlinkat(int fd, const char *path, int flags) {
+	if (fd != AT_FDCWD)
+		return ENOSYS;
+	long ret = raw_syscall(flags & AT_REMOVEDIR ? SYS_rmdir : SYS_unlink, (long)path);
+	return ret < 0 ? (int)-ret : 0;
 }
 
 // This kernel's pipe(22) takes only `int pipefd[2]` — no pipe2() flags

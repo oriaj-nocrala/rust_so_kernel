@@ -3,12 +3,16 @@
 // Writable in-memory filesystem, mounted at /tmp.
 //
 // Everything else in the VFS (initramfs, devfs) is read-only; this is the
-// one place a process can create/write/read files at runtime — mainly
-// intended as debug scratch space: write a batch script here, then run it
-// with the shell's `sh` command (see userspace/src/bin/shell.rs) instead of
-// re-typing a sequence of commands by hand every time.
+// one place a process can create/write/read files (and, now, directories)
+// at runtime — mainly intended as debug scratch space: write a batch
+// script here, then run it with the shell's `sh` command (see
+// userspace/src/bin/shell.rs) instead of re-typing a sequence of commands
+// by hand every time.
 //
-// Flat namespace (no subdirectories), not persisted across reboots.
+// Real (recursive) subdirectories, not persisted across reboots. Each
+// directory's `entries` map holds `Arc<dyn Inode>` — files and
+// subdirectories side by side, told apart via `Inode::file_type()` — so a
+// directory can contain other directories without a parallel enum.
 // Directory listings are a snapshot taken at open() time — fine for a
 // scratch fs nobody expects strict live-mutation semantics from.
 
@@ -23,6 +27,16 @@ use crate::fs::{
 use crate::process::file::{FileHandle, FileResult};
 
 const ROOT_INO: u64 = 1;
+
+/// Single counter shared by every `RamDirNode`/`RamFileNode`, however
+/// deeply nested — per-directory counters (the old flat-namespace design)
+/// would hand out colliding inode numbers as soon as two different
+/// subdirectories both allocated children.
+static NEXT_INO: AtomicU64 = AtomicU64::new(ROOT_INO + 1);
+
+fn alloc_ino() -> u64 {
+    NEXT_INO.fetch_add(1, Ordering::Relaxed)
+}
 
 // ── Filesystem ───────────────────────────────────────────────────────────────
 
@@ -48,8 +62,7 @@ impl Filesystem for RamFs {
 
 struct RamDirNode {
     ino: u64,
-    entries: Mutex<BTreeMap<String, Arc<RamFileNode>>>,
-    next_ino: AtomicU64,
+    entries: Mutex<BTreeMap<String, Arc<dyn Inode>>>,
 }
 
 impl RamDirNode {
@@ -57,7 +70,6 @@ impl RamDirNode {
         Self {
             ino,
             entries: Mutex::new(BTreeMap::new()),
-            next_ino: AtomicU64::new(ino + 1),
         }
     }
 }
@@ -75,16 +87,13 @@ impl Inode for RamDirNode {
         snapshot.push(DirEntry::new(self.ino, FileType::Directory, b"."));
         snapshot.push(DirEntry::new(self.ino, FileType::Directory, b".."));
         for (name, node) in entries.iter() {
-            snapshot.push(DirEntry::new(node.ino, FileType::Regular, name.as_bytes()));
+            snapshot.push(DirEntry::new(node.stat().st_ino, node.file_type(), name.as_bytes()));
         }
         Ok(Box::new(RamDirHandle { snapshot, offset: 0 }))
     }
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, Errno> {
-        self.entries.lock().get(name)
-            .cloned()
-            .map(|node| node as Arc<dyn Inode>)
-            .ok_or(Errno::ENOENT)
+        self.entries.lock().get(name).cloned().ok_or(Errno::ENOENT)
     }
 
     fn readdir(&self, offset: u64) -> Result<Option<DirEntry>, Errno> {
@@ -95,7 +104,7 @@ impl Inode for RamDirNode {
                 let idx = (n - 2) as usize;
                 let entries = self.entries.lock();
                 match entries.iter().nth(idx) {
-                    Some((name, node)) => Ok(Some(DirEntry::new(node.ino, FileType::Regular, name.as_bytes()))),
+                    Some((name, node)) => Ok(Some(DirEntry::new(node.stat().st_ino, node.file_type(), name.as_bytes()))),
                     None => Ok(None),
                 }
             }
@@ -105,12 +114,64 @@ impl Inode for RamDirNode {
     fn create(&self, name: &str) -> Result<Arc<dyn Inode>, Errno> {
         let mut entries = self.entries.lock();
         if let Some(existing) = entries.get(name) {
-            return Ok(existing.clone() as Arc<dyn Inode>);
+            if existing.file_type() == FileType::Directory {
+                return Err(Errno::EISDIR);
+            }
+            return Ok(existing.clone());
         }
-        let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
-        let node = Arc::new(RamFileNode { ino, data: Arc::new(Mutex::new(Vec::new())) });
-        entries.insert(name.to_string(), node.clone());
+        let node = Arc::new(RamFileNode { ino: alloc_ino(), data: Arc::new(Mutex::new(Vec::new())) });
+        entries.insert(name.to_string(), node.clone() as Arc<dyn Inode>);
         Ok(node as Arc<dyn Inode>)
+    }
+
+    fn mkdir(&self, name: &str) -> Result<Arc<dyn Inode>, Errno> {
+        let mut entries = self.entries.lock();
+        if entries.contains_key(name) {
+            return Err(Errno::EEXIST);
+        }
+        let node = Arc::new(RamDirNode::new(alloc_ino()));
+        entries.insert(name.to_string(), node.clone() as Arc<dyn Inode>);
+        Ok(node as Arc<dyn Inode>)
+    }
+
+    fn unlink(&self, name: &str) -> Result<(), Errno> {
+        let mut entries = self.entries.lock();
+        match entries.get(name) {
+            None => Err(Errno::ENOENT),
+            Some(node) if node.file_type() == FileType::Directory => Err(Errno::EISDIR),
+            Some(_) => { entries.remove(name); Ok(()) }
+        }
+    }
+
+    fn rmdir(&self, name: &str) -> Result<(), Errno> {
+        let mut entries = self.entries.lock();
+        let node = match entries.get(name) {
+            None => return Err(Errno::ENOENT),
+            Some(node) => node,
+        };
+        if node.file_type() != FileType::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        // offset 2 is the first entry past "." and ".." — Ok(None) there
+        // means the directory holds nothing else.
+        if node.readdir(2)?.is_some() {
+            return Err(Errno::ENOTEMPTY);
+        }
+        entries.remove(name);
+        Ok(())
+    }
+
+    fn take_child(&self, name: &str) -> Result<Arc<dyn Inode>, Errno> {
+        self.entries.lock().remove(name).ok_or(Errno::ENOENT)
+    }
+
+    fn insert_child(&self, name: &str, node: Arc<dyn Inode>) -> Result<(), Errno> {
+        let mut entries = self.entries.lock();
+        if entries.contains_key(name) {
+            return Err(Errno::EEXIST);
+        }
+        entries.insert(name.to_string(), node);
+        Ok(())
     }
 }
 
