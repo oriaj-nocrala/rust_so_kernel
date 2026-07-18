@@ -78,6 +78,26 @@ pub struct Process {
     /// Stored here (not in a global) so multiple processes can wait concurrently.
     pub waiting_for: Option<usize>,
 
+    /// User pointer `waitpid()`'s caller wants the reaped child's wait
+    /// status written to (0 = none requested, i.e. a NULL status pointer).
+    /// Only meaningful while `waiting_for` is `Some`. Not usable directly
+    /// from `Scheduler::notify_child_death` (which can run in the *dying
+    /// child's* address space, not this process's) — that instead stashes
+    /// the value in `pending_wait_status`, consumed by
+    /// `Scheduler::resolve_wait_status` the next time this process actually
+    /// resumes in user mode, once its own page table is active again.
+    pub waiting_status_ptr: usize,
+    /// See `waiting_status_ptr`: the actual status word, waiting to be
+    /// written into user memory once it's safe to.
+    pub pending_wait_status: Option<i32>,
+
+    /// Set just before this process is killed by an uncaught signal or a
+    /// hardware fault (segfault, GPF, divide-by-zero, ...) — `None` for a
+    /// normal `exit()`. Hardware faults are all reported as `SIGSEGV` for
+    /// wait-status purposes (this kernel doesn't distinguish fault kinds
+    /// at the signal level). Read by `wait_status_word()`.
+    pub killed_by_signal: Option<u32>,
+
     /// FS segment base (used for TLS via arch_prctl ARCH_SET_FS).
     /// Saved/restored on every context switch so mlibc's TLS works correctly.
     pub fs_base: u64,
@@ -173,6 +193,9 @@ impl Process {
             address_space: Arc::new(address_space),
             files: Arc::new(Mutex::new(FileDescriptorTable::new_with_stdio())),
             waiting_for: None,
+            waiting_status_ptr: 0,
+            pending_wait_status: None,
+            killed_by_signal: None,
             fs_base: 0,
             is_thread: false,
             owned_stack_vma: None,
@@ -233,6 +256,9 @@ impl Process {
             address_space: Arc::new(address_space),
             files: Arc::new(Mutex::new(FileDescriptorTable::new_with_stdio())),
             waiting_for: None,
+            waiting_status_ptr: 0,
+            pending_wait_status: None,
+            killed_by_signal: None,
             fs_base: 0,
             is_thread: false,
             owned_stack_vma: None,
@@ -272,6 +298,9 @@ impl Process {
             address_space: Arc::new(address_space),
             files: Arc::new(Mutex::new(files)),
             waiting_for: None,
+            waiting_status_ptr: 0,
+            pending_wait_status: None,
+            killed_by_signal: None,
             fs_base: 0,
             is_thread: false,
             owned_stack_vma: None,
@@ -346,6 +375,9 @@ impl Process {
             address_space,
             files,
             waiting_for: None,
+            waiting_status_ptr: 0,
+            pending_wait_status: None,
+            killed_by_signal: None,
             fs_base: 0,
             is_thread: true,
             owned_stack_vma,
@@ -365,6 +397,22 @@ impl Process {
         let p = core::cmp::min(priority, 10);
         self.priority = p;
         self.effective_priority = p;
+    }
+
+    /// Encodes this (dead) process's exit condition into this kernel's
+    /// wait(2)-ABI status word.
+    ///
+    /// `mlibc-port/constanos-sysdeps/include/abi-bits/wait.h` uses the
+    /// dripos-style encoding (`WIFEXITED` = bit `0x200`, `WIFSIGNALED` =
+    /// bit `0x400` with the signal number in bits 24-31) rather than
+    /// Linux's `WTERMSIG(x) == 0` trick — see the mlibc-port ABI-bug
+    /// history for why this port follows that header instead of assuming
+    /// Linux's layout here.
+    pub fn wait_status_word(&self) -> i32 {
+        match self.killed_by_signal {
+            Some(sig) => (((sig as i32) & 0xFF) << 24) | 0x400,
+            None => 0x200 | (self.exit_status & 0xFF),
+        }
     }
 }
 

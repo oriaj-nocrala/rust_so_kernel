@@ -80,7 +80,13 @@ pub unsafe fn jump_to_user(tf: *const TrapFrame) -> ! {
     unsafe { core::arch::asm!("cli"); }
     let tf = {
         let mut sched = super::scheduler::local_scheduler();
-        sched.resolve_signals(tf)
+        let tf = sched.resolve_signals(tf);
+        // Flush a pending reaped-child wait status into this process's own
+        // memory now that its address space is (already) active — see
+        // `Scheduler::resolve_wait_status`'s doc comment for why this can't
+        // happen any earlier, from the child's own exit path.
+        sched.resolve_wait_status();
+        tf
     };
     unsafe { jump_to_trapframe(tf) }
 }

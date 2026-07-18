@@ -274,7 +274,25 @@ extern "x86-interrupt" fn page_fault_handler(
 fn kill_current_user_process(reason: &str) -> ! {
     let tf_ptr = {
         let mut scheduler = crate::process::scheduler::local_scheduler();
+
+        // Tag the about-to-die process so `waitpid()` reports a real
+        // WIFSIGNALED/SIGSEGV status instead of a lying "exited(0)" — every
+        // hardware fault this handler covers (divide-by-zero, invalid
+        // opcode, GPF, unhandled page fault) is reported as SIGSEGV, since
+        // this kernel doesn't distinguish fault kinds at the signal level.
+        // Captured before `kill_and_switch_tf` takes the process out of
+        // `self.running`.
+        let (dead_pid, parent_pid) = match scheduler.running_mut() {
+            Some(proc) => {
+                proc.killed_by_signal = Some(crate::process::signal::SIGSEGV);
+                let parent = if proc.is_thread { None } else { proc.parent_pid };
+                (proc.pid.0, parent)
+            }
+            None => (0, None),
+        };
+
         let ptr = scheduler.kill_and_switch_tf(reason);
+        scheduler.notify_child_death(dead_pid, parent_pid);
 
         serial_println!("  → Switching to next process (full TrapFrame restore)");
         ptr

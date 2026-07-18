@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <errno.h>
 #include <string.h>
+#include <signal.h>
 
 int main(void) {
     struct stat st;
@@ -34,13 +35,15 @@ int main(void) {
     close(fd);
     printf("stat_test: OK\n");
 
+    // Real exit code, not 0 — proves the kernel is actually reporting the
+    // child's own status instead of a hardcoded "exited(0)".
     pid_t child = fork();
     if (child < 0) {
         printf("fork FAILED\n");
         return 1;
     }
     if (child == 0) {
-        _exit(0);
+        _exit(42);
     }
 
     int status = -1;
@@ -51,6 +54,33 @@ int main(void) {
     }
     printf("waitpid: reaped=%d WIFEXITED=%d WEXITSTATUS=%d\n",
            (int)reaped, WIFEXITED(status), WEXITSTATUS(status));
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 42) {
+        printf("waitpid_test FAILED: expected WIFEXITED && WEXITSTATUS==42\n");
+        return 1;
+    }
+
+    // A child killed by an uncaught signal should report WIFSIGNALED/
+    // WTERMSIG, not WIFEXITED.
+    pid_t child2 = fork();
+    if (child2 < 0) {
+        printf("fork(2) FAILED\n");
+        return 1;
+    }
+    if (child2 == 0) {
+        kill(getpid(), SIGKILL);
+        _exit(1); // unreachable if SIGKILL actually took effect
+    }
+    int status2 = -1;
+    pid_t reaped2 = waitpid(child2, &status2, 0);
+    if (reaped2 != child2) {
+        printf("waitpid(2) FAILED: reaped=%d child=%d\n", (int)reaped2, (int)child2);
+        return 1;
+    }
+    printf("waitpid(2): WIFSIGNALED=%d WTERMSIG=%d\n", WIFSIGNALED(status2), WTERMSIG(status2));
+    if (!WIFSIGNALED(status2) || WTERMSIG(status2) != SIGKILL) {
+        printf("waitpid_test(2) FAILED: expected WIFSIGNALED && WTERMSIG==SIGKILL\n");
+        return 1;
+    }
     printf("waitpid_test: OK\n");
 
     DIR *dir = opendir("/dev");

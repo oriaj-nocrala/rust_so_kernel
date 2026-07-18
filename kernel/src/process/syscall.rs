@@ -159,7 +159,13 @@ extern "C" fn syscall_handler_asm(regs: &SavedRegisters) -> i64 {
     unsafe { core::arch::asm!("cli"); }
     let resolved_tf = {
         let mut sched = super::scheduler::local_scheduler();
-        sched.resolve_signals(tf_ptr as *const TrapFrame)
+        let tf = sched.resolve_signals(tf_ptr as *const TrapFrame);
+        // Same reasoning as `trapframe::jump_to_user` — must run regardless
+        // of which branch below fires, since the signal-killed-and-rescheduled
+        // branch jumps via a raw `jump_to_trapframe` that bypasses
+        // `jump_to_user` entirely.
+        sched.resolve_wait_status();
+        tf
     };
 
     if resolved_tf != tf_ptr as *const TrapFrame {
@@ -457,7 +463,7 @@ pub fn syscall_handler(
         SyscallNumber::Fork => sys_fork(),
         SyscallNumber::Exec => sys_exec(arg1 as usize, arg2 as usize, arg3 as usize),
         SyscallNumber::Exit => sys_exit(arg1 as i32),
-        SyscallNumber::Waitpid => sys_waitpid(arg1 as usize),
+        SyscallNumber::Waitpid => sys_waitpid(arg1 as usize, arg2 as usize),
         SyscallNumber::Kill => sys_kill(arg1 as usize, arg2 as u32),
         SyscallNumber::ArchPrctl => sys_arch_prctl(arg1 as i32, arg2),
         SyscallNumber::Futex => sys_futex(arg1, arg2 as i32, arg3 as i32, arg4),
@@ -1375,33 +1381,16 @@ fn sys_exit(status: i32) -> SyscallResult {
     drop(old_files);
 
     // Queue SIGCHLD on the parent (default action Ignore — purely additive,
-    // no observable change unless the parent installed a handler). Not
-    // combined with a wake(): a parent actually blocked in waitpid() for
-    // this pid is already correctly woken with the right return value by
-    // waitpid_wakeup() below; waking it a second time here for an unrelated
-    // block (futex/pipe/nanosleep/...) would risk resuming it with a stale
-    // return value in a register nothing recomputed — see sys_kill's doc
-    // comment for the same tradeoff.
-    if let Some(parent_pid) = parent_to_notify {
-        unsafe { core::arch::asm!("cli"); }
-        let mut sched = super::scheduler::local_scheduler();
-        // `find_process_mut` only searches run_queues/wait_queue (deliberately
-        // excludes `running` — see its doc comment); the parent may already
-        // *be* `running` here if `kill_and_switch_tf` above just picked it as
-        // the next process to schedule, so that case needs its own check.
-        if sched.current_pid() == Some(parent_pid) {
-            if let Some(parent) = sched.running_mut() {
-                super::signal::queue_signal(parent, super::signal::SIGCHLD);
-            }
-        } else if let Some(parent) = sched.find_process_mut(parent_pid.0) {
-            super::signal::queue_signal(parent, super::signal::SIGCHLD);
-        }
-        drop(sched);
-        unsafe { core::arch::asm!("sti"); }
-    }
-
-    // Wake any parent waiting via waitpid
-    waitpid_wakeup(dead_pid);
+    // no observable change unless the parent installed a handler) and wake
+    // it if it's blocked in waitpid() for exactly this pid, delivering the
+    // real wait status. One locked section for both — `find_process_mut`
+    // only searches run_queues/wait_queue (deliberately excludes `running`,
+    // see its doc comment); the parent may already *be* `running` here if
+    // `kill_and_switch_tf` above just picked it as the next process to
+    // schedule, so `notify_child_death` checks that case itself.
+    unsafe { core::arch::asm!("cli"); }
+    super::scheduler::local_scheduler().notify_child_death(dead_pid, parent_to_notify);
+    unsafe { core::arch::asm!("sti"); }
 
     // Cancel any pending poll/epoll wait and clear side tables
     poll_cancel_waiter(dead_pid);
@@ -1716,7 +1705,11 @@ fn find_program_elf(name: &str) -> Option<&'static [u8]> {
     crate::fs::initramfs::bytes(name)
 }
 
-fn sys_waitpid(child_pid: usize) -> SyscallResult {
+fn sys_waitpid(child_pid: usize, status_ptr: usize) -> SyscallResult {
+    if status_ptr != 0 {
+        if let Err(e) = validate_user_buffer(status_ptr as u64, 4) { return e; }
+    }
+
     let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame;
 
     unsafe { core::arch::asm!("cli"); }
@@ -1742,8 +1735,15 @@ fn sys_waitpid(child_pid: usize) -> SyscallResult {
         }) {
             // Safe to free the zombie's kernel stack immediately: we're
             // running on the *parent's* stack here (this is its own
-            // waitpid() syscall), never the dead child's.
+            // waitpid() syscall), never the dead child's. Same reasoning
+            // makes it safe to write the real wait status straight into
+            // `status_ptr` right here, unlike the not-yet-zombie path below:
+            // this is the parent's own page table, no cross-address-space
+            // concern.
             if let Some(proc) = scheduler.wait_queue.remove(pos) {
+                if status_ptr != 0 {
+                    unsafe { core::ptr::write(status_ptr as *mut i32, proc.wait_status_word()); }
+                }
                 crate::init::processes::free_kernel_stack(proc.kernel_stack);
             }
             already_zombie = true;
@@ -1751,12 +1751,15 @@ fn sys_waitpid(child_pid: usize) -> SyscallResult {
         } else {
             already_zombie = false;
 
-            // Not a zombie yet — record what we are waiting for in the
-            // Process struct (supports multiple concurrent waitpid callers:
-            // shell + ipc_ping etc.) and block until the child exits and
-            // calls waitpid_wakeup().
+            // Not a zombie yet — record what we are waiting for (and where
+            // to eventually write its status — see `Process::
+            // waiting_status_ptr`'s doc comment for why that write can't
+            // happen from `notify_child_death` directly) in the Process
+            // struct (supports multiple concurrent waitpid callers: shell +
+            // ipc_ping etc.) and block until the child exits.
             if let Some(proc) = scheduler.running_mut() {
                 proc.waiting_for = Some(child_pid);
+                proc.waiting_status_ptr = status_ptr;
             }
 
             scheduler.block_current(tf_ptr)
@@ -1831,32 +1834,6 @@ fn sys_clock_gettime(clk_id: u64, tp_ptr: u64) -> SyscallResult {
     }
 
     0
-}
-
-/// Called from sys_exit after the process is killed.
-///
-/// Scans the wait_queue for any process whose waiting_for == dead_pid.
-/// Supports multiple concurrent waiters (shell + ipc_ping etc.) because
-/// the wait info lives in each Process rather than a single global slot.
-pub(crate) fn waitpid_wakeup(dead_pid: usize) {
-    let mut sched = super::scheduler::local_scheduler();
-
-    // Find the parent blocked in waitpid for dead_pid.
-    let mut parent_pid_to_wake: Option<usize> = None;
-    for proc in sched.wait_queue.iter_mut() {
-        if proc.waiting_for == Some(dead_pid)
-            && matches!(proc.state, super::ProcessState::Blocked)
-        {
-            proc.trapframe.rax = dead_pid as u64;
-            proc.waiting_for = None;
-            parent_pid_to_wake = Some(proc.pid.0);
-            break;
-        }
-    }
-
-    if let Some(pid) = parent_pid_to_wake {
-        sched.wake(pid);
-    }
 }
 
 // ============================================================================

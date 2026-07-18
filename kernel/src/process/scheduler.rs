@@ -303,19 +303,34 @@ impl Scheduler {
                 return tf;
             }
 
-            let terminate = match self.running_mut() {
+            let terminate_sig = match self.running_mut() {
                 Some(proc) if proc.privilege == crate::process::PrivilegeLevel::User => {
-                    matches!(
-                        super::signal::deliver_pending(proc, tf as *mut TrapFrame),
-                        super::signal::SignalOutcome::Terminate(_)
-                    )
+                    match super::signal::deliver_pending(proc, tf as *mut TrapFrame) {
+                        super::signal::SignalOutcome::Terminate(sig) => Some(sig),
+                        _ => None,
+                    }
                 }
-                _ => false,
+                _ => None,
             };
-            if !terminate {
+            let Some(sig) = terminate_sig else {
                 return tf;
-            }
+            };
+
+            // Tag the about-to-die process with the signal that killed it
+            // (read back by `Process::wait_status_word()`) and capture what
+            // its parent needs to be told, before `kill_and_switch_tf` below
+            // takes it out of `self.running`.
+            let (dead_pid, parent_pid) = match self.running_mut() {
+                Some(proc) => {
+                    proc.killed_by_signal = Some(sig);
+                    let parent = if proc.is_thread { None } else { proc.parent_pid };
+                    (proc.pid.0, parent)
+                }
+                None => (0, None),
+            };
+
             tf = self.kill_and_switch_tf("uncaught signal");
+            self.notify_child_death(dead_pid, parent_pid);
         }
     }
 
@@ -486,6 +501,78 @@ impl Scheduler {
                 self.run_queues[pri].push_back(proc);
             }
         }
+    }
+
+    /// Called once `dead_pid` is fully dead (either already zombie-parked
+    /// in `wait_queue`, or reaped immediately if it was a thread) — queues
+    /// `SIGCHLD` on the parent (if there is one to notify — threads never
+    /// get one, see `Process::is_thread`'s doc comment) and wakes it if
+    /// it's blocked in `waitpid()` for exactly this child.
+    ///
+    /// Must be called with the scheduler lock already held (`&mut self`,
+    /// i.e. from inside a method on `Scheduler`) and interrupts already
+    /// disabled — every call site satisfies both by the time a process is
+    /// fully dead. This replaces what used to be two separate operations
+    /// (a manual SIGCHLD-queue block plus a freestanding `waitpid_wakeup`
+    /// function that re-acquired the scheduler lock itself) so both
+    /// `sys_exit` and the uncaught-signal/hardware-fault kill paths can
+    /// share one correctly-locked implementation instead of each growing
+    /// their own copy.
+    pub fn notify_child_death(&mut self, dead_pid: usize, parent_pid: Option<Pid>) {
+        if let Some(parent_pid) = parent_pid {
+            if self.current_pid() == Some(parent_pid) {
+                if let Some(parent) = self.running_mut() {
+                    super::signal::queue_signal(parent, super::signal::SIGCHLD);
+                }
+            } else if let Some(parent) = self.find_process_mut(parent_pid.0) {
+                super::signal::queue_signal(parent, super::signal::SIGCHLD);
+            }
+        }
+
+        // Real exit status, if `dead_pid` is parked as a zombie. Threads
+        // aren't (reaped immediately in `kill_current`), so this stays at
+        // the "exited(0)" default for them — matches this kernel's existing
+        // stance that nothing meaningful ever `waitpid()`s a thread's tid.
+        let status_word = self.wait_queue.iter()
+            .find(|p| p.pid.0 == dead_pid && matches!(p.state, ProcessState::Zombie))
+            .map(|p| p.wait_status_word())
+            .unwrap_or(0x200);
+
+        let mut waker_pid: Option<usize> = None;
+        for proc in self.wait_queue.iter_mut() {
+            if proc.waiting_for == Some(dead_pid) && matches!(proc.state, ProcessState::Blocked) {
+                proc.trapframe.rax = dead_pid as u64;
+                proc.waiting_for = None;
+                proc.pending_wait_status = Some(status_word);
+                waker_pid = Some(proc.pid.0);
+                break;
+            }
+        }
+        if let Some(pid) = waker_pid {
+            self.wake(pid);
+        }
+    }
+
+    /// If the process about to resume (`self.running`) has a pending
+    /// reaped-child wait status (stashed by `notify_child_death`, possibly
+    /// while a completely different process's page table was active, since
+    /// a dying child can't safely write into its blocked parent's user
+    /// memory directly), write it into the user pointer that process
+    /// originally passed to `waitpid()`, now that its own address space is
+    /// active again.
+    ///
+    /// Called from every "about to return to user mode" site (mirrors
+    /// `resolve_signals`, see its call sites) — cheap no-op check when
+    /// there's nothing pending, which is the common case.
+    pub fn resolve_wait_status(&mut self) {
+        let Some(proc) = self.running_mut() else { return; };
+        let Some(status) = proc.pending_wait_status.take() else { return; };
+        if proc.waiting_status_ptr != 0 {
+            unsafe {
+                core::ptr::write(proc.waiting_status_ptr as *mut i32, status);
+            }
+        }
+        proc.waiting_status_ptr = 0;
     }
 
     // ====================================================================

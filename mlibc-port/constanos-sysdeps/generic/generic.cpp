@@ -487,17 +487,14 @@ int sys_execve(const char *path, char *const argv[], char *const envp[]) {
 // kernel can't honor up front instead of silently hanging or waiting on
 // the wrong thing.
 //
-// It also has no out-param for the exit status: `Process::exit_status` is
-// tracked kernel-side (see kernel/src/process/syscall.rs::sys_exit) but
-// there's no ABI to read it back here, so every reaped child is reported
-// as if it called `exit(0)` regardless of what it actually passed. Fixing
-// this needs the kernel syscall to grow a status-out pointer — and even
-// then, only the "child already a zombie" path can safely write straight
-// into the caller's memory; the "block, then get woken by the child's
-// sys_exit" path resumes via a raw trapframe restore (jump_to_trapframe)
-// with no return back into this function, and waitpid_wakeup() itself
-// runs in the *dying child's* address space, not the parent's — so it
-// can't just core::ptr::write into a parent-space status_ptr either.
+// The kernel now writes a real status word into a second syscall argument
+// (a user pointer) — see kernel/src/process/syscall.rs::sys_waitpid and
+// Scheduler::{notify_child_death,resolve_wait_status} for how it gets
+// there safely even across the "block, then get woken by the child's
+// sys_exit" path (which resumes via a raw trapframe restore with no
+// return into Rust code, and originally couldn't write into the parent's
+// memory from the dying child's own address space — fixed by deferring
+// the write to the next time the parent itself resumes in user mode).
 int sys_waitpid(pid_t pid, int *status, int flags, struct rusage *ru,
 		pid_t *ret_pid) {
 	(void)flags;
@@ -505,15 +502,12 @@ int sys_waitpid(pid_t pid, int *status, int flags, struct rusage *ru,
 		__builtin_memset(ru, 0, sizeof(*ru));
 	if (pid <= 0)
 		return ECHILD;
-	long ret = raw_syscall(SYS_waitpid, pid);
+	int kstatus = 0;
+	long ret = raw_syscall(SYS_waitpid, pid, (long)&kstatus);
 	if (ret < 0)
 		return (int)-ret;
-	// abi-bits/wait.h uses the dripos-style encoding (WIFEXITED = bit
-	// 0x200, not Linux's "WTERMSIG == 0"), so plain 0 would make
-	// WIFEXITED() false. 0x200 alone reports "exited normally with
-	// code 0" — always 0 since (as above) the real code isn't tracked.
 	if (status)
-		*status = 0x200;
+		*status = kstatus;
 	if (ret_pid)
 		*ret_pid = (pid_t)ret;
 	return 0;

@@ -119,6 +119,7 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> *const 
             // resuming it. Still clear poll waiters for any pids woken by
             // hrtimer either way.
             let tf = scheduler.resolve_signals(current_tf);
+            scheduler.resolve_wait_status();
             drop(scheduler);
             for &pid in &wake_pids[..wake_count] {
                 crate::process::syscall::poll_clear_on_timeout(pid);
@@ -128,7 +129,15 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> *const 
 
         // ── 5. Time slice exhausted — context switch ──────────────────
         let tf = scheduler.switch_to_next(current_tf);
-        scheduler.resolve_signals(tf)
+        let tf = scheduler.resolve_signals(tf);
+        // A process woken from a blocked waitpid() (see `Scheduler::
+        // notify_child_death`) most commonly gets picked up right here —
+        // this is the scheduler's main "what runs next" decision point,
+        // called on every exhausted time slice. Must flush its pending
+        // status now, same as every other "about to return to user mode"
+        // site (`trapframe::jump_to_user`, the syscall-return epilogue).
+        scheduler.resolve_wait_status();
+        tf
         // scheduler lock released here
     };
 
