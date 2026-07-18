@@ -366,6 +366,13 @@ impl FileHandle for FramebufferConsole {
         Some(Stat::chardev(0))
     }
 
+    // A bare unit struct — all real state (cursor, color, ANSI parser) is
+    // the global FB_STATE, so a second instance is already a correct dup,
+    // no need to route through ::new()'s one-time-clear check again.
+    fn dup(&self) -> Option<Box<dyn FileHandle>> {
+        Some(Box::new(FramebufferConsole))
+    }
+
     fn name(&self) -> &str {
         "fb"
     }

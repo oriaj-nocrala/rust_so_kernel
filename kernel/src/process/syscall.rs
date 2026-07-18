@@ -192,6 +192,9 @@ pub enum SyscallNumber {
     Mkdir = 83,
     Rmdir = 84,
     Unlink = 87,
+    Dup = 32,
+    Dup2 = 33,
+    Fcntl = 72,
     Pipe = 22,
     Munmap = 11,
     Brk = 12,
@@ -246,6 +249,9 @@ impl SyscallNumber {
             83 => Some(Self::Mkdir),
             84 => Some(Self::Rmdir),
             87 => Some(Self::Unlink),
+            32 => Some(Self::Dup),
+            33 => Some(Self::Dup2),
+            72 => Some(Self::Fcntl),
             22 => Some(Self::Pipe),
             11 => Some(Self::Munmap),
             12 => Some(Self::Brk),
@@ -430,6 +436,9 @@ pub fn syscall_handler(
         SyscallNumber::Mkdir => sys_mkdir(arg1 as usize),
         SyscallNumber::Rmdir => sys_rmdir(arg1 as usize),
         SyscallNumber::Unlink => sys_unlink(arg1 as usize),
+        SyscallNumber::Dup => sys_dup(arg1 as i32),
+        SyscallNumber::Dup2 => sys_dup2(arg1 as i32, arg2 as i32),
+        SyscallNumber::Fcntl => sys_fcntl(arg1 as i32, arg2 as i32, arg3),
         SyscallNumber::Pipe => sys_pipe(arg1),
         SyscallNumber::Munmap => sys_munmap(arg1, arg2),
         SyscallNumber::Brk => sys_brk(arg1),
@@ -816,6 +825,91 @@ fn sys_close(fd: i32) -> SyscallResult {
     match result {
         Ok(_) => 0,
         Err(_) => errno::EBADF,
+    }
+}
+
+/// dup(32): long dup(int fd)
+///
+/// Never closes anything (always lands on a *free* slot), so — unlike
+/// dup2/close — there's no pipe-Drop-while-locked hazard here; plain
+/// `with_current_process` is fine.
+fn sys_dup(fd: i32) -> SyscallResult {
+    if fd < 0 { return errno::EBADF; }
+    with_current_process(|proc| {
+        match proc.files.lock().dup(fd as usize, 0) {
+            Ok(newfd) => newfd as SyscallResult,
+            Err(_) => errno::EBADF,
+        }
+    })
+}
+
+/// dup2(33): long dup2(int oldfd, int newfd)
+///
+/// Same lock-dropping shape as `sys_close` (see its doc comment): if
+/// `newfd` is already open, installing the dup closes whatever was there
+/// first, which can run a pipe's Drop impl and deadlock if SCHEDULER were
+/// still held.
+fn sys_dup2(oldfd: i32, newfd: i32) -> SyscallResult {
+    if oldfd < 0 || newfd < 0 { return errno::EBADF; }
+
+    let files = {
+        unsafe { core::arch::asm!("cli"); }
+        let scheduler = super::scheduler::local_scheduler();
+        let result = match scheduler.running_ref() {
+            Some(proc) => proc.files.clone(),
+            None => { unsafe { core::arch::asm!("sti"); } return errno::ESRCH; }
+        };
+        unsafe { core::arch::asm!("sti"); }
+        result
+    };
+
+    unsafe { core::arch::asm!("cli"); }
+    let result = files.lock().dup2(oldfd as usize, newfd as usize);
+    unsafe { core::arch::asm!("sti"); }
+    match result {
+        Ok(nf) => nf as SyscallResult,
+        Err(_) => errno::EBADF,
+    }
+}
+
+// fcntl(2) commands this kernel understands — real Linux x86-64 values.
+const F_DUPFD: i32 = 0;
+const F_GETFD: i32 = 1;
+const F_SETFD: i32 = 2;
+const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+const F_DUPFD_CLOEXEC: i32 = 1030;
+
+/// fcntl(72): long fcntl(int fd, int cmd, unsigned long arg)
+///
+/// Only F_DUPFD/F_DUPFD_CLOEXEC actually do something, and they do the
+/// same thing: this kernel has no per-fd close-on-exec flag anywhere, so
+/// there's nothing for the CLOEXEC half to set differently. F_GETFD/
+/// F_SETFD/F_GETFL/F_SETFL are stubbed — `FileDescriptorTable` has no
+/// per-fd flags storage to back real answers with, so the getters always
+/// report 0 and the setters silently accept anything (after checking `fd`
+/// is actually open). Good enough for callers that only care whether the
+/// call succeeded, not a real flags implementation.
+fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
+    if fd < 0 { return errno::EBADF; }
+    match cmd {
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            with_current_process(|proc| {
+                match proc.files.lock().dup(fd as usize, arg as usize) {
+                    Ok(newfd) => newfd as SyscallResult,
+                    Err(_) => errno::EBADF,
+                }
+            })
+        }
+        F_GETFD | F_SETFD | F_GETFL | F_SETFL => {
+            with_current_process(|proc| {
+                match proc.files.lock().get(fd as usize) {
+                    Ok(_)  => 0,
+                    Err(_) => errno::EBADF,
+                }
+            })
+        }
+        _ => errno::EINVAL,
     }
 }
 

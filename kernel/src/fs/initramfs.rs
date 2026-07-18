@@ -13,6 +13,7 @@
 // Inode numbers: 1 = root directory, 2+ = files (index + 2).
 
 use alloc::{boxed::Box, sync::Arc};
+use spin::Mutex;
 
 use crate::fs::{
     types::{DirEntry, Errno, FileType, OpenFlags, Stat},
@@ -123,24 +124,28 @@ impl Inode for InitramfsFileInode {
 /// Seekable read-only file handle over a static byte slice.
 struct RamFile {
     data:   &'static [u8],
-    offset: usize,
+    // Arc'd so dup()/dup2() can share one true "open file description"
+    // position between two fds (POSIX dup() semantics) — see ramfs.rs's
+    // RamFileHandle, which has the exact same reasoning.
+    offset: Arc<Mutex<usize>>,
 }
 
 impl RamFile {
     fn new(data: &'static [u8]) -> Self {
-        Self { data, offset: 0 }
+        Self { data, offset: Arc::new(Mutex::new(0)) }
     }
 }
 
 impl FileHandle for RamFile {
     fn read(&mut self, buf: &mut [u8]) -> FileResult<usize> {
-        let remaining = &self.data[self.offset..];
+        let mut offset = self.offset.lock();
+        let remaining = &self.data[*offset..];
         if remaining.is_empty() {
             return Ok(0); // EOF
         }
         let n = buf.len().min(remaining.len());
         buf[..n].copy_from_slice(&remaining[..n]);
-        self.offset += n;
+        *offset += n;
         Ok(n)
     }
 
@@ -150,6 +155,10 @@ impl FileHandle for RamFile {
 
     fn stat(&self) -> Option<crate::fs::types::Stat> {
         Some(Stat::regular(0, self.data.len() as i64))
+    }
+
+    fn dup(&self) -> Option<Box<dyn FileHandle>> {
+        Some(Box::new(RamFile { data: self.data, offset: self.offset.clone() }))
     }
 
     fn name(&self) -> &str { "initramfs" }

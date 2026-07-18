@@ -35,20 +35,24 @@
 #define O_PATH      010000000
 #define O_TMPFILE   (020000000 | O_DIRECTORY)
 
+// Same story as the O_* block above: real Linux x86-64 values, not the
+// dripos-template ones — kernel/src/process/syscall.rs::sys_fcntl matches
+// on these exact numbers (F_DUPFD=0 vs. this header's old F_DUPFD=1 would
+// have silently landed on F_GETFD's stub instead of actually duplicating).
 /* constants for fcntl()'s command argument */
-#define F_DUPFD 1
-#define F_DUPFD_CLOEXEC 2
-#define F_GETFD 3
-#define F_SETFD 4
-#define F_GETFL 5
-#define F_SETFL 6
-#define F_GETLK 7
-#define F_SETLK 8
+#define F_DUPFD 0
+#define F_GETFD 1
+#define F_SETFD 2
+#define F_GETFL 3
+#define F_SETFL 4
+#define F_GETLK 5
+#define F_SETLK 6
 #define F_SETLK64 F_SETLK
-#define F_SETLKW 9
+#define F_SETLKW 7
 #define F_SETLKW64 F_SETLKW
-#define F_GETOWN 10
-#define F_SETOWN 11
+#define F_SETOWN 8
+#define F_GETOWN 9
+#define F_DUPFD_CLOEXEC 1030
 
 /* constants for struct flock's l_type member */
 #define F_RDLCK 1

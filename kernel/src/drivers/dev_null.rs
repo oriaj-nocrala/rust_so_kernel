@@ -21,6 +21,12 @@ impl FileHandle for DevNull {
         Some(Stat::chardev(0))
     }
 
+    // Stateless (no fields at all) — a fresh instance behaves identically
+    // to the original, so "duplicating" it is just making another one.
+    fn dup(&self) -> Option<Box<dyn FileHandle>> {
+        Some(Box::new(DevNull))
+    }
+
     fn name(&self) -> &str {
         "/dev/null"
     }

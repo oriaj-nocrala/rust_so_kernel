@@ -49,6 +49,10 @@ impl FileHandle for SerialConsole {
         Some(Stat::chardev(0))
     }
 
+    fn dup(&self) -> Option<Box<dyn FileHandle>> {
+        Some(Box::new(SerialConsole))
+    }
+
     fn name(&self) -> &str {
         "serial"
     }

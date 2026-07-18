@@ -24,6 +24,10 @@ impl FileHandle for DevZero {
         Some(Stat::chardev(0))
     }
 
+    fn dup(&self) -> Option<Box<dyn FileHandle>> {
+        Some(Box::new(DevZero))
+    }
+
     fn name(&self) -> &str {
         "/dev/zero"
     }

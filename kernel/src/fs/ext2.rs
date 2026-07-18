@@ -18,7 +18,7 @@
 // completely, so mounting refuses outright rather than guess.
 
 use alloc::{boxed::Box, string::String, string::ToString, sync::Arc, vec::Vec};
-use spin::Once;
+use spin::{Mutex, Once};
 
 use crate::fs::{
     types::{DirEntry, Errno, FileType, OpenFlags, Stat},
@@ -339,7 +339,7 @@ impl Inode for Ext2Inode {
             let entries = fs().read_dir_entries(&self.raw);
             Ok(Box::new(Ext2DirHandle { ino: self.ino, entries, offset: 0 }))
         } else {
-            Ok(Box::new(Ext2FileHandle { raw: self.raw.clone(), offset: 0 }))
+            Ok(Box::new(Ext2FileHandle { raw: self.raw.clone(), offset: Arc::new(Mutex::new(0)) }))
         }
     }
 
@@ -374,18 +374,21 @@ impl Inode for Ext2Inode {
 
 struct Ext2FileHandle {
     raw: RawInode,
-    offset: usize,
+    // Arc'd so dup()/dup2() can share one true "open file description"
+    // position between two fds — same reasoning as ramfs's RamFileHandle.
+    offset: Arc<Mutex<usize>>,
 }
 
 impl FileHandle for Ext2FileHandle {
     fn read(&mut self, buf: &mut [u8]) -> FileResult<usize> {
         let size = self.raw.size as usize;
-        if self.offset >= size {
+        let mut offset = self.offset.lock();
+        if *offset >= size {
             return Ok(0);
         }
-        let n = buf.len().min(size - self.offset);
-        fs().read_file_range(&self.raw, self.offset, &mut buf[..n]);
-        self.offset += n;
+        let n = buf.len().min(size - *offset);
+        fs().read_file_range(&self.raw, *offset, &mut buf[..n]);
+        *offset += n;
         Ok(n)
     }
 
@@ -395,6 +398,13 @@ impl FileHandle for Ext2FileHandle {
 
     fn stat(&self) -> Option<Stat> {
         Some(Stat::regular(0, self.raw.size as i64))
+    }
+
+    fn dup(&self) -> Option<Box<dyn FileHandle>> {
+        Some(Box::new(Ext2FileHandle {
+            raw: self.raw.clone(),
+            offset: self.offset.clone(),
+        }))
     }
 
     fn name(&self) -> &str { "ext2" }

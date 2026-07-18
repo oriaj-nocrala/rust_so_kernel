@@ -37,6 +37,10 @@ impl FileHandle for KbdDevice {
         Some(Stat::chardev(0))
     }
 
+    fn dup(&self) -> Option<Box<dyn FileHandle>> {
+        Some(Box::new(KbdDevice))
+    }
+
     fn name(&self) -> &str {
         "/dev/kbd"
     }

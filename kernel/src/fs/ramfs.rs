@@ -234,7 +234,11 @@ impl Inode for RamFileNode {
         } else {
             0
         };
-        Ok(Box::new(RamFileHandle { ino: self.ino, data: self.data.clone(), offset }))
+        Ok(Box::new(RamFileHandle {
+            ino: self.ino,
+            data: self.data.clone(),
+            offset: Arc::new(Mutex::new(offset)),
+        }))
     }
 }
 
@@ -243,34 +247,47 @@ impl Inode for RamFileNode {
 struct RamFileHandle {
     ino:    u64,
     data:   Arc<Mutex<Vec<u8>>>,
-    offset: usize,
+    // Arc'd (not a plain usize) so dup()/dup2() can share one true "open
+    // file description" position between two fds, matching POSIX dup()
+    // semantics — reading through either fd advances both.
+    offset: Arc<Mutex<usize>>,
 }
 
 impl FileHandle for RamFileHandle {
     fn read(&mut self, buf: &mut [u8]) -> FileResult<usize> {
         let data = self.data.lock();
-        if self.offset >= data.len() {
+        let mut offset = self.offset.lock();
+        if *offset >= data.len() {
             return Ok(0); // EOF
         }
-        let n = buf.len().min(data.len() - self.offset);
-        buf[..n].copy_from_slice(&data[self.offset..self.offset + n]);
-        self.offset += n;
+        let n = buf.len().min(data.len() - *offset);
+        buf[..n].copy_from_slice(&data[*offset..*offset + n]);
+        *offset += n;
         Ok(n)
     }
 
     fn write(&mut self, buf: &[u8]) -> FileResult<usize> {
         let mut data = self.data.lock();
-        let end = self.offset + buf.len();
+        let mut offset = self.offset.lock();
+        let end = *offset + buf.len();
         if data.len() < end {
             data.resize(end, 0);
         }
-        data[self.offset..end].copy_from_slice(buf);
-        self.offset = end;
+        data[*offset..end].copy_from_slice(buf);
+        *offset = end;
         Ok(buf.len())
     }
 
     fn stat(&self) -> Option<Stat> {
         Some(Stat::regular(self.ino, self.data.lock().len() as i64))
+    }
+
+    fn dup(&self) -> Option<Box<dyn FileHandle>> {
+        Some(Box::new(RamFileHandle {
+            ino: self.ino,
+            data: self.data.clone(),
+            offset: self.offset.clone(),
+        }))
     }
 
     fn name(&self) -> &str { "ramfs" }

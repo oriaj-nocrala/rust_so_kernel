@@ -21,6 +21,7 @@
 #include <limits.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -62,6 +63,9 @@ constexpr long SYS_rename = 82;
 constexpr long SYS_mkdir = 83;
 constexpr long SYS_rmdir = 84;
 constexpr long SYS_unlink = 87;
+constexpr long SYS_dup = 32;
+constexpr long SYS_dup2 = 33;
+constexpr long SYS_fcntl = 72;
 constexpr long SYS_pipe = 22;
 constexpr long SYS_munmap = 11;
 constexpr long SYS_ioctl = 16;
@@ -151,6 +155,54 @@ int sys_open(const char *path, int flags, mode_t, int *fd) {
 int sys_close(int fd) {
 	long ret = raw_syscall(SYS_close, fd);
 	return ret < 0 ? (int)-ret : 0;
+}
+
+// `flags` here is always 0 from mlibc's dup()/dup2() frontends (it'd only
+// be nonzero for a dup3()-style O_CLOEXEC-on-the-new-fd request, which
+// nothing in this port calls) — this kernel's dup/dup2 syscalls don't take
+// a flags argument at all, so it's simply dropped rather than threaded
+// through for no observable effect.
+int sys_dup(int fd, int flags, int *newfd) {
+	(void)flags;
+	long ret = raw_syscall(SYS_dup, fd);
+	if (ret < 0)
+		return (int)-ret;
+	*newfd = (int)ret;
+	return 0;
+}
+
+int sys_dup2(int fd, int flags, int newfd) {
+	(void)flags;
+	long ret = raw_syscall(SYS_dup2, fd, newfd);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+// This kernel's fcntl(72) only really implements F_DUPFD/F_DUPFD_CLOEXEC
+// (both dup(), since there's no per-fd CLOEXEC flag to set differently)
+// and stubs F_GETFD/F_SETFD/F_GETFL/F_SETFL (fd-validity-checked, but no
+// real flags storage backs them — see the kernel-side doc comment). Only
+// F_DUPFD/F_DUPFD_CLOEXEC/F_SETFD/F_SETFL take a variadic argument; the
+// getters don't, so `va_arg` is only pulled for the ones that need it.
+int sys_fcntl(int fd, int request, va_list args, int *result) {
+	// All commands this kernel understands take an `int`-sized argument
+	// (POSIX: F_DUPFD's is "the minimum new fd", F_SETFD/F_SETFL's are
+	// flag bits) — none need `long`/pointer-sized varargs.
+	long arg = 0;
+	switch (request) {
+		case F_DUPFD:
+		case F_DUPFD_CLOEXEC:
+		case F_SETFD:
+		case F_SETFL:
+			arg = va_arg(args, int);
+			break;
+		default:
+			break;
+	}
+	long ret = raw_syscall(SYS_fcntl, fd, request, arg);
+	if (ret < 0)
+		return (int)-ret;
+	*result = (int)ret;
+	return 0;
 }
 
 namespace {

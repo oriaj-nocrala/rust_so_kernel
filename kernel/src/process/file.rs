@@ -165,6 +165,45 @@ impl FileDescriptorTable {
         Err(FileError::InvalidArgument) // Too many files open
     }
 
+    /// dup(2): install a clone of `fd`'s handle at the first free slot
+    /// `>= min_fd`. Relies on `FileHandle::dup()` — fds backed by a handle
+    /// that doesn't implement it (returns `None`) can't be dup'd; today
+    /// that's only directory handles (opendir), which nothing needs to
+    /// dup in practice.
+    pub fn dup(&mut self, fd: usize, min_fd: usize) -> FileResult<usize> {
+        let cloned = self.get(fd)?.dup().ok_or(FileError::NotSupported)?;
+
+        for i in min_fd..MAX_FILES {
+            if self.files[i].is_none() {
+                self.files[i] = Some(cloned);
+                return Ok(i);
+            }
+        }
+        Err(FileError::InvalidArgument) // no free fd
+    }
+
+    /// dup2(2): install a clone of `oldfd`'s handle at exactly `newfd`,
+    /// closing whatever was already there first. `oldfd == newfd` is a
+    /// POSIX-mandated no-op (returns `newfd` without touching anything),
+    /// as long as `oldfd` is actually open.
+    pub fn dup2(&mut self, oldfd: usize, newfd: usize) -> FileResult<usize> {
+        if newfd >= MAX_FILES {
+            return Err(FileError::BadFileDescriptor);
+        }
+        if oldfd == newfd {
+            self.get(oldfd)?; // still must be a valid open fd
+            return Ok(newfd);
+        }
+
+        let cloned = self.get(oldfd)?.dup().ok_or(FileError::NotSupported)?;
+
+        if let Some(mut old) = self.files[newfd].take() {
+            let _ = old.close();
+        }
+        self.files[newfd] = Some(cloned);
+        Ok(newfd)
+    }
+
     /// Close a file descriptor.
     pub fn close(&mut self, fd: usize) -> FileResult<()> {
         if fd >= MAX_FILES {

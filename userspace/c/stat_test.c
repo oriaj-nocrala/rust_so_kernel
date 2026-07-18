@@ -7,6 +7,7 @@
 #include <dirent.h>
 #include <poll.h>
 #include <errno.h>
+#include <string.h>
 
 int main(void) {
     struct stat st;
@@ -159,5 +160,67 @@ int main(void) {
         return 1;
     }
     printf("mkdir_test: OK\n");
+
+    // dup/dup2/fcntl: write a known 10-byte file, then prove a dup'd fd
+    // shares the same *offset* (not just the same underlying file) —
+    // that's the part that's easy to get wrong (a naive dup could hand
+    // back an independent fd starting at 0 again).
+    int wfd = open("/tmp/dup_test.txt", O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (wfd < 0) {
+        printf("open(dup_test.txt, O_CREAT) FAILED\n");
+        return 1;
+    }
+    write(wfd, "0123456789", 10);
+    close(wfd);
+
+    int rfd = open("/tmp/dup_test.txt", O_RDONLY);
+    if (rfd < 0) {
+        printf("open(dup_test.txt, O_RDONLY) FAILED\n");
+        return 1;
+    }
+    int dupfd = dup(rfd);
+    if (dupfd < 0) {
+        printf("dup FAILED\n");
+        return 1;
+    }
+
+    char half1[6] = {0}, half2[6] = {0};
+    if (read(rfd, half1, 5) != 5) {
+        printf("read via rfd FAILED\n");
+        return 1;
+    }
+    if (read(dupfd, half2, 5) != 5) {
+        printf("read via dupfd FAILED\n");
+        return 1;
+    }
+    if (memcmp(half1, "01234", 5) != 0 || memcmp(half2, "56789", 5) != 0) {
+        printf("dup offset NOT shared: half1=%s half2=%s\n", half1, half2);
+        return 1;
+    }
+    printf("dup: shared offset OK (half1=%s half2=%s)\n", half1, half2);
+
+    // dup2 onto a specific target: both ends still at EOF (10/10 read).
+    if (dup2(rfd, 9) != 9) {
+        printf("dup2 FAILED\n");
+        return 1;
+    }
+    char tail[2] = {0};
+    long n2 = read(9, tail, 1);
+    if (n2 != 0) {
+        printf("dup2 offset NOT shared: expected EOF, got n=%ld\n", n2);
+        return 1;
+    }
+    close(9);
+    close(dupfd);
+
+    // fcntl(F_DUPFD, 5): same handle, forced to land at fd >= 5.
+    int fdupfd = fcntl(rfd, F_DUPFD, 5);
+    if (fdupfd < 5) {
+        printf("fcntl(F_DUPFD) FAILED: got %d\n", fdupfd);
+        return 1;
+    }
+    close(fdupfd);
+    close(rfd);
+    printf("dup_test: OK\n");
     return 0;
 }
