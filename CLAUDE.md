@@ -35,7 +35,7 @@ Kernel crate config in `kernel/.cargo/config.toml` enables `-Z build-std` to reb
 ## Boot Sequence (`kernel/src/init/mod.rs`)
 
 `kernel_main` → `init::boot`:
-1. `devices::init_idt()` — load IDT (exceptions, PIC IRQs, syscall at `int 0x80`)
+1. `devices::init_idt()` — load IDT (exceptions, PIC IRQs); syscalls go through the `syscall` instruction (MSR LSTAR, wired later in `process::tss::init()`), not an IDT gate
 2. Framebuffer setup (inline, requires `&'static mut` lifetime from BootInfo)
 3. `memory::init_core()` — store physical memory offset, seed Buddy allocator
 4. `memory::test_allocators()` — smoke test slab + Vec + String
@@ -60,7 +60,7 @@ Kernel crate config in `kernel/.cargo/config.toml` enables `-Z build-std` to reb
 
 **Demand paging** (`memory/demand_paging.rs`): Page fault handler (in `init/devices.rs`) reads CR2, finds the faulting VMA, calls `map_demand_page` to allocate a physical frame from Buddy, zero it, and map it. Kernel-mode faults panic; user-mode faults outside any VMA kill the process.
 
-**ELF loader** (`memory/elf_loader.rs`): Parses ELF64 PT_LOAD segments, maps them into a fresh `AddressSpace`, zeros BSS, and registers demand-paged stack. Static executables only (no dynamic linker).
+**ELF loader** (`memory/elf_loader.rs`): Parses ELF64 PT_LOAD segments, maps them into a fresh `AddressSpace`, zeros BSS, and registers demand-paged stack. Static executables only (no dynamic linker). `build_initial_stack` writes a real, dynamically-sized SysV ABI initial stack frame (argc/argv/envp/auxv) onto the pre-mapped top stack page — sized from whatever `sys_exec` read out of the caller's argv/envp arrays, capped to fit in one page (`E2BIG` if it doesn't).
 
 ## Process Subsystem (`kernel/src/process/`)
 
@@ -74,42 +74,74 @@ Kernel crate config in `kernel/.cargo/config.toml` enables `-Z build-std` to reb
 
 ## Syscall Interface (`kernel/src/process/syscall.rs`)
 
-Triggered via `int 0x80`. The assembly stub (`syscall_entry`) pushes all GPRs onto the current stack, calls `syscall_handler_asm`, writes the return value back into the saved RAX slot, pops, and `iretq`.
+Triggered via the `syscall` instruction (not `int 0x80` — no IDT entry involved). `process/tss.rs` wires `IA32_LSTAR` to `syscall_entry_fast` at boot. The assembly stub pushes all GPRs onto the current stack, calls the Rust dispatcher, writes the return value back into the saved RAX slot, pops, and `sysretq`/`iretq`.
 
-Implemented syscalls (Linux-compatible numbers):
+Implemented syscalls (Linux-compatible numbers — see `SyscallNumber` enum for the authoritative list):
 
 | Number | Name | Description |
 |--------|------|-------------|
 | 0 | `read` | Read from fd |
 | 1 | `write` | Write to fd |
-| 2 | `open` | Open device by path |
+| 2 | `open` | Open device/file by path |
 | 3 | `close` | Close fd |
+| 4/5/6 | `stat`/`fstat`/`lstat` | File metadata (`lstat` aliases `stat` — no symlinks yet) |
+| 7 | `poll` | Wait for events on up to 16 fds |
+| 8 | `lseek` | Reposition file offset |
+| 9/11 | `mmap`/`munmap` | Anonymous memory mapping |
+| 12 | `brk` | Heap break |
+| 13/14/15 | `sigaction`/`sigprocmask`/`sigreturn` | POSIX signals |
+| 16 | `ioctl` | Only enough for `isatty()` (TCGETS on fd 0-2) |
+| 20 | `writev` | Vectored write |
+| 22 | `pipe` | Anonymous pipe |
 | 24 | `yield` | Voluntary context switch |
+| 32/33 | `dup`/`dup2` | Duplicate fd (real shared-offset semantics) |
+| 35 | `nanosleep` | Sleep via hrtimer |
 | 39 | `getpid` | Return current PID |
+| 41/42/43/46/47/49 | `socket`/`connect`/`accept`/`sendmsg`/`recvmsg`/`bind` | Socket-style IPC channels |
+| 56/57 | `clone`/`fork` | Threads (shared AddressSpace+fds) / COW process fork |
+| 59 | `exec` | `(path, argv, envp)` — real argc/argv/envp built onto the new stack, see `memory/elf_loader.rs::build_initial_stack` |
 | 60 | `exit` | Terminate process (immediate switch) |
+| 61 | `waitpid` | Reap a specific child pid (no `-1`/"any child"; exit status always reported as 0 — see `sys_waitpid`'s doc comment for why that's not trivial to fix) |
+| 62 | `kill` | Send a signal (single pid, no process groups) |
+| 72 | `fcntl` | Only `F_DUPFD`/`F_DUPFD_CLOEXEC` do something; rest are validity-checked stubs |
+| 82/83/84/87 | `rename`/`mkdir`/`rmdir`/`unlink` | VFS mutation — only ramfs (`/tmp`) supports these, ext2/devfs/initramfs are read-only |
+| 158 | `arch_prctl` | `ARCH_SET_FS` (TLS base) |
+| 202 | `futex` | Wait/wake, backs mlibc mutexes/condvars |
+| 213/232/233 | `epoll_create`/`epoll_wait`/`epoll_ctl` | Epoll |
+| 217 | `getdents64` | Directory entries, `linux_dirent64` layout |
+| 218 | `set_tid_address` | Stub for TLS/thread bookkeeping |
+| 228 | `clock_gettime` | |
+| 400/401/402 | `uptime_ms`/`uptime_sec`/`meminfo_kb` | Custom, above the Linux syscall range — debug/introspection only |
 
-Helpers `with_current_process` and `with_scheduler` guarantee `cli` before lock and `sti` after lock is dropped to prevent deadlocks with the timer ISR.
+Helpers `with_current_process` and `with_scheduler` guarantee `cli` before lock and `sti` after lock is dropped to prevent deadlocks with the timer ISR. `sys_close`/`sys_dup2` deliberately avoid `with_current_process` (see their doc comments) — closing a handle can run a `Drop` impl that needs a fresh `SCHEDULER` lock, which would self-deadlock if the outer helper were still holding it.
 
 ## Device Driver Framework (`kernel/src/drivers/`)
 
-Drivers implement `FileHandle` (trait in `process/file.rs`): `read`, `write`, `close`.
+Drivers implement `FileHandle` (trait in `process/file.rs`): `read`, `write`, `close`, plus optional `stat`/`dup`/`getdents64` (defaults: no metadata, not dup-able, `ENOTDIR`). Device drivers are stateless (state lives in kernel globals), so their `dup()` impls just construct a fresh instance of the same type.
 
 Register a new driver by:
 1. Creating `kernel/src/drivers/<name>.rs` implementing `FileHandle`
 2. Adding one entry to the `DEVICES` static slice in `drivers/mod.rs`
 
-Current devices: `/dev/null`, `/dev/zero`, `/dev/console` (serial), `/dev/fb` (framebuffer).
+Current devices: `/dev/null`, `/dev/zero`, `/dev/console` (serial), `/dev/fb` (framebuffer), `/dev/kbd` (non-blocking keyboard).
 
 The `FileDescriptorTable` per process holds up to 16 open files. FDs 0/1/2 are pre-opened to `/dev/console` (stdin/stdout/stderr).
 
 ## Userspace Programs (`kernel/src/process/user_programs.rs`)
 
-Embedded ELF binaries live in `kernel/embedded/`. Workflow to add a new program:
+Embedded ELF binaries live in `kernel/embedded/`, rebuilt automatically by `kernel/build.rs` (three families, each built differently):
 
-1. Write it as a standalone `#![no_std]` binary targeting `x86_64-unknown-none`
-2. Build it and copy the ELF to `kernel/embedded/<name>.elf`
-3. Add `("name", ProgramSource::Elf(include_bytes!("../../embedded/name.elf")))` to `PROGRAMS` in `user_programs.rs`
-4. Wire it up in `init/processes.rs`
+- **Rust** (`RUST_PROGRAMS` in `build.rs`) — built via `cargo build --release` in `userspace/` (separate Cargo workspace), copied from `userspace/target/x86_64-unknown-none/release/`.
+- **C** (`C_PROGRAMS` in `build.rs`) — `userspace/c/<name>.c`, compiled directly with `clang` against `sysroot/` (built by `scripts/setup-mlibc.sh` if missing).
+- **BusyBox** (`BUSYBOX_ELF` in `build.rs`) — external `make`-based build via `scripts/build-busybox.sh` (git submodule at `busybox/`, config at `busybox-config/minimal.config`), only invoked when `kernel/embedded/busybox.elf` is missing (unlike the two families above, this isn't rebuilt unconditionally — it's slow and `make` already does its own incremental rebuilds).
+
+Only the embedded/*.elf → `PROGRAMS` registration step is manual:
+
+1. Write the program (Rust in `userspace/src/bin/`, C in `userspace/c/`) or point at an externally-built ELF.
+2. Register it in the relevant `build.rs` list (skip this for BusyBox-style external builds).
+3. Add `("name", ProgramSource::Elf(include_bytes!("../../embedded/name.elf")))` to `PROGRAMS` in `user_programs.rs` — this alone makes it runnable both via `sys_exec`/the shell (any typed command not matching a shell builtin falls through to `fork()`+`exec_argv()`) and visible in `/` under initramfs (`ls`, `opendir`).
+
+Only `shell` is spawned automatically at boot (`init/processes.rs`); everything else is launched on demand from the shell.
 
 The fallback `ProgramSource::RawCode` embeds inline assembly tests from `process/user_test_fileio.rs` and is used for bootstrapping when no ELF exists.
 
