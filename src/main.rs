@@ -34,6 +34,12 @@ fn main() {
     cmd.arg("-m").arg("512M");  // 512MB RAM
     cmd.arg("-serial").arg("stdio");  // Serial output to terminal
 
+    // Without this, QEMU falls back to its conservative default CPU
+    // model, which lacks features (e.g. FSGSBASE) that the bootloader
+    // crate's UEFI stage uses unconditionally — that mismatch triggers a
+    // #UD (invalid opcode) fault in OVMF before our kernel ever loads.
+    cmd.arg("-cpu").arg("max");
+
     let mut child = cmd.spawn().unwrap();
     child.wait().unwrap();
 }
