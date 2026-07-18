@@ -252,5 +252,81 @@ int main(void) {
     close(fdupfd);
     close(rfd);
     printf("dup_test: OK\n");
+
+    // chdir/getcwd: real relative-path resolution, not just string storage.
+    char cwdbuf[64];
+    if (getcwd(cwdbuf, sizeof(cwdbuf)) == NULL || strcmp(cwdbuf, "/") != 0) {
+        printf("getcwd(initial) FAILED: got '%s'\n", cwdbuf);
+        return 1;
+    }
+
+    if (chdir("/tmp/mkdir_test_does_not_exist") == 0 || errno != ENOENT) {
+        printf("chdir(nonexistent) should have failed ENOENT, errno=%d\n", errno);
+        return 1;
+    }
+
+    // chdir onto a regular file must fail ENOTDIR, and must NOT change cwd.
+    int cfd = open("/tmp/chdir_target_file", O_CREAT | O_WRONLY, 0644);
+    if (cfd < 0) { printf("open(chdir_target_file) FAILED\n"); return 1; }
+    close(cfd);
+    if (chdir("/tmp/chdir_target_file") == 0 || errno != ENOTDIR) {
+        printf("chdir(file) should have failed ENOTDIR, errno=%d\n", errno);
+        return 1;
+    }
+
+    if (chdir("/tmp") != 0) {
+        printf("chdir(/tmp) FAILED: errno=%d\n", errno);
+        return 1;
+    }
+    if (getcwd(cwdbuf, sizeof(cwdbuf)) == NULL || strcmp(cwdbuf, "/tmp") != 0) {
+        printf("getcwd(after chdir /tmp) FAILED: got '%s'\n", cwdbuf);
+        return 1;
+    }
+
+    // Relative path resolution: create+read a file using no leading '/'.
+    int relfd = open("chdir_rel.txt", O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (relfd < 0) { printf("open(relative) FAILED: errno=%d\n", errno); return 1; }
+    write(relfd, "rel", 3);
+    close(relfd);
+    struct stat relst;
+    if (stat("/tmp/chdir_rel.txt", &relst) != 0) {
+        printf("relative create didn't land in /tmp\n");
+        return 1;
+    }
+
+    // ".." must actually walk up, not just get stripped.
+    if (chdir("..") != 0) {
+        printf("chdir(..) FAILED: errno=%d\n", errno);
+        return 1;
+    }
+    if (getcwd(cwdbuf, sizeof(cwdbuf)) == NULL || strcmp(cwdbuf, "/") != 0) {
+        printf("getcwd(after chdir ..) FAILED: got '%s'\n", cwdbuf);
+        return 1;
+    }
+
+    // chdir() survives fork(): child sees the parent's cwd at fork time.
+    if (chdir("/tmp") != 0) { printf("chdir(/tmp, 2nd) FAILED\n"); return 1; }
+    pid_t cpid = fork();
+    if (cpid < 0) { printf("fork(chdir) FAILED\n"); return 1; }
+    if (cpid == 0) {
+        char childbuf[64];
+        if (getcwd(childbuf, sizeof(childbuf)) == NULL || strcmp(childbuf, "/tmp") != 0) {
+            _exit(1);
+        }
+        _exit(0);
+    }
+    int cstatus = -1;
+    waitpid(cpid, &cstatus, 0);
+    if (!WIFEXITED(cstatus) || WEXITSTATUS(cstatus) != 0) {
+        printf("child did not inherit cwd via fork\n");
+        return 1;
+    }
+
+    if (unlink("/tmp/chdir_target_file") != 0 || unlink("/tmp/chdir_rel.txt") != 0) {
+        printf("chdir_test cleanup FAILED\n");
+        return 1;
+    }
+    printf("chdir_test: OK\n");
+
     return 0;
 }

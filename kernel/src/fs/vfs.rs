@@ -226,6 +226,38 @@ pub fn stat(path: &str) -> Result<Stat, Errno> {
     Ok(resolve(path)?.stat())
 }
 
+/// Turn a possibly-relative `path` into a clean, normalized absolute path,
+/// resolving `.`/`..` components lexically against `cwd` (or against `path`
+/// itself if it's already absolute — `/a/b/../c` still needs collapsing,
+/// since `resolve()`'s own `..` handling is a no-op placeholder).
+///
+/// Purely string-based: doesn't touch the filesystem, so it can't tell
+/// `../` past `/` from `../` past a real directory — both just get dropped,
+/// matching how a shell's `..` behaves at the true root.
+pub fn normalize_path(cwd: &str, path: &str) -> alloc::string::String {
+    let mut stack: Vec<&str> = if path.starts_with('/') {
+        Vec::new()
+    } else {
+        cwd.split('/').filter(|s| !s.is_empty()).collect()
+    };
+
+    for component in path.split('/').filter(|s| !s.is_empty()) {
+        match component {
+            "."  => {}
+            ".." => { stack.pop(); }
+            name => stack.push(name),
+        }
+    }
+
+    if stack.is_empty() {
+        alloc::string::String::from("/")
+    } else {
+        let mut out = alloc::string::String::from("/");
+        out.push_str(&stack.join("/"));
+        out
+    }
+}
+
 /// Split `path` into (parent directory path, leaf component name).
 ///
 /// `"/tmp/sub/file"` → `("/tmp/sub", "file")`; `"/file"` → `("/", "file")`.

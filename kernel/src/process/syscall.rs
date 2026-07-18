@@ -194,6 +194,8 @@ pub enum SyscallNumber {
     Poll = 7,
     Lseek = 8,
     Mmap = 9,
+    Getcwd = 79,
+    Chdir = 80,
     Rename = 82,
     Mkdir = 83,
     Rmdir = 84,
@@ -251,6 +253,8 @@ impl SyscallNumber {
             7  => Some(Self::Poll),
             8  => Some(Self::Lseek),
             9  => Some(Self::Mmap),
+            79 => Some(Self::Getcwd),
+            80 => Some(Self::Chdir),
             82 => Some(Self::Rename),
             83 => Some(Self::Mkdir),
             84 => Some(Self::Rmdir),
@@ -312,9 +316,11 @@ pub mod errno {
     pub const ENOTBLK: i64 = -15;
     pub const EBUSY: i64 = -16;
     pub const EEXIST: i64 = -17;
+    pub const ENOTDIR: i64 = -20;
     pub const EINVAL: i64 = -22;
     pub const ENOTTY: i64 = -25;
     pub const ESPIPE: i64 = -29;
+    pub const ERANGE: i64 = -34;
     pub const ENOSYS: i64 = -38;
     pub const EAGAIN: i64 = -11;
     pub const EWOULDBLOCK: i64 = -11;
@@ -382,6 +388,28 @@ fn read_user_str(ptr: usize) -> &'static str {
     }
 }
 
+/// Read the running process's cwd (briefly takes the scheduler lock, same
+/// cli/sti discipline as `with_current_process`).
+fn current_cwd() -> alloc::string::String {
+    unsafe { core::arch::asm!("cli"); }
+    let cwd = {
+        let mut scheduler = super::scheduler::local_scheduler();
+        scheduler.running_mut()
+            .map(|p| p.cwd.clone())
+            .unwrap_or_else(|| alloc::string::String::from("/"))
+    };
+    unsafe { core::arch::asm!("sti"); }
+    cwd
+}
+
+/// Normalize a raw user-supplied path against the current process's cwd.
+/// Every syscall taking a filesystem path must route it through here so
+/// relative paths (and `.`/`..` inside absolute ones, e.g. `/a/../b`) work —
+/// `vfs::resolve` itself assumes an already-clean absolute path.
+fn resolve_path(raw: &str) -> alloc::string::String {
+    crate::fs::vfs::normalize_path(&current_cwd(), raw)
+}
+
 fn validate_user_buffer(addr: u64, size: usize) -> Result<(), i64> {
     if addr == 0 {
         return Err(errno::EFAULT);
@@ -438,6 +466,8 @@ pub fn syscall_handler(
         SyscallNumber::Poll => sys_poll(arg1, arg2 as u32, arg3 as i32),
         SyscallNumber::Lseek => sys_lseek(arg1 as i32, arg2 as i64, arg3 as i32),
         SyscallNumber::Mmap => sys_mmap(arg1, arg2, arg3 as u32, arg4 as u32, arg5 as i32),
+        SyscallNumber::Getcwd => sys_getcwd(arg1 as usize, arg2 as usize),
+        SyscallNumber::Chdir => sys_chdir(arg1 as usize),
         SyscallNumber::Rename => sys_rename(arg1 as usize, arg2 as usize),
         SyscallNumber::Mkdir => sys_mkdir(arg1 as usize),
         SyscallNumber::Rmdir => sys_rmdir(arg1 as usize),
@@ -676,10 +706,11 @@ fn sys_open(path_ptr: usize, flags: i32) -> SyscallResult {
 
     let path = read_user_str(path_ptr);
     if path.is_empty() { return errno::EINVAL; }
+    let path = resolve_path(path);
 
     // Resolve through VFS: /dev/* → drivers, /bin/* → initramfs, …
     // Box allocation uses Slab (different lock from SCHEDULER).
-    let handle = match crate::fs::vfs::open(path, crate::fs::types::OpenFlags(flags)) {
+    let handle = match crate::fs::vfs::open(&path, crate::fs::types::OpenFlags(flags)) {
         Ok(h)  => h,
         Err(e) => return e.as_i64(),
     };
@@ -699,7 +730,8 @@ fn sys_stat(path_ptr: usize, stat_ptr: usize) -> SyscallResult {
     if let Err(e) = validate_user_buffer(stat_ptr as u64, core::mem::size_of::<Stat>()) { return e; }
 
     let path = read_user_str(path_ptr);
-    match crate::fs::vfs::stat(path) {
+    let path = resolve_path(path);
+    match crate::fs::vfs::stat(&path) {
         Err(e)   => e.as_i64(),
         Ok(stat) => {
             unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
@@ -738,7 +770,8 @@ fn sys_mkdir(path_ptr: usize) -> SyscallResult {
     if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
     let path = read_user_str(path_ptr);
     if path.is_empty() { return errno::EINVAL; }
-    match crate::fs::vfs::mkdir(path) {
+    let path = resolve_path(path);
+    match crate::fs::vfs::mkdir(&path) {
         Ok(())  => 0,
         Err(e)  => e.as_i64(),
     }
@@ -749,7 +782,8 @@ fn sys_rmdir(path_ptr: usize) -> SyscallResult {
     if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
     let path = read_user_str(path_ptr);
     if path.is_empty() { return errno::EINVAL; }
-    match crate::fs::vfs::rmdir(path) {
+    let path = resolve_path(path);
+    match crate::fs::vfs::rmdir(&path) {
         Ok(())  => 0,
         Err(e)  => e.as_i64(),
     }
@@ -760,7 +794,8 @@ fn sys_unlink(path_ptr: usize) -> SyscallResult {
     if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
     let path = read_user_str(path_ptr);
     if path.is_empty() { return errno::EINVAL; }
-    match crate::fs::vfs::unlink(path) {
+    let path = resolve_path(path);
+    match crate::fs::vfs::unlink(&path) {
         Ok(())  => 0,
         Err(e)  => e.as_i64(),
     }
@@ -773,10 +808,62 @@ fn sys_rename(old_path_ptr: usize, new_path_ptr: usize) -> SyscallResult {
     let old_path = read_user_str(old_path_ptr);
     let new_path = read_user_str(new_path_ptr);
     if old_path.is_empty() || new_path.is_empty() { return errno::EINVAL; }
-    match crate::fs::vfs::rename(old_path, new_path) {
+    let old_path = resolve_path(old_path);
+    let new_path = resolve_path(new_path);
+    match crate::fs::vfs::rename(&old_path, &new_path) {
         Ok(())  => 0,
         Err(e)  => e.as_i64(),
     }
+}
+
+/// getcwd(79): long getcwd(char *buffer, size_t size)
+///
+/// This kernel's raw-syscall convention (unlike glibc's libc-level
+/// `getcwd()`, which returns a `char*`) matches Linux's actual syscall:
+/// returns the number of bytes written to `buffer` (including the NUL) on
+/// success, or a negative errno. `ERANGE` if `size` is too small to hold
+/// the current path + NUL.
+fn sys_getcwd(buf_ptr: usize, size: usize) -> SyscallResult {
+    if size == 0 { return errno::EINVAL; }
+    if let Err(e) = validate_user_buffer(buf_ptr as u64, size) { return e; }
+
+    let cwd = current_cwd();
+    let needed = cwd.len() + 1; // + NUL
+    if needed > size {
+        return errno::ERANGE;
+    }
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(cwd.as_ptr(), buf_ptr as *mut u8, cwd.len());
+        *(buf_ptr as *mut u8).add(cwd.len()) = 0;
+    }
+    needed as SyscallResult
+}
+
+/// chdir(80): long chdir(const char *path)
+///
+/// Resolves `path` (relative to the current cwd if not absolute) and, if it
+/// names an existing directory, replaces the process's cwd with the clean
+/// normalized form — never the raw user string, so a later `getcwd()` never
+/// echoes back `..`/`.`/double-slashes the caller happened to type.
+fn sys_chdir(path_ptr: usize) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
+    let path = read_user_str(path_ptr);
+    if path.is_empty() { return errno::EINVAL; }
+    let path = resolve_path(path);
+
+    let inode = match crate::fs::vfs::resolve(&path) {
+        Ok(i)  => i,
+        Err(e) => return e.as_i64(),
+    };
+    if inode.file_type() != crate::fs::types::FileType::Directory {
+        return errno::ENOTDIR;
+    }
+
+    with_current_process(|proc| {
+        proc.cwd = path;
+        0
+    })
 }
 
 fn sys_getdents64(fd: i32, buf_ptr: usize, count: usize) -> SyscallResult {
@@ -1409,7 +1496,7 @@ fn sys_fork() -> SyscallResult {
     unsafe { core::arch::asm!("cli"); }
 
     // Collect what we need from the running process
-    let (child_as, parent_pid, parent_fs_base, files, child_tf) = {
+    let (child_as, parent_pid, parent_fs_base, files, child_tf, parent_cwd) = {
         let scheduler = super::scheduler::local_scheduler();
         match scheduler.running_ref() {
             Some(proc) => {
@@ -1418,7 +1505,7 @@ fn sys_fork() -> SyscallResult {
                 tf_copy.rax = 0;
 
                 match unsafe { proc.address_space.fork() } {
-                    Ok(child_as) => (child_as, proc.pid, proc.fs_base, proc.files.lock().clone(), tf_copy),
+                    Ok(child_as) => (child_as, proc.pid, proc.fs_base, proc.files.lock().clone(), tf_copy, proc.cwd.clone()),
                     Err(e) => {
                         serial_println!("fork: address_space.fork() failed: {}", e);
                         unsafe { core::arch::asm!("sti"); }
@@ -1442,7 +1529,7 @@ fn sys_fork() -> SyscallResult {
         let mut child = alloc::boxed::Box::new(
             super::Process::new_user_from_fork(
                 pid, parent_pid, alloc::boxed::Box::new(child_tf),
-                kernel_stack, child_as, files,
+                kernel_stack, child_as, files, parent_cwd,
             )
         );
         child.fs_base = parent_fs_base; // inherit TLS base from parent
@@ -1482,10 +1569,10 @@ fn sys_fork() -> SyscallResult {
 /// thread's `Process` immediately instead of waiting for a collector that
 /// will never come).
 fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
-    let (parent_pid, address_space, files) = {
+    let (parent_pid, address_space, files, parent_cwd) = {
         let sched = super::scheduler::local_scheduler();
         match sched.running_ref() {
-            Some(proc) => (proc.pid, proc.address_space.clone(), proc.files.clone()),
+            Some(proc) => (proc.pid, proc.address_space.clone(), proc.files.clone(), proc.cwd.clone()),
             None => return errno::ESRCH,
         }
     };
@@ -1517,7 +1604,7 @@ fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
             super::Process::new_thread(
                 pid, parent_pid,
                 x86_64::VirtAddr::new(entry), x86_64::VirtAddr::new(stack),
-                kernel_stack, address_space, files, owned_stack_vma,
+                kernel_stack, address_space, files, owned_stack_vma, parent_cwd,
             )
         );
         thread.set_name("thread");

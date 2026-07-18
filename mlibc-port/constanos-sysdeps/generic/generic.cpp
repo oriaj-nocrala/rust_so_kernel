@@ -59,6 +59,8 @@ constexpr long SYS_sigprocmask = 14;
 constexpr long SYS_poll = 7;
 constexpr long SYS_lseek = 8;
 constexpr long SYS_mmap = 9;
+constexpr long SYS_getcwd = 79;
+constexpr long SYS_chdir = 80;
 constexpr long SYS_rename = 82;
 constexpr long SYS_mkdir = 83;
 constexpr long SYS_rmdir = 84;
@@ -330,6 +332,22 @@ int sys_rmdir(const char *path) {
 
 int sys_rename(const char *path, const char *new_path) {
 	long ret = raw_syscall(SYS_rename, (long)path, (long)new_path);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+int sys_chdir(const char *path) {
+	long ret = raw_syscall(SYS_chdir, (long)path);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+// The kernel's getcwd(79) matches the real Linux raw-syscall convention
+// (unlike this port's usual single-rax-return style, which is already what
+// raw_syscall() exposes): returns bytes written (incl. NUL) on success, or
+// -errno. mlibc's own getcwd() (options/posix/generic/unistd.cpp) expects
+// this sysdeps hook to just return 0/errno, not the byte count — it never
+// looks at the count, only whether `buffer` got filled in.
+int sys_getcwd(char *buffer, size_t size) {
+	long ret = raw_syscall(SYS_getcwd, (long)buffer, (long)size);
 	return ret < 0 ? (int)-ret : 0;
 }
 

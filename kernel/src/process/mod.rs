@@ -132,6 +132,14 @@ pub struct Process {
     /// stack, can't free anything inline" logic as `kernel_stack`.
     pub owned_stack_vma: Option<(u64, usize)>,
 
+    /// Current working directory, always a clean absolute path (see
+    /// `fs::vfs::normalize_path`). Survives `exec()` (same `Process`, never
+    /// reset) like real POSIX cwd; NOT shared between `clone()`-created
+    /// threads (each gets its own `String` copy at creation time) — a
+    /// simplification vs. real Linux `CLONE_FS`, same spirit as
+    /// `signal_handlers` not being inherited across `fork()`.
+    pub cwd: alloc::string::String,
+
     /// Bitmask of pending (not yet delivered) signals — bit N = signal N.
     pub pending_signals: u64,
     /// Bitmask of currently blocked signals (`sigprocmask`).
@@ -199,6 +207,7 @@ impl Process {
             fs_base: 0,
             is_thread: false,
             owned_stack_vma: None,
+            cwd: alloc::string::String::from("/"),
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
             pending_signals: 0,
@@ -262,6 +271,7 @@ impl Process {
             fs_base: 0,
             is_thread: false,
             owned_stack_vma: None,
+            cwd: alloc::string::String::from("/"),
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
             pending_signals: 0,
@@ -279,6 +289,7 @@ impl Process {
         kernel_stack: VirtAddr,
         address_space: AddressSpace,
         files: FileDescriptorTable,
+        cwd: alloc::string::String,
     ) -> Self {
         crate::serial_println!(
             "Creating FORKED process PID {} (parent PID {})",
@@ -304,6 +315,7 @@ impl Process {
             fs_base: 0,
             is_thread: false,
             owned_stack_vma: None,
+            cwd,
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
             pending_signals: 0,
@@ -331,6 +343,7 @@ impl Process {
         address_space: Arc<AddressSpace>,
         files: Arc<Mutex<FileDescriptorTable>>,
         owned_stack_vma: Option<(u64, usize)>,
+        cwd: alloc::string::String,
     ) -> Self {
         let mut trapframe = Box::new(TrapFrame::default());
 
@@ -381,6 +394,7 @@ impl Process {
             fs_base: 0,
             is_thread: true,
             owned_stack_vma,
+            cwd,
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
             pending_signals: 0,
