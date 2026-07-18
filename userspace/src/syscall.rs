@@ -258,10 +258,45 @@ pub fn fork() -> i64 {
     unsafe { syscall0(SYS_FORK) }
 }
 
-/// Replaces the current image with the named embedded/initramfs program.
-/// Only the path/name is passed — no argv/envp support.
+/// Replaces the current image with the named embedded/initramfs program,
+/// passing an empty argv/envp (argc=0) — a thin wrapper around
+/// [`exec_argv`] for callers that don't need to pass arguments.
 pub fn exec(name_cstr: &[u8]) -> i64 {
-    unsafe { syscall1(SYS_EXEC, name_cstr.as_ptr() as u64) }
+    exec_argv(name_cstr, &[], &[])
+}
+
+/// Max argv/envp entries forwarded — matches the kernel's own
+/// `MAX_EXEC_ARGS` cap (`kernel/src/process/syscall.rs`), comfortably
+/// enough for shell-typed command lines without needing a heap allocation.
+const MAX_EXEC_ARGV: usize = 16;
+
+/// Replaces the current image with `path`, passing `args`/`envp` as the
+/// new process's argv/envp.
+///
+/// Every entry must already be NUL-terminated (see [`with_cstr`]) — the
+/// kernel reads them straight out of *this* process's memory before the
+/// address space is replaced (`kernel/src/process/syscall.rs::sys_exec`),
+/// so the pointers only need to stay valid until the syscall returns —
+/// which, on success, is never (this process's image is gone).
+pub fn exec_argv(path_cstr: &[u8], args: &[&[u8]], envp: &[&[u8]]) -> i64 {
+    let mut argv_ptrs = [core::ptr::null::<u8>(); MAX_EXEC_ARGV + 1];
+    for (i, a) in args.iter().take(MAX_EXEC_ARGV).enumerate() {
+        argv_ptrs[i] = a.as_ptr();
+    }
+
+    let mut envp_ptrs = [core::ptr::null::<u8>(); MAX_EXEC_ARGV + 1];
+    for (i, e) in envp.iter().take(MAX_EXEC_ARGV).enumerate() {
+        envp_ptrs[i] = e.as_ptr();
+    }
+
+    unsafe {
+        syscall3(
+            SYS_EXEC,
+            path_cstr.as_ptr() as u64,
+            argv_ptrs.as_ptr() as u64,
+            envp_ptrs.as_ptr() as u64,
+        )
+    }
 }
 
 pub fn waitpid(child_pid: i64) -> i64 {

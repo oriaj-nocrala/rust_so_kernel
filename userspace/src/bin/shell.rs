@@ -74,11 +74,47 @@ fn print_help() {
     println!("  demo        - guided tour: VFS/ext2, threads, IPC, pipes, signals");
 }
 
-fn run_program(name: &str) {
+/// Runs `cmd` (the whole typed line, e.g. `"ls /tmp -l"`) as argv[0..]:
+/// the first whitespace-separated word is both the program name to exec
+/// and argv[0], the rest becomes argv[1..]. No `alloc` in this userspace
+/// crate, so argv is built out of one flat stack buffer instead of a Vec —
+/// each word gets NUL-terminated in place and `argv[i]` becomes a slice
+/// pointing back into it.
+fn run_program(cmd: &str) {
+    let mut words = cmd.split_whitespace();
+    let name = match words.next() {
+        Some(w) => w,
+        None => return,
+    };
+
     let pid = syscall::fork();
     if pid == 0 {
+        const MAX_ARGS: usize = 16;
+        const SCRATCH_SIZE: usize = 512;
+        let mut scratch = [0u8; SCRATCH_SIZE];
+        let mut offsets = [(0usize, 0usize); MAX_ARGS]; // (start, len incl. NUL)
+        let mut argc = 0usize;
+        let mut cursor = 0usize;
+
+        for word in core::iter::once(name).chain(words) {
+            if argc >= MAX_ARGS || cursor >= SCRATCH_SIZE { break; }
+            let bytes = word.as_bytes();
+            let n = bytes.len().min(SCRATCH_SIZE - cursor - 1);
+            scratch[cursor..cursor + n].copy_from_slice(&bytes[..n]);
+            scratch[cursor + n] = 0; // NUL terminator
+            offsets[argc] = (cursor, n + 1);
+            cursor += n + 1;
+            argc += 1;
+        }
+
+        let mut argv: [&[u8]; MAX_ARGS] = [&[]; MAX_ARGS];
+        for i in 0..argc {
+            let (start, len) = offsets[i];
+            argv[i] = &scratch[start..start + len];
+        }
+
         // Child: try to exec the requested program.
-        syscall::with_cstr(name, |p| syscall::exec(p));
+        syscall::exec_argv(argv[0], &argv[..argc], &[]);
         // Only reached if exec failed.
         eprintln!("shell: unknown command: {}", name);
         syscall::exit(1);

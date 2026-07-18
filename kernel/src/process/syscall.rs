@@ -292,6 +292,7 @@ pub mod errno {
     pub const EINTR: i64 = -4;
     pub const EIO: i64 = -5;
     pub const ENXIO: i64 = -6;
+    pub const E2BIG: i64 = -7;
     pub const EBADF: i64 = -9;
     pub const ENOMEM: i64 = -12;
     pub const EACCES: i64 = -13;
@@ -445,7 +446,7 @@ pub fn syscall_handler(
         SyscallNumber::Bind    => sys_bind_impl(arg1 as i32, arg2 as usize, arg3 as usize),
         SyscallNumber::Clone => sys_clone(arg1, arg2, arg3),
         SyscallNumber::Fork => sys_fork(),
-        SyscallNumber::Exec => sys_exec(arg1 as usize),
+        SyscallNumber::Exec => sys_exec(arg1 as usize, arg2 as usize, arg3 as usize),
         SyscallNumber::Exit => sys_exit(arg1 as i32),
         SyscallNumber::Waitpid => sys_waitpid(arg1 as usize),
         SyscallNumber::Kill => sys_kill(arg1 as usize, arg2 as u32),
@@ -1445,7 +1446,56 @@ fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
     tid
 }
 
-fn sys_exec(path_ptr: usize) -> SyscallResult {
+/// Max entries `sys_exec` will read out of an argv/envp array — past this,
+/// exec fails with `E2BIG` rather than silently truncating (a program
+/// silently missing half its arguments is a worse failure mode than a
+/// loud one).
+const MAX_EXEC_ARGS: usize = 64;
+/// Max bytes per argv/envp string (including the caller's NUL, which isn't
+/// copied). Same 255-byte cap `read_user_str` already uses for paths.
+const MAX_EXEC_ARG_LEN: usize = 255;
+
+/// Read a NULL-terminated array of C-string pointers (`char *const argv[]`)
+/// out of the *calling* process's user memory into owned kernel buffers.
+///
+/// Must run and finish *before* `load_elf`/the address-space swap: once
+/// `sys_exec` replaces `proc.address_space`, the caller's old user pointers
+/// (including `ptr` itself) stop being valid to dereference.
+///
+/// `ptr == 0` means "no array" → returns empty, so old callers that never
+/// learned about this ABI extension (e.g. the Rust userspace's original
+/// `exec(name)`, which still passes 0 for argv/envp) keep working exactly
+/// as before (argc=0).
+fn read_user_str_array(ptr: usize) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, i64> {
+    use alloc::vec::Vec;
+    let mut out = Vec::new();
+    if ptr == 0 {
+        return Ok(out);
+    }
+    for i in 0..MAX_EXEC_ARGS {
+        let slot_addr = ptr as u64 + (i as u64) * 8;
+        validate_user_buffer(slot_addr, 8)?;
+        let str_ptr = unsafe { *(slot_addr as *const u64) };
+        if str_ptr == 0 {
+            return Ok(out); // NULL terminator reached
+        }
+        validate_user_buffer(str_ptr, 1)?;
+        let s = unsafe {
+            let p = str_ptr as *const u8;
+            let mut len = 0usize;
+            while len < MAX_EXEC_ARG_LEN {
+                if *p.add(len) == 0 { break; }
+                len += 1;
+            }
+            core::slice::from_raw_parts(p, len).to_vec()
+        };
+        out.push(s);
+    }
+    // MAX_EXEC_ARGS entries consumed and still no NULL terminator in sight.
+    Err(errno::E2BIG)
+}
+
+fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> SyscallResult {
     if let Err(e) = validate_user_buffer(path_ptr as u64, 64) {
         return e;
     }
@@ -1466,7 +1516,20 @@ fn sys_exec(path_ptr: usize) -> SyscallResult {
         Err(_) => return errno::EINVAL,
     };
 
-    serial_println!("sys_exec: loading '{}'", name);
+    // Both must be read out of the caller's memory now — load_elf below
+    // swaps in a fresh address space, after which argv_ptr/envp_ptr (and
+    // any pointers *inside* those arrays) no longer resolve to anything
+    // meaningful in this process's page table.
+    let argv = match read_user_str_array(argv_ptr) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let envp = match read_user_str_array(envp_ptr) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    serial_println!("sys_exec: loading '{}' (argc={}, envc={})", name, argv.len(), envp.len());
 
     let elf_bytes = match find_program_elf(name) {
         Some(b) => b,
@@ -1477,11 +1540,15 @@ fn sys_exec(path_ptr: usize) -> SyscallResult {
     };
 
     // Load ELF without any lock — may take time and allocates frames
-    let loaded = match unsafe { crate::memory::elf_loader::load_elf(elf_bytes, 0) } {
+    let loaded = match unsafe { crate::memory::elf_loader::load_elf(elf_bytes, 0, &argv, &envp) } {
         Ok(l) => l,
         Err(e) => {
             serial_println!("sys_exec: load_elf failed: {}", e);
-            return errno::ENOMEM;
+            return if e == "ELF loader: argv/envp too large for the initial stack page" {
+                errno::E2BIG
+            } else {
+                errno::ENOMEM
+            };
         }
     };
 

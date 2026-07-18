@@ -248,7 +248,9 @@ fn load_elf_process(
     process_index: usize,
 ) -> Result<(AddressSpace, VirtAddr, VirtAddr), &'static str> {
     let loaded = unsafe {
-        crate::memory::elf_loader::load_elf(elf_bytes, process_index)?
+        // Boot-time processes (idle/user/shell) start with an empty
+        // argv/envp — nothing here has a caller to inherit them from.
+        crate::memory::elf_loader::load_elf(elf_bytes, process_index, &[], &[])?
     };
 
     serial_println!(

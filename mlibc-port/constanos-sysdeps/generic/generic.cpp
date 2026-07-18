@@ -419,9 +419,13 @@ int sys_fork(pid_t *child) {
 	return 0;
 }
 
-int sys_execve(const char *path, char *const[], char *const[]) {
-	// This kernel's exec() only takes a program name — no argv/envp.
-	long ret = raw_syscall(SYS_execve, (long)path);
+// This kernel's exec(59) reads argv/envp as plain NULL-terminated arrays
+// of C-string pointers straight out of the caller's memory (see
+// kernel/src/process/syscall.rs::read_user_str_array) — exactly what
+// `char *const argv[]`/`char *const envp[]` already are, so both pass
+// through unconverted.
+int sys_execve(const char *path, char *const argv[], char *const envp[]) {
+	long ret = raw_syscall(SYS_execve, (long)path, (long)argv, (long)envp);
 	return ret < 0 ? (int)-ret : 0;
 }
 

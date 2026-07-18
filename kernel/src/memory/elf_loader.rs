@@ -20,6 +20,7 @@
 //   - Segments must not overlap (undefined behavior if they do).
 //   - User code must live in the lower half of the address space.
 
+use alloc::vec::Vec;
 use x86_64::{
     VirtAddr,
     structures::paging::{Page, PageTableFlags, Size4KiB},
@@ -73,6 +74,8 @@ pub struct LoadedElf {
 pub unsafe fn load_elf(
     elf_bytes: &[u8],
     process_index: usize,
+    argv: &[Vec<u8>],
+    envp: &[Vec<u8>],
 ) -> Result<LoadedElf, &'static str> {
     // ── 1. Parse ELF ──────────────────────────────────────────────────
 
@@ -163,32 +166,16 @@ pub unsafe fn load_elf(
     // Zero the page.
     core::ptr::write_bytes(page_ptr, 0, 4096);
 
-    // Write the initial stack frame at the top of the page (last 128 bytes).
-    // Layout: argc=0, NULL(argv end), NULL(envp end), AT_PHDR, AT_PHENT,
-    //         AT_PHNUM, AT_ENTRY, AT_NULL
-    const FRAME_BYTES: usize = 128; // 16 u64 slots
-    let frame_page_offset = 4096 - FRAME_BYTES;
-    let rsp_va = top_page_vaddr + frame_page_offset as u64;
-    let f = (page_ptr as usize + frame_page_offset) as *mut u64;
-
-    *f.add(0)  = 0;                         // argc = 0
-    *f.add(1)  = 0;                         // argv[0] = NULL (end of argv)
-    *f.add(2)  = 0;                         // envp[0] = NULL (end of envp)
-    *f.add(3)  = 3;                         // AT_PHDR type
-    *f.add(4)  = phdr_vaddr;                // AT_PHDR value
-    *f.add(5)  = 4;                         // AT_PHENT type
-    *f.add(6)  = 56;                        // AT_PHENT value (sizeof Elf64_Phdr)
-    *f.add(7)  = 5;                         // AT_PHNUM type
-    *f.add(8)  = elf.ph_count() as u64;     // AT_PHNUM value
-    *f.add(9)  = 9;                         // AT_ENTRY type
-    *f.add(10) = elf.entry_point();         // AT_ENTRY value
-    *f.add(11) = 0;                         // AT_NULL type
-    *f.add(12) = 0;                         // AT_NULL value
-    // slots 13-15 remain zero
+    // Write argc/argv/envp/auxv (see build_initial_stack's doc comment for
+    // the exact layout) into this page and get back the resulting RSP.
+    let rsp_va = build_initial_stack(
+        page_ptr, top_page_vaddr, argv, envp,
+        phdr_vaddr, elf.ph_count(), elf.entry_point(),
+    )?;
 
     crate::serial_println!(
-        "ELF: initial stack at {:#x} (phdr_vaddr={:#x}, ph_count={})",
-        rsp_va, phdr_vaddr, elf.ph_count(),
+        "ELF: initial stack at {:#x} (argc={}, envc={}, phdr_vaddr={:#x}, ph_count={})",
+        rsp_va, argv.len(), envp.len(), phdr_vaddr, elf.ph_count(),
     );
 
     // ── 5b. Map the sigreturn trampoline ──────────────────────────────
@@ -227,6 +214,106 @@ pub unsafe fn load_elf(
         entry_point: VirtAddr::new(elf.entry_point()),
         user_stack_top: VirtAddr::new(rsp_va),
     })
+}
+
+// ============================================================================
+// Initial stack construction (argc/argv/envp/auxv)
+// ============================================================================
+
+/// Writes the SysV ABI initial-stack frame — argc, argv[], envp[], and the
+/// auxiliary vector — into the (already zeroed) top stack page, and
+/// returns the resulting RSP as a virtual address.
+///
+/// Page layout, high to low addresses:
+///   `[4096 - strings_bytes, 4096)`  argv/envp string bytes (envp first,
+///                                   then argv — order between the two
+///                                   string blocks is arbitrary, only the
+///                                   pointer tables built from them matter)
+///   `[rsp, frame_top)`              argc, argv ptrs + NULL, envp ptrs +
+///                                   NULL, then 5 auxv (type, value) pairs
+///                                   (AT_PHDR/AT_PHENT/AT_PHNUM/AT_ENTRY/
+///                                   AT_NULL)
+///
+/// `rsp` always comes out 16-byte aligned, as the ABI requires at process
+/// entry: `frame_top` is rounded down to 16 first, and if the slot count
+/// above is odd, one inert zero word is appended *after* AT_NULL to round
+/// it to an even (so 16-byte-multiple) size — safe because a conforming
+/// reader stops at the first AT_NULL entry and never looks further, so
+/// that trailing word is just dangling, never misread as another entry.
+/// Padding can't go anywhere else without shifting argc off `RSP+0`, which
+/// every caller (mlibc's `__dlapi_enter`, any C runtime) assumes unconditionally.
+unsafe fn build_initial_stack(
+    page_ptr: *mut u8,
+    top_page_vaddr: u64,
+    argv: &[Vec<u8>],
+    envp: &[Vec<u8>],
+    phdr_vaddr: u64,
+    ph_count: usize,
+    entry_point: u64,
+) -> Result<u64, &'static str> {
+    const AUXV_PAIRS: usize = 5; // AT_PHDR, AT_PHENT, AT_PHNUM, AT_ENTRY, AT_NULL
+
+    let strings_bytes: usize = argv.iter().chain(envp.iter()).map(|s| s.len() + 1).sum();
+
+    let mut slot_count = 1                  // argc
+        + (argv.len() + 1)                  // argv[..] + NULL
+        + (envp.len() + 1)                  // envp[..] + NULL
+        + AUXV_PAIRS * 2;
+    let pad = slot_count % 2 != 0;
+    if pad { slot_count += 1; }
+    let frame_bytes = slot_count * 8;
+
+    // 16 bytes of slack for frame_top's alignment rounding below.
+    if strings_bytes + frame_bytes + 16 > 4096 {
+        return Err("ELF loader: argv/envp too large for the initial stack page");
+    }
+
+    // ── Place strings ───────────────────────────────────────────────────
+    let content_top = 4096 - strings_bytes;
+    let mut cursor = content_top;
+
+    let mut envp_addrs: Vec<u64> = Vec::with_capacity(envp.len());
+    for s in envp {
+        core::ptr::copy_nonoverlapping(s.as_ptr(), page_ptr.add(cursor), s.len());
+        *page_ptr.add(cursor + s.len()) = 0;
+        envp_addrs.push(top_page_vaddr + cursor as u64);
+        cursor += s.len() + 1;
+    }
+    let mut argv_addrs: Vec<u64> = Vec::with_capacity(argv.len());
+    for s in argv {
+        core::ptr::copy_nonoverlapping(s.as_ptr(), page_ptr.add(cursor), s.len());
+        *page_ptr.add(cursor + s.len()) = 0;
+        argv_addrs.push(top_page_vaddr + cursor as u64);
+        cursor += s.len() + 1;
+    }
+
+    // ── Place argc/argv/envp/auxv ────────────────────────────────────────
+    let frame_top = content_top & !0xF;
+    if frame_bytes > frame_top {
+        return Err("ELF loader: argv/envp too large for the initial stack page");
+    }
+    let rsp = frame_top - frame_bytes;
+
+    let f = (page_ptr as usize + rsp) as *mut u64;
+    let mut i = 0usize;
+    macro_rules! put {
+        ($v:expr) => {{ *f.add(i) = $v; i += 1; }};
+    }
+
+    put!(argv.len() as u64);
+    for a in &argv_addrs { put!(*a); }
+    put!(0); // argv NULL terminator
+    for e in &envp_addrs { put!(*e); }
+    put!(0); // envp NULL terminator
+
+    put!(3); put!(phdr_vaddr);      // AT_PHDR
+    put!(4); put!(56);              // AT_PHENT (sizeof Elf64_Phdr)
+    put!(5); put!(ph_count as u64); // AT_PHNUM
+    put!(9); put!(entry_point);     // AT_ENTRY
+    put!(0); put!(0);               // AT_NULL
+    if pad { put!(0); }
+
+    Ok(top_page_vaddr + rsp as u64)
 }
 
 // ============================================================================
