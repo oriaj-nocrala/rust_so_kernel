@@ -26,6 +26,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <termios.h>
 
 namespace {
 
@@ -79,7 +80,18 @@ constexpr long SYS_execve = 59;
 constexpr long SYS_exit = 60;
 constexpr long SYS_waitpid = 61;
 constexpr long SYS_kill = 62;
+constexpr long SYS_setpgid = 109;
+constexpr long SYS_setsid = 112;
+constexpr long SYS_getpgid = 121;
 constexpr long SYS_arch_prctl = 158;
+
+// Not real syscall numbers — internal ioctl `request` values this port
+// passes through `SYS_ioctl` for tcgetattr/tcsetattr (see `sys_tcgetattr`/
+// `sys_tcsetattr` below), same convention real glibc uses on Linux.
+constexpr long TCGETS_REQ = 0x5401;
+constexpr long TCSETS_REQ = 0x5402;
+constexpr long TCSETSW_REQ = 0x5403;
+constexpr long TCSETSF_REQ = 0x5404;
 constexpr long SYS_futex = 202;
 constexpr long SYS_clock_gettime = 228;
 
@@ -396,8 +408,74 @@ int sys_write(int fd, const void *buf, size_t count, ssize_t *bytes_written) {
 // TCGETS (0x5401): our kernel's sys_ioctl returns 0 for fd 0/1/2 (the
 // console), ENOTTY otherwise — exactly the check isatty() needs.
 int sys_isatty(int fd) {
-	long ret = raw_syscall(SYS_ioctl, fd, 0x5401, 0);
+	long ret = raw_syscall(SYS_ioctl, fd, TCGETS_REQ, 0);
 	return ret < 0 ? (int)-ret : 0;
+}
+
+// Generic ioctl() passthrough — backs the public `ioctl()` (glibc option)
+// and, via that, `tcgetpgrp`/`tcsetpgrp` (options/posix/generic/unistd.cpp
+// calls `ioctl(fd, TIOCGPGRP/TIOCSPGRP, &pgrp)` directly rather than going
+// through a dedicated sysdeps hook).
+int sys_ioctl(int fd, unsigned long request, void *arg, int *result) {
+	long ret = raw_syscall(SYS_ioctl, fd, (long)request, (long)arg);
+	if (ret < 0)
+		return (int)-ret;
+	if (result)
+		*result = (int)ret;
+	return 0;
+}
+
+// mlibc's posix `tcgetattr()`/`tcsetattr()` (options/posix/generic/
+// termios.cpp) call these sysdeps hooks directly rather than going through
+// `ioctl()` — implemented as thin TCGETS/TCSETS* wrappers around our
+// kernel's existing ioctl(16) syscall, the same way real glibc implements
+// them. `struct termios` here is this port's own ABI (`abi-bits/termios.h`
+// — `cc_t`/`tcflag_t` are `unsigned int`, not the real-POSIX `unsigned
+// char`), which is exactly what the kernel's TCGETS/TCSETS* handling
+// marshals (see kernel/src/tty.rs::Termios).
+int sys_tcgetattr(int fd, struct termios *attr) {
+	long ret = raw_syscall(SYS_ioctl, fd, TCGETS_REQ, (long)attr);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+int sys_tcsetattr(int fd, int opts, const struct termios *attr) {
+	long req = TCSETS_REQ;
+	if (opts == TCSADRAIN)
+		req = TCSETSW_REQ;
+	else if (opts == TCSAFLUSH)
+		req = TCSETSF_REQ;
+	long ret = raw_syscall(SYS_ioctl, fd, req, (long)attr);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+// No real output buffering or discardable input queue exists beyond
+// `keyboard_buffer::KEYBOARD_BUFFER` (which nothing here usefully
+// truncates) — these are all no-ops that report success, same spirit as
+// `sys_brk` telling mlibc "nothing to do here, you already got what you
+// need another way".
+int sys_tcdrain(int) { return 0; }
+int sys_tcflow(int, int) { return 0; }
+int sys_tcflush(int, int) { return 0; }
+
+int sys_setpgid(pid_t pid, pid_t pgid) {
+	long ret = raw_syscall(SYS_setpgid, pid, pgid);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+int sys_getpgid(pid_t pid, pid_t *pgid) {
+	long ret = raw_syscall(SYS_getpgid, pid);
+	if (ret < 0)
+		return (int)-ret;
+	*pgid = (pid_t)ret;
+	return 0;
+}
+
+int sys_setsid(pid_t *sid) {
+	long ret = raw_syscall(SYS_setsid);
+	if (ret < 0)
+		return (int)-ret;
+	*sid = (pid_t)ret;
+	return 0;
 }
 
 int sys_seek(int fd, off_t offset, int whence, off_t *new_offset) {
@@ -499,29 +577,28 @@ int sys_execve(const char *path, char *const argv[], char *const envp[]) {
 	return ret < 0 ? (int)-ret : 0;
 }
 
-// This kernel's waitpid(61) takes only a specific child pid — no -1/0/
-// process-group forms (i.e. no "wait for any child") — and no `flags`
-// (WNOHANG always blocks until the target exits). Reject anything this
-// kernel can't honor up front instead of silently hanging or waiting on
-// the wrong thing.
+// This kernel's waitpid(61) now supports the real POSIX pid overloads
+// (`>0` exact pid, `0` own process group, `-1` any child, `<-1` group
+// `-pid`) and `flags` (WNOHANG/WUNTRACED — see kernel/src/process/
+// syscall.rs::sys_waitpid's doc comment). `pid` and `flags` both pass
+// through unconverted; the kernel itself returns ECHILD when nothing
+// matches at all, so nothing needs rejecting up front here anymore.
 //
-// The kernel now writes a real status word into a second syscall argument
-// (a user pointer) — see kernel/src/process/syscall.rs::sys_waitpid and
-// Scheduler::{notify_child_death,resolve_wait_status} for how it gets
-// there safely even across the "block, then get woken by the child's
-// sys_exit" path (which resumes via a raw trapframe restore with no
-// return into Rust code, and originally couldn't write into the parent's
-// memory from the dying child's own address space — fixed by deferring
-// the write to the next time the parent itself resumes in user mode).
+// The kernel writes a real status word into a second syscall argument (a
+// user pointer) — see kernel/src/process/syscall.rs::sys_waitpid and
+// Scheduler::{notify_child_death,notify_child_stopped,resolve_wait_status}
+// for how it gets there safely even across the "block, then get woken by
+// the child's sys_exit" path (which resumes via a raw trapframe restore
+// with no return into Rust code, and originally couldn't write into the
+// parent's memory from the dying child's own address space — fixed by
+// deferring the write to the next time the parent itself resumes in user
+// mode).
 int sys_waitpid(pid_t pid, int *status, int flags, struct rusage *ru,
 		pid_t *ret_pid) {
-	(void)flags;
 	if (ru)
 		__builtin_memset(ru, 0, sizeof(*ru));
-	if (pid <= 0)
-		return ECHILD;
 	int kstatus = 0;
-	long ret = raw_syscall(SYS_waitpid, pid, (long)&kstatus);
+	long ret = raw_syscall(SYS_waitpid, pid, (long)&kstatus, flags);
 	if (ret < 0)
 		return (int)-ret;
 	if (status)
@@ -540,6 +617,9 @@ pid_t sys_getppid() {
 	return 1;
 }
 
+// `pid` passes through unconverted — the kernel itself now understands the
+// real POSIX overloads (`0` own process group, `<-1` group `-pid`; `-1`
+// broadcast is rejected with EINVAL, no permission model to bound it by).
 int sys_kill(int pid, int sig) {
 	long ret = raw_syscall(SYS_kill, pid, sig);
 	return ret < 0 ? (int)-ret : 0;

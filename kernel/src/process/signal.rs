@@ -1,10 +1,12 @@
 // kernel/src/process/signal.rs
 //
-// Minimal POSIX-ish signal delivery: SIGKILL, SIGTERM, SIGSEGV, SIGPIPE
-// (all default-terminate), SIGCHLD (default-ignore), SIGUSR1/SIGUSR2
-// (default-terminate, meant for installing custom handlers in tests).
+// Minimal POSIX-ish signal delivery: SIGKILL, SIGTERM, SIGSEGV, SIGPIPE,
+// SIGINT, SIGQUIT (all default-terminate), SIGCHLD/SIGCONT (default-ignore),
+// SIGUSR1/SIGUSR2 (default-terminate, meant for installing custom handlers
+// in tests). SIGSTOP/SIGTSTP default-stop (job control — see
+// `SignalOutcome::Stop` and `Scheduler::stop_and_switch_tf`/`wake_stopped`).
 // void (*)(int) handlers only — no siginfo, no altstack, no real-time
-// signals, no SIGSTOP/SIGCONT/job control.
+// signals.
 //
 // DELIVERY
 //
@@ -29,6 +31,8 @@
 use super::{Process, TrapFrame};
 use crate::memory::signal_trampoline::TRAMPOLINE_VA;
 
+pub const SIGINT: u32 = 2;
+pub const SIGQUIT: u32 = 3;
 pub const SIGKILL: u32 = 9;
 pub const SIGUSR1: u32 = 10;
 pub const SIGSEGV: u32 = 11;
@@ -36,6 +40,9 @@ pub const SIGUSR2: u32 = 12;
 pub const SIGPIPE: u32 = 13;
 pub const SIGTERM: u32 = 15;
 pub const SIGCHLD: u32 = 17;
+pub const SIGCONT: u32 = 18;
+pub const SIGSTOP: u32 = 19;
+pub const SIGTSTP: u32 = 20;
 
 // 64, not 32: `pending_signals`/`blocked_signals` are `u64` bitmasks, so 64
 // is the natural width — and mlibc's pthread subsystem unconditionally
@@ -62,11 +69,17 @@ pub enum SignalOutcome {
     /// caller must kill it (e.g. via `Scheduler::kill_and_switch_tf`) and
     /// pick a different TrapFrame to run instead.
     Terminate(u32),
+    /// This signal's default action is to stop the process (job control);
+    /// the caller must park it as `ProcessState::Stopped` (e.g. via
+    /// `Scheduler::stop_and_switch_tf`) and pick a different TrapFrame.
+    Stop(u32),
 }
 
-/// Only SIGCHLD defaults to Ignore among the signals this kernel raises.
+/// SIGCHLD and SIGCONT default to Ignore; everything else this kernel
+/// raises defaults to Terminate *except* SIGSTOP/SIGTSTP, which
+/// `deliver_pending` checks before ever consulting this (see there).
 fn default_terminates(sig: u32) -> bool {
-    sig != SIGCHLD
+    sig != SIGCHLD && sig != SIGCONT
 }
 
 /// Set `sig`'s pending bit. Pending state is independent of whether the
@@ -93,9 +106,18 @@ pub fn deliver_pending(proc: &mut Process, tf: *mut TrapFrame) -> SignalOutcome 
     proc.pending_signals &= !(1u64 << sig);
 
     match proc.signal_handlers[sig as usize] {
+        // SIGSTOP can never be caught/ignored (sys_sigaction rejects
+        // attempts to change its disposition) and SIGTSTP's *default*
+        // action is always to stop even if `signal_handlers[SIGTSTP]` was
+        // never touched — checked ahead of the `SignalAction` match so a
+        // stray `Ignore`/`Handler` entry for SIGSTOP specifically (which
+        // sigaction should never produce) can't accidentally suppress it.
+        _ if sig == SIGSTOP => SignalOutcome::Stop(sig),
         SignalAction::Ignore => SignalOutcome::None,
         SignalAction::Default => {
-            if default_terminates(sig) {
+            if sig == SIGTSTP {
+                SignalOutcome::Stop(sig)
+            } else if default_terminates(sig) {
                 SignalOutcome::Terminate(sig)
             } else {
                 SignalOutcome::None

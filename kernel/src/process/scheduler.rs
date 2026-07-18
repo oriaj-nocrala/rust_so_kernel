@@ -303,34 +303,49 @@ impl Scheduler {
                 return tf;
             }
 
-            let terminate_sig = match self.running_mut() {
+            let outcome = match self.running_mut() {
                 Some(proc) if proc.privilege == crate::process::PrivilegeLevel::User => {
-                    match super::signal::deliver_pending(proc, tf as *mut TrapFrame) {
-                        super::signal::SignalOutcome::Terminate(sig) => Some(sig),
-                        _ => None,
-                    }
+                    super::signal::deliver_pending(proc, tf as *mut TrapFrame)
                 }
-                _ => None,
-            };
-            let Some(sig) = terminate_sig else {
-                return tf;
+                _ => super::signal::SignalOutcome::None,
             };
 
-            // Tag the about-to-die process with the signal that killed it
-            // (read back by `Process::wait_status_word()`) and capture what
-            // its parent needs to be told, before `kill_and_switch_tf` below
-            // takes it out of `self.running`.
-            let (dead_pid, parent_pid) = match self.running_mut() {
-                Some(proc) => {
-                    proc.killed_by_signal = Some(sig);
-                    let parent = if proc.is_thread { None } else { proc.parent_pid };
-                    (proc.pid.0, parent)
-                }
-                None => (0, None),
-            };
+            match outcome {
+                super::signal::SignalOutcome::Terminate(sig) => {
+                    // Tag the about-to-die process with the signal that
+                    // killed it (read back by `Process::wait_status_word()`)
+                    // and capture what its parent needs to be told, before
+                    // `kill_and_switch_tf` below takes it out of `self.running`.
+                    let (dead_pid, parent_pid) = match self.running_mut() {
+                        Some(proc) => {
+                            proc.killed_by_signal = Some(sig);
+                            let parent = if proc.is_thread { None } else { proc.parent_pid };
+                            (proc.pid.0, parent)
+                        }
+                        None => (0, None),
+                    };
 
-            tf = self.kill_and_switch_tf("uncaught signal");
-            self.notify_child_death(dead_pid, parent_pid);
+                    tf = self.kill_and_switch_tf("uncaught signal");
+                    self.notify_child_death(dead_pid, parent_pid);
+                }
+                super::signal::SignalOutcome::Stop(sig) => {
+                    // Same shape as Terminate above, but parks the process
+                    // as Stopped instead of discarding it — see
+                    // `stop_and_switch_tf`/`notify_child_stopped`.
+                    let (stopped_pid, parent_pid) = match self.running_mut() {
+                        Some(proc) => {
+                            proc.stopped_by_signal = Some(sig);
+                            proc.stop_reported = false;
+                            (proc.pid.0, proc.parent_pid)
+                        }
+                        None => (0, None),
+                    };
+
+                    tf = self.stop_and_switch_tf(tf);
+                    self.notify_child_stopped(stopped_pid, parent_pid);
+                }
+                _ => return tf,
+            }
         }
     }
 
@@ -437,6 +452,96 @@ impl Scheduler {
         panic!("No process to switch to after killing user process");
     }
 
+    /// Stop the running process (job control: SIGSTOP/SIGTSTP) and schedule
+    /// the next one. Mirrors `kill_and_switch_tf`, except the process is
+    /// parked as `ProcessState::Stopped` in `wait_queue` instead of being
+    /// discarded — `sys_kill`'s SIGCONT handling (`wake_stopped`) is the
+    /// only thing that ever resumes it.
+    ///
+    /// Unlike `kill_and_switch_tf` (which never needs the outgoing process's
+    /// register state, since it's being thrown away), this *does* need to
+    /// save `tf` into `proc.trapframe` first — `tf` may be the live syscall-
+    /// entry stack frame rather than `proc.trapframe` itself (see
+    /// `resolve_signals`'s call sites), and a stopped process must resume
+    /// later exactly where it left off.
+    pub fn stop_and_switch_tf(&mut self, tf: *const TrapFrame) -> *const TrapFrame {
+        if let Some(mut proc) = self.running.take() {
+            unsafe { *proc.trapframe = *tf; }
+            proc.fs_base = read_fs_base();
+            crate::serial_println!(
+                "⏸ Stopped PID {} ({})",
+                proc.pid.0,
+                core::str::from_utf8(&proc.name).unwrap_or("<?>").trim_end_matches('\0'),
+            );
+            proc.state = ProcessState::Stopped;
+            self.wait_queue.push_back(proc);
+        }
+        clear_current_fast();
+
+        for priority in (0..NUM_PRIORITIES).rev() {
+            if let Some(mut proc) = self.run_queues[priority].pop_front() {
+                proc.state = ProcessState::Running;
+                unsafe { proc.address_space.activate(); }
+                super::tss::set_kernel_stack(proc.kernel_stack);
+                write_fs_base(proc.fs_base);
+                self.remaining_ticks = Self::quantum_for(proc.effective_priority);
+                let tf_ptr = &*proc.trapframe as *const TrapFrame;
+                update_current_fast(&proc);
+                self.running = Some(proc);
+                return tf_ptr;
+            }
+        }
+
+        panic!("No process to switch to after stopping process");
+    }
+
+    /// Queue `sig` on every process whose `pgid` matches — used for
+    /// job-control signals (Ctrl-C/Ctrl-Z at the tty, see `tty::feed_input`)
+    /// and `sys_kill`'s process-group target forms (`pid == 0` / negative).
+    /// Caller must already hold the scheduler lock (this takes `&mut self`,
+    /// not a fresh lock) — see `syscall::send_to_group` for the ISR-context
+    /// wrapper that acquires one.
+    pub fn queue_signal_to_group(&mut self, pgid: u32, sig: u32) {
+        if let Some(proc) = self.running.as_deref_mut() {
+            if proc.pgid == pgid {
+                super::signal::queue_signal(proc, sig);
+            }
+        }
+        for queue in self.run_queues.iter_mut() {
+            for proc in queue.iter_mut() {
+                if proc.pgid == pgid {
+                    super::signal::queue_signal(proc, sig);
+                }
+            }
+        }
+        for proc in self.wait_queue.iter_mut() {
+            if proc.pgid == pgid {
+                super::signal::queue_signal(proc, sig);
+            }
+        }
+    }
+
+    /// Wake a Stopped process (SIGCONT): move it from `wait_queue` back to
+    /// its run queue, exactly like `wake()` does for a Blocked one. Unlike
+    /// `wake()`, this is the *only* wakeup path a Stopped process ever has
+    /// — it can't wake itself the way a Blocked process does when its I/O
+    /// completes, since being stopped isn't waiting on anything.
+    pub fn wake_stopped(&mut self, pid: usize) -> bool {
+        if let Some(pos) = self.wait_queue.iter().position(|p| {
+            p.pid.0 == pid && matches!(p.state, ProcessState::Stopped)
+        }) {
+            if let Some(mut proc) = self.wait_queue.remove(pos) {
+                proc.state = ProcessState::Ready;
+                proc.stopped_by_signal = None;
+                let pri = (proc.effective_priority as usize).min(NUM_PRIORITIES - 1);
+                self.run_queues[pri].push_back(proc);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     // ====================================================================
     // Blocking / wakeup (I/O wait)
     // ====================================================================
@@ -533,14 +638,20 @@ impl Scheduler {
         // aren't (reaped immediately in `kill_current`), so this stays at
         // the "exited(0)" default for them — matches this kernel's existing
         // stance that nothing meaningful ever `waitpid()`s a thread's tid.
-        let status_word = self.wait_queue.iter()
-            .find(|p| p.pid.0 == dead_pid && matches!(p.state, ProcessState::Zombie))
-            .map(|p| p.wait_status_word())
-            .unwrap_or(0x200);
+        let dead = self.wait_queue.iter()
+            .find(|p| p.pid.0 == dead_pid && matches!(p.state, ProcessState::Zombie));
+        let status_word = dead.map(|p| p.wait_status_word()).unwrap_or(0x200);
+        let dead_pgid = dead.map(|p| p.pgid).unwrap_or(0);
 
+        // Only the real parent can be woken — `WaitTarget::AnyChild`/`Pgid`
+        // still must not wake an unrelated process just because its own
+        // `waitpid()` target happens to match by pid/pgid coincidence.
         let mut waker_pid: Option<usize> = None;
         for proc in self.wait_queue.iter_mut() {
-            if proc.waiting_for == Some(dead_pid) && matches!(proc.state, ProcessState::Blocked) {
+            if Some(proc.pid) == parent_pid
+                && matches!(proc.state, ProcessState::Blocked)
+                && proc.waiting_for.map(|t| t.matches(dead_pid, dead_pgid)).unwrap_or(false)
+            {
                 proc.trapframe.rax = dead_pid as u64;
                 proc.waiting_for = None;
                 proc.pending_wait_status = Some(status_word);
@@ -549,6 +660,56 @@ impl Scheduler {
             }
         }
         if let Some(pid) = waker_pid {
+            self.wake(pid);
+        }
+    }
+
+    /// Called once a child transitions to `ProcessState::Stopped` (SIGSTOP/
+    /// SIGTSTP) — queues `SIGCHLD` on the parent (matches real POSIX: a
+    /// child stopping is also a `SIGCHLD`-worthy event, not just exiting)
+    /// and wakes the parent if it's blocked in a `WUNTRACED` `waitpid()`
+    /// matching this pid/pgid. Unlike `notify_child_death`, the stopped
+    /// process is NOT removed from `wait_queue` — it stays there so a later
+    /// real exit, or another stop/continue cycle, can still be observed.
+    pub fn notify_child_stopped(&mut self, stopped_pid: usize, parent_pid: Option<Pid>) {
+        if let Some(parent_pid) = parent_pid {
+            if self.current_pid() == Some(parent_pid) {
+                if let Some(parent) = self.running_mut() {
+                    super::signal::queue_signal(parent, super::signal::SIGCHLD);
+                }
+            } else if let Some(parent) = self.find_process_mut(parent_pid.0) {
+                super::signal::queue_signal(parent, super::signal::SIGCHLD);
+            }
+        }
+
+        let Some((stopped_pgid, status_word)) = self.wait_queue.iter()
+            .find(|p| p.pid.0 == stopped_pid && matches!(p.state, ProcessState::Stopped))
+            .map(|p| (p.pgid, p.stop_status_word()))
+        else {
+            return;
+        };
+
+        const WUNTRACED: i32 = 4;
+        let mut waker_pid: Option<usize> = None;
+        for proc in self.wait_queue.iter_mut() {
+            if Some(proc.pid) == parent_pid
+                && matches!(proc.state, ProcessState::Blocked)
+                && proc.waiting_options & WUNTRACED != 0
+                && proc.waiting_for.map(|t| t.matches(stopped_pid, stopped_pgid)).unwrap_or(false)
+            {
+                proc.trapframe.rax = stopped_pid as u64;
+                proc.waiting_for = None;
+                proc.pending_wait_status = Some(status_word);
+                waker_pid = Some(proc.pid.0);
+                break;
+            }
+        }
+        if let Some(pid) = waker_pid {
+            // One-shot: don't let a future waitpid() scan re-report the
+            // same stop event (see `Process::stop_reported`'s doc comment).
+            if let Some(p) = self.wait_queue.iter_mut().find(|p| p.pid.0 == stopped_pid) {
+                p.stop_reported = true;
+            }
             self.wake(pid);
         }
     }
@@ -672,8 +833,9 @@ impl Scheduler {
                     let pri = (proc.effective_priority as usize).min(NUM_PRIORITIES - 1);
                     self.run_queues[pri].push_back(proc);
                 }
-                ProcessState::Zombie | ProcessState::Blocked => {
-                    // Process was killed or blocked during its slice
+                ProcessState::Zombie | ProcessState::Blocked | ProcessState::Stopped => {
+                    // Process was killed, blocked, or stopped (job control)
+                    // during its slice.
                     self.wait_queue.push_back(proc);
                 }
                 ProcessState::Ready => {

@@ -228,6 +228,16 @@ fn create_user_processes() {
             user_proc.set_name(name);
             user_proc.set_priority(5);
 
+            // The shell is the only process spawned at boot (everything
+            // else is exec'd on demand from it) — it becomes the tty's
+            // initial foreground process group (its own pgid, set by
+            // `Process::new_user`), so Ctrl-C/Ctrl-Z at the keyboard/serial
+            // reach it (and whatever job it later brings to the foreground
+            // via `tcsetpgrp`) instead of going nowhere. See `tty.rs`.
+            if *name == "shell" {
+                crate::tty::FOREGROUND_PGID.store(pid.0 as u32, core::sync::atomic::Ordering::Relaxed);
+            }
+
             let mut scheduler = crate::process::scheduler::local_scheduler();
             scheduler.add_process(user_proc);
         }

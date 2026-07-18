@@ -101,9 +101,16 @@ extern "x86-interrupt" fn serial_interrupt_handler(_: &mut ExceptionStackFrame) 
         // The 16550 FIFO may hold several bytes by the time we get to run.
         while lsr.read() & DATA_READY != 0 {
             let byte = rbr.read();
-            crate::keyboard_buffer::KEYBOARD_BUFFER.push(byte as char);
-            crate::process::syscall::stdin_wakeup();
-            crate::process::syscall::poll_wakeup_for_fd0();
+            // Same ISIG line discipline the PS/2 path goes through (see
+            // `keyboard::push`/`tty::feed_input`) — a byte consumed as a
+            // signal (Ctrl-C over `-serial stdio`, say) never becomes input,
+            // so skip the wakeups too: there's nothing new for a stdin
+            // reader to consume.
+            if crate::tty::feed_input(byte as char) {
+                crate::keyboard_buffer::KEYBOARD_BUFFER.push(byte as char);
+                crate::process::syscall::stdin_wakeup();
+                crate::process::syscall::poll_wakeup_for_fd0();
+            }
         }
     }
     crate::interrupts::pic::end_of_interrupt(crate::interrupts::pic::Irq::Com1.as_u8());

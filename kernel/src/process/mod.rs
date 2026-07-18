@@ -32,6 +32,30 @@ pub enum ProcessState {
     Running,
     Blocked,
     Zombie,
+    /// Stopped by SIGSTOP/SIGTSTP (job control). Parked in `wait_queue` like
+    /// Blocked/Zombie (excluded from the scheduler's run queues), but unlike
+    /// Blocked it never wakes itself — only an explicit SIGCONT (`sys_kill`)
+    /// moves it back to Ready. See `Scheduler::stop_and_switch_tf`/`wake_stopped`.
+    Stopped,
+}
+
+/// What a process blocked in `waitpid()` is waiting for — mirrors the pid
+/// argument's POSIX overload (specific pid / process group / any child).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitTarget {
+    Pid(usize),
+    Pgid(u32),
+    AnyChild,
+}
+
+impl WaitTarget {
+    pub fn matches(&self, pid: usize, pgid: u32) -> bool {
+        match *self {
+            WaitTarget::Pid(p) => p == pid,
+            WaitTarget::Pgid(g) => g == pgid,
+            WaitTarget::AnyChild => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +100,10 @@ pub struct Process {
 
     /// Set while this process is blocked in waitpid(), waiting for a child.
     /// Stored here (not in a global) so multiple processes can wait concurrently.
-    pub waiting_for: Option<usize>,
+    pub waiting_for: Option<WaitTarget>,
+    /// The `options` (WNOHANG/WUNTRACED) passed to the `waitpid()` call that
+    /// set `waiting_for`. Only meaningful while `waiting_for` is `Some`.
+    pub waiting_options: i32,
 
     /// User pointer `waitpid()`'s caller wants the reaped child's wait
     /// status written to (0 = none requested, i.e. a NULL status pointer).
@@ -97,6 +124,24 @@ pub struct Process {
     /// wait-status purposes (this kernel doesn't distinguish fault kinds
     /// at the signal level). Read by `wait_status_word()`.
     pub killed_by_signal: Option<u32>,
+
+    /// Process group id (job control). Defaults to this process's own pid
+    /// (group leader) at creation; `fork()`/`clone()` inherit the parent's
+    /// pgid unless `setpgid()` later changes it — matches real POSIX
+    /// default behavior. There is no separate session-id concept tracked —
+    /// `setsid()` is approximated as "become your own group leader".
+    pub pgid: u32,
+
+    /// Set when this process is currently `ProcessState::Stopped`, to the
+    /// signal that stopped it (SIGSTOP or SIGTSTP) — read by
+    /// `stop_status_word()` for a `WUNTRACED` `waitpid()` report.
+    pub stopped_by_signal: Option<u32>,
+    /// Whether the *current* stop (see `stopped_by_signal`) has already
+    /// been reported to a `waitpid(WUNTRACED)` caller. Reset to `false`
+    /// every time this process is freshly stopped, so a stop is reported
+    /// exactly once — matching real POSIX "each stop/continue transition
+    /// is reported once" semantics (this kernel doesn't track WCONTINUED).
+    pub stop_reported: bool,
 
     /// FS segment base (used for TLS via arch_prctl ARCH_SET_FS).
     /// Saved/restored on every context switch so mlibc's TLS works correctly.
@@ -201,9 +246,13 @@ impl Process {
             address_space: Arc::new(address_space),
             files: Arc::new(Mutex::new(FileDescriptorTable::new_with_stdio())),
             waiting_for: None,
+            waiting_options: 0,
             waiting_status_ptr: 0,
             pending_wait_status: None,
             killed_by_signal: None,
+            pgid: pid.0 as u32,
+            stopped_by_signal: None,
+            stop_reported: false,
             fs_base: 0,
             is_thread: false,
             owned_stack_vma: None,
@@ -265,9 +314,13 @@ impl Process {
             address_space: Arc::new(address_space),
             files: Arc::new(Mutex::new(FileDescriptorTable::new_with_stdio())),
             waiting_for: None,
+            waiting_options: 0,
             waiting_status_ptr: 0,
             pending_wait_status: None,
             killed_by_signal: None,
+            pgid: pid.0 as u32,
+            stopped_by_signal: None,
+            stop_reported: false,
             fs_base: 0,
             is_thread: false,
             owned_stack_vma: None,
@@ -290,6 +343,7 @@ impl Process {
         address_space: AddressSpace,
         files: FileDescriptorTable,
         cwd: alloc::string::String,
+        parent_pgid: u32,
     ) -> Self {
         crate::serial_println!(
             "Creating FORKED process PID {} (parent PID {})",
@@ -309,9 +363,13 @@ impl Process {
             address_space: Arc::new(address_space),
             files: Arc::new(Mutex::new(files)),
             waiting_for: None,
+            waiting_options: 0,
             waiting_status_ptr: 0,
             pending_wait_status: None,
             killed_by_signal: None,
+            pgid: parent_pgid,
+            stopped_by_signal: None,
+            stop_reported: false,
             fs_base: 0,
             is_thread: false,
             owned_stack_vma: None,
@@ -344,6 +402,7 @@ impl Process {
         files: Arc<Mutex<FileDescriptorTable>>,
         owned_stack_vma: Option<(u64, usize)>,
         cwd: alloc::string::String,
+        parent_pgid: u32,
     ) -> Self {
         let mut trapframe = Box::new(TrapFrame::default());
 
@@ -388,9 +447,13 @@ impl Process {
             address_space,
             files,
             waiting_for: None,
+            waiting_options: 0,
             waiting_status_ptr: 0,
             pending_wait_status: None,
             killed_by_signal: None,
+            pgid: parent_pgid,
+            stopped_by_signal: None,
+            stop_reported: false,
             fs_base: 0,
             is_thread: true,
             owned_stack_vma,
@@ -426,6 +489,20 @@ impl Process {
         match self.killed_by_signal {
             Some(sig) => (((sig as i32) & 0xFF) << 24) | 0x400,
             None => 0x200 | (self.exit_status & 0xFF),
+        }
+    }
+
+    /// Encodes this (currently `Stopped`) process's condition into a
+    /// `WUNTRACED` wait status: `WIFSTOPPED` = bit `0x800`, stop signal in
+    /// bits 16-23 (`WSTOPSIG`) — see `abi-bits/wait.h`. Returns a plain
+    /// exited(0) word if called on a process that isn't actually stopped
+    /// (shouldn't happen — callers only reach this via a `Stopped`-state
+    /// match — but this avoids a bogus status word if that invariant is
+    /// ever violated).
+    pub fn stop_status_word(&self) -> i32 {
+        match self.stopped_by_signal {
+            Some(sig) => 0x800 | (((sig as i32) & 0xFF) << 16),
+            None => 0x200,
         }
     }
 }

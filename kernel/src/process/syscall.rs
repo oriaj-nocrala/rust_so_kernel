@@ -223,6 +223,9 @@ pub enum SyscallNumber {
     Exit = 60,
     Waitpid = 61,
     Kill = 62,
+    Setpgid = 109,
+    Setsid = 112,
+    Getpgid = 121,
     ArchPrctl = 158,
     Futex = 202,
     EpollCreate = 213,
@@ -282,6 +285,9 @@ impl SyscallNumber {
             60 => Some(Self::Exit),
             61 => Some(Self::Waitpid),
             62 => Some(Self::Kill),
+            109 => Some(Self::Setpgid),
+            112 => Some(Self::Setsid),
+            121 => Some(Self::Getpgid),
             158 => Some(Self::ArchPrctl),
             202 => Some(Self::Futex),
             213 => Some(Self::EpollCreate),
@@ -305,6 +311,7 @@ pub mod errno {
     pub const EPERM: i64 = -1;
     pub const ENOENT: i64 = -2;
     pub const ESRCH: i64 = -3;
+    pub const ECHILD: i64 = -10;
     pub const EINTR: i64 = -4;
     pub const EIO: i64 = -5;
     pub const ENXIO: i64 = -6;
@@ -493,8 +500,11 @@ pub fn syscall_handler(
         SyscallNumber::Fork => sys_fork(),
         SyscallNumber::Exec => sys_exec(arg1 as usize, arg2 as usize, arg3 as usize),
         SyscallNumber::Exit => sys_exit(arg1 as i32),
-        SyscallNumber::Waitpid => sys_waitpid(arg1 as usize, arg2 as usize),
-        SyscallNumber::Kill => sys_kill(arg1 as usize, arg2 as u32),
+        SyscallNumber::Waitpid => sys_waitpid(arg1 as i64, arg2 as usize, arg3 as i32),
+        SyscallNumber::Kill => sys_kill(arg1 as i64, arg2 as u32),
+        SyscallNumber::Setpgid => sys_setpgid(arg1 as i64, arg2 as i64),
+        SyscallNumber::Setsid => sys_setsid(),
+        SyscallNumber::Getpgid => sys_getpgid(arg1 as i64),
         SyscallNumber::ArchPrctl => sys_arch_prctl(arg1 as i32, arg2),
         SyscallNumber::Futex => sys_futex(arg1, arg2 as i32, arg3 as i32, arg4),
         SyscallNumber::SetTidAddress => sys_set_tid_address(arg1),
@@ -608,6 +618,14 @@ fn block_stdin_read(current_tf: *const TrapFrame) -> ! {
 /// If a process is blocked on stdin, delivers the character to its user
 /// buffer (via physical-memory translation), sets rax=1 in its saved
 /// TrapFrame, and moves it back to the run queue.
+/// Deliver `sig` to every process in group `pgid` — used by the tty line
+/// discipline (Ctrl-C/Ctrl-Z, see `tty::feed_input`) from ISR context,
+/// where interrupts are already off, so (like `stdin_wakeup` below) this
+/// locks the scheduler directly with no explicit cli/sti.
+pub(crate) fn send_to_group(pgid: u32, sig: u32) {
+    super::scheduler::local_scheduler().queue_signal_to_group(pgid, sig);
+}
+
 pub(crate) fn stdin_wakeup() {
     // Take the waiter atomically — if no one is waiting, return immediately.
     let waiter = {
@@ -1107,11 +1125,20 @@ fn sys_brk(_addr: u64) -> SyscallResult {
 
 /// ioctl(16): int ioctl(int fd, unsigned long request, ...)
 ///
-/// Minimal implementation: answer the two queries that mlibc cares about
-/// to make isatty() and terminal-size queries work.
+/// Backs mlibc's `sys_isatty` (via TCGETS with a null pointer — kept
+/// working exactly as before), the real `tcgetattr`/`tcsetattr` sysdeps
+/// hooks (which this port implements as thin TCGETS/TCSETS* wrappers, same
+/// as real glibc does — see `mlibc-port/.../generic.cpp::sys_tcgetattr`),
+/// `tcgetpgrp`/`tcsetpgrp` (TIOCGPGRP/TIOCSPGRP — mlibc calls `ioctl()`
+/// directly for these, not a sysdeps hook), and terminal-size queries.
 fn sys_ioctl(fd: i32, request: u64, argp: u64) -> SyscallResult {
-    const TCGETS: u64 = 0x5401;      // "is this a terminal?" probe
-    const TIOCGWINSZ: u64 = 0x5413; // get terminal window size
+    const TCGETS: u64 = 0x5401;
+    const TCSETS: u64 = 0x5402;
+    const TCSETSW: u64 = 0x5403;
+    const TCSETSF: u64 = 0x5404;
+    const TIOCGWINSZ: u64 = 0x5413;
+    const TIOCGPGRP: u64 = 0x540F;
+    const TIOCSPGRP: u64 = 0x5410;
 
     if fd < 0 { return errno::EBADF; }
 
@@ -1121,15 +1148,25 @@ fn sys_ioctl(fd: i32, request: u64, argp: u64) -> SyscallResult {
     match request {
         TCGETS => {
             if !is_tty { return errno::ENOTTY; }
-            // Write a zeroed termios struct if the caller supplied a pointer.
-            // mlibc only checks the return code for isatty(); it doesn't use
-            // the actual termios fields yet.
-            if argp != 0 && validate_user_buffer(argp, 60).is_ok() {
-                // termios is 60 bytes on x86-64 Linux ABI — zero-fill it.
-                unsafe {
-                    core::ptr::write_bytes(argp as *mut u8, 0, 60);
-                }
+            // `argp == 0` is `sys_isatty`'s "just probe the return code"
+            // call — nothing to write, and that's fine.
+            const SZ: usize = core::mem::size_of::<crate::tty::Termios>();
+            if argp != 0 && validate_user_buffer(argp, SZ).is_ok() {
+                let t = *crate::tty::TERMIOS.lock();
+                unsafe { core::ptr::write(argp as *mut crate::tty::Termios, t); }
             }
+            0
+        }
+        TCSETS | TCSETSW | TCSETSF => {
+            if !is_tty { return errno::ENOTTY; }
+            const SZ: usize = core::mem::size_of::<crate::tty::Termios>();
+            if let Err(e) = validate_user_buffer(argp, SZ) { return e; }
+            // TCSETSW/TCSETSF (drain-first / flush-first) collapse to the
+            // same immediate apply as TCSETS: there's no real output queue
+            // to drain and no queued-but-unread input beyond
+            // `keyboard_buffer::KEYBOARD_BUFFER` worth discarding.
+            let t = unsafe { core::ptr::read(argp as *const crate::tty::Termios) };
+            *crate::tty::TERMIOS.lock() = t;
             0
         }
         TIOCGWINSZ => {
@@ -1144,6 +1181,21 @@ fn sys_ioctl(fd: i32, request: u64, argp: u64) -> SyscallResult {
                     *ws.add(3) = 0;
                 }
             }
+            0
+        }
+        TIOCGPGRP => {
+            if !is_tty { return errno::ENOTTY; }
+            if let Err(e) = validate_user_buffer(argp, 4) { return e; }
+            let pgid = crate::tty::FOREGROUND_PGID.load(core::sync::atomic::Ordering::Relaxed);
+            unsafe { *(argp as *mut i32) = pgid as i32; }
+            0
+        }
+        TIOCSPGRP => {
+            if !is_tty { return errno::ENOTTY; }
+            if let Err(e) = validate_user_buffer(argp, 4) { return e; }
+            let pgid = unsafe { *(argp as *const i32) };
+            if pgid <= 0 { return errno::EINVAL; }
+            crate::tty::FOREGROUND_PGID.store(pgid as u32, core::sync::atomic::Ordering::Relaxed);
             0
         }
         _ => errno::EINVAL,
@@ -1496,7 +1548,7 @@ fn sys_fork() -> SyscallResult {
     unsafe { core::arch::asm!("cli"); }
 
     // Collect what we need from the running process
-    let (child_as, parent_pid, parent_fs_base, files, child_tf, parent_cwd) = {
+    let (child_as, parent_pid, parent_fs_base, files, child_tf, parent_cwd, parent_pgid) = {
         let scheduler = super::scheduler::local_scheduler();
         match scheduler.running_ref() {
             Some(proc) => {
@@ -1505,7 +1557,7 @@ fn sys_fork() -> SyscallResult {
                 tf_copy.rax = 0;
 
                 match unsafe { proc.address_space.fork() } {
-                    Ok(child_as) => (child_as, proc.pid, proc.fs_base, proc.files.lock().clone(), tf_copy, proc.cwd.clone()),
+                    Ok(child_as) => (child_as, proc.pid, proc.fs_base, proc.files.lock().clone(), tf_copy, proc.cwd.clone(), proc.pgid),
                     Err(e) => {
                         serial_println!("fork: address_space.fork() failed: {}", e);
                         unsafe { core::arch::asm!("sti"); }
@@ -1529,7 +1581,7 @@ fn sys_fork() -> SyscallResult {
         let mut child = alloc::boxed::Box::new(
             super::Process::new_user_from_fork(
                 pid, parent_pid, alloc::boxed::Box::new(child_tf),
-                kernel_stack, child_as, files, parent_cwd,
+                kernel_stack, child_as, files, parent_cwd, parent_pgid,
             )
         );
         child.fs_base = parent_fs_base; // inherit TLS base from parent
@@ -1569,10 +1621,10 @@ fn sys_fork() -> SyscallResult {
 /// thread's `Process` immediately instead of waiting for a collector that
 /// will never come).
 fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
-    let (parent_pid, address_space, files, parent_cwd) = {
+    let (parent_pid, address_space, files, parent_cwd, parent_pgid) = {
         let sched = super::scheduler::local_scheduler();
         match sched.running_ref() {
-            Some(proc) => (proc.pid, proc.address_space.clone(), proc.files.clone(), proc.cwd.clone()),
+            Some(proc) => (proc.pid, proc.address_space.clone(), proc.files.clone(), proc.cwd.clone(), proc.pgid),
             None => return errno::ESRCH,
         }
     };
@@ -1604,7 +1656,7 @@ fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
             super::Process::new_thread(
                 pid, parent_pid,
                 x86_64::VirtAddr::new(entry), x86_64::VirtAddr::new(stack),
-                kernel_stack, address_space, files, owned_stack_vma, parent_cwd,
+                kernel_stack, address_space, files, owned_stack_vma, parent_cwd, parent_pgid,
             )
         );
         thread.set_name("thread");
@@ -1792,7 +1844,26 @@ fn find_program_elf(name: &str) -> Option<&'static [u8]> {
     crate::fs::initramfs::bytes(name)
 }
 
-fn sys_waitpid(child_pid: usize, status_ptr: usize) -> SyscallResult {
+/// waitpid(61): long waitpid(pid_t pid, int *status, int options)
+///
+/// `pid`: `>0` = exactly that pid; `0` = any child in the caller's own
+/// process group; `-1` = any child at all; `<-1` = any child in group
+/// `-pid` — the real POSIX overloads (this kernel used to accept only a
+/// single exact pid). Only actual children of the caller ever match
+/// (checked via `parent_pid`), same as real `waitpid()`; if the target
+/// selector matches no live-or-zombie child of the caller at all, this
+/// returns `ECHILD` instead of blocking forever.
+///
+/// `options`: `WNOHANG` (2) returns 0 immediately instead of blocking when
+/// nothing is reapable yet. `WUNTRACED` (4) also matches a `Stopped` child
+/// (job control), reporting it once (see `Process::stop_reported`) without
+/// removing it from the wait queue — a later real exit, or another
+/// stop/continue cycle, can still be observed. No `WCONTINUED` support
+/// (this kernel doesn't track SIGCONT-resume events for reporting).
+fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> SyscallResult {
+    const WNOHANG: i32 = 2;
+    const WUNTRACED: i32 = 4;
+
     if status_ptr != 0 {
         if let Err(e) = validate_user_buffer(status_ptr as u64, 4) { return e; }
     }
@@ -1801,63 +1872,100 @@ fn sys_waitpid(child_pid: usize, status_ptr: usize) -> SyscallResult {
 
     unsafe { core::arch::asm!("cli"); }
 
-    // `already_zombie` is checked *after* the block below ends (guard
-    // dropped) so `sti` never runs while `scheduler` is still locked — a
-    // guard alive past `sti` leaves a window where a timer tick can land
+    enum Outcome {
+        Return(SyscallResult),
+        Block(*const TrapFrame),
+    }
+
+    // Everything that decides Return-vs-Block must finish inside this one
+    // locked block, so `sti` never runs while `scheduler` is still held —
+    // a guard alive past `sti` opens a window where a timer tick could land
     // inside the critical section and spin on `local_scheduler()` forever,
     // since the only thing that could release it (this call, mid-return)
-    // can't resume until that spin gives up, which it never does. The
-    // previous version called `sti` then `return`ed from inside the same
-    // block that still owned the guard — same bug class as `sys_kill`'s
-    // (see its doc comment), just pre-existing here instead of newly
-    // introduced. Found via the `signal_test`/`pipe_test` programs, which
-    // are the first to combine heavy `yield_now()`-driven preemption with
-    // a `waitpid()` on an already-exited child.
-    let already_zombie;
-    let next_tf = {
+    // can't resume until that spin gives up, which it never does. Same bug
+    // class as `sys_kill`'s doc comment describes.
+    let outcome = {
         let mut scheduler = super::scheduler::local_scheduler();
 
-        if let Some(pos) = scheduler.wait_queue.iter().position(|p| {
-            p.pid.0 == child_pid && matches!(p.state, super::ProcessState::Zombie)
-        }) {
-            // Safe to free the zombie's kernel stack immediately: we're
-            // running on the *parent's* stack here (this is its own
-            // waitpid() syscall), never the dead child's. Same reasoning
-            // makes it safe to write the real wait status straight into
-            // `status_ptr` right here, unlike the not-yet-zombie path below:
-            // this is the parent's own page table, no cross-address-space
-            // concern.
-            if let Some(proc) = scheduler.wait_queue.remove(pos) {
-                if status_ptr != 0 {
-                    unsafe { core::ptr::write(status_ptr as *mut i32, proc.wait_status_word()); }
-                }
-                crate::init::processes::free_kernel_stack(proc.kernel_stack);
-            }
-            already_zombie = true;
-            core::ptr::null()
+        let caller_pid = scheduler.current_pid();
+        let caller_pgid = scheduler.running_ref().map(|p| p.pgid).unwrap_or(0);
+
+        let target = match pid_arg {
+            p if p > 0 => super::WaitTarget::Pid(p as usize),
+            0 => super::WaitTarget::Pgid(caller_pgid),
+            -1 => super::WaitTarget::AnyChild,
+            p => super::WaitTarget::Pgid((-p) as u32),
+        };
+
+        let zombie_pos = scheduler.wait_queue.iter().position(|p| {
+            matches!(p.state, super::ProcessState::Zombie)
+                && p.parent_pid == caller_pid
+                && target.matches(p.pid.0, p.pgid)
+        });
+        let stopped_pos = if zombie_pos.is_none() && options & WUNTRACED != 0 {
+            scheduler.wait_queue.iter().position(|p| {
+                matches!(p.state, super::ProcessState::Stopped)
+                    && !p.stop_reported
+                    && p.parent_pid == caller_pid
+                    && target.matches(p.pid.0, p.pgid)
+            })
         } else {
-            already_zombie = false;
+            None
+        };
 
-            // Not a zombie yet — record what we are waiting for (and where
-            // to eventually write its status — see `Process::
-            // waiting_status_ptr`'s doc comment for why that write can't
-            // happen from `notify_child_death` directly) in the Process
-            // struct (supports multiple concurrent waitpid callers: shell +
-            // ipc_ping etc.) and block until the child exits.
-            if let Some(proc) = scheduler.running_mut() {
-                proc.waiting_for = Some(child_pid);
-                proc.waiting_status_ptr = status_ptr;
+        if let Some(pos) = zombie_pos {
+            // Safe to free the zombie's kernel stack and write the status
+            // straight into `status_ptr` right here: we're running on the
+            // *parent's* stack in the parent's own address space (this is
+            // its own waitpid() syscall), never the dead child's.
+            let proc = scheduler.wait_queue.remove(pos).unwrap();
+            let status = proc.wait_status_word();
+            let pid = proc.pid.0;
+            crate::init::processes::free_kernel_stack(proc.kernel_stack);
+            if status_ptr != 0 {
+                unsafe { core::ptr::write(status_ptr as *mut i32, status); }
             }
-
-            scheduler.block_current(tf_ptr)
+            Outcome::Return(pid as SyscallResult)
+        } else if let Some(pos) = stopped_pos {
+            let status = scheduler.wait_queue[pos].stop_status_word();
+            let pid = scheduler.wait_queue[pos].pid.0;
+            scheduler.wait_queue[pos].stop_reported = true;
+            if status_ptr != 0 {
+                unsafe { core::ptr::write(status_ptr as *mut i32, status); }
+            }
+            Outcome::Return(pid as SyscallResult)
+        } else if options & WNOHANG != 0 {
+            Outcome::Return(0)
+        } else {
+            let has_any = scheduler.iter_all()
+                .any(|p| p.parent_pid == caller_pid && target.matches(p.pid.0, p.pgid));
+            if !has_any {
+                Outcome::Return(errno::ECHILD)
+            } else {
+                // Not reapable yet — record what we are waiting for (and
+                // where to eventually write its status — see `Process::
+                // waiting_status_ptr`'s doc comment for why that write can't
+                // happen from `notify_child_death`/`notify_child_stopped`
+                // directly) in the Process struct (supports multiple
+                // concurrent waitpid callers: shell + ipc_ping etc.) and
+                // block until a matching child exits or (if WUNTRACED) stops.
+                if let Some(proc) = scheduler.running_mut() {
+                    proc.waiting_for = Some(target);
+                    proc.waiting_options = options;
+                    proc.waiting_status_ptr = status_ptr;
+                }
+                Outcome::Block(scheduler.block_current(tf_ptr))
+            }
         }
     };
 
-    if already_zombie {
-        unsafe { core::arch::asm!("sti"); }
-        return child_pid as SyscallResult;
+    match outcome {
+        Outcome::Return(v) => {
+            unsafe { core::arch::asm!("sti"); }
+            v
+        }
+        Outcome::Block(next_tf) => unsafe { super::trapframe::jump_to_user(next_tf) },
     }
-    unsafe { super::trapframe::jump_to_user(next_tf) }
 }
 
 fn sys_uptime_ms() -> SyscallResult {
@@ -1929,11 +2037,25 @@ fn sys_clock_gettime(clk_id: u64, tp_ptr: u64) -> SyscallResult {
 
 /// kill(62): long kill(pid_t pid, int sig)
 ///
-/// Only single-pid targets (no process-group/broadcast forms). Only queues
-/// the signal — never force-wakes a Blocked target; see the doc comment
-/// inside for why.
-fn sys_kill(target_pid: usize, sig: u32) -> SyscallResult {
+/// `pid > 0`: single target, as before. `pid == 0`: every process in the
+/// caller's own process group. `pid < -1`: every process in group `-pid`.
+/// `pid == -1` (broadcast to every signalable process) is not supported —
+/// this kernel has no permission model to bound it, so it just returns
+/// `EINVAL` rather than doing something surprising.
+///
+/// Only queues the signal on Blocked/Ready/Zombie targets — never
+/// force-wakes them; see the doc comment inside for why. The one deliberate
+/// exception is `SIGCONT` against a currently-`Stopped` target (single or
+/// group): that's the *only* wakeup a stopped process ever gets (see
+/// `Process::state`'s `Stopped` doc comment), so it's force-woken via
+/// `wake_stopped` in addition to (not instead of) the normal
+/// `queue_signal` — if a handler is installed for SIGCONT, it still runs
+/// once the process resumes and passes through `deliver_pending`.
+fn sys_kill(target_pid: i64, sig: u32) -> SyscallResult {
     if sig == 0 || sig as usize >= super::signal::NUM_SIGNALS {
+        return errno::EINVAL;
+    }
+    if target_pid == -1 {
         return errno::EINVAL;
     }
 
@@ -1952,38 +2074,145 @@ fn sys_kill(target_pid: usize, sig: u32) -> SyscallResult {
     let result = {
         let mut sched = super::scheduler::local_scheduler();
 
-        let is_self = sched.current_pid().map(|p| p.0) == Some(target_pid);
-        if is_self {
-            if let Some(proc) = sched.running_mut() {
-                super::signal::queue_signal(proc, sig);
+        if target_pid == 0 || target_pid < -1 {
+            let pgid = if target_pid == 0 {
+                sched.running_ref().map(|p| p.pgid).unwrap_or(0)
+            } else {
+                (-target_pid) as u32
+            };
+            if sig == super::signal::SIGCONT {
+                let stopped: alloc::vec::Vec<usize> = sched.wait_queue.iter()
+                    .filter(|p| p.pgid == pgid && matches!(p.state, super::ProcessState::Stopped))
+                    .map(|p| p.pid.0)
+                    .collect();
+                for pid in stopped {
+                    sched.wake_stopped(pid);
+                }
             }
+            sched.queue_signal_to_group(pgid, sig);
             0
         } else {
-            // Just queue the signal — never force-wake a Blocked target.
-            // Whatever it's actually blocked on (pipe data, a futex, a
-            // timer) has its own wakeup path that sets a *correct* return
-            // value for that specific wait; a generic wake() here would
-            // resume it with whatever stale rax was live before it blocked
-            // (pipe/futex reads never preset one, unlike nanosleep), and —
-            // worse — removes it from wait_queue before its real wakeup
-            // gets a chance to find it there, silently losing whatever
-            // that wakeup was about to deliver. Confirmed by
-            // mlibc_signal_test.c: a kill()-woken pipe reader raced its
-            // sibling's write() and read back "" instead of the message,
-            // because deliver_and_wake's wait_queue scan found nothing —
-            // kill() had already moved it to Ready. The tradeoff (no
-            // instant SIGKILL for something blocked forever on a condition
-            // that will never occur) is accepted for this minimal
-            // implementation — delivery still happens the next time this
-            // process wakes for its own real reason and passes through a
-            // jump_to_user checkpoint.
-            match sched.find_process_mut(target_pid) {
-                Some(proc) => { super::signal::queue_signal(proc, sig); 0 }
-                None => errno::ESRCH,
+            let target_pid = target_pid as usize;
+            let is_self = sched.current_pid().map(|p| p.0) == Some(target_pid);
+            if is_self {
+                if let Some(proc) = sched.running_mut() {
+                    super::signal::queue_signal(proc, sig);
+                }
+                0
+            } else {
+                // Just queue the signal — never force-wake a Blocked target.
+                // Whatever it's actually blocked on (pipe data, a futex, a
+                // timer) has its own wakeup path that sets a *correct* return
+                // value for that specific wait; a generic wake() here would
+                // resume it with whatever stale rax was live before it blocked
+                // (pipe/futex reads never preset one, unlike nanosleep), and —
+                // worse — removes it from wait_queue before its real wakeup
+                // gets a chance to find it there, silently losing whatever
+                // that wakeup was about to deliver. Confirmed by
+                // mlibc_signal_test.c: a kill()-woken pipe reader raced its
+                // sibling's write() and read back "" instead of the message,
+                // because deliver_and_wake's wait_queue scan found nothing —
+                // kill() had already moved it to Ready. The tradeoff (no
+                // instant SIGKILL for something blocked forever on a condition
+                // that will never occur) is accepted for this minimal
+                // implementation — delivery still happens the next time this
+                // process wakes for its own real reason and passes through a
+                // jump_to_user checkpoint. SIGCONT against a Stopped target is
+                // the one exception (see this function's doc comment).
+                if sig == super::signal::SIGCONT {
+                    sched.wake_stopped(target_pid);
+                }
+                match sched.find_process_mut(target_pid) {
+                    Some(proc) => { super::signal::queue_signal(proc, sig); 0 }
+                    None => errno::ESRCH,
+                }
             }
         }
     };
 
+    unsafe { core::arch::asm!("sti"); }
+    result
+}
+
+// ── setpgid(109) / getpgid(121) / setsid(112) ───────────────────────────────
+
+/// setpgid(109): int setpgid(pid_t pid, pid_t pgid)
+///
+/// `pid == 0` means "the caller"; `pgid == 0` means "use `pid`'s own pid as
+/// its new group id" (become a group leader) — matches real POSIX. No
+/// session concept is tracked, so (unlike real POSIX) this never checks
+/// "is `pid` a session leader" — every process can always repoint its pgid.
+fn sys_setpgid(pid: i64, pgid: i64) -> SyscallResult {
+    if pid < 0 || pgid < 0 {
+        return errno::EINVAL;
+    }
+
+    unsafe { core::arch::asm!("cli"); }
+    let result = {
+        let mut sched = super::scheduler::local_scheduler();
+        let caller_pid = sched.current_pid().map(|p| p.0).unwrap_or(0);
+        let target_pid = if pid == 0 { caller_pid } else { pid as usize };
+        let new_pgid = if pgid == 0 { target_pid as u32 } else { pgid as u32 };
+
+        if target_pid == caller_pid {
+            match sched.running_mut() {
+                Some(proc) => { proc.pgid = new_pgid; 0 }
+                None => errno::ESRCH,
+            }
+        } else {
+            match sched.find_process_mut(target_pid) {
+                Some(proc) => { proc.pgid = new_pgid; 0 }
+                None => errno::ESRCH,
+            }
+        }
+    };
+    unsafe { core::arch::asm!("sti"); }
+    result
+}
+
+/// getpgid(121): pid_t getpgid(pid_t pid)
+fn sys_getpgid(pid: i64) -> SyscallResult {
+    if pid < 0 {
+        return errno::EINVAL;
+    }
+
+    unsafe { core::arch::asm!("cli"); }
+    let result = {
+        let mut sched = super::scheduler::local_scheduler();
+        let caller_pid = sched.current_pid().map(|p| p.0).unwrap_or(0);
+        let target_pid = if pid == 0 { caller_pid } else { pid as usize };
+
+        if target_pid == caller_pid {
+            sched.running_ref().map(|p| p.pgid as SyscallResult).unwrap_or(errno::ESRCH)
+        } else {
+            sched.find_process_mut(target_pid).map(|p| p.pgid as SyscallResult).unwrap_or(errno::ESRCH)
+        }
+    };
+    unsafe { core::arch::asm!("sti"); }
+    result
+}
+
+/// setsid(112): pid_t setsid(void)
+///
+/// No real session tracking exists — approximated as "become your own
+/// process group leader", rejected with `EPERM` if already one (the real
+/// POSIX rule: a process that's already a group leader can't `setsid()`).
+fn sys_setsid() -> SyscallResult {
+    unsafe { core::arch::asm!("cli"); }
+    let result = {
+        let mut sched = super::scheduler::local_scheduler();
+        match sched.running_mut() {
+            Some(proc) => {
+                if proc.pgid == proc.pid.0 as u32 {
+                    errno::EPERM
+                } else {
+                    proc.pgid = proc.pid.0 as u32;
+                    proc.pid.0 as SyscallResult
+                }
+            }
+            None => errno::ESRCH,
+        }
+    };
     unsafe { core::arch::asm!("sti"); }
     result
 }
@@ -1999,7 +2228,8 @@ const SIG_IGN: u64 = 1;
 /// rather than the full struct — this kernel's userspace test programs use
 /// a matching minimal ABI (see `userspace/src/syscall.rs::sigaction`).
 fn sys_sigaction(sig: u32, act_ptr: u64, oldact_ptr: u64) -> SyscallResult {
-    if sig == 0 || sig as usize >= super::signal::NUM_SIGNALS || sig == super::signal::SIGKILL {
+    if sig == 0 || sig as usize >= super::signal::NUM_SIGNALS
+        || sig == super::signal::SIGKILL || sig == super::signal::SIGSTOP {
         return errno::EINVAL;
     }
     if act_ptr != 0 {

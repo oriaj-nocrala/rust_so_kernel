@@ -37,6 +37,7 @@ const C_PROGRAMS: &[(&str, &str)] = &[
     ("mlibc_signal_test", "mlibc_signal_test.elf"),
     ("stat_test", "stat_test.elf"),
     ("argv_test", "argv_test.elf"),
+    ("jobctl_test", "jobctl_test.elf"),
 ];
 
 /// Not built here at all — see the busybox.elf handling below, which

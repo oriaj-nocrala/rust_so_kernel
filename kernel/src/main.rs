@@ -21,6 +21,7 @@ mod process;
 mod pit;
 mod serial;
 mod time;
+mod tty;
 
 use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
 

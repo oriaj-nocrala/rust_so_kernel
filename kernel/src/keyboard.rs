@@ -21,6 +21,9 @@ use crate::keyboard_buffer::KEYBOARD_BUFFER;
 /// True while any Shift key is held down.
 static SHIFT: AtomicBool = AtomicBool::new(false);
 
+/// True while any Ctrl key is held down (scancode 0x1D, left or right).
+static CTRL: AtomicBool = AtomicBool::new(false);
+
 /// CapsLock toggle.
 static CAPS: AtomicBool = AtomicBool::new(false);
 
@@ -46,6 +49,7 @@ pub fn process_scancode(scancode: u8) {
         let base = scancode & 0x7F;
         match (ext, base) {
             (false, 0x2A) | (false, 0x36) => SHIFT.store(false, Ordering::Relaxed),
+            (_, 0x1D) => CTRL.store(false, Ordering::Relaxed), // Ctrl (left or right)
             _ => {}
         }
         return;
@@ -54,10 +58,12 @@ pub fn process_scancode(scancode: u8) {
     // ── Key press ────────────────────────────────────────────────────────
     let shifted = SHIFT.load(Ordering::Relaxed);
     let caps    = CAPS.load(Ordering::Relaxed);
+    let ctrl    = CTRL.load(Ordering::Relaxed);
 
-    // Extended (0xE0-prefixed) codes — arrow keys and a few extras
+    // Extended (0xE0-prefixed) codes — arrow keys, right Ctrl, and a few extras
     if ext {
         match scancode {
+            0x1D => { CTRL.store(true, Ordering::Relaxed); return; } // Right Ctrl
             0x48 => { push('\x1b'); push('['); push('A'); } // Up
             0x50 => { push('\x1b'); push('['); push('B'); } // Down
             0x4D => { push('\x1b'); push('['); push('C'); } // Right
@@ -75,11 +81,12 @@ pub fn process_scancode(scancode: u8) {
     // Modifier key presses
     match scancode {
         0x2A | 0x36 => { SHIFT.store(true,  Ordering::Relaxed); return; } // Shift
+        0x1D        => { CTRL.store(true,  Ordering::Relaxed); return; } // Left Ctrl
         0x3A        => { let c = CAPS.load(Ordering::Relaxed); CAPS.store(!c, Ordering::Relaxed); return; } // CapsLock
         _ => {}
     }
 
-    if let Some(c) = scancode_to_char(scancode, shifted, caps) {
+    if let Some(c) = scancode_to_char(scancode, shifted, caps, ctrl) {
         push(c);
     }
 }
@@ -99,19 +106,49 @@ pub fn read_key_peek() -> bool {
 // HELPERS
 // ============================================================================
 
+/// Routes every character through the tty's ISIG line discipline
+/// (`tty::feed_input`) before queueing it — a byte that matches the
+/// current VINTR/VQUIT/VSUSP setting is turned into a real signal to the
+/// foreground process group instead of becoming input (Ctrl-C/Ctrl-\/
+/// Ctrl-Z). See `tty.rs`'s module doc comment.
 fn push(c: char) {
-    KEYBOARD_BUFFER.push(c);
+    if crate::tty::feed_input(c) {
+        KEYBOARD_BUFFER.push(c);
+    }
 }
 
 /// Convert a Set-1 scancode to a character given the current modifier state.
 ///
 /// `shifted`: any Shift key is currently held.
 /// `caps`:    CapsLock is active (affects letters only).
-fn scancode_to_char(sc: u8, shifted: bool, caps: bool) -> Option<char> {
+/// `ctrl`:    any Ctrl key is currently held — turns a letter (or `\`/`[`/
+///            `]`) into the corresponding C0 control character (e.g.
+///            Ctrl-C → 0x03), the same mapping a real PS/2 tty driver uses.
+fn scancode_to_char(sc: u8, shifted: bool, caps: bool, ctrl: bool) -> Option<char> {
     // For letters, CapsLock XORs with Shift to determine case.
     // For symbols, only Shift matters (CapsLock has no effect).
     let upper = shifted ^ caps; // true → uppercase / shifted symbol
 
+    let base = scancode_to_base_char(sc, shifted, upper);
+
+    if ctrl {
+        if let Some(c) = base {
+            if c.is_ascii_alphabetic() {
+                let up = c.to_ascii_uppercase() as u8;
+                return Some((up - b'A' + 1) as char);
+            }
+            match c {
+                '\\' => return Some('\x1c'), // Ctrl-\  (SIGQUIT by default)
+                '['  => return Some('\x1b'), // Ctrl-[ == Esc
+                ']'  => return Some('\x1d'),
+                _ => {}
+            }
+        }
+    }
+    base
+}
+
+fn scancode_to_base_char(sc: u8, shifted: bool, upper: bool) -> Option<char> {
     match sc {
         // ── Number row ───────────────────────────────────────────────────
         0x02 => Some(if shifted { '!' } else { '1' }),
