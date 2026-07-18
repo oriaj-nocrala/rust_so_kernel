@@ -65,6 +65,8 @@ const SYS_READ: u64 = 0;
 const SYS_WRITE: u64 = 1;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
+const SYS_DUP: u64 = 32;
+const SYS_DUP2: u64 = 33;
 const SYS_STAT: u64 = 4;
 const SYS_FSTAT: u64 = 5;
 #[allow(dead_code)]
@@ -149,6 +151,19 @@ pub const O_APPEND: i32 = 0o2000;
 
 pub fn close(fd: i32) -> i64 {
     unsafe { syscall1(SYS_CLOSE, fd as u64) }
+}
+
+/// Duplicates `fd` onto the first free descriptor. Returns the new fd, or
+/// a negative errno.
+pub fn dup(fd: i32) -> i64 {
+    unsafe { syscall1(SYS_DUP, fd as u64) }
+}
+
+/// Duplicates `oldfd` onto exactly `newfd` (closing whatever `newfd` was
+/// already open on first) — the primitive shell redirection is built on:
+/// `cmd > file` is "open file, dup2(fd, 1), close(fd), exec cmd".
+pub fn dup2(oldfd: i32, newfd: i32) -> i64 {
+    unsafe { syscall2(SYS_DUP2, oldfd as u64, newfd as u64) }
 }
 
 /// Returns `(read_fd, write_fd)` on success, or the negative errno.

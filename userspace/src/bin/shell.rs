@@ -74,49 +74,144 @@ fn print_help() {
     println!("  demo        - guided tour: VFS/ext2, threads, IPC, pipes, signals");
 }
 
-/// Runs `cmd` (the whole typed line, e.g. `"ls /tmp -l"`) as argv[0..]:
-/// the first whitespace-separated word is both the program name to exec
-/// and argv[0], the rest becomes argv[1..]. No `alloc` in this userspace
-/// crate, so argv is built out of one flat stack buffer instead of a Vec —
-/// each word gets NUL-terminated in place and `argv[i]` becomes a slice
-/// pointing back into it.
+/// A pending fd redirection, parsed out of the command line before exec.
+/// Either "dup `dup_src` onto `target_fd`" (`2>&1`) or "open the file at
+/// `scratch[path_off..path_off+path_len]` (NUL included) with `flags` and
+/// dup2 the result onto `target_fd`" (`>`, `>>`, `<`, `2>`, `2>>`).
+#[derive(Clone, Copy)]
+struct Redirect {
+    target_fd: i32,
+    dup_src:   i32, // >= 0 for the "dup an fd" form, -1 for "open a file"
+    path_off:  usize,
+    path_len:  usize,
+    flags:     i32,
+}
+
+/// Runs `cmd` (the whole typed line, e.g. `"ls /tmp > /tmp/out.txt"`).
+///
+/// The first non-redirect word is both the program name to exec and
+/// argv[0], the rest becomes argv[1..]. Recognizes `>`, `>>`, `<`, `2>`,
+/// `2>>`, `2>&1`, `1>&2` as whitespace-separated tokens (no `cmd>file`
+/// without spaces — this parser is line-oriented, not a real tokenizer).
+/// No `alloc` in this userspace crate, so both argv and the redirect
+/// target paths are built out of one flat stack buffer instead of a Vec —
+/// each word gets NUL-terminated in place and sliced back out of it.
+///
+/// Redirection only ever applies to the forked child, exactly like a real
+/// shell: `dup2` happens after `fork()` and before `exec()`, so the
+/// shell's own stdin/stdout/stderr are never touched and need no
+/// restoring afterward.
 fn run_program(cmd: &str) {
+    const MAX_ARGS: usize = 16;
+    const MAX_REDIRECTS: usize = 4;
+    const SCRATCH_SIZE: usize = 512;
+
+    let mut scratch = [0u8; SCRATCH_SIZE];
+    let mut cursor = 0usize;
+
+    let mut arg_offsets = [(0usize, 0usize); MAX_ARGS]; // (start, len incl. NUL)
+    let mut argc = 0usize;
+    let mut prog_name: &str = "";
+
+    let mut redirects = [Redirect { target_fd: -1, dup_src: -1, path_off: 0, path_len: 0, flags: 0 }; MAX_REDIRECTS];
+    let mut nredirs = 0usize;
+
     let mut words = cmd.split_whitespace();
-    let name = match words.next() {
-        Some(w) => w,
-        None => return,
-    };
+    while let Some(word) = words.next() {
+        // (target fd, append?, read-instead-of-write?, dup-not-file?)
+        let op = match word {
+            ">"    => Some((1, false, false, false)),
+            ">>"   => Some((1, true,  false, false)),
+            "<"    => Some((0, false, true,  false)),
+            "2>"   => Some((2, false, false, false)),
+            "2>>"  => Some((2, true,  false, false)),
+            "2>&1" => Some((2, false, false, true)),
+            "1>&2" => Some((1, false, false, true)),
+            _ => None,
+        };
+
+        let Some((target_fd, append, is_input, is_dup)) = op else {
+            // Plain argv word.
+            if argc < MAX_ARGS {
+                let bytes = word.as_bytes();
+                let n = bytes.len().min(SCRATCH_SIZE.saturating_sub(cursor + 1));
+                scratch[cursor..cursor + n].copy_from_slice(&bytes[..n]);
+                scratch[cursor + n] = 0; // NUL terminator
+                if argc == 0 { prog_name = word; }
+                arg_offsets[argc] = (cursor, n + 1);
+                cursor += n + 1;
+                argc += 1;
+            }
+            continue;
+        };
+
+        if nredirs >= MAX_REDIRECTS { continue; }
+
+        if is_dup {
+            let dup_src = if target_fd == 2 { 1 } else { 2 };
+            redirects[nredirs] = Redirect { target_fd, dup_src, path_off: 0, path_len: 0, flags: 0 };
+            nredirs += 1;
+            continue;
+        }
+
+        let path = match words.next() {
+            Some(p) => p,
+            None => { eprintln!("shell: {}: missing filename", word); return; }
+        };
+        let bytes = path.as_bytes();
+        let n = bytes.len().min(SCRATCH_SIZE.saturating_sub(cursor + 1));
+        let path_off = cursor;
+        scratch[cursor..cursor + n].copy_from_slice(&bytes[..n]);
+        scratch[cursor + n] = 0;
+        cursor += n + 1;
+
+        let flags = if is_input {
+            syscall::O_RDONLY
+        } else if append {
+            syscall::O_CREAT | syscall::O_APPEND | syscall::O_WRONLY
+        } else {
+            syscall::O_CREAT | syscall::O_TRUNC | syscall::O_WRONLY
+        };
+        redirects[nredirs] = Redirect { target_fd, dup_src: -1, path_off, path_len: n + 1, flags };
+        nredirs += 1;
+    }
+
+    if argc == 0 {
+        return;
+    }
+
+    let mut argv: [&[u8]; MAX_ARGS] = [&[]; MAX_ARGS];
+    for i in 0..argc {
+        let (start, len) = arg_offsets[i];
+        argv[i] = &scratch[start..start + len];
+    }
 
     let pid = syscall::fork();
     if pid == 0 {
-        const MAX_ARGS: usize = 16;
-        const SCRATCH_SIZE: usize = 512;
-        let mut scratch = [0u8; SCRATCH_SIZE];
-        let mut offsets = [(0usize, 0usize); MAX_ARGS]; // (start, len incl. NUL)
-        let mut argc = 0usize;
-        let mut cursor = 0usize;
-
-        for word in core::iter::once(name).chain(words) {
-            if argc >= MAX_ARGS || cursor >= SCRATCH_SIZE { break; }
-            let bytes = word.as_bytes();
-            let n = bytes.len().min(SCRATCH_SIZE - cursor - 1);
-            scratch[cursor..cursor + n].copy_from_slice(&bytes[..n]);
-            scratch[cursor + n] = 0; // NUL terminator
-            offsets[argc] = (cursor, n + 1);
-            cursor += n + 1;
-            argc += 1;
-        }
-
-        let mut argv: [&[u8]; MAX_ARGS] = [&[]; MAX_ARGS];
-        for i in 0..argc {
-            let (start, len) = offsets[i];
-            argv[i] = &scratch[start..start + len];
+        for i in 0..nredirs {
+            let r = redirects[i];
+            let src_fd = if r.dup_src >= 0 {
+                r.dup_src
+            } else {
+                let path_cstr = &scratch[r.path_off..r.path_off + r.path_len];
+                let fd = syscall::open(path_cstr, r.flags) as i32;
+                if fd < 0 {
+                    let path = core::str::from_utf8(&path_cstr[..r.path_len - 1]).unwrap_or("?");
+                    eprintln!("shell: cannot open {}", path);
+                    syscall::exit(1);
+                }
+                fd
+            };
+            syscall::dup2(src_fd, r.target_fd);
+            if r.dup_src < 0 && src_fd != r.target_fd {
+                syscall::close(src_fd);
+            }
         }
 
         // Child: try to exec the requested program.
         syscall::exec_argv(argv[0], &argv[..argc], &[]);
         // Only reached if exec failed.
-        eprintln!("shell: unknown command: {}", name);
+        eprintln!("shell: unknown command: {}", prog_name);
         syscall::exit(1);
     } else if pid > 0 {
         // Parent: wait for the child to finish.
