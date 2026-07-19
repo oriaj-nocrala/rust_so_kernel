@@ -23,7 +23,6 @@ const RUST_PROGRAMS: &[(&str, &str)] = &[
     ("ipc_ping",   "ipc_ping.elf"),
     ("mmap_test",  "mmap_test.elf"),
     ("poll_test",  "poll_test.elf"),
-    ("ls",         "ls.elf"),
     ("pipe_test",  "pipe_test.elf"),
     ("signal_test", "signal_test.elf"),
     ("demo",       "demo.elf"),
@@ -45,6 +44,37 @@ const C_PROGRAMS: &[(&str, &str)] = &[
 /// nothing like the Rust/C recipes above) only when the output is missing.
 const BUSYBOX_ELF: &str = "busybox.elf";
 
+/// Emit `cargo:rerun-if-changed` for every file under `dir`, recursively.
+///
+/// Pointing `rerun-if-changed` straight at a *directory* only ever catches
+/// entries being added/removed — editing an existing file in place doesn't
+/// change the containing directory's own mtime on Linux, so cargo's
+/// freshness check sees nothing to react to and silently skips rerunning
+/// this build script (confirmed directly: editing `userspace/src/bin/
+/// shell.rs` left `kernel/embedded/shell.elf` stale through a full
+/// `cargo build` — the fix had to be `touch`ing this very file to force a
+/// rerun). Watching every individual file instead makes in-place edits
+/// visible the same way top-level `Cargo.toml`/`linker.ld` entries already
+/// are. `target/`/`.git` are skipped: they're the *output* of the cargo
+/// invocation below, not an input — watching them would make this build
+/// script look dirty on every single run (its own output always changes)
+/// without ever actually catching a missed rebuild.
+fn watch_dir_recursive(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        if name == "target" || name == ".git" {
+            continue;
+        }
+        if path.is_dir() {
+            watch_dir_recursive(&path);
+        } else {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+}
+
 fn main() {
     let kernel_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let workspace_root = kernel_dir.parent().unwrap();
@@ -57,11 +87,8 @@ fn main() {
     for entry in &[
         userspace_dir.join("Cargo.toml"),
         userspace_dir.join("linker.ld"),
-        userspace_dir.join("src"),
-        c_dir.clone(),
         sysroot_dir.join("usr/lib/libc.a"),
         sysroot_dir.join("usr/lib/crt1.o"),
-        workspace_root.join("mlibc-port"),
         workspace_root.join("mlibc-cross.ini"),
         workspace_root.join("scripts/setup-mlibc.sh"),
         workspace_root.join("scripts/build-busybox.sh"),
@@ -69,6 +96,13 @@ fn main() {
     ] {
         println!("cargo:rerun-if-changed={}", entry.display());
     }
+    // userspace/src, userspace/c, and mlibc-port hold many files that get
+    // edited in place — recurse into them individually (see
+    // watch_dir_recursive's doc comment) instead of one coarse
+    // directory-level entry each.
+    watch_dir_recursive(&userspace_dir.join("src"));
+    watch_dir_recursive(&c_dir);
+    watch_dir_recursive(&workspace_root.join("mlibc-port"));
 
     // ── Build the mlibc sysroot if missing ──────────────────────────────────
     //
