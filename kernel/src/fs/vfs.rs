@@ -167,6 +167,37 @@ pub fn mount(prefix: &'static str, fs: Arc<dyn Filesystem>) {
     table.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
 }
 
+/// Names of filesystems mounted exactly one path component below `parent`
+/// (e.g. `direct_children("/")` → `["dev", "tmp", "proc", ...]`).
+///
+/// On real Linux, `/proc`, `/dev`, etc. show up in `ls /` because they're
+/// real, pre-existing empty directories in the root filesystem that a mount
+/// later overlays — traversal redirects into the mount, but the parent
+/// directory's own listing is what makes the mountpoint visible at all.
+/// This is the equivalent for our synthetic root: `fs::initramfs`'s root
+/// directory calls this to list every other mount as a real (if empty from
+/// its perspective — actual traversal never reaches them, since a longer,
+/// more specific mount prefix always wins in `resolve_inner`) subdirectory
+/// entry, instead of only ever showing its own "bin".
+pub fn direct_children(parent: &str) -> Vec<&'static str> {
+    let table = mounts().lock();
+    table.iter().filter_map(|e| {
+        if e.prefix == parent {
+            return None; // don't list the mount itself as its own child
+        }
+        let rel = if parent == "/" {
+            e.prefix.strip_prefix('/')?
+        } else {
+            e.prefix.strip_prefix(parent)?.strip_prefix('/')?
+        };
+        if rel.is_empty() || rel.contains('/') {
+            None // not a direct child: either self ("") or nested deeper
+        } else {
+            Some(rel)
+        }
+    }).collect()
+}
+
 // ── Path resolution ──────────────────────────────────────────────────────────
 
 /// Symlink chains longer than this are rejected with `ELOOP`, same spirit

@@ -1948,13 +1948,17 @@ fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> SyscallResult 
 /// its canonical, fully symlink-resolved absolute path — real VFS
 /// traversal, not a special-cased string match.
 ///
-/// This kernel has no real `/bin`, `/usr/bin`, etc. as *separate mounts*,
-/// but `/bin` and `/` are both mounted to the same flat `InitramfsFs` (see
-/// `fs::mod`'s doc comment) — so a real shell's own `$PATH` search (e.g.
-/// BusyBox `ash` with `FEATURE_SH_STANDALONE`, trying `/bin/hello` before
-/// giving up) resolves correctly through the ordinary VFS mount table,
-/// same as a bareword `hello` (cwd-normalized to `/hello`) or an explicit
-/// `./ls`. `/proc/self/exe` — which `ash` re-execs for any applet that
+/// This kernel has no real `/bin`, `/usr/bin`, etc. as *separate mounts* —
+/// `/bin` is a real subdirectory of the single `/` `InitramfsFs` mount (see
+/// `fs::mod`'s doc comment and `fs::initramfs`) — so a real shell's own
+/// `$PATH` search (e.g. BusyBox `ash` with `FEATURE_SH_STANDALONE`, trying
+/// `/bin/hello` before giving up) resolves correctly through the ordinary
+/// VFS mount table, same as an explicit `./ls`. A *bareword* like `hello`
+/// only resolves if the caller already searched `$PATH` itself — the
+/// kernel does not do `$PATH` search here; `ash` is the only shell now
+/// (see `userspace/src/bin/shell.rs`, a minimal `fork`+exec+respawn init
+/// loop, not an interactive shell) and it already does this correctly.
+/// `/proc/self/exe` — which `ash` re-execs for any applet that
 /// isn't `NOFORK`/`NOEXEC` (most of them; `echo`/`ls` are exceptions) —
 /// is just another symlink under this same mechanism now (see
 /// `fs::procfs::ProcExeInode`, backed by `Process::exe_name`): no

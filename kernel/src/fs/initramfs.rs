@@ -4,13 +4,25 @@
 //
 // LAYOUT
 // ──────
-//   /   (InitramfsDirInode)
-//   ├── shell
-//   ├── uname
-//   └── …   (one entry per PROGRAMS registry entry)
+//   /
+//   ├── bin/                (real subdirectory, owned by this filesystem)
+//   │   ├── shell
+//   │   ├── uname
+//   │   └── …                (one entry per PROGRAMS registry entry)
+//   ├── dev/                 (empty placeholder — real content lives behind
+//   ├── tmp/                  the /dev, /tmp, /mnt, /proc mounts; traversal
+//   ├── mnt/                  into them is redirected there by the VFS
+//   └── proc/                 mount table before ever reaching this inode)
+//
+// The placeholders under root aren't hardcoded: `RootDirInode` asks
+// `vfs::direct_children("/")` for every *other* mount and lists it, mirroring
+// how a real Linux rootfs has actual empty directories that mounts overlay
+// (see that function's doc comment). This is what makes `ls /` show `bin`,
+// `dev`, `tmp`, `proc`, etc. instead of just `bin`.
 //
 // All files are read-only.  Writes return EROFS.
-// Inode numbers: 1 = root directory, 2+ = files (index + 2).
+// Inode numbers: 1 = root dir, 2 = /bin dir, 3+ = files (registry index + 3),
+// 100+ = mount placeholder dirs (index into `direct_children`, cosmetic only).
 
 use alloc::{boxed::Box, sync::Arc};
 use spin::Mutex;
@@ -24,6 +36,10 @@ use crate::process::{
     user_programs::{ProgramSource, list_programs},
 };
 
+const ROOT_INO: u64 = 1;
+const BIN_INO: u64 = 2;
+const MOUNT_PLACEHOLDER_INO_BASE: u64 = 100;
+
 // ── Filesystem ───────────────────────────────────────────────────────────────
 
 pub struct InitramfsFs;
@@ -32,48 +48,105 @@ impl Filesystem for InitramfsFs {
     fn name(&self) -> &str { "initramfs" }
 
     fn root(&self) -> Arc<dyn Inode> {
-        Arc::new(InitramfsDirInode)
+        Arc::new(RootDirInode)
     }
 }
 
-/// Return raw ELF bytes for `name`, or `None` if not found.
-///
-/// Used by `sys_exec` to feed the ELF loader without opening an FD.
-pub fn bytes(name: &str) -> Option<&'static [u8]> {
-    for (prog_name, source) in list_programs() {
-        if *prog_name == name {
-            if let ProgramSource::Elf(b) = source {
-                return Some(b);
-            }
-        }
-    }
-    None
-}
+// ── Root directory: contains only "bin" ─────────────────────────────────────
 
-/// Open a file by name as a `FileHandle` (for `sys_open("/bin/<name>")`).
-pub fn open(name: &str) -> Option<Box<dyn FileHandle>> {
-    let data = bytes(name)?;
-    Some(Box::new(RamFile::new(data)))
-}
+struct RootDirInode;
 
-// ── Directory inode ──────────────────────────────────────────────────────────
-
-struct InitramfsDirInode;
-
-impl Inode for InitramfsDirInode {
+impl Inode for RootDirInode {
     fn stat(&self) -> Stat {
-        Stat::dir(1)
+        Stat::dir(ROOT_INO)
     }
 
     fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
-        Ok(Box::new(InitramfsDirHandle { offset: 0 }))
+        Ok(Box::new(DirHandle { kind: DirKind::Root, offset: 0 }))
+    }
+
+    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, Errno> {
+        if name == "bin" {
+            return Ok(Arc::new(BinDirInode));
+        }
+        let children = crate::fs::vfs::direct_children("/");
+        match children.iter().position(|&n| n == name) {
+            Some(idx) => Ok(Arc::new(MountPointDirInode {
+                ino: MOUNT_PLACEHOLDER_INO_BASE + idx as u64,
+            })),
+            None => Err(Errno::ENOENT),
+        }
+    }
+
+    fn readdir(&self, offset: u64) -> Result<Option<DirEntry>, Errno> {
+        match offset {
+            0 => Ok(Some(DirEntry::new(ROOT_INO, FileType::Directory, b"."))),
+            1 => Ok(Some(DirEntry::new(ROOT_INO, FileType::Directory, b".."))),
+            2 => Ok(Some(DirEntry::new(BIN_INO, FileType::Directory, b"bin"))),
+            n => {
+                let idx = (n - 3) as usize;
+                let children = crate::fs::vfs::direct_children("/");
+                if idx >= children.len() {
+                    return Ok(None);
+                }
+                let ino = MOUNT_PLACEHOLDER_INO_BASE + idx as u64;
+                Ok(Some(DirEntry::new(ino, FileType::Directory, children[idx].as_bytes())))
+            }
+        }
+    }
+}
+
+// ── Mount placeholder directory: empty, cosmetic only ───────────────────────
+//
+// Represents a *different* mount (`/dev`, `/tmp`, `/mnt`, `/proc`, ...) as
+// seen from root's own listing. Real traversal into e.g. "/dev/console"
+// never reaches this inode — `vfs::resolve_inner` picks the longer, more
+// specific "/dev" mount prefix first — so this only ever needs to look like
+// an empty directory, never actually serve one.
+struct MountPointDirInode {
+    ino: u64,
+}
+
+impl Inode for MountPointDirInode {
+    fn stat(&self) -> Stat {
+        Stat::dir(self.ino)
+    }
+
+    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+        Ok(Box::new(DirHandle { kind: DirKind::MountPoint(self.ino), offset: 0 }))
+    }
+
+    fn lookup(&self, _name: &str) -> Result<Arc<dyn Inode>, Errno> {
+        Err(Errno::ENOENT)
+    }
+
+    fn readdir(&self, offset: u64) -> Result<Option<DirEntry>, Errno> {
+        match offset {
+            0 => Ok(Some(DirEntry::new(self.ino, FileType::Directory, b"."))),
+            1 => Ok(Some(DirEntry::new(ROOT_INO, FileType::Directory, b".."))),
+            _ => Ok(None),
+        }
+    }
+}
+
+// ── /bin directory: one entry per embedded ELF ──────────────────────────────
+
+struct BinDirInode;
+
+impl Inode for BinDirInode {
+    fn stat(&self) -> Stat {
+        Stat::dir(BIN_INO)
+    }
+
+    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+        Ok(Box::new(DirHandle { kind: DirKind::Bin, offset: 0 }))
     }
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, Errno> {
         for (i, (prog_name, source)) in list_programs().iter().enumerate() {
             if *prog_name == name {
                 if let ProgramSource::Elf(data) = source {
-                    let ino = (i as u64) + 2;
+                    let ino = (i as u64) + 3;
                     return Ok(Arc::new(InitramfsFileInode { ino, data }));
                 }
             }
@@ -83,8 +156,8 @@ impl Inode for InitramfsDirInode {
 
     fn readdir(&self, offset: u64) -> Result<Option<DirEntry>, Errno> {
         match offset {
-            0 => Ok(Some(DirEntry::new(1, FileType::Directory, b"."))),
-            1 => Ok(Some(DirEntry::new(1, FileType::Directory, b".."))),
+            0 => Ok(Some(DirEntry::new(BIN_INO, FileType::Directory, b"."))),
+            1 => Ok(Some(DirEntry::new(ROOT_INO, FileType::Directory, b".."))),
             n => {
                 let idx = (n - 2) as usize;
                 let programs = list_programs();
@@ -92,7 +165,7 @@ impl Inode for InitramfsDirInode {
                     return Ok(None);
                 }
                 let (name, _) = &programs[idx];
-                let ino = idx as u64 + 2;
+                let ino = idx as u64 + 3;
                 Ok(Some(DirEntry::new(ino, FileType::Regular, name.as_bytes())))
             }
         }
@@ -108,7 +181,7 @@ struct InitramfsFileInode {
 
 impl Inode for InitramfsFileInode {
     fn stat(&self) -> Stat {
-        Stat::regular(self.ino, self.data.len() as i64)
+        Stat::executable(self.ino, self.data.len() as i64)
     }
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
@@ -154,7 +227,7 @@ impl FileHandle for RamFile {
     }
 
     fn stat(&self) -> Option<crate::fs::types::Stat> {
-        Some(Stat::regular(0, self.data.len() as i64))
+        Some(Stat::executable(0, self.data.len() as i64))
     }
 
     fn dup(&self) -> Option<Box<dyn FileHandle>> {
@@ -164,12 +237,21 @@ impl FileHandle for RamFile {
     fn name(&self) -> &str { "initramfs" }
 }
 
-/// Directory handle: keeps a readdir cursor and serves `getdents64`.
-struct InitramfsDirHandle {
+/// Directory handle: keeps a readdir cursor and serves `getdents64`, shared
+/// by `RootDirInode`, `BinDirInode` and every `MountPointDirInode` (only
+/// their `readdir` differs).
+enum DirKind {
+    Root,
+    Bin,
+    MountPoint(u64),
+}
+
+struct DirHandle {
+    kind:   DirKind,
     offset: u64,
 }
 
-impl FileHandle for InitramfsDirHandle {
+impl FileHandle for DirHandle {
     fn read(&mut self, _buf: &mut [u8]) -> FileResult<usize> {
         Err(FileError::InvalidArgument) // directories use getdents64
     }
@@ -179,14 +261,18 @@ impl FileHandle for InitramfsDirHandle {
     }
 
     fn getdents64(&mut self, buf: &mut [u8]) -> i64 {
-        let dir = InitramfsDirInode;
         let mut written: usize = 0;
 
         loop {
-            let entry = match dir.readdir(self.offset) {
-                Ok(Some(e))  => e,
-                Ok(None)     => break,
-                Err(e)       => return e.as_i64(),
+            let entry = match &self.kind {
+                DirKind::Root => RootDirInode.readdir(self.offset),
+                DirKind::Bin => BinDirInode.readdir(self.offset),
+                DirKind::MountPoint(ino) => MountPointDirInode { ino: *ino }.readdir(self.offset),
+            };
+            let entry = match entry {
+                Ok(Some(e)) => e,
+                Ok(None)    => break,
+                Err(e)      => return e.as_i64(),
             };
             let needed = entry.dirent64_size();
             if written + needed > buf.len() {
@@ -202,8 +288,18 @@ impl FileHandle for InitramfsDirHandle {
     }
 
     fn stat(&self) -> Option<crate::fs::types::Stat> {
-        Some(Stat::dir(1))
+        match self.kind {
+            DirKind::Root => Some(Stat::dir(ROOT_INO)),
+            DirKind::Bin => Some(Stat::dir(BIN_INO)),
+            DirKind::MountPoint(ino) => Some(Stat::dir(ino)),
+        }
     }
 
-    fn name(&self) -> &str { "initramfs/dir" }
+    fn name(&self) -> &str {
+        match self.kind {
+            DirKind::Root => "initramfs/root",
+            DirKind::Bin => "initramfs/bin",
+            DirKind::MountPoint(_) => "initramfs/mountpoint",
+        }
+    }
 }

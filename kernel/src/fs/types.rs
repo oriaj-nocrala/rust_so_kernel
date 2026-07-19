@@ -167,6 +167,18 @@ impl Stat {
         }
     }
 
+    /// Construct a regular-file stat with the execute bits set (`0o555` —
+    /// still read-only, no write, same as `regular()`). Used for
+    /// initramfs's embedded ELF binaries: they genuinely are executable
+    /// programs, and reporting them as such (rather than the plain `0o444`
+    /// `regular()` uses) is what lets a real `ls --color`/`ls -l` correctly
+    /// identify and color them, exactly like Linux does.
+    pub fn executable(ino: u64, size: i64) -> Self {
+        let mut s = Self::regular(ino, size);
+        s.st_mode = FileType::Regular.as_mode_bits() | 0o555;
+        s
+    }
+
     /// Construct a symlink stat. `target_len` is the byte length of the
     /// link target string — real `stat()` reports a symlink's `st_size`
     /// as the length of the path it points to, not the size of any real

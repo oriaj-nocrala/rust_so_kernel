@@ -5,7 +5,7 @@
 // MODULES
 //   types      — Stat, Errno, DirEntry, FileType, OpenFlags
 //   vfs        — Inode + Filesystem traits, MountTable, path resolution
-//   initramfs  — /bin/*  backed by embedded ELF bytes
+//   initramfs  — /  and /bin/*, a real two-level tree backed by embedded ELF bytes
 //   devfs      — /dev/*  backed by the driver registry
 //   ramfs      — /tmp/*  writable, in-memory scratch space
 //   ext2       — /mnt/*  read-only, backed by the ATA disk (persists across reboots)
@@ -13,11 +13,12 @@
 //
 // MOUNT LAYOUT (after init())
 //   /dev   → DevFs
-//   /bin   → InitramfsFs  (mounted at /bin so sys_exec uses "/bin/<name>")
 //   /tmp   → RamFs        (writable scratch — e.g. shell `write`/`sh` scripts)
 //   /mnt   → Ext2Fs        (read-only; only mounted if the ATA disk is present)
 //   /proc  → ProcFs        (read-only, synthetic — /proc/meminfo)
-//   /      → InitramfsFs  (fallback root, also serves plain-name exec)
+//   /      → InitramfsFs  (root dir contains just "bin"; "/bin/<name>" resolves
+//                          through it as a real subdirectory lookup, not a
+//                          second mount aliasing the same flat namespace)
 
 pub mod devfs;
 pub mod ext2;
@@ -38,8 +39,6 @@ use alloc::sync::Arc;
 pub fn init() {
     // /dev — character devices from the driver registry
     vfs::mount("/dev", Arc::new(devfs::DevFs));
-    // /bin — user-space ELF binaries from initramfs
-    vfs::mount("/bin", Arc::new(initramfs::InitramfsFs));
     // /tmp — writable scratch space (ramfs)
     vfs::mount("/tmp", Arc::new(ramfs::RamFs::new()));
     // /mnt — real disk, read-only ext2 (best-effort: no disk / bad image just
@@ -53,7 +52,8 @@ pub fn init() {
     }
     // /proc — synthetic, read-only (meminfo today)
     vfs::mount("/proc", Arc::new(procfs::ProcFs));
-    // /   — root (fallback; also exposes binaries without /bin prefix)
+    // /   — root; contains the real "bin" subdirectory (user-space ELF
+    // binaries live at /bin/<name>, not flattened into root itself)
     vfs::mount("/", Arc::new(initramfs::InitramfsFs));
 }
 
