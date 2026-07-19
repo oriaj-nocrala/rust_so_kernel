@@ -977,6 +977,46 @@ pub fn exe_name_for_pid(pid: usize) -> Option<alloc::string::String> {
     name
 }
 
+/// Every live pid (running + every run queue + the wait queue, via
+/// `iter_all`) — backs `/proc`'s `readdir()` (`fs::procfs`), which is what
+/// lets `ls /proc` / BusyBox `ps`'s `opendir("/proc")` scan see every
+/// process instead of only the ones looked up by exact name/pid.
+pub fn all_pids() -> alloc::vec::Vec<usize> {
+    unsafe { core::arch::asm!("cli"); }
+    let pids = local_scheduler().iter_all().map(|p| p.pid.0).collect();
+    unsafe { core::arch::asm!("sti"); }
+    pids
+}
+
+/// Snapshot of the `Process` fields `/proc/<pid>/stat` needs to report
+/// (`fs::procfs`) — the classic Linux `stat` format BusyBox `ps`/`top`
+/// parse (`comm`, one-char state, ppid, pgid). Copied out under the same
+/// `cli`/lock scope as `exe_name_for_pid` rather than returning a
+/// reference, for the same reason: the process could be reaped the moment
+/// the lock is released.
+pub struct ProcStatSnapshot {
+    pub ppid: usize,
+    pub pgid: u32,
+    pub name: [u8; 16],
+    pub state: crate::process::ProcessState,
+    pub priority: u8,
+}
+
+pub fn proc_stat_snapshot(pid: usize) -> Option<ProcStatSnapshot> {
+    unsafe { core::arch::asm!("cli"); }
+    let snap = local_scheduler().iter_all()
+        .find(|p| p.pid.0 == pid)
+        .map(|p| ProcStatSnapshot {
+            ppid: p.parent_pid.map(|pp| pp.0).unwrap_or(0),
+            pgid: p.pgid,
+            name: p.name,
+            state: p.state,
+            priority: p.effective_priority,
+        });
+    unsafe { core::arch::asm!("sti"); }
+    snap
+}
+
 pub fn find_current_vma(addr: u64) -> Option<(usize, Vma)> {
     let scheduler = local_scheduler();
     let proc = scheduler.running_ref()?;

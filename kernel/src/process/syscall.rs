@@ -201,6 +201,10 @@ pub enum SyscallNumber {
     Rmdir = 84,
     Unlink = 87,
     Readlink = 89,
+    Symlink = 88,
+    Access = 21,
+    Chmod = 90,
+    Fchmod = 91,
     Dup = 32,
     Dup2 = 33,
     Fcntl = 72,
@@ -239,6 +243,8 @@ pub enum SyscallNumber {
     UptimeMs = 400,
     UptimeSec = 401,
     MemInfoKb = 402,
+    KdebugCtl = 403,
+    Statvfs = 404,
 }
 
 impl SyscallNumber {
@@ -264,6 +270,10 @@ impl SyscallNumber {
             84 => Some(Self::Rmdir),
             87 => Some(Self::Unlink),
             89 => Some(Self::Readlink),
+            88 => Some(Self::Symlink),
+            21 => Some(Self::Access),
+            90 => Some(Self::Chmod),
+            91 => Some(Self::Fchmod),
             32 => Some(Self::Dup),
             33 => Some(Self::Dup2),
             72 => Some(Self::Fcntl),
@@ -301,6 +311,8 @@ impl SyscallNumber {
             400 => Some(Self::UptimeMs),
             401 => Some(Self::UptimeSec),
             402 => Some(Self::MemInfoKb),
+            403 => Some(Self::KdebugCtl),
+            404 => Some(Self::Statvfs),
             _ => None,
         }
     }
@@ -483,6 +495,10 @@ pub fn syscall_handler(
         SyscallNumber::Rmdir => sys_rmdir(arg1 as usize),
         SyscallNumber::Unlink => sys_unlink(arg1 as usize),
         SyscallNumber::Readlink => sys_readlink(arg1 as usize, arg2 as usize, arg3 as usize),
+        SyscallNumber::Symlink => sys_symlink(arg1 as usize, arg2 as usize),
+        SyscallNumber::Access => sys_access(arg1 as usize, arg2 as i32),
+        SyscallNumber::Chmod => sys_chmod(arg1 as usize, arg2 as u32),
+        SyscallNumber::Fchmod => sys_fchmod(arg1 as i32),
         SyscallNumber::Dup => sys_dup(arg1 as i32),
         SyscallNumber::Dup2 => sys_dup2(arg1 as i32, arg2 as i32),
         SyscallNumber::Fcntl => sys_fcntl(arg1 as i32, arg2 as i32, arg3),
@@ -520,12 +536,42 @@ pub fn syscall_handler(
         SyscallNumber::UptimeMs => sys_uptime_ms(),
         SyscallNumber::UptimeSec => sys_uptime_sec(),
         SyscallNumber::MemInfoKb => sys_meminfo_kb(),
+        SyscallNumber::KdebugCtl => sys_kdebug_ctl(arg1, arg2, arg3),
+        SyscallNumber::Statvfs => sys_statvfs(arg1 as usize, arg2 as usize),
     }
 }
 
 // ============================================================================
 // SYSCALL IMPLEMENTATIONS
 // ============================================================================
+
+/// True iff fd 0 is still bound to the real console device.
+///
+/// `sys_read`'s fd==0 fast path bypasses the file table entirely and reads
+/// straight from the keyboard ISR buffer, blocking the caller until a key
+/// arrives — required for an interactive shell, since `SerialConsole::read`
+/// itself is non-blocking (see its doc comment). But that fast path used to
+/// fire unconditionally, so once fd 0 had been `dup2`'d onto a file or pipe
+/// (e.g. `tr a-z A-Z < file`), reads still went to the keyboard buffer
+/// instead of the redirected file — the redirect was silently ignored and
+/// the program blocked on real keyboard input forever. This gate restricts
+/// the keyboard fast path to fd 0 handles that are still the console;
+/// anything else (a redirected file, a pipe) falls through to the generic
+/// file-table path below, same as any other fd.
+fn stdin_is_console() -> bool {
+    unsafe { core::arch::asm!("cli"); }
+    let result = {
+        let scheduler = super::scheduler::local_scheduler();
+        match scheduler.running_ref() {
+            Some(proc) => proc.files.lock().get(0)
+                .map(|h| h.name() == "serial")
+                .unwrap_or(false),
+            None => false,
+        }
+    };
+    unsafe { core::arch::asm!("sti"); }
+    result
+}
 
 fn sys_read(fd: i32, buf: usize, count: usize) -> SyscallResult {
     if count == 0 {
@@ -535,8 +581,11 @@ fn sys_read(fd: i32, buf: usize, count: usize) -> SyscallResult {
         return e;
     }
 
-    if fd == 0 {
-        // stdin: try to read from keyboard buffer; block if empty.
+    let stdin_console = fd == 0 && stdin_is_console();
+    crate::ktrace!(crate::debug::FS, "sys_read: fd={} count={} stdin_console={}", fd, count, stdin_console);
+    if stdin_console {
+        // stdin, still bound to the real console (not redirected via
+        // dup2): read from the keyboard buffer; block if empty.
         //
         // cli prevents a race between the buffer-empty check and setting
         // STDIN_WAITER — the keyboard ISR could fire between them otherwise.
@@ -681,6 +730,7 @@ fn sys_write(fd: i32, buf: usize, count: usize) -> SyscallResult {
     if let Err(e) = validate_user_buffer(buf as u64, count) {
         return e;
     }
+    crate::ktrace!(crate::debug::FS, "sys_write: fd={} count={}", fd, count);
 
     unsafe { core::arch::asm!("cli"); }
 
@@ -729,12 +779,13 @@ fn sys_open(path_ptr: usize, flags: i32) -> SyscallResult {
     let path = read_user_str(path_ptr);
     if path.is_empty() { return errno::EINVAL; }
     let path = resolve_path(path);
+    crate::ktrace!(crate::debug::FS, "sys_open: path={} flags={:#x}", path, flags);
 
     // Resolve through VFS: /dev/* → drivers, /bin/* → initramfs, …
     // Box allocation uses Slab (different lock from SCHEDULER).
     let handle = match crate::fs::vfs::open(&path, crate::fs::types::OpenFlags(flags)) {
         Ok(h)  => h,
-        Err(e) => return e.as_i64(),
+        Err(e) => { crate::ktrace!(crate::debug::FS, "sys_open: {} -> Err({:?})", path, e); return e.as_i64(); }
     };
 
     // Only take scheduler lock for the FD table insertion
@@ -861,6 +912,69 @@ fn sys_readlink(path_ptr: usize, buf_ptr: usize, bufsiz: usize) -> SyscallResult
     }
 }
 
+/// symlink(88): long symlink(const char *target, const char *linkpath)
+///
+/// `target` is stored verbatim — not resolved, not required to exist
+/// (matches real `symlink(2)`: a dangling symlink is legal, e.g. targeting
+/// something created later). Only `linkpath` (where the new symlink node
+/// goes) gets cwd-normalized; `target` is exactly what the caller passed,
+/// same as real symlinks store whatever string they were given.
+fn sys_symlink(target_ptr: usize, linkpath_ptr: usize) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(target_ptr as u64, 1) { return e; }
+    if let Err(e) = validate_user_buffer(linkpath_ptr as u64, 1) { return e; }
+    let target = read_user_str(target_ptr);
+    let linkpath = read_user_str(linkpath_ptr);
+    if target.is_empty() || linkpath.is_empty() { return errno::EINVAL; }
+    let linkpath = resolve_path(linkpath);
+    match crate::fs::vfs::symlink(&target, &linkpath) {
+        Ok(()) => 0,
+        Err(e) => e.as_i64(),
+    }
+}
+
+/// access(21): long access(const char *path, int mode)
+///
+/// `mode` is `F_OK` (0) or a bitmask of `R_OK`(4)/`W_OK`(2)/`X_OK`(1). This
+/// kernel has no per-uid permission model, so R_OK/X_OK just mean "resolves
+/// at all" (same as F_OK). W_OK needs a real answer, though: BusyBox `vi`
+/// calls `access(path, W_OK)` to decide whether to open
+/// `[Readonly]` — before this syscall existed at all it fell through the
+/// dispatcher's default `ENOSYS`, which `vi` (correctly, defensively)
+/// treats as "not writable", so every file — including ones on the
+/// writable ramfs `/tmp` mount — opened readonly.
+///
+/// There's no `Inode`-level "is this writable" query to call instead
+/// (writability is a property of the `FileHandle` returned by `open()`,
+/// not the `Inode`), so this probes the same way a real write would: open
+/// the path for writing, then issue a zero-length `write()`. Every
+/// read-only filesystem's regular-file handle (initramfs, ext2, procfs)
+/// unconditionally errors on `write()` regardless of buffer length,
+/// while `RamFileHandle::write` with an empty buffer computes
+/// `end == *offset` and no-ops — real answer, no side effect either way.
+fn sys_access(path_ptr: usize, mode: i32) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
+    let path = read_user_str(path_ptr);
+    if path.is_empty() { return errno::EINVAL; }
+    let path = resolve_path(path);
+
+    const W_OK: i32 = 2;
+
+    if mode & W_OK != 0 {
+        match crate::fs::vfs::open(&path, crate::fs::types::OpenFlags::WRONLY) {
+            Ok(mut handle) => match handle.write(&[]) {
+                Ok(_) => 0,
+                Err(_) => errno::EACCES,
+            },
+            Err(e) => e.as_i64(),
+        }
+    } else {
+        match crate::fs::stat(&path) {
+            Ok(_) => 0,
+            Err(e) => e.as_i64(),
+        }
+    }
+}
+
 /// rename(82): long rename(const char *old_path, const char *new_path)
 fn sys_rename(old_path_ptr: usize, new_path_ptr: usize) -> SyscallResult {
     if let Err(e) = validate_user_buffer(old_path_ptr as u64, 1) { return e; }
@@ -926,11 +1040,35 @@ fn sys_chdir(path_ptr: usize) -> SyscallResult {
     })
 }
 
+/// getdents64(217): long getdents64(int fd, void *buf, size_t count)
+///
+/// Deliberately does NOT use `with_current_process`: that helper holds the
+/// SCHEDULER lock across the whole closure, but `FileHandle::getdents64`
+/// can need a fresh SCHEDULER lock of its own — `fs::procfs`'s `/proc`
+/// listing (`ls /proc`, BusyBox `ps`'s `opendir("/proc")` scan) calls
+/// `scheduler::all_pids()` to enumerate live pids, which self-deadlocks
+/// (spin locks aren't reentrant) if SCHEDULER is already held on the way
+/// in. Same shape as `sys_read`'s generic (fd > 0) path: clone the
+/// `Arc<Mutex<FileDescriptorTable>>` under a short scheduler-lock scope,
+/// release it, then call into the file outside any scheduler lock (cli
+/// stays engaged throughout for the usual preemption-safety reasons, just
+/// not the SCHEDULER mutex itself).
 fn sys_getdents64(fd: i32, buf_ptr: usize, count: usize) -> SyscallResult {
     if let Err(e) = validate_user_buffer(buf_ptr as u64, count) { return e; }
+    crate::ktrace!(crate::debug::FS, "sys_getdents64: fd={} count={}", fd, count);
 
-    with_current_process(|proc| {
-        match proc.files.lock().get_mut(fd as usize) {
+    unsafe { core::arch::asm!("cli"); }
+    let files = {
+        let scheduler = super::scheduler::local_scheduler();
+        match scheduler.running_ref() {
+            Some(proc) => proc.files.clone(),
+            None => { unsafe { core::arch::asm!("sti"); } return errno::ESRCH; }
+        }
+    };
+
+    let result = {
+        let mut files_guard = files.lock();
+        match files_guard.get_mut(fd as usize) {
             Err(_) => errno::EBADF,
             Ok(f)  => {
                 let buf = unsafe {
@@ -939,7 +1077,9 @@ fn sys_getdents64(fd: i32, buf_ptr: usize, count: usize) -> SyscallResult {
                 f.getdents64(buf)
             }
         }
-    })
+    };
+    unsafe { core::arch::asm!("sti"); }
+    result
 }
 
 /// sys_close — close a file descriptor.
@@ -1234,11 +1374,16 @@ fn sys_ioctl(fd: i32, request: u64, argp: u64) -> SyscallResult {
         TIOCGWINSZ => {
             if argp != 0 && validate_user_buffer(argp, 8).is_ok() {
                 // struct winsize { ws_row, ws_col, ws_xpixel, ws_ypixel }
-                // Use 25 rows × 80 cols as a reasonable default.
+                // Real framebuffer text-grid geometry (falls back to 80x25
+                // if there's no framebuffer, e.g. serial-only boot) — a
+                // full-screen program like `vi` sizes its display from
+                // this, so a hardcoded value left it unable to use more
+                // than a corner of an actual (usually much bigger) screen.
+                let (cols, rows) = crate::drivers::framebuffer_console::text_dimensions();
                 let ws = argp as *mut u16;
                 unsafe {
-                    *ws.add(0) = 25;  // rows
-                    *ws.add(1) = 80;  // cols
+                    *ws.add(0) = rows as u16;
+                    *ws.add(1) = cols as u16;
                     *ws.add(2) = 0;
                     *ws.add(3) = 0;
                 }
@@ -1875,25 +2020,40 @@ fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> SyscallResult 
             };
         }
     };
+    // `load_elf` copies whatever it needs from `elf_owned` into the new
+    // address space's own frames (`LoadedElf` holds no borrow into it) —
+    // drop it explicitly here rather than let it fall out of scope
+    // naturally. This function ends by jumping into the new process via
+    // `jump_to_user`/`jump_to_trapframe` (`-> !`, a raw `iretq`, not a
+    // normal Rust return), so any local still alive at that point never
+    // gets its destructor run — this Vec (the whole ELF file's bytes,
+    // rounded up to the Buddy allocator's nearest order — ~1 MiB for
+    // busybox) was leaking on *every single successful exec()*, exactly
+    // the ~1 MiB-per-fork+exec leak that hung the kernel under heavier
+    // busybox use this session (confirmed via free_bytes() bracketing a
+    // single fork/exec/wait/reap cycle — see the now-removed [MEM-DEBUG]
+    // instrumentation this fix was diagnosed with).
+    drop(elf_owned);
 
-    crate::serial_println_raw!("[EXEC] load_elf done, going cli");
+    crate::ktrace!(crate::debug::SCHED, "exec: load_elf done, going cli");
     unsafe { core::arch::asm!("cli"); }
-    crate::serial_println_raw!("[EXEC] cli done, taking scheduler lock");
+    crate::ktrace!(crate::debug::SCHED, "exec: cli done, taking scheduler lock");
 
     let next_tf = {
         let mut scheduler = super::scheduler::local_scheduler();
-        crate::serial_println_raw!("[EXEC] scheduler locked, swapping address space");
+        crate::ktrace!(crate::debug::SCHED, "exec: scheduler locked, swapping address space");
         match scheduler.running_mut() {
             Some(proc) => {
                 proc.exe_name = resolved_path;
-                crate::serial_println_raw!("[EXEC] dropping old AS");
+                crate::ktrace!(crate::debug::SCHED, "exec: dropping old AS");
                 // Replace address space with freshly loaded one. This drops
                 // this Process's Arc reference to whatever it had before —
                 // if that was a shared (thread) address space, the actual
                 // page table/pages are only freed once every other thread
                 // sharing it has also exited (Arc refcount reaches 0).
                 proc.address_space = alloc::sync::Arc::new(loaded.address_space);
-                crate::serial_println_raw!("[EXEC] old AS dropped, new AS in place");
+                crate::ktrace!(crate::debug::SCHED, "exec: old AS dropped, new AS in place");
+                crate::debug::inc_execs();
 
                 // The page-fault fast path caches a raw pointer to the
                 // process's AddressSpace (see scheduler::refresh_current_fast);
@@ -1926,9 +2086,9 @@ fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> SyscallResult 
                     );
                 }
 
-                crate::serial_println_raw!("[EXEC] activating new CR3");
+                crate::ktrace!(crate::debug::SCHED, "exec: activating new CR3");
                 unsafe { proc.address_space.activate(); }
-                crate::serial_println_raw!("[EXEC] CR3 active, jumping to entry={:#x}", proc.trapframe.rip);
+                crate::ktrace!(crate::debug::SCHED, "exec: CR3 active, jumping to entry={:#x}", proc.trapframe.rip);
                 &*proc.trapframe as *const TrapFrame
             }
             None => {
@@ -1938,7 +2098,7 @@ fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> SyscallResult 
         }
     };
 
-    crate::serial_println_raw!("[EXEC] jump_to_trapframe");
+    crate::ktrace!(crate::debug::SCHED, "exec: jump_to_trapframe");
     // Jump to the new program — never returns
     unsafe { super::trapframe::jump_to_user(next_tf) }
 }
@@ -2064,6 +2224,7 @@ fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> SyscallResult {
             let status = proc.wait_status_word();
             let pid = proc.pid.0;
             crate::init::processes::free_kernel_stack(proc.kernel_stack);
+            crate::debug::inc_reaps();
             if status_ptr != 0 {
                 // write_unaligned, not write: `validate_user_buffer` only
                 // checks that this pointer falls inside the user canonical
@@ -2132,6 +2293,145 @@ fn sys_uptime_ms() -> SyscallResult {
 /// `free_kernel_stack` for the leak this was added to verify.
 fn sys_meminfo_kb() -> SyscallResult {
     (crate::allocator::buddy_allocator::BUDDY.lock().free_bytes() / 1024) as SyscallResult
+}
+
+/// sys_kdebug_ctl (custom #403): long kdebug_ctl(int cmd, const char *name, int enable)
+///
+/// Runtime control for `crate::debug`'s tracing subsystems (see that
+/// module's doc comment for why this exists — replaces hand-added-then-
+/// stripped-out `serial_println!` debugging with tracepoints that stay in
+/// the code permanently, toggled live instead of by rebuilding). Backs the
+/// `kdebug` userspace program.
+///
+/// `cmd`: 0 = get current mask (other args ignored). 1 = set: resolve
+/// `name` (a NUL-terminated string, e.g. "mm") to its subsystem bit and
+/// set or clear it in the mask depending on `enable`; returns the *new*
+/// mask, or `EINVAL` if `name` doesn't match a known subsystem.
+fn sys_kdebug_ctl(cmd: u64, name_ptr: u64, enable: u64) -> SyscallResult {
+    match cmd {
+        0 => crate::debug::get_mask() as SyscallResult,
+        1 => {
+            if let Err(e) = validate_user_buffer(name_ptr, 32) {
+                return e;
+            }
+            let name_bytes = unsafe {
+                let ptr = name_ptr as *const u8;
+                let mut len = 0usize;
+                while len < 32 {
+                    if *ptr.add(len) == 0 { break; }
+                    len += 1;
+                }
+                core::slice::from_raw_parts(ptr, len)
+            };
+            let name = match core::str::from_utf8(name_bytes) {
+                Ok(s) => s,
+                Err(_) => return errno::EINVAL,
+            };
+            let Some(bit) = crate::debug::subsystem_bit_by_name(name) else {
+                return errno::EINVAL;
+            };
+            let mut mask = crate::debug::get_mask();
+            if enable != 0 { mask |= bit; } else { mask &= !bit; }
+            crate::debug::set_mask(mask);
+            mask as SyscallResult
+        }
+        _ => errno::EINVAL,
+    }
+}
+
+/// `struct statvfs` (see `sysroot/usr/include/abi-bits/statvfs.h`) — 11
+/// `unsigned long`/`fsblkcnt_t`/`fsfilcnt_t` fields, all `u64` on x86-64.
+#[repr(C)]
+struct Statvfs {
+    f_bsize: u64,
+    f_frsize: u64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_favail: u64,
+    f_fsid: u64,
+    f_flag: u64,
+    f_namemax: u64,
+}
+
+/// sys_statvfs (custom #404): long statvfs(const char *path, struct statvfs *out)
+///
+/// Backs BusyBox `df` (`statvfs()`, POSIX — mlibc's `sys_fstatvfs` also
+/// routes here with a fixed `"/"`, see the sysdep). This kernel has one
+/// physical-memory pool (the Buddy allocator) behind every mount rather
+/// than real per-filesystem block accounting, so every path reports the
+/// same numbers — enough for `df` to run and print plausible, live
+/// (not fabricated-constant) total/free figures, not a real per-mount
+/// breakdown. `path` only needs to resolve; the numbers don't depend on
+/// what it resolves to.
+fn sys_statvfs(path_ptr: usize, out_ptr: usize) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
+    if let Err(e) = validate_user_buffer(out_ptr as u64, core::mem::size_of::<Statvfs>()) { return e; }
+    let path = read_user_str(path_ptr);
+    if path.is_empty() { return errno::EINVAL; }
+    let path = resolve_path(path);
+    if let Err(e) = crate::fs::stat(&path) {
+        return e.as_i64();
+    }
+
+    const BLOCK: u64 = 4096;
+    let buddy = crate::allocator::buddy_allocator::BUDDY.lock();
+    let total_blocks = buddy.total_bytes() as u64 / BLOCK;
+    let free_blocks = buddy.free_bytes() as u64 / BLOCK;
+    drop(buddy);
+
+    let out = Statvfs {
+        f_bsize: BLOCK,
+        f_frsize: BLOCK,
+        f_blocks: total_blocks,
+        f_bfree: free_blocks,
+        f_bavail: free_blocks,
+        f_files: 0,
+        f_ffree: 0,
+        f_favail: 0,
+        f_fsid: 0,
+        f_flag: 0,
+        f_namemax: 255,
+    };
+    unsafe { core::ptr::write(out_ptr as *mut Statvfs, out); }
+    0
+}
+
+/// chmod(90)/fchmod(91): long chmod(const char *path, mode_t mode)
+///
+/// This kernel has no per-inode permission-bits storage to actually change
+/// (see `Stat::regular`/`regular_writable` — permission is a hardcoded
+/// property of *which filesystem* a file lives on, not a stored, settable
+/// per-file value), so there's nothing real to do beyond validating the
+/// path exists — same "validity-checked stub" shape as `sys_fcntl`'s
+/// F_GETFD/F_SETFD. Good enough for `chmod`/`tar -p` extraction to report
+/// success instead of failing outright; a real permission model would
+/// need `Inode`/`FileHandle` to grow actual mutable mode-bit storage,
+/// which nothing else in this kernel has needed yet.
+fn sys_chmod(path_ptr: usize, _mode: u32) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
+    let path = read_user_str(path_ptr);
+    if path.is_empty() { return errno::EINVAL; }
+    let path = resolve_path(path);
+    match crate::fs::stat(&path) {
+        Ok(_) => 0,
+        Err(e) => e.as_i64(),
+    }
+}
+
+/// fchmod(91): same stub reasoning as `sys_chmod`, just fd-addressed —
+/// only checks the fd is actually open (EBADF otherwise) since there's no
+/// path to validate.
+fn sys_fchmod(fd: i32) -> SyscallResult {
+    if fd < 0 { return errno::EBADF; }
+    with_current_process(|proc| {
+        match proc.files.lock().get(fd as usize) {
+            Ok(_) => 0,
+            Err(_) => errno::EBADF,
+        }
+    })
 }
 
 /// sys_uptime_sec (custom #202) — seconds elapsed since kernel boot.

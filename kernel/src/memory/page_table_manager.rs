@@ -417,7 +417,7 @@ impl OwnedPageTable {
     unsafe fn release_user_pages(&self) {
         use x86_64::structures::paging::PageTable;
 
-        crate::serial_println_raw!("[RPU] start PML4={:#x}", self.pml4_frame.start_address().as_u64());
+        crate::ktrace!(crate::debug::MM, "rpu: start PML4={:#x}", self.pml4_frame.start_address().as_u64());
 
         let phys_offset = crate::memory::physical_memory_offset();
         let pml4_virt = phys_offset + self.pml4_frame.start_address().as_u64();
@@ -433,7 +433,7 @@ impl OwnedPageTable {
                 Err(_) => continue,
             };
 
-            crate::serial_println_raw!("[RPU] PML4[{}] → PDPT={:#x}", pml4_idx, pdpt_frame.start_address().as_u64());
+            crate::ktrace!(crate::debug::MM, "rpu: PML4[{}] → PDPT={:#x}", pml4_idx, pdpt_frame.start_address().as_u64());
 
             let pdpt_virt = phys_offset + pdpt_frame.start_address().as_u64();
             let pdpt: &PageTable = &*pdpt_virt.as_ptr::<PageTable>();
@@ -446,7 +446,7 @@ impl OwnedPageTable {
                     Ok(f) => f,
                     Err(_) => continue, // huge page — skip
                 };
-                crate::serial_println_raw!("[RPU]   PDPT entry → PD={:#x}", pd_frame.start_address().as_u64());
+                crate::ktrace!(crate::debug::MM, "rpu:   PDPT entry → PD={:#x}", pd_frame.start_address().as_u64());
 
                 let pd_virt = phys_offset + pd_frame.start_address().as_u64();
                 let pd: &PageTable = &*pd_virt.as_ptr::<PageTable>();
@@ -458,14 +458,14 @@ impl OwnedPageTable {
                     let pt_frame = match pd_entry.frame() {
                         Ok(f) => f,
                         Err(FrameError::HugeFrame) => {
-                            crate::serial_println_raw!("[RPU]     PD[{}] huge={:#x} free order=21", pd_idx, pd_entry.addr().as_u64());
+                            crate::ktrace!(crate::debug::MM, "rpu:     PD[{}] huge={:#x} free order=21", pd_idx, pd_entry.addr().as_u64());
                             unsafe { crate::allocator::phys_free(pd_entry.addr(), 21); }
                             continue;
                         }
                         Err(_) => continue,
                     };
 
-                    crate::serial_println_raw!("[RPU]     PD[{}] → PT={:#x}", pd_idx, pt_frame.start_address().as_u64());
+                    crate::ktrace!(crate::debug::MM, "rpu:     PD[{}] → PT={:#x}", pd_idx, pt_frame.start_address().as_u64());
 
                     let pt_virt = phys_offset + pt_frame.start_address().as_u64();
                     let pt: &PageTable = &*pt_virt.as_ptr::<PageTable>();
@@ -485,27 +485,27 @@ impl OwnedPageTable {
                         }
                     }
 
-                    crate::serial_println_raw!("[RPU]     PT={:#x} done, freeing PT frame", pt_frame.start_address().as_u64());
+                    crate::ktrace!(crate::debug::MM, "rpu:     PT={:#x} done, freeing PT frame", pt_frame.start_address().as_u64());
                     unsafe { crate::allocator::phys_free(pt_frame.start_address(), 12); }
-                    crate::serial_println_raw!("[RPU]     PT frame freed");
+                    crate::ktrace!(crate::debug::MM, "rpu:     PT frame freed");
                 }
 
                 // PD is an intermediate frame — free directly.
-                crate::serial_println_raw!("[RPU]   freeing PD={:#x}", pd_frame.start_address().as_u64());
+                crate::ktrace!(crate::debug::MM, "rpu:   freeing PD={:#x}", pd_frame.start_address().as_u64());
                 unsafe { crate::allocator::phys_free(pd_frame.start_address(), 12); }
-                crate::serial_println_raw!("[RPU]   PD freed");
+                crate::ktrace!(crate::debug::MM, "rpu:   PD freed");
             }
 
             // PDPT is an intermediate frame — free directly.
-            crate::serial_println_raw!("[RPU] freeing PDPT={:#x}", pdpt_frame.start_address().as_u64());
+            crate::ktrace!(crate::debug::MM, "rpu: freeing PDPT={:#x}", pdpt_frame.start_address().as_u64());
             unsafe { crate::allocator::phys_free(pdpt_frame.start_address(), 12); }
-            crate::serial_println_raw!("[RPU] PDPT freed");
+            crate::ktrace!(crate::debug::MM, "rpu: PDPT freed");
         }
 
         // Free the PML4 frame itself.
-        crate::serial_println_raw!("[RPU] freeing PML4={:#x}", self.pml4_frame.start_address().as_u64());
+        crate::ktrace!(crate::debug::MM, "rpu: freeing PML4={:#x}", self.pml4_frame.start_address().as_u64());
         unsafe { crate::allocator::phys_free(self.pml4_frame.start_address(), 12); }
-        crate::serial_println_raw!("[RPU] done");
+        crate::ktrace!(crate::debug::MM, "rpu: done");
     }
 
     /// Map `num_pages` contiguous user pages starting at `start`.

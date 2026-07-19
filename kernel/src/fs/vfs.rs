@@ -125,6 +125,15 @@ pub trait Inode: Send + Sync {
     fn readlink(&self) -> Result<alloc::string::String, Errno> {
         Err(Errno::EINVAL)
     }
+
+    /// Create a new symlink child `name` under this (directory) inode,
+    /// pointing at `target` (an arbitrary string — not resolved or checked
+    /// to exist, matching real `symlink(2)`: a dangling target is legal).
+    ///
+    /// Same read-only-by-default convention as `create()`/`mkdir()`.
+    fn symlink(&self, _name: &str, _target: &str) -> Result<Arc<dyn Inode>, Errno> {
+        Err(Errno::EROFS)
+    }
 }
 
 // ── Filesystem ───────────────────────────────────────────────────────────────
@@ -362,6 +371,15 @@ fn split_parent(path: &str) -> Result<(&str, &str), Errno> {
 pub fn mkdir(path: &str) -> Result<(), Errno> {
     let (dir_path, leaf) = split_parent(path)?;
     resolve(dir_path)?.mkdir(leaf)?;
+    Ok(())
+}
+
+/// Create a symlink at `path` pointing at `target`. `path`'s parent
+/// directory is resolved (and must exist and be writable); `target` is
+/// stored as-is, unresolved — matches real `symlink(2)`.
+pub fn symlink(target: &str, path: &str) -> Result<(), Errno> {
+    let (dir_path, leaf) = split_parent(path)?;
+    resolve(dir_path)?.symlink(leaf, target)?;
     Ok(())
 }
 

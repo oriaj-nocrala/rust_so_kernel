@@ -7,6 +7,7 @@ extern crate alloc;
 mod allocator;
 mod block;
 mod cpu;
+mod debug;
 mod drivers;
 mod framebuffer;
 mod fs;

@@ -169,14 +169,31 @@ extern "x86-interrupt" fn page_fault_handler(
 
     let _ = sf; // ExceptionStackFrame values unreliable for user-mode PFs
 
-    // ── COW write fault: page present + user write, no reserved bit ───
+    // ── COW write fault: page present + write, no reserved bit ───
     //
     // This must be checked BEFORE is_demand_pageable, which returns Err
     // for present pages (treating them as protection violations).
     //
+    // Deliberately NOT gated on PF_USER: a syscall handler (read(),
+    // getdents64(), etc.) writes into the *calling* process's own buffer
+    // using its own CR3/address space, but executes in ring 0 — so the
+    // exact same COW-shared-page write can fault with PF_USER clear
+    // instead of set. This is routine for any BusyBox `APPLET_NOEXEC`
+    // applet (`ls`, `sort`, ...): they fork but never call a real
+    // execve(), so their own buffers stay COW-shared with the parent
+    // shell until the applet's first read()/write() into them — which
+    // happens inside the kernel, in kernel mode. Before this fix, that
+    // fell through to the generic "kernel-mode, not demand-pageable"
+    // panic below instead of being resolved exactly like a user-mode
+    // COW fault would be (confirmed live: `sort`/`find` reliably paniced
+    // the kernel this way). Safe to drop the check: find_vma_fast only
+    // ever matches an address inside the *current* process's own
+    // registered VMA, so a fault on real kernel memory still correctly
+    // falls through un-resolved either way.
+    //
     // Uses the lock-free fast path: find_vma_fast + current_as_fast.
     // Safe because the fault handler runs with IF=0 (no preemption).
-    if (error_code & (PF_PRESENT | PF_WRITE | PF_USER)) == (PF_PRESENT | PF_WRITE | PF_USER)
+    if (error_code & (PF_PRESENT | PF_WRITE)) == (PF_PRESENT | PF_WRITE)
         && (error_code & PF_RESERVED) == 0
     {
         let handled = unsafe {

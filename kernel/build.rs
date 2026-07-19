@@ -18,7 +18,6 @@ const RUST_PROGRAMS: &[(&str, &str)] = &[
     ("shell",      "shell.elf"),
     ("snake",      "snake.elf"),
     ("uptime",     "uptime.elf"),
-    ("sleep",      "sleep.elf"),
     ("tsc",        "tsc.elf"),
     ("ipc_ping",   "ipc_ping.elf"),
     ("mmap_test",  "mmap_test.elf"),
@@ -37,6 +36,7 @@ const C_PROGRAMS: &[(&str, &str)] = &[
     ("stat_test", "stat_test.elf"),
     ("argv_test", "argv_test.elf"),
     ("jobctl_test", "jobctl_test.elf"),
+    ("kdebug", "kdebug.elf"),
 ];
 
 /// Not built here at all — see the busybox.elf handling below, which

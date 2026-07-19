@@ -1,14 +1,14 @@
 #ifndef _MNTENT_H
 #define _MNTENT_H
 
-// Declarations-only (same approach as the ironclad/vinix sysdeps ports —
-// see mlibc/sysdeps/ironclad/include/mntent.h, this is a near-identical
-// copy). This kernel has no /etc/mtab or mount-table concept, so none of
-// these functions are actually implemented anywhere; anything that only
-// needs the header to compile (BusyBox's libbb.h includes it
-// unconditionally) is fine, and anything that actually *calls* one of
-// these will fail at link time with an undefined symbol — a louder,
-// more honest failure than silently pretending mounts work.
+// setmntent/getmntent/endmntent ARE implemented (generic.cpp) — BusyBox
+// `df` (no args) needs them to enumerate mounts at all, and this kernel's
+// mount table is small and fixed at compile time (see fs/mod.rs's MOUNT
+// LAYOUT), so hardcoding it here is a straight port of real, if static,
+// data rather than a fake. addmntent/hasmntopt/getmntent_r stay
+// unimplemented — nothing in this port's applet set calls them, and a
+// link-time "undefined symbol" for those is a louder, more honest failure
+// than silently stubbing a function nothing has validated the behavior of.
 
 #include <stdio.h>
 

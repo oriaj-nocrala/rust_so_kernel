@@ -245,21 +245,28 @@ impl FileHandle for NullFallback {
     fn name(&self) -> &str { "<fallback>" }
 }
 
-// fds 0-2 get fresh stdio handles (same as before); fds 3+ are inherited via
-// `dup()` when the underlying handle supports it (e.g. pipe ends) — needed
-// so a pipe created before `fork()` is usable by both parent and child.
+// Every fd, including 0-2, is inherited via `dup()` when the underlying
+// handle supports it (e.g. pipe ends, redirected regular files) — needed so
+// a pipe created before `fork()` is usable by both parent and child, and so
+// a shell redirect (`< file`, done via `open()`+`dup2()` onto fd 0 before
+// `fork()`) survives into the child instead of silently reverting to the
+// real console. fds 0-2 fall back to a fresh stdio handle only when nothing
+// is open there, or the open handle doesn't support `dup()`.
 impl Clone for FileDescriptorTable {
     fn clone(&self) -> Self {
         let mut new_table = Self::new();
 
         if self.files[0].is_some() {
-            new_table.files[0] = crate::drivers::open_device("/dev/console");
+            new_table.files[0] = self.files[0].as_ref().unwrap().dup()
+                .or_else(|| crate::drivers::open_device("/dev/console"));
         }
         if self.files[1].is_some() {
-            new_table.files[1] = crate::drivers::open_device("/dev/fb");
+            new_table.files[1] = self.files[1].as_ref().unwrap().dup()
+                .or_else(|| crate::drivers::open_device("/dev/fb"));
         }
         if self.files[2].is_some() {
-            new_table.files[2] = crate::drivers::open_device("/dev/console");
+            new_table.files[2] = self.files[2].as_ref().unwrap().dup()
+                .or_else(|| crate::drivers::open_device("/dev/console"));
         }
 
         for i in 3..MAX_FILES {

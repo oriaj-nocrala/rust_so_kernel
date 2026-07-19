@@ -210,6 +210,19 @@ fn apply_sgr(params: &[u32], state: &mut FbState) {
     }
 }
 
+/// Overwrite `row`'s cells in `[start_col, end_col)` with blanks in the
+/// current background color. Shared by `ESC[J`'s partial-screen-clear
+/// cases (0 and 1), which need to blank a range of whole rows plus one
+/// partial row, the same way `ESC[K` already blanks a range within a
+/// single row.
+fn clear_row_from(fb: &mut Framebuffer, state: &FbState, row: usize, start_col: usize, end_col: usize) {
+    for c in start_col..end_col {
+        let px = MARGIN_X + c * CHAR_W;
+        let py = MARGIN_Y + row * CHAR_H;
+        fb.draw_char(px, py, b' ', DEFAULT_FG, state.bg, 1);
+    }
+}
+
 // ── CSI dispatcher ────────────────────────────────────────────────────────────
 
 fn dispatch_csi(
@@ -250,7 +263,32 @@ fn dispatch_csi(
             state.col = state.col.saturating_sub(n);
         }
         b'J' => {
+            // ESC[J with no explicit parameter means ESC[0J ("clear from
+            // cursor to end of screen"), not "do nothing" — `parse_params`
+            // already reports that as params[0] == 0, same as a real
+            // ESC[0J. Real full-screen apps (BusyBox `vi`'s `redraw()`,
+            // see ESC_SET_CURSOR_TOPLEFT ESC_CLEAR2EOS) send exactly
+            // ESC[H ESC[J to clear the whole screen — cursor-home followed
+            // by the no-param form — never ESC[2J. Treating the no-param
+            // case as a no-op (the previous behavior here) meant the
+            // screen was never actually cleared: only the cells a program
+            // explicitly overwrote changed, leaving old text bleeding
+            // through everywhere else (visible as e.g. the boot banner's
+            // "BusyBox..." still on screen with just its leading "B"
+            // overwritten by vi's "~" column).
             match params[0] {
+                0 => {
+                    clear_row_from(fb, state, state.row, state.col, cols);
+                    for r in (state.row + 1)..rows {
+                        clear_row_from(fb, state, r, 0, cols);
+                    }
+                }
+                1 => {
+                    for r in 0..state.row {
+                        clear_row_from(fb, state, r, 0, cols);
+                    }
+                    clear_row_from(fb, state, state.row, 0, state.col + 1);
+                }
                 2 | 3 => {
                     fb.clear(state.bg);
                     state.col = 0;
@@ -407,6 +445,19 @@ impl FileHandle for FramebufferConsole {
     fn name(&self) -> &str {
         "fb"
     }
+}
+
+/// Text grid size (cols, rows) of the framebuffer console, in the same
+/// units `TIOCGWINSZ` reports. Falls back to 80x25 if no framebuffer was
+/// set up (headless/serial-only boot) — same default the ioctl used to
+/// hardcode unconditionally.
+pub fn text_dimensions() -> (usize, usize) {
+    let fb_guard = FRAMEBUFFER.lock();
+    let Some(fb) = fb_guard.as_ref() else { return (80, 25); };
+    let (w, h) = fb.dimensions();
+    let cols = (w.saturating_sub(MARGIN_X)) / CHAR_W;
+    let rows = (h.saturating_sub(MARGIN_Y)) / CHAR_H;
+    (cols.max(1), rows.max(1))
 }
 
 pub fn open() -> Box<dyn FileHandle> {

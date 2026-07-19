@@ -68,6 +68,7 @@ if not no_headers
 	install_headers(
 		'include/sys/sysmacros.h',
 		'include/sys/statfs.h',
+		'include/sys/sysinfo.h',
 		subdir: 'sys',
 		follow_symlinks: true
 	)

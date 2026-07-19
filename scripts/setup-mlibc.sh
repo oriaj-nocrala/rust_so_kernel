@@ -28,6 +28,73 @@ fi
 rm -rf mlibc/sysdeps/constanos
 cp -r mlibc-port/constanos-sysdeps mlibc/sysdeps/constanos
 
+# ── 1b. Patch a real upstream mlibc bug: suppressed scanf conversions ─────
+#
+# `do_scanf` (options/ansi/generic/stdio.cpp) only advances its internal
+# `count` inside the `if(typed_dest)` branch of `append_to_buffer` — for a
+# suppressed conversion (`%*s`/`%*c`/`%*[`, where `dest` is deliberately
+# null), `count` never moves, so the very next `NOMATCH_CHECK(count == 0)`
+# reads as "matched nothing" even though a real token was consumed, and
+# `do_scanf` returns early right there. Any `sscanf`/`fscanf` format with a
+# `%*s` gets silently truncated at the first one — discovered via BusyBox
+# `ps`/`top` (`libbb/procps.c`'s `/proc/<pid>/stat` parser skips half its
+# fields with exactly that conversion) reading every field correctly but
+# still coming back empty. Upstream bug, not specific to this port; patched
+# here (not forked) so it keeps applying across submodule updates.
+if ! grep -q "must advance even when there's nowhere to store" \
+        mlibc/options/ansi/generic/stdio.cpp; then
+    python3 - "$REPO_ROOT/mlibc/options/ansi/generic/stdio.cpp" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+
+old = '''		const auto append_to_buffer = [&](char c) {
+			if(allocate_buf) {
+				temp_dest += c;
+				count++;
+			} else {
+				char *typed_dest = (char *)dest;
+				if(typed_dest)
+					typed_dest[count++] = c;
+			}
+		};'''
+
+new = '''		const auto append_to_buffer = [&](char c) {
+			// `count` must advance even when there's nowhere to store `c`
+			// (a suppressed `%*s`/`%*c`/`%*[` conversion: `dest` is null,
+			// `allocate_buf` is false) — every caller of this lambda
+			// (the 's'/'c'/'[' cases below) uses `count == 0` afterwards
+			// to decide whether the conversion matched anything at all
+			// (NOMATCH_CHECK(count == 0)). With the increment inside the
+			// `if(typed_dest)` branch, every suppressed conversion looked
+			// like "matched nothing" regardless of what was actually
+			// consumed, so `do_scanf` returned early right at the first
+			// `%*s` in a format string.
+			if(allocate_buf) {
+				temp_dest += c;
+			} else {
+				char *typed_dest = (char *)dest;
+				if(typed_dest)
+					typed_dest[count] = c;
+			}
+			count++;
+		};'''
+
+if old not in content:
+    print("error: mlibc's do_scanf append_to_buffer lambda doesn't match the "
+          "expected text (upstream mlibc changed) -- setup-mlibc.sh's scanf "
+          "patch needs updating", file=sys.stderr)
+    sys.exit(1)
+
+content = content.replace(old, new, 1)
+with open(path, "w") as f:
+    f.write(content)
+PYEOF
+    echo "setup-mlibc: patched do_scanf's suppressed-conversion count bug"
+fi
+
 # ── 2. Register 'constanos' in mlibc/meson.build (idempotent) ─────────────
 
 if ! grep -q "host_machine.system() == 'constanos'" mlibc/meson.build; then

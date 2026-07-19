@@ -34,8 +34,9 @@ use crate::fs::{
 };
 use crate::process::file::{FileError, FileHandle, FileResult};
 
-fn pid_dir_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 2 }
-fn pid_exe_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 2 + 1 }
+fn pid_dir_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 3 }
+fn pid_exe_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 3 + 1 }
+fn pid_stat_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 3 + 2 }
 
 // ── Filesystem ───────────────────────────────────────────────────────────────
 
@@ -65,6 +66,34 @@ fn render_meminfo() -> String {
     )
 }
 
+/// Renders `/proc/<pid>/stat` in the classic Linux `"pid (comm) state
+/// ppid pgid sid tty tpgid flags minflt cminflt majflt cmajflt utime stime
+/// cutime cstime priority nice ..."` shape — this is what BusyBox
+/// `ps`/`top` (`libbb/procps.c::procps_scan`) actually parses: split on the
+/// last `)` to pull `comm` out (so it's safe even if `comm` itself
+/// contained spaces, though ours never does), then a fixed-position
+/// `sscanf` over everything after. Fields this kernel has no real data for
+/// (page fault counts, per-process cpu ticks, start time, memory size) are
+/// reported as `0` — enough for `ps`/`top` to run and show real pid/name/
+/// state/ppid/pgid/priority without crashing on a short field list, not
+/// enough for their CPU%/MEM%/VSZ/RSS columns to mean anything yet.
+fn render_proc_stat(pid: usize, snap: &crate::process::scheduler::ProcStatSnapshot) -> String {
+    let end = snap.name.iter().position(|&b| b == 0).unwrap_or(snap.name.len());
+    let comm = String::from_utf8_lossy(&snap.name[..end]);
+    let comm = if comm.is_empty() { "?" } else { comm.as_ref() };
+    let state = match snap.state {
+        crate::process::ProcessState::Ready | crate::process::ProcessState::Running => 'R',
+        crate::process::ProcessState::Blocked => 'S',
+        crate::process::ProcessState::Zombie => 'Z',
+        crate::process::ProcessState::Stopped => 'T',
+    };
+    format!(
+        "{pid} ({comm}) {state} {ppid} {pgid} {pgid} 0 -1 0 0 0 0 0 0 0 0 0 {priority} 0 0 0 0 0 0\n",
+        pid = pid, comm = comm, state = state,
+        ppid = snap.ppid, pgid = snap.pgid, priority = snap.priority,
+    )
+}
+
 // ── Directory inode ──────────────────────────────────────────────────────────
 
 struct ProcDirInode;
@@ -81,6 +110,7 @@ impl Inode for ProcDirInode {
     fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, Errno> {
         match name {
             "meminfo" => Ok(Arc::new(MeminfoInode)),
+            "kdebug" => Ok(Arc::new(KdebugInode)),
             "self" => Ok(Arc::new(SelfInode)),
             _ => {
                 let pid: usize = name.parse().map_err(|_| Errno::ENOENT)?;
@@ -99,7 +129,19 @@ impl Inode for ProcDirInode {
             1 => Ok(Some(DirEntry::new(200, FileType::Directory, b".."))),
             2 => Ok(Some(DirEntry::new(201, FileType::Regular, b"meminfo"))),
             3 => Ok(Some(DirEntry::new(202, FileType::Symlink, b"self"))),
-            _ => Ok(None),
+            4 => Ok(Some(DirEntry::new(203, FileType::Regular, b"kdebug"))),
+            n => {
+                // Live pids, appended after the always-present entries above
+                // — this is what makes `ls /proc` / BusyBox `ps`'s
+                // `opendir("/proc")` scan see every process (previously
+                // direct lookup like `cat /proc/3/exe` worked but nothing
+                // enumerated them, see this module's top doc comment).
+                let idx = (n - 5) as usize;
+                let pids = crate::process::scheduler::all_pids();
+                let Some(&pid) = pids.get(idx) else { return Ok(None); };
+                let name = format!("{}", pid);
+                Ok(Some(DirEntry::new(pid_dir_ino(pid), FileType::Directory, name.as_bytes())))
+            }
         }
     }
 }
@@ -118,6 +160,27 @@ impl Inode for MeminfoInode {
             return Err(Errno::EROFS);
         }
         Ok(Box::new(ProcFile { data: render_meminfo().into_bytes(), offset: 0 }))
+    }
+}
+
+// ── kdebug file inode ────────────────────────────────────────────────────────
+//
+// Read-only report of `crate::debug`'s state: which tracepoint subsystems
+// are currently enabled, plus the permanent lifecycle counters (forks,
+// execs, reaps, COW faults resolved/failed) — regenerated fresh on every
+// open(), same convention as `/proc/meminfo`.
+struct KdebugInode;
+
+impl Inode for KdebugInode {
+    fn stat(&self) -> Stat {
+        Stat::regular(203, crate::debug::render_report().len() as i64)
+    }
+
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+        if flags.is_write() {
+            return Err(Errno::EROFS);
+        }
+        Ok(Box::new(ProcFile { data: crate::debug::render_report().into_bytes(), offset: 0 }))
     }
 }
 
@@ -167,6 +230,7 @@ impl Inode for ProcPidDirInode {
     fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, Errno> {
         match name {
             "exe" => Ok(Arc::new(ProcExeInode { pid: self.pid })),
+            "stat" => Ok(Arc::new(ProcStatInode { pid: self.pid })),
             _ => Err(Errno::ENOENT),
         }
     }
@@ -177,8 +241,35 @@ impl Inode for ProcPidDirInode {
             0 => Ok(Some(DirEntry::new(ino, FileType::Directory, b"."))),
             1 => Ok(Some(DirEntry::new(ino, FileType::Directory, b".."))),
             2 => Ok(Some(DirEntry::new(pid_exe_ino(self.pid), FileType::Symlink, b"exe"))),
+            3 => Ok(Some(DirEntry::new(pid_stat_ino(self.pid), FileType::Regular, b"stat"))),
             _ => Ok(None),
         }
+    }
+}
+
+// ── /proc/<pid>/stat file inode ──────────────────────────────────────────────
+
+/// See `render_proc_stat`'s doc comment for the format and what backs it.
+struct ProcStatInode {
+    pid: usize,
+}
+
+impl Inode for ProcStatInode {
+    fn stat(&self) -> Stat {
+        let len = crate::process::scheduler::proc_stat_snapshot(self.pid)
+            .map(|s| render_proc_stat(self.pid, &s).len())
+            .unwrap_or(0);
+        Stat::regular(pid_stat_ino(self.pid), len as i64)
+    }
+
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+        if flags.is_write() {
+            return Err(Errno::EROFS);
+        }
+        let snap = crate::process::scheduler::proc_stat_snapshot(self.pid)
+            .ok_or(Errno::ENOENT)?;
+        let data = render_proc_stat(self.pid, &snap).into_bytes();
+        Ok(Box::new(ProcFile { data, offset: 0 }))
     }
 }
 

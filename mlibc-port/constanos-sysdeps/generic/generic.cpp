@@ -23,9 +23,13 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <mntent.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/sysinfo.h>
+#include <sys/utsname.h>
 #include <termios.h>
 
 namespace {
@@ -68,6 +72,12 @@ constexpr long SYS_rmdir = 84;
 constexpr long SYS_unlink = 87;
 constexpr long SYS_lstat = 6;
 constexpr long SYS_readlink = 89;
+constexpr long SYS_access = 21;
+constexpr long SYS_symlink = 88;
+constexpr long SYS_chmod = 90;
+constexpr long SYS_fchmod = 91;
+constexpr long SYS_statvfs = 404;
+constexpr long SYS_uptime_sec = 401;
 constexpr long SYS_dup = 32;
 constexpr long SYS_dup2 = 33;
 constexpr long SYS_fcntl = 72;
@@ -325,6 +335,19 @@ int sys_readlink(const char *path, void *buffer, size_t max_size, ssize_t *lengt
 		return (int)-ret;
 	*length = (ssize_t)ret;
 	return 0;
+}
+
+// access(): no per-uid permission model kernel-side, so this is really just
+// "does the path resolve, and — for W_OK — is it actually writable" (see
+// SYS_access's doc comment in kernel/src/process/syscall.rs for how the
+// kernel answers that without a stat-mode-bits permission check). Without
+// this hook, mlibc's access() short-circuits to ENOSYS on the weak
+// mlibc::sys_access default, which callers that use access() to probe
+// writability (e.g. BusyBox `vi` deciding whether to open readonly) treat
+// as "assume not writable" — so every file looked permanently readonly.
+int sys_access(const char *path, int mode) {
+	long ret = raw_syscall(SYS_access, (long)path, mode);
+	return ret < 0 ? (int)-ret : 0;
 }
 
 // A "directory handle" is just a regular fd here — this kernel's open()
@@ -649,6 +672,184 @@ uid_t sys_getuid() { return 0; }
 uid_t sys_geteuid() { return 0; }
 gid_t sys_getgid() { return 0; }
 gid_t sys_getegid() { return 0; }
+
+// Single-user kernel, single implicit group (root's, gid 0) — `size == 0`
+// is the POSIX "just tell me how many groups there are" probe (must NOT
+// touch `list`, since it may be null/undersized on that call).
+int sys_getgroups(size_t size, gid_t *list, int *ret) {
+	if (size > 0)
+		list[0] = 0;
+	*ret = 1;
+	return 0;
+}
+
+// symlink()/symlinkat(): real symlink creation — this kernel's SYS_symlink
+// stores `target_path` verbatim under `link_path` (writable filesystems
+// only, e.g. ramfs at /tmp; read-only mounts answer EROFS same as
+// mkdir/create there). symlinkat(AT_FDCWD, ...) degrades to plain
+// symlink(), same trick as sys_fchmodat above.
+int sys_symlink(const char *target_path, const char *link_path) {
+	long ret = raw_syscall(SYS_symlink, (long)target_path, (long)link_path);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+int sys_symlinkat(const char *target_path, int dirfd, const char *link_path) {
+	if (dirfd != AT_FDCWD)
+		return ENOSYS;
+	return sys_symlink(target_path, link_path);
+}
+
+// chmod()/fchmod(): this kernel has no per-inode permission-bits storage
+// (see SYS_chmod's doc comment in kernel/src/process/syscall.rs), so these
+// just validate (path exists / fd is open) and otherwise no-op-succeed.
+int sys_chmod(const char *path, mode_t mode) {
+	long ret = raw_syscall(SYS_chmod, (long)path, mode);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+int sys_fchmod(int fd, mode_t mode) {
+	long ret = raw_syscall(SYS_fchmod, fd, mode);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+// fchmodat(AT_FDCWD, path, ...) is just chmod(path, ...) in disguise — same
+// degrade-to-the-plain-path-syscall trick this port already uses for
+// sys_unlinkat/sys_stat's fd_path case, since there's no real dirfd-relative
+// syscall to route a non-AT_FDCWD dirfd to.
+int sys_fchmodat(int dirfd, const char *path, mode_t mode, int) {
+	if (dirfd != AT_FDCWD)
+		return ENOSYS;
+	return sys_chmod(path, mode);
+}
+
+// uname(): fixed, hardcoded fields — this kernel has exactly one "release"
+// (whatever's currently running), no kernel-version negotiation concept for
+// software to probe.
+int sys_uname(struct utsname *out) {
+	auto copy = [](char *dst, const char *src) {
+		size_t i = 0;
+		for (; src[i] && i < 64; i++) dst[i] = src[i];
+		dst[i] = '\0';
+	};
+	copy(out->sysname, "ConstanOS");
+	copy(out->nodename, "constanos");
+	copy(out->release, "0.1.0");
+	copy(out->version, "#1");
+	copy(out->machine, "x86_64");
+	return 0;
+}
+
+// gethostname()/sethostname(): process-local storage (a plain static
+// buffer baked into every process's own copy of this translation unit's
+// globals) — good enough for `hostname` to report/set something
+// consistent within one process's lifetime; a `sethostname` in one shell
+// session won't be visible to a process started afterwards, since there's
+// no kernel-side global to route it through. Nothing in this kernel's
+// current use of `hostname` needs cross-process persistence.
+namespace {
+char g_hostname[65] = "constanos";
+} // namespace
+
+int sys_gethostname(char *buffer, size_t bufsize) {
+	size_t len = __builtin_strlen(g_hostname);
+	if (len + 1 > bufsize)
+		return ENAMETOOLONG;
+	__builtin_memcpy(buffer, g_hostname, len + 1);
+	return 0;
+}
+
+int sys_sethostname(const char *buffer, size_t bufsize) {
+	if (bufsize >= sizeof(g_hostname))
+		return EINVAL;
+	__builtin_memcpy(g_hostname, buffer, bufsize);
+	g_hostname[bufsize] = '\0';
+	return 0;
+}
+
+// statvfs()/fstatvfs(): see SYS_statvfs's doc comment in
+// kernel/src/process/syscall.rs — one physical-memory pool backs every
+// mount here, so both just report the same live Buddy-allocator-derived
+// numbers. fstatvfs has no path to give the kernel (only an fd, and this
+// kernel's statvfs doesn't need one beyond "does something resolve here"),
+// so it passes a fixed "/" — always resolves, and the kernel-side
+// implementation's numbers don't depend on the path anyway.
+int sys_statvfs(const char *path, struct statvfs *out) {
+	long ret = raw_syscall(SYS_statvfs, (long)path, (long)out);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+int sys_fstatvfs(int, struct statvfs *out) {
+	long ret = raw_syscall(SYS_statvfs, (long)"/", (long)out);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+// sysinfo(): not an mlibc sysdep hook — mlibc only declares this under its
+// "linux" option (disabled for this port, see sys/sysinfo.h), so there's no
+// public wrapper function elsewhere to call into a hook. BusyBox `free`
+// calls it unconditionally though (procps/free.c has no /proc/meminfo-only
+// fallback), so this port just defines the public symbol directly (`extern
+// "C"` gives it global linkage regardless of this enclosing namespace),
+// reassembling it from two syscalls this port already has: SYS_statvfs
+// (for total/free bytes — same live Buddy-allocator numbers `df` sees) and
+// SYS_uptime_sec. `mem_unit = 1` sidesteps unit conversion entirely by
+// reporting totalram/freeram as raw bytes instead of block counts.
+// setmntent()/getmntent()/endmntent(): this kernel's mount table is fixed
+// at compile time (see kernel/src/fs/mod.rs's MOUNT LAYOUT), so rather than
+// parse a real /etc/mtab (which doesn't exist — nothing here writes one),
+// this ports that same static table directly. `filename`/`type` are
+// ignored — every "file" this could be asked to open is the same table.
+// `setmntent`'s return value only needs to be a non-null token the other
+// two calls recognize, not a real `FILE*`; nothing dereferences it.
+namespace {
+struct MntRow { const char *fsname; const char *dir; const char *type; const char *opts; };
+constexpr MntRow MNT_TABLE[] = {
+	{"initramfs", "/",     "initramfs", "ro"},
+	{"devfs",     "/dev",  "devfs",     "ro"},
+	{"ramfs",     "/tmp",  "ramfs",     "rw"},
+	{"ext2",      "/mnt",  "ext2",      "ro"},
+	{"procfs",    "/proc", "procfs",    "ro"},
+};
+constexpr size_t MNT_TABLE_LEN = sizeof(MNT_TABLE) / sizeof(MNT_TABLE[0]);
+size_t g_mnt_index = 0;
+struct mntent g_mntent;
+} // namespace
+
+extern "C" FILE *setmntent(const char *, const char *) {
+	g_mnt_index = 0;
+	return (FILE *)&g_mnt_index;
+}
+
+extern "C" struct mntent *getmntent(FILE *) {
+	if (g_mnt_index >= MNT_TABLE_LEN)
+		return nullptr;
+	const MntRow &row = MNT_TABLE[g_mnt_index++];
+	g_mntent.mnt_fsname = (char *)row.fsname;
+	g_mntent.mnt_dir = (char *)row.dir;
+	g_mntent.mnt_type = (char *)row.type;
+	g_mntent.mnt_opts = (char *)row.opts;
+	g_mntent.mnt_freq = 0;
+	g_mntent.mnt_passno = 0;
+	return &g_mntent;
+}
+
+extern "C" int endmntent(FILE *) {
+	g_mnt_index = 0;
+	return 1;
+}
+
+extern "C" int sysinfo(struct sysinfo *info) {
+	__builtin_memset(info, 0, sizeof(*info));
+
+	long up = raw_syscall(SYS_uptime_sec);
+	info->uptime = up > 0 ? up : 0;
+
+	struct statvfs sv{};
+	raw_syscall(SYS_statvfs, (long)"/", (long)&sv);
+	info->totalram = (unsigned long)(sv.f_blocks * sv.f_bsize);
+	info->freeram = (unsigned long)(sv.f_bfree * sv.f_bsize);
+	info->mem_unit = 1;
+	return 0;
+}
 
 // `pid` passes through unconverted — the kernel itself now understands the
 // real POSIX overloads (`0` own process group, `<-1` group `-pid`; `-1`

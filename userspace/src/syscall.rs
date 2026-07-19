@@ -117,6 +117,8 @@ const SYS_EPOLL_CTL: u64 = 233;
 const SYS_UPTIME_MS: u64 = 400;
 const SYS_UPTIME_SEC: u64 = 401;
 const SYS_MEMINFO_KB: u64 = 402;
+const SYS_KDEBUG_CTL: u64 = 403;
+const SYS_MKDIR: u64 = 83;
 
 // ── File I/O ─────────────────────────────────────────────────────────────
 
@@ -136,6 +138,10 @@ pub fn write_str(fd: i32, s: &str) -> i64 {
 /// include a trailing NUL; use [`with_cstr`] to build one from a `&str`.
 pub fn open(path_cstr: &[u8], flags: i32) -> i64 {
     unsafe { syscall2(SYS_OPEN, path_cstr.as_ptr() as u64, flags as u64) }
+}
+
+pub fn mkdir(path_cstr: &[u8]) -> i64 {
+    unsafe { syscall1(SYS_MKDIR, path_cstr.as_ptr() as u64) }
 }
 
 // ── open() flags (must match kernel/src/fs/types.rs::OpenFlags) ────────────
@@ -373,6 +379,21 @@ pub fn uptime_sec() -> i64 {
 /// Free physical memory, in KiB.
 pub fn meminfo_kb() -> i64 {
     unsafe { syscall0(SYS_MEMINFO_KB) }
+}
+
+/// Get the current kernel tracing mask (see `kernel::debug`).
+pub fn kdebug_get_mask() -> i64 {
+    // Explicit 0, 0 for the unused args — never leave stale registers for
+    // the kernel to misread as a pointer/flag (see waitpid()'s past bug of
+    // exactly this shape).
+    unsafe { syscall3(SYS_KDEBUG_CTL, 0, 0, 0) }
+}
+
+/// Enable/disable a tracing subsystem by name (e.g. "mm", "sched", "fs",
+/// "proc") — `name_cstr` must be NUL-terminated (see [`with_cstr`]).
+/// Returns the new mask, or a negative errno if the name is unknown.
+pub fn kdebug_set(name_cstr: &[u8], enable: bool) -> i64 {
+    unsafe { syscall3(SYS_KDEBUG_CTL, 1, name_cstr.as_ptr() as u64, enable as u64) }
 }
 
 /// `struct timespec { i64 tv_sec; i64 tv_nsec; }`

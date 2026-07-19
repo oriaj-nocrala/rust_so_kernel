@@ -61,7 +61,6 @@ static PROGRAMS: [(&str, ProgramSource); 20] = [
     ("shell",     ProgramSource::Elf(include_bytes!("../../embedded/shell.elf"))),
     ("snake",     ProgramSource::Elf(include_bytes!("../../embedded/snake.elf"))),
     ("uptime",    ProgramSource::Elf(include_bytes!("../../embedded/uptime.elf"))),
-    ("sleep",     ProgramSource::Elf(include_bytes!("../../embedded/sleep.elf"))),
     ("tsc",       ProgramSource::Elf(include_bytes!("../../embedded/tsc.elf"))),
     ("ipc_ping",  ProgramSource::Elf(include_bytes!("../../embedded/ipc_ping.elf"))),
     ("mmap_test", ProgramSource::Elf(include_bytes!("../../embedded/mmap_test.elf"))),
@@ -76,6 +75,7 @@ static PROGRAMS: [(&str, ProgramSource); 20] = [
     ("stat_test", ProgramSource::Elf(include_bytes!("../../embedded/stat_test.elf"))),
     ("argv_test", ProgramSource::Elf(include_bytes!("../../embedded/argv_test.elf"))),
     ("jobctl_test", ProgramSource::Elf(include_bytes!("../../embedded/jobctl_test.elf"))),
+    ("kdebug",    ProgramSource::Elf(include_bytes!("../../embedded/kdebug.elf"))),
     // Manually vendored (not built by kernel/build.rs — no Makefile-based
     // C_PROGRAMS support yet): busybox-1.36.1 built out-of-tree against
     // sysroot/ with CONFIG_TRUE=y (only the `true` applet) as a first

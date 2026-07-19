@@ -210,25 +210,34 @@ impl AddressSpace {
         fault_addr: u64,
         vma_flags: PageTableFlags,
     ) -> Result<(), &'static str> {
+        use crate::debug::MM;
+
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(fault_addr));
-        let old_frame = self.translate_page(page).ok_or("COW: page not mapped")?;
+        let old_frame = match self.translate_page(page) {
+            Some(f) => f,
+            None => {
+                crate::debug::inc_cow_failed();
+                return Err("COW: page not mapped");
+            }
+        };
 
         // ── Zero-page: promote the shared zero frame to a private writable copy.
         // Must be checked BEFORE the refcount path (zero frame has refcount 0).
         if crate::memory::cow::is_zero_frame(old_frame) {
             let phys_offset = crate::memory::physical_memory_offset();
-            let new_frame = crate::allocator::phys_alloc(12)
-                .map(|a| PhysFrame::containing_address(a))
-                .ok_or("COW zero-frame: OOM")?;
+            let Some(new_frame) = crate::allocator::phys_alloc(12).map(|a| PhysFrame::containing_address(a)) else {
+                crate::debug::inc_cow_failed();
+                return Err("COW zero-frame: OOM");
+            };
             crate::memory::cow::set_ref(new_frame, 1);
             let dst = (phys_offset + new_frame.start_address().as_u64()).as_mut_ptr::<u8>();
             core::ptr::write_bytes(dst, 0, 4096);
             // Do NOT dec_ref the zero frame — it is permanent.
-            crate::serial_println!(
-                "[COW] zero-frame promotion at {:#x} → new_frame {:#x}",
-                fault_addr, new_frame.start_address().as_u64()
-            );
-            return self.page_table.unmap_and_remap(page, new_frame, vma_flags);
+            crate::ktrace!(MM, "zero-frame promotion at {:#x} -> new_frame {:#x}",
+                fault_addr, new_frame.start_address().as_u64());
+            let r = self.page_table.unmap_and_remap(page, new_frame, vma_flags);
+            if r.is_ok() { crate::debug::inc_cow_resolved(); } else { crate::debug::inc_cow_failed(); }
+            return r;
         }
 
         let refcount = crate::memory::cow::get_ref(old_frame);
@@ -238,8 +247,7 @@ impl AddressSpace {
             core::arch::asm!("mov {}, cr3", out(reg) cr3_val);
             cr3_val
         };
-        crate::serial_println!(
-            "[COW] addr={:#x} old_frame={:#x} ref={} vma_flags={:#x} pml4={:#x} cr3={:#x}",
+        crate::ktrace!(MM, "addr={:#x} old_frame={:#x} ref={} vma_flags={:#x} pml4={:#x} cr3={:#x}",
             fault_addr,
             old_frame.start_address().as_u64(),
             refcount,
@@ -248,31 +256,29 @@ impl AddressSpace {
             cr3,
         );
 
-        if refcount <= 1 {
+        let r = if refcount <= 1 {
             // Last owner — just restore the WRITABLE flag (no copy).
             let levels_before = self.page_table.get_pte_all_levels(page);
-            crate::serial_println!(
-                "[COW] path=update_flags  PTE_all=[{:#x},{:#x},{:#x},{:#x}]",
-                levels_before[0], levels_before[1], levels_before[2], levels_before[3]
-            );
+            crate::ktrace!(MM, "path=update_flags PTE_all=[{:#x},{:#x},{:#x},{:#x}]",
+                levels_before[0], levels_before[1], levels_before[2], levels_before[3]);
             let r = self.page_table.update_page_flags(page, vma_flags);
             let pte_after = self.page_table.get_pte_raw(page);
-            crate::serial_println!("[COW] update_flags result={} PTE_leaf_after={:#x}",
-                r.is_ok(), pte_after);
+            crate::ktrace!(MM, "update_flags result={} PTE_leaf_after={:#x}", r.is_ok(), pte_after);
             r
         } else {
             // Shared frame — allocate a new frame and copy.
             let phys_offset = crate::memory::physical_memory_offset();
 
             let new_frame = unsafe {
-                crate::allocator::phys_alloc(12)
-                    .map(|a| PhysFrame::containing_address(a))
-                    .ok_or("COW: out of memory")?
+                match crate::allocator::phys_alloc(12).map(|a| PhysFrame::containing_address(a)) {
+                    Some(f) => f,
+                    None => {
+                        crate::debug::inc_cow_failed();
+                        return Err("COW: out of memory");
+                    }
+                }
             };
-            crate::serial_println!(
-                "[COW] path=copy new_frame={:#x}",
-                new_frame.start_address().as_u64()
-            );
+            crate::ktrace!(MM, "path=copy new_frame={:#x}", new_frame.start_address().as_u64());
             crate::memory::cow::set_ref(new_frame, 1);
 
             // Copy 4 KiB from the shared frame to the private frame.
@@ -282,17 +288,14 @@ impl AddressSpace {
 
             // Replace the page table entry with the new private frame.
             let r = self.page_table.unmap_and_remap(page, new_frame, vma_flags);
-            crate::serial_println!("[COW] unmap_and_remap result: {}", r.is_ok());
+            crate::ktrace!(MM, "unmap_and_remap result: {}", r.is_ok());
 
             // Verify fix
             if let Some(f) = self.translate_page(page) {
-                crate::serial_println!(
-                    "[COW] after fix: frame={:#x} (expected {:#x})",
-                    f.start_address().as_u64(),
-                    new_frame.start_address().as_u64()
-                );
+                crate::ktrace!(MM, "after fix: frame={:#x} (expected {:#x})",
+                    f.start_address().as_u64(), new_frame.start_address().as_u64());
             } else {
-                crate::serial_println!("[COW] after fix: translate_page returned None!");
+                crate::ktrace!(MM, "after fix: translate_page returned None!");
             }
 
             // Drop our share of the old frame.
@@ -301,7 +304,9 @@ impl AddressSpace {
             }
 
             r
-        }
+        };
+        if r.is_ok() { crate::debug::inc_cow_resolved(); } else { crate::debug::inc_cow_failed(); }
+        r
     }
 
     // ====================================================================

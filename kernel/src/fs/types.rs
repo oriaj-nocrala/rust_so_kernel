@@ -167,6 +167,22 @@ impl Stat {
         }
     }
 
+    /// Construct a regular-file stat with the owner-write bit set (`0o644`)
+    /// — for filesystems where files are genuinely writable (ramfs). Every
+    /// other regular-file constructor here reports `0o444`/read-only
+    /// permission bits, which is correct for initramfs/ext2/procfs but was
+    /// *also* being used for ramfs, even though `write()` on those handles
+    /// genuinely succeeds: userspace code that checks `st_mode`'s write
+    /// bits directly instead of (or in addition to, e.g. BusyBox `vi`'s
+    /// `access(fn, W_OK) < 0 || !(st_mode & (S_IWUSR|...))` readonly check)
+    /// calling `access()` was seeing a permanent false "not writable" no
+    /// matter which mount the file was actually on.
+    pub fn regular_writable(ino: u64, size: i64) -> Self {
+        let mut s = Self::regular(ino, size);
+        s.st_mode = FileType::Regular.as_mode_bits() | 0o644;
+        s
+    }
+
     /// Construct a regular-file stat with the execute bits set (`0o555` —
     /// still read-only, no write, same as `regular()`). Used for
     /// initramfs's embedded ELF binaries: they genuinely are executable

@@ -362,6 +362,7 @@ impl Process {
             "Creating FORKED process PID {} (parent PID {})",
             pid.0, parent_pid.0,
         );
+        crate::debug::inc_forks();
         Process {
             pid,
             parent_pid: Some(parent_pid),

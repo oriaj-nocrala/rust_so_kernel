@@ -173,6 +173,16 @@ impl Inode for RamDirNode {
         entries.insert(name.to_string(), node);
         Ok(())
     }
+
+    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn Inode>, Errno> {
+        let mut entries = self.entries.lock();
+        if entries.contains_key(name) {
+            return Err(Errno::EEXIST);
+        }
+        let node = Arc::new(RamSymlinkNode { ino: alloc_ino(), target: target.to_string() });
+        entries.insert(name.to_string(), node.clone() as Arc<dyn Inode>);
+        Ok(node as Arc<dyn Inode>)
+    }
 }
 
 /// Directory handle: serves `getdents64` off the open-time snapshot.
@@ -222,7 +232,7 @@ struct RamFileNode {
 
 impl Inode for RamFileNode {
     fn stat(&self) -> Stat {
-        Stat::regular(self.ino, self.data.lock().len() as i64)
+        Stat::regular_writable(self.ino, self.data.lock().len() as i64)
     }
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
@@ -239,6 +249,36 @@ impl Inode for RamFileNode {
             data: self.data.clone(),
             offset: Arc::new(Mutex::new(offset)),
         }))
+    }
+}
+
+// ── Symlink inode ────────────────────────────────────────────────────────────
+
+/// A real, persisted (for this boot — ramfs isn't disk-backed) symlink,
+/// created via `symlink(2)` (`RamDirNode::symlink`). Unlike the synthetic
+/// symlink inodes elsewhere in this VFS (`fs::procfs::SelfInode`,
+/// `fs::initramfs::BusyboxAppletInode`) which compute their target on the
+/// fly, this one just stores whatever string `symlink()` was called with —
+/// same as a real filesystem's symlink.
+struct RamSymlinkNode {
+    ino:    u64,
+    target: String,
+}
+
+impl Inode for RamSymlinkNode {
+    fn stat(&self) -> Stat {
+        Stat::symlink(self.ino, self.target.len() as i64)
+    }
+
+    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+        // Real Unix: open() without O_NOFOLLOW follows the symlink, so this
+        // is unreachable through normal traversal — same reasoning as
+        // procfs::SelfInode::open().
+        Err(Errno::EINVAL)
+    }
+
+    fn readlink(&self) -> Result<String, Errno> {
+        Ok(self.target.clone())
     }
 }
 
@@ -279,7 +319,7 @@ impl FileHandle for RamFileHandle {
     }
 
     fn stat(&self) -> Option<Stat> {
-        Some(Stat::regular(self.ino, self.data.lock().len() as i64))
+        Some(Stat::regular_writable(self.ino, self.data.lock().len() as i64))
     }
 
     fn dup(&self) -> Option<Box<dyn FileHandle>> {

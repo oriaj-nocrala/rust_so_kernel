@@ -20,6 +20,15 @@
 // (see that function's doc comment). This is what makes `ls /` show `bin`,
 // `dev`, `tmp`, `proc`, etc. instead of just `bin`.
 //
+// BusyBox applets (vi, grep, sed, ...) do NOT get a symlink here — this
+// filesystem is compile-time-baked and read-only, so a symlink under /bin
+// could only ever be a synthetic, computed-on-the-fly stand-in for a real
+// one. Real symlinks belong on a writable mount: `init::processes`'s PID 1
+// runs actual `busybox --install -s /tmp/bin` at boot (real `symlink(2)`,
+// see `ramfs::RamDirNode::symlink`), the same mechanism a real Linux install
+// uses (one multi-call binary + real symlinks + argv[0] dispatch) — nothing
+// synthetic, no kernel-side awareness of the applet list required.
+//
 // All files are read-only.  Writes return EROFS.
 // Inode numbers: 1 = root dir, 2 = /bin dir, 3+ = files (registry index + 3),
 // 100+ = mount placeholder dirs (index into `direct_children`, cosmetic only).
@@ -39,6 +48,7 @@ use crate::process::{
 const ROOT_INO: u64 = 1;
 const BIN_INO: u64 = 2;
 const MOUNT_PLACEHOLDER_INO_BASE: u64 = 100;
+const BUSYBOX_APPLET_INO_BASE: u64 = 1000;
 
 // ── Filesystem ───────────────────────────────────────────────────────────────
 
