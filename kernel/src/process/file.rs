@@ -31,6 +31,31 @@ pub enum FileError {
 
 pub type FileResult<T> = Result<T, FileError>;
 
+/// Shared `lseek(2)` offset arithmetic for regular-file handles (ramfs,
+/// initramfs, ext2) — same SEEK_SET/SEEK_CUR/SEEK_END semantics, only the
+/// "current position" and "file size" inputs differ per filesystem.
+/// Negative results (seeking before byte 0) are rejected; seeking past
+/// EOF is allowed (real `lseek` permits it — the next `read()` just
+/// returns 0, or, for filesystems with write support, a later `write()`
+/// there would create a hole).
+pub fn compute_seek(current: i64, size: i64, offset: i64, whence: i32) -> FileResult<i64> {
+    const SEEK_SET: i32 = 0;
+    const SEEK_CUR: i32 = 1;
+    const SEEK_END: i32 = 2;
+
+    let base = match whence {
+        SEEK_SET => 0,
+        SEEK_CUR => current,
+        SEEK_END => size,
+        _ => return Err(FileError::InvalidArgument),
+    };
+    let new_pos = base.checked_add(offset).ok_or(FileError::InvalidArgument)?;
+    if new_pos < 0 {
+        return Err(FileError::InvalidArgument);
+    }
+    Ok(new_pos)
+}
+
 // ============================================================================
 // TRAIT: FileHandle
 // ============================================================================
@@ -83,6 +108,17 @@ pub trait FileHandle: Send {
     /// underlying buffer — required for pipe semantics across fork.
     fn dup(&self) -> Option<Box<dyn FileHandle>> {
         None
+    }
+
+    /// Reposition the file offset. `whence` uses the same values as real
+    /// `lseek(2)`: 0 = SEEK_SET, 1 = SEEK_CUR, 2 = SEEK_END. Returns the
+    /// new absolute offset.
+    ///
+    /// Default `NotSupported` — correct for character devices and pipes
+    /// (no meaningful position). Regular-file handles (ramfs, initramfs,
+    /// ext2) override this.
+    fn seek(&mut self, _offset: i64, _whence: i32) -> FileResult<i64> {
+        Err(FileError::NotSupported)
     }
 }
 

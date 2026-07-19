@@ -244,6 +244,13 @@ impl FileHandle for RamFile {
         Some(Box::new(RamFile { data: self.data, offset: self.offset.clone() }))
     }
 
+    fn seek(&mut self, offset: i64, whence: i32) -> FileResult<i64> {
+        let mut cur = self.offset.lock();
+        let new_pos = crate::process::file::compute_seek(*cur as i64, self.data.len() as i64, offset, whence)?;
+        *cur = new_pos as usize;
+        Ok(new_pos)
+    }
+
     fn name(&self) -> &str { "initramfs" }
 }
 

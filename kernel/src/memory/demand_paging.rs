@@ -39,7 +39,6 @@ use crate::memory::page_table_manager::BuddyFrameAllocator;
 // Page fault error code bits
 const PF_PRESENT: u64 = 1 << 0;    // 0 = not present, 1 = protection violation
 const PF_WRITE: u64 = 1 << 1;      // 0 = read, 1 = write
-const PF_USER: u64 = 1 << 2;       // 0 = kernel mode, 1 = user mode
 const PF_RESERVED: u64 = 1 << 3;   // 1 = reserved bit set in page table
 
 /// Read CR2 (faulting address) via inline assembly.
@@ -54,22 +53,35 @@ pub fn read_cr2() -> u64 {
 
 /// Pre-filter: can this page fault potentially be resolved by demand paging?
 ///
-/// Returns `Ok(())` if the fault is a candidate (user-mode, not-present).
+/// Returns `Ok(())` if the fault is a candidate (not-present, non-reserved).
 /// Returns `Err(reason)` if the fault is definitely not demand-pageable.
 ///
 /// This is a pure function of the CPU error code — no process state needed.
+///
+/// Deliberately NOT gated on `PF_USER` — same reasoning as the COW-fault
+/// check in `init/devices.rs::page_fault_handler`, which this mirrors: a
+/// syscall handler (`read()`, `getdents64()`, ...) writes into the
+/// *calling* process's own buffer using its own CR3/address space, but
+/// executes in ring 0, so the exact same "first touch of a freshly
+/// mmap'd/never-yet-faulted anonymous page" fault can arrive with
+/// `PF_USER` clear instead of set — confirmed live: `doom`'s WAD loader
+/// (`sys_read` into a buffer straight off `malloc()`, never touched from
+/// user mode first) reliably panicked the kernel here before this fix.
+/// Safe to drop the check for the same reason the COW case already is:
+/// the caller's subsequent VMA lookup (`find_vma_fast`) only ever matches
+/// an address inside the *current* process's own registered VMA, so a
+/// fault on real kernel memory still correctly falls through un-resolved
+/// (panics) either way — this only ever widens what's demand-pageable,
+/// never what's excused from the "no VMA" panic.
 pub fn is_demand_pageable(error_code: u64) -> Result<(), &'static str> {
     if error_code & PF_RESERVED != 0 {
         return Err("Reserved bit set in page table entry");
     }
 
-    if error_code & PF_USER == 0 {
-        return Err("Kernel-mode page fault (not demand-pageable)");
-    }
-
     if error_code & PF_PRESENT != 0 {
-        // Page IS present but faulted → protection violation.
-        // Future: this is where Copy-on-Write would go.
+        // Page IS present but faulted → protection violation (the COW
+        // case is already handled earlier, before this function is ever
+        // called — see page_fault_handler).
         return Err("Protection violation (page present, future CoW)");
     }
 

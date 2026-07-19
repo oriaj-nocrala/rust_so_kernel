@@ -64,10 +64,23 @@ fn ensure_ext2_disk_image() -> PathBuf {
         return disk_path;
     }
 
-    println!("cargo:warning=disk.img missing — creating a 16MiB ext2 image seeded from disk-image-root/...");
+    // Freedoom's IWAD (~29MB, see scripts/fetch-freedoom.sh) is seeded into
+    // this same image — fetch it first so mke2fs picks it up below.
+    println!("cargo:rerun-if-changed={}", manifest_dir.join("scripts/fetch-freedoom.sh").display());
+    if !seed_dir.join("freedoom1.wad").exists() {
+        println!("cargo:warning=freedoom1.wad missing — downloading Freedoom...");
+        let status = Command::new("bash")
+            .arg(manifest_dir.join("scripts/fetch-freedoom.sh"))
+            .current_dir(&manifest_dir)
+            .status()
+            .expect("Failed to spawn scripts/fetch-freedoom.sh");
+        assert!(status.success(), "scripts/fetch-freedoom.sh failed");
+    }
+
+    println!("cargo:warning=disk.img missing — creating a 48MiB ext2 image seeded from disk-image-root/...");
 
     let status = Command::new("dd")
-        .args(["if=/dev/zero", "bs=1M", "count=16"])
+        .args(["if=/dev/zero", "bs=1M", "count=48"])
         .arg(format!("of={}", disk_path.display()))
         .status()
         .expect("Failed to spawn dd for disk.img");
@@ -110,15 +123,50 @@ fn ensure_ext2_disk_image() -> PathBuf {
 /// that combination panics inside cargo itself ("no entry found for key" in
 /// unit_dependencies.rs) on every nightly tested — a known upstream
 /// limitation, not something fixable from this repo's config.
+/// Emit `cargo:rerun-if-changed` for every file under `dir`, recursively.
+///
+/// Same helper (and same lesson) as kernel/build.rs: a directory-level
+/// `rerun-if-changed` only notices files being added/removed — editing an
+/// existing file in place doesn't touch the directory's mtime, so this
+/// build script silently skips rerunning and QEMU boots a stale image
+/// (confirmed live: an edit to doom-port/doomgeneric_constanos.c alone
+/// produced a 0.04s "Finished" no-op build). `target`/`.git` are outputs,
+/// not inputs — watching them would dirty every build.
+fn watch_dir_recursive(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        if name == "target" || name == ".git" {
+            continue;
+        }
+        if path.is_dir() {
+            watch_dir_recursive(&path);
+        } else {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+}
+
 fn build_kernel() -> PathBuf {
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let kernel_dir = manifest_dir.join("kernel");
 
-    println!("cargo:rerun-if-changed={}", kernel_dir.join("src").display());
+    // Every *input* of the nested kernel build (which itself builds all
+    // userspace) must be watched from up here too — the nested build only
+    // runs at all if this script reruns. NOT kernel/embedded: those files
+    // are rewritten by the nested build on every run (outputs, not
+    // inputs), so watching them would make this script permanently dirty.
+    watch_dir_recursive(&kernel_dir.join("src"));
+    watch_dir_recursive(&manifest_dir.join("userspace/src"));
+    watch_dir_recursive(&manifest_dir.join("userspace/c"));
+    watch_dir_recursive(&manifest_dir.join("mlibc-port"));
+    watch_dir_recursive(&manifest_dir.join("doom-port"));
+    watch_dir_recursive(&manifest_dir.join("scripts"));
+    watch_dir_recursive(&manifest_dir.join("busybox-config"));
     println!("cargo:rerun-if-changed={}", kernel_dir.join("Cargo.toml").display());
     println!("cargo:rerun-if-changed={}", kernel_dir.join(".cargo/config.toml").display());
     println!("cargo:rerun-if-changed={}", kernel_dir.join("build.rs").display());
-    println!("cargo:rerun-if-changed={}", kernel_dir.join("embedded").display());
 
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());

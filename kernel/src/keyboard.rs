@@ -44,6 +44,17 @@ pub fn process_scancode(scancode: u8) {
 
     let ext = EXT.swap(false, Ordering::Relaxed);
 
+    // Raw press/release event, pushed unconditionally before any of the
+    // char-decoding branches below — a client reading `/dev/kbdraw` (e.g.
+    // a ported game needing real key-up events for movement/action keys)
+    // gets every transition regardless of whether this scancode also
+    // produces a character down in the ASCII/ANSI path.
+    {
+        let pressed = scancode < 0x80;
+        let keycode = if ext { 0x80 | (scancode & 0x7F) } else { scancode & 0x7F };
+        crate::keyboard_buffer::RAW_KEY_EVENTS.push(keycode, pressed);
+    }
+
     // ── Key release (bit 7 set) ──────────────────────────────────────────
     if scancode >= 0x80 {
         let base = scancode & 0x7F;
@@ -100,6 +111,12 @@ pub fn read_key() -> Option<char> {
 /// Used by poll/epoll to check POLLIN readiness for fd=0 (stdin).
 pub fn read_key_peek() -> bool {
     KEYBOARD_BUFFER.peek()
+}
+
+/// Non-blocking read of the next raw press/release transition — see
+/// `keyboard_buffer::RAW_KEY_EVENTS`.
+pub fn read_raw_event() -> Option<crate::keyboard_buffer::RawKeyEvent> {
+    crate::keyboard_buffer::RAW_KEY_EVENTS.pop()
 }
 
 // ============================================================================

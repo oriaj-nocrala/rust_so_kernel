@@ -1287,10 +1287,28 @@ fn sys_munmap(addr: u64, length: u64) -> SyscallResult {
 /// Seeking on character devices (console, keyboard) is not meaningful;
 /// return ESPIPE just like Linux does for pipes.  When we have a VFS,
 /// this will delegate to the file's seek method.
-fn sys_lseek(fd: i32, _offset: i64, _whence: i32) -> SyscallResult {
+/// lseek(8): off_t lseek(int fd, off_t offset, int whence)
+///
+/// Real seek support for regular-file handles (ramfs, initramfs, ext2 —
+/// see their `FileHandle::seek` impls); character devices and pipes still
+/// report `ESPIPE` via the trait's default. This used to be a blanket
+/// stub returning `ESPIPE` unconditionally, written back when every fd
+/// really was a character device — never updated once regular files
+/// existed, which silently broke any program doing non-sequential reads
+/// on a real file (confirmed live: `doom`'s WAD loader, which seeks
+/// around a WAD's lump directory instead of reading it start-to-end).
+fn sys_lseek(fd: i32, offset: i64, whence: i32) -> SyscallResult {
     if fd < 0 || fd >= 16 { return errno::EBADF; }
-    // All current fds are character devices — not seekable.
-    errno::ESPIPE
+    with_current_process(|proc| {
+        match proc.files.lock().get_mut(fd as usize) {
+            Ok(file) => match file.seek(offset, whence) {
+                Ok(pos) => pos,
+                Err(super::file::FileError::NotSupported) => errno::ESPIPE,
+                Err(_) => errno::EINVAL,
+            },
+            Err(_) => errno::EBADF,
+        }
+    })
 }
 
 // ── brk(12) ────────────────────────────────────────────────────────────────
@@ -1313,6 +1331,17 @@ fn sys_brk(_addr: u64) -> SyscallResult {
 /// as real glibc does — see `mlibc-port/.../generic.cpp::sys_tcgetattr`),
 /// `tcgetpgrp`/`tcsetpgrp` (TIOCGPGRP/TIOCSPGRP — mlibc calls `ioctl()`
 /// directly for these, not a sysdeps hook), and terminal-size queries.
+/// A blit request's fixed-size argument struct, written by userspace into
+/// the buffer `FBIO_BLIT`'s `argp` points at: a pointer to its own
+/// `0x00RRGGBB`-packed pixel buffer plus that buffer's dimensions. Matches
+/// C layout so a C caller can just define the equivalent struct directly.
+#[repr(C)]
+struct FbBlitArgs {
+    ptr: u64,
+    width: u32,
+    height: u32,
+}
+
 fn sys_ioctl(fd: i32, request: u64, argp: u64) -> SyscallResult {
     const TCGETS: u64 = 0x5401;
     const TCSETS: u64 = 0x5402;
@@ -1321,8 +1350,37 @@ fn sys_ioctl(fd: i32, request: u64, argp: u64) -> SyscallResult {
     const TIOCGWINSZ: u64 = 0x5413;
     const TIOCGPGRP: u64 = 0x540F;
     const TIOCSPGRP: u64 = 0x5410;
+    // Custom, this-kernel-only request code (not a real Linux fbdev ioctl —
+    // real fbdev exposes the framebuffer via mmap; we don't support
+    // device-backed mmap, so a raw-pixel client instead hands us its own
+    // offscreen buffer once per frame and we blit it in).
+    const FBIO_BLIT: u64 = 0x4642_0001;
 
     if fd < 0 { return errno::EBADF; }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum FdKind { Serial, Fb, Other }
+
+    // Classify the driver backing `fd`, under the same cli/SCHEDULER-lock/
+    // sti dance every other fd-identity check in this function uses (never
+    // by fd number — see the `is_tty` doc below for why that breaks under
+    // `dup`). An owned enum (not the handle's borrowed `&str` name) so the
+    // result can outlive the lock guard it was computed under.
+    let fd_kind = {
+        unsafe { core::arch::asm!("cli"); }
+        let result = {
+            let mut sched = super::scheduler::local_scheduler();
+            sched.running_mut().and_then(|proc| {
+                proc.files.lock().get(fd as usize).ok().map(|f| match f.name() {
+                    "serial" => FdKind::Serial,
+                    "fb" => FdKind::Fb,
+                    _ => FdKind::Other,
+                })
+            })
+        };
+        unsafe { core::arch::asm!("sti"); }
+        result
+    };
 
     // A handle counts as a tty if it's actually backed by the console
     // driver (serial or framebuffer) — checked by the handle's identity,
@@ -1333,19 +1391,7 @@ fn sys_ioctl(fd: i32, request: u64, argp: u64) -> SyscallResult {
     // fd >= 10 before calling `tcgetpgrp()` on *that* fd — confirmed live,
     // this was silently sending ash down its "can't access tty, job
     // control turned off" fallback path.
-    let is_tty = {
-        unsafe { core::arch::asm!("cli"); }
-        let result = {
-            let mut sched = super::scheduler::local_scheduler();
-            sched.running_mut().map(|proc| {
-                proc.files.lock().get(fd as usize).ok()
-                    .map(|f| matches!(f.name(), "serial" | "fb"))
-                    .unwrap_or(false)
-            }).unwrap_or(false)
-        };
-        unsafe { core::arch::asm!("sti"); }
-        result
-    };
+    let is_tty = matches!(fd_kind, Some(FdKind::Serial) | Some(FdKind::Fb));
 
     match request {
         TCGETS => {
@@ -1403,6 +1449,23 @@ fn sys_ioctl(fd: i32, request: u64, argp: u64) -> SyscallResult {
             let pgid = unsafe { *(argp as *const i32) };
             if pgid <= 0 { return errno::EINVAL; }
             crate::tty::FOREGROUND_PGID.store(pgid as u32, core::sync::atomic::Ordering::Relaxed);
+            0
+        }
+        FBIO_BLIT => {
+            if fd_kind != Some(FdKind::Fb) { return errno::ENOTTY; }
+            const SZ: usize = core::mem::size_of::<FbBlitArgs>();
+            if let Err(e) = validate_user_buffer(argp, SZ) { return e; }
+            let args = unsafe { core::ptr::read(argp as *const FbBlitArgs) };
+            let (w, h) = (args.width as usize, args.height as usize);
+            // Bound the claimed size before trusting it for the slice
+            // length below — an unchecked w*h here is a user-controlled
+            // out-of-bounds read.
+            if w == 0 || h == 0 || w > 4096 || h > 4096 { return errno::EINVAL; }
+            if let Err(e) = validate_user_buffer(args.ptr, w * h * 4) { return e; }
+            let src = unsafe { core::slice::from_raw_parts(args.ptr as *const u32, w * h) };
+            if let Some(fb) = crate::framebuffer::FRAMEBUFFER.lock().as_mut() {
+                fb.blit_scaled(src, w, h);
+            }
             0
         }
         _ => errno::EINVAL,

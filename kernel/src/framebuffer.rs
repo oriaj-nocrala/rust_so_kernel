@@ -135,6 +135,50 @@ impl Framebuffer {
     pub fn dimensions(&self) -> (usize, usize) {
         (self.width, self.height)
     }
+
+    /// Blits a `0x00RRGGBB`-packed `src_w`x`src_h` buffer onto the real
+    /// framebuffer, nearest-neighbor scaled up by the largest integer
+    /// factor that still fits (never distorts aspect ratio) and centered
+    /// (letterboxed) — used by raw-pixel userspace clients (e.g. a ported
+    /// game) that draw into their own small offscreen buffer instead of
+    /// going through the text console's char/ANSI layer.
+    pub fn blit_scaled(&mut self, src: &[u32], src_w: usize, src_h: usize) {
+        if src_w == 0 || src_h == 0 || src.len() < src_w * src_h {
+            return;
+        }
+        let scale = core::cmp::max(1, core::cmp::min(self.width / src_w, self.height / src_h));
+        let dst_w = src_w * scale;
+        let dst_h = src_h * scale;
+        let off_x = (self.width.saturating_sub(dst_w)) / 2;
+        let off_y = (self.height.saturating_sub(dst_h)) / 2;
+
+        let buffer = unsafe {
+            core::slice::from_raw_parts_mut(self.buffer.as_ptr(), self.height * self.stride * self.bytes_per_pixel)
+        };
+
+        for sy in 0..src_h {
+            let src_row = sy * src_w;
+            for sx in 0..src_w {
+                let p = src[src_row + sx];
+                let r = ((p >> 16) & 0xFF) as u8;
+                let g = ((p >> 8) & 0xFF) as u8;
+                let b = (p & 0xFF) as u8;
+                for oy in 0..scale {
+                    let dy = off_y + sy * scale + oy;
+                    let row_off = dy * self.stride * self.bytes_per_pixel;
+                    for ox in 0..scale {
+                        let dx = off_x + sx * scale + ox;
+                        let offset = row_off + dx * self.bytes_per_pixel;
+                        if offset + self.bytes_per_pixel <= buffer.len() {
+                            buffer[offset] = b;
+                            buffer[offset + 1] = g;
+                            buffer[offset + 2] = r;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

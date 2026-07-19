@@ -9,9 +9,11 @@
 // "por implementar" notes): read-only. No write support (no block/inode
 // allocation, no bitmap updates) — that's real complexity (crash-safety,
 // allocator correctness) saved for later, once this read path has proven
-// itself. Direct + singly-indirect blocks only (doubly/triply indirect not
-// implemented) — enough for the kind of small files this image ships with;
-// a file needing those simply reads short rather than corrupting anything.
+// itself. Direct, singly-indirect, and doubly-indirect blocks (see
+// `block_for_index`) — up to ptrs_per_block² + ptrs_per_block + 12 blocks,
+// 64MiB+ at this driver's 1024-byte block size — triply-indirect isn't
+// implemented (nothing this image ships needs a file bigger than that);
+// a file needing that simply reads short rather than corrupting anything.
 //
 // Requires `s_feature_incompat` to only have FILETYPE set — anything else
 // (in particular EXTENTS, i.e. an ext4 image) would misinterpret i_block
@@ -163,26 +165,51 @@ impl Ext2Fs {
     }
 
     /// Map a file-relative block index to a filesystem block number.
-    /// Direct (0..12) and singly-indirect (12..12+ptrs_per_block) only —
-    /// returns `None` beyond that (see module doc comment).
+    /// Direct (0..12), singly-indirect, and doubly-indirect — returns
+    /// `None` beyond that (see module doc comment: triply-indirect would
+    /// only matter for files bigger than doubly-indirect's own reach,
+    /// ptrs_per_block² blocks — 64MiB+ at the 1024-byte block size this
+    /// driver is built around — not needed by anything this image ships).
     fn block_for_index(&self, raw: &RawInode, index: u32) -> Option<u32> {
         if index < 12 {
             let b = raw.i_block[index as usize];
             return if b == 0 { None } else { Some(b) };
         }
         let ptrs_per_block = self.block_size / 4;
+
         let indirect_index = index - 12;
         if indirect_index < ptrs_per_block {
             let indirect_block = raw.i_block[12];
             if indirect_block == 0 {
                 return None;
             }
-            let buf = self.block_vec(indirect_block);
-            let off = (indirect_index * 4) as usize;
-            let b = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-            return if b == 0 { None } else { Some(b) };
+            return self.read_block_ptr(indirect_block, indirect_index);
         }
-        None // doubly/triply indirect — not implemented
+
+        let dbl_index = indirect_index - ptrs_per_block;
+        let dbl_capacity = ptrs_per_block * ptrs_per_block;
+        if dbl_index < dbl_capacity {
+            let dbl_indirect_block = raw.i_block[13];
+            if dbl_indirect_block == 0 {
+                return None;
+            }
+            let first_level_index = dbl_index / ptrs_per_block;
+            let second_level_index = dbl_index % ptrs_per_block;
+            let first_level_block = self.read_block_ptr(dbl_indirect_block, first_level_index)?;
+            return self.read_block_ptr(first_level_block, second_level_index);
+        }
+
+        None // triply indirect — not implemented
+    }
+
+    /// Read the `index`-th block-pointer `u32` out of an indirect (or
+    /// doubly-indirect first-level) pointer block — shared by both levels
+    /// of `block_for_index` above.
+    fn read_block_ptr(&self, block_num: u32, index: u32) -> Option<u32> {
+        let buf = self.block_vec(block_num);
+        let off = (index * 4) as usize;
+        let b = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        if b == 0 { None } else { Some(b) }
     }
 
     /// Read `buf.len()` bytes of file data starting at byte `offset`.
@@ -405,6 +432,13 @@ impl FileHandle for Ext2FileHandle {
             raw: self.raw.clone(),
             offset: self.offset.clone(),
         }))
+    }
+
+    fn seek(&mut self, offset: i64, whence: i32) -> FileResult<i64> {
+        let mut cur = self.offset.lock();
+        let new_pos = crate::process::file::compute_seek(*cur as i64, self.raw.size as i64, offset, whence)?;
+        *cur = new_pos as usize;
+        Ok(new_pos)
     }
 
     fn name(&self) -> &str { "ext2" }

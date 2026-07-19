@@ -37,12 +37,19 @@ const C_PROGRAMS: &[(&str, &str)] = &[
     ("argv_test", "argv_test.elf"),
     ("jobctl_test", "jobctl_test.elf"),
     ("kdebug", "kdebug.elf"),
+    ("wadio", "wadio.elf"),
 ];
 
 /// Not built here at all — see the busybox.elf handling below, which
 /// shells out to scripts/build-busybox.sh (a `make`-based external build,
 /// nothing like the Rust/C recipes above) only when the output is missing.
 const BUSYBOX_ELF: &str = "busybox.elf";
+
+/// Same "external build, only if missing" shape as BUSYBOX_ELF, but for
+/// doomgeneric (git submodule + our own doom-port/ platform file) via
+/// scripts/build-doom.sh — a whole-engine multi-file C build that doesn't
+/// fit the one-.c-file-per-program C_PROGRAMS loop below.
+const DOOM_ELF: &str = "doom.elf";
 
 /// Emit `cargo:rerun-if-changed` for every file under `dir`, recursively.
 ///
@@ -93,6 +100,8 @@ fn main() {
         workspace_root.join("scripts/setup-mlibc.sh"),
         workspace_root.join("scripts/build-busybox.sh"),
         workspace_root.join("busybox-config/minimal.config"),
+        workspace_root.join("scripts/build-doom.sh"),
+        workspace_root.join("scripts/fetch-freedoom.sh"),
     ] {
         println!("cargo:rerun-if-changed={}", entry.display());
     }
@@ -103,6 +112,7 @@ fn main() {
     watch_dir_recursive(&userspace_dir.join("src"));
     watch_dir_recursive(&c_dir);
     watch_dir_recursive(&workspace_root.join("mlibc-port"));
+    watch_dir_recursive(&workspace_root.join("doom-port"));
 
     // ── Build the mlibc sysroot if missing ──────────────────────────────────
     //
@@ -203,5 +213,56 @@ fn main() {
             .status()
             .expect("Failed to spawn scripts/build-busybox.sh");
         assert!(status.success(), "scripts/build-busybox.sh failed");
+    }
+
+    // ── Embed the Freedoom IWAD if missing ──────────────────────────────────
+    //
+    // drivers/dev_wad.rs include_bytes!'s kernel/embedded/freedoom1.wad and
+    // serves it as /dev/freedoom1.wad — the WAD is deliberately NOT read
+    // from the ext2 disk image at runtime (transient ATA read corruption
+    // under DOOM's access pattern, see dev_wad.rs). fetch-freedoom.sh
+    // downloads into disk-image-root/; copy from there.
+    let wad_dst = embedded_dir.join("freedoom1.wad");
+    if !wad_dst.exists() {
+        let wad_src = workspace_root.join("disk-image-root/freedoom1.wad");
+        if !wad_src.exists() {
+            println!("cargo:warning=freedoom1.wad missing — downloading Freedoom...");
+            let status = Command::new("bash")
+                .arg(workspace_root.join("scripts/fetch-freedoom.sh"))
+                .current_dir(workspace_root)
+                .status()
+                .expect("Failed to spawn scripts/fetch-freedoom.sh");
+            assert!(status.success(), "scripts/fetch-freedoom.sh failed");
+        }
+        std::fs::copy(&wad_src, &wad_dst).unwrap_or_else(|e| {
+            panic!("Failed to copy {} -> {}: {}", wad_src.display(), wad_dst.display(), e)
+        });
+    }
+
+    // ── Build doomgeneric if missing or stale ───────────────────────────────
+    //
+    // Same rationale as BusyBox above: an external, from-scratch multi-file
+    // C build (no incremental object cache of its own, unlike BusyBox's own
+    // Makefile). Unlike BusyBox, though, our own platform port file gets
+    // edited in place — compare its mtime against the output so those edits
+    // actually make it into doom.elf (a from-scratch rebuild is only a few
+    // seconds; upstream doomgeneric/ is a pinned submodule, so the port
+    // file is the only input that changes in practice).
+    let doom_elf = embedded_dir.join(DOOM_ELF);
+    let port_src = workspace_root.join("doom-port/doomgeneric_constanos.c");
+    let doom_stale = !doom_elf.exists()
+        || match (doom_elf.metadata().and_then(|m| m.modified()),
+                  port_src.metadata().and_then(|m| m.modified())) {
+            (Ok(elf), Ok(src)) => src > elf,
+            _ => true,
+        };
+    if doom_stale {
+        println!("cargo:warning=doom.elf missing/stale — building doomgeneric...");
+        let status = Command::new("bash")
+            .arg(workspace_root.join("scripts/build-doom.sh"))
+            .current_dir(workspace_root)
+            .status()
+            .expect("Failed to spawn scripts/build-doom.sh");
+        assert!(status.success(), "scripts/build-doom.sh failed");
     }
 }

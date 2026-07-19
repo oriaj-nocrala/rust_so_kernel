@@ -102,7 +102,7 @@ Implemented syscalls (Linux-compatible numbers — see `SyscallNumber` enum for 
 | 9/11 | `mmap`/`munmap` | Anonymous memory mapping |
 | 12 | `brk` | Heap break |
 | 13/14/15 | `sigaction`/`sigprocmask`/`sigreturn` | POSIX signals |
-| 16 | `ioctl` | Only enough for `isatty()` (TCGETS on fd 0-2) |
+| 16 | `ioctl` | TCGETS/TCSETS* (termios, `isatty()`), TIOCGWINSZ, TIOCG/SPGRP, plus the custom `FBIO_BLIT` (`0x4642_0001`) on `/dev/fb` — full-frame scaled blit for the DOOM port, see `FbBlitArgs` |
 | 20 | `writev` | Vectored write |
 | 22 | `pipe` | Anonymous pipe |
 | 24 | `yield` | Voluntary context switch |
@@ -145,7 +145,7 @@ Register a new driver by:
 1. Creating `kernel/src/drivers/<name>.rs` implementing `FileHandle`
 2. Adding one entry to the `DEVICES` static slice in `drivers/mod.rs`
 
-Current devices: `/dev/null`, `/dev/zero`, `/dev/console` (serial), `/dev/fb` (framebuffer), `/dev/kbd` (non-blocking keyboard).
+Current devices: `/dev/null`, `/dev/zero`, `/dev/console` (serial), `/dev/fb` (framebuffer), `/dev/kbd` (non-blocking keyboard, char/ANSI stream), `/dev/kbdraw` (non-blocking raw `[keycode, pressed]` press/release pairs from the PS/2 IRQ — extended E0 keys encoded as `0x80|scancode`; backs the DOOM port's input; note the ring buffer fills from every keypress since boot, so a game must drain the backlog at startup — see `doom-port/doomgeneric_constanos.c::DG_Init`), `/dev/freedoom1.wad` (the Freedoom IWAD, `include_bytes!`-embedded, seekable read-only — named after the real file because doomgeneric validates the path string itself, see `drivers/dev_wad.rs`).
 
 VFS mounts (`kernel/src/fs/mod.rs`): `/dev` (devfs), `/` (initramfs, embedded ELFs — a real two-level tree: root contains a real `bin` subdirectory, `/bin/<name>` is a genuine directory lookup, not a second mount aliasing the same flat namespace, see `fs::initramfs`), `/tmp` (ramfs, writable), `/mnt` (ext2, read-only, best-effort), `/proc` (procfs, read-only, synthetic — `/proc/meminfo` generated fresh on every `open()` from the live Buddy allocator stats; `/proc/self` and `/proc/<pid>/exe` are real symlinks, see `fs::procfs`). `ls /` also shows every other mount (`dev`, `tmp`, `mnt`, `proc`) as an entry — `fs::vfs::direct_children` lets initramfs's root directory list them dynamically, same idea as a real Linux rootfs pre-creating empty `/proc`, `/dev`, etc. that mounts later overlay; actual traversal into them is still redirected by the mount table before ever reaching initramfs, so they only need to look like directories, not serve one.
 
@@ -163,7 +163,8 @@ Embedded ELF binaries live in `kernel/embedded/`, rebuilt automatically by `kern
 
 - **Rust** (`RUST_PROGRAMS` in `build.rs`) — built via `cargo build --release` in `userspace/` (separate Cargo workspace), copied from `userspace/target/x86_64-unknown-none/release/`.
 - **C** (`C_PROGRAMS` in `build.rs`) — `userspace/c/<name>.c`, compiled directly with `clang` against `sysroot/` (built by `scripts/setup-mlibc.sh` if missing).
-- **BusyBox** (`BUSYBOX_ELF` in `build.rs`) — external `make`-based build via `scripts/build-busybox.sh` (git submodule at `busybox/`, config at `busybox-config/minimal.config`), only invoked when `kernel/embedded/busybox.elf` is missing (unlike the two families above, this isn't rebuilt unconditionally — it's slow and `make` already does its own incremental rebuilds).
+- **BusyBox** (`BUSYBOX_ELF` in `build.rs`) — external `make`-based build via `scripts/build-busybox.sh` (git submodule at `busybox/`, config at `busybox-config/minimal.config`), only invoked when `kernel/embedded/busybox.elf` is missing (unlike the two families above, this isn't rebuilt unconditionally — it's slow and `make` already does its own incremental rebuilds). **Caveat of "only if missing":** after any change to sysroot ABI headers (`mlibc-port/.../abi-bits/*.h`), `rm kernel/embedded/busybox.elf` (and `doom.elf`) so the constants don't stay baked into the old static binary — this is exactly how the `SEEK_SET=3` bug survived one rebuild cycle.
+- **DOOM** (`DOOM_ELF` in `build.rs`) — doomgeneric (git submodule `doomgeneric/`) + our platform port `doom-port/doomgeneric_constanos.c`, built by `scripts/build-doom.sh`; rebuilt when `doom.elf` is missing *or* the port file is newer than it (mtime check — the port file is the only input that changes in practice). The Freedoom IWAD is downloaded by `scripts/fetch-freedoom.sh` into `disk-image-root/`, copied to `kernel/embedded/freedoom1.wad` (gitignored) by `kernel/build.rs`, and served at runtime from kernel memory as `/dev/freedoom1.wad` — deliberately NOT read from the ext2 `/mnt` image. Video: `/dev/fb`'s custom `FBIO_BLIT` ioctl (userspace hands a `0x00RRGGBB` buffer + dims; kernel nearest-neighbor scales and letterboxes it — `Framebuffer::blit_scaled`). Input: `/dev/kbdraw`. No audio (no sound driver; `i_sound.c` is a null backend when no sound module is compiled in). Run it by typing `doom` in ash.
 
 Only the embedded/*.elf → `PROGRAMS` registration step is manual:
 
@@ -182,6 +183,8 @@ The fallback `ProgramSource::RawCode` embeds inline assembly tests from `process
 ## mlibc Port (`mlibc-port/constanos-sysdeps/`)
 
 `scripts/setup-mlibc.sh` copies this into the `mlibc/` submodule checkout and rebuilds `sysroot/` — it's the only thing that survives a `git submodule update` reset of `mlibc/` itself, so **any fix that needs to live inside the `mlibc/` submodule tree goes through a patch step in `setup-mlibc.sh`, never a direct edit to the checkout** (see the `do_scanf` patch below for the pattern: idempotency-checked via `grep`, then a Python string-replace, with an explicit error if upstream's text ever stops matching).
+
+**ABI-constant hygiene:** the `abi-bits/*.h` headers were originally copied from non-Linux mlibc ports and have repeatedly disagreed with this kernel's Linux-numbered syscall ABI (`MAP_ANONYMOUS`, `O_CREAT`, `POLLOUT`, `F_DUPFD`, `WIFEXITED`, `ENOTEMPTY`, and most recently `SEEK_SET`, which was `3` — `lseek(fd, n, SEEK_SET)` returned EINVAL while SEEK_CUR/SEEK_END coincidentally worked, making files "go empty" after any `fseek(END)` size probe). When touching any of these headers, cross-check values against `mlibc/abis/linux/` and the kernel's own constants, rebuild the sysroot, **and delete `kernel/embedded/busybox.elf` + `doom.elf`** so the "only build if missing" binaries don't keep the old constants baked in.
 
 **Real upstream mlibc bug, patched here:** `options/ansi/generic/stdio.cpp`'s `do_scanf` only advanced its internal `count` inside the `if(typed_dest)` branch of the `append_to_buffer` lambda shared by the `%s`/`%c`/`%[` conversions. A *suppressed* conversion (`%*s` — `dest` deliberately null) never touched `count`, so the very next `NOMATCH_CHECK(count == 0)` read "matched nothing" regardless of what was actually consumed, and `do_scanf` returned early right at the first `%*s` in any format string — silently truncating the match count for everything after it. Found via BusyBox `ps`/`top`: `libbb/procps.c`'s `/proc/<pid>/stat` parser skips half its fields with exactly that conversion, so every pid was read correctly but `procps_scan` still reported zero matches (`n=5` instead of the required `11`). Not specific to this port or to BusyBox — any `sscanf`/`fscanf` call with a `%*s` anywhere in it was affected.
 

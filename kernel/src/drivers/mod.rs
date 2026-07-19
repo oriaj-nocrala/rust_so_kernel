@@ -9,7 +9,9 @@
 // Adding a new device driver = add a module + one line in DEVICES.
 
 pub mod dev_kbd;
+pub mod dev_kbdraw;
 pub mod dev_null;
+pub mod dev_wad;
 pub mod dev_zero;
 pub mod serial_console;
 pub mod framebuffer_console;
@@ -27,10 +29,14 @@ struct DeviceEntry {
 /// To add a new device: create the module, add one line here.
 static DEVICES: &[DeviceEntry] = &[
     DeviceEntry { path: "/dev/kbd",     open: dev_kbd::open },
+    DeviceEntry { path: "/dev/kbdraw",  open: dev_kbdraw::open },
     DeviceEntry { path: "/dev/null",    open: dev_null::open },
     DeviceEntry { path: "/dev/zero",    open: dev_zero::open },
     DeviceEntry { path: "/dev/console", open: serial_console::open },
     DeviceEntry { path: "/dev/fb",      open: framebuffer_console::open },
+    // Named after the real file, not "wad0" — doomgeneric validates the
+    // path string itself (extension + basename), see dev_wad.rs.
+    DeviceEntry { path: "/dev/freedoom1.wad", open: dev_wad::open },
 ];
 
 /// Open a device by path.  Returns `None` if no driver matches.

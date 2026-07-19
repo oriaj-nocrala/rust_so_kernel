@@ -330,5 +330,13 @@ impl FileHandle for RamFileHandle {
         }))
     }
 
+    fn seek(&mut self, offset: i64, whence: i32) -> FileResult<i64> {
+        let mut cur = self.offset.lock();
+        let size = self.data.lock().len() as i64;
+        let new_pos = crate::process::file::compute_seek(*cur as i64, size, offset, whence)?;
+        *cur = new_pos as usize;
+        Ok(new_pos)
+    }
+
     fn name(&self) -> &str { "ramfs" }
 }
