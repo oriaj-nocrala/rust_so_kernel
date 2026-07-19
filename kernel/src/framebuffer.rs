@@ -2,6 +2,13 @@ use font8x8::legacy::BASIC_LEGACY;
 use spin::Mutex;
 use core::ptr::NonNull;
 
+/// Glyph pixel size at `scale == 1`, derived from `BASIC_LEGACY` itself
+/// (one bit per pixel column, one `u8` row per pixel row) instead of a
+/// hand-typed guess living separately in the console driver — if the font
+/// ever changes, this can't silently drift out of sync with `draw_char`.
+pub const GLYPH_W: usize = u8::BITS as usize;
+pub const GLYPH_H: usize = BASIC_LEGACY[0].len();
+
 pub struct Framebuffer {
     buffer: NonNull<u8>,
     width: usize,

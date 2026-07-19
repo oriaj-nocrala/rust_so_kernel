@@ -19,8 +19,16 @@ use crate::{
 
 const MARGIN_X: usize = 4;
 const MARGIN_Y: usize = 4;
-const CHAR_W:   usize = 8;   // font8x8 glyphs are 8 px wide
-const CHAR_H:   usize = 9;   // 8px glyph + 1px gap
+
+/// Every `draw_char`/`draw_text` call in this file uses this scale — one
+/// constant instead of a literal `1` repeated at each call site, so
+/// `CHAR_W`/`CHAR_H` (and every cols/rows computation derived from them)
+/// can never drift out of sync with what's actually drawn.
+const SCALE: usize = 1;
+const LINE_GAP: usize = 1; // extra px of line spacing below each glyph row
+
+const CHAR_W: usize = crate::framebuffer::GLYPH_W * SCALE;
+const CHAR_H: usize = crate::framebuffer::GLYPH_H * SCALE + LINE_GAP;
 
 const DEFAULT_FG: Color = Color::rgb(220, 220, 220);
 const DEFAULT_BG: Color = Color::rgb(0, 0, 0);
@@ -219,7 +227,7 @@ fn clear_row_from(fb: &mut Framebuffer, state: &FbState, row: usize, start_col: 
     for c in start_col..end_col {
         let px = MARGIN_X + c * CHAR_W;
         let py = MARGIN_Y + row * CHAR_H;
-        fb.draw_char(px, py, b' ', DEFAULT_FG, state.bg, 1);
+        fb.draw_char(px, py, b' ', DEFAULT_FG, state.bg, SCALE);
     }
 }
 
@@ -303,21 +311,21 @@ fn dispatch_csi(
                     for c in state.col..cols {
                         let px = MARGIN_X + c * CHAR_W;
                         let py = MARGIN_Y + state.row * CHAR_H;
-                        fb.draw_char(px, py, b' ', DEFAULT_FG, state.bg, 1);
+                        fb.draw_char(px, py, b' ', DEFAULT_FG, state.bg, SCALE);
                     }
                 }
                 1 => {
                     for c in 0..=state.col {
                         let px = MARGIN_X + c * CHAR_W;
                         let py = MARGIN_Y + state.row * CHAR_H;
-                        fb.draw_char(px, py, b' ', DEFAULT_FG, state.bg, 1);
+                        fb.draw_char(px, py, b' ', DEFAULT_FG, state.bg, SCALE);
                     }
                 }
                 2 => {
                     for c in 0..cols {
                         let px = MARGIN_X + c * CHAR_W;
                         let py = MARGIN_Y + state.row * CHAR_H;
-                        fb.draw_char(px, py, b' ', DEFAULT_FG, state.bg, 1);
+                        fb.draw_char(px, py, b' ', DEFAULT_FG, state.bg, SCALE);
                     }
                 }
                 _ => {}
@@ -384,13 +392,13 @@ impl FileHandle for FramebufferConsole {
                                 state.col -= 1;
                                 let px = MARGIN_X + state.col * CHAR_W;
                                 let py = MARGIN_Y + state.row * CHAR_H;
-                                fb.draw_char(px, py, b' ', state.fg, state.bg, 1);
+                                fb.draw_char(px, py, b' ', state.fg, state.bg, SCALE);
                             }
                         }
                         b if b >= 0x20 && b < 0x7f => {
                             let px = MARGIN_X + state.col * CHAR_W;
                             let py = MARGIN_Y + state.row * CHAR_H;
-                            fb.draw_char(px, py, b, state.fg, state.bg, 1);
+                            fb.draw_char(px, py, b, state.fg, state.bg, SCALE);
                             state.col += 1;
                             if state.col >= cols {
                                 state.col = 0;
