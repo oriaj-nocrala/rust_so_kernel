@@ -155,7 +155,7 @@ VFS mounts (`kernel/src/fs/mod.rs`): `/dev` (devfs), `/` (initramfs, embedded EL
 
 **Permission bits** (`fs::types::Stat`): no real per-inode permission model — `regular()` (initramfs/ext2/procfs) hardcodes `0o444`, `regular_writable()` (ramfs only) hardcodes `0o644`. Added because BusyBox `vi`'s readonly check is `access(fn, W_OK) < 0 || !(st_mode & (S_IWUSR|...))` — fixing `access()` alone wasn't enough; every regular file reported zero write bits regardless of which filesystem it actually lived on, so `vi` opened `/tmp/*` files `[Readonly]` too.
 
-The `FileDescriptorTable` per process holds up to 16 open files. FDs 0/1/2 are pre-opened to `/dev/console` (stdin/stdout/stderr).
+The `FileDescriptorTable` per process holds up to 16 open files. FD 0 (stdin) is pre-opened to `/dev/console` (serial — real reads still come from the shared keyboard/UART ring buffer regardless of the handle here); FDs 1/2 (stdout/stderr) are both pre-opened to `/dev/fb` so user-process output and errors are visible on the actual screen, not just in `serial.log` — `FramebufferConsole::write` mirrors every byte it renders out over COM1 too (`[fb] ` prefix), so headless/serial-log debugging still sees everything.
 
 ## Userspace Programs (`kernel/src/process/user_programs.rs`)
 

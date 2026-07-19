@@ -530,10 +530,13 @@ limpio, o al menos ser consciente de esto al leer los logs.
 
 Desde el commit `42c7b7f` de esta misma sesión, el stdout de los procesos
 de usuario (que antes solo iba al framebuffer, invisible en modo headless)
-también se espeja al puerto serie con el prefijo `[stdout] `
+también se espeja al puerto serie con el prefijo `[fb] `
 (`kernel/src/drivers/framebuffer_console.rs::FramebufferConsole::write`).
 Ya no hace falta `screendump` para ver texto — solo para verificar
-renderizado real (colores, cursor, etc.).
+renderizado real (colores, cursor, etc.). stderr (fd 2) está atado al mismo
+driver que stdout — antes iba solo a `/dev/console` (serie), así que errores
+como `ash: clear: not found` quedaban invisibles en pantalla y solo se veían
+grepeando `serial.log`; ahora se ven en ambos lados.
 
 ### Cómo agregar tracing temporal
 

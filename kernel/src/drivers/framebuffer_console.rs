@@ -104,14 +104,14 @@ static FB_CLEARED: AtomicBool = AtomicBool::new(false);
 
 // ── Serial mirror ──────────────────────────────────────────────────────────
 //
-// User-process stdout (fd 1) is bound to this driver, so it's only ever
-// visible on the framebuffer — invisible in headless runs (`-display none`)
-// short of a `screendump`. Mirror every byte written here out over COM1 too
-// (raw port I/O, same as SerialConsole::write — no shared lock, so no
-// deadlock risk against the FB_STATE/FRAMEBUFFER locks already held by the
-// caller), tagged with a `[stdout] ` prefix at the start of each line so
-// it's greppable/distinguishable from the kernel's own `serial_println!`
-// diagnostics in the same log.
+// User-process stdout *and* stderr (fds 1 and 2) are both bound to this
+// driver, so they're only ever visible on the framebuffer — invisible in
+// headless runs (`-display none`) short of a `screendump`. Mirror every byte
+// written here out over COM1 too (raw port I/O, same as
+// SerialConsole::write — no shared lock, so no deadlock risk against the
+// FB_STATE/FRAMEBUFFER locks already held by the caller), tagged with a
+// `[fb] ` prefix at the start of each line so it's greppable/distinguishable
+// from the kernel's own `serial_println!` diagnostics in the same log.
 static STDOUT_AT_LINE_START: AtomicBool = AtomicBool::new(true);
 
 fn mirror_to_serial(buf: &[u8]) {
@@ -119,7 +119,7 @@ fn mirror_to_serial(buf: &[u8]) {
     let mut port = Port::<u8>::new(0x3F8);
     for &byte in buf {
         if STDOUT_AT_LINE_START.load(Ordering::Relaxed) {
-            for &b in b"[stdout] " {
+            for &b in b"[fb] " {
                 unsafe { port.write(b); }
             }
             STDOUT_AT_LINE_START.store(false, Ordering::Relaxed);

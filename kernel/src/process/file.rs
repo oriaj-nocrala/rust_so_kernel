@@ -130,8 +130,14 @@ impl FileDescriptorTable {
         table.files[1] = Some(drivers::open_device("/dev/fb")
             .unwrap_or_else(|| Box::new(NullFallback)));
 
-        // FD 2: stderr (serial console)
-        table.files[2] = Some(drivers::open_device("/dev/console")
+        // FD 2: stderr (framebuffer, same as stdout). Used to be bound to
+        // `/dev/console` (serial-only) — errors like `ash: clear: not
+        // found` were then invisible on the actual screen, only visible by
+        // grepping serial.log, since nothing mirrors fb output *back* to
+        // serial's own writes. Binding it to `/dev/fb` instead means stderr
+        // is on-screen like stdout, and still reaches serial.log too via
+        // `framebuffer_console`'s own `mirror_to_serial`.
+        table.files[2] = Some(drivers::open_device("/dev/fb")
             .unwrap_or_else(|| Box::new(NullFallback)));
 
         table
@@ -266,7 +272,7 @@ impl Clone for FileDescriptorTable {
         }
         if self.files[2].is_some() {
             new_table.files[2] = self.files[2].as_ref().unwrap().dup()
-                .or_else(|| crate::drivers::open_device("/dev/console"));
+                .or_else(|| crate::drivers::open_device("/dev/fb"));
         }
 
         for i in 3..MAX_FILES {
