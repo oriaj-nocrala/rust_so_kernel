@@ -277,14 +277,17 @@ void convert_stat(const KernelStat &in, struct stat *out) {
 
 } // namespace
 
-// Backs stat()/lstat()/fstat() alike (mlibc funnels all three through this
-// one entry point, discriminated by `fsfdt`). `lstat()` is `fsfd_target::path`
-// with `AT_SYMLINK_NOFOLLOW` set in `flags` — real symlink support now
-// exists kernel-side (see kernel/src/fs/vfs.rs's `resolve`/`resolve_no_follow`),
-// so this now genuinely routes to the no-follow SYS_lstat instead of aliasing
-// plain stat(). fd_path/none (the *at() directory-relative forms) aren't
-// wired up: this kernel's stat/fstat only take an absolute-ish path or a
-// bare fd, no dirfd+relative-path syscall.
+// Backs stat()/lstat()/fstat()/fstatat() alike (mlibc funnels all four
+// through this one entry point, discriminated by `fsfdt`). `lstat()` is
+// `fsfd_target::path` with `AT_SYMLINK_NOFOLLOW` set in `flags` — real
+// symlink support now exists kernel-side (see kernel/src/fs/vfs.rs's
+// `resolve`/`resolve_no_follow`), so this now genuinely routes to the
+// no-follow SYS_lstat instead of aliasing plain stat(). `fd_path` (fstatat's
+// dirfd+relative-path form) is handled the same way sys_unlinkat below
+// handles it: this kernel has no dirfd+relative-path syscall, but
+// `fstatat(AT_FDCWD, path, ...)` — by far the common case — is just a path
+// stat/lstat in disguise, so that degrades to the `path` case; a real dirfd
+// has no way to be serviced here.
 int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags,
 		struct stat *statbuf) {
 	KernelStat ks{};
@@ -296,6 +299,12 @@ int sys_stat(fsfd_target fsfdt, int fd, const char *path, int flags,
 			break;
 		case fsfd_target::fd:
 			ret = raw_syscall(SYS_fstat, fd, (long)&ks);
+			break;
+		case fsfd_target::fd_path:
+			if (fd != AT_FDCWD)
+				return ENOSYS;
+			ret = raw_syscall((flags & AT_SYMLINK_NOFOLLOW) ? SYS_lstat : SYS_stat,
+					(long)path, (long)&ks);
 			break;
 		default:
 			return EINVAL;
