@@ -18,6 +18,19 @@
 #   scripts/qemu-debug.sh enter                    # shortcut for: key ret
 #   scripts/qemu-debug.sh screendump [out.png]      # defaults to STATE_DIR/screen.png
 #   scripts/qemu-debug.sh log [N]                   # tail -n N serial.log (default 100)
+#   scripts/qemu-debug.sh rawlog [N]                # like log, but ANSI/control bytes shown
+#                                                    # as ^[ (cat -v) instead of raw — only
+#                                                    # needed to tell a *real* escape code
+#                                                    # apart from a program that literally
+#                                                    # printed the text "[32m". Ordinary `log`
+#                                                    # (or `grep`ping serial.log directly) is
+#                                                    # usually enough on its own to check
+#                                                    # color/SGR output: an ESC byte renders
+#                                                    # invisible in a tool-result stream, but
+#                                                    # the rest of the code ("[1;32m...[m")
+#                                                    # stays as plain, greppable text — no
+#                                                    # screendump/pixel-sampling needed just to
+#                                                    # confirm what SGR codes got emitted.
 #   scripts/qemu-debug.sh dlog [N]                  # tail -n N debug.log (-d int trace)
 #   scripts/qemu-debug.sh wait-for PATTERN [TIMEOUT_SECS]   # poll serial.log for a regex
 #
@@ -235,6 +248,15 @@ cmd_log() {
     tail -n "${1:-100}" "$SERIAL_LOG"
 }
 
+cmd_rawlog() {
+    # `cat -v` renders control bytes visibly (ESC -> "^[", so a color code
+    # like "\x1b[0;32m" reads as "^[[0;32m") instead of the terminal
+    # swallowing/misrendering them or `log`'s plain tail hiding them
+    # entirely. Greppable — e.g. `rawlog 200 | grep -o '\^\[\[[0-9;]*m'`
+    # pulls out every SGR code emitted, no screendump/pixel-sampling needed.
+    tail -n "${1:-100}" "$SERIAL_LOG" | cat -v
+}
+
 cmd_dlog() {
     tail -n "${1:-100}" "$DEBUG_LOG"
 }
@@ -263,10 +285,11 @@ case "${1:-}" in
     enter) cmd_key ret ;;
     screendump) cmd_screendump "${2:-}" ;;
     log) cmd_log "${2:-}" ;;
+    rawlog) cmd_rawlog "${2:-}" ;;
     dlog) cmd_dlog "${2:-}" ;;
     wait-for) cmd_wait_for "$2" "${3:-}" ;;
     *)
-        echo "Usage: $0 {start|stop|status|send TEXT|key KEY...|enter|screendump [out]|log [N]|dlog [N]|wait-for PATTERN [TIMEOUT]}" >&2
+        echo "Usage: $0 {start|stop|status|send TEXT|key KEY...|enter|screendump [out]|log [N]|rawlog [N]|dlog [N]|wait-for PATTERN [TIMEOUT]}" >&2
         exit 1
         ;;
 esac
