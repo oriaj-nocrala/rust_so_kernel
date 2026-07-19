@@ -6,6 +6,10 @@ Un kernel de sistema operativo x86_64 escrito en Rust desde cero, con multitarea
 
 *Captura del comando `demo` (`userspace/src/bin/demo.rs`) — un recorrido guiado por varias capacidades del kernel en una sola corrida real, no texto estático.*
 
+![DOOM corriendo de verdad en ConstanOS — partida real en curso, HUD con vida/armadura/munición, "PICKED UP A STIMPACK."](docs/doom-screenshot.png)
+
+*Sí, corre DOOM. Captura real de una partida en curso — ver la sección de abajo.*
+
 ## 📋 Descripción
 
 Empezó como un proyecto de aprendizaje ("SO2") para explorar desarrollo de sistemas operativos en Rust, y creció hasta tener un scheduler preemptivo real, syscalls compatibles con la ABI de Linux, fork con copy-on-write, un loader de ELF, y un port de libc que permite compilar y correr programas en C sin modificaciones (más allá del target).
