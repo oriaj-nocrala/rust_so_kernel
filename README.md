@@ -29,6 +29,7 @@ Empezó como un proyecto de aprendizaje ("SO2") para explorar desarrollo de sist
 - **Consola con framebuffer** con soporte de escapes ANSI real (colores, posicionamiento de cursor, clear screen/line) — suficiente para que aplicaciones full-screen como `vi`/`less` dibujen bien. `ioctl` da termios real (`TCGETS`/`TCSETS`), tamaño de terminal real vía `TIOCGWINSZ` (calculado del framebuffer, no un 80×25 fijo), y control de grupo de terminal (`TIOCGPGRP`/`TIOCSPGRP`) — suficiente para job control real.
 - **mlibc portado a este kernel** (`mlibc-port/`, ver más abajo): permite compilar programas en C reales (`printf`, `malloc`, TLS, stdio con buffering) contra la ABI de syscalls propia. En el camino se encontró y parchó un bug real de mlibc *upstream* (no de este puerto): `sscanf`/`fscanf` cortaban de raíz en la primera conversión suprimida (`%*s`) — afecta a cualquier programa que use ese patrón, se descubrió porque rompía en silencio el parser de `/proc/<pid>/stat` de BusyBox `ps`/`top`. El parche vive en `scripts/setup-mlibc.sh` (se re-aplica solo, sobrevive a un reset del submódulo), no en el checkout.
 - **BusyBox real corriendo, con uso real**: BusyBox 1.36.1 (fuente oficial sin modificar, submódulo git) compila y corre contra el `sysroot/` propio. Ya no es solo `busybox echo hello`: `ash` (con job control real) es la shell interactiva de PID 1 en adelante, y hay ~60 applets reales — `vi` (editor full-screen), `grep`/`sed`/`awk`/`find`/`sort`/`diff`, `tar`/`gzip`/`gunzip`, `ps`/`top` (vía `/proc` real), `df` (vía `statvfs`), `du`, `chmod`, `id`/`hostname`, `md5sum`, `od`/`hexdump`, `less`/`more`. Al bootear, PID 1 corre `busybox --install -s /tmp/bin` de verdad — `symlink()` real por cada applet, la misma mecánica que usa una instalación real de Linux (un binario multicall + symlinks reales + dispatch por `argv[0]`), no algo calculado por el kernel.
+- **🎮 DOOM corre y se juega de verdad**: [doomgeneric](https://github.com/ozkl/doomgeneric) (submódulo git) + un puerto propio (`doom-port/doomgeneric_constanos.c`) sobre dos primitivas nuevas del kernel — un ioctl `FBIO_BLIT` en `/dev/fb` (el juego manda su propio buffer offscreen, el kernel lo escala y bliteá directo al framebuffer real) y `/dev/kbdraw` (eventos crudos de press/release `[scancode, pressed]`, no el stream de char/ANSI de `/dev/kbd`). El IWAD (Freedoom, licencia libre) se sirve desde memoria del kernel como `/dev/freedoom1.wad`. Sin audio (no hay driver de sonido). Escribir "doom" desde `ash` — probado de punta a punta: pantalla de título, menús, partida real, movimiento y disparo. En el camino aparecieron y se arreglaron 3 bugs reales y preexistentes del kernel: `ext2` solo soportaba bloques directos + indirectos simples (tope ~268KB por archivo, ahora soporta doblemente indirectos), un `read()` escribiendo en un buffer de usuario recién `malloc`-eado (nunca tocado en modo usuario) paniqueaba el kernel por tratar todo fault en modo kernel como bug irrecuperable, y `lseek()` era un stub completo que siempre devolvía `ESPIPE` desde una época en que no existían archivos reales. La causa raíz real de los símiles "el WAD se vacía" terminó siendo un mismatch de ABI: `SEEK_SET` valía `3` en un header de mlibc copiado de un puerto no-Linux, en vez del `0` que esta ABI espera.
 
 ### Programas de usuario incluidos
 
@@ -52,6 +53,8 @@ Empezó como un proyecto de aprendizaje ("SO2") para explorar desarrollo de sist
 | `mlibc_signal_test` | Programa en **C real**: lo mismo que `signal_test` pero pasando por `pipe()`/`fork()`/`kill()`/`sigaction()` reales de mlibc |
 | `stat_test` / `argv_test` / `jobctl_test` | Programas en **C real**: ejercitan `stat`/`fstat`/`lstat`, argv/envp reales de `exec()`, y job control (`tcgetpgrp`/`tcsetpgrp`, señales de terminal) respectivamente |
 | `kdebug` | Prende/apaga en caliente los subsistemas de tracing del kernel (`kernel::debug`) sin recompilar — ver `kdebug_ctl` en la tabla de syscalls |
+| `doom` | **DOOM real, jugable** — [doomgeneric](https://github.com/ozkl/doomgeneric) + puerto propio sobre `FBIO_BLIT` (`/dev/fb`) y `/dev/kbdraw`, IWAD Freedoom servido desde memoria del kernel (`/dev/freedoom1.wad`). Ver la entrada de arriba |
+| `wadio` | Programa en **C real**: reproduce la secuencia exacta `fopen`/`fseek`/`fread` que usa `W_AddFile` de DOOM sobre un WAD — regresión del bug de `SEEK_SET` |
 
 ## 🏗️ Estructura del workspace
 
@@ -64,17 +67,21 @@ Empezó como un proyecto de aprendizaje ("SO2") para explorar desarrollo de sist
 │   │   ├── fs/           # VFS: initramfs, devfs, ramfs (symlinks reales), ext2 (RO), procfs, tipos compartidos
 │   │   ├── ipc/          # Canales tipo socket
 │   │   ├── block/        # Driver ATA PIO (canal secundario IDE)
-│   │   ├── drivers/      # /dev/null, /dev/zero, /dev/console, /dev/fb, /dev/kbd
+│   │   ├── drivers/      # /dev/null, /dev/zero, /dev/console, /dev/fb, /dev/kbd, /dev/kbdraw, /dev/freedoom1.wad
 │   │   └── time/         # TSC, hrtimer, clocksource
 │   └── embedded/         # ELFs de userspace embebidos vía include_bytes!
 ├── userspace/            # Programas de usuario en Rust (workspace Cargo separado)
-│   └── c/                 # Programas de usuario en C real (hello, stat_test, argv_test, ...)
+│   └── c/                 # Programas de usuario en C real (hello, stat_test, argv_test, wadio, ...)
+├── doomgeneric/          # Submódulo git: doomgeneric (ozkl/doomgeneric)
+├── doom-port/            # Puerto propio de doomgeneric a este kernel (doomgeneric_constanos.c)
 ├── mlibc/                # Submódulo git: mlibc upstream (managarm/mlibc)
 ├── mlibc-port/           # Puerto propio de mlibc a este kernel (sysdeps "constanos")
 ├── busybox/              # Submódulo git: BusyBox oficial (git.busybox.net), pineado en 1_36_1
 ├── busybox-config/        # .config mínimo versionado para BusyBox
 ├── scripts/setup-mlibc.sh    # Reconstruye el sysroot de mlibc automáticamente
 ├── scripts/build-busybox.sh  # Compila BusyBox contra el sysroot automáticamente
+├── scripts/build-doom.sh     # Compila doomgeneric + el puerto propio contra el sysroot
+├── scripts/fetch-freedoom.sh # Descarga el IWAD de Freedoom (no versionado, ~29MB)
 ├── disk-image-root/      # Contenido semilla del disco ext2 (/mnt) — mke2fs -d
 └── build.rs / src/main.rs # Host: arma la imagen UEFI + disk.img, lanza QEMU
 ```
@@ -87,6 +94,7 @@ Requisitos:
 - `clang`, `llvm` (para `llvm-ar`/`llvm-strip`/`llvm-objcopy`), `meson`, `ninja` — para compilar el sysroot de mlibc la primera vez.
 - `make` — para compilar BusyBox (submódulo `busybox/`) contra ese sysroot.
 - `e2fsprogs` (`mke2fs`) — para armar `disk.img` (el ext2 que se monta en `/mnt`) la primera vez. Opcional: sin esto el build sigue, simplemente no hay `/mnt`.
+- `curl`, `unzip` — para bajar el IWAD de Freedoom la primera vez (~29MB, no versionado). Sin esto el build sigue, simplemente `doom` no tiene con qué correr.
 
 En Arch:
 ```bash
@@ -98,7 +106,7 @@ Y listo:
 cargo run
 ```
 
-Este comando, desde un clon limpio, hace **todo** solo: inicializa los submódulos `mlibc/` y `busybox/`, arma el sysroot de mlibc (`sysroot/`), compila los programas de `userspace/` (Rust y C), compila BusyBox contra ese sysroot, compila el kernel, arma la imagen UEFI, y levanta QEMU (con ventana gráfica si tenés `qemu-ui-gtk`, si no cae a VNC). BusyBox solo se recompila si `kernel/embedded/busybox.elf` falta — a diferencia del resto, ese paso tarda de verdad.
+Este comando, desde un clon limpio, hace **todo** solo: inicializa los submódulos `mlibc/`, `busybox/` y `doomgeneric/`, arma el sysroot de mlibc (`sysroot/`), compila los programas de `userspace/` (Rust y C), compila BusyBox y DOOM contra ese sysroot, baja el IWAD de Freedoom, compila el kernel, arma la imagen UEFI, y levanta QEMU (con ventana gráfica si tenés `qemu-ui-gtk`, si no cae a VNC). BusyBox y DOOM solo se recompilan si sus `.elf` faltan en `kernel/embedded/` — a diferencia del resto, esos pasos tardan de verdad.
 
 ## 🎯 Estado / por implementar
 
@@ -106,7 +114,7 @@ Lo que falta o está a medias, mirando el propio código:
 
 - ⏳ **Sin linker dinámico**: `exec()` solo carga binarios estáticos, no hay `.so`/relocations.
 - ⏳ **Un solo core real**: la infraestructura para SMP existe (arrays por-CPU, `MAX_CPUS=8`) pero `cpu_id()` siempre devuelve 0. Todo el modelo de concurrencia actual (`cli`/`sti` + `spin::Mutex`) asume esto — el día que haya un segundo core de verdad, cada sitio que usa `cli` como si fuera exclusión mutua (no solo el propio lock) necesita auditoría, no es un cambio aislado.
-- ⏳ **Sin guardar FPU/SSE en los context switches**: `TrapFrame` solo tiene registros de propósito general — cero `fxsave`/`xrstor` en todo el árbol. No importa para nada de lo que corre hoy (BusyBox, mlibc, los tests en C) porque nada hace matemática de punto flotante pesada de forma sostenida a través de una preempción, pero es el bloqueante real para portar algo como Quake (motor 100% en punto flotante) — Doom, en cambio, no lo necesitaría (su motor es aritmética de punto fijo a propósito).
+- ⏳ **Sin guardar FPU/SSE en los context switches**: `TrapFrame` solo tiene registros de propósito general — cero `fxsave`/`xrstor` en todo el árbol. No importa para nada de lo que corre hoy (BusyBox, mlibc, los tests en C, **ni DOOM** — confirmado corriendo, su motor es aritmética de punto fijo a propósito) porque nada hace matemática de punto flotante pesada de forma sostenida a través de una preempción, pero sigue siendo el bloqueante real para portar algo como Quake (motor 100% en punto flotante).
 - ⏳ **ext2 sin escritura**: `/mnt` lee de un disco real (ATA PIO), pero no hay allocation de bloques/inodos ni bitmaps — crear/escribir archivos ahí todavía no anda. `/tmp` (ramfs) sí soporta `mkdir`/`unlink`/`rmdir`/`rename`/`symlink` de verdad (árbol recursivo real, no un namespace plano), pero no persiste entre reboots.
 - ⏳ **`mmap` solo anónimo**: no hay mmap de archivos/devices (`fd` tiene que ser `-1`). Bloquea, por ejemplo, un framebuffer mapeable directamente en vez de escrito por syscall.
 - ✅ **Leak de stack por hilo, arreglado en su mayor parte**: el `mmap()` de 2MiB que mlibc arma para la pila de cada `pthread_create` nunca se liberaba — es un gap de mlibc *upstream* (`pthread_exit`/`thread_join` tienen TODOs/FIXMEs propios admitiéndolo), no específico de este puerto. El kernel ahora lo libera solo al morir el hilo (mismo patrón de liberación diferida que `kernel_stack`, evitando el mismo peligro de liberar la pila mientras el hilo todavía corre sobre ella). Con `meminfo`: bajó de ~8.9MB a ~2.7MB perdidos por corrida de `pthread_test` — probablemente el TCB en sí (`thread_join`'s FIXME: "destroy tcb here, currently we leak it"), sin investigar todavía.
