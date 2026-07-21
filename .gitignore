@@ -16,11 +16,11 @@
 # Freedoom IWAD (~29MB, fetched by scripts/fetch-freedoom.sh) — a large
 # external data asset, not source; kept out of git like sysroot/ rather
 # than committed like the smaller embedded *.elf program binaries. Landed
-# in disk-image-root/ by the fetch script, copied to kernel/embedded/ by
-# kernel/build.rs (which is what dev_wad.rs actually include_bytes!'s).
+# in disk-image-root/ by the fetch script, from where the workspace-root
+# build.rs seeds it into disk.img (ext2, mounted read-only at /mnt) —
+# that's where DOOM reads it from at runtime, not a kernel-embedded copy.
 /disk-image-root/freedoom1.wad
 /disk-image-root/freedoom-COPYING.txt
-/kernel/embedded/freedoom1.wad
 
 # Bootloader artifacts
 bootimage-*.bin

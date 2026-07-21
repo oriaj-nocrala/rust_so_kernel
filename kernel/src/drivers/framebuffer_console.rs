@@ -110,6 +110,22 @@ static FB_STATE: Mutex<FbState> = Mutex::new(FbState {
 });
 static FB_CLEARED: AtomicBool = AtomicBool::new(false);
 
+/// Set by `FBIO_BLIT` (`sys_ioctl`) every time a raw-pixel client (e.g. the
+/// DOOM port) blits a frame directly onto the framebuffer, bypassing this
+/// driver's char/cursor tracking entirely. `FbState.row`/`col` are left
+/// stale from whatever text was on screen before the raw client started —
+/// without this flag, the next text write (e.g. the shell prompt after
+/// DOOM exits) resumes at that stale position on top of the client's last
+/// rendered frame instead of a clean screen. Checked and cleared on the
+/// next `FramebufferConsole::write`, which does one full clear + cursor
+/// reset before drawing anything.
+static FB_RAW_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// Called by `FBIO_BLIT`'s ioctl handler after every raw blit.
+pub fn mark_raw_dirty() {
+    FB_RAW_DIRTY.store(true, Ordering::SeqCst);
+}
+
 // ── Serial mirror ──────────────────────────────────────────────────────────
 //
 // User-process stdout *and* stderr (fds 1 and 2) are both bound to this
@@ -361,6 +377,15 @@ impl FileHandle for FramebufferConsole {
         let mut state = FB_STATE.lock();
         let mut fb_guard = FRAMEBUFFER.lock();
         let Some(fb) = fb_guard.as_mut() else { return Ok(buf.len()); };
+
+        if FB_RAW_DIRTY.swap(false, Ordering::SeqCst) {
+            fb.clear(DEFAULT_BG);
+            state.col = 0;
+            state.row = 0;
+            state.fg = DEFAULT_FG;
+            state.bg = DEFAULT_BG;
+            state.ansi = AnsiState::Normal;
+        }
 
         let (w, h) = fb.dimensions();
         let cols = (w.saturating_sub(MARGIN_X)) / CHAR_W;

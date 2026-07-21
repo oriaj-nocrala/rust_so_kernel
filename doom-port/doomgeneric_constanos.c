@@ -11,17 +11,30 @@
 //   - /dev/fb's FBIO_BLIT ioctl (kernel/src/process/syscall.rs) — hands the
 //     kernel our own offscreen pixel buffer once a frame; it scales/blits
 //     it into the real framebuffer itself (see Framebuffer::blit_scaled).
-//   - /dev/kbdraw (kernel/src/drivers/dev_kbdraw.rs) — non-blocking real
-//     press/release events as [scancode, pressed] byte pairs, sourced from
-//     the PS/2 IRQ's raw scancode decode (kernel/src/keyboard.rs), instead
-//     of /dev/kbd's char/ANSI-escape stream (no key-up events there).
-//   - /dev/freedoom1.wad (kernel/src/drivers/dev_wad.rs) — the IWAD itself,
-//     embedded in the kernel image and served as a seekable read-only file.
-//     The ext2 route (/mnt/freedoom1.wad) was abandoned: DOOM's access
-//     pattern triggered transient ATA read corruption that wedged the
-//     channel for the rest of the boot. The device is named after the real
-//     file because doomgeneric validates the path string itself — see
-//     dev_wad.rs's header comment.
+//   - /dev/input/event0 (kernel/src/drivers/dev_input_event.rs) —
+//     non-blocking real press/release events, sourced from the PS/2 IRQ's
+//     raw scancode decode (kernel/src/keyboard.rs), instead of /dev/kbd's
+//     char/ANSI-escape stream (no key-up events there). Wire-compatible
+//     with real Linux evdev: each read() returns one real
+//     `struct input_event` (EV_KEY + a real linux/input-event-codes.h
+//     KEY_* code + press/release value, immediately followed by an
+//     EV_SYN/SYN_REPORT), the exact protocol an unmodified Linux evdev
+//     client would expect — this port just happens to be the one reading
+//     it. An earlier version of this port used a bespoke [scancode,
+//     pressed] 2-byte format over /dev/kbdraw instead; superseded once the
+//     driver itself started speaking real evdev.
+//   - /mnt/freedoom1.wad — the IWAD itself, read straight off the ext2
+//     image (fs::ext2, read-only, seeded from disk-image-root/ at build
+//     time). An earlier version of this port routed the WAD through a
+//     kernel-embedded /dev/freedoom1.wad device instead, worked around
+//     what looked like transient ATA read corruption under DOOM's access
+//     pattern (fopen + SEEK_END size probe + scattered lump reads) — the
+//     real cause turned out to be an mlibc sysdeps ABI bug (SEEK_SET was
+//     wired to the wrong numeric value, so any SEEK_END size probe failed
+//     silently and made the file "go empty"), long since fixed — see the
+//     SEEK_SET bug note in mlibc-port-and-kernel-bugs. With that fixed,
+//     ext2 works fine and the embedded-device workaround (and its
+//     kernel-image size cost) is gone.
 //
 // No audio: this kernel has no sound driver. FEATURE_SOUND is left
 // undefined for this build, which is enough — i_sound.c already behaves
@@ -74,61 +87,84 @@ static unsigned short s_KeyQueue[KEYQUEUE_SIZE];
 static unsigned int s_KeyQueueWriteIndex = 0;
 static unsigned int s_KeyQueueReadIndex = 0;
 
-// Unshifted base-key table for PC/AT Set-1 non-extended scancodes, same
-// layout as kernel/src/keyboard.rs::scancode_to_base_char minus the
+// Real Linux evdev protocol constants (linux/input-event-codes.h,
+// linux/input.h) — defined locally since the sysroot doesn't ship those
+// headers, not because the values are made up; these are the actual
+// upstream numbers, which is what makes /dev/input/event0 a real evdev
+// device rather than a lookalike.
+#define EV_SYN 0x00
+#define EV_KEY 0x01
+#define SYN_REPORT 0
+
+// Wire-compatible with the real Linux `struct input_event` on x86_64 —
+// see kernel/src/drivers/dev_input_event.rs's matching Rust definition.
+struct input_event {
+    long tv_sec;
+    long tv_usec;
+    unsigned short type;
+    unsigned short code;
+    int value;
+};
+
+// Unshifted base-key table indexed by Linux KEY_* code for the "base"
+// (non-extended) keyboard block. No translation needed here: Linux's
+// KEY_* numbering for this block was carried over directly from the
+// original PC/AT Set-1 scancodes (KEY_ESC=1, KEY_1=2, ... KEY_SPACE=57),
+// so this table is literally the same shape as
+// kernel/src/keyboard.rs::scancode_to_base_char minus the
 // shift/capslock/ctrl transforms — i_input.c derives the shifted "typed
 // char" itself from raw key id + its own shift tracking, once we forward
 // KEY_RSHIFT press/release events (see convertToDoomKey below), so this
 // table only needs to name each *key*, not every shifted variant.
-static const unsigned char s_baseKeys[0x3A] = {
-    /*0x00*/ 0,
-    /*0x01*/ KEY_ESCAPE,
-    /*0x02*/ '1','2','3','4','5','6','7','8','9','0','-','=',
-    /*0x0e*/ KEY_BACKSPACE,
-    /*0x0f*/ KEY_TAB,
-    /*0x10*/ 'q','w','e','r','t','y','u','i','o','p','[',']',
-    /*0x1c*/ KEY_ENTER,
-    /*0x1d*/ 0, // left ctrl — handled in convertToDoomKey
-    /*0x1e*/ 'a','s','d','f','g','h','j','k','l',';','\'','`',
-    /*0x2a*/ 0, // left shift — handled in convertToDoomKey
-    /*0x2b*/ '\\',
-    /*0x2c*/ 'z','x','c','v','b','n','m',',','.','/',
-    /*0x36*/ 0, // right shift — handled in convertToDoomKey
-    /*0x37*/ 0, // keypad '*' — unused
-    /*0x38*/ 0, // left alt — handled in convertToDoomKey
-    /*0x39*/ ' ',
+static const unsigned char s_baseKeys[58] = {
+    /*0*/  0,
+    /*1*/  KEY_ESCAPE,
+    /*2*/  '1','2','3','4','5','6','7','8','9','0','-','=',
+    /*14*/ KEY_BACKSPACE,
+    /*15*/ KEY_TAB,
+    /*16*/ 'q','w','e','r','t','y','u','i','o','p','[',']',
+    /*28*/ KEY_ENTER,
+    /*29*/ 0, // KEY_LEFTCTRL — handled in convertToDoomKey
+    /*30*/ 'a','s','d','f','g','h','j','k','l',';','\'','`',
+    /*42*/ 0, // KEY_LEFTSHIFT — handled in convertToDoomKey
+    /*43*/ '\\',
+    /*44*/ 'z','x','c','v','b','n','m',',','.','/',
+    /*54*/ 0, // KEY_RIGHTSHIFT — handled in convertToDoomKey
+    /*55*/ 0, // KEY_KPASTERISK — unused
+    /*56*/ 0, // KEY_LEFTALT — handled in convertToDoomKey
+    /*57*/ ' ',
 };
 
-static unsigned char convertToDoomKey(unsigned char scancode)
+static unsigned char convertToDoomKey(unsigned short code)
 {
-    switch (scancode) {
-        case 0x1d: case 0x9d: return KEY_FIRE;    // ctrl, left or E0-right
-        case 0x2a: case 0x36: return KEY_RSHIFT;  // shift, left or right
-        case 0x38: case 0xb8: return KEY_RALT;    // alt, left or E0-right
-        case 0xc8: return KEY_UPARROW;    // ext 0x48
-        case 0xd0: return KEY_DOWNARROW;  // ext 0x50
-        case 0xcb: return KEY_LEFTARROW;  // ext 0x4B
-        case 0xcd: return KEY_RIGHTARROW; // ext 0x4D
-        case 0xc7: return KEY_HOME;       // ext 0x47
-        case 0xcf: return KEY_END;        // ext 0x4F
-        case 0xc9: return KEY_PGUP;       // ext 0x49
-        case 0xd1: return KEY_PGDN;       // ext 0x51
-        case 0xd2: return KEY_INS;        // ext 0x52
-        case 0xd3: return KEY_DEL;        // ext 0x53
-        case 0x39: return KEY_USE;        // space
+    switch (code) {
+        case 29: case 97:  return KEY_FIRE;    // KEY_LEFTCTRL / KEY_RIGHTCTRL
+        case 42: case 54:  return KEY_RSHIFT;  // KEY_LEFTSHIFT / KEY_RIGHTSHIFT
+        case 56: case 100: return KEY_RALT;    // KEY_LEFTALT / KEY_RIGHTALT
+        case 103: return KEY_UPARROW;
+        case 108: return KEY_DOWNARROW;
+        case 105: return KEY_LEFTARROW;
+        case 106: return KEY_RIGHTARROW;
+        case 102: return KEY_HOME;
+        case 107: return KEY_END;
+        case 104: return KEY_PGUP;
+        case 109: return KEY_PGDN;
+        case 110: return KEY_INS;
+        case 111: return KEY_DEL;
+        case 57:  return KEY_USE; // KEY_SPACE
         default:
-            if (scancode < sizeof(s_baseKeys)) {
-                return s_baseKeys[scancode];
+            if (code < sizeof(s_baseKeys)) {
+                return s_baseKeys[code];
             }
             return 0;
     }
 }
 
-static void addKeyToQueue(int pressed, unsigned char scancode)
+static void addKeyToQueue(int pressed, unsigned short code)
 {
-    unsigned char key = convertToDoomKey(scancode);
+    unsigned char key = convertToDoomKey(code);
     if (key == 0) {
-        return; // unmapped scancode (F-keys, numlock, ...) — ignore
+        return; // unmapped code (F-keys, numlock, ...) — ignore
     }
     unsigned short keyData = ((unsigned short)(pressed ? 1 : 0) << 8) | key;
     s_KeyQueue[s_KeyQueueWriteIndex] = keyData;
@@ -138,23 +174,27 @@ static void addKeyToQueue(int pressed, unsigned char scancode)
 void DG_Init(void)
 {
     s_fbFd = open("/dev/fb", O_WRONLY);
-    s_kbdFd = open("/dev/kbdraw", O_RDONLY);
+    s_kbdFd = open("/dev/input/event0", O_RDONLY);
 
-    // Drain keystrokes typed before we started: the kernel's raw-event
-    // ring buffer fills from every keypress since boot and nothing else
-    // reads it, so the shell commands that launched us (and anything
-    // typed earlier) are still queued as press/release pairs — without
-    // this, DOOM replays that backlog into the title screen (observed:
-    // stray Enters walking the menu into episode select on their own).
-    unsigned char ev[2];
-    while (s_kbdFd >= 0 && read(s_kbdFd, ev, 2) == 2) { }
+    // Drain events queued before we started: the kernel's raw-event ring
+    // buffer fills from every keypress since boot and nothing else reads
+    // it, so the shell commands that launched us (and anything typed
+    // earlier) are still queued — without this, DOOM replays that backlog
+    // into the title screen (observed: stray Enters walking the menu into
+    // episode select on their own).
+    struct input_event ev;
+    while (s_kbdFd >= 0 && read(s_kbdFd, &ev, sizeof(ev)) == (long)sizeof(ev)) { }
 }
 
 void DG_DrawFrame(void)
 {
-    unsigned char ev[2];
-    while (s_kbdFd >= 0 && read(s_kbdFd, ev, 2) == 2) {
-        addKeyToQueue(ev[1], ev[0]);
+    struct input_event ev;
+    while (s_kbdFd >= 0 && read(s_kbdFd, &ev, sizeof(ev)) == (long)sizeof(ev)) {
+        if (ev.type == EV_KEY) {
+            addKeyToQueue(ev.value != 0, ev.code);
+        }
+        // EV_SYN/SYN_REPORT and anything else this device doesn't emit:
+        // nothing to do, just consume it.
     }
 
     if (s_fbFd >= 0) {
@@ -202,7 +242,7 @@ int main(int argc, char **argv)
     if (argc <= 1) {
         fixedArgv[0] = argv[0];
         fixedArgv[1] = "-iwad";
-        fixedArgv[2] = "/dev/freedoom1.wad"; // embedded WAD device — see dev_wad.rs
+        fixedArgv[2] = "/mnt/freedoom1.wad"; // ext2-served IWAD
         argv = fixedArgv;
         argc = 3;
     }

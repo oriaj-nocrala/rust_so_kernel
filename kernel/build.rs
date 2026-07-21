@@ -37,7 +37,6 @@ const C_PROGRAMS: &[(&str, &str)] = &[
     ("argv_test", "argv_test.elf"),
     ("jobctl_test", "jobctl_test.elf"),
     ("kdebug", "kdebug.elf"),
-    ("wadio", "wadio.elf"),
 ];
 
 /// Not built here at all — see the busybox.elf handling below, which
@@ -215,29 +214,12 @@ fn main() {
         assert!(status.success(), "scripts/build-busybox.sh failed");
     }
 
-    // ── Embed the Freedoom IWAD if missing ──────────────────────────────────
-    //
-    // drivers/dev_wad.rs include_bytes!'s kernel/embedded/freedoom1.wad and
-    // serves it as /dev/freedoom1.wad — the WAD is deliberately NOT read
-    // from the ext2 disk image at runtime (transient ATA read corruption
-    // under DOOM's access pattern, see dev_wad.rs). fetch-freedoom.sh
-    // downloads into disk-image-root/; copy from there.
-    let wad_dst = embedded_dir.join("freedoom1.wad");
-    if !wad_dst.exists() {
-        let wad_src = workspace_root.join("disk-image-root/freedoom1.wad");
-        if !wad_src.exists() {
-            println!("cargo:warning=freedoom1.wad missing — downloading Freedoom...");
-            let status = Command::new("bash")
-                .arg(workspace_root.join("scripts/fetch-freedoom.sh"))
-                .current_dir(workspace_root)
-                .status()
-                .expect("Failed to spawn scripts/fetch-freedoom.sh");
-            assert!(status.success(), "scripts/fetch-freedoom.sh failed");
-        }
-        std::fs::copy(&wad_src, &wad_dst).unwrap_or_else(|e| {
-            panic!("Failed to copy {} -> {}: {}", wad_src.display(), wad_dst.display(), e)
-        });
-    }
+    // The Freedoom IWAD is no longer embedded in the kernel image — DOOM
+    // reads it from /mnt/freedoom1.wad (ext2, seeded from
+    // disk-image-root/freedoom1.wad by the workspace-root build.rs, which
+    // already runs scripts/fetch-freedoom.sh on its own). See
+    // doom-port/doomgeneric_constanos.c's header comment for why the
+    // earlier kernel-embedded-device workaround existed and why it's gone.
 
     // ── Build doomgeneric if missing or stale ───────────────────────────────
     //

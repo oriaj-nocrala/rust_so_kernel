@@ -1466,6 +1466,11 @@ fn sys_ioctl(fd: i32, request: u64, argp: u64) -> SyscallResult {
             if let Some(fb) = crate::framebuffer::FRAMEBUFFER.lock().as_mut() {
                 fb.blit_scaled(src, w, h);
             }
+            // Bypasses the text console's cursor/char tracking entirely —
+            // flag it so the next text write (e.g. the shell prompt after
+            // DOOM exits) clears the screen first instead of drawing over
+            // whatever frame was left on screen. See framebuffer_console.rs.
+            crate::drivers::framebuffer_console::mark_raw_dirty();
             0
         }
         _ => errno::EINVAL,
