@@ -14,6 +14,7 @@ pub mod tss;
 pub mod syscall;
 mod irq_guard;
 pub mod file;
+pub mod fpu;
 pub mod pipe;
 pub mod signal;
 pub mod user_test_fileio;
@@ -148,6 +149,13 @@ pub struct Process {
     /// Saved/restored on every context switch so mlibc's TLS works correctly.
     pub fs_base: u64,
 
+    /// FPU/SSE register state (x87, XMM0-15, MXCSR) — saved/restored on
+    /// every context switch (see `process::fpu`) so a preemption mid
+    /// floating-point computation doesn't corrupt it. Boxed: 512 bytes,
+    /// 16-byte aligned, no reason to carry that inline in every `Process`
+    /// when it's only ever touched at switch time.
+    pub fpu_state: Box<fpu::FpuState>,
+
     /// True for a `Process` created by `new_thread` (i.e. `clone()`, POSIX
     /// thread), false for a normal process (fork/exec).
     ///
@@ -265,6 +273,7 @@ impl Process {
             stopped_by_signal: None,
             stop_reported: false,
             fs_base: 0,
+            fpu_state: Box::new(fpu::default_state()),
             is_thread: false,
             owned_stack_vma: None,
             cwd: alloc::string::String::from("/"),
@@ -334,6 +343,7 @@ impl Process {
             stopped_by_signal: None,
             stop_reported: false,
             fs_base: 0,
+            fpu_state: Box::new(fpu::default_state()),
             is_thread: false,
             owned_stack_vma: None,
             cwd: alloc::string::String::from("/"),
@@ -348,6 +358,12 @@ impl Process {
     ///
     /// The child gets the parent's TrapFrame (with rax=0 so fork() returns 0
     /// in the child), a copy of the address space, and cloned file descriptors.
+    /// `fpu_state` is a copy of the parent's *live* FPU/SSE registers at the
+    /// moment of `fork()` (real `fork()` semantics — a child starts with the
+    /// same register contents, not a reset default) — see `syscall::sys_fork`,
+    /// which captures it with a fresh `fpu::save()` rather than reusing
+    /// whatever was last stashed in the parent's own `Process::fpu_state`
+    /// (stale as of its last preemption, not necessarily its current state).
     pub fn new_user_from_fork(
         pid: Pid,
         parent_pid: Pid,
@@ -358,6 +374,7 @@ impl Process {
         cwd: alloc::string::String,
         parent_pgid: u32,
         exe_name: alloc::string::String,
+        fpu_state: Box<fpu::FpuState>,
     ) -> Self {
         crate::serial_println!(
             "Creating FORKED process PID {} (parent PID {})",
@@ -386,6 +403,7 @@ impl Process {
             stopped_by_signal: None,
             stop_reported: false,
             fs_base: 0,
+            fpu_state,
             is_thread: false,
             owned_stack_vma: None,
             cwd,
@@ -472,6 +490,7 @@ impl Process {
             stopped_by_signal: None,
             stop_reported: false,
             fs_base: 0,
+            fpu_state: Box::new(fpu::default_state()),
             is_thread: true,
             owned_stack_vma,
             cwd,

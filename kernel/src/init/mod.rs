@@ -84,6 +84,12 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     process::tss::init();
     process::tss::init_syscall_msrs();
 
+    // ── FPU/SSE ────────────────────────────────────────────────────
+    // Must run before the first `Process` is created below — every
+    // constructor initializes its `fpu_state` from the template this
+    // captures.
+    process::fpu::init();
+
     // ── Processes ──────────────────────────────────────────────────
     serial_println!("\nStep 10: Creating processes");
     processes::init_all();

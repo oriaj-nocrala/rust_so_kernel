@@ -195,12 +195,23 @@ static COW_FAULTS_FAILED:      AtomicU64 = AtomicU64::new(0);
 /// thing.
 static ORPHAN_BLOCKS_RECLAIMED: AtomicU64 = AtomicU64::new(0);
 static ORPHAN_INODES_RECLAIMED: AtomicU64 = AtomicU64::new(0);
+/// Full context switches (`Scheduler::switch_to_next` landing on a
+/// different process) since boot — added while verifying `process::fpu`'s
+/// FPU/SSE save/restore actually exercises the switch path during
+/// `fpu_test` (a per-switch `serial_println!` was tried first to check
+/// this and made exec()/page-fault-heavy boot phases crawl, since it ran
+/// on literally every timer preemption; a plain atomic counter is free by
+/// comparison and, per this kernel's own convention of keeping bug-hunting
+/// instrumentation around instead of deleting it, useful for the next
+/// scheduler investigation too).
+static SWITCHES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 pub fn inc_forks()         { FORKS_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_execs()         { EXECS_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_reaps()         { REAPS_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_cow_resolved()  { COW_FAULTS_RESOLVED.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_cow_failed()    { COW_FAULTS_FAILED.fetch_add(1, Ordering::Relaxed); }
+pub fn inc_switches()      { SWITCHES_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn add_orphans_reclaimed(blocks: u64, inodes: u64) {
     ORPHAN_BLOCKS_RECLAIMED.fetch_add(blocks, Ordering::Relaxed);
     ORPHAN_INODES_RECLAIMED.fetch_add(inodes, Ordering::Relaxed);
@@ -233,6 +244,7 @@ pub fn render_report() -> alloc::string::String {
          cow_faults_failed: {}\n\
          orphan_blocks_reclaimed: {}\n\
          orphan_inodes_reclaimed: {}\n\
+         switches_total: {}\n\
          {}",
         mask, enabled,
         FORKS_TOTAL.load(Ordering::Relaxed),
@@ -242,6 +254,7 @@ pub fn render_report() -> alloc::string::String {
         COW_FAULTS_FAILED.load(Ordering::Relaxed),
         ORPHAN_BLOCKS_RECLAIMED.load(Ordering::Relaxed),
         ORPHAN_INODES_RECLAIMED.load(Ordering::Relaxed),
+        SWITCHES_TOTAL.load(Ordering::Relaxed),
         SCHEDULER_LOCK.render("scheduler"),
     )
 }

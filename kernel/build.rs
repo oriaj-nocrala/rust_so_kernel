@@ -38,6 +38,7 @@ const C_PROGRAMS: &[(&str, &str)] = &[
     ("jobctl_test", "jobctl_test.elf"),
     ("kdebug", "kdebug.elf"),
     ("ext2_robust_test", "ext2_robust_test.elf"),
+    ("fpu_test", "fpu_test.elf"),
 ];
 
 /// Not built here at all — see the busybox.elf handling below, which

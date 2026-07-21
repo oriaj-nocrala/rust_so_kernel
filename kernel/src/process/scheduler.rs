@@ -511,6 +511,7 @@ impl Scheduler {
                     proc.address_space.activate();
                 }
                 super::tss::set_kernel_stack(proc.kernel_stack);
+                unsafe { super::fpu::restore(&proc.fpu_state); }
 
                 self.remaining_ticks = Self::quantum_for(proc.effective_priority);
 
@@ -540,6 +541,7 @@ impl Scheduler {
         if let Some(mut proc) = self.running.take() {
             unsafe { *proc.trapframe = *tf; }
             proc.fs_base = read_fs_base();
+            unsafe { super::fpu::save(&mut proc.fpu_state); }
             crate::serial_println!(
                 "⏸ Stopped PID {} ({})",
                 proc.pid.0,
@@ -556,6 +558,7 @@ impl Scheduler {
                 unsafe { proc.address_space.activate(); }
                 super::tss::set_kernel_stack(proc.kernel_stack);
                 write_fs_base(proc.fs_base);
+                unsafe { super::fpu::restore(&proc.fpu_state); }
                 self.remaining_ticks = Self::quantum_for(proc.effective_priority);
                 let tf_ptr = &*proc.trapframe as *const TrapFrame;
                 update_current_fast(&proc);
@@ -626,6 +629,7 @@ impl Scheduler {
         if let Some(mut proc) = self.running.take() {
             unsafe { *proc.trapframe = *current_tf; }
             proc.fs_base = read_fs_base();
+            unsafe { super::fpu::save(&mut proc.fpu_state); }
             proc.state = ProcessState::Blocked;
             self.wait_queue.push_back(proc);
         }
@@ -638,6 +642,7 @@ impl Scheduler {
                 unsafe { proc.address_space.activate(); }
                 super::tss::set_kernel_stack(proc.kernel_stack);
                 write_fs_base(proc.fs_base);
+                unsafe { super::fpu::restore(&proc.fpu_state); }
                 self.remaining_ticks = Self::quantum_for(proc.effective_priority);
                 let tf_ptr = &*proc.trapframe as *const TrapFrame;
                 update_current_fast(&proc);
@@ -898,6 +903,7 @@ impl Scheduler {
                 *proc.trapframe = *current_tf;
             }
             proc.fs_base = read_fs_base();
+            unsafe { super::fpu::save(&mut proc.fpu_state); }
 
             match proc.state {
                 ProcessState::Running => {
@@ -938,6 +944,8 @@ impl Scheduler {
                 }
                 super::tss::set_kernel_stack(proc.kernel_stack);
                 write_fs_base(proc.fs_base);
+                unsafe { super::fpu::restore(&proc.fpu_state); }
+                crate::debug::inc_switches();
 
                 self.remaining_ticks = Self::quantum_for(proc.effective_priority);
 
@@ -993,6 +1001,7 @@ impl Scheduler {
                     unsafe {
                         proc.address_space.activate();
                     }
+                    unsafe { super::fpu::restore(&proc.fpu_state); }
 
                     self.remaining_ticks = Self::quantum_for(proc.effective_priority);
 

@@ -247,6 +247,15 @@ pub(super) fn sys_fork() -> SyscallResult {
 
     let _irq = crate::process::irq_guard::InterruptGuard::new();
 
+    // Real fork() semantics: the child gets a copy of the parent's *live*
+    // FPU/SSE registers, not whatever was last stashed in the parent's own
+    // `Process::fpu_state` (stale as of its last preemption — this process
+    // has been running uninterrupted since then, up to and including
+    // whatever FP code ran right before calling fork()). A fresh
+    // `fpu::save()` here captures the actual current hardware state.
+    let mut parent_fpu_state = crate::process::fpu::default_state();
+    unsafe { crate::process::fpu::save(&mut parent_fpu_state); }
+
     // Collect what we need from the running process
     let (child_as, parent_pid, parent_fs_base, files, child_tf, parent_cwd, parent_pgid, parent_exe_name) = {
         let scheduler = crate::process::scheduler::local_scheduler();
@@ -278,6 +287,7 @@ pub(super) fn sys_fork() -> SyscallResult {
             crate::process::Process::new_user_from_fork(
                 pid, parent_pid, alloc::boxed::Box::new(child_tf),
                 kernel_stack, child_as, files, parent_cwd, parent_pgid, parent_exe_name,
+                alloc::boxed::Box::new(parent_fpu_state),
             )
         );
         child.fs_base = parent_fs_base; // inherit TLS base from parent
@@ -553,6 +563,19 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
                         options(nostack, preserves_flags),
                     );
                 }
+
+                // Reset FPU/SSE state too — real `execve()` resets it, and
+                // there's no reason for a brand-new program image to see
+                // whatever XMM/x87 garbage the previous one left behind.
+                // Written directly to live hardware (like the MSR write
+                // above): this continues running on the same CPU without
+                // an intervening context switch, so `proc.fpu_state`
+                // itself would never get consulted before the exec'd
+                // program runs — but keep it in sync anyway so the next
+                // real context switch (which reads `proc.fpu_state`, not
+                // hardware) doesn't stash a stale pre-exec image over it.
+                *proc.fpu_state = crate::process::fpu::default_state();
+                unsafe { crate::process::fpu::restore(&proc.fpu_state); }
 
                 crate::ktrace!(crate::debug::SCHED, "exec: activating new CR3");
                 unsafe { proc.address_space.activate(); }
