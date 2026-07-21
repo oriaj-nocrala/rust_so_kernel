@@ -12,6 +12,7 @@ pub mod trapframe;
 pub mod timer_preempt;
 pub mod tss;
 pub mod syscall;
+mod irq_guard;
 pub mod file;
 pub mod pipe;
 pub mod signal;
