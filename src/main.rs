@@ -40,14 +40,34 @@ fn main() {
     // #UD (invalid opcode) fault in OVMF before our kernel ever loads.
     cmd.arg("-cpu").arg("max");
 
-    // AC97 sound card (kernel/src/ac97.rs) — "none" audiodev backend since
-    // this QEMU build has no real host-audio backend compiled in (only
-    // "none"/"wav" are available; see `qemu-system-x86_64 -audiodev
-    // help`). The guest-visible PCI device and DMA still work correctly
-    // with "none" — it just discards the PCM instead of playing it.
-    cmd.arg("-audiodev").arg("none,id=snd0");
+    // AC97 sound card (kernel/src/ac97.rs) — routed through PipeWire
+    // (qemu-audio-pipewire package) so DOOM/Quake's sound effects actually
+    // reach real speakers, not just a `wav` capture file. Falls back to
+    // "none" (silently discards the PCM, guest-visible device/DMA still
+    // work) if that QEMU audio backend isn't installed — e.g. a fresh
+    // clone that hasn't run `sudo pacman -S qemu-audio-pipewire` yet.
+    let audiodev = if qemu_has_audiodev("pipewire") { "pipewire" } else { "none" };
+    cmd.arg("-audiodev").arg(format!("{},id=snd0", audiodev));
     cmd.arg("-device").arg("AC97,audiodev=snd0");
 
     let mut child = cmd.spawn().unwrap();
     child.wait().unwrap();
+}
+
+/// Checks `qemu-system-x86_64 -audiodev help`'s output for a named backend
+/// (e.g. "pipewire") — QEMU audio backends are separate, optional distro
+/// packages (Arch: `qemu-audio-pipewire`, `qemu-audio-pa`, etc.), so a
+/// backend requested but not installed would otherwise fail at spawn time
+/// with an opaque QEMU error instead of falling back cleanly.
+fn qemu_has_audiodev(name: &str) -> bool {
+    let Ok(output) = std::process::Command::new("qemu-system-x86_64")
+        .arg("-audiodev")
+        .arg("help")
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.trim() == name)
 }
