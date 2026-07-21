@@ -75,9 +75,10 @@ pub(super) fn sys_uptime_sec() -> SyscallResult {
 /// sys_clock_gettime (Linux #228) — write a `struct timespec` to user memory.
 ///
 /// Supported clock IDs:
-///   0 = CLOCK_REALTIME   — returns monotonic uptime (no RTC; boot = epoch)
-///   1 = CLOCK_MONOTONIC  — same as REALTIME for now
-///   7 = CLOCK_BOOTTIME   — same; included for glibc compatibility
+///   0 = CLOCK_REALTIME   — real wall-clock time (CMOS RTC read once at
+///                          boot, see `crate::rtc`, plus uptime since)
+///   1 = CLOCK_MONOTONIC  — uptime since boot, unaffected by wall-clock
+///   7 = CLOCK_BOOTTIME   — same as MONOTONIC; included for glibc compat
 ///
 /// `struct timespec { i64 tv_sec; i64 tv_nsec; }` (16 bytes, 8-byte aligned).
 ///
@@ -96,8 +97,15 @@ pub(super) fn sys_clock_gettime(clk_id: u64, tp_ptr: u64) -> SyscallResult {
     }
 
     let uptime_ns = crate::time::ktime_get();
-    let tv_sec  = (uptime_ns / 1_000_000_000) as i64;
+    // `tv_nsec` is uptime's own sub-second fraction either way — for
+    // CLOCK_REALTIME that's also real time's fraction of its current
+    // second, since the RTC reading only ever contributes whole seconds.
     let tv_nsec = (uptime_ns % 1_000_000_000) as i64;
+    let tv_sec = if clk_id == 0 {
+        crate::time::now_unix_secs() as i64
+    } else {
+        (uptime_ns / 1_000_000_000) as i64
+    };
 
     // Direct write into user VA — safe because:
     //   1. validate_user_buffer confirmed it is in user-space range.

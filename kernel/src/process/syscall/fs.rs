@@ -1040,36 +1040,37 @@ pub(super) fn sys_statvfs(path_ptr: usize, out_ptr: usize) -> SyscallResult {
     0
 }
 
-/// chmod(90)/fchmod(91): long chmod(const char *path, mode_t mode)
+/// chmod(90): long chmod(const char *path, mode_t mode)
 ///
-/// This kernel has no per-inode permission-bits storage to actually change
-/// (see `Stat::regular`/`regular_writable` — permission is a hardcoded
-/// property of *which filesystem* a file lives on, not a stored, settable
-/// per-file value), so there's nothing real to do beyond validating the
-/// path exists — same "validity-checked stub" shape as `sys_fcntl`'s
-/// F_GETFD/F_SETFD. Good enough for `chmod`/`tar -p` extraction to report
-/// success instead of failing outright; a real permission model would
-/// need `Inode`/`FileHandle` to grow actual mutable mode-bit storage,
-/// which nothing else in this kernel has needed yet.
-pub(super) fn sys_chmod(path_ptr: usize, _mode: u32) -> SyscallResult {
+/// Most filesystems here have no real per-inode permission-bits storage
+/// (see `Stat::regular`/`regular_writable` — permission there is a
+/// hardcoded property of *which filesystem* a file lives on), so for them
+/// `Inode::chmod`'s default `Ok(())` keeps this a "validity-checked stub"
+/// — good enough for `chmod`/`tar -p` extraction to report success
+/// instead of failing outright. `ext2` is the exception: it has a real
+/// on-disk `i_mode` field, and `Ext2Inode::chmod` actually persists the
+/// change there.
+pub(super) fn sys_chmod(path_ptr: usize, mode: u32) -> SyscallResult {
     if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
     let path = read_user_str(path_ptr);
     if path.is_empty() { return errno::EINVAL; }
     let path = resolve_path(path);
-    match crate::fs::stat(&path) {
-        Ok(_) => 0,
+    match crate::fs::vfs::resolve(&path).and_then(|inode| inode.chmod(mode)) {
+        Ok(()) => 0,
         Err(e) => e.as_i64(),
     }
 }
 
-/// fchmod(91): same stub reasoning as `sys_chmod`, just fd-addressed —
-/// only checks the fd is actually open (EBADF otherwise) since there's no
-/// path to validate.
-pub(super) fn sys_fchmod(fd: i32) -> SyscallResult {
+/// fchmod(91): same reasoning as `sys_chmod`, just fd-addressed via
+/// `FileHandle::chmod` instead of resolving a path to an `Inode`.
+pub(super) fn sys_fchmod(fd: i32, mode: u32) -> SyscallResult {
     if fd < 0 { return errno::EBADF; }
     with_current_process(|proc| {
-        match proc.files.lock().get(fd as usize) {
-            Ok(_) => 0,
+        match proc.files.lock().get_mut(fd as usize) {
+            Ok(file) => match file.chmod(mode) {
+                Ok(()) => 0,
+                Err(_) => errno::EIO,
+            },
             Err(_) => errno::EBADF,
         }
     })

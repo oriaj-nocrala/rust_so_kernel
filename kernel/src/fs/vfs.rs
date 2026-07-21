@@ -135,6 +135,19 @@ pub trait Inode: Send + Sync {
         Err(Errno::EROFS)
     }
 
+    /// Change this inode's permission bits (the low 12 bits of `st_mode`
+    /// — `chmod(2)`'s `mode` argument). Default `Ok(())` matches the
+    /// pre-existing "validity-checked stub" behavior every filesystem had
+    /// before this method existed (`sys_chmod`/`sys_fchmod` used to just
+    /// confirm the path/fd resolved and otherwise no-op) — filesystems
+    /// with no real per-inode permission storage (ramfs, devfs,
+    /// initramfs, procfs) keep exactly that behavior by inheriting this
+    /// default. Only `ext2::Ext2Inode` overrides it: it has a real on-disk
+    /// `i_mode` field to persist the change into.
+    fn chmod(&self, _mode: u32) -> Result<(), Errno> {
+        Ok(())
+    }
+
     /// Type-erased downcast handle. Lets a filesystem whose directory
     /// entries can only reference its own inodes (ext2: a dirent is
     /// literally an inode *number*, meaningless outside that filesystem)
@@ -166,7 +179,17 @@ pub trait Filesystem: Send + Sync {
     fn name(&self) -> &str;
 
     /// Root inode of this filesystem.
-    fn root(&self) -> Arc<dyn Inode>;
+    ///
+    /// `Result`-returning (not a bare `Arc<dyn Inode>`) because this is
+    /// re-invoked on *every* path resolution into this mount (see
+    /// `resolve_inner` below), not just at mount time — for most
+    /// filesystems here (ramfs, devfs, initramfs, procfs) the root inode
+    /// can never fail to produce, so they just wrap it in `Ok`. `ext2` is
+    /// the exception: its root is a real disk read that can genuinely
+    /// fail, and this `Result` is what lets that failure propagate as a
+    /// clean `EIO` through `resolve()` like any other failed path-
+    /// resolution step, instead of needing a synthetic stand-in inode.
+    fn root(&self) -> Result<Arc<dyn Inode>, Errno>;
 }
 
 // ── Mount table ──────────────────────────────────────────────────────────────
@@ -277,8 +300,9 @@ fn resolve_inner(path: &str, follow_final: bool, hops_left: u32) -> Result<Arc<d
     } else {
         path[entry.prefix.len()..].trim_start_matches('/')
     };
+    let mount_prefix = entry.prefix; // `&'static str` — cheap to keep past `drop(table)` below
 
-    let mut node: Arc<dyn Inode> = entry.fs.root();
+    let mut node: Arc<dyn Inode> = entry.fs.root()?;
     drop(table); // don't hold the mount table locked across a recursive resolve()
 
     let components: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
@@ -287,7 +311,18 @@ fn resolve_inner(path: &str, follow_final: bool, hops_left: u32) -> Result<Arc<d
     for (i, component) in components.iter().enumerate() {
         match *component {
             "."  => { /* stay at current directory */ }
-            ".." => { /* parent not implemented yet — stay put */ }
+            ".." => {
+                // Every caller normalizes `..`/`.` away before a path
+                // reaches this function (`resolve_path` in the syscall
+                // layer, and this function's own relative-symlink-target
+                // handling above, both go through `normalize_path` first
+                // — verified against every `vfs::resolve*`/`vfs::open`/
+                // `fs::stat` call site in the kernel). A raw `..` showing
+                // up here anyway means some caller skipped that step; fail
+                // loudly with `EINVAL` instead of silently resolving the
+                // wrong file the way a no-op here used to.
+                return Err(Errno::EINVAL);
+            }
             name => {
                 node = node.lookup(name)?;
                 let is_final = Some(i) == last_idx;
@@ -296,17 +331,26 @@ fn resolve_inner(path: &str, follow_final: bool, hops_left: u32) -> Result<Arc<d
                         return Err(Errno::ELOOP);
                     }
                     let target = node.readlink()?;
-                    // Targets this kernel's own synthetic symlinks (procfs)
-                    // ever produce are always absolute; a relative target
-                    // is approximated by normalizing against root, since
-                    // Inode has no notion of "my containing directory" to
-                    // resolve against properly. Nothing here creates
-                    // relative symlinks today, so this is untested but
-                    // harmless dead weight rather than a real gap.
+                    // A relative target resolves against the symlink's own
+                    // containing directory (real symlink(2)/readlink(2)
+                    // semantics), not root — matters now that ext2's real
+                    // `symlink()` can produce genuinely relative targets
+                    // (e.g. `symlink("realfile.txt", "/mnt/link")`, the
+                    // common case for a real `ln -s`). Reconstruct that
+                    // directory from the mount prefix plus every path
+                    // component consumed so far (everything before this
+                    // one, i.e. `components[..i]`) — `Inode` itself has no
+                    // notion of "my containing directory" to ask for
+                    // directly.
                     let abs_target = if target.starts_with('/') {
                         target
                     } else {
-                        normalize_path("/", &target)
+                        let mut dir_path = alloc::string::String::from(mount_prefix);
+                        for c in &components[..i] {
+                            dir_path.push('/');
+                            dir_path.push_str(c);
+                        }
+                        normalize_path(&dir_path, &target)
                     };
                     node = resolve_inner(&abs_target, follow_final, hops_left - 1)?;
                 }
@@ -430,4 +474,57 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), Errno> {
         return Err(e);
     }
     Ok(())
+}
+
+// ── Shared getdents64 helpers ───────────────────────────────────────────────
+//
+// Every directory `FileHandle` in this VFS packs `DirEntry`s into
+// `linux_dirent64` records the same way — only *where the entries come
+// from* differs, which is why this is two helpers, not one. Before these
+// existed, seven directory handles (devfs x2, initramfs, procfs x2, ramfs,
+// ext2) each hand-rolled an identical packing loop.
+
+/// Walk `dir.readdir(offset)` one entry at a time, packing each into `buf`
+/// as a `linux_dirent64` record, until either the directory is exhausted
+/// or the next entry wouldn't fit. For directory handles backed by a
+/// cheap-to-call-repeatedly `Inode::readdir` (devfs, initramfs, procfs) —
+/// see `getdents64_from_snapshot` for handles that pre-collect their
+/// listing into a `Vec<DirEntry>` at `open()` time instead (ramfs, ext2).
+pub fn getdents64_via_readdir(dir: &dyn Inode, offset: &mut u64, buf: &mut [u8]) -> i64 {
+    let mut written: usize = 0;
+    loop {
+        let entry = match dir.readdir(*offset) {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(e) => return e.as_i64(),
+        };
+        let needed = entry.dirent64_size();
+        if written + needed > buf.len() {
+            break;
+        }
+        let next_off = *offset as i64 + 1;
+        entry.write_dirent64(next_off, &mut buf[written..written + needed]);
+        written += needed;
+        *offset += 1;
+    }
+    written as i64
+}
+
+/// Same packing loop as `getdents64_via_readdir`, indexed by position
+/// through an already-collected `Vec<DirEntry>` snapshot instead of
+/// re-querying `readdir()` per entry.
+pub fn getdents64_from_snapshot(entries: &[crate::fs::types::DirEntry], offset: &mut usize, buf: &mut [u8]) -> i64 {
+    let mut written: usize = 0;
+    while *offset < entries.len() {
+        let entry = &entries[*offset];
+        let needed = entry.dirent64_size();
+        if written + needed > buf.len() {
+            break;
+        }
+        let next_off = *offset as i64 + 1;
+        entry.write_dirent64(next_off, &mut buf[written..written + needed]);
+        written += needed;
+        *offset += 1;
+    }
+    written as i64
 }

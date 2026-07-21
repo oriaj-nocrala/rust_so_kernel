@@ -139,13 +139,15 @@ const _: () = assert!(
 );
 
 impl Stat {
-    /// Construct a directory stat.
-    pub fn dir(ino: u64) -> Self {
+    /// Shared field layout every constructor below fills in differently
+    /// only for `(mode, nlink, size, blocks)` — extracted so a new `Stat`
+    /// field only ever needs to be added/defaulted in one place instead of
+    /// once per file-type constructor.
+    fn base(ino: u64, mode: u32, nlink: u64, size: i64, blocks: i64) -> Self {
         Self {
-            st_dev: 1, st_ino: ino, st_nlink: 2,
-            st_mode: FileType::Directory.as_mode_bits() | 0o755,
+            st_dev: 1, st_ino: ino, st_nlink: nlink, st_mode: mode,
             st_uid: 0, st_gid: 0, _pad0: 0, st_rdev: 0,
-            st_size: 0, st_blksize: 4096, st_blocks: 0,
+            st_size: size, st_blksize: 4096, st_blocks: blocks,
             st_atime: 0, st_atime_nsec: 0,
             st_mtime: 0, st_mtime_nsec: 0,
             st_ctime: 0, st_ctime_nsec: 0,
@@ -153,19 +155,33 @@ impl Stat {
         }
     }
 
+    /// Overlay real permission bits (the low 12 bits: rwxrwxrwx plus
+    /// setuid/setgid/sticky) onto whichever file-type bits a constructor
+    /// already set. For filesystems with real per-inode mode storage
+    /// (ext2, ramfs) to report the actual stored value instead of the
+    /// fixed default a bare constructor call produces.
+    pub fn with_perm_bits(mut self, bits: u32) -> Self {
+        self.st_mode = (self.st_mode & !0o7777) | (bits & 0o7777);
+        self
+    }
+
+    /// Override the link count a constructor defaulted to (`dir()`'s `2`,
+    /// every other constructor's `1`) with a real count — e.g. a
+    /// directory's true `2 + subdirectory count`, or a file's real hard-
+    /// link count from an on-disk inode.
+    pub fn with_nlink(mut self, nlink: u64) -> Self {
+        self.st_nlink = nlink;
+        self
+    }
+
+    /// Construct a directory stat.
+    pub fn dir(ino: u64) -> Self {
+        Self::base(ino, FileType::Directory.as_mode_bits() | 0o755, 2, 0, 0)
+    }
+
     /// Construct a regular-file stat.
     pub fn regular(ino: u64, size: i64) -> Self {
-        Self {
-            st_dev: 1, st_ino: ino, st_nlink: 1,
-            st_mode: FileType::Regular.as_mode_bits() | 0o444,
-            st_uid: 0, st_gid: 0, _pad0: 0, st_rdev: 0,
-            st_size: size, st_blksize: 4096,
-            st_blocks: (size + 511) / 512,
-            st_atime: 0, st_atime_nsec: 0,
-            st_mtime: 0, st_mtime_nsec: 0,
-            st_ctime: 0, st_ctime_nsec: 0,
-            _reserved: [0; 3],
-        }
+        Self::base(ino, FileType::Regular.as_mode_bits() | 0o444, 1, size, (size + 511) / 512)
     }
 
     /// Construct a regular-file stat with the owner-write bit set (`0o644`)
@@ -201,30 +217,12 @@ impl Stat {
     /// as the length of the path it points to, not the size of any real
     /// backing storage (there isn't one).
     pub fn symlink(ino: u64, target_len: i64) -> Self {
-        Self {
-            st_dev: 1, st_ino: ino, st_nlink: 1,
-            st_mode: FileType::Symlink.as_mode_bits() | 0o777,
-            st_uid: 0, st_gid: 0, _pad0: 0, st_rdev: 0,
-            st_size: target_len, st_blksize: 4096, st_blocks: 0,
-            st_atime: 0, st_atime_nsec: 0,
-            st_mtime: 0, st_mtime_nsec: 0,
-            st_ctime: 0, st_ctime_nsec: 0,
-            _reserved: [0; 3],
-        }
+        Self::base(ino, FileType::Symlink.as_mode_bits() | 0o777, 1, target_len, 0)
     }
 
     /// Construct a character-device stat.
     pub fn chardev(ino: u64) -> Self {
-        Self {
-            st_dev: 1, st_ino: ino, st_nlink: 1,
-            st_mode: FileType::CharDevice.as_mode_bits() | 0o666,
-            st_uid: 0, st_gid: 0, _pad0: 0, st_rdev: 0,
-            st_size: 0, st_blksize: 4096, st_blocks: 0,
-            st_atime: 0, st_atime_nsec: 0,
-            st_mtime: 0, st_mtime_nsec: 0,
-            st_ctime: 0, st_ctime_nsec: 0,
-            _reserved: [0; 3],
-        }
+        Self::base(ino, FileType::CharDevice.as_mode_bits() | 0o666, 1, 0, 0)
     }
 }
 

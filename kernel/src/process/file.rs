@@ -124,6 +124,15 @@ pub trait FileHandle: Send {
     fn seek(&mut self, _offset: i64, _whence: i32) -> FileResult<i64> {
         Err(FileError::NotSupported)
     }
+
+    /// Change this open file's permission bits — `fchmod(2)`. Default
+    /// `Ok(())` matches `Inode::chmod`'s same "pre-existing stub behavior"
+    /// default (see its doc comment); only `ext2::Ext2FileHandle`
+    /// overrides it, since ext2 is the only filesystem here with a real
+    /// on-disk mode field to persist the change into.
+    fn chmod(&mut self, _mode: u32) -> FileResult<()> {
+        Ok(())
+    }
 }
 
 // ============================================================================

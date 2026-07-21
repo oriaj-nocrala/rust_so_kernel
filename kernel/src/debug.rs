@@ -185,12 +185,26 @@ static EXECS_TOTAL:            AtomicU64 = AtomicU64::new(0);
 static REAPS_TOTAL:            AtomicU64 = AtomicU64::new(0);
 static COW_FAULTS_RESOLVED:    AtomicU64 = AtomicU64::new(0);
 static COW_FAULTS_FAILED:      AtomicU64 = AtomicU64::new(0);
+/// Blocks/inodes `fs::ext2::Ext2Fs::reclaim_orphans` freed at mount time —
+/// bitmap-set but unreachable from the root directory, i.e. left behind
+/// by an unclean shutdown mid `create`/`mkdir`/`write` (see that
+/// function's doc comment). Should read `0` on any boot that followed a
+/// clean shutdown; a nonzero value here is direct evidence a previous
+/// session ended uncleanly, independent of whether FS tracing happened to
+/// be on on this boot to catch the `ktrace!` line reporting the same
+/// thing.
+static ORPHAN_BLOCKS_RECLAIMED: AtomicU64 = AtomicU64::new(0);
+static ORPHAN_INODES_RECLAIMED: AtomicU64 = AtomicU64::new(0);
 
 pub fn inc_forks()         { FORKS_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_execs()         { EXECS_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_reaps()         { REAPS_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_cow_resolved()  { COW_FAULTS_RESOLVED.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_cow_failed()    { COW_FAULTS_FAILED.fetch_add(1, Ordering::Relaxed); }
+pub fn add_orphans_reclaimed(blocks: u64, inodes: u64) {
+    ORPHAN_BLOCKS_RECLAIMED.fetch_add(blocks, Ordering::Relaxed);
+    ORPHAN_INODES_RECLAIMED.fetch_add(inodes, Ordering::Relaxed);
+}
 
 /// Render the current state for `/proc/kdebug`: enabled subsystems (by
 /// name, not just the raw mask) plus every counter above.
@@ -217,6 +231,8 @@ pub fn render_report() -> alloc::string::String {
          reaps_total: {}\n\
          cow_faults_resolved: {}\n\
          cow_faults_failed: {}\n\
+         orphan_blocks_reclaimed: {}\n\
+         orphan_inodes_reclaimed: {}\n\
          {}",
         mask, enabled,
         FORKS_TOTAL.load(Ordering::Relaxed),
@@ -224,6 +240,8 @@ pub fn render_report() -> alloc::string::String {
         REAPS_TOTAL.load(Ordering::Relaxed),
         COW_FAULTS_RESOLVED.load(Ordering::Relaxed),
         COW_FAULTS_FAILED.load(Ordering::Relaxed),
+        ORPHAN_BLOCKS_RECLAIMED.load(Ordering::Relaxed),
+        ORPHAN_INODES_RECLAIMED.load(Ordering::Relaxed),
         SCHEDULER_LOCK.render("scheduler"),
     )
 }

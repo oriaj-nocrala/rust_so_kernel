@@ -505,7 +505,7 @@ pub fn syscall_handler(
         SyscallNumber::Symlink => fs::sys_symlink(arg1 as usize, arg2 as usize),
         SyscallNumber::Access => fs::sys_access(arg1 as usize, arg2 as i32),
         SyscallNumber::Chmod => fs::sys_chmod(arg1 as usize, arg2 as u32),
-        SyscallNumber::Fchmod => fs::sys_fchmod(arg1 as i32),
+        SyscallNumber::Fchmod => fs::sys_fchmod(arg1 as i32, arg2 as u32),
         SyscallNumber::Dup => fs::sys_dup(arg1 as i32),
         SyscallNumber::Dup2 => fs::sys_dup2(arg1 as i32, arg2 as i32),
         SyscallNumber::Fcntl => fs::sys_fcntl(arg1 as i32, arg2 as i32, arg3),

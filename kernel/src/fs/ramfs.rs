@@ -17,7 +17,7 @@
 // scratch fs nobody expects strict live-mutation semantics from.
 
 use alloc::{boxed::Box, collections::BTreeMap, string::String, string::ToString, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
 
 use crate::fs::{
@@ -53,8 +53,8 @@ impl RamFs {
 impl Filesystem for RamFs {
     fn name(&self) -> &str { "ramfs" }
 
-    fn root(&self) -> Arc<dyn Inode> {
-        self.root.clone()
+    fn root(&self) -> Result<Arc<dyn Inode>, Errno> {
+        Ok(self.root.clone())
     }
 }
 
@@ -63,6 +63,17 @@ impl Filesystem for RamFs {
 struct RamDirNode {
     ino: u64,
     entries: Mutex<BTreeMap<String, Arc<dyn Inode>>>,
+    // Real per-inode permission storage (not a hardcoded per-filesystem
+    // constant like the read-only filesystems use) — ramfs is one of only
+    // two genuinely writable filesystems here (the other being ext2), so
+    // `chmod` should persist for real on both. Plain `AtomicU32` (not
+    // `Arc`-wrapped, unlike `RamFileNode::mode`): only path-based `chmod`
+    // ever reaches a directory in this kernel (no `fchmod` on a directory
+    // fd — matches `ext2::Ext2DirHandle`'s identical scope), and
+    // path-based chmod always operates on the same `Arc<RamDirNode>`
+    // instance already shared through the parent's `entries` map, so no
+    // extra sharing mechanism is needed.
+    mode: AtomicU32,
 }
 
 impl RamDirNode {
@@ -70,6 +81,7 @@ impl RamDirNode {
         Self {
             ino,
             entries: Mutex::new(BTreeMap::new()),
+            mode: AtomicU32::new(0o755),
         }
     }
 }
@@ -78,7 +90,13 @@ impl Inode for RamDirNode {
     fn as_any(&self) -> &dyn core::any::Any { self }
 
     fn stat(&self) -> Stat {
-        Stat::dir(self.ino)
+        // Real link count (2 + subdirectory count), same "report the
+        // actual state, not a fixed default" fix applied to permission
+        // bits below and to ext2's own `stat()`.
+        let nlink = 2 + self.entries.lock().values()
+            .filter(|v| v.file_type() == FileType::Directory)
+            .count() as u64;
+        Stat::dir(self.ino).with_perm_bits(self.mode.load(Ordering::Relaxed)).with_nlink(nlink)
     }
 
     fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
@@ -121,7 +139,11 @@ impl Inode for RamDirNode {
             }
             return Ok(existing.clone());
         }
-        let node = Arc::new(RamFileNode { ino: alloc_ino(), data: Arc::new(Mutex::new(Vec::new())) });
+        let node = Arc::new(RamFileNode {
+            ino: alloc_ino(),
+            data: Arc::new(Mutex::new(Vec::new())),
+            mode: Arc::new(AtomicU32::new(0o644)),
+        });
         entries.insert(name.to_string(), node.clone() as Arc<dyn Inode>);
         Ok(node as Arc<dyn Inode>)
     }
@@ -185,6 +207,11 @@ impl Inode for RamDirNode {
         entries.insert(name.to_string(), node.clone() as Arc<dyn Inode>);
         Ok(node as Arc<dyn Inode>)
     }
+
+    fn chmod(&self, mode: u32) -> Result<(), Errno> {
+        self.mode.store(mode & 0o7777, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 /// Directory handle: serves `getdents64` off the open-time snapshot.
@@ -203,19 +230,7 @@ impl FileHandle for RamDirHandle {
     }
 
     fn getdents64(&mut self, buf: &mut [u8]) -> i64 {
-        let mut written: usize = 0;
-        while self.offset < self.snapshot.len() {
-            let entry = &self.snapshot[self.offset];
-            let needed = entry.dirent64_size();
-            if written + needed > buf.len() {
-                break;
-            }
-            let next_off = self.offset as i64 + 1;
-            entry.write_dirent64(next_off, &mut buf[written..written + needed]);
-            written += needed;
-            self.offset += 1;
-        }
-        written as i64
+        crate::fs::vfs::getdents64_from_snapshot(&self.snapshot, &mut self.offset, buf)
     }
 
     fn stat(&self) -> Option<Stat> {
@@ -230,6 +245,13 @@ impl FileHandle for RamDirHandle {
 struct RamFileNode {
     ino:  u64,
     data: Arc<Mutex<Vec<u8>>>,
+    // `Arc`-wrapped (unlike `RamDirNode::mode`): a `RamFileHandle` opened
+    // from this node needs to share the same storage so `fchmod` (which
+    // only ever sees the handle, never this `Inode`) and path-based
+    // `chmod`/`stat()` (which only ever see this `Inode`, never a live
+    // handle) agree on one true value — same reasoning as `data` itself
+    // being `Arc`-shared below.
+    mode: Arc<AtomicU32>,
 }
 
 impl Inode for RamFileNode {
@@ -237,6 +259,7 @@ impl Inode for RamFileNode {
 
     fn stat(&self) -> Stat {
         Stat::regular_writable(self.ino, self.data.lock().len() as i64)
+            .with_perm_bits(self.mode.load(Ordering::Relaxed))
     }
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
@@ -252,7 +275,13 @@ impl Inode for RamFileNode {
             ino: self.ino,
             data: self.data.clone(),
             offset: Arc::new(Mutex::new(offset)),
+            mode: self.mode.clone(),
         }))
+    }
+
+    fn chmod(&self, mode: u32) -> Result<(), Errno> {
+        self.mode.store(mode & 0o7777, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -297,6 +326,9 @@ struct RamFileHandle {
     // file description" position between two fds, matching POSIX dup()
     // semantics — reading through either fd advances both.
     offset: Arc<Mutex<usize>>,
+    // Shared with the owning `RamFileNode` (and every other open handle on
+    // it) — see that struct's doc comment on this same field.
+    mode: Arc<AtomicU32>,
 }
 
 impl FileHandle for RamFileHandle {
@@ -325,7 +357,8 @@ impl FileHandle for RamFileHandle {
     }
 
     fn stat(&self) -> Option<Stat> {
-        Some(Stat::regular_writable(self.ino, self.data.lock().len() as i64))
+        Some(Stat::regular_writable(self.ino, self.data.lock().len() as i64)
+            .with_perm_bits(self.mode.load(Ordering::Relaxed)))
     }
 
     fn dup(&self) -> Option<Box<dyn FileHandle>> {
@@ -333,6 +366,7 @@ impl FileHandle for RamFileHandle {
             ino: self.ino,
             data: self.data.clone(),
             offset: self.offset.clone(),
+            mode: self.mode.clone(),
         }))
     }
 
@@ -342,6 +376,11 @@ impl FileHandle for RamFileHandle {
         let new_pos = crate::process::file::compute_seek(*cur as i64, size, offset, whence)?;
         *cur = new_pos as usize;
         Ok(new_pos)
+    }
+
+    fn chmod(&mut self, mode: u32) -> FileResult<()> {
+        self.mode.store(mode & 0o7777, Ordering::Relaxed);
+        Ok(())
     }
 
     fn name(&self) -> &str { "ramfs" }

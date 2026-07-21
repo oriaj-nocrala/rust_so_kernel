@@ -45,8 +45,8 @@ pub struct ProcFs;
 impl Filesystem for ProcFs {
     fn name(&self) -> &str { "procfs" }
 
-    fn root(&self) -> Arc<dyn Inode> {
-        Arc::new(ProcDirInode)
+    fn root(&self) -> Result<Arc<dyn Inode>, Errno> {
+        Ok(Arc::new(ProcDirInode))
     }
 }
 
@@ -301,23 +301,7 @@ impl FileHandle for ProcPidDirHandle {
 
     fn getdents64(&mut self, buf: &mut [u8]) -> i64 {
         let dir = ProcPidDirInode { pid: self.pid };
-        let mut written: usize = 0;
-        loop {
-            let entry = match dir.readdir(self.offset) {
-                Ok(Some(e)) => e,
-                Ok(None)    => break,
-                Err(e)      => return e.as_i64(),
-            };
-            let needed = entry.dirent64_size();
-            if written + needed > buf.len() {
-                break;
-            }
-            let next_off = self.offset as i64 + 1;
-            entry.write_dirent64(next_off, &mut buf[written..written + needed]);
-            written += needed;
-            self.offset += 1;
-        }
-        written as i64
+        crate::fs::vfs::getdents64_via_readdir(&dir, &mut self.offset, buf)
     }
 
     fn stat(&self) -> Option<crate::fs::types::Stat> {
@@ -406,26 +390,7 @@ impl FileHandle for ProcDirHandle {
     }
 
     fn getdents64(&mut self, buf: &mut [u8]) -> i64 {
-        let dir = ProcDirInode;
-        let mut written: usize = 0;
-
-        loop {
-            let entry = match dir.readdir(self.offset) {
-                Ok(Some(e)) => e,
-                Ok(None)    => break,
-                Err(e)      => return e.as_i64(),
-            };
-            let needed = entry.dirent64_size();
-            if written + needed > buf.len() {
-                break;
-            }
-            let next_off = self.offset as i64 + 1;
-            entry.write_dirent64(next_off, &mut buf[written..written + needed]);
-            written += needed;
-            self.offset += 1;
-        }
-
-        written as i64
+        crate::fs::vfs::getdents64_via_readdir(&ProcDirInode, &mut self.offset, buf)
     }
 
     fn stat(&self) -> Option<crate::fs::types::Stat> {

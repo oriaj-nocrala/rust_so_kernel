@@ -16,22 +16,94 @@
 // the filesystem inconsistent. Not a regression this port introduces, just
 // not fixed either — `e2fsck` exists for a reason.
 //
-// Direct, singly-indirect, and doubly-indirect blocks (see
-// `block_for_index`/`block_for_index_alloc`) — up to ptrs_per_block² +
-// ptrs_per_block + 12 blocks, 64MiB+ at this driver's 1024-byte block size;
-// triply-indirect isn't implemented (nothing this image ships needs a file
-// bigger than that) — reads short/writes fail with `EFBIG` rather than
-// misbehaving.
+// Direct, singly-, doubly-, and triply-indirect blocks are all implemented
+// (see `block_for_index`/`block_for_index_alloc`) — up to ptrs_per_block³ +
+// ptrs_per_block² + ptrs_per_block + 12 blocks, ~16 GiB+ at this driver's
+// 1024-byte block size (`EFBIG` beyond that is now purely theoretical: no
+// disk image this kernel builds is anywhere near that size).
 //
-// ext2-native symlinks aren't implemented (same "ramfs-only" convention the
-// `symlink()` syscall already documents in kernel/src/process/syscall.rs —
-// `Inode::symlink`'s EROFS default is left as-is here).
+// ext2-native symlinks ARE implemented (`Ext2Inode::symlink`/`readlink`),
+// matching real ext2's own two on-disk representations: "fast" (target
+// under 60 bytes, stored directly in the inode's `i_block` array, no data
+// block ever allocated) when it fits, "slow" (ordinary file content,
+// exactly like a regular file) otherwise. This driver always *writes*
+// whichever representation fits, and reads both — a real `mke2fs`/host-
+// authored image may contain either.
+//
+// Permission bits: `Ext2Inode::stat()` reports the real on-disk `i_mode`
+// permission bits (not a hardcoded per-filesystem constant like every
+// other filesystem here — see `fs::types::Stat`'s doc comments) and
+// `Ext2Inode::chmod`/`Ext2FileHandle::chmod` persist real changes to them.
+// New files/dirs still get a fixed initial mode (`create`/`mkdir` have no
+// caller-supplied mode to honor — `sys_open`/`sys_mkdir` don't take one at
+// all, see their doc comments in `process/syscall/fs.rs`), but that mode
+// is now correctly round-tripped through `stat()` afterward, and `chmod`
+// can change it for real.
 //
 // Requires `s_feature_incompat` to only have FILETYPE set — anything else
 // (in particular EXTENTS, i.e. an ext4 image) would misinterpret i_block
 // completely, so mounting refuses outright rather than guess. FILETYPE is
 // also what makes the on-disk dirent file_type byte meaningful, which the
 // write path relies on when creating new entries.
+//
+// ROBUSTNESS
+// ──────────
+// Every method that touches disk propagates ATA I/O failures as
+// `Errno::EIO` (via `read_block`/`write_block`) instead of panicking —
+// including `Filesystem::root()` (`vfs.rs`'s `Filesystem` trait makes this
+// `Result`-returning specifically so ext2 can propagate a real read
+// failure cleanly, even though it's re-invoked on *every* `/mnt` path
+// resolution, not just at mount time — see `vfs.rs`'s `resolve_inner`).
+//
+// A single coarse `EXT2_LOCK` (`spin::Mutex<()>`) is held across every
+// mutating operation (`create`/`mkdir`/`unlink`/`rmdir`/`take_child`/
+// `insert_child`/truncate-on-open/`Ext2FileHandle::write`) — without it,
+// two processes racing `alloc_block`/`alloc_inode`'s read-bitmap-then-
+// write-bitmap sequence (this kernel is preemptible; syscalls run with
+// interrupts enabled) could both see the same clear bit and silently
+// double-allocate a block or inode. Read-only paths (`lookup`/`readdir`/
+// `open` for reading) don't take it: besides being unnecessary for the
+// bitmap race specifically, `lookup` is called internally by every
+// mutating method above *while already holding the lock*, and
+// `spin::Mutex` isn't reentrant — locking there would deadlock.
+//
+// `read_block`/`write_block` reject any block number `>= blocks_count`
+// before ever issuing the ATA command — this is the single choke point
+// every on-disk pointer (BGD block/inode-table pointers, direct/indirect
+// `i_block` entries) flows through before being trusted, so it catches a
+// corrupted pointer wherever it originated instead of needing a bounds
+// check at every call site. `inode_location`, `free_block`, and
+// `free_inode` additionally validate their own `ino`/`block_num` inputs
+// *before* subtracting (a corrupt value below `first_data_block`/`1`
+// would otherwise underflow the `u32` group/bit computation — a panic in
+// debug builds, a wraparound to a wrong-but-in-range group in release).
+//
+// Crash consistency: this driver still keeps no journal (see SCOPE above)
+// — a power loss mid multi-step operation can still leak an allocated
+// block/inode that never got linked into any inode/directory. What *is*
+// handled: every multi-step mutation in this file already orders its
+// writes "allocate & write content, then link" (never the reverse), so
+// the only failure mode a crash can produce is an unreachable-but-still-
+// marked-used block/inode (a leak) — never a dangling pointer into freed/
+// reused space. Two mount-time passes clean up after exactly that failure
+// mode, both run from `init()` before `/mnt` is exposed to the VFS, both
+// deliberately mirroring what real `e2fsck` does most often in practice:
+//   - `Ext2Fs::reconcile_free_counts` — the free block/inode *counters*
+//     (BGD + superblock) are separate, independently-flushed writes from
+//     the bitmaps they summarize, so a crash between the two leaves them
+//     drifted ("Free blocks count wrong for group #N... FIXED"). Recomputes
+//     the true counts directly from the bitmaps and corrects any mismatch.
+//   - `Ext2Fs::reclaim_orphans` — walks every inode actually reachable
+//     from the root directory (`mark_reachable`, reusing the same
+//     `visit_inode_blocks` tree-walk `free_all_blocks` uses) and frees any
+//     block/inode the bitmaps mark used that the walk never reached: real
+//     e2fsck's passes 1-4 (build the "should be used" picture from the
+//     directory tree, reconcile it against what the bitmaps claim), just
+//     without the deeper structural checks (bad mode bits, cross-linked
+//     blocks, etc.) a full e2fsck also performs. This is what actually
+//     reclaims a block/inode a crash left allocated-but-never-linked —
+//     the one concrete gap the paragraph above used to describe as
+//     unrecoverable "in principle."
 
 use alloc::{boxed::Box, string::String, string::ToString, sync::Arc, vec::Vec};
 use spin::{Mutex, Once};
@@ -56,6 +128,11 @@ const FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
 
 static EXT2: Once<Ext2Fs> = Once::new();
 
+/// Serializes every mutating ext2 operation — see the module-level
+/// ROBUSTNESS doc comment for why this exists and why read-only paths
+/// don't take it.
+static EXT2_LOCK: Mutex<()> = Mutex::new(());
+
 /// Mount the ext2 filesystem from the ATA disk. Call once, before the VFS
 /// mounts `/mnt`. Returns `Err` (not panics) on any problem — a missing or
 /// unreadable disk shouldn't take down boot, just leave `/mnt` unmounted.
@@ -64,6 +141,19 @@ pub fn init() -> Result<(), &'static str> {
         return Err("no disk on the secondary IDE channel");
     }
     let fs = Ext2Fs::mount()?;
+    // Repair any free-count drift left by an unclean shutdown before this
+    // filesystem is exposed to the VFS — see `reconcile_free_counts`'s doc
+    // comment for why this matters beyond cosmetics.
+    fs.reconcile_free_counts()
+        .map_err(|_| "ext2: mount-time free-count reconciliation failed (ATA I/O error)")?;
+    // Reclaim any block/inode an unclean shutdown left allocated but never
+    // linked into the directory tree — see `reclaim_orphans`'s doc
+    // comment. Also before `/mnt` is exposed to the VFS: if this can't
+    // complete safely (I/O error, or a directory tree deeper than its
+    // guard), refuse the mount rather than risk sweeping against an
+    // incomplete picture of what's actually in use.
+    fs.reclaim_orphans()
+        .map_err(|_| "ext2: mount-time orphan reclaim failed (I/O error or directory tree too deep)")?;
     EXT2.call_once(|| fs);
     Ok(())
 }
@@ -84,12 +174,19 @@ struct Ext2Fs {
     inode_size: u16,
     bgdt_block: u32,
     num_groups: u32,
+    /// First non-reserved inode number (`s_first_ino`, rev>=1 only; fixed
+    /// at 11 for rev 0) — inodes below this (root's own ino=2 among them)
+    /// are always "in use" by convention, even though nothing walks a
+    /// directory entry to them. Used by `reclaim_orphans` so it doesn't
+    /// mistake a reserved inode for an orphan.
+    first_ino: u32,
 }
 
 /// The subset of a block group descriptor's fields this driver reads/writes.
 struct BgdRaw {
     block_bitmap: u32,
     inode_bitmap: u32,
+    inode_table: u32,
     free_blocks: u16,
     free_inodes: u16,
 }
@@ -126,6 +223,11 @@ impl Ext2Fs {
         } else {
             u32::from_le_bytes(raw[96..100].try_into().unwrap())
         };
+        let first_ino = if rev_level == 0 {
+            11
+        } else {
+            u32::from_le_bytes(raw[84..88].try_into().unwrap())
+        };
 
         if feature_incompat & !FEATURE_INCOMPAT_FILETYPE != 0 {
             return Err("unsupported ext2 incompat features (ext4 extents? journal?) — refusing to mount");
@@ -144,33 +246,47 @@ impl Ext2Fs {
             inode_size: if inode_size == 0 { 128 } else { inode_size },
             bgdt_block,
             num_groups: num_groups.max(1),
+            first_ino: if first_ino == 0 { 11 } else { first_ino },
         })
     }
 
     // ── Raw block I/O ────────────────────────────────────────────────────
 
     /// Read one filesystem block (`self.block_size` bytes) into `buf`.
-    fn read_block(&self, block_num: u32, buf: &mut [u8]) {
+    /// Propagates an ATA failure as `Errno::EIO` instead of panicking —
+    /// every caller in this file ultimately funnels a failure here up
+    /// through the VFS's own `Result<_, Errno>` surface. Also rejects any
+    /// `block_num` outside `0..blocks_count` — the single choke point
+    /// every on-disk pointer passes through, so a corrupted BGD/inode
+    /// pointer can't turn into a wild read at an arbitrary LBA (see the
+    /// module-level ROBUSTNESS comment).
+    fn read_block(&self, block_num: u32, buf: &mut [u8]) -> Result<(), Errno> {
         debug_assert!(buf.len() >= self.block_size as usize);
+        if block_num >= self.blocks_count {
+            return Err(Errno::EIO);
+        }
         let sectors_per_block = (self.block_size / crate::block::ata::SECTOR_SIZE as u32) as u8;
         let lba = block_num * sectors_per_block as u32;
-        crate::block::ata::read_sectors(lba, sectors_per_block, buf)
-            .expect("fs::ext2: ATA read failed");
+        crate::block::ata::read_sectors(lba, sectors_per_block, buf).map_err(|_| Errno::EIO)
     }
 
-    fn block_vec(&self, block_num: u32) -> Vec<u8> {
+    fn block_vec(&self, block_num: u32) -> Result<Vec<u8>, Errno> {
         let mut buf = alloc::vec![0u8; self.block_size as usize];
-        self.read_block(block_num, &mut buf);
-        buf
+        self.read_block(block_num, &mut buf)?;
+        Ok(buf)
     }
 
     /// Write one filesystem block (`self.block_size` bytes) from `buf`.
-    fn write_block(&self, block_num: u32, buf: &[u8]) {
+    /// Same EIO-not-panic contract and out-of-range-`block_num` rejection
+    /// as `read_block`.
+    fn write_block(&self, block_num: u32, buf: &[u8]) -> Result<(), Errno> {
         debug_assert!(buf.len() >= self.block_size as usize);
+        if block_num >= self.blocks_count {
+            return Err(Errno::EIO);
+        }
         let sectors_per_block = (self.block_size / crate::block::ata::SECTOR_SIZE as u32) as u8;
         let lba = block_num * sectors_per_block as u32;
-        crate::block::ata::write_sectors(lba, sectors_per_block, buf)
-            .expect("fs::ext2: ATA write failed");
+        crate::block::ata::write_sectors(lba, sectors_per_block, buf).map_err(|_| Errno::EIO)
     }
 
     // ── Inode table ──────────────────────────────────────────────────────
@@ -178,23 +294,32 @@ impl Ext2Fs {
     /// Locate the inode table block + byte offset for `ino` — shared by
     /// `read_inode` and `write_inode` so the two can never disagree about
     /// where an inode lives.
-    fn inode_location(&self, ino: u32) -> (u32, usize) {
-        debug_assert!(ino >= 1 && ino <= self.inodes_count, "ext2: inode {} out of range", ino);
+    fn inode_location(&self, ino: u32) -> Result<(u32, usize), Errno> {
+        // Real check, not `debug_assert!` — this driver trusts `ino`
+        // values read back out of directory entries on disk, so a
+        // corrupted dirent must not reach the `ino - 1` subtraction below
+        // (a `u32` underflow: a panic in debug builds, a wraparound to a
+        // huge-but-in-range-looking group index in release).
+        if ino < 1 || ino > self.inodes_count {
+            return Err(Errno::EIO);
+        }
         let group = (ino - 1) / self.inodes_per_group;
-        debug_assert!(group < self.num_groups, "ext2: inode {} maps to out-of-range group {}", ino, group);
+        if group >= self.num_groups {
+            return Err(Errno::EIO);
+        }
         let index_in_group = (ino - 1) % self.inodes_per_group;
 
         // Block Group Descriptor for `group` (32 bytes each). bg_inode_table
         // is the THIRD u32 field (bg_block_bitmap, bg_inode_bitmap, then
         // bg_inode_table) — +8 bytes into the descriptor, not +0.
         let (bgd_block, bgd_off) = self.bgd_location(group);
-        let bgd_buf = self.block_vec(bgd_block);
+        let bgd_buf = self.block_vec(bgd_block)?;
         let inode_table_block = u32::from_le_bytes(bgd_buf[bgd_off + 8..bgd_off + 12].try_into().unwrap());
 
         let inodes_per_block = self.block_size / self.inode_size as u32;
         let table_block = inode_table_block + index_in_group / inodes_per_block;
         let offset_in_block = ((index_in_group % inodes_per_block) * self.inode_size as u32) as usize;
-        (table_block, offset_in_block)
+        Ok((table_block, offset_in_block))
     }
 
     /// Read the raw on-disk inode record for `ino`.
@@ -203,32 +328,32 @@ impl Ext2Fs {
     /// directory entry, or the well-known root inode 2) — bounds-checked
     /// against the superblock's own counts as a corruption tripwire, not
     /// because callers are expected to pass arbitrary numbers.
-    fn read_inode(&self, ino: u32) -> RawInode {
-        let (table_block, offset_in_block) = self.inode_location(ino);
-        let block_buf = self.block_vec(table_block);
-        RawInode::parse(&block_buf[offset_in_block..offset_in_block + self.inode_size as usize])
+    fn read_inode(&self, ino: u32) -> Result<RawInode, Errno> {
+        let (table_block, offset_in_block) = self.inode_location(ino)?;
+        let block_buf = self.block_vec(table_block)?;
+        Ok(RawInode::parse(&block_buf[offset_in_block..offset_in_block + self.inode_size as usize]))
     }
 
     /// Write `raw` back to `ino`'s on-disk inode record. Read-modify-write:
     /// the inode table block holds several inodes, so the rest of the
     /// block must survive untouched.
-    fn write_inode(&self, ino: u32, raw: &RawInode) {
-        let (table_block, offset_in_block) = self.inode_location(ino);
-        let mut block_buf = self.block_vec(table_block);
+    fn write_inode(&self, ino: u32, raw: &RawInode) -> Result<(), Errno> {
+        let (table_block, offset_in_block) = self.inode_location(ino)?;
+        let mut block_buf = self.block_vec(table_block)?;
         block_buf[offset_in_block..offset_in_block + self.inode_size as usize].copy_from_slice(&raw.buf);
-        self.write_block(table_block, &block_buf);
+        self.write_block(table_block, &block_buf)
     }
 
     // ── Block-pointer mapping (read-only lookup) ────────────────────────
 
     /// Map a file-relative block index to a filesystem block number.
     /// Direct (0..12), singly-indirect, and doubly-indirect — returns
-    /// `None` if the block is a hole (not yet allocated) or beyond what
+    /// `Ok(None)` if the block is a hole (not yet allocated) or beyond what
     /// this driver supports (see module doc comment).
-    fn block_for_index(&self, raw: &RawInode, index: u32) -> Option<u32> {
+    fn block_for_index(&self, raw: &RawInode, index: u32) -> Result<Option<u32>, Errno> {
         if index < 12 {
             let b = raw.i_block(index as usize);
-            return if b == 0 { None } else { Some(b) };
+            return Ok(if b == 0 { None } else { Some(b) });
         }
         let ptrs_per_block = self.block_size / 4;
 
@@ -236,7 +361,7 @@ impl Ext2Fs {
         if indirect_index < ptrs_per_block {
             let indirect_block = raw.i_block(12);
             if indirect_block == 0 {
-                return None;
+                return Ok(None);
             }
             return self.read_block_ptr(indirect_block, indirect_index);
         }
@@ -246,25 +371,47 @@ impl Ext2Fs {
         if dbl_index < dbl_capacity {
             let dbl_indirect_block = raw.i_block(13);
             if dbl_indirect_block == 0 {
-                return None;
+                return Ok(None);
             }
             let first_level_index = dbl_index / ptrs_per_block;
             let second_level_index = dbl_index % ptrs_per_block;
-            let first_level_block = self.read_block_ptr(dbl_indirect_block, first_level_index)?;
+            let Some(first_level_block) = self.read_block_ptr(dbl_indirect_block, first_level_index)? else {
+                return Ok(None);
+            };
             return self.read_block_ptr(first_level_block, second_level_index);
         }
 
-        None // triply indirect — not implemented
+        let tpl_index = dbl_index - dbl_capacity;
+        let tpl_capacity = dbl_capacity * ptrs_per_block;
+        if tpl_index < tpl_capacity {
+            let tpl_block = raw.i_block(14);
+            if tpl_block == 0 {
+                return Ok(None);
+            }
+            let first_level_index = tpl_index / dbl_capacity;
+            let rem = tpl_index % dbl_capacity;
+            let second_level_index = rem / ptrs_per_block;
+            let third_level_index = rem % ptrs_per_block;
+            let Some(first_level_block) = self.read_block_ptr(tpl_block, first_level_index)? else {
+                return Ok(None);
+            };
+            let Some(second_level_block) = self.read_block_ptr(first_level_block, second_level_index)? else {
+                return Ok(None);
+            };
+            return self.read_block_ptr(second_level_block, third_level_index);
+        }
+
+        Ok(None) // beyond even triply-indirect capacity
     }
 
     /// Read the `index`-th block-pointer `u32` out of an indirect (or
     /// doubly-indirect first-level) pointer block — shared by both levels
     /// of `block_for_index` above.
-    fn read_block_ptr(&self, block_num: u32, index: u32) -> Option<u32> {
-        let buf = self.block_vec(block_num);
+    fn read_block_ptr(&self, block_num: u32, index: u32) -> Result<Option<u32>, Errno> {
+        let buf = self.block_vec(block_num)?;
         let off = (index * 4) as usize;
         let b = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-        if b == 0 { None } else { Some(b) }
+        Ok(if b == 0 { None } else { Some(b) })
     }
 
     // ── Block-pointer mapping (allocate-on-demand) ──────────────────────
@@ -273,15 +420,15 @@ impl Ext2Fs {
     /// indirect/doubly-indirect pointer block, writing the new pointer back
     /// immediately — shared by both levels of `block_for_index_alloc`.
     fn get_or_alloc_ptr(&self, container_block: u32, index: u32) -> Result<u32, Errno> {
-        let mut buf = self.block_vec(container_block);
+        let mut buf = self.block_vec(container_block)?;
         let off = (index * 4) as usize;
         let existing = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
         if existing != 0 {
             return Ok(existing);
         }
-        let new_block = self.alloc_block().ok_or(Errno::ENOSPC)?;
+        let new_block = self.alloc_block()?.ok_or(Errno::ENOSPC)?;
         buf[off..off + 4].copy_from_slice(&new_block.to_le_bytes());
-        self.write_block(container_block, &buf);
+        self.write_block(container_block, &buf)?;
         Ok(new_block)
     }
 
@@ -295,7 +442,7 @@ impl Ext2Fs {
             if b != 0 {
                 return Ok(b);
             }
-            let nb = self.alloc_block().ok_or(Errno::ENOSPC)?;
+            let nb = self.alloc_block()?.ok_or(Errno::ENOSPC)?;
             raw.set_i_block(index as usize, nb);
             return Ok(nb);
         }
@@ -305,7 +452,7 @@ impl Ext2Fs {
         if indirect_index < ptrs_per_block {
             let indirect_block = raw.i_block(12);
             let indirect_block = if indirect_block == 0 {
-                let nb = self.alloc_block().ok_or(Errno::ENOSPC)?;
+                let nb = self.alloc_block()?.ok_or(Errno::ENOSPC)?;
                 raw.set_i_block(12, nb);
                 nb
             } else {
@@ -319,7 +466,7 @@ impl Ext2Fs {
         if dbl_index < dbl_capacity {
             let dbl_block = raw.i_block(13);
             let dbl_block = if dbl_block == 0 {
-                let nb = self.alloc_block().ok_or(Errno::ENOSPC)?;
+                let nb = self.alloc_block()?.ok_or(Errno::ENOSPC)?;
                 raw.set_i_block(13, nb);
                 nb
             } else {
@@ -331,13 +478,33 @@ impl Ext2Fs {
             return self.get_or_alloc_ptr(first_level_block, second_level_index);
         }
 
-        Err(Errno::EFBIG) // triply indirect — not implemented, see module doc comment
+        let tpl_index = dbl_index - dbl_capacity;
+        let tpl_capacity = dbl_capacity * ptrs_per_block;
+        if tpl_index < tpl_capacity {
+            let tpl_block = raw.i_block(14);
+            let tpl_block = if tpl_block == 0 {
+                let nb = self.alloc_block()?.ok_or(Errno::ENOSPC)?;
+                raw.set_i_block(14, nb);
+                nb
+            } else {
+                tpl_block
+            };
+            let first_level_index = tpl_index / dbl_capacity;
+            let rem = tpl_index % dbl_capacity;
+            let second_level_index = rem / ptrs_per_block;
+            let third_level_index = rem % ptrs_per_block;
+            let first_level_block = self.get_or_alloc_ptr(tpl_block, first_level_index)?;
+            let second_level_block = self.get_or_alloc_ptr(first_level_block, second_level_index)?;
+            return self.get_or_alloc_ptr(second_level_block, third_level_index);
+        }
+
+        Err(Errno::EFBIG) // beyond even triply-indirect capacity — genuinely unsupported
     }
 
     // ── File data read/write ─────────────────────────────────────────────
 
     /// Read `buf.len()` bytes of file data starting at byte `offset`.
-    fn read_file_range(&self, raw: &RawInode, offset: usize, buf: &mut [u8]) {
+    fn read_file_range(&self, raw: &RawInode, offset: usize, buf: &mut [u8]) -> Result<(), Errno> {
         let bs = self.block_size as usize;
         let mut done = 0;
         while done < buf.len() {
@@ -346,9 +513,9 @@ impl Ext2Fs {
             let block_off = file_pos % bs;
             let n = (bs - block_off).min(buf.len() - done);
 
-            match self.block_for_index(raw, block_index) {
+            match self.block_for_index(raw, block_index)? {
                 Some(block_num) => {
-                    let block_buf = self.block_vec(block_num);
+                    let block_buf = self.block_vec(block_num)?;
                     buf[done..done + n].copy_from_slice(&block_buf[block_off..block_off + n]);
                 }
                 None => {
@@ -358,6 +525,7 @@ impl Ext2Fs {
             }
             done += n;
         }
+        Ok(())
     }
 
     /// Write `data` at byte `offset`, allocating whatever blocks are
@@ -381,12 +549,12 @@ impl Ext2Fs {
 
             let block_num = self.block_for_index_alloc(raw, block_index)?;
             if n == bs {
-                self.write_block(block_num, &data[done..done + n]);
+                self.write_block(block_num, &data[done..done + n])?;
             } else {
                 // Partial-block write — preserve the rest of the block's content.
-                let mut block_buf = self.block_vec(block_num);
+                let mut block_buf = self.block_vec(block_num)?;
                 block_buf[block_off..block_off + n].copy_from_slice(&data[done..done + n]);
-                self.write_block(block_num, &block_buf);
+                self.write_block(block_num, &block_buf)?;
             }
             done += n;
         }
@@ -395,84 +563,168 @@ impl Ext2Fs {
         if new_size > raw.size() {
             raw.set_size(new_size);
         }
-        self.write_inode(ino, raw);
+        self.write_inode(ino, raw)?;
         Ok(data.len())
     }
 
-    /// Free every block this inode owns (direct, singly-indirect data +
-    /// pointer block, doubly-indirect data + first-level pointer blocks +
-    /// the doubly-indirect block itself) and zero its size. Does NOT free
-    /// the inode itself — callers decide that based on link count.
-    fn free_all_blocks(&self, raw: &mut RawInode) {
+    /// Free every block this inode owns (direct, singly-, doubly-, and
+    /// triply-indirect data + every pointer block along the way) and zero
+    /// its size. Does NOT free the inode itself — callers decide that
+    /// based on link count.
+    ///
+    /// Guarded by `has_block_pointers()`: a fast symlink's `i_block` bytes
+    /// are inline text, not real pointers (see module doc comment) —
+    /// walking them as if they were would try to "free" whatever garbage
+    /// block numbers the text happens to decode to. Before this guard
+    /// existed, `unlink()` on a fast symlink hit exactly that: the first
+    /// four bytes of a target like `"realfile.txt"` decode to block
+    /// `0x6C616572` (huge — safely rejected by `free_block`'s bounds
+    /// check, see the module-level ROBUSTNESS comment — but the rejection
+    /// itself made the whole `unlink()` fail with `EIO` instead of
+    /// succeeding).
+    fn free_all_blocks(&self, raw: &mut RawInode) -> Result<(), Errno> {
+        if raw.has_block_pointers() {
+            self.visit_inode_blocks(raw, |b| self.free_block(b))?;
+            for i in 0..15 {
+                raw.set_i_block(i, 0);
+            }
+        }
+        raw.set_size(0);
+        raw.set_blocks_512(0);
+        Ok(())
+    }
+
+    /// Call `visit(block_num)` for every block number this inode owns —
+    /// direct, singly-, doubly-, and triply-indirect, pointer blocks
+    /// themselves as well as their leaf targets. Shared tree-walk shape
+    /// behind both `free_all_blocks` (frees what it visits) and the
+    /// mount-time orphan scan `reclaim_orphans`/`mark_reachable` (marks
+    /// what it visits as reachable, never frees anything itself) — same
+    /// traversal, different action per block, so the shape only needs to
+    /// be right in one place.
+    ///
+    /// Callers are responsible for the `has_block_pointers()` guard (see
+    /// `free_all_blocks`'s doc comment) — this function trusts `i_block`
+    /// to hold real pointers unconditionally.
+    fn visit_inode_blocks(&self, raw: &RawInode, mut visit: impl FnMut(u32) -> Result<(), Errno>) -> Result<(), Errno> {
         for i in 0..12 {
             let b = raw.i_block(i);
             if b != 0 {
-                self.free_block(b);
-                raw.set_i_block(i, 0);
+                visit(b)?;
             }
         }
 
         let ptrs_per_block = self.block_size / 4;
+
         let indirect = raw.i_block(12);
         if indirect != 0 {
-            self.free_pointer_block_targets(indirect);
-            self.free_block(indirect);
-            raw.set_i_block(12, 0);
+            visit(indirect)?;
+            self.visit_pointer_block_targets(indirect, &mut visit)?;
         }
 
         let dbl = raw.i_block(13);
         if dbl != 0 {
-            let buf = self.block_vec(dbl);
+            visit(dbl)?;
+            let buf = self.block_vec(dbl)?;
             for idx in 0..ptrs_per_block {
                 let off = (idx * 4) as usize;
                 let first_level = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
                 if first_level != 0 {
-                    self.free_pointer_block_targets(first_level);
-                    self.free_block(first_level);
+                    visit(first_level)?;
+                    self.visit_pointer_block_targets(first_level, &mut visit)?;
                 }
             }
-            self.free_block(dbl);
-            raw.set_i_block(13, 0);
         }
 
-        // Triply-indirect (i_block(14)) is never allocated by this driver
-        // (see block_for_index_alloc), so there's nothing to free there.
+        let tpl = raw.i_block(14);
+        if tpl != 0 {
+            visit(tpl)?;
+            let buf = self.block_vec(tpl)?;
+            for idx in 0..ptrs_per_block {
+                let off = (idx * 4) as usize;
+                let second_level = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+                if second_level != 0 {
+                    visit(second_level)?;
+                    let buf2 = self.block_vec(second_level)?;
+                    for idx2 in 0..ptrs_per_block {
+                        let off2 = (idx2 * 4) as usize;
+                        let first_level = u32::from_le_bytes(buf2[off2..off2 + 4].try_into().unwrap());
+                        if first_level != 0 {
+                            visit(first_level)?;
+                            self.visit_pointer_block_targets(first_level, &mut visit)?;
+                        }
+                    }
+                }
+            }
+        }
 
-        raw.set_size(0);
-        raw.set_blocks_512(0);
+        Ok(())
     }
 
-    /// Free every block a pointer block (indirect, or one doubly-indirect
-    /// first-level block) points at — NOT the pointer block itself.
-    fn free_pointer_block_targets(&self, block_num: u32) {
-        let buf = self.block_vec(block_num);
+    /// Call `visit` for every block number a pointer block (indirect, or
+    /// one doubly-/triply-indirect first-level block) itself points at —
+    /// NOT the pointer block's own number. Shared leaf-level step of
+    /// `visit_inode_blocks`.
+    fn visit_pointer_block_targets(&self, block_num: u32, visit: &mut impl FnMut(u32) -> Result<(), Errno>) -> Result<(), Errno> {
+        let buf = self.block_vec(block_num)?;
         let ptrs_per_block = self.block_size / 4;
         for idx in 0..ptrs_per_block {
             let off = (idx * 4) as usize;
             let b = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-            if b != 0 { self.free_block(b); }
+            if b != 0 {
+                visit(b)?;
+            }
         }
+        Ok(())
     }
 
     /// Truncate a file to zero length: frees all its data blocks and
     /// persists the now-empty inode. Backs `O_TRUNC`.
-    fn truncate_to_zero(&self, ino: u32, raw: &mut RawInode) {
-        self.free_all_blocks(raw);
-        self.write_inode(ino, raw);
+    fn truncate_to_zero(&self, ino: u32, raw: &mut RawInode) -> Result<(), Errno> {
+        self.free_all_blocks(raw)?;
+        self.write_inode(ino, raw)
+    }
+
+    /// Read a symlink inode's target string. Real ext2 has two on-disk
+    /// representations, and this driver reads both (see module doc
+    /// comment): "fast" — target under 60 bytes, stored directly in the
+    /// inode's `i_block` bytes, no data block ever allocated — and "slow"
+    /// — target stored as ordinary file content, same as a regular file.
+    /// `size < 60` (not, say, `i_block(0) == 0`) is the only reliable way
+    /// to tell them apart *while reading*: the fast representation's inline
+    /// storage bytes physically alias `i_block`'s own byte range (that's
+    /// the whole space-saving trick — see `Ext2Inode::symlink`), so a
+    /// short target whose own bytes happen to decode to a nonzero
+    /// `i_block(0)` would otherwise be misread as a slow symlink and its
+    /// text bytes reinterpreted as real block pointers. `size < 60` has no
+    /// such ambiguity: a target that size can only ever have been written
+    /// as "fast" (60 bytes is the hard physical limit of the inline area,
+    /// on any ext2 image, not just this driver's own writes), so this
+    /// matches both this driver's own symlinks and a real `mke2fs`/host-
+    /// authored image's.
+    fn read_symlink_target(&self, raw: &RawInode) -> Result<String, Errno> {
+        let size = raw.size() as usize;
+        if raw.is_fast_symlink() {
+            let bytes = &raw.buf[40..40 + size];
+            return Ok(String::from_utf8_lossy(bytes).to_string());
+        }
+        let mut buf = alloc::vec![0u8; size];
+        self.read_file_range(raw, 0, &mut buf)?;
+        Ok(String::from_utf8_lossy(&buf).to_string())
     }
 
     // ── Directory entries ────────────────────────────────────────────────
 
     /// Parse every directory entry out of `raw`'s data blocks (direct +
     /// indirect, same limit as file reads).
-    fn read_dir_entries(&self, raw: &RawInode) -> Vec<Ext2DirEntry> {
+    fn read_dir_entries(&self, raw: &RawInode) -> Result<Vec<Ext2DirEntry>, Errno> {
         let mut entries = Vec::new();
         let bs = self.block_size;
         let num_blocks = (raw.size() + bs as u64 - 1) / bs as u64;
 
         for block_index in 0..num_blocks as u32 {
-            let Some(block_num) = self.block_for_index(raw, block_index) else { continue };
-            let buf = self.block_vec(block_num);
+            let Some(block_num) = self.block_for_index(raw, block_index)? else { continue };
+            let buf = self.block_vec(block_num)?;
             let mut off = 0usize;
             while off + 8 <= buf.len() {
                 let inode = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
@@ -495,7 +747,7 @@ impl Ext2Fs {
                 off += rec_len as usize;
             }
         }
-        entries
+        Ok(entries)
     }
 
     /// Insert a new `(name -> ino)` directory entry into `dir_raw`'s data,
@@ -509,8 +761,8 @@ impl Ext2Fs {
         let num_blocks = ((dir_raw.size() as usize) + bs - 1) / bs;
 
         for block_index in 0..num_blocks as u32 {
-            let Some(block_num) = self.block_for_index(dir_raw, block_index) else { continue };
-            let mut buf = self.block_vec(block_num);
+            let Some(block_num) = self.block_for_index(dir_raw, block_index)? else { continue };
+            let mut buf = self.block_vec(block_num)?;
             let mut off = 0usize;
             while off + 8 <= buf.len() {
                 let entry_ino = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
@@ -533,7 +785,7 @@ impl Ext2Fs {
                         // Reuse a deleted slot in place, keeping its rec_len.
                         write_dirent(&mut buf[off..off + rec_len], ino, rec_len as u16, name, kind);
                     }
-                    self.write_block(block_num, &buf);
+                    self.write_block(block_num, &buf)?;
                     return Ok(());
                 }
                 off += rec_len;
@@ -545,9 +797,9 @@ impl Ext2Fs {
         let new_block = self.block_for_index_alloc(dir_raw, new_block_index)?;
         let mut buf = alloc::vec![0u8; bs];
         write_dirent(&mut buf[..], ino, bs as u16, name, kind);
-        self.write_block(new_block, &buf);
+        self.write_block(new_block, &buf)?;
         dir_raw.set_size((new_block_index as u64 + 1) * bs as u64);
-        self.write_inode(dir_ino, dir_raw);
+        self.write_inode(dir_ino, dir_raw)?;
         Ok(())
     }
 
@@ -561,8 +813,8 @@ impl Ext2Fs {
         let num_blocks = ((dir_raw.size() as usize) + bs - 1) / bs;
 
         for block_index in 0..num_blocks as u32 {
-            let Some(block_num) = self.block_for_index(dir_raw, block_index) else { continue };
-            let mut buf = self.block_vec(block_num);
+            let Some(block_num) = self.block_for_index(dir_raw, block_index)? else { continue };
+            let mut buf = self.block_vec(block_num)?;
             let mut off = 0usize;
             let mut prev_off: Option<usize> = None;
             while off + 8 <= buf.len() {
@@ -582,7 +834,7 @@ impl Ext2Fs {
                     } else {
                         buf[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
                     }
-                    self.write_block(block_num, &buf);
+                    self.write_block(block_num, &buf)?;
                     return Ok((entry_ino, ext2_file_type_to_vfs(file_type)));
                 }
                 prev_off = Some(off);
@@ -597,8 +849,8 @@ impl Ext2Fs {
     /// `".."` is always in the directory's first data block (it's written
     /// there by `mkdir` and this driver never reorders entries).
     fn set_dotdot(&self, dir_raw: &RawInode, new_parent_ino: u32) -> Result<(), Errno> {
-        let Some(block_num) = self.block_for_index(dir_raw, 0) else { return Err(Errno::EIO) };
-        let mut buf = self.block_vec(block_num);
+        let Some(block_num) = self.block_for_index(dir_raw, 0)? else { return Err(Errno::EIO) };
+        let mut buf = self.block_vec(block_num)?;
         let mut off = 0usize;
         while off + 8 <= buf.len() {
             let rec_len = u16::from_le_bytes(buf[off + 4..off + 6].try_into().unwrap()) as usize;
@@ -608,7 +860,7 @@ impl Ext2Fs {
             let name_len = buf[off + 6] as usize;
             if name_len == 2 && off + 8 + 2 <= buf.len() && &buf[off + 8..off + 10] == b".." {
                 buf[off..off + 4].copy_from_slice(&new_parent_ino.to_le_bytes());
-                self.write_block(block_num, &buf);
+                self.write_block(block_num, &buf)?;
                 return Ok(());
             }
             off += rec_len;
@@ -625,20 +877,21 @@ impl Ext2Fs {
         (bgd_block, bgd_offset)
     }
 
-    fn read_bgd(&self, group: u32) -> BgdRaw {
+    fn read_bgd(&self, group: u32) -> Result<BgdRaw, Errno> {
         let (blk, off) = self.bgd_location(group);
-        let buf = self.block_vec(blk);
-        BgdRaw {
+        let buf = self.block_vec(blk)?;
+        Ok(BgdRaw {
             block_bitmap: u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()),
             inode_bitmap: u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap()),
+            inode_table: u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap()),
             free_blocks: u16::from_le_bytes(buf[off + 12..off + 14].try_into().unwrap()),
             free_inodes: u16::from_le_bytes(buf[off + 14..off + 16].try_into().unwrap()),
-        }
+        })
     }
 
-    fn adjust_bgd_counts(&self, group: u32, free_blocks_delta: i32, free_inodes_delta: i32, used_dirs_delta: i32) {
+    fn adjust_bgd_counts(&self, group: u32, free_blocks_delta: i32, free_inodes_delta: i32, used_dirs_delta: i32) -> Result<(), Errno> {
         let (blk, off) = self.bgd_location(group);
-        let mut buf = self.block_vec(blk);
+        let mut buf = self.block_vec(blk)?;
         if free_blocks_delta != 0 {
             let cur = u16::from_le_bytes(buf[off + 12..off + 14].try_into().unwrap());
             let new = (cur as i32 + free_blocks_delta) as u16;
@@ -654,16 +907,16 @@ impl Ext2Fs {
             let new = (cur as i32 + used_dirs_delta) as u16;
             buf[off + 16..off + 18].copy_from_slice(&new.to_le_bytes());
         }
-        self.write_block(blk, &buf);
+        self.write_block(blk, &buf)
     }
 
     /// Patch the superblock's free block/inode counts directly on disk —
     /// re-reads the fixed byte-1024 superblock sectors fresh each time
     /// (same as `mount()`) rather than keeping a cached copy, since this is
     /// the only mutable superblock state this driver tracks.
-    fn adjust_sb_counts(&self, free_blocks_delta: i32, free_inodes_delta: i32) {
+    fn adjust_sb_counts(&self, free_blocks_delta: i32, free_inodes_delta: i32) -> Result<(), Errno> {
         let mut raw = [0u8; 1024];
-        crate::block::ata::read_sectors(2, 2, &mut raw).expect("fs::ext2: superblock re-read failed");
+        crate::block::ata::read_sectors(2, 2, &mut raw).map_err(|_| Errno::EIO)?;
         if free_blocks_delta != 0 {
             let cur = u32::from_le_bytes(raw[12..16].try_into().unwrap());
             let new = (cur as i64 + free_blocks_delta as i64) as u32;
@@ -674,7 +927,7 @@ impl Ext2Fs {
             let new = (cur as i64 + free_inodes_delta as i64) as u32;
             raw[16..20].copy_from_slice(&new.to_le_bytes());
         }
-        crate::block::ata::write_sectors(2, 2, &raw).expect("fs::ext2: superblock write failed");
+        crate::block::ata::write_sectors(2, 2, &raw).map_err(|_| Errno::EIO)
     }
 
     fn blocks_in_group(&self, group: u32) -> u32 {
@@ -690,85 +943,417 @@ impl Ext2Fs {
     /// Allocate a free data block: scan each group's block bitmap for a
     /// clear bit, set it, update the group + superblock free counts, and
     /// zero the block's content (so a demand-paging-style hole never
-    /// exposes stale disk data). Returns `None` when the filesystem is
-    /// full (`ENOSPC`).
-    fn alloc_block(&self) -> Option<u32> {
+    /// exposes stale disk data). Returns `Ok(None)` when the filesystem is
+    /// full (`ENOSPC`), `Err` on an I/O failure.
+    fn alloc_block(&self) -> Result<Option<u32>, Errno> {
         for group in 0..self.num_groups {
-            let bgd = self.read_bgd(group);
+            let bgd = self.read_bgd(group)?;
             if bgd.free_blocks == 0 {
                 continue;
             }
             let group_blocks = self.blocks_in_group(group);
-            let mut bitmap = self.block_vec(bgd.block_bitmap);
+            let mut bitmap = self.block_vec(bgd.block_bitmap)?;
             for bit in 0..group_blocks {
                 let byte = (bit / 8) as usize;
                 let mask = 1u8 << (bit % 8);
                 if bitmap[byte] & mask == 0 {
                     bitmap[byte] |= mask;
-                    self.write_block(bgd.block_bitmap, &bitmap);
-                    self.adjust_bgd_counts(group, -1, 0, 0);
-                    self.adjust_sb_counts(-1, 0);
+                    self.write_block(bgd.block_bitmap, &bitmap)?;
+                    self.adjust_bgd_counts(group, -1, 0, 0)?;
+                    self.adjust_sb_counts(-1, 0)?;
                     let block_num = self.first_data_block + group * self.blocks_per_group + bit;
                     let zeros = alloc::vec![0u8; self.block_size as usize];
-                    self.write_block(block_num, &zeros);
-                    return Some(block_num);
+                    self.write_block(block_num, &zeros)?;
+                    return Ok(Some(block_num));
                 }
             }
         }
-        None
+        Ok(None)
     }
 
-    fn free_block(&self, block_num: u32) {
+    fn free_block(&self, block_num: u32) -> Result<(), Errno> {
+        // Validate before subtracting — `block_num` here always originates
+        // from an on-disk `i_block`/indirect pointer (see callers in
+        // `free_all_blocks`/`free_pointer_block_targets`), so a corrupted
+        // value below `first_data_block` must not underflow the `u32`
+        // group/bit computation below.
+        if block_num < self.first_data_block || block_num >= self.blocks_count {
+            return Err(Errno::EIO);
+        }
         let group = (block_num - self.first_data_block) / self.blocks_per_group;
         let bit = (block_num - self.first_data_block) % self.blocks_per_group;
-        let bgd = self.read_bgd(group);
-        let mut bitmap = self.block_vec(bgd.block_bitmap);
+        let bgd = self.read_bgd(group)?;
+        let mut bitmap = self.block_vec(bgd.block_bitmap)?;
         let byte = (bit / 8) as usize;
         let mask = 1u8 << (bit % 8);
         bitmap[byte] &= !mask;
-        self.write_block(bgd.block_bitmap, &bitmap);
-        self.adjust_bgd_counts(group, 1, 0, 0);
-        self.adjust_sb_counts(1, 0);
+        self.write_block(bgd.block_bitmap, &bitmap)?;
+        self.adjust_bgd_counts(group, 1, 0, 0)?;
+        self.adjust_sb_counts(1, 0)
     }
 
     /// Allocate a free inode. `is_dir` also bumps the group's directory
     /// count (`bg_used_dirs_count`) — cosmetic bookkeeping real ext2 tools
     /// (e2fsck, `df -i` equivalents) rely on, harmless if never read here.
-    fn alloc_inode(&self, is_dir: bool) -> Option<u32> {
+    fn alloc_inode(&self, is_dir: bool) -> Result<Option<u32>, Errno> {
         for group in 0..self.num_groups {
-            let bgd = self.read_bgd(group);
+            let bgd = self.read_bgd(group)?;
             if bgd.free_inodes == 0 {
                 continue;
             }
             let group_inodes = self.inodes_in_group(group);
-            let mut bitmap = self.block_vec(bgd.inode_bitmap);
+            let mut bitmap = self.block_vec(bgd.inode_bitmap)?;
             for bit in 0..group_inodes {
                 let byte = (bit / 8) as usize;
                 let mask = 1u8 << (bit % 8);
                 if bitmap[byte] & mask == 0 {
                     bitmap[byte] |= mask;
-                    self.write_block(bgd.inode_bitmap, &bitmap);
-                    self.adjust_bgd_counts(group, 0, -1, if is_dir { 1 } else { 0 });
-                    self.adjust_sb_counts(0, -1);
-                    return Some(group * self.inodes_per_group + bit + 1);
+                    self.write_block(bgd.inode_bitmap, &bitmap)?;
+                    self.adjust_bgd_counts(group, 0, -1, if is_dir { 1 } else { 0 })?;
+                    self.adjust_sb_counts(0, -1)?;
+                    return Ok(Some(group * self.inodes_per_group + bit + 1));
                 }
             }
         }
-        None
+        Ok(None)
     }
 
-    fn free_inode(&self, ino: u32, is_dir: bool) {
+    fn free_inode(&self, ino: u32, is_dir: bool) -> Result<(), Errno> {
+        // Same corrupted-input-before-underflow guard as `free_block`.
+        if ino < 1 || ino > self.inodes_count {
+            return Err(Errno::EIO);
+        }
         let group = (ino - 1) / self.inodes_per_group;
         let bit = (ino - 1) % self.inodes_per_group;
-        let bgd = self.read_bgd(group);
-        let mut bitmap = self.block_vec(bgd.inode_bitmap);
+        let bgd = self.read_bgd(group)?;
+        let mut bitmap = self.block_vec(bgd.inode_bitmap)?;
         let byte = (bit / 8) as usize;
         let mask = 1u8 << (bit % 8);
         bitmap[byte] &= !mask;
-        self.write_block(bgd.inode_bitmap, &bitmap);
-        self.adjust_bgd_counts(group, 0, 1, if is_dir { -1 } else { 0 });
-        self.adjust_sb_counts(0, 1);
+        self.write_block(bgd.inode_bitmap, &bitmap)?;
+        self.adjust_bgd_counts(group, 0, 1, if is_dir { -1 } else { 0 })?;
+        self.adjust_sb_counts(0, 1)
     }
+
+    // ── Mount-time consistency repair ───────────────────────────────────
+
+    /// Recompute every group's true free block/inode counts directly from
+    /// its bitmap and correct the stored BGD + superblock counters if they
+    /// disagree. Called once from `init()`, before this filesystem is
+    /// exposed to the VFS.
+    ///
+    /// Bitmap writes are always durable the instant they happen (this
+    /// driver has no write-back cache), but the *counters* that track free
+    /// space are separate, independently-flushed writes (see the module
+    /// doc comment) — an unclean shutdown between a bitmap write and its
+    /// matching counter update leaves the bitmap correct but the counter
+    /// stale. Left unrepaired, that drift is a real correctness bug, not
+    /// just cosmetic: `alloc_block`/`alloc_inode` use the counter as a
+    /// fast "is this group full" pre-check, so a counter that's stuck too
+    /// low makes them wrongly skip a group that actually has free bits,
+    /// eventually surfacing as spurious `ENOSPC`. This is the same repair
+    /// real `e2fsck` applies most often in practice; it does not attempt
+    /// the harder problem of reclaiming blocks/inodes that a crash left
+    /// allocated-but-unlinked (an orphan scan needs a full reachability
+    /// walk from the root, which this driver doesn't implement) — that
+    /// space just stays leaked until a real `e2fsck` run outside this
+    /// kernel.
+    fn reconcile_free_counts(&self) -> Result<(), Errno> {
+        let mut sb_raw = [0u8; 1024];
+        crate::block::ata::read_sectors(2, 2, &mut sb_raw).map_err(|_| Errno::EIO)?;
+        let sb_free_blocks = u32::from_le_bytes(sb_raw[12..16].try_into().unwrap());
+        let sb_free_inodes = u32::from_le_bytes(sb_raw[16..20].try_into().unwrap());
+
+        let mut total_free_blocks: u32 = 0;
+        let mut total_free_inodes: u32 = 0;
+
+        for group in 0..self.num_groups {
+            let bgd = self.read_bgd(group)?;
+
+            let block_bitmap = self.block_vec(bgd.block_bitmap)?;
+            let real_free_blocks = count_free_bits(&block_bitmap, self.blocks_in_group(group));
+
+            let inode_bitmap = self.block_vec(bgd.inode_bitmap)?;
+            let real_free_inodes = count_free_bits(&inode_bitmap, self.inodes_in_group(group));
+
+            if real_free_blocks != bgd.free_blocks || real_free_inodes != bgd.free_inodes {
+                crate::ktrace!(
+                    crate::debug::FS,
+                    "ext2: group {} free-count drift (blocks {}->{}, inodes {}->{}), repairing",
+                    group, bgd.free_blocks, real_free_blocks, bgd.free_inodes, real_free_inodes
+                );
+                self.adjust_bgd_counts(
+                    group,
+                    real_free_blocks as i32 - bgd.free_blocks as i32,
+                    real_free_inodes as i32 - bgd.free_inodes as i32,
+                    0,
+                )?;
+            }
+
+            total_free_blocks += real_free_blocks as u32;
+            total_free_inodes += real_free_inodes as u32;
+        }
+
+        if total_free_blocks != sb_free_blocks || total_free_inodes != sb_free_inodes {
+            crate::ktrace!(
+                crate::debug::FS,
+                "ext2: superblock free-count drift (blocks {}->{}, inodes {}->{}), repairing",
+                sb_free_blocks, total_free_blocks, sb_free_inodes, total_free_inodes
+            );
+            self.adjust_sb_counts(
+                total_free_blocks as i32 - sb_free_blocks as i32,
+                total_free_inodes as i32 - sb_free_inodes as i32,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Mount-time orphan scan — see the module-level ROBUSTNESS comment
+    /// for the full rationale. Builds a "should be used" bitmap pair by
+    /// walking every inode actually reachable from the root directory
+    /// (fixed metadata + reserved inodes are seeded in as used up front,
+    /// same convention real ext2 tools use), then clears any bit the real
+    /// on-disk bitmaps mark used that the walk never reached.
+    ///
+    /// Safety-critical property: the sweep only ever runs if the walk
+    /// completed with no error at all (`?` on every fallible step here
+    /// means a single I/O failure or a directory tree deeper than the
+    /// depth guard aborts the *whole* function before the sweep, via
+    /// `mark_reachable`'s own `Err` return — never partially). An
+    /// incomplete "should be used" picture must never be swept against,
+    /// or a still-live block/inode could be freed out from under a file
+    /// that's simply reached through a deep path.
+    fn reclaim_orphans(&self) -> Result<(), Errno> {
+        let block_bytes = ((self.blocks_count as usize) + 7) / 8;
+        let inode_bytes = ((self.inodes_count as usize) + 7) / 8;
+        let mut used_blocks = alloc::vec![0u8; block_bytes];
+        let mut used_inodes = alloc::vec![0u8; inode_bytes];
+
+        // Fixed metadata: boot block, the superblock itself, the
+        // block-group descriptor table, and every group's own bitmaps +
+        // inode table. None of this is owned by any inode, so the tree
+        // walk below would never mark it, but it's legitimately in use.
+        // The superblock lives AT block `first_data_block` (`bgdt_block`
+        // above is computed as `first_data_block + 1`, i.e. right after
+        // it) — `0..first_data_block` only covers the boot block ahead of
+        // it, not the superblock's own block, so that block must be
+        // included too (`0..=first_data_block`). Missing this let the
+        // sweep below "reclaim" the superblock's block as an orphan on
+        // first mount, and the very next allocation handed it out to real
+        // file data, corrupting the superblock.
+        for b in 0..=self.first_data_block {
+            mark_bit(&mut used_blocks, b);
+        }
+        let bgd_per_block = self.block_size / 32;
+        let bgdt_blocks = (self.num_groups + bgd_per_block - 1) / bgd_per_block;
+        for b in self.bgdt_block..self.bgdt_block + bgdt_blocks {
+            mark_bit(&mut used_blocks, b);
+        }
+        let inodes_per_block = self.block_size / self.inode_size as u32;
+        for group in 0..self.num_groups {
+            let bgd = self.read_bgd(group)?;
+            mark_bit(&mut used_blocks, bgd.block_bitmap);
+            mark_bit(&mut used_blocks, bgd.inode_bitmap);
+            let inode_table_blocks = (self.inodes_per_group + inodes_per_block - 1) / inodes_per_block;
+            for b in bgd.inode_table..bgd.inode_table + inode_table_blocks {
+                mark_bit(&mut used_blocks, b);
+            }
+
+            // Real ext2 (sparse_super, mke2fs's default) keeps backup
+            // superblock+BGDT copies in group 0, group 1, and every group
+            // whose number is a power of 3/5/7 — mirroring that placement
+            // logic exactly here would be one more way to get it subtly
+            // wrong, so instead just reserve every group's leading
+            // `1 + bgdt_blocks` blocks unconditionally. Overkill for a
+            // group that doesn't actually have a backup (those blocks were
+            // never marked used in the real per-group bitmap to begin
+            // with, so reserving them here is a no-op), but it means a
+            // group that *does* have one — which this driver has no
+            // reason to expect specifically — can never be misread as an
+            // orphan and freed into real file data the way group 0's own
+            // primary copy already was (see the loop above this one).
+            let group_start = self.first_data_block + group * self.blocks_per_group;
+            for b in group_start..group_start + 1 + bgdt_blocks {
+                mark_bit(&mut used_blocks, b);
+            }
+        }
+
+        // Walk the real directory tree from root, marking every inode and
+        // block actually reachable. 64 levels of nesting is far beyond
+        // anything a shell/script here would ever create — hitting it is
+        // treated as a hard error (not a silent stop), since silently
+        // under-marking a legitimately-deep subtree would make the sweep
+        // below wrongly reclaim it.
+        //
+        // MUST run before the reserved-inode marking just below: root's
+        // own ino (2) falls inside that reserved range, and
+        // `mark_reachable`'s cycle guard treats an already-marked bit as
+        // "already visited, nothing more to do" — pre-marking root first
+        // used to make the very first call return immediately without
+        // ever reading root's own blocks or descending into a single
+        // child. That silently treated the *entire* real directory tree
+        // (every file this filesystem was seeded with) as unreachable, so
+        // the sweep below freed almost every real block/inode on the very
+        // first mount — the very first new file/dir write after that
+        // then handed out an already-live block to something else,
+        // corrupting whatever legitimately owned it (this is what
+        // produced the `add_dir_entry` "range end index ... out of range"
+        // panic: the root directory's own data block had been reused for
+        // unrelated file content).
+        self.mark_reachable(ROOT_INO, &mut used_inodes, &mut used_blocks, 64)?;
+
+        // Reserved inodes below `first_ino` (root's own ino=2 among them)
+        // are always "in use" even though this driver never reaches most
+        // of them (1, 3..=10 have no directory entry pointing at them at
+        // all, ever) via the walk above.
+        for ino in 1..self.first_ino {
+            mark_bit_1based(&mut used_inodes, ino);
+        }
+
+        // Sweep: anything the real bitmaps mark used that the walk above
+        // never reached is an orphan — clear it. Counter bookkeeping is
+        // deliberately NOT duplicated here: `reconcile_free_counts` (just
+        // above) already knows how to recompute BGD/superblock free
+        // counts from a bitmap, so just clear bits and re-run it once at
+        // the end if anything actually changed.
+        let mut freed_blocks: u32 = 0;
+        let mut freed_inodes: u32 = 0;
+        for group in 0..self.num_groups {
+            let bgd = self.read_bgd(group)?;
+
+            let mut block_bitmap = self.block_vec(bgd.block_bitmap)?;
+            let mut changed = false;
+            for bit in 0..self.blocks_in_group(group) {
+                let byte = (bit / 8) as usize;
+                let mask = 1u8 << (bit % 8);
+                if block_bitmap[byte] & mask == 0 {
+                    continue;
+                }
+                let block_num = self.first_data_block + group * self.blocks_per_group + bit;
+                if !bit_set(&used_blocks, block_num) {
+                    block_bitmap[byte] &= !mask;
+                    changed = true;
+                    freed_blocks += 1;
+                }
+            }
+            if changed {
+                self.write_block(bgd.block_bitmap, &block_bitmap)?;
+            }
+
+            let mut inode_bitmap = self.block_vec(bgd.inode_bitmap)?;
+            let mut ichanged = false;
+            for bit in 0..self.inodes_in_group(group) {
+                let byte = (bit / 8) as usize;
+                let mask = 1u8 << (bit % 8);
+                if inode_bitmap[byte] & mask == 0 {
+                    continue;
+                }
+                let ino = group * self.inodes_per_group + bit + 1;
+                if !bit_set_1based(&used_inodes, ino) {
+                    inode_bitmap[byte] &= !mask;
+                    ichanged = true;
+                    freed_inodes += 1;
+                }
+            }
+            if ichanged {
+                self.write_block(bgd.inode_bitmap, &inode_bitmap)?;
+            }
+        }
+
+        if freed_blocks > 0 || freed_inodes > 0 {
+            crate::ktrace!(
+                crate::debug::FS,
+                "ext2: reclaimed {} orphaned block(s), {} orphaned inode(s) left by an unclean shutdown",
+                freed_blocks, freed_inodes
+            );
+            // Permanent counter (see kernel::debug), not just a trace line
+            // — readable via /proc/kdebug regardless of whether FS
+            // tracing happened to be on for this particular boot.
+            crate::debug::add_orphans_reclaimed(freed_blocks as u64, freed_inodes as u64);
+            self.reconcile_free_counts()?;
+        }
+
+        Ok(())
+    }
+
+    /// Recursive step of `reclaim_orphans`: mark `ino` (and, if it's a
+    /// directory, everything reachable through it) as used in
+    /// `used_inodes`/`used_blocks`. `used_inodes` doubles as the
+    /// already-visited set — an inode marked on entry short-circuits
+    /// immediately, which is what makes a cyclic (corrupted) directory
+    /// structure terminate instead of recursing forever, on top of the
+    /// hard `depth_left` bound below.
+    fn mark_reachable(&self, ino: u32, used_inodes: &mut [u8], used_blocks: &mut [u8], depth_left: u32) -> Result<(), Errno> {
+        if bit_set_1based(used_inodes, ino) {
+            return Ok(()); // already visited — cycle guard
+        }
+        if depth_left == 0 {
+            // See `reclaim_orphans`'s doc comment: failing loudly here
+            // (instead of silently stopping) is what keeps an
+            // unexpectedly-deep-but-legitimate subtree from being
+            // mistaken for garbage by the sweep.
+            return Err(Errno::ELOOP);
+        }
+        mark_bit_1based(used_inodes, ino);
+
+        let raw = self.read_inode(ino)?;
+        if raw.has_block_pointers() {
+            self.visit_inode_blocks(&raw, |b| {
+                mark_bit(used_blocks, b);
+                Ok(())
+            })?;
+        }
+
+        if raw.is_dir() {
+            for entry in self.read_dir_entries(&raw)? {
+                self.mark_reachable(entry.ino, used_inodes, used_blocks, depth_left - 1)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Set bit `n` (0-based) in a byte-packed bitmap — shared by
+/// `reclaim_orphans`'s block-side bookkeeping, which (like the real
+/// on-disk block bitmap it mirrors) indexes by absolute block number.
+fn mark_bit(bitmap: &mut [u8], n: u32) {
+    let byte = (n / 8) as usize;
+    if byte < bitmap.len() {
+        bitmap[byte] |= 1u8 << (n % 8);
+    }
+}
+
+fn bit_set(bitmap: &[u8], n: u32) -> bool {
+    let byte = (n / 8) as usize;
+    bitmap.get(byte).is_some_and(|b| b & (1u8 << (n % 8)) != 0)
+}
+
+/// Same as `mark_bit`/`bit_set`, but for a 1-based inode number (real
+/// ext2's own convention — inode 0 doesn't exist, inode 1 is bit 0).
+fn mark_bit_1based(bitmap: &mut [u8], ino: u32) {
+    if ino >= 1 {
+        mark_bit(bitmap, ino - 1);
+    }
+}
+
+fn bit_set_1based(bitmap: &[u8], ino: u32) -> bool {
+    ino >= 1 && bit_set(bitmap, ino - 1)
+}
+
+/// Count clear (free) bits among the first `valid_bits` bits of `bitmap` —
+/// shared by `reconcile_free_counts`'s block- and inode-bitmap passes.
+fn count_free_bits(bitmap: &[u8], valid_bits: u32) -> u16 {
+    let mut free = 0u32;
+    for bit in 0..valid_bits {
+        let byte = (bit / 8) as usize;
+        let mask = 1u8 << (bit % 8);
+        if bitmap[byte] & mask == 0 {
+            free += 1;
+        }
+    }
+    free as u16
 }
 
 fn ext2_file_type_to_vfs(ft: u8) -> FileType {
@@ -857,6 +1442,24 @@ impl RawInode {
         self.buf[28..32].copy_from_slice(&v.to_le_bytes());
     }
 
+    /// `i_dtime` (deletion time, real Unix epoch seconds) — real ext2
+    /// stamps this when an inode's last link is removed. Earlier this
+    /// wrote a raw boot-relative uptime value here instead (this kernel
+    /// had no RTC at the time), which is small enough (single/double-digit
+    /// seconds) to collide with a *different* on-disk use of this same
+    /// field: ext3+ threads its in-progress orphan-inode list through
+    /// `i_dtime` as a next-inode-number link while a deletion is
+    /// mid-flight across a crash, and `e2fsck` tells the two uses apart
+    /// purely by plausibility (a real calendar time is ~10 digits; a small
+    /// value reads as a link, not a timestamp) — so that raw uptime got
+    /// misdiagnosed as "part of a corrupted orphan inode list" and
+    /// silently rewritten. Now backed by a real CMOS RTC reading (see
+    /// `crate::rtc`/`crate::time::now_unix_secs`), so this is a genuine
+    /// wall-clock timestamp and the collision doesn't come up.
+    fn set_dtime(&mut self, unix_secs: u32) {
+        self.buf[20..24].copy_from_slice(&unix_secs.to_le_bytes());
+    }
+
     /// `size_hi` (`i_dir_acl`/`i_size_high`) only means "upper size bits"
     /// for regular files under the large_file feature; for directories
     /// it's genuinely the (unused, by us) ACL block pointer, so it's only
@@ -895,6 +1498,27 @@ impl RawInode {
     fn is_reg(&self) -> bool {
         (self.i_mode() & 0xF000) == 0x8000
     }
+
+    fn is_symlink(&self) -> bool {
+        (self.i_mode() & 0xF000) == 0xA000
+    }
+
+    /// A symlink short enough that its target lives inline in `i_block`'s
+    /// own bytes instead of a real data block — see module doc comment.
+    fn is_fast_symlink(&self) -> bool {
+        self.is_symlink() && self.size() < 60
+    }
+
+    /// True if `i_block`'s 15 slots hold real block-number pointers safe
+    /// to walk (`visit_inode_blocks`/`free_all_blocks`) — false for a
+    /// fast symlink (inline text, not pointers) and for any inode type
+    /// this driver never creates itself (char/block device, FIFO,
+    /// socket), whose `i_block` encoding means something else entirely
+    /// (e.g. a device's major/minor pair) that would misread as wild
+    /// pointers if walked the same way.
+    fn has_block_pointers(&self) -> bool {
+        (self.is_dir() || self.is_reg() || self.is_symlink()) && !self.is_fast_symlink()
+    }
 }
 
 // ── VFS glue ─────────────────────────────────────────────────────────────────
@@ -904,8 +1528,14 @@ pub struct Ext2FsHandle;
 impl Filesystem for Ext2FsHandle {
     fn name(&self) -> &str { "ext2" }
 
-    fn root(&self) -> Arc<dyn Inode> {
-        Arc::new(Ext2Inode::new(ROOT_INO))
+    fn root(&self) -> Result<Arc<dyn Inode>, Errno> {
+        // `Filesystem::root()` being `Result`-returning (see its doc
+        // comment in vfs.rs) is what lets this just reuse the ordinary
+        // fallible constructor below — a disk read failure here
+        // propagates as a clean `EIO` through `resolve()` like any other
+        // failed path-resolution step. No synthetic stand-in inode
+        // needed.
+        Ok(Arc::new(Ext2Inode::new(ROOT_INO)?))
     }
 }
 
@@ -915,9 +1545,9 @@ struct Ext2Inode {
 }
 
 impl Ext2Inode {
-    fn new(ino: u32) -> Self {
-        let raw = fs().read_inode(ino);
-        Self { ino, raw }
+    fn new(ino: u32) -> Result<Self, Errno> {
+        let raw = fs().read_inode(ino)?;
+        Ok(Self { ino, raw })
     }
 }
 
@@ -925,24 +1555,49 @@ impl Inode for Ext2Inode {
     fn as_any(&self) -> &dyn core::any::Any { self }
 
     fn stat(&self) -> Stat {
+        // Real on-disk permission bits, not a hardcoded per-filesystem
+        // constant (see module doc comment) — overlaid onto whichever
+        // constructor already set the right type bits/size shape.
+        let perm = (self.raw.i_mode() & 0o7777) as u32;
+        let nlink = self.raw.links_count() as u64;
         if self.raw.is_dir() {
-            Stat::dir(self.ino as u64)
+            Stat::dir(self.ino as u64).with_perm_bits(perm).with_nlink(nlink)
+        } else if self.raw.is_symlink() {
+            Stat::symlink(self.ino as u64, self.raw.size() as i64)
         } else {
-            Stat::regular_writable(self.ino as u64, self.raw.size() as i64)
+            Stat::regular_writable(self.ino as u64, self.raw.size() as i64).with_perm_bits(perm).with_nlink(nlink)
         }
     }
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+        if self.raw.is_symlink() {
+            // Dead code through normal traversal: `vfs::resolve` always
+            // dereferences a symlink (via `readlink()`) before `open()` is
+            // ever called on the final inode — same defensive-only
+            // rejection ramfs's `RamSymlinkNode::open()` uses.
+            return Err(Errno::EINVAL);
+        }
         if self.raw.is_dir() {
             if flags.is_write() {
                 return Err(Errno::EISDIR);
             }
-            let entries = fs().read_dir_entries(&self.raw);
-            Ok(Box::new(Ext2DirHandle { ino: self.ino, entries, offset: 0 }))
+            // Snapshot into plain `DirEntry`s (synthetic "."/".." included)
+            // up front, same shape ramfs's `RamDirHandle` uses — lets both
+            // share `vfs::getdents64_from_snapshot` instead of each
+            // hand-rolling their own packing loop.
+            let raw_entries = fs().read_dir_entries(&self.raw)?;
+            let mut snapshot: Vec<DirEntry> = Vec::with_capacity(raw_entries.len() + 2);
+            snapshot.push(DirEntry::new(self.ino as u64, FileType::Directory, b"."));
+            snapshot.push(DirEntry::new(self.ino as u64, FileType::Directory, b".."));
+            for e in raw_entries {
+                snapshot.push(DirEntry::new(e.ino as u64, e.kind, e.name.as_bytes()));
+            }
+            Ok(Box::new(Ext2DirHandle { ino: self.ino, snapshot, offset: 0 }))
         } else {
             let mut raw = self.raw.clone();
             if flags.is_write() && flags.0 & OpenFlags::TRUNC.0 != 0 {
-                fs().truncate_to_zero(self.ino, &mut raw);
+                let _guard = EXT2_LOCK.lock();
+                fs().truncate_to_zero(self.ino, &mut raw)?;
             }
             let start_offset = if flags.0 & OpenFlags::APPEND.0 != 0 {
                 raw.size() as usize
@@ -961,11 +1616,9 @@ impl Inode for Ext2Inode {
         if !self.raw.is_dir() {
             return Err(Errno::ENOTDIR);
         }
-        fs().read_dir_entries(&self.raw)
-            .into_iter()
-            .find(|e| e.name == name)
-            .map(|e| Arc::new(Ext2Inode::new(e.ino)) as Arc<dyn Inode>)
-            .ok_or(Errno::ENOENT)
+        let entries = fs().read_dir_entries(&self.raw)?;
+        let e = entries.into_iter().find(|e| e.name == name).ok_or(Errno::ENOENT)?;
+        Ok(Arc::new(Ext2Inode::new(e.ino)?) as Arc<dyn Inode>)
     }
 
     fn readdir(&self, offset: u64) -> Result<Option<DirEntry>, Errno> {
@@ -976,7 +1629,7 @@ impl Inode for Ext2Inode {
             0 => Ok(Some(DirEntry::new(self.ino as u64, FileType::Directory, b"."))),
             1 => Ok(Some(DirEntry::new(self.ino as u64, FileType::Directory, b".."))),
             n => {
-                let entries = fs().read_dir_entries(&self.raw);
+                let entries = fs().read_dir_entries(&self.raw)?;
                 let idx = (n - 2) as usize;
                 Ok(entries.get(idx).map(|e| DirEntry::new(e.ino as u64, e.kind, e.name.as_bytes())))
             }
@@ -987,6 +1640,7 @@ impl Inode for Ext2Inode {
         if !self.raw.is_dir() {
             return Err(Errno::ENOTDIR);
         }
+        let _guard = EXT2_LOCK.lock();
         if let Ok(existing) = self.lookup(name) {
             if existing.file_type() == FileType::Directory {
                 return Err(Errno::EISDIR);
@@ -995,33 +1649,34 @@ impl Inode for Ext2Inode {
         }
 
         let f = fs();
-        let new_ino = f.alloc_inode(false).ok_or(Errno::ENOSPC)?;
+        let new_ino = f.alloc_inode(false)?.ok_or(Errno::ENOSPC)?;
         let mut new_raw = RawInode::zeroed(f.inode_size as usize);
         new_raw.set_i_mode(0x8000 | 0o644);
         new_raw.set_links_count(1);
-        f.write_inode(new_ino, &new_raw);
+        f.write_inode(new_ino, &new_raw)?;
 
         let mut dir_raw = self.raw.clone();
         if let Err(e) = f.add_dir_entry(self.ino, &mut dir_raw, name, new_ino, FileType::Regular) {
-            f.free_inode(new_ino, false);
+            let _ = f.free_inode(new_ino, false); // best-effort cleanup — original error wins either way
             return Err(e);
         }
-        Ok(Arc::new(Ext2Inode::new(new_ino)))
+        Ok(Arc::new(Ext2Inode::new(new_ino)?))
     }
 
     fn mkdir(&self, name: &str) -> Result<Arc<dyn Inode>, Errno> {
         if !self.raw.is_dir() {
             return Err(Errno::ENOTDIR);
         }
+        let _guard = EXT2_LOCK.lock();
         if self.lookup(name).is_ok() {
             return Err(Errno::EEXIST);
         }
 
         let f = fs();
-        let new_ino = f.alloc_inode(true).ok_or(Errno::ENOSPC)?;
-        let new_block = match f.alloc_block() {
+        let new_ino = f.alloc_inode(true)?.ok_or(Errno::ENOSPC)?;
+        let new_block = match f.alloc_block()? {
             Some(b) => b,
-            None => { f.free_inode(new_ino, true); return Err(Errno::ENOSPC); }
+            None => { let _ = f.free_inode(new_ino, true); return Err(Errno::ENOSPC); }
         };
 
         let mut new_raw = RawInode::zeroed(f.inode_size as usize);
@@ -1036,27 +1691,28 @@ impl Inode for Ext2Inode {
         write_dirent(&mut buf[0..dot_len], new_ino, dot_len as u16, ".", FileType::Directory);
         let remaining = bs - dot_len;
         write_dirent(&mut buf[dot_len..dot_len + remaining], self.ino, remaining as u16, "..", FileType::Directory);
-        f.write_block(new_block, &buf);
-        f.write_inode(new_ino, &new_raw);
+        f.write_block(new_block, &buf)?;
+        f.write_inode(new_ino, &new_raw)?;
 
         let mut dir_raw = self.raw.clone();
         if let Err(e) = f.add_dir_entry(self.ino, &mut dir_raw, name, new_ino, FileType::Directory) {
-            f.free_block(new_block);
-            f.free_inode(new_ino, true);
+            let _ = f.free_block(new_block);
+            let _ = f.free_inode(new_ino, true);
             return Err(e);
         }
         // The new subdirectory's ".." counts as a link to this parent.
         let mut parent_raw = dir_raw;
         parent_raw.set_links_count(parent_raw.links_count() + 1);
-        f.write_inode(self.ino, &parent_raw);
+        f.write_inode(self.ino, &parent_raw)?;
 
-        Ok(Arc::new(Ext2Inode::new(new_ino)))
+        Ok(Arc::new(Ext2Inode::new(new_ino)?))
     }
 
     fn unlink(&self, name: &str) -> Result<(), Errno> {
         if !self.raw.is_dir() {
             return Err(Errno::ENOTDIR);
         }
+        let _guard = EXT2_LOCK.lock();
         let child = self.lookup(name)?;
         if child.file_type() == FileType::Directory {
             return Err(Errno::EISDIR);
@@ -1066,14 +1722,25 @@ impl Inode for Ext2Inode {
         let dir_raw = self.raw.clone();
         let (child_ino, _kind) = f.remove_dir_entry(&dir_raw, name)?;
 
-        let mut child_raw = f.read_inode(child_ino);
+        let mut child_raw = f.read_inode(child_ino)?;
         let links = child_raw.links_count().saturating_sub(1);
         child_raw.set_links_count(links);
         if links == 0 {
-            f.free_all_blocks(&mut child_raw);
-            f.free_inode(child_ino, false);
+            f.free_all_blocks(&mut child_raw)?;
+            child_raw.set_dtime(crate::time::now_unix_secs() as u32);
+            // Persist the now-zeroed record (size/blocks/pointers) before
+            // dropping the inode bitmap bit — `free_all_blocks` only
+            // updates `child_raw` in memory. Skipping this left the old,
+            // pre-delete inode record (nonzero mode, stale block
+            // pointers into blocks whose bits `free_all_blocks` had
+            // already cleared) sitting on disk with a freed bitmap bit —
+            // a real `e2fsck` sees that as a "disconnected inode" with
+            // dangling pointers into blocks a later allocation could
+            // legitimately reuse for something else.
+            f.write_inode(child_ino, &child_raw)?;
+            f.free_inode(child_ino, false)?;
         } else {
-            f.write_inode(child_ino, &child_raw);
+            f.write_inode(child_ino, &child_raw)?;
         }
         Ok(())
     }
@@ -1082,6 +1749,7 @@ impl Inode for Ext2Inode {
         if !self.raw.is_dir() {
             return Err(Errno::ENOTDIR);
         }
+        let _guard = EXT2_LOCK.lock();
         let child = self.lookup(name)?;
         if child.file_type() != FileType::Directory {
             return Err(Errno::ENOTDIR);
@@ -1096,14 +1764,18 @@ impl Inode for Ext2Inode {
         let dir_raw = self.raw.clone();
         let (child_ino, _kind) = f.remove_dir_entry(&dir_raw, name)?;
 
-        let mut child_raw = f.read_inode(child_ino);
-        f.free_all_blocks(&mut child_raw);
-        f.free_inode(child_ino, true);
+        let mut child_raw = f.read_inode(child_ino)?;
+        f.free_all_blocks(&mut child_raw)?;
+        child_raw.set_dtime(crate::time::now_unix_secs() as u32);
+        // Same "persist the zeroed record before freeing the bitmap bit"
+        // fix as `unlink` above.
+        f.write_inode(child_ino, &child_raw)?;
+        f.free_inode(child_ino, true)?;
 
         // This directory loses the link the removed child's ".." held.
         let mut parent_raw = self.raw.clone();
         parent_raw.set_links_count(parent_raw.links_count().saturating_sub(1));
-        f.write_inode(self.ino, &parent_raw);
+        f.write_inode(self.ino, &parent_raw)?;
         Ok(())
     }
 
@@ -1111,6 +1783,7 @@ impl Inode for Ext2Inode {
         if !self.raw.is_dir() {
             return Err(Errno::ENOTDIR);
         }
+        let _guard = EXT2_LOCK.lock();
         let child = self.lookup(name)?;
         let f = fs();
         let dir_raw = self.raw.clone();
@@ -1118,7 +1791,7 @@ impl Inode for Ext2Inode {
         if kind == FileType::Directory {
             let mut parent_raw = self.raw.clone();
             parent_raw.set_links_count(parent_raw.links_count().saturating_sub(1));
-            f.write_inode(self.ino, &parent_raw);
+            f.write_inode(self.ino, &parent_raw)?;
         }
         Ok(child)
     }
@@ -1127,6 +1800,7 @@ impl Inode for Ext2Inode {
         if !self.raw.is_dir() {
             return Err(Errno::ENOTDIR);
         }
+        let _guard = EXT2_LOCK.lock();
         if self.lookup(name).is_ok() {
             return Err(Errno::EEXIST);
         }
@@ -1147,9 +1821,73 @@ impl Inode for Ext2Inode {
             f.set_dotdot(&ext2_node.raw, self.ino)?;
             let mut parent_raw = dir_raw;
             parent_raw.set_links_count(parent_raw.links_count() + 1);
-            f.write_inode(self.ino, &parent_raw);
+            f.write_inode(self.ino, &parent_raw)?;
         }
         Ok(())
+    }
+
+    fn readlink(&self) -> Result<String, Errno> {
+        if !self.raw.is_symlink() {
+            return Err(Errno::EINVAL);
+        }
+        fs().read_symlink_target(&self.raw)
+    }
+
+    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn Inode>, Errno> {
+        if !self.raw.is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        let _guard = EXT2_LOCK.lock();
+        if self.lookup(name).is_ok() {
+            return Err(Errno::EEXIST);
+        }
+
+        let f = fs();
+        let new_ino = f.alloc_inode(false)?.ok_or(Errno::ENOSPC)?;
+        let mut new_raw = RawInode::zeroed(f.inode_size as usize);
+        new_raw.set_i_mode(0xA000 | 0o777);
+        new_raw.set_links_count(1);
+
+        if target.len() < 60 {
+            // Fast symlink: target lives directly in the i_block bytes,
+            // no data block allocated — see module doc comment.
+            new_raw.buf[40..40 + target.len()].copy_from_slice(target.as_bytes());
+            new_raw.set_size(target.len() as u64);
+            if let Err(e) = f.write_inode(new_ino, &new_raw) {
+                let _ = f.free_inode(new_ino, false);
+                return Err(e);
+            }
+        } else {
+            // Slow symlink: persist mode/links first (same "write content
+            // before linking" ordering as `create`), then grow it exactly
+            // like a regular file's content.
+            if let Err(e) = f.write_inode(new_ino, &new_raw) {
+                let _ = f.free_inode(new_ino, false);
+                return Err(e);
+            }
+            if let Err(e) = f.write_file_range(new_ino, &mut new_raw, 0, target.as_bytes()) {
+                let _ = f.free_all_blocks(&mut new_raw);
+                let _ = f.free_inode(new_ino, false);
+                return Err(e);
+            }
+        }
+
+        let mut dir_raw = self.raw.clone();
+        if let Err(e) = f.add_dir_entry(self.ino, &mut dir_raw, name, new_ino, FileType::Symlink) {
+            let _ = f.free_all_blocks(&mut new_raw); // no-op if it was a fast symlink (no blocks allocated)
+            let _ = f.free_inode(new_ino, false);
+            return Err(e);
+        }
+        Ok(Arc::new(Ext2Inode::new(new_ino)?))
+    }
+
+    fn chmod(&self, mode: u32) -> Result<(), Errno> {
+        let _guard = EXT2_LOCK.lock();
+        let f = fs();
+        let mut raw = f.read_inode(self.ino)?; // fresh, not `self.raw` — don't clobber a concurrent write's size/blocks
+        let new_mode = (raw.i_mode() & 0xF000) | (mode as u16 & 0o7777);
+        raw.set_i_mode(new_mode);
+        f.write_inode(self.ino, &raw)
     }
 }
 
@@ -1174,12 +1912,13 @@ impl FileHandle for Ext2FileHandle {
             return Ok(0);
         }
         let n = buf.len().min(size - *offset);
-        fs().read_file_range(&raw, *offset, &mut buf[..n]);
+        fs().read_file_range(&raw, *offset, &mut buf[..n]).map_err(|_| FileError::IOError)?;
         *offset += n;
         Ok(n)
     }
 
     fn write(&mut self, buf: &[u8]) -> FileResult<usize> {
+        let _guard = EXT2_LOCK.lock();
         let mut raw = self.raw.lock();
         let mut offset = self.offset.lock();
         match fs().write_file_range(self.ino, &mut raw, *offset, buf) {
@@ -1209,12 +1948,20 @@ impl FileHandle for Ext2FileHandle {
         Ok(new_pos)
     }
 
+    fn chmod(&mut self, mode: u32) -> FileResult<()> {
+        let _guard = EXT2_LOCK.lock();
+        let mut raw = self.raw.lock();
+        let new_mode = (raw.i_mode() & 0xF000) | (mode as u16 & 0o7777);
+        raw.set_i_mode(new_mode);
+        fs().write_inode(self.ino, &raw).map_err(|_| FileError::IOError)
+    }
+
     fn name(&self) -> &str { "ext2" }
 }
 
 struct Ext2DirHandle {
     ino: u32,
-    entries: Vec<Ext2DirEntry>,
+    snapshot: Vec<DirEntry>,
     offset: usize,
 }
 
@@ -1228,35 +1975,7 @@ impl FileHandle for Ext2DirHandle {
     }
 
     fn getdents64(&mut self, buf: &mut [u8]) -> i64 {
-        let mut written = 0usize;
-        let synthetic = [
-            DirEntry::new(self.ino as u64, FileType::Directory, b"."),
-            DirEntry::new(self.ino as u64, FileType::Directory, b".."),
-        ];
-
-        loop {
-            let entry = if self.offset < synthetic.len() {
-                let e = &synthetic[self.offset];
-                DirEntry::new(e.ino, e.kind, &e.name[..e.name_len])
-            } else {
-                let idx = self.offset - synthetic.len();
-                match self.entries.get(idx) {
-                    Some(e) => DirEntry::new(e.ino as u64, e.kind, e.name.as_bytes()),
-                    None => break,
-                }
-            };
-
-            let needed = entry.dirent64_size();
-            if written + needed > buf.len() {
-                break;
-            }
-            let next_off = self.offset as i64 + 1;
-            entry.write_dirent64(next_off, &mut buf[written..written + needed]);
-            written += needed;
-            self.offset += 1;
-        }
-
-        written as i64
+        crate::fs::vfs::getdents64_from_snapshot(&self.snapshot, &mut self.offset, buf)
     }
 
     fn stat(&self) -> Option<Stat> {

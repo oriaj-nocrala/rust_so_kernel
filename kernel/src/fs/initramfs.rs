@@ -57,8 +57,8 @@ pub struct InitramfsFs;
 impl Filesystem for InitramfsFs {
     fn name(&self) -> &str { "initramfs" }
 
-    fn root(&self) -> Arc<dyn Inode> {
-        Arc::new(RootDirInode)
+    fn root(&self) -> Result<Arc<dyn Inode>, Errno> {
+        Ok(Arc::new(RootDirInode))
     }
 }
 
@@ -286,30 +286,11 @@ impl FileHandle for DirHandle {
     }
 
     fn getdents64(&mut self, buf: &mut [u8]) -> i64 {
-        let mut written: usize = 0;
-
-        loop {
-            let entry = match &self.kind {
-                DirKind::Root => RootDirInode.readdir(self.offset),
-                DirKind::Bin => BinDirInode.readdir(self.offset),
-                DirKind::MountPoint(ino) => MountPointDirInode { ino: *ino }.readdir(self.offset),
-            };
-            let entry = match entry {
-                Ok(Some(e)) => e,
-                Ok(None)    => break,
-                Err(e)      => return e.as_i64(),
-            };
-            let needed = entry.dirent64_size();
-            if written + needed > buf.len() {
-                break;
-            }
-            let next_off = self.offset as i64 + 1;
-            entry.write_dirent64(next_off, &mut buf[written..written + needed]);
-            written += needed;
-            self.offset += 1;
+        match self.kind {
+            DirKind::Root => crate::fs::vfs::getdents64_via_readdir(&RootDirInode, &mut self.offset, buf),
+            DirKind::Bin => crate::fs::vfs::getdents64_via_readdir(&BinDirInode, &mut self.offset, buf),
+            DirKind::MountPoint(ino) => crate::fs::vfs::getdents64_via_readdir(&MountPointDirInode { ino }, &mut self.offset, buf),
         }
-
-        written as i64
     }
 
     fn stat(&self) -> Option<crate::fs::types::Stat> {

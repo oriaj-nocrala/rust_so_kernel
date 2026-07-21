@@ -23,6 +23,7 @@ mod panic;
 mod pci;
 mod process;
 mod pit;
+mod rtc;
 mod serial;
 mod time;
 mod tty;
