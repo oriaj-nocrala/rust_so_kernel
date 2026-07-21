@@ -1121,6 +1121,31 @@ pub unsafe fn find_vma_fast(fault_addr: u64) -> Option<(usize, Vma)> {
     Some((pid, vma))
 }
 
+/// Same as `find_vma_fast`, but if no VMA directly contains `fault_addr`,
+/// also tries growing a `GrowableStack` VMA to cover it (see
+/// `AddressSpace::grow_stack_vma`) before giving up. Used by the page
+/// fault handler's "not present" path so no process needs its stack size
+/// known in advance — deliberately NOT used by the COW-write-fault path,
+/// where "no VMA" should never trigger growth (a COW fault only ever
+/// happens on an already-*present* page, which by definition is already
+/// covered by some VMA).
+///
+/// # Safety
+/// Same as `find_vma_fast`.
+pub unsafe fn find_vma_fast_or_grow(fault_addr: u64) -> Option<(usize, Vma)> {
+    let cpu = crate::cpu::cpu_id();
+    let as_ptr = CURRENT_AS_PTR[cpu].load(Ordering::Acquire) as *const AddressSpace;
+    if as_ptr.is_null() {
+        return None;
+    }
+    let pid = CURRENT_PID_FAST[cpu].load(Ordering::Acquire);
+    let address_space = &*as_ptr;
+    let vma = address_space
+        .find_vma(fault_addr)
+        .or_else(|| address_space.grow_stack_vma(fault_addr))?;
+    Some((pid, vma))
+}
+
 /// Fast access to the running process's AddressSpace without the Mutex.
 ///
 /// Same safety invariants as `find_vma_fast`.

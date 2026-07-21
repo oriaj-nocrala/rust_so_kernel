@@ -84,6 +84,14 @@ impl AddressSpace {
         self.vmas.lock().find(addr).copied()
     }
 
+    /// Try to grow a `GrowableStack` VMA to cover `addr` — see
+    /// `VmaList::grow_stack`'s doc comment for the guard-gap/cap rules.
+    /// Called by the page fault handler only after `find_vma` already
+    /// came back empty.
+    pub fn grow_stack_vma(&self, addr: u64) -> Option<Vma> {
+        self.vmas.lock().grow_stack(addr)
+    }
+
     /// Debug: print all VMAs (uses serial, no allocation).
     pub fn dump_vmas(&self, label: usize) {
         self.vmas.lock().dump(label);
@@ -434,7 +442,7 @@ impl AddressSpace {
         }
 
         match vma.kind {
-            VmaKind::Anonymous | VmaKind::Code => {
+            VmaKind::Anonymous | VmaKind::Code | VmaKind::GrowableStack => {
                 for i in 0..vma.size_pages {
                     let va = vma.start + i as u64 * 4096;
                     let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));

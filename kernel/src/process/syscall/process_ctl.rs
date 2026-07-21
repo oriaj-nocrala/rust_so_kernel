@@ -481,14 +481,10 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
     };
 
     // Load ELF without any lock — may take time and allocates frames.
-    // Most programs get the default (64 KiB) stack; a couple of
-    // stack-hungry ones (currently just Quake) ask for more — see
-    // `user_programs::stack_pages_for`'s doc comment for why that's a
-    // narrow per-program override instead of a raised global default.
-    let stack_pages = crate::process::user_programs::stack_pages_for(&resolved_path);
-    let loaded = match unsafe {
-        crate::memory::elf_loader::load_elf_with_stack_pages(&elf_owned, 0, &argv, &envp, stack_pages)
-    } {
+    // Every process's stack starts small and grows on demand (see
+    // memory::elf_loader::STACK_PAGES/STACK_MAX_PAGES) — no per-program
+    // size to pass in.
+    let loaded = match unsafe { crate::memory::elf_loader::load_elf(&elf_owned, 0, &argv, &envp) } {
         Ok(l) => l,
         Err(e) => {
             serial_println!("sys_exec: load_elf failed: {}", e);

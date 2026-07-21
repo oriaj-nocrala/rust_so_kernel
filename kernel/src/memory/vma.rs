@@ -20,6 +20,22 @@ use x86_64::structures::paging::PageTableFlags;
 /// Maximum VMAs per process (code + stack + heap + extras).
 pub const MAX_VMAS_PER_PROCESS: usize = 64;
 
+/// How far below a `GrowableStack` VMA's current low boundary a fault is
+/// still treated as legitimate stack growth rather than a wild pointer —
+/// see `VmaList::grow_stack`'s doc comment.
+const STACK_GROWTH_GUARD_PAGES: u64 = 64; // 256 KiB
+
+/// Hard cap on how far any `GrowableStack` VMA can grow, in 4 KiB pages —
+/// matches a real OS's `RLIMIT_STACK`-style ceiling (8 MiB is a common
+/// real-world default). A single global constant rather than a per-VMA
+/// field on `VmaKind::GrowableStack`: every stack in this kernel wants the
+/// same cap, and keeping `VmaKind` a plain fieldless enum keeps `Vma`
+/// (and the fixed-size `[Option<Vma>; MAX_VMAS_PER_PROCESS]` array backing
+/// every process's VMA list) exactly the same size it always was — see
+/// `elf_loader::STACK_PAGES`'s doc comment for why that matters here more
+/// than it would look at first glance.
+pub const STACK_MAX_PAGES: usize = 2048; // 8 MiB
+
 // ============================================================================
 // VMA types
 // ============================================================================
@@ -35,6 +51,15 @@ pub enum VmaKind {
     /// Demand-paged anonymous region backed by 2 MiB huge pages.
     /// `size_pages` is still in 4 KiB units; each huge page covers 512 entries.
     Huge2M,
+    /// Like `Anonymous`, but the page fault handler is allowed to extend
+    /// `start` downward (never upward — this is specifically the "stack
+    /// grows down" shape) when a fault lands just below the current low
+    /// boundary, up to `STACK_MAX_PAGES` total. Used for every process's
+    /// user stack: no program needs its actual stack usage known in
+    /// advance — it starts small and grows exactly as far as it's
+    /// actually used, same idea as a real OS's `RLIMIT_STACK`-capped
+    /// growable stack VMA. See `VmaList::grow_stack`.
+    GrowableStack,
 }
 
 /// A single virtual memory area.
@@ -130,6 +155,63 @@ impl VmaList {
             .any(|v| v.start < end && v.end() > start)
     }
 
+    /// Try to grow a `GrowableStack` VMA downward to cover `addr` (which
+    /// must be below every existing VMA's start — `find` already found
+    /// nothing, or this wouldn't be called). Returns the updated VMA on
+    /// success.
+    ///
+    /// Fails (returns `None`, meaning "treat this as a real segfault") if:
+    /// - `addr` is more than `STACK_GROWTH_GUARD_PAGES` below the nearest
+    ///   `GrowableStack` VMA's current boundary — a wild pointer landing
+    ///   in the (large) unmapped gap between the stack and everything
+    ///   else should still segfault instead of silently "growing" a stack
+    ///   that was never actually being used that far down.
+    /// - Growing would exceed `STACK_MAX_PAGES`.
+    /// - The newly-covered range would overlap another VMA — unlikely in
+    ///   practice (stacks live at a fixed high address with nothing else
+    ///   registered nearby) but checked rather than assumed.
+    pub fn grow_stack(&mut self, addr: u64) -> Option<Vma> {
+        let page_addr = addr & !0xFFF;
+
+        // Find a growth candidate first (immutable pass — `overlaps`-style
+        // scan below needs its own immutable iteration, so don't hold a
+        // `&mut` into `self.entries` across it).
+        let mut target: Option<(usize, u64, usize)> = None; // (index, old_start, new_size_pages)
+        for (i, slot) in self.entries.iter().enumerate() {
+            let Some(vma) = slot else { continue };
+            if vma.kind != VmaKind::GrowableStack {
+                continue;
+            }
+            if page_addr >= vma.start {
+                continue; // not below this VMA's current boundary
+            }
+            let gap_pages = (vma.start - page_addr) / 4096;
+            if gap_pages > STACK_GROWTH_GUARD_PAGES {
+                continue; // too far below — likely a wild pointer
+            }
+            let new_size_pages = ((vma.end() - page_addr) / 4096) as usize;
+            if new_size_pages > STACK_MAX_PAGES {
+                continue; // would exceed the stack growth cap
+            }
+            target = Some((i, vma.start, new_size_pages));
+            break;
+        }
+
+        let (idx, old_start, new_size_pages) = target?;
+
+        let would_overlap = self.entries.iter().enumerate()
+            .filter_map(|(j, s)| if j == idx { None } else { s.as_ref() })
+            .any(|other| other.start < old_start && other.end() > page_addr);
+        if would_overlap {
+            return None;
+        }
+
+        let slot = self.entries[idx].as_mut().unwrap();
+        slot.start = page_addr;
+        slot.size_pages = new_size_pages;
+        Some(*slot)
+    }
+
     /// Remove all VMAs (for process exit).
     pub fn clear(&mut self) {
         for slot in self.entries.iter_mut() {
@@ -151,6 +233,7 @@ impl VmaList {
                 VmaKind::Anonymous => "anon",
                 VmaKind::Code => "code",
                 VmaKind::Huge2M => "huge2m",
+                VmaKind::GrowableStack => "stack(grows down)",
             };
             crate::serial_println!(
                 "  {:#x}..{:#x} ({} pages) [{}] flags={:#x}",

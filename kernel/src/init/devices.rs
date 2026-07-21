@@ -251,8 +251,10 @@ extern "x86-interrupt" fn page_fault_handler(
         );
     }
 
-    // Step 2: VMA lookup — lock-free fast path.
-    let (pid, vma) = match unsafe { crate::process::scheduler::find_vma_fast(fault_addr) } {
+    // Step 2: VMA lookup — lock-free fast path. Also tries growing a
+    // GrowableStack VMA (the user stack) downward if the address is just
+    // below it — see find_vma_fast_or_grow's doc comment.
+    let (pid, vma) = match unsafe { crate::process::scheduler::find_vma_fast_or_grow(fault_addr) } {
         Some(result) => result,
         None => {
             if is_user {

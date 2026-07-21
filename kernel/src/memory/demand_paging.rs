@@ -127,7 +127,7 @@ pub fn map_demand_page(
         VmaKind::Huge2M => {
             return map_demand_page_2m(fault_addr, vma, pid);
         }
-        VmaKind::Anonymous => { /* fall through */ }
+        VmaKind::Anonymous | VmaKind::GrowableStack => { /* fall through */ }
     }
 
     let page: Page<Size4KiB> = Page::containing_address(
