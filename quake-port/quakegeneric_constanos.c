@@ -290,15 +290,25 @@ static double now_seconds(void)
 
 int main(int argc, char **argv)
 {
-    static char *fixedArgv[3];
+    static char *fixedArgv[5];
     if (argc <= 1) {
         // Default to the ext2-served pak, same "no args = sane default"
-        // trick doom-port/doomgeneric_constanos.c uses for -iwad.
+        // trick doom-port/doomgeneric_constanos.c uses for -iwad. -zone
+        // bumps Z_Malloc's own dedicated arena (zone.c's DYNAMIC_SIZE,
+        // 48 KB by default — a separate, much smaller region carved out
+        // of the general hunk, specifically for small/ephemeral
+        // allocations) to 8 MB so quakegeneric_sound_constanos.c's real
+        // decoded-WAV cache (Z_Malloc'd, kept forever — see that file's
+        // header comment) actually fits; the general hunk itself is
+        // patched to 64 MB in quakegeneric.c by scripts/build-quake.sh
+        // for exactly the same reason, see that patch's own comment.
         fixedArgv[0] = argv[0];
         fixedArgv[1] = "-basedir";
         fixedArgv[2] = "/mnt";
+        fixedArgv[3] = "-zone";
+        fixedArgv[4] = "8192";
         argv = fixedArgv;
-        argc = 3;
+        argc = 5;
     }
 
     QG_Create(argc, argv);

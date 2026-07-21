@@ -182,6 +182,7 @@ fn build_kernel() -> PathBuf {
     watch_dir_recursive(&manifest_dir.join("userspace/c"));
     watch_dir_recursive(&manifest_dir.join("mlibc-port"));
     watch_dir_recursive(&manifest_dir.join("doom-port"));
+    watch_dir_recursive(&manifest_dir.join("quake-port"));
     watch_dir_recursive(&manifest_dir.join("scripts"));
     watch_dir_recursive(&manifest_dir.join("busybox-config"));
     println!("cargo:rerun-if-changed={}", kernel_dir.join("Cargo.toml").display());
