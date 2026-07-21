@@ -341,6 +341,7 @@ pub mod errno {
     pub const EINVAL: i64 = -22;
     pub const ENOTTY: i64 = -25;
     pub const ESPIPE: i64 = -29;
+    pub const ENOSPC: i64 = -28;
     pub const ERANGE: i64 = -34;
     pub const ENOSYS: i64 = -38;
     pub const ELOOP: i64 = -40;
@@ -758,6 +759,7 @@ fn sys_write(fd: i32, buf: usize, count: usize) -> SyscallResult {
     match result {
         Ok(n) => { unsafe { core::arch::asm!("sti"); } n as i64 }
         Err(super::file::FileError::BrokenPipe) => { unsafe { core::arch::asm!("sti"); } errno::EPIPE }
+        Err(super::file::FileError::NoSpace) => { unsafe { core::arch::asm!("sti"); } errno::ENOSPC }
         Err(super::file::FileError::WouldBlock) => {
             let tf_ptr = current_tf_ptr();
             let next_tf = {
@@ -947,10 +949,10 @@ fn sys_symlink(target_ptr: usize, linkpath_ptr: usize) -> SyscallResult {
 /// (writability is a property of the `FileHandle` returned by `open()`,
 /// not the `Inode`), so this probes the same way a real write would: open
 /// the path for writing, then issue a zero-length `write()`. Every
-/// read-only filesystem's regular-file handle (initramfs, ext2, procfs)
-/// unconditionally errors on `write()` regardless of buffer length,
-/// while `RamFileHandle::write` with an empty buffer computes
-/// `end == *offset` and no-ops — real answer, no side effect either way.
+/// read-only filesystem's regular-file handle (initramfs, procfs)
+/// unconditionally errors on `write()` regardless of buffer length, while
+/// `RamFileHandle`'s and `Ext2FileHandle`'s `write()` with an empty
+/// buffer are true no-ops — real answer, no side effect either way.
 fn sys_access(path_ptr: usize, mode: i32) -> SyscallResult {
     if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
     let path = read_user_str(path_ptr);

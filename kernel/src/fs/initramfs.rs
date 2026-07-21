@@ -67,6 +67,8 @@ impl Filesystem for InitramfsFs {
 struct RootDirInode;
 
 impl Inode for RootDirInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
     fn stat(&self) -> Stat {
         Stat::dir(ROOT_INO)
     }
@@ -118,6 +120,8 @@ struct MountPointDirInode {
 }
 
 impl Inode for MountPointDirInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
     fn stat(&self) -> Stat {
         Stat::dir(self.ino)
     }
@@ -144,6 +148,8 @@ impl Inode for MountPointDirInode {
 struct BinDirInode;
 
 impl Inode for BinDirInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
     fn stat(&self) -> Stat {
         Stat::dir(BIN_INO)
     }
@@ -190,6 +196,8 @@ struct InitramfsFileInode {
 }
 
 impl Inode for InitramfsFileInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
     fn stat(&self) -> Stat {
         Stat::executable(self.ino, self.data.len() as i64)
     }

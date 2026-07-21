@@ -30,6 +30,8 @@ const STATUS_DRQ: u8 = 1 << 3;
 const STATUS_BSY: u8 = 1 << 7;
 
 const CMD_READ_SECTORS: u8 = 0x20;
+const CMD_WRITE_SECTORS: u8 = 0x30;
+const CMD_CACHE_FLUSH: u8 = 0xE7;
 
 pub const SECTOR_SIZE: usize = 512;
 
@@ -122,6 +124,63 @@ pub fn read_sectors(lba: u32, count: u8, buf: &mut [u8]) -> Result<(), &'static 
                 buf[base + i * 2 + 1] = (word >> 8) as u8;
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Write `count` sectors (512 bytes each) from `buf` starting at `lba`.
+/// `buf.len()` must be at least `count as usize * SECTOR_SIZE`. Same
+/// LBA28/`count == 0` convention as `read_sectors`. Issues a CACHE FLUSH
+/// (0xE7) after the transfer so a write is actually on stable media before
+/// this returns — matters once `fs::ext2` starts persisting bitmaps and
+/// inodes here, unlike the read-only path this driver started as.
+pub fn write_sectors(lba: u32, count: u8, buf: &[u8]) -> Result<(), &'static str> {
+    let n = if count == 0 { 256 } else { count as usize };
+    assert!(buf.len() >= n * SECTOR_SIZE, "ata::write_sectors: buf too small");
+    assert!(lba & 0xF000_0000 == 0, "ata::write_sectors: LBA28 overflow");
+
+    let _guard = ATA_LOCK.lock();
+
+    unsafe {
+        let mut drive_head: Port<u8> = Port::new(DRIVE_HEAD);
+        let mut sector_count: Port<u8> = Port::new(SECTOR_COUNT);
+        let mut lba_low: Port<u8> = Port::new(LBA_LOW);
+        let mut lba_mid: Port<u8> = Port::new(LBA_MID);
+        let mut lba_high: Port<u8> = Port::new(LBA_HIGH);
+        let mut command: Port<u8> = Port::new(COMMAND_STATUS);
+        let mut data: Port<u16> = Port::new(DATA);
+        let mut error: Port<u8> = Port::new(ERROR_FEATURES);
+
+        drive_head.write(0xE0 | ((lba >> 24) & 0x0F) as u8);
+        wait_400ns();
+        wait_not_busy()?;
+
+        sector_count.write(count);
+        lba_low.write((lba & 0xFF) as u8);
+        lba_mid.write(((lba >> 8) & 0xFF) as u8);
+        lba_high.write(((lba >> 16) & 0xFF) as u8);
+        command.write(CMD_WRITE_SECTORS);
+
+        for sector in 0..n {
+            if let Err(e) = wait_drq() {
+                let _ = error.read();
+                return Err(e);
+            }
+            let base = sector * SECTOR_SIZE;
+            for i in 0..256 {
+                let word = (buf[base + i * 2] as u16) | ((buf[base + i * 2 + 1] as u16) << 8);
+                data.write(word);
+            }
+            // Drive clears DRQ and processes the sector before it will
+            // raise DRQ again for the next one (or finish the command on
+            // the last sector) — wait for BSY to drop each time, same as
+            // the read path's per-sector DRQ wait, just mirrored.
+            wait_not_busy()?;
+        }
+
+        command.write(CMD_CACHE_FLUSH);
+        wait_not_busy()?;
     }
 
     Ok(())

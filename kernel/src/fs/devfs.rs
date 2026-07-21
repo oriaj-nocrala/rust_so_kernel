@@ -56,6 +56,8 @@ const INPUT_DIR_INO: u64 = 100_000;
 struct DevDirInode;
 
 impl Inode for DevDirInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
     fn stat(&self) -> Stat {
         Stat::dir(100)
     }
@@ -122,6 +124,8 @@ impl Inode for DevDirInode {
 struct InputDirInode;
 
 impl Inode for InputDirInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
     fn stat(&self) -> Stat {
         Stat::dir(INPUT_DIR_INO)
     }
@@ -224,6 +228,8 @@ struct DevInode {
 }
 
 impl Inode for DevInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
     fn stat(&self) -> Stat {
         Stat::chardev(self.ino)
     }

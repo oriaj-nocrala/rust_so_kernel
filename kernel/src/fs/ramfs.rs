@@ -75,6 +75,8 @@ impl RamDirNode {
 }
 
 impl Inode for RamDirNode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
     fn stat(&self) -> Stat {
         Stat::dir(self.ino)
     }
@@ -231,6 +233,8 @@ struct RamFileNode {
 }
 
 impl Inode for RamFileNode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
     fn stat(&self) -> Stat {
         Stat::regular_writable(self.ino, self.data.lock().len() as i64)
     }
@@ -266,6 +270,8 @@ struct RamSymlinkNode {
 }
 
 impl Inode for RamSymlinkNode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
     fn stat(&self) -> Stat {
         Stat::symlink(self.ino, self.target.len() as i64)
     }

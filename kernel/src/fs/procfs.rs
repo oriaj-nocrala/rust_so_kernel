@@ -99,6 +99,8 @@ fn render_proc_stat(pid: usize, snap: &crate::process::scheduler::ProcStatSnapsh
 struct ProcDirInode;
 
 impl Inode for ProcDirInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
     fn stat(&self) -> Stat {
         Stat::dir(200)
     }
@@ -151,6 +153,8 @@ impl Inode for ProcDirInode {
 struct MeminfoInode;
 
 impl Inode for MeminfoInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
     fn stat(&self) -> Stat {
         Stat::regular(201, render_meminfo().len() as i64)
     }
@@ -172,6 +176,8 @@ impl Inode for MeminfoInode {
 struct KdebugInode;
 
 impl Inode for KdebugInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
     fn stat(&self) -> Stat {
         Stat::regular(203, crate::debug::render_report().len() as i64)
     }
@@ -193,6 +199,8 @@ impl Inode for KdebugInode {
 struct SelfInode;
 
 impl Inode for SelfInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
     fn stat(&self) -> Stat {
         Stat::symlink(202, self.readlink().map(|s| s.len()).unwrap_or(0) as i64)
     }
@@ -219,6 +227,8 @@ struct ProcPidDirInode {
 }
 
 impl Inode for ProcPidDirInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
     fn stat(&self) -> Stat {
         Stat::dir(pid_dir_ino(self.pid))
     }
@@ -255,6 +265,8 @@ struct ProcStatInode {
 }
 
 impl Inode for ProcStatInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
     fn stat(&self) -> Stat {
         let len = crate::process::scheduler::proc_stat_snapshot(self.pid)
             .map(|s| render_proc_stat(self.pid, &s).len())
@@ -329,6 +341,8 @@ struct ProcExeInode {
 }
 
 impl Inode for ProcExeInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
     fn stat(&self) -> Stat {
         let len = self.readlink().map(|s| s.len()).unwrap_or(0);
         Stat::symlink(pid_exe_ino(self.pid), len as i64)

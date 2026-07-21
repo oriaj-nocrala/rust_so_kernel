@@ -8,13 +8,13 @@
 //   initramfs  — /  and /bin/*, a real two-level tree backed by embedded ELF bytes
 //   devfs      — /dev/*  backed by the driver registry
 //   ramfs      — /tmp/*  writable, in-memory scratch space
-//   ext2       — /mnt/*  read-only, backed by the ATA disk (persists across reboots)
+//   ext2       — /mnt/*  writable, backed by the ATA disk (persists across reboots)
 //   procfs     — /proc/* read-only, generated on open() (currently just meminfo)
 //
 // MOUNT LAYOUT (after init())
 //   /dev   → DevFs
 //   /tmp   → RamFs        (writable scratch — e.g. shell `write`/`sh` scripts)
-//   /mnt   → Ext2Fs        (read-only; only mounted if the ATA disk is present)
+//   /mnt   → Ext2Fs        (writable; only mounted if the ATA disk is present)
 //   /proc  → ProcFs        (read-only, synthetic — /proc/meminfo)
 //   /      → InitramfsFs  (root dir contains just "bin"; "/bin/<name>" resolves
 //                          through it as a real subdirectory lookup, not a
@@ -41,7 +41,7 @@ pub fn init() {
     vfs::mount("/dev", Arc::new(devfs::DevFs));
     // /tmp — writable scratch space (ramfs)
     vfs::mount("/tmp", Arc::new(ramfs::RamFs::new()));
-    // /mnt — real disk, read-only ext2 (best-effort: no disk / bad image just
+    // /mnt — real disk, writable ext2 (best-effort: no disk / bad image just
     // means no /mnt, not a boot failure).
     match ext2::init() {
         Ok(()) => {

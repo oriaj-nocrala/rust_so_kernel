@@ -134,6 +134,25 @@ pub trait Inode: Send + Sync {
     fn symlink(&self, _name: &str, _target: &str) -> Result<Arc<dyn Inode>, Errno> {
         Err(Errno::EROFS)
     }
+
+    /// Type-erased downcast handle. Lets a filesystem whose directory
+    /// entries can only reference its own inodes (ext2: a dirent is
+    /// literally an inode *number*, meaningless outside that filesystem)
+    /// verify, inside `insert_child`, that a node handed across the
+    /// generic `Arc<dyn Inode>` VFS boundary during `rename()` is actually
+    /// one of its own before trusting its inode number — otherwise a
+    /// cross-filesystem rename could write a dirent pointing at whatever
+    /// inode number happens to collide in the wrong filesystem.
+    ///
+    /// No default body: `Self` has no implicit `Sized` bound inside a
+    /// trait definition (traits stay dyn-compatible by default), so a
+    /// shared `{ self }` default can't coerce `&Self` to `&dyn Any`
+    /// without also adding `where Self: Sized` — which would exclude the
+    /// method from the vtable entirely, making it uncallable through
+    /// `Arc<dyn Inode>` (the whole point). Every implementor below adds
+    /// the same one-line `{ self }` body instead, where `Self` is the
+    /// concrete, `Sized` type.
+    fn as_any(&self) -> &dyn core::any::Any;
 }
 
 // ── Filesystem ───────────────────────────────────────────────────────────────

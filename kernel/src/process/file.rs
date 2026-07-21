@@ -22,6 +22,10 @@ pub enum FileError {
     /// Write to a pipe with no open read ends (maps to EPIPE, and the
     /// caller additionally raises SIGPIPE — see `pipe.rs`/`sys_write`).
     BrokenPipe,
+    /// Backing store (ext2 block/inode bitmap) is full — maps to ENOSPC,
+    /// distinct from `IOError` so `sys_write` can report the real reason a
+    /// write to a disk-backed filesystem failed.
+    NoSpace,
     /// The operation would block (empty pipe on read, full pipe on write).
     /// `sys_read`/`sys_write` catch this, drop the fd-table lock, and
     /// perform the actual block_current/jump_to_trapframe themselves — see
