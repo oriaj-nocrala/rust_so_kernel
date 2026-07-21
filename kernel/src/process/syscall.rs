@@ -1095,15 +1095,27 @@ fn sys_getdents64(fd: i32, buf_ptr: usize, count: usize) -> SyscallResult {
 /// under a short scheduler-lock scope, release it, then close outside any
 /// scheduler lock — same shape sys_fork/sys_exec use for lock-crossing work.
 fn sys_close(fd: i32) -> SyscallResult {
-    let files = {
-        unsafe { core::arch::asm!("cli"); }
-        let scheduler = super::scheduler::local_scheduler();
-        let result = match scheduler.running_ref() {
-            Some(proc) => proc.files.clone(),
-            None => { unsafe { core::arch::asm!("sti"); } return errno::ESRCH; }
-        };
-        unsafe { core::arch::asm!("sti"); }
-        result
+    unsafe { core::arch::asm!("cli"); }
+    // The `local_scheduler()` guard here is a bare temporary (never bound
+    // to a name), so it drops at the end of *this* statement — strictly
+    // before the `sti` on the next line. Previously this bound the guard
+    // to `let scheduler = ...` in the same block as an explicit `sti()`
+    // call, so the guard didn't actually drop until the block's closing
+    // brace, *after* that `sti()` had already run. That reopened-
+    // interrupts-but-still-locked window is exactly what caused a real,
+    // reproducible full-kernel hang: a timer tick landing in it finds
+    // SCHEDULER held with no way to ever release it (this context can't
+    // resume until the ISR's own `local_scheduler()` call stops spinning,
+    // which it never does — single core, `spin::Mutex` isn't reentrant).
+    // Confirmed via the QEMU monitor: an acquire/release counter on
+    // `local_scheduler()` showed exactly one un-released guard, and
+    // `#[track_caller]` pointed at this exact `sti()` call. Same fix
+    // applied to `sys_dup2` below, which had the identical shape.
+    let files = super::scheduler::local_scheduler().running_ref().map(|proc| proc.files.clone());
+    unsafe { core::arch::asm!("sti"); }
+    let files = match files {
+        Some(f) => f,
+        None => return errno::ESRCH,
     };
 
     // cli here too: closing a pipe end can run its Drop impl (deallocating,
@@ -1147,15 +1159,17 @@ fn sys_dup(fd: i32) -> SyscallResult {
 fn sys_dup2(oldfd: i32, newfd: i32) -> SyscallResult {
     if oldfd < 0 || newfd < 0 { return errno::EBADF; }
 
-    let files = {
-        unsafe { core::arch::asm!("cli"); }
-        let scheduler = super::scheduler::local_scheduler();
-        let result = match scheduler.running_ref() {
-            Some(proc) => proc.files.clone(),
-            None => { unsafe { core::arch::asm!("sti"); } return errno::ESRCH; }
-        };
-        unsafe { core::arch::asm!("sti"); }
-        result
+    unsafe { core::arch::asm!("cli"); }
+    // See sys_close's doc comment: the scheduler guard (a temporary here,
+    // never bound to a name) drops at the end of *this* statement — before
+    // `sti` on the next line — not at the end of some later block. Binding
+    // it to a name in the same block as an explicit `sti()` call is exactly
+    // the bug that caused a real, reproducible kernel hang (see sys_close).
+    let files = super::scheduler::local_scheduler().running_ref().map(|proc| proc.files.clone());
+    unsafe { core::arch::asm!("sti"); }
+    let files = match files {
+        Some(f) => f,
+        None => return errno::ESRCH,
     };
 
     unsafe { core::arch::asm!("cli"); }

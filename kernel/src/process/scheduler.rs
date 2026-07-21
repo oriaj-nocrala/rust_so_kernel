@@ -29,6 +29,62 @@
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+/// Thin wrapper around `spin::MutexGuard<Scheduler>` that (1) reports every
+/// acquire/release through `debug::SCHEDULER_LOCK` — permanent, always-on
+/// diagnostics, see that type's doc comment — and (2) asserts on `drop`
+/// that interrupts are still disabled.
+///
+/// That second part is the actual fix for the bug class this guard was
+/// built to catch, not just observe: `sys_close`/`sys_dup2` used to call
+/// `sti` one statement too early, while the scheduler guard from the same
+/// block was still alive, so a timer tick landing in that reopened window
+/// found SCHEDULER held forever. Rather than trying to *automatically
+/// correct* every one of the ~90 call sites that pair a manual `cli`/`sti`
+/// around `local_scheduler()` (which would need a global IRQ-nesting
+/// counter with careful, error-prone special-casing at every context-
+/// switch/iretq boundary — timer ISR, page-fault/GPF/etc. process-killing
+/// paths, `jump_to_user`, `start_first_process` — a wrong reset there
+/// would silently corrupt interrupt state kernel-wide, a *worse* bug than
+/// the one being fixed), this instead makes the invariant those call
+/// sites are already supposed to uphold ("interrupts stay off for
+/// SCHEDULER's entire *real* lifetime") self-enforcing and impossible to
+/// violate silently: the check is purely observational (reads RFLAGS,
+/// changes no control flow), so it requires editing none of them, and it
+/// fires deterministically the very first time the bad ordering executes
+/// — in any normal test run — instead of needing an hours-long, timing-
+/// dependent stress test to manifest as a hang. See `local_scheduler()`'s
+/// matching acquire-time assertion for the other half (missing `cli`
+/// before the call).
+pub struct TrackedSchedulerGuard(Option<spin::MutexGuard<'static, Scheduler>>);
+
+impl core::ops::Deref for TrackedSchedulerGuard {
+    type Target = Scheduler;
+    fn deref(&self) -> &Scheduler { self.0.as_ref().unwrap() }
+}
+
+impl core::ops::DerefMut for TrackedSchedulerGuard {
+    fn deref_mut(&mut self) -> &mut Scheduler { self.0.as_mut().unwrap() }
+}
+
+impl Drop for TrackedSchedulerGuard {
+    fn drop(&mut self) {
+        self.0 = None;
+        crate::debug::SCHEDULER_LOCK.record_release();
+        assert!(
+            !x86_64::instructions::interrupts::are_enabled(),
+            "SCHEDULER guard dropped with interrupts already enabled (IF=1) — \
+             a `sti` ran before this guard's scope actually closed. This is \
+             exactly the bug class that caused a real, hours-to-diagnose \
+             kernel deadlock (timer ISR spinning on `local_scheduler()` \
+             forever) — see the `deadlock_scheduler_filehandle_drop` \
+             session memory / this type's doc comment. Fix: don't bind the \
+             guard to a name in a block that also calls `sti` — use it as a \
+             bare temporary (drops at the end of its own statement) or \
+             nest it in its own tighter sub-block that closes before `sti`."
+        );
+    }
+}
+
 // ── FS.base save / restore helpers ──────────────────────────────────────────
 // FS.base (MSR 0xC000_0100) is used by mlibc for TLS.  We must save it
 // when context-switching away from a process and restore it for the next one.
@@ -141,10 +197,20 @@ static SCHEDULERS: [Mutex<Scheduler>; crate::cpu::MAX_CPUS] = [
 
 /// Acquires the current CPU's scheduler lock.
 /// CALLER must disable interrupts before calling (cli) and
-/// re-enable after dropping the guard (sti).
-#[inline]
-pub fn local_scheduler() -> spin::MutexGuard<'static, Scheduler> {
-    SCHEDULERS[crate::cpu::cpu_id()].lock()
+/// re-enable after dropping the guard (sti) — enforced by assertion, not
+/// just this doc comment: see `TrackedSchedulerGuard::drop`'s doc comment
+/// for why an assertion here (missing `cli`) instead of an automatic fix.
+#[track_caller]
+pub fn local_scheduler() -> TrackedSchedulerGuard {
+    assert!(
+        !x86_64::instructions::interrupts::are_enabled(),
+        "local_scheduler() called with interrupts enabled (IF=1) — the \
+         caller must `cli` first. Same bug class `TrackedSchedulerGuard`'s \
+         drop-time assertion catches on the other end; see its doc comment."
+    );
+    let guard = SCHEDULERS[crate::cpu::cpu_id()].lock();
+    crate::debug::SCHEDULER_LOCK.record_acquire(core::panic::Location::caller());
+    TrackedSchedulerGuard(Some(guard))
 }
 
 pub struct Scheduler {

@@ -29,8 +29,102 @@
 // ────────────────────
 //   Add an `AtomicU64` below, a matching `inc_*`/getter, and a line in
 //   `render_report()` — then it shows up in `/proc/kdebug` for free.
+//
+// ADDING LOCK DIAGNOSTICS FOR A NEW LOCK
+// ───────────────────────────────────────
+//   See `LockDiag` below — grew out of a real, hours-long hunt for a
+//   single-core deadlock (SCHEDULER held, interrupts re-enabled one
+//   statement too early, timer ISR spins on `local_scheduler()` forever)
+//   that could only be pinned down by manually reading raw memory through
+//   the QEMU monitor (cross-referencing `nm` symbol addresses, decoding
+//   an ASCII file path byte-by-byte by hand). `ktrace!` couldn't have
+//   caught this even turned on ahead of time: it's print-based, and a
+//   print inside the acquire/release path risks perturbing the exact
+//   timing the race depends on. `LockDiag` is the generalized, permanent
+//   version of the ad hoc atomics that actually found it — add one
+//   `static FOO_LOCK: LockDiag = LockDiag::new();` per lock worth
+//   watching, call `.record_acquire(core::panic::Location::caller())` /
+//   `.record_release()` around it (see `scheduler::local_scheduler()`'s
+//   `TrackedSchedulerGuard` for the pattern), and add a `.render(...)`
+//   line to `render_report()`. Next time: `cat /proc/kdebug` shows
+//   `outstanding` (acquires − releases; anything but 0/1 means a guard
+//   leaked) and exactly which call site is holding it, live, with no
+//   monitor session required.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+/// Always-on diagnostics for one lock: acquire/release counts (a
+/// persistent gap between them means a guard leaked — the lock will
+/// never be released again) and the `file:line` of whoever acquired it
+/// *most recently*. On a single core that's sufficient to name the
+/// culprit outright: whoever is stuck holding a lock forever must be the
+/// last one who successfully locked it (nothing else could have raced in
+/// after). See the module doc comment above for how this was born.
+pub struct LockDiag {
+    acquires:      AtomicU64,
+    releases:      AtomicU64,
+    last_file_ptr: AtomicUsize,
+    last_file_len: AtomicU32,
+    last_line:     AtomicU32,
+}
+
+impl LockDiag {
+    pub const fn new() -> Self {
+        Self {
+            acquires: AtomicU64::new(0),
+            releases: AtomicU64::new(0),
+            last_file_ptr: AtomicUsize::new(0),
+            last_file_len: AtomicU32::new(0),
+            last_line: AtomicU32::new(0),
+        }
+    }
+
+    /// Call immediately after acquiring the lock, passing
+    /// `core::panic::Location::caller()` from a `#[track_caller]` wrapper
+    /// around the real lock call — see `local_scheduler()`.
+    pub fn record_acquire(&self, loc: &core::panic::Location) {
+        self.last_file_ptr.store(loc.file().as_ptr() as usize, Ordering::Relaxed);
+        self.last_file_len.store(loc.file().len() as u32, Ordering::Relaxed);
+        self.last_line.store(loc.line(), Ordering::Relaxed);
+        self.acquires.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Call from the guard wrapper's `Drop` impl.
+    pub fn record_release(&self) {
+        self.releases.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One `/proc/kdebug` line: `{name}_lock: acquires=.. releases=..
+    /// outstanding=.. last_acquirer=file:line`.
+    pub fn render(&self, name: &str) -> alloc::string::String {
+        use alloc::format;
+        let acq = self.acquires.load(Ordering::Relaxed);
+        let rel = self.releases.load(Ordering::Relaxed);
+        let ptr = self.last_file_ptr.load(Ordering::Relaxed);
+        let len = self.last_file_len.load(Ordering::Relaxed) as usize;
+        let line = self.last_line.load(Ordering::Relaxed);
+        // Safe: `loc.file()` (core::panic::Location) always points into the
+        // binary's rodata — a real 'static str that's never freed — so a
+        // pointer captured from it stays valid to reconstruct and read back
+        // at any later point, from any context, including this one.
+        let file: &str = if ptr != 0 && len > 0 && len < 512 {
+            unsafe {
+                let bytes = core::slice::from_raw_parts(ptr as *const u8, len);
+                core::str::from_utf8(bytes).unwrap_or("<non-utf8>")
+            }
+        } else {
+            "<none yet>"
+        };
+        format!(
+            "{name}_lock: acquires={} releases={} outstanding={} last_acquirer={}:{}\n",
+            acq, rel, acq.saturating_sub(rel), file, line,
+        )
+    }
+}
+
+/// Diagnostics for the scheduler's per-CPU lock — see `scheduler::
+/// local_scheduler()`, which is the only thing that acquires it.
+pub static SCHEDULER_LOCK: LockDiag = LockDiag::new();
 
 // ── Subsystems ───────────────────────────────────────────────────────────────
 
@@ -122,13 +216,15 @@ pub fn render_report() -> alloc::string::String {
          execs_total: {}\n\
          reaps_total: {}\n\
          cow_faults_resolved: {}\n\
-         cow_faults_failed: {}\n",
+         cow_faults_failed: {}\n\
+         {}",
         mask, enabled,
         FORKS_TOTAL.load(Ordering::Relaxed),
         EXECS_TOTAL.load(Ordering::Relaxed),
         REAPS_TOTAL.load(Ordering::Relaxed),
         COW_FAULTS_RESOLVED.load(Ordering::Relaxed),
         COW_FAULTS_FAILED.load(Ordering::Relaxed),
+        SCHEDULER_LOCK.render("scheduler"),
     )
 }
 
