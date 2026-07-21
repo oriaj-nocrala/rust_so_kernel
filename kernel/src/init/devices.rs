@@ -47,6 +47,7 @@ pub fn init_idt() {
         idt.entries[32].set_handler_addr(crate::process::timer_preempt::timer_interrupt_entry as u64);
         idt.add_handler(33, keyboard_interrupt_handler);
         idt.add_handler(36, serial_interrupt_handler);
+        idt.add_handler(44, mouse_interrupt_handler);
         // Syscalls are now handled via the `syscall` instruction (LSTAR MSR),
         // not via int 0x80.  No IDT entry needed.
         idt
@@ -114,6 +115,17 @@ extern "x86-interrupt" fn serial_interrupt_handler(_: &mut ExceptionStackFrame) 
         }
     }
     crate::interrupts::pic::end_of_interrupt(crate::interrupts::pic::Irq::Com1.as_u8());
+}
+
+/// IRQ12 — PS/2 auxiliary device (mouse). Each byte belongs to a 3-byte
+/// packet; `mouse::process_byte` does the reassembly/decode, same shape
+/// as `keyboard::process_scancode` does for IRQ1.
+extern "x86-interrupt" fn mouse_interrupt_handler(_: &mut ExceptionStackFrame) {
+    let data = unsafe {
+        x86_64::instructions::port::PortReadOnly::<u8>::new(0x60).read()
+    };
+    crate::mouse::process_byte(data);
+    crate::interrupts::pic::end_of_interrupt(crate::interrupts::pic::Irq::Mouse.as_u8());
 }
 
 extern "x86-interrupt" fn divide_by_zero_handler(sf: &mut ExceptionStackFrame) {

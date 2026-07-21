@@ -23,6 +23,11 @@
 //     it. An earlier version of this port used a bespoke [scancode,
 //     pressed] 2-byte format over /dev/kbdraw instead; superseded once the
 //     driver itself started speaking real evdev.
+//   - /dev/input/event1 (kernel/src/drivers/dev_mouse_event.rs) — same
+//     real evdev wire format as event0 above, sourced from the PS/2
+//     auxiliary device (kernel/src/mouse.rs, IRQ12): EV_REL (REL_X/REL_Y)
+//     for relative motion, EV_KEY (BTN_LEFT/RIGHT/MIDDLE) for buttons.
+//     Drives mouse-look via D_PostEvent(ev_mouse) — see DG_DrawFrame.
 //   - /mnt/freedoom1.wad — the IWAD itself, read straight off the ext2
 //     image (fs::ext2, read-only, seeded from disk-image-root/ at build
 //     time). An earlier version of this port routed the WAD through a
@@ -35,13 +40,20 @@
 //     SEEK_SET bug note in mlibc-port-and-kernel-bugs. With that fixed,
 //     ext2 works fine and the embedded-device workaround (and its
 //     kernel-image size cost) is gone.
+//   - /dev/dsp (kernel/src/drivers/dev_dsp.rs, backed by the AC97 PCI
+//     driver kernel/src/ac97.rs) — fixed-format (48000 Hz stereo s16le)
+//     PCM output for sound effects. See doomgeneric_sound_constanos.c
+//     (this port's sound_module_t, a separate file — self-contained
+//     mixing/resampling subsystem, not folded in here). Sound effects
+//     only, no music: this doomgeneric fork has no MIDI/OPL synthesis
+//     backend at all, unrelated to the audio driver work.
 //
-// No audio: this kernel has no sound driver. FEATURE_SOUND is left
-// undefined for this build, which is enough — i_sound.c already behaves
-// as a null sound backend when no sound_module is compiled in.
+// Audio note: FEATURE_SOUND is defined for this build (see
+// scripts/build-doom.sh) — see doomgeneric_sound_constanos.c above.
 
 #include "doomkeys.h"
 #include "doomgeneric.h"
+#include "d_event.h" // event_t, ev_mouse, D_PostEvent — mouse-look
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -81,6 +93,8 @@ static long raw_syscall0(long nr)
 
 static int s_fbFd = -1;
 static int s_kbdFd = -1;
+static int s_mouseFd = -1;
+static int s_mouseButtons = 0; // persistent held-button bitmask (bit0=L,1=R,2=M)
 
 #define KEYQUEUE_SIZE 16
 static unsigned short s_KeyQueue[KEYQUEUE_SIZE];
@@ -94,7 +108,13 @@ static unsigned int s_KeyQueueReadIndex = 0;
 // device rather than a lookalike.
 #define EV_SYN 0x00
 #define EV_KEY 0x01
+#define EV_REL 0x02
 #define SYN_REPORT 0
+#define REL_X 0x00
+#define REL_Y 0x01
+#define BTN_LEFT   0x110
+#define BTN_RIGHT  0x111
+#define BTN_MIDDLE 0x112
 
 // Wire-compatible with the real Linux `struct input_event` on x86_64 —
 // see kernel/src/drivers/dev_input_event.rs's matching Rust definition.
@@ -175,6 +195,7 @@ void DG_Init(void)
 {
     s_fbFd = open("/dev/fb", O_WRONLY);
     s_kbdFd = open("/dev/input/event0", O_RDONLY);
+    s_mouseFd = open("/dev/input/event1", O_RDONLY);
 
     // Drain events queued before we started: the kernel's raw-event ring
     // buffer fills from every keypress since boot and nothing else reads
@@ -184,6 +205,7 @@ void DG_Init(void)
     // episode select on their own).
     struct input_event ev;
     while (s_kbdFd >= 0 && read(s_kbdFd, &ev, sizeof(ev)) == (long)sizeof(ev)) { }
+    while (s_mouseFd >= 0 && read(s_mouseFd, &ev, sizeof(ev)) == (long)sizeof(ev)) { }
 }
 
 void DG_DrawFrame(void)
@@ -195,6 +217,50 @@ void DG_DrawFrame(void)
         }
         // EV_SYN/SYN_REPORT and anything else this device doesn't emit:
         // nothing to do, just consume it.
+    }
+
+    // Accumulate every mouse packet since the last frame into one
+    // ev_mouse event — matches how a real port (e.g. SDL relative mouse
+    // mode) coalesces motion between ticks instead of posting one event
+    // per PS/2 packet. data2/data3 are raw evdev REL_X/REL_Y deltas,
+    // unnegated: PS/2's own sign convention (X+ = right, Y+ = up/away
+    // from the user) already matches what g_game.c's mouse handling
+    // expects (angleturn -= mousex*0x8 turns right on X+; forward +=
+    // mousey advances on Y+) — this is the same raw convention the
+    // original DOS mouse driver reported through, which is what that
+    // formula was written against.
+    if (s_mouseFd >= 0) {
+        int mdx = 0, mdy = 0;
+        int haveMouseEvent = 0;
+        while (read(s_mouseFd, &ev, sizeof(ev)) == (long)sizeof(ev)) {
+            haveMouseEvent = 1;
+            if (ev.type == EV_REL) {
+                if (ev.code == REL_X) mdx += ev.value;
+                else if (ev.code == REL_Y) mdy += ev.value;
+            } else if (ev.type == EV_KEY) {
+                // Update persistent held-button state (s_mouseButtons),
+                // not a per-frame-local one — a button held across
+                // several frames with no new transition must still read
+                // as held every frame, not just the frame it was pressed.
+                int bit = (ev.code == BTN_LEFT) ? 1
+                        : (ev.code == BTN_RIGHT) ? 2
+                        : (ev.code == BTN_MIDDLE) ? 4 : 0;
+                if (bit) {
+                    if (ev.value) s_mouseButtons |= bit;
+                    else s_mouseButtons &= ~bit;
+                }
+            }
+            // EV_SYN/SYN_REPORT: nothing to do, just consumed by the loop.
+        }
+        if (haveMouseEvent) {
+            event_t doomEv;
+            doomEv.type = ev_mouse;
+            doomEv.data1 = s_mouseButtons;
+            doomEv.data2 = mdx;
+            doomEv.data3 = mdy;
+            doomEv.data4 = 0;
+            D_PostEvent(&doomEv);
+        }
     }
 
     if (s_fbFd >= 0) {

@@ -225,19 +225,24 @@ fn main() {
     //
     // Same rationale as BusyBox above: an external, from-scratch multi-file
     // C build (no incremental object cache of its own, unlike BusyBox's own
-    // Makefile). Unlike BusyBox, though, our own platform port file gets
-    // edited in place — compare its mtime against the output so those edits
-    // actually make it into doom.elf (a from-scratch rebuild is only a few
-    // seconds; upstream doomgeneric/ is a pinned submodule, so the port
-    // file is the only input that changes in practice).
+    // Makefile). Unlike BusyBox, though, our own platform port files get
+    // edited in place — compare their mtimes against the output so those
+    // edits actually make it into doom.elf (a from-scratch rebuild is only
+    // a few seconds; upstream doomgeneric/ is a pinned submodule, so the
+    // port files are the only inputs that change in practice).
     let doom_elf = embedded_dir.join(DOOM_ELF);
-    let port_src = workspace_root.join("doom-port/doomgeneric_constanos.c");
+    let port_srcs = [
+        workspace_root.join("doom-port/doomgeneric_constanos.c"),
+        workspace_root.join("doom-port/doomgeneric_sound_constanos.c"),
+    ];
     let doom_stale = !doom_elf.exists()
-        || match (doom_elf.metadata().and_then(|m| m.modified()),
-                  port_src.metadata().and_then(|m| m.modified())) {
-            (Ok(elf), Ok(src)) => src > elf,
-            _ => true,
-        };
+        || port_srcs.iter().any(|port_src| {
+            match (doom_elf.metadata().and_then(|m| m.modified()),
+                   port_src.metadata().and_then(|m| m.modified())) {
+                (Ok(elf), Ok(src)) => src > elf,
+                _ => true,
+            }
+        });
     if doom_stale {
         println!("cargo:warning=doom.elf missing/stale — building doomgeneric...");
         let status = Command::new("bash")

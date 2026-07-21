@@ -23,6 +23,7 @@ pub enum Irq {
     Timer = PIC1_OFFSET,
     Keyboard, // 33
     Com1 = PIC1_OFFSET + 4, // 36 — serial (COM1) receive
+    Mouse = PIC2_OFFSET + 4, // 44 — PS/2 auxiliary device (IRQ12)
 }
 
 impl Irq {

@@ -56,6 +56,16 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     // ── Hardware interrupts ────────────────────────────────────────
     devices::init_hardware_interrupts();
 
+    // ── PS/2 mouse ──────────────────────────────────────────────────
+    // Best-effort (bounded polls, never hangs boot) — see mouse::init.
+    crate::mouse::init();
+
+    // ── AC97 audio ──────────────────────────────────────────────────
+    // Best-effort (bounded polls, never hangs boot) — see ac97::init.
+    // Needs phys_alloc/physical_memory_offset, both already up from
+    // memory::init_core above.
+    crate::ac97::init();
+
     // ── TSC calibration ────────────────────────────────────────────
     // PIT is now running; interrupts still masked — safe to busy-poll.
     crate::cpu::tsc::init();

@@ -16,6 +16,8 @@
 #   scripts/qemu-debug.sh key ret                  # raw qemu keynames, one per arg
 #   scripts/qemu-debug.sh key ctrl-c
 #   scripts/qemu-debug.sh enter                    # shortcut for: key ret
+#   scripts/qemu-debug.sh mouse-move dx dy          # relative PS/2 motion (HMP mouse_move)
+#   scripts/qemu-debug.sh mouse-button val          # HMP bitmask: 1=left, 2=middle, 4=right, 0=release
 #   scripts/qemu-debug.sh screendump [out.png]      # defaults to STATE_DIR/screen.png
 #   scripts/qemu-debug.sh log [N]                   # tail -n N serial.log (default 100)
 #   scripts/qemu-debug.sh rawlog [N]                # like log, but ANSI/control bytes shown
@@ -113,6 +115,12 @@ cmd_start() {
     : > "$SERIAL_LOG"
     : > "$DEBUG_LOG"
 
+    # AC97 audiodev backend: "none" by default (no host audio needed,
+    # works in any headless/sandboxed environment) — override with
+    # QEMU_AUDIODEV="wav,id=snd0,path=/some/file.wav" to capture real PCM
+    # output to a host .wav file for verification.
+    local audiodev="${QEMU_AUDIODEV:-none,id=snd0}"
+
     local qemu_args=(
         -drive "if=pflash,format=raw,readonly=on,file=$ovmf_code"
         -drive "if=pflash,format=raw,file=$ovmf_vars_src"
@@ -123,6 +131,8 @@ cmd_start() {
         -monitor "unix:$SOCK,server,nowait"
         -display none
         -d int,guest_errors -D "$DEBUG_LOG"
+        -audiodev "$audiodev"
+        -device "AC97,audiodev=snd0"
     )
     if [ -f "$ext2_disk" ]; then
         qemu_args+=(-drive "file=$ext2_disk,format=raw,if=none,id=ext2disk" -device "ide-hd,drive=ext2disk,bus=ide.1")
@@ -233,6 +243,19 @@ cmd_key() {
     done
 }
 
+cmd_mouse_move() {
+    is_running || { echo "Not running." >&2; exit 1; }
+    # QEMU HMP mouse_move dx dy [dz] — relative deltas by default (no
+    # absolute pointing device, e.g. usb-tablet, is attached in cmd_start).
+    mon "mouse_move $1 $2"
+}
+
+cmd_mouse_button() {
+    is_running || { echo "Not running." >&2; exit 1; }
+    # QEMU HMP bitmask: 1=left, 2=middle, 4=right. 0 releases all buttons.
+    mon "mouse_button $1"
+}
+
 cmd_screendump() {
     is_running || { echo "Not running." >&2; exit 1; }
     local out="${1:-$STATE_DIR/screen.png}"
@@ -283,6 +306,8 @@ case "${1:-}" in
     send) cmd_send "$2" ;;
     key) shift; cmd_key "$@" ;;
     enter) cmd_key ret ;;
+    mouse-move) cmd_mouse_move "${2:-0}" "${3:-0}" ;;
+    mouse-button) cmd_mouse_button "${2:-0}" ;;
     screendump) cmd_screendump "${2:-}" ;;
     log) cmd_log "${2:-}" ;;
     rawlog) cmd_rawlog "${2:-}" ;;

@@ -40,6 +40,14 @@ fn main() {
     // #UD (invalid opcode) fault in OVMF before our kernel ever loads.
     cmd.arg("-cpu").arg("max");
 
+    // AC97 sound card (kernel/src/ac97.rs) — "none" audiodev backend since
+    // this QEMU build has no real host-audio backend compiled in (only
+    // "none"/"wav" are available; see `qemu-system-x86_64 -audiodev
+    // help`). The guest-visible PCI device and DMA still work correctly
+    // with "none" — it just discards the PCM instead of playing it.
+    cmd.arg("-audiodev").arg("none,id=snd0");
+    cmd.arg("-device").arg("AC97,audiodev=snd0");
+
     let mut child = cmd.spawn().unwrap();
     child.wait().unwrap();
 }

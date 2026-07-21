@@ -12,10 +12,13 @@
 # static config.h and no Makefile at all (only a Visual Studio .sln), so
 # this script hardcodes the same source file list as that .sln's own
 # Win32 build (`doomgeneric.vcxproj`) minus its platform file
-# (doomgeneric_win.c) and the SDL/Allegro sound backends (unused — no
-# FEATURE_SOUND, no audio driver in this kernel; i_sound.c already
-# behaves as a null sound backend with no sound_module compiled in),
-# plus our own doomgeneric_constanos.c instead.
+# (doomgeneric_win.c) and the SDL/Allegro sound backends (unused — this
+# kernel has its own AC97 driver + sound_module_t instead, see
+# doom-port/doomgeneric_sound_constanos.c), plus our own
+# doomgeneric_constanos.c and doomgeneric_sound_constanos.c.
+#
+# FEATURE_SOUND is defined below so i_sound.c actually registers
+# DG_sound_module instead of behaving as a null backend.
 #
 # Idempotent: safe to re-run; always rebuilds (no incremental object
 # cache — a from-scratch compile of ~83 files is a few seconds, not worth
@@ -70,6 +73,7 @@ for f in "${CORE_SOURCES[@]}"; do
     SOURCES+=("$DG_SRC/$f")
 done
 SOURCES+=("$REPO_ROOT/doom-port/doomgeneric_constanos.c")
+SOURCES+=("$REPO_ROOT/doom-port/doomgeneric_sound_constanos.c")
 
 # ── Cross-compiler wrapper ──────────────────────────────────────────────
 #
@@ -94,6 +98,7 @@ exec clang \\
     -fomit-frame-pointer \\
     -mno-red-zone \\
     -D_GNU_SOURCE \\
+    -DFEATURE_SOUND \\
     -nostdinc \\
     -isystem "\$SYSROOT/usr/include" \\
     -isystem "\$RESOURCE_INC" \\
@@ -108,6 +113,6 @@ chmod +x "$CC_WRAPPER"
 # ── Build ────────────────────────────────────────────────────────────────
 
 mkdir -p kernel/embedded
-"$CC_WRAPPER" -I"$DG_SRC" -O2 "${SOURCES[@]}" -o kernel/embedded/doom.elf
+"$CC_WRAPPER" -I"$DG_SRC" -I"$REPO_ROOT/doom-port/stub-include" -O2 "${SOURCES[@]}" -o kernel/embedded/doom.elf
 
 echo "build-doom: kernel/embedded/doom.elf ready"

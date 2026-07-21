@@ -8,8 +8,11 @@
 // This replaces the hardcoded `match path` in sys_open.
 // Adding a new device driver = add a module + one line in DEVICES.
 
+mod evdev;
+pub mod dev_dsp;
 pub mod dev_input_event;
 pub mod dev_kbd;
+pub mod dev_mouse_event;
 pub mod dev_null;
 pub mod dev_zero;
 pub mod serial_console;
@@ -35,7 +38,9 @@ static DEVICES: &[DeviceEntry] = &[
     // Nested under /dev/input/, same layout real Linux uses for evdev
     // devices — see fs/devfs.rs's InputDirInode for the one-level
     // subdirectory support this needs (devfs is otherwise flat).
-    DeviceEntry { path: "/dev/input/event0", open: dev_input_event::open },
+    DeviceEntry { path: "/dev/input/event0", open: dev_input_event::open }, // keyboard
+    DeviceEntry { path: "/dev/input/event1", open: dev_mouse_event::open }, // mouse
+    DeviceEntry { path: "/dev/dsp", open: dev_dsp::open }, // AC97 PCM output, see ac97.rs
 ];
 
 /// Open a device by path.  Returns `None` if no driver matches.

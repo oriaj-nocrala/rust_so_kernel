@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+mod ac97;
 mod allocator;
 mod block;
 mod cpu;
@@ -17,7 +18,9 @@ mod ipc;
 mod keyboard;
 mod keyboard_buffer;
 mod memory;
+mod mouse;
 mod panic;
+mod pci;
 mod process;
 mod pit;
 mod serial;
