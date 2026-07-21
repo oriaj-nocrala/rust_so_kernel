@@ -77,10 +77,30 @@ fn ensure_ext2_disk_image() -> PathBuf {
         assert!(status.success(), "scripts/fetch-freedoom.sh failed");
     }
 
-    println!("cargo:warning=disk.img missing — creating a 48MiB ext2 image seeded from disk-image-root/...");
+    // Same idea for Quake's shareware pak0.pak (~18MB) — see
+    // scripts/fetch-quake-shareware.sh. Seeded to disk-image-root/id1/
+    // (not the root) since that's the real on-disk layout Quake's own
+    // COM_InitFilesystem expects (basedir/id1/pak0.pak).
+    println!("cargo:rerun-if-changed={}", manifest_dir.join("scripts/fetch-quake-shareware.sh").display());
+    if !seed_dir.join("id1/pak0.pak").exists() {
+        println!("cargo:warning=id1/pak0.pak missing — downloading Quake shareware...");
+        let status = Command::new("bash")
+            .arg(manifest_dir.join("scripts/fetch-quake-shareware.sh"))
+            .current_dir(&manifest_dir)
+            .status()
+            .expect("Failed to spawn scripts/fetch-quake-shareware.sh");
+        assert!(status.success(), "scripts/fetch-quake-shareware.sh failed");
+    }
+
+    // 96MiB: freedoom1.wad (~29MB) + id1/pak0.pak (~18MB) alone are
+    // ~47MB — the previous 48MiB image (sized back when freedoom1.wad was
+    // the only large asset) would leave almost no headroom for ext2
+    // metadata overhead or anything ext2_robust_test/regular use creates
+    // afterward.
+    println!("cargo:warning=disk.img missing — creating a 96MiB ext2 image seeded from disk-image-root/...");
 
     let status = Command::new("dd")
-        .args(["if=/dev/zero", "bs=1M", "count=48"])
+        .args(["if=/dev/zero", "bs=1M", "count=96"])
         .arg(format!("of={}", disk_path.display()))
         .status()
         .expect("Failed to spawn dd for disk.img");

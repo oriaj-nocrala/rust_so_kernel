@@ -41,7 +41,21 @@ const DEFAULT_STACK_BASE: u64 = 0x0000_7100_0000_0000;
 /// Gap between process stacks (64 KiB guard + 64 KiB stack = 128 KiB per process).
 const STACK_PROCESS_GAP: u64 = 0x10000;
 
-/// Number of stack pages per process (demand-paged).
+/// Default number of stack pages per process (demand-paged, so this only
+/// costs real physical memory for pages actually touched). 64 KiB has been
+/// enough for everything except Quake (see `load_elf`'s `stack_pages`
+/// parameter and `user_programs::stack_pages_for` — that request goes
+/// through a per-program override instead of raising this default for
+/// every process): bumping this constant directly to 256 (1 MiB, what
+/// Quake's `Host_Init` call chain actually needs) reproducibly hung boot
+/// partway through `busybox --install`'s own `fork()` — never fully
+/// root-caused (some timing-sensitive interaction with the COW fork loop
+/// in `AddressSpace::fork()`, which walks every page of every VMA
+/// including the stack; adding an unrelated `serial_println!` near it
+/// reliably made the hang disappear, which smells like a genuine race,
+/// not a fluke, and not something to ship for every process on a hunch).
+/// Confining the bigger stack to the one program that actually needs it
+/// keeps every already-stable process exactly as it was.
 const STACK_PAGES: usize = 16; // 64 KiB
 
 // ============================================================================
@@ -62,7 +76,10 @@ pub struct LoadedElf {
 // Loader
 // ============================================================================
 
-/// Load an ELF64 binary into a new user address space.
+/// Load an ELF64 binary into a new user address space, with the default
+/// stack size (`STACK_PAGES`, 64 KiB) — every caller except `sys_exec`
+/// (which uses `load_elf_with_stack_pages` to let a specific program ask
+/// for more, see `user_programs::stack_pages_for`) wants this.
 ///
 /// `elf_bytes` is the raw ELF file content (e.g. from `include_bytes!`).
 /// `process_index` is used to offset the stack base so processes don't
@@ -76,6 +93,22 @@ pub unsafe fn load_elf(
     process_index: usize,
     argv: &[Vec<u8>],
     envp: &[Vec<u8>],
+) -> Result<LoadedElf, &'static str> {
+    unsafe { load_elf_with_stack_pages(elf_bytes, process_index, argv, envp, STACK_PAGES) }
+}
+
+/// Same as `load_elf`, but with an explicit stack page count instead of
+/// the default `STACK_PAGES` — see that constant's doc comment for why
+/// this exists as a per-call override rather than a raised default.
+///
+/// # Safety
+/// Same as `load_elf`.
+pub unsafe fn load_elf_with_stack_pages(
+    elf_bytes: &[u8],
+    process_index: usize,
+    argv: &[Vec<u8>],
+    envp: &[Vec<u8>],
+    stack_pages: usize,
 ) -> Result<LoadedElf, &'static str> {
     // ── 1. Parse ELF ──────────────────────────────────────────────────
 
@@ -113,7 +146,7 @@ pub unsafe fn load_elf(
 
     address_space.add_vma(Vma {
         start: stack_base,
-        size_pages: STACK_PAGES,
+        size_pages: stack_pages,
         flags: stack_flags.bits(),
         kind: VmaKind::Anonymous,
     }).map_err(|_| "ELF loader: failed to register stack VMA")?;
@@ -121,8 +154,8 @@ pub unsafe fn load_elf(
     crate::serial_println!(
         "ELF: stack VMA {:#x}..{:#x} ({} pages, demand-paged)",
         stack_base,
-        stack_base + (STACK_PAGES as u64 * 4096),
-        STACK_PAGES,
+        stack_base + (stack_pages as u64 * 4096),
+        stack_pages,
     );
 
     // ── 5. Pre-map top stack page and write initial ABI stack frame ───
@@ -153,7 +186,7 @@ pub unsafe fn load_elf(
     }
 
     // Pre-allocate and map the top stack page so we can write to it now.
-    let top_page_vaddr = stack_base + ((STACK_PAGES as u64 - 1) * 4096);
+    let top_page_vaddr = stack_base + ((stack_pages as u64 - 1) * 4096);
     let top_page = Page::<Size4KiB>::containing_address(VirtAddr::new(top_page_vaddr));
     let stack_page_frame = address_space
         .map_user_page(top_page, stack_flags)

@@ -7,3 +7,6 @@
 [submodule "doomgeneric"]
 	path = doomgeneric
 	url = https://github.com/ozkl/doomgeneric.git
+[submodule "quakegeneric"]
+	path = quakegeneric
+	url = https://github.com/erysdren/quakegeneric

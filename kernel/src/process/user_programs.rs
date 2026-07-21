@@ -56,7 +56,7 @@ pub enum ProgramSource {
 /// To add an ELF program:
 ///   1. Build it (see workflow above)
 ///   2. Add: ("name", ProgramSource::Elf(include_bytes!("../../embedded/name.elf")))
-static PROGRAMS: [(&str, ProgramSource); 23] = [
+static PROGRAMS: [(&str, ProgramSource); 24] = [
     ("uname",     ProgramSource::Elf(include_bytes!("../../embedded/uname.elf"))),
     ("shell",     ProgramSource::Elf(include_bytes!("../../embedded/shell.elf"))),
     ("snake",     ProgramSource::Elf(include_bytes!("../../embedded/snake.elf"))),
@@ -90,7 +90,34 @@ static PROGRAMS: [(&str, ProgramSource); 23] = [
     // multi-file build, not the single-file C_PROGRAMS loop" shape as
     // BusyBox above.
     ("doom",      ProgramSource::Elf(include_bytes!("../../embedded/doom.elf"))),
+    // quakegeneric (git submodule) + quake-port/quakegeneric_constanos.c
+    // (our platform port), built by scripts/build-quake.sh — same shape
+    // as doom.elf above.
+    ("quake",     ProgramSource::Elf(include_bytes!("../../embedded/quake.elf"))),
 ];
+
+/// Stack size (in 4 KiB pages) `sys_exec` should request for a program
+/// resolved to `exe_name` (its canonical VFS path, e.g. `/bin/quake`) —
+/// see `memory::elf_loader::load_elf_with_stack_pages`. Everything gets
+/// the loader's own default (64 KiB) except entries listed here.
+///
+/// This exists as a narrow, per-program override rather than a raised
+/// global default: `elf_loader::STACK_PAGES`'s doc comment has the full
+/// story, but in short, bumping the default itself (every process, not
+/// just the one that needs it) reproducibly hung boot partway through
+/// `busybox --install`'s own `fork()` — a real, if not fully root-caused,
+/// regression. Confining the bigger stack to just the program that
+/// actually needs it (Quake's software renderer — `Host_Init`'s call
+/// chain overflows the 64 KiB default) avoids destabilizing every other
+/// already-stable process.
+pub fn stack_pages_for(exe_name: &str) -> usize {
+    const LARGE_STACK_PAGES: usize = 256; // 1 MiB
+    if exe_name.rsplit('/').next() == Some("quake") {
+        LARGE_STACK_PAGES
+    } else {
+        16 // matches elf_loader::STACK_PAGES's default
+    }
+}
 
 /// Print available programs to serial.
 pub fn print_available() {

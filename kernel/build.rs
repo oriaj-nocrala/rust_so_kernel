@@ -46,6 +46,11 @@ const C_PROGRAMS: &[(&str, &str)] = &[
 /// nothing like the Rust/C recipes above) only when the output is missing.
 const BUSYBOX_ELF: &str = "busybox.elf";
 
+/// Same "external build, only if missing/stale" shape as DOOM_ELF below,
+/// but for quakegeneric (git submodule + our own quake-port/ platform
+/// file) via scripts/build-quake.sh.
+const QUAKE_ELF: &str = "quake.elf";
+
 /// Same "external build, only if missing" shape as BUSYBOX_ELF, but for
 /// doomgeneric (git submodule + our own doom-port/ platform file) via
 /// scripts/build-doom.sh — a whole-engine multi-file C build that doesn't
@@ -103,6 +108,8 @@ fn main() {
         workspace_root.join("busybox-config/minimal.config"),
         workspace_root.join("scripts/build-doom.sh"),
         workspace_root.join("scripts/fetch-freedoom.sh"),
+        workspace_root.join("scripts/build-quake.sh"),
+        workspace_root.join("scripts/fetch-quake-shareware.sh"),
     ] {
         println!("cargo:rerun-if-changed={}", entry.display());
     }
@@ -114,6 +121,7 @@ fn main() {
     watch_dir_recursive(&c_dir);
     watch_dir_recursive(&workspace_root.join("mlibc-port"));
     watch_dir_recursive(&workspace_root.join("doom-port"));
+    watch_dir_recursive(&workspace_root.join("quake-port"));
 
     // ── Build the mlibc sysroot if missing ──────────────────────────────────
     //
@@ -253,5 +261,28 @@ fn main() {
             .status()
             .expect("Failed to spawn scripts/build-doom.sh");
         assert!(status.success(), "scripts/build-doom.sh failed");
+    }
+
+    // ── Build quakegeneric if missing or stale ──────────────────────────────
+    //
+    // Same rationale as doom.elf above: quakegeneric/ is a pinned
+    // submodule, so quake-port/quakegeneric_constanos.c is the only input
+    // that changes in practice — compare its mtime against the output.
+    let quake_elf = embedded_dir.join(QUAKE_ELF);
+    let quake_port_src = workspace_root.join("quake-port/quakegeneric_constanos.c");
+    let quake_stale = !quake_elf.exists()
+        || match (quake_elf.metadata().and_then(|m| m.modified()),
+                  quake_port_src.metadata().and_then(|m| m.modified())) {
+            (Ok(elf), Ok(src)) => src > elf,
+            _ => true,
+        };
+    if quake_stale {
+        println!("cargo:warning=quake.elf missing/stale — building quakegeneric...");
+        let status = Command::new("bash")
+            .arg(workspace_root.join("scripts/build-quake.sh"))
+            .current_dir(workspace_root)
+            .status()
+            .expect("Failed to spawn scripts/build-quake.sh");
+        assert!(status.success(), "scripts/build-quake.sh failed");
     }
 }
