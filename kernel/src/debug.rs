@@ -126,6 +126,78 @@ impl LockDiag {
 /// local_scheduler()`, which is the only thing that acquires it.
 pub static SCHEDULER_LOCK: LockDiag = LockDiag::new();
 
+/// Always-on check for `memory::cow.rs`'s stated invariant ("all accesses
+/// must be under `cli` — single CPU, no atomics needed"). Every public
+/// accessor (`inc_ref`/`dec_ref`/`set_ref`/`get_ref`) reports here on
+/// entry; if any of them is ever reached with IF=1 (interrupts enabled),
+/// the non-atomic `FRAME_REFCOUNTS[idx] = ...saturating_add/sub(1)` RMW
+/// can be interrupted mid-read-modify-write by the timer ISR re-entering
+/// the same table (e.g. via another process's page fault or a scheduler
+/// tick that runs COW teardown), losing an update. Built to get direct
+/// evidence for/against that mechanism instead of reasoning about every
+/// call site by hand — see the `busybox_install_fork_flake` investigation.
+/// `outstanding`-style leak tracking doesn't apply here (this isn't a
+/// lock), so it's a simpler plain counter + last-call-site, read via
+/// `/proc/kdebug`'s `cow_if_violations` line.
+pub struct IfViolationDiag {
+    count:         AtomicU64,
+    last_file_ptr: AtomicUsize,
+    last_file_len: AtomicU32,
+    last_line:     AtomicU32,
+}
+
+impl IfViolationDiag {
+    pub const fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            last_file_ptr: AtomicUsize::new(0),
+            last_file_len: AtomicU32::new(0),
+            last_line: AtomicU32::new(0),
+        }
+    }
+
+    /// Call from a `#[track_caller]` wrapper right after observing
+    /// `interrupts::are_enabled() == true` in a context that must not
+    /// allow that.
+    pub fn record(&self, loc: &core::panic::Location) {
+        self.last_file_ptr.store(loc.file().as_ptr() as usize, Ordering::Relaxed);
+        self.last_file_len.store(loc.file().len() as u32, Ordering::Relaxed);
+        self.last_line.store(loc.line(), Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn render(&self, name: &str) -> alloc::string::String {
+        use alloc::format;
+        let count = self.count.load(Ordering::Relaxed);
+        let ptr = self.last_file_ptr.load(Ordering::Relaxed);
+        let len = self.last_file_len.load(Ordering::Relaxed) as usize;
+        let line = self.last_line.load(Ordering::Relaxed);
+        // Safe: same reasoning as `LockDiag::render` — `loc.file()` always
+        // points into 'static rodata.
+        let file: &str = if ptr != 0 && len > 0 && len < 512 {
+            unsafe {
+                let bytes = core::slice::from_raw_parts(ptr as *const u8, len);
+                core::str::from_utf8(bytes).unwrap_or("<non-utf8>")
+            }
+        } else {
+            "<none yet>"
+        };
+        format!("{name}: count={} last_caller={}:{}\n", count, file, line)
+    }
+}
+
+/// See `IfViolationDiag`'s doc comment — tracks `memory::cow.rs` accessor
+/// calls reached with interrupts enabled, split one counter per accessor
+/// (`set_ref` is a plain write into an exclusively-owned index, not
+/// itself racy; `inc_ref`/`dec_ref` are the real non-atomic
+/// read-modify-write lost-update hazard; `get_ref` is a plain read,
+/// tracked for completeness) so a violation in one doesn't hide a
+/// same-boot violation in another behind a single shared "last caller".
+pub static COW_IF_VIOLATIONS_SET_REF: IfViolationDiag = IfViolationDiag::new();
+pub static COW_IF_VIOLATIONS_INC_REF: IfViolationDiag = IfViolationDiag::new();
+pub static COW_IF_VIOLATIONS_DEC_REF: IfViolationDiag = IfViolationDiag::new();
+pub static COW_IF_VIOLATIONS_GET_REF: IfViolationDiag = IfViolationDiag::new();
+
 // ── Subsystems ───────────────────────────────────────────────────────────────
 
 /// A named, independently-toggleable tracing subsystem.
@@ -245,7 +317,7 @@ pub fn render_report() -> alloc::string::String {
          orphan_blocks_reclaimed: {}\n\
          orphan_inodes_reclaimed: {}\n\
          switches_total: {}\n\
-         {}",
+         {}{}",
         mask, enabled,
         FORKS_TOTAL.load(Ordering::Relaxed),
         EXECS_TOTAL.load(Ordering::Relaxed),
@@ -256,7 +328,40 @@ pub fn render_report() -> alloc::string::String {
         ORPHAN_INODES_RECLAIMED.load(Ordering::Relaxed),
         SWITCHES_TOTAL.load(Ordering::Relaxed),
         SCHEDULER_LOCK.render("scheduler"),
+        alloc::format!(
+            "{}{}{}{}",
+            COW_IF_VIOLATIONS_SET_REF.render("cow_if_violations_set_ref"),
+            COW_IF_VIOLATIONS_INC_REF.render("cow_if_violations_inc_ref"),
+            COW_IF_VIOLATIONS_DEC_REF.render("cow_if_violations_dec_ref"),
+            COW_IF_VIOLATIONS_GET_REF.render("cow_if_violations_get_ref"),
+        ),
     )
+}
+
+/// Allocation-free counter dump for the panic handler (`panic.rs`) —
+/// see its call site for why this can't just call `render_report()`
+/// (that one builds a `String` via `format!`, unsafe to do from a panic
+/// whose root cause might be heap corruption). Every line here goes
+/// straight through `serial_println_raw!`, which formats lazily with no
+/// allocation.
+pub fn print_panic_snapshot() {
+    crate::serial_println_raw!("--- /proc/kdebug snapshot at panic ---");
+    crate::serial_println_raw!("  forks_total: {}", FORKS_TOTAL.load(Ordering::Relaxed));
+    crate::serial_println_raw!("  execs_total: {}", EXECS_TOTAL.load(Ordering::Relaxed));
+    crate::serial_println_raw!("  reaps_total: {}", REAPS_TOTAL.load(Ordering::Relaxed));
+    crate::serial_println_raw!("  cow_faults_resolved: {}", COW_FAULTS_RESOLVED.load(Ordering::Relaxed));
+    crate::serial_println_raw!("  cow_faults_failed: {}", COW_FAULTS_FAILED.load(Ordering::Relaxed));
+    crate::serial_println_raw!("  switches_total: {}", SWITCHES_TOTAL.load(Ordering::Relaxed));
+    let acq = SCHEDULER_LOCK.acquires.load(Ordering::Relaxed);
+    let rel = SCHEDULER_LOCK.releases.load(Ordering::Relaxed);
+    crate::serial_println_raw!("  scheduler_lock: acquires={} releases={} outstanding={}", acq, rel, acq.saturating_sub(rel));
+    crate::serial_println_raw!(
+        "  cow_if_violations: set_ref count={} last_line={} | inc_ref count={} last_line={} | dec_ref count={} last_line={} | get_ref count={} last_line={}",
+        COW_IF_VIOLATIONS_SET_REF.count.load(Ordering::Relaxed), COW_IF_VIOLATIONS_SET_REF.last_line.load(Ordering::Relaxed),
+        COW_IF_VIOLATIONS_INC_REF.count.load(Ordering::Relaxed), COW_IF_VIOLATIONS_INC_REF.last_line.load(Ordering::Relaxed),
+        COW_IF_VIOLATIONS_DEC_REF.count.load(Ordering::Relaxed), COW_IF_VIOLATIONS_DEC_REF.last_line.load(Ordering::Relaxed),
+        COW_IF_VIOLATIONS_GET_REF.count.load(Ordering::Relaxed), COW_IF_VIOLATIONS_GET_REF.last_line.load(Ordering::Relaxed),
+    );
 }
 
 /// Resolve a subsystem name (e.g. "mm") to its bit, for the `kdebug_ctl`

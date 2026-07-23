@@ -22,6 +22,20 @@ fn panic(info: &PanicInfo) -> ! {
     }
     crate::serial_println_raw!("  {}", info.message());
 
+    // Dump the always-on debug counters (forks/execs/COW faults, lock
+    // diagnostics, the cow.rs IF-invariant violation counter — see
+    // `kernel::debug`) as part of every panic report. Uses
+    // `debug::print_panic_snapshot`, NOT `debug::render_report` — the
+    // latter builds an `alloc::string::String` via `format!`, and if
+    // whatever corrupted state caused this panic also poisoned the heap,
+    // that allocation could itself panic/fault recursively. The snapshot
+    // printer does plain atomic loads straight into `serial_println_raw!`
+    // (which formats lazily, no allocation) — safe even then, which is
+    // exactly the situation a post-mortem needs it most: a hang/double-
+    // fault reachable from this same panic path may never get to run
+    // `cat /proc/kdebug` interactively again.
+    crate::debug::print_panic_snapshot();
+
     // Best-effort: the framebuffer lock may already be held by whatever
     // code paniced (e.g. a fault inside a framebuffer-holding critical
     // section) — try_lock so we never deadlock the panic handler itself.

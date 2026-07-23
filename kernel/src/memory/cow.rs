@@ -22,12 +22,37 @@ fn frame_idx(frame: PhysFrame) -> usize {
     (frame.start_address().as_u64() / 4096) as usize
 }
 
+/// Check the module's stated invariant ("all accesses must be under
+/// `cli`") on every accessor call, reporting any violation into the
+/// per-accessor counter passed in (see `debug::COW_IF_VIOLATIONS_*`)
+/// instead of just asserting/panicking — this is a bug hunt, not a case
+/// where crashing harder helps, and a live counter survives to be read
+/// from `/proc/kdebug`/the panic snapshot even on a run that goes on to
+/// hang/double-fault before a fix could ever print anything. Split by
+/// accessor (rather than one shared counter) because `set_ref` (a plain
+/// write — always into a just-allocated, exclusively-owned frame index,
+/// so not itself a lost-update hazard) and `inc_ref`/`dec_ref` (a real
+/// non-atomic read-modify-write, the actual lost-update hazard if a
+/// timer tick lands mid-sequence and something else touches the same
+/// frame index before it resumes) have very different risk profiles —
+/// a shared "last caller" would hide whichever violation happened
+/// second. One relaxed load + branch — same cost model as `ktrace!`.
+#[inline]
+#[track_caller]
+fn check_if_disabled(diag: &crate::debug::IfViolationDiag) {
+    if x86_64::instructions::interrupts::are_enabled() {
+        diag.record(core::panic::Location::caller());
+    }
+}
+
 /// Set the refcount of a data frame to an explicit value.
 /// Called after allocating a new data frame (set to 1).
 ///
 /// # Safety
 /// Must be called with interrupts disabled (single CPU).
+#[track_caller]
 pub unsafe fn set_ref(frame: PhysFrame, count: u8) {
+    check_if_disabled(&crate::debug::COW_IF_VIOLATIONS_SET_REF);
     let idx = frame_idx(frame);
     if idx < MAX_FRAMES {
         FRAME_REFCOUNTS[idx] = count;
@@ -38,7 +63,9 @@ pub unsafe fn set_ref(frame: PhysFrame, count: u8) {
 ///
 /// # Safety
 /// Must be called with interrupts disabled (single CPU).
+#[track_caller]
 pub unsafe fn inc_ref(frame: PhysFrame) {
+    check_if_disabled(&crate::debug::COW_IF_VIOLATIONS_INC_REF);
     let idx = frame_idx(frame);
     if idx < MAX_FRAMES {
         FRAME_REFCOUNTS[idx] = FRAME_REFCOUNTS[idx].saturating_add(1);
@@ -50,7 +77,9 @@ pub unsafe fn inc_ref(frame: PhysFrame) {
 ///
 /// # Safety
 /// Must be called with interrupts disabled (single CPU).
+#[track_caller]
 pub unsafe fn dec_ref(frame: PhysFrame) -> u8 {
+    check_if_disabled(&crate::debug::COW_IF_VIOLATIONS_DEC_REF);
     let idx = frame_idx(frame);
     if idx < MAX_FRAMES {
         FRAME_REFCOUNTS[idx] = FRAME_REFCOUNTS[idx].saturating_sub(1);
@@ -64,7 +93,9 @@ pub unsafe fn dec_ref(frame: PhysFrame) -> u8 {
 ///
 /// # Safety
 /// Must be called with interrupts disabled (single CPU).
+#[track_caller]
 pub unsafe fn get_ref(frame: PhysFrame) -> u8 {
+    check_if_disabled(&crate::debug::COW_IF_VIOLATIONS_GET_REF);
     let idx = frame_idx(frame);
     if idx < MAX_FRAMES {
         FRAME_REFCOUNTS[idx]
