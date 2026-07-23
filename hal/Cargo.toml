@@ -1,0 +1,18 @@
+[package]
+name = "hal"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately detached from the parent workspace (empty `[workspace]` table
+# below) even though it lives inside the same directory tree. The parent
+# root Cargo.toml sets `panic = "abort"` for both dev/release profiles
+# (required for the bare-metal kernel binary); inheriting that here would
+# break `cargo test`'s harness, which needs unwinding. This crate is NOT
+# listed in the root `Cargo.toml`'s `members` for the same reason — it is
+# only ever pulled in via a `path` dependency from `kernel/Cargo.toml`.
+[workspace]
+
+[dependencies]
+spin = "0.10.0"
+
+[dev-dependencies]

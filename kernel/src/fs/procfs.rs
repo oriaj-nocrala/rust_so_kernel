@@ -66,6 +66,39 @@ fn render_meminfo() -> String {
     )
 }
 
+/// Renders `/proc/acpi` — a human-readable dump of `crate::acpi::topology()`
+/// (Local APIC address, enabled CPUs, I/O APICs, interrupt source
+/// overrides), regenerated fresh on every `open()`, same convention as
+/// `/proc/meminfo` and `/proc/kdebug`. If ACPI parsing never succeeded at
+/// boot (no RSDP, bad checksum, no MADT — see `acpi::init`), reports that
+/// plainly instead of an empty file.
+fn render_acpi() -> String {
+    let Some(topo) = crate::acpi::topology() else {
+        return String::from("ACPI: not available\n");
+    };
+    let mut out = format!("Local APIC: {:#010x}\n", topo.local_apic_addr);
+    out.push_str(&format!("CPUs: {}\n", topo.cpus.len()));
+    for cpu in &topo.cpus {
+        out.push_str(&format!(
+            "  processor_id={} apic_id={}\n",
+            cpu.processor_id, cpu.apic_id
+        ));
+    }
+    for io in &topo.io_apics {
+        out.push_str(&format!(
+            "I/O APIC {} @ {:#010x} gsi_base={}\n",
+            io.id, io.address, io.gsi_base
+        ));
+    }
+    for iso in &topo.overrides {
+        out.push_str(&format!(
+            "override: bus {} IRQ {} -> GSI {} (flags {:#x})\n",
+            iso.bus, iso.source, iso.gsi, iso.flags
+        ));
+    }
+    out
+}
+
 /// Renders `/proc/<pid>/stat` in the classic Linux `"pid (comm) state
 /// ppid pgid sid tty tpgid flags minflt cminflt majflt cmajflt utime stime
 /// cutime cstime priority nice ..."` shape — this is what BusyBox
@@ -113,6 +146,7 @@ impl Inode for ProcDirInode {
         match name {
             "meminfo" => Ok(Arc::new(MeminfoInode)),
             "kdebug" => Ok(Arc::new(KdebugInode)),
+            "acpi" => Ok(Arc::new(AcpiInode)),
             "self" => Ok(Arc::new(SelfInode)),
             _ => {
                 let pid: usize = name.parse().map_err(|_| Errno::ENOENT)?;
@@ -132,13 +166,14 @@ impl Inode for ProcDirInode {
             2 => Ok(Some(DirEntry::new(201, FileType::Regular, b"meminfo"))),
             3 => Ok(Some(DirEntry::new(202, FileType::Symlink, b"self"))),
             4 => Ok(Some(DirEntry::new(203, FileType::Regular, b"kdebug"))),
+            5 => Ok(Some(DirEntry::new(204, FileType::Regular, b"acpi"))),
             n => {
                 // Live pids, appended after the always-present entries above
                 // — this is what makes `ls /proc` / BusyBox `ps`'s
                 // `opendir("/proc")` scan see every process (previously
                 // direct lookup like `cat /proc/3/exe` worked but nothing
                 // enumerated them, see this module's top doc comment).
-                let idx = (n - 5) as usize;
+                let idx = (n - 6) as usize;
                 let pids = crate::process::scheduler::all_pids();
                 let Some(&pid) = pids.get(idx) else { return Ok(None); };
                 let name = format!("{}", pid);
@@ -187,6 +222,28 @@ impl Inode for KdebugInode {
             return Err(Errno::EROFS);
         }
         Ok(Box::new(ProcFile { data: crate::debug::render_report().into_bytes(), offset: 0 }))
+    }
+}
+
+// ── acpi file inode ──────────────────────────────────────────────────────────
+//
+// Read-only report of `crate::acpi::topology()` — Local APIC address,
+// enabled CPUs, I/O APICs, interrupt source overrides — regenerated fresh
+// on every open(), same convention as `/proc/meminfo`/`/proc/kdebug`.
+struct AcpiInode;
+
+impl Inode for AcpiInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
+    fn stat(&self) -> Stat {
+        Stat::regular(204, render_acpi().len() as i64)
+    }
+
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+        if flags.is_write() {
+            return Err(Errno::EROFS);
+        }
+        Ok(Box::new(ProcFile { data: render_acpi().into_bytes(), offset: 0 }))
     }
 }
 

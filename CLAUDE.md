@@ -17,7 +17,7 @@ cargo build
 cd kernel && cargo build --target x86_64-unknown-none
 ```
 
-The top-level `cargo run` builds the kernel ELF (via artifact dependency), wraps it in a UEFI disk image via the `bootloader` crate, then spawns `qemu-system-x86_64`. Serial output appears in the terminal.
+The top-level `cargo run` builds the kernel ELF, wraps it in a UEFI disk image via the `bootloader` crate, then spawns `qemu-system-x86_64`. Serial output appears in the terminal. The kernel ELF is built by `build.rs` shelling out to a **nested** `cargo build` (not cargo's artifact-dependency/`bindeps` feature) — see `build_kernel()` in the root `build.rs` for why (`bindeps` + `-Z build-std` panics inside cargo itself on every nightly tested).
 
 ### Headless interactive debugging (no display/keyboard)
 
@@ -31,7 +31,34 @@ scripts/qemu-debug.sh log 50                                   # tail serial.log
 scripts/qemu-debug.sh stop
 ```
 
-There is no test framework wired up; `cargo test` is not used.
+### QEMU integration tests
+
+Real hardware-path behavior (drivers that need actual QEMU devices, not just host-testable
+pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 64 tests, <1s, no QEMU) is
+asserted by a `#![feature(custom_test_frameworks)]` harness that boots the real kernel in
+QEMU and reports PASS/FAIL as a process exit code:
+
+```bash
+scripts/run-kernel-tests.sh
+```
+
+This builds `kernel`'s test binary (`cargo build --target x86_64-unknown-none --tests`, run
+from `kernel/`), boots it headless in QEMU with `-device isa-debug-exit`, and exits 0 (every
+`#[test_case]` passed) or nonzero (a test failed, or the kernel hung/crashed before reporting)
+— see the guest side (`kernel/src/test_framework.rs`, `kernel/src/hw_tests.rs`,
+`kernel/src/init/test_support.rs`) and host side (`qemu-test-runner/`, a standalone crate).
+
+**Plain `cargo test --target x86_64-unknown-none` does not work here** — verified, not
+assumed: it builds the `kernel` bin target twice in one invocation (once normally, once under
+`--cfg test`), and with this crate's `-Z build-std`, that produces two independently-built
+`core` crates that collide (`error[E0152]: duplicate lang item in crate 'core': 'sized'`) the
+moment a shared dependency needs both. `cargo build --tests` doesn't hit this, so
+`scripts/run-kernel-tests.sh` drives that instead of `cargo test` itself — see that script's
+header comment and `kernel/.cargo/config.toml`'s `[target.x86_64-unknown-none] runner`
+comment for the full diagnosis. `[acpi] SELFTEST` (`kernel/src/acpi.rs`, the boot-time ACPI
+self-check against known QEMU i440fx values) is the first real test case
+(`kernel/src/hw_tests.rs::acpi_selftest_passes`). See `docs/drivers/architecture.md`'s
+Testing section and `docs/drivers/roadmap.md`'s Phase 2 for more.
 
 ## Two-Crate Workspace
 

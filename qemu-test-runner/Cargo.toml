@@ -1,0 +1,31 @@
+[package]
+name = "qemu-test-runner"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately its own workspace root (empty `[workspace]` table below,
+# same precedent as `hal/Cargo.toml` — see that file's comment) and
+# EXCLUDED from the root `Cargo.toml`'s workspace (`exclude = [...]`).
+# This is a plain host-side (std) binary; it needs no `panic = "abort"`
+# profile and no relationship to the bare-metal `kernel`/`hal` build at
+# all. Keeping it standalone also means building it never triggers the
+# root `so2` package's `build.rs` — which does its own slow, nested
+# `cargo build` of the entire kernel + userspace tree (see that file's
+# `build_kernel()`). Running this crate on every `cargo test` inside
+# `kernel/` must NOT pay that cost.
+[workspace]
+
+[dependencies]
+# Pinned EXACTLY (not "0.11") to match the root `Cargo.lock`'s resolved
+# version. `bootloader`'s build script builds its own UEFI stub binary via
+# a nested `cargo install bootloader-x86_64-uefi ... -Zbuild-std=core`
+# (see its build.rs) — 0.11.16 pulls in `x86_64 v0.15.5`, whose manual
+# `Step` trait impl doesn't match this repo's pinned nightly's unstable
+# `Step` trait shape anymore (`error[E0407]: method
+# 'forward_overflowing' is not a member of trait 'Step'`), so a COLD
+# build of 0.11.16's UEFI stub fails outright on `nightly-2026-03-08`.
+# 0.11.15 (what the root package already has locked and builds
+# successfully) resolves an older `x86_64` that doesn't hit this. Bump
+# this in lockstep with the root `Cargo.toml`'s `bootloader` version if
+# that's ever deliberately upgraded.
+bootloader = { version = "=0.11.15", default-features = false, features = ["uefi"] }

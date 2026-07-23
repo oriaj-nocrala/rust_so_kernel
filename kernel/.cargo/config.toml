@@ -1,3 +1,29 @@
 [unstable]
 build-std = ["core", "compiler_builtins", "alloc"]
 build-std-features = ["compiler-builtins-mem"]
+
+[target.x86_64-unknown-none]
+# The "natural" hook for `cargo test`'s runner mechanism — but VERIFIED
+# NOT TO WORK here, not assumed: `cargo test --target x86_64-unknown-none`
+# (run from this directory) makes cargo build the "kernel" bin TWICE in
+# one invocation — once normally, once under `--cfg test` — and with
+# `-Z build-std` active, those two units each get their own from-source
+# build of `core`, landing two DIFFERENT `libcore-*.rmeta` files in the
+# same target dir. Any third dependency (spin, bitflags, bootloader_api,
+# ...) then fails to link with `error[E0152]: duplicate lang item in
+# crate 'core': 'sized'` the moment both are needed in the same unit
+# graph. This reproduces on `nightly-2026-03-08` and is the same class of
+# `-Z build-std` limitation as the `bindeps` panic documented in the root
+# `build.rs` — not something fixable from this repo's config.
+#
+# `cargo build --target x86_64-unknown-none --tests` (build only, no
+# implicit "also build it normally" step) does NOT hit this and produces
+# a real, working test ELF — so that's what actually drives integration
+# tests: `scripts/run-kernel-tests.sh` runs that build, resolves the
+# produced artifact via `--message-format=json` (the filename is
+# content-hashed, not stable), and feeds it straight to
+# `../qemu-test-runner`, bypassing `cargo test`'s runner mechanism
+# entirely. This `runner` key is left wired up anyway — correct, and free
+# to leave in place — in case a future cargo/rustc fixes the underlying
+# bug and `cargo test` starts working again unmodified.
+runner = "../scripts/run-kernel-tests.sh"

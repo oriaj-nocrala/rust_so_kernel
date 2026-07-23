@@ -13,6 +13,19 @@ ovmf-prebuilt = "0.2.3"
 
 [workspace]
 members = ["kernel"]
+# `hal` and `qemu-test-runner` live in this directory tree but are each
+# deliberately their OWN workspace root (empty `[workspace]` table in
+# their own Cargo.toml) so their `cargo build`/`cargo test` don't inherit
+# this workspace's `panic = "abort"` profiles below (which would break a
+# unwinding test harness) and, for `qemu-test-runner` specifically, so
+# building it never triggers this package's `build.rs` (which does its
+# own slow nested `cargo build` of the whole kernel — see `build_kernel()`
+# there). Both must be excluded here or cargo errors with "multiple
+# workspace roots found in the same workspace" — `kernel` depends on `hal`
+# via a plain `path` dependency; `qemu-test-runner` is invoked as an
+# external binary (see `scripts/run-kernel-tests.sh`), not depended on by
+# anything in this workspace.
+exclude = ["hal", "qemu-test-runner"]
 
 [profile.dev]
 panic = "abort"
@@ -20,6 +33,11 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 
-[package.metadata.bootimage]
-test-args = ["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-serial", "stdio"]
-test-success-exit-code = 33
+# NOTE: there used to be a `[package.metadata.bootimage]` block here. It
+# was dead config — `bootimage` is the `bootloader` 0.9-era launcher tool,
+# is not installed in this repo's toolchain, and nothing here ever read
+# these keys. This repo uses `bootloader` 0.11 with a hand-written
+# `build.rs` + `src/main.rs` QEMU launcher instead. The real QEMU
+# integration test framework lives in `kernel/src/test_framework.rs` +
+# `qemu-test-runner/` + `scripts/run-kernel-tests.sh` — see
+# `docs/drivers/architecture.md` and `CLAUDE.md`'s build section.

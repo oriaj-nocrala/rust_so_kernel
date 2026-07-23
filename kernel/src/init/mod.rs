@@ -6,6 +6,8 @@
 pub mod devices;
 pub mod memory;
 pub mod processes;
+#[cfg(test)]
+pub mod test_support;
 
 use bootloader_api::BootInfo;
 use x86_64::VirtAddr;
@@ -50,6 +52,19 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
 
     memory::test_allocators();
 
+    // ── ACPI tables ────────────────────────────────────────────────
+    // Best-effort, parse-only (bounded, never hangs boot) — see
+    // `acpi::AcpiDriver`. Does NOT touch the existing 8259 PIC/IDT
+    // interrupt setup; only extracts interrupt topology (Local APIC, I/O
+    // APICs, CPUs, interrupt source overrides) for later use /
+    // introspection (/proc/acpi). Needs physical_memory_offset, already up
+    // from memory::init_core above. Run through the new best-effort driver
+    // registry (`hal::run_all`) as the pilot for that pattern — see the HAL
+    // refactor; other drivers (mouse, ac97, ...) still init directly below
+    // and migrate onto this incrementally.
+    let mut acpi_driver = crate::acpi::AcpiDriver::new(boot_info.rsdp_addr.into_option());
+    crate::hal::run_all(&mut [&mut acpi_driver]);
+
     // ── Boot screen ────────────────────────────────────────────────
     devices::draw_boot_screen();
 
@@ -57,14 +72,21 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     devices::init_hardware_interrupts();
 
     // ── PS/2 mouse ──────────────────────────────────────────────────
-    // Best-effort (bounded polls, never hangs boot) — see mouse::init.
-    crate::mouse::init();
+    // Best-effort (bounded polls, never hangs boot) — see
+    // mouse::MouseDriver. Migrated onto the `hal` seam pattern
+    // (`hal::mouse`, PortIo-generic 8042 enable sequence + pure packet
+    // decoder), same registry ACPI/ac97 were piloted through.
+    let mut mouse_driver = crate::mouse::MouseDriver::new();
+    crate::hal::run_all(&mut [&mut mouse_driver]);
 
     // ── AC97 audio ──────────────────────────────────────────────────
-    // Best-effort (bounded polls, never hangs boot) — see ac97::init.
+    // Best-effort (bounded polls, never hangs boot) — see ac97::Ac97Driver.
     // Needs phys_alloc/physical_memory_offset, both already up from
-    // memory::init_core above.
-    crate::ac97::init();
+    // memory::init_core above. Migrated onto the `hal` seam pattern
+    // (`hal::ac97`, PortIo-generic protocol + pure ring state machine),
+    // same registry ACPI was piloted through.
+    let mut ac97_driver = crate::ac97::Ac97Driver::new();
+    crate::hal::run_all(&mut [&mut ac97_driver]);
 
     // ── TSC calibration ────────────────────────────────────────────
     // PIT is now running; interrupts still masked — safe to busy-poll.
