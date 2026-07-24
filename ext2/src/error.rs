@@ -46,4 +46,16 @@ pub enum Ext2Error {
     /// (not a generic I/O error) since it's exactly the error a real
     /// `unlink(2)`/`rmdir(2)` reports for a name that doesn't exist.
     NotFound,
+    /// `Ext2Core::reclaim_orphans`'s reachability walk (`mark_reachable`,
+    /// migration step 5) hit its hard recursion-depth guard (64 levels) —
+    /// either a directory tree unexpectedly deeper than anything this
+    /// kernel would ever create, or a cyclic/corrupted directory structure
+    /// the cycle guard (an already-marked inode short-circuits) didn't
+    /// catch in time. Failing loudly here, instead of silently stopping the
+    /// walk partway, is load-bearing: see `reclaim_orphans`'s own doc
+    /// comment — a sweep run against an incompletely-marked reachability
+    /// picture could free a block/inode that's simply reached through a
+    /// deep-but-legitimate path. Maps to `Errno::ELOOP` in the kernel
+    /// adapter, the same value a real deep-symlink resolution guard uses.
+    TooDeep,
 }

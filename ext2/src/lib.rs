@@ -42,11 +42,18 @@
 //!    kernel's `fs::types::FileType`) and [`Ext2Core::read_symlink_target`]/
 //!    [`Ext2Core::write_symlink_target`].
 //!
-//! Steps 5-6 (`mount`'s own repair passes `reconcile_free_counts`/
-//! `reclaim_orphans`, and turning what's left of `kernel::fs::ext2` into a
-//! pure VFS adapter) deliberately have **not** moved yet and still live in
-//! `kernel::fs::ext2` — see the plan document for why each is its own
-//! step, verified green independently.
+//! 5. **Mount-time consistency repair** — [`Ext2Core::reconcile_free_counts`]/
+//!    [`Ext2Core::reclaim_orphans`] (module [`repair`], plus the private
+//!    recursive `mark_reachable` step and the test-inspection accessors
+//!    `inode_used`/`block_used`/`inode_mode`/`sb_free_counts`/
+//!    `bgd_free_counts`/`true_free_counts_group0`). Same walk order, same
+//!    on-disk bytes — see `repair`'s module doc comment for the ordering
+//!    invariant that must never change, and for how these two methods
+//!    report what they found/fixed through their return values instead of
+//!    tracing directly (this crate can't call the kernel's `ktrace!`).
+//!
+//! Step 6 (turning what's left of `kernel::fs::ext2` into a pure VFS
+//! adapter) deliberately has **not** moved yet — see the plan document.
 //!
 //! ## Error type and locking (design decisions carried over from the plan)
 //!
@@ -85,6 +92,7 @@ pub mod dir;
 pub mod dirent;
 pub mod error;
 pub mod inode;
+pub mod repair;
 pub mod superblock;
 #[cfg(test)]
 mod test_support;
@@ -94,5 +102,6 @@ pub use bgd::{bgd_location, BlockGroupDesc};
 pub use dir::DirEntry;
 pub use error::Ext2Error;
 pub use inode::RawInode;
+pub use repair::ReconcileReport;
 pub use superblock::{Superblock, EXT2_MAGIC, FEATURE_INCOMPAT_FILETYPE, ROOT_INO};
 pub use volume::Ext2Core;

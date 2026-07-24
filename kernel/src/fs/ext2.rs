@@ -141,15 +141,26 @@ use crate::process::file::{FileError, FileHandle, FileResult};
 // `add_dir_entry`/`remove_dir_entry`/`set_dotdot`/`read_symlink_target`)
 // delegating straight to `self.core`, so every call site elsewhere in this
 // file (`create`/`mkdir`/`unlink`/`rmdir`/`take_child`/`insert_child`/
-// `lookup`/`mark_reachable`, `Ext2FileHandle`) keeps working unchanged —
-// same pattern `read_block`/`write_block`/`block_vec` already established.
-// The directory-op wrappers additionally convert between the core's raw
+// `lookup`, `Ext2FileHandle`) keeps working unchanged — same pattern
+// `read_block`/`write_block`/`block_vec` already established. The
+// directory-op wrappers additionally convert between the core's raw
 // on-disk `file_type: u8` and this file's own `fs::types::FileType` at the
 // boundary (`ext2_file_type_to_vfs`/`vfs_file_type_to_ext2`, which stay
 // here — the core crate never depends on `fs::types`, see its own crate
-// doc comment). Mount + its repair passes (`reconcile_free_counts`/
-// `reclaim_orphans`) are unmigrated and stay here, per that plan's steps
-// 5-6.
+// doc comment).
+//
+// Mount's own repair passes (`reconcile_free_counts`/`reclaim_orphans`,
+// migration step 5) moved too — into `ext2::repair`, as real methods on
+// `Ext2Core`, including the recursive `mark_reachable` walk and the
+// `inode_used`/`block_used`/`inode_mode`/`sb_free_counts`/
+// `bgd_free_counts`/`true_free_counts_group0` test-inspection accessors
+// `TestFs` below wraps. What's left here for those two is only the part
+// that can't move: emitting a `ktrace!` line + the permanent
+// `/proc/kdebug` counter from what the core methods report finding/fixing
+// — see those two wrapper methods' own doc comments below for the exact
+// split, and `ext2::repair`'s module doc comment for why this crate can't
+// call `ktrace!` directly. Step 6 (turning what's left of this file into a
+// pure VFS adapter) is unmigrated, per that plan.
 //
 // `RawInode`/`BgdRaw` are re-exported/aliased here (not redefined) so every
 // existing call site in this file (`RawInode::parse(...)`, `bgd.
@@ -183,6 +194,12 @@ impl From<ext2::Ext2Error> for Errno {
             // real `unlink(2)`/`rmdir(2)` reports for a name that doesn't
             // exist.
             ext2::Ext2Error::NotFound => Errno::ENOENT,
+            // `Ext2Core::reclaim_orphans`'s `mark_reachable` (migration
+            // step 5) hit its hard recursion-depth guard — same `Errno`
+            // value a real deep-symlink-resolution guard uses, and the
+            // exact value `mount_and_repair`'s own doc comment already
+            // promises ("a directory tree too deep").
+            ext2::Ext2Error::TooDeep => Errno::ELOOP,
         }
     }
 }
@@ -274,8 +291,8 @@ impl Ext2Fs {
     /// Parse the superblock (delegated to `ext2::Ext2Core::mount` —
     /// migration step 1) and construct the adapter. Does NOT run the
     /// mount-time repair passes (`reconcile_free_counts`/
-    /// `reclaim_orphans`, migration step 5, unmigrated) — `mount_and_repair`
-    /// above calls those right after this returns, before publishing the
+    /// `reclaim_orphans`) — `mount_and_repair` above calls those right
+    /// after this returns, before publishing the
     /// result anywhere shared. Error strings match exactly what this
     /// function used to produce inline, one per `ext2::Ext2Error` variant.
     fn mount(device: Box<dyn BlockDevice>) -> Result<Self, &'static str> {
@@ -287,13 +304,15 @@ impl Ext2Fs {
             }
             // `Ext2Core::mount()` itself can never produce these — they're
             // only ever returned by `block_for_index_alloc` (migration
-            // step 3) or `remove_dir_entry` (migration step 4), reachable
-            // solely through a live, already-mounted filesystem. Matched
-            // here anyway because `Ext2Error` is a single enum shared
-            // across every method in the crate, so this `match` must stay
-            // exhaustive; `unreachable!()` documents that exhaustiveness
-            // rather than silently falling back to a misleading message.
-            ext2::Ext2Error::NoSpace | ext2::Ext2Error::TooLarge | ext2::Ext2Error::NotFound => {
+            // step 3), `remove_dir_entry` (migration step 4), or
+            // `reclaim_orphans`'s `mark_reachable` (migration step 5),
+            // reachable solely through a live, already-mounted filesystem.
+            // Matched here anyway because `Ext2Error` is a single enum
+            // shared across every method in the crate, so this `match`
+            // must stay exhaustive; `unreachable!()` documents that
+            // exhaustiveness rather than silently falling back to a
+            // misleading message.
+            ext2::Ext2Error::NoSpace | ext2::Ext2Error::TooLarge | ext2::Ext2Error::NotFound | ext2::Ext2Error::TooDeep => {
                 unreachable!("mount() cannot produce this error")
             }
         })?;
@@ -661,231 +680,55 @@ impl Ext2Fs {
     }
 
     // ── Mount-time consistency repair ───────────────────────────────────
+    //
+    // Both methods below are thin wrappers over `ext2::Ext2Core` (migration
+    // step 5 — see the "ext2 core crate" note near the top of this file):
+    // the bitmap walk, the write ordering, and — critically — the
+    // reachability-walk-before-reserved-inodes ordering in
+    // `reclaim_orphans` (see `CLAUDE.md`'s "Filesystem: ext2" section,
+    // "Critical ordering invariant in reclaim_orphans") all moved verbatim
+    // into `ext2::repair`. What stays here is exactly the part that
+    // can't move: this crate's `ktrace!`/`kernel::debug` tracing infra,
+    // which `ext2` doesn't (and can't, without depending on the kernel)
+    // call directly — see `ext2::repair`'s own module doc comment for the
+    // full split. Both core methods report what they found/fixed through
+    // their return values; these wrappers are the only place that turns
+    // that into a trace line + (for `reclaim_orphans`) the permanent
+    // `/proc/kdebug` counter.
 
     /// Recompute every group's true free block/inode counts directly from
     /// its bitmap and correct the stored BGD + superblock counters if they
     /// disagree. Called once from `init()`, before this filesystem is
-    /// exposed to the VFS.
+    /// exposed to the VFS. See `ext2::Ext2Core::reconcile_free_counts`'s
+    /// own doc comment for the full rationale (why drift happens, why it's
+    /// a real correctness bug and not just cosmetic).
     ///
-    /// Bitmap writes are always durable the instant they happen (this
-    /// driver has no write-back cache), but the *counters* that track free
-    /// space are separate, independently-flushed writes (see the module
-    /// doc comment) — an unclean shutdown between a bitmap write and its
-    /// matching counter update leaves the bitmap correct but the counter
-    /// stale. Left unrepaired, that drift is a real correctness bug, not
-    /// just cosmetic: `alloc_block`/`alloc_inode` use the counter as a
-    /// fast "is this group full" pre-check, so a counter that's stuck too
-    /// low makes them wrongly skip a group that actually has free bits,
-    /// eventually surfacing as spurious `ENOSPC`. This is the same repair
-    /// real `e2fsck` applies most often in practice; it does not attempt
-    /// the harder problem of reclaiming blocks/inodes that a crash left
-    /// allocated-but-unlinked (an orphan scan needs a full reachability
-    /// walk from the root, which this driver doesn't implement) — that
-    /// space just stays leaked until a real `e2fsck` run outside this
-    /// kernel.
+    /// The per-group trace detail the pre-extraction version of this
+    /// method used to emit (group number, before/after block/inode counts)
+    /// is gone — `ext2::repair::ReconcileReport` deliberately collapses
+    /// that (diagnostic-only, gated off unless `kdebug fs on`) down to
+    /// "did anything drift" + the final corrected totals, see that
+    /// struct's own doc comment. Nothing about the repair itself changed,
+    /// only how much of it gets traced.
     fn reconcile_free_counts(&self) -> Result<(), Errno> {
-        let mut sb_raw = [0u8; 1024];
-        self.core.device.read_sectors(2, 2, &mut sb_raw).map_err(|_| Errno::EIO)?;
-        let sb_free_blocks = u32::from_le_bytes(sb_raw[12..16].try_into().unwrap());
-        let sb_free_inodes = u32::from_le_bytes(sb_raw[16..20].try_into().unwrap());
-
-        let mut total_free_blocks: u32 = 0;
-        let mut total_free_inodes: u32 = 0;
-
-        for group in 0..self.core.sb.num_groups {
-            let bgd = self.read_bgd(group)?;
-
-            let block_bitmap = self.block_vec(bgd.block_bitmap)?;
-            let real_free_blocks = count_free_bits(&block_bitmap, self.blocks_in_group(group));
-
-            let inode_bitmap = self.block_vec(bgd.inode_bitmap)?;
-            let real_free_inodes = count_free_bits(&inode_bitmap, self.inodes_in_group(group));
-
-            if real_free_blocks != bgd.free_blocks || real_free_inodes != bgd.free_inodes {
-                crate::ktrace!(
-                    crate::debug::FS,
-                    "ext2: group {} free-count drift (blocks {}->{}, inodes {}->{}), repairing",
-                    group, bgd.free_blocks, real_free_blocks, bgd.free_inodes, real_free_inodes
-                );
-                self.adjust_bgd_counts(
-                    group,
-                    real_free_blocks as i32 - bgd.free_blocks as i32,
-                    real_free_inodes as i32 - bgd.free_inodes as i32,
-                    0,
-                )?;
-            }
-
-            total_free_blocks += real_free_blocks as u32;
-            total_free_inodes += real_free_inodes as u32;
-        }
-
-        if total_free_blocks != sb_free_blocks || total_free_inodes != sb_free_inodes {
+        let report = self.core.reconcile_free_counts()?;
+        if report.bgd_drift || report.sb_drift {
             crate::ktrace!(
                 crate::debug::FS,
-                "ext2: superblock free-count drift (blocks {}->{}, inodes {}->{}), repairing",
-                sb_free_blocks, total_free_blocks, sb_free_inodes, total_free_inodes
+                "ext2: free-count drift detected, repaired (now {} free block(s), {} free inode(s))",
+                report.total_free_blocks, report.total_free_inodes
             );
-            self.adjust_sb_counts(
-                total_free_blocks as i32 - sb_free_blocks as i32,
-                total_free_inodes as i32 - sb_free_inodes as i32,
-            )?;
         }
-
         Ok(())
     }
 
     /// Mount-time orphan scan — see the module-level ROBUSTNESS comment
-    /// for the full rationale. Builds a "should be used" bitmap pair by
-    /// walking every inode actually reachable from the root directory
-    /// (fixed metadata + reserved inodes are seeded in as used up front,
-    /// same convention real ext2 tools use), then clears any bit the real
-    /// on-disk bitmaps mark used that the walk never reached.
-    ///
-    /// Safety-critical property: the sweep only ever runs if the walk
-    /// completed with no error at all (`?` on every fallible step here
-    /// means a single I/O failure or a directory tree deeper than the
-    /// depth guard aborts the *whole* function before the sweep, via
-    /// `mark_reachable`'s own `Err` return — never partially). An
-    /// incomplete "should be used" picture must never be swept against,
-    /// or a still-live block/inode could be freed out from under a file
-    /// that's simply reached through a deep path.
+    /// for the full rationale, and `ext2::Ext2Core::reclaim_orphans`'s own
+    /// doc comment for the full mechanics (the reachability walk, the
+    /// sweep, and the safety-critical "only sweep if the walk completed
+    /// with no error at all" property).
     fn reclaim_orphans(&self) -> Result<(), Errno> {
-        let block_bytes = ((self.core.sb.blocks_count as usize) + 7) / 8;
-        let inode_bytes = ((self.core.sb.inodes_count as usize) + 7) / 8;
-        let mut used_blocks = alloc::vec![0u8; block_bytes];
-        let mut used_inodes = alloc::vec![0u8; inode_bytes];
-
-        // Fixed metadata: boot block, the superblock itself, the
-        // block-group descriptor table, and every group's own bitmaps +
-        // inode table. None of this is owned by any inode, so the tree
-        // walk below would never mark it, but it's legitimately in use.
-        // The superblock lives AT block `first_data_block` (`bgdt_block`
-        // above is computed as `first_data_block + 1`, i.e. right after
-        // it) — `0..first_data_block` only covers the boot block ahead of
-        // it, not the superblock's own block, so that block must be
-        // included too (`0..=first_data_block`). Missing this let the
-        // sweep below "reclaim" the superblock's block as an orphan on
-        // first mount, and the very next allocation handed it out to real
-        // file data, corrupting the superblock.
-        for b in 0..=self.core.sb.first_data_block {
-            mark_bit(&mut used_blocks, b);
-        }
-        let bgd_per_block = self.core.sb.block_size / 32;
-        let bgdt_blocks = (self.core.sb.num_groups + bgd_per_block - 1) / bgd_per_block;
-        for b in self.core.sb.bgdt_block..self.core.sb.bgdt_block + bgdt_blocks {
-            mark_bit(&mut used_blocks, b);
-        }
-        let inodes_per_block = self.core.sb.block_size / self.core.sb.inode_size as u32;
-        for group in 0..self.core.sb.num_groups {
-            let bgd = self.read_bgd(group)?;
-            mark_bit(&mut used_blocks, bgd.block_bitmap);
-            mark_bit(&mut used_blocks, bgd.inode_bitmap);
-            let inode_table_blocks = (self.core.sb.inodes_per_group + inodes_per_block - 1) / inodes_per_block;
-            for b in bgd.inode_table..bgd.inode_table + inode_table_blocks {
-                mark_bit(&mut used_blocks, b);
-            }
-
-            // Real ext2 (sparse_super, mke2fs's default) keeps backup
-            // superblock+BGDT copies in group 0, group 1, and every group
-            // whose number is a power of 3/5/7 — mirroring that placement
-            // logic exactly here would be one more way to get it subtly
-            // wrong, so instead just reserve every group's leading
-            // `1 + bgdt_blocks` blocks unconditionally. Overkill for a
-            // group that doesn't actually have a backup (those blocks were
-            // never marked used in the real per-group bitmap to begin
-            // with, so reserving them here is a no-op), but it means a
-            // group that *does* have one — which this driver has no
-            // reason to expect specifically — can never be misread as an
-            // orphan and freed into real file data the way group 0's own
-            // primary copy already was (see the loop above this one).
-            let group_start = self.core.sb.first_data_block + group * self.core.sb.blocks_per_group;
-            for b in group_start..group_start + 1 + bgdt_blocks {
-                mark_bit(&mut used_blocks, b);
-            }
-        }
-
-        // Walk the real directory tree from root, marking every inode and
-        // block actually reachable. 64 levels of nesting is far beyond
-        // anything a shell/script here would ever create — hitting it is
-        // treated as a hard error (not a silent stop), since silently
-        // under-marking a legitimately-deep subtree would make the sweep
-        // below wrongly reclaim it.
-        //
-        // MUST run before the reserved-inode marking just below: root's
-        // own ino (2) falls inside that reserved range, and
-        // `mark_reachable`'s cycle guard treats an already-marked bit as
-        // "already visited, nothing more to do" — pre-marking root first
-        // used to make the very first call return immediately without
-        // ever reading root's own blocks or descending into a single
-        // child. That silently treated the *entire* real directory tree
-        // (every file this filesystem was seeded with) as unreachable, so
-        // the sweep below freed almost every real block/inode on the very
-        // first mount — the very first new file/dir write after that
-        // then handed out an already-live block to something else,
-        // corrupting whatever legitimately owned it (this is what
-        // produced the `add_dir_entry` "range end index ... out of range"
-        // panic: the root directory's own data block had been reused for
-        // unrelated file content).
-        self.mark_reachable(ROOT_INO, &mut used_inodes, &mut used_blocks, 64)?;
-
-        // Reserved inodes below `first_ino` (root's own ino=2 among them)
-        // are always "in use" even though this driver never reaches most
-        // of them (1, 3..=10 have no directory entry pointing at them at
-        // all, ever) via the walk above.
-        for ino in 1..self.core.sb.first_ino {
-            mark_bit_1based(&mut used_inodes, ino);
-        }
-
-        // Sweep: anything the real bitmaps mark used that the walk above
-        // never reached is an orphan — clear it. Counter bookkeeping is
-        // deliberately NOT duplicated here: `reconcile_free_counts` (just
-        // above) already knows how to recompute BGD/superblock free
-        // counts from a bitmap, so just clear bits and re-run it once at
-        // the end if anything actually changed.
-        let mut freed_blocks: u32 = 0;
-        let mut freed_inodes: u32 = 0;
-        for group in 0..self.core.sb.num_groups {
-            let bgd = self.read_bgd(group)?;
-
-            let mut block_bitmap = self.block_vec(bgd.block_bitmap)?;
-            let mut changed = false;
-            for bit in 0..self.blocks_in_group(group) {
-                let byte = (bit / 8) as usize;
-                let mask = 1u8 << (bit % 8);
-                if block_bitmap[byte] & mask == 0 {
-                    continue;
-                }
-                let block_num = self.core.sb.first_data_block + group * self.core.sb.blocks_per_group + bit;
-                if !bit_set(&used_blocks, block_num) {
-                    block_bitmap[byte] &= !mask;
-                    changed = true;
-                    freed_blocks += 1;
-                }
-            }
-            if changed {
-                self.write_block(bgd.block_bitmap, &block_bitmap)?;
-            }
-
-            let mut inode_bitmap = self.block_vec(bgd.inode_bitmap)?;
-            let mut ichanged = false;
-            for bit in 0..self.inodes_in_group(group) {
-                let byte = (bit / 8) as usize;
-                let mask = 1u8 << (bit % 8);
-                if inode_bitmap[byte] & mask == 0 {
-                    continue;
-                }
-                let ino = group * self.core.sb.inodes_per_group + bit + 1;
-                if !bit_set_1based(&used_inodes, ino) {
-                    inode_bitmap[byte] &= !mask;
-                    ichanged = true;
-                    freed_inodes += 1;
-                }
-            }
-            if ichanged {
-                self.write_block(bgd.inode_bitmap, &inode_bitmap)?;
-            }
-        }
-
+        let (freed_blocks, freed_inodes) = self.core.reclaim_orphans()?;
         if freed_blocks > 0 || freed_inodes > 0 {
             crate::ktrace!(
                 crate::debug::FS,
@@ -896,93 +739,9 @@ impl Ext2Fs {
             // — readable via /proc/kdebug regardless of whether FS
             // tracing happened to be on for this particular boot.
             crate::debug::add_orphans_reclaimed(freed_blocks as u64, freed_inodes as u64);
-            self.reconcile_free_counts()?;
         }
-
         Ok(())
     }
-
-    /// Recursive step of `reclaim_orphans`: mark `ino` (and, if it's a
-    /// directory, everything reachable through it) as used in
-    /// `used_inodes`/`used_blocks`. `used_inodes` doubles as the
-    /// already-visited set — an inode marked on entry short-circuits
-    /// immediately, which is what makes a cyclic (corrupted) directory
-    /// structure terminate instead of recursing forever, on top of the
-    /// hard `depth_left` bound below.
-    fn mark_reachable(&self, ino: u32, used_inodes: &mut [u8], used_blocks: &mut [u8], depth_left: u32) -> Result<(), Errno> {
-        if bit_set_1based(used_inodes, ino) {
-            return Ok(()); // already visited — cycle guard
-        }
-        if depth_left == 0 {
-            // See `reclaim_orphans`'s doc comment: failing loudly here
-            // (instead of silently stopping) is what keeps an
-            // unexpectedly-deep-but-legitimate subtree from being
-            // mistaken for garbage by the sweep.
-            return Err(Errno::ELOOP);
-        }
-        mark_bit_1based(used_inodes, ino);
-
-        let raw = self.read_inode(ino)?;
-        if raw.has_block_pointers() {
-            // `visit_inode_blocks` moved into `ext2::Ext2Core` (migration
-            // step 3) — see `free_all_blocks`'s doc comment above for why
-            // this calls `self.core.visit_inode_blocks` directly rather
-            // than through a kernel-side wrapper.
-            self.core.visit_inode_blocks(&raw, |b| {
-                mark_bit(used_blocks, b);
-                Ok(())
-            })?;
-        }
-
-        if raw.is_dir() {
-            for entry in self.read_dir_entries(&raw)? {
-                self.mark_reachable(entry.ino, used_inodes, used_blocks, depth_left - 1)?;
-            }
-        }
-
-        Ok(())
-    }
-}
-
-/// Set bit `n` (0-based) in a byte-packed bitmap — shared by
-/// `reclaim_orphans`'s block-side bookkeeping, which (like the real
-/// on-disk block bitmap it mirrors) indexes by absolute block number.
-fn mark_bit(bitmap: &mut [u8], n: u32) {
-    let byte = (n / 8) as usize;
-    if byte < bitmap.len() {
-        bitmap[byte] |= 1u8 << (n % 8);
-    }
-}
-
-fn bit_set(bitmap: &[u8], n: u32) -> bool {
-    let byte = (n / 8) as usize;
-    bitmap.get(byte).is_some_and(|b| b & (1u8 << (n % 8)) != 0)
-}
-
-/// Same as `mark_bit`/`bit_set`, but for a 1-based inode number (real
-/// ext2's own convention — inode 0 doesn't exist, inode 1 is bit 0).
-fn mark_bit_1based(bitmap: &mut [u8], ino: u32) {
-    if ino >= 1 {
-        mark_bit(bitmap, ino - 1);
-    }
-}
-
-fn bit_set_1based(bitmap: &[u8], ino: u32) -> bool {
-    ino >= 1 && bit_set(bitmap, ino - 1)
-}
-
-/// Count clear (free) bits among the first `valid_bits` bits of `bitmap` —
-/// shared by `reconcile_free_counts`'s block- and inode-bitmap passes.
-fn count_free_bits(bitmap: &[u8], valid_bits: u32) -> u16 {
-    let mut free = 0u32;
-    for bit in 0..valid_bits {
-        let byte = (bit / 8) as usize;
-        let mask = 1u8 << (bit % 8);
-        if bitmap[byte] & mask == 0 {
-            free += 1;
-        }
-    }
-    free as u16
 }
 
 fn ext2_file_type_to_vfs(ft: u8) -> FileType {
@@ -1697,6 +1456,33 @@ pub(crate) const PHANTOM_DIR_INO: u32 = 45;
 /// real content, bitmap bit left clear (see `PHANTOM_DIR_INO`).
 pub(crate) const PHANTOM_DIR_BLOCK: u32 = 24;
 
+/// Set bit `n` (0-based) in a byte-packed bitmap — used only by
+/// `build_image_with_orphans` below to hand-construct its block/inode
+/// bitmaps. The equivalent (and, since migration step 5, the *only*
+/// production) copy of this helper now lives in `ext2::repair` — this one
+/// stays here, `#[cfg(test)]`-only, purely because `ext2::repair`'s copy is
+/// `pub(crate)` to that crate, not visible from here, and this file's own
+/// `build_image_with_orphans` is itself an accepted, `#[cfg(test)]`-only
+/// duplicate of `ext2::test_support`'s copy of the same fixture (see that
+/// function's doc comment for why both exist).
+#[cfg(test)]
+fn mark_bit(bitmap: &mut [u8], n: u32) {
+    let byte = (n / 8) as usize;
+    if byte < bitmap.len() {
+        bitmap[byte] |= 1u8 << (n % 8);
+    }
+}
+
+/// Same as `mark_bit`, but for a 1-based inode number (real ext2's own
+/// convention — inode 0 doesn't exist, inode 1 is bit 0). Same
+/// test-only-duplicate rationale as `mark_bit` above.
+#[cfg(test)]
+fn mark_bit_1based(bitmap: &mut [u8], ino: u32) {
+    if ino >= 1 {
+        mark_bit(bitmap, ino - 1);
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn build_image_with_orphans() -> Vec<u8> {
     const BLOCK_SIZE: u32 = 1024;
@@ -1896,24 +1682,23 @@ impl TestFs {
         self.0.reclaim_orphans()
     }
 
+    // All six accessors below are thin wrappers over `ext2::Ext2Core`
+    // (migration step 5 — see the "ext2 core crate" note near the top of
+    // this file): moved verbatim, same on-disk reads, no behavior change.
+    // Kept on `TestFs` rather than called directly as `self.0.core....` at
+    // each `hw_tests.rs` call site purely so that file doesn't need to
+    // change at all.
+
     /// Whether `ino` (1-based) is marked used in its group's on-disk
     /// inode bitmap right now.
     pub(crate) fn inode_used(&self, ino: u32) -> Result<bool, Errno> {
-        let group = (ino - 1) / self.0.core.sb.inodes_per_group;
-        let bit = (ino - 1) % self.0.core.sb.inodes_per_group;
-        let bgd = self.0.read_bgd(group)?;
-        let bitmap = self.0.block_vec(bgd.inode_bitmap)?;
-        Ok(bit_set(&bitmap, bit))
+        self.0.core.inode_used(ino).map_err(Into::into)
     }
 
     /// Whether `block` (absolute block number) is marked used in its
     /// group's on-disk block bitmap right now.
     pub(crate) fn block_used(&self, block: u32) -> Result<bool, Errno> {
-        let group = (block - self.0.core.sb.first_data_block) / self.0.core.sb.blocks_per_group;
-        let bit = (block - self.0.core.sb.first_data_block) % self.0.core.sb.blocks_per_group;
-        let bgd = self.0.read_bgd(group)?;
-        let bitmap = self.0.block_vec(bgd.block_bitmap)?;
-        Ok(bit_set(&bitmap, bit))
+        self.0.core.block_used(block).map_err(Into::into)
     }
 
     /// Raw `i_mode` of `ino`'s on-disk inode record, read directly (not
@@ -1922,23 +1707,18 @@ impl TestFs {
     /// untouched after a repair pass that, by design, never looks at
     /// content behind an already-clear bitmap bit.
     pub(crate) fn inode_mode(&self, ino: u32) -> Result<u16, Errno> {
-        Ok(self.0.read_inode(ino)?.i_mode())
+        self.0.core.inode_mode(ino).map_err(Into::into)
     }
 
     /// `(free_blocks, free_inodes)` straight off the on-disk superblock.
     pub(crate) fn sb_free_counts(&self) -> Result<(u32, u32), Errno> {
-        let mut raw = [0u8; 1024];
-        self.0.core.device.read_sectors(2, 2, &mut raw).map_err(|_| Errno::EIO)?;
-        let free_blocks = u32::from_le_bytes(raw[12..16].try_into().unwrap());
-        let free_inodes = u32::from_le_bytes(raw[16..20].try_into().unwrap());
-        Ok((free_blocks, free_inodes))
+        self.0.core.sb_free_counts().map_err(Into::into)
     }
 
     /// `(free_blocks, free_inodes)` straight off group `group`'s on-disk
     /// BGD entry.
     pub(crate) fn bgd_free_counts(&self, group: u32) -> Result<(u16, u16), Errno> {
-        let bgd = self.0.read_bgd(group)?;
-        Ok((bgd.free_blocks, bgd.free_inodes))
+        self.0.core.bgd_free_counts(group).map_err(Into::into)
     }
 
     /// Recompute the *true* free block/inode counts directly from the
@@ -1946,11 +1726,6 @@ impl TestFs {
     /// lets a test assert the on-disk counters are self-consistent with
     /// the bitmaps, not just with what the test expects.
     pub(crate) fn true_free_counts_group0(&self) -> Result<(u16, u16), Errno> {
-        let bgd = self.0.read_bgd(0)?;
-        let block_bitmap = self.0.block_vec(bgd.block_bitmap)?;
-        let real_free_blocks = count_free_bits(&block_bitmap, self.0.blocks_in_group(0));
-        let inode_bitmap = self.0.block_vec(bgd.inode_bitmap)?;
-        let real_free_inodes = count_free_bits(&inode_bitmap, self.0.inodes_in_group(0));
-        Ok((real_free_blocks, real_free_inodes))
+        self.0.core.true_free_counts_group0().map_err(Into::into)
     }
 }

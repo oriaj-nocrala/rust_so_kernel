@@ -51,6 +51,23 @@ pub fn bit_is_set(bitmap: &[u8], bit: u32) -> bool {
     bitmap.get(byte).is_some_and(|b| b & (1u8 << (bit % 8)) != 0)
 }
 
+/// Count clear (free) bits among the first `valid_bits` bits of `bitmap` —
+/// shared by `repair::Ext2Core::reconcile_free_counts`'s block- and inode-
+/// bitmap passes (migration step 5, moved verbatim out of
+/// `kernel::fs::ext2`'s free-standing function of the same name) and by the
+/// `true_free_counts_group0` test-inspection accessor.
+pub fn count_free_bits(bitmap: &[u8], valid_bits: u32) -> u16 {
+    let mut free = 0u32;
+    for bit in 0..valid_bits {
+        let byte = (bit / 8) as usize;
+        let mask = 1u8 << (bit % 8);
+        if bitmap[byte] & mask == 0 {
+            free += 1;
+        }
+    }
+    free as u16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
