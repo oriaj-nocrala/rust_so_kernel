@@ -45,6 +45,18 @@
 # disk.img's /bin by the root build.rs's sync_disk_bin_dir.
 /disk-image-root/bin/
 
+# Embedded userspace ELFs (shell, busybox, kdebug, the small Rust programs)
+# that kernel/build.rs regenerates and main.rs `include_bytes!`s. These used
+# to be committed, which cost 214 MB across 167 blob versions in history —
+# every rebuild recommitted a new copy of each binary (hello.elf alone
+# accounted for 35.9 MB across 17 versions). They are build outputs, not
+# source: `kernel/build.rs` recreates the directory (`create_dir_all`) and
+# rebuilds everything in it, so a fresh clone is self-sufficient. Note that
+# busybox.elf comes from a slow external `make` build (scripts/build-busybox.sh)
+# that only runs when the file is missing — so the first build after a fresh
+# clone pays for it once.
+/kernel/embedded/
+
 # Bootloader artifacts
 bootimage-*.bin
 *.img
