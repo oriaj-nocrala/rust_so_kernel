@@ -56,7 +56,13 @@ extern "C" fn _start() -> ! {
         let pid = syscall::fork();
         if pid == 0 {
             let argv: [&[u8]; 2] = [b"busybox\0", b"ash\0"];
-            let envp: [&[u8]; 1] = [b"PATH=/tmp/bin:/bin\0"];
+            // /mnt/bin holds the userspace programs that were moved off the
+            // kernel binary onto the ext2 disk image (doom, quake, and most
+            // of the old C test programs — see kernel/build.rs's module doc
+            // comment and CLAUDE.md's Userspace Programs section). Listed
+            // last: /tmp/bin (busybox applet symlinks) and /bin (initramfs)
+            // should win on any name collision, same as before.
+            let envp: [&[u8]; 1] = [b"PATH=/tmp/bin:/bin:/mnt/bin\0"];
             syscall::exec_argv(b"/bin/busybox\0", &argv, &envp);
             // Only reached if exec failed.
             println!("init: exec /bin/busybox failed");

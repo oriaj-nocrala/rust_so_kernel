@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# scripts/build-quake.sh
+# scripts/build-quake.sh [output-path]
 #
 # Cross-compiles quakegeneric (git submodule, upstream erysdren/quakegeneric
 # — a doomgeneric-style minimal port of id Software's GPL WinQuake source)
 # plus our own platform port (quake-port/quakegeneric_constanos.c) against
-# sysroot/, dropping the resulting static ELF at kernel/embedded/quake.elf.
+# sysroot/, dropping the resulting static ELF at $1 (default:
+# kernel/embedded/quake.elf; kernel/build.rs passes disk-image-root/bin/quake
+# explicitly — quake is disk-resident, not embedded, see that file's module
+# doc comment).
 #
 # Same shape as scripts/build-doom.sh: quakegeneric has no config step
 # either (its own makefile just lists every source file), so this hardcodes
@@ -19,6 +22,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+
+OUT="${1:-$REPO_ROOT/kernel/embedded/quake.elf}"
 
 if [ ! -f sysroot/usr/lib/libc.a ]; then
     echo "build-quake: sysroot/ missing — run scripts/setup-mlibc.sh first" >&2
@@ -145,7 +150,7 @@ chmod +x "$CC_WRAPPER"
 
 # ── Build ────────────────────────────────────────────────────────────────
 
-mkdir -p kernel/embedded
-"$CC_WRAPPER" -I"$QG_SRC" -O2 "${SOURCES[@]}" -o kernel/embedded/quake.elf
+mkdir -p "$(dirname "$OUT")"
+"$CC_WRAPPER" -I"$QG_SRC" -O2 "${SOURCES[@]}" -o "$OUT"
 
-echo "build-quake: kernel/embedded/quake.elf ready"
+echo "build-quake: $OUT ready"

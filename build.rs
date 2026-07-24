@@ -37,6 +37,7 @@ fn main() {
     bootloader::UefiBoot::new(&kernel).create_disk_image(&uefi_path).unwrap();
 
     let disk_image = ensure_ext2_disk_image();
+    sync_disk_bin_dir(&disk_image);
 
     // pass the disk image paths as env variables to the `main.rs`
     println!("cargo:rustc-env=UEFI_PATH={}", uefi_path.display());
@@ -132,6 +133,146 @@ fn ensure_ext2_disk_image() -> PathBuf {
     }
 
     disk_path
+}
+
+/// Sync `disk-image-root/bin/` (populated fresh on every build by
+/// `kernel/build.rs` — see that file's module doc comment and
+/// `DISK_C_PROGRAMS`/`DOOM_NAME`/`QUAKE_NAME`) onto `disk.img`'s `/bin`
+/// directory, using `debugfs -w` to write directly into the existing
+/// filesystem image.
+///
+/// This exists because `ensure_ext2_disk_image` above is deliberately
+/// create-once: it returns the existing `disk.img` untouched if one is
+/// already on disk, so `mke2fs -d disk-image-root` (which would otherwise
+/// pick up `disk-image-root/bin/` automatically) never runs again after the
+/// first `cargo build` in a checkout. Without this function, dropping new
+/// binaries into `disk-image-root/bin/` would silently do nothing on any
+/// tree that already has a `disk.img` — exactly the trap this was written
+/// to close, since `cargo run` on an existing tree must still end up with
+/// every disk-resident program actually reachable.
+///
+/// Three alternatives considered and rejected:
+///   - Regenerating `disk.img` whenever the seed content looks newer would
+///     defeat the entire point of `ensure_ext2_disk_image`'s create-once
+///     design (a persistent image proving the ext2 *write* path survives
+///     across `cargo run` invocations — see that function's doc comment) —
+///     it would nuke any state a prior boot's ext2 test/session wrote.
+///   - Requiring the developer to `rm disk.img` by hand is bad DX and,
+///     more importantly, contradicts this task's own requirement that an
+///     existing checkout's `cargo run` "must end up with the programs
+///     actually reachable, not silently missing".
+///   - `e2cp` (a smaller, more targeted tool for exactly this) isn't
+///     installed on this dev machine; `debugfs -w` ships with the same
+///     `e2fsprogs` package this build already requires for `mke2fs`, so it
+///     adds no new dependency.
+///
+/// Idempotent by construction: `rm <name>` (ignored if the file doesn't
+/// exist yet — the first sync on any given `disk.img`) then `write <host>
+/// <name>` on every call, so a changed program's content is really
+/// replaced, not just left as a stale first copy. `debugfs -f <script>`
+/// exits 0 unconditionally (verified directly — even a completely missing
+/// image or a `write` of a nonexistent host path still exits 0), so
+/// success is checked for real afterward: `debugfs -R "ls -l /bin"` is
+/// parsed and every synced file's on-disk size is compared against its
+/// host-side size.
+fn sync_disk_bin_dir(disk_path: &std::path::Path) {
+    let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let bin_seed_dir = manifest_dir.join("disk-image-root/bin");
+
+    let Ok(read_dir) = std::fs::read_dir(&bin_seed_dir) else {
+        // kernel/build.rs (which populates this dir) hasn't run, or
+        // produced nothing — nothing to sync.
+        return;
+    };
+
+    if !disk_path.exists() {
+        // mke2fs was missing/failed above; ensure_ext2_disk_image already
+        // warned about /mnt being unavailable. Nothing to sync into.
+        return;
+    }
+
+    let mut entries: Vec<(String, PathBuf, u64)> = Vec::new();
+    for entry in read_dir {
+        let entry = entry.expect("reading disk-image-root/bin/ entry");
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name().into_string()
+            .expect("non-UTF8 filename in disk-image-root/bin/");
+        let size = entry.metadata().expect("stat disk-image-root/bin entry").len();
+        entries.push((name, entry.path(), size));
+    }
+    if entries.is_empty() {
+        return;
+    }
+
+    if Command::new("debugfs").arg("-V").output().is_err() {
+        println!(
+            "cargo:warning=debugfs (e2fsprogs) not found — cannot sync disk-image-root/bin/ \
+             onto the existing disk.img. {} program(s) built there ({}) won't be reachable at \
+             /mnt/bin until e2fsprogs is installed and this build reruns.",
+            entries.len(),
+            entries.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>().join(", "),
+        );
+        return;
+    }
+
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let script_path = out_dir.join("sync_disk_bin.debugfs");
+    let mut script = String::from("mkdir /bin\ncd /bin\n");
+    for (name, host_path, _) in &entries {
+        script.push_str(&format!("rm {name}\nwrite {} {name}\n", host_path.display()));
+    }
+    std::fs::write(&script_path, &script).expect("writing debugfs sync script");
+
+    Command::new("debugfs")
+        .arg("-w")
+        .arg("-f").arg(&script_path)
+        .arg(disk_path)
+        .output()
+        .expect("Failed to spawn debugfs");
+
+    // Real verification, since debugfs's own exit code is not trustworthy
+    // here (see doc comment above — it exits 0 even for a `write` of a
+    // nonexistent host path or a completely unopenable image): re-list
+    // `/bin` with a fresh `-R` invocation and check every synced file
+    // actually landed at its expected size.
+    let relist = Command::new("debugfs")
+        .arg("-R").arg("ls -l /bin")
+        .arg(disk_path)
+        .output()
+        .expect("Failed to spawn debugfs for verification");
+    let relisting = String::from_utf8_lossy(&relist.stdout);
+
+    let missing_or_wrong: Vec<&str> = entries.iter()
+        .filter(|(name, _, expected_size)| {
+            // debugfs `ls -l` line shape:
+            // "  <ino>  <mode> (<x>)  <uid> <gid> <size> <date...> <name>"
+            !relisting.lines().any(|line| {
+                let mut fields = line.split_whitespace();
+                let size_field = fields.nth(5); // ino, mode, (x), uid, gid, size
+                let name_field = line.trim_end().rsplit(char::is_whitespace).next();
+                name_field == Some(name.as_str())
+                    && size_field == Some(expected_size.to_string().as_str())
+            })
+        })
+        .map(|(name, _, _)| name.as_str())
+        .collect();
+
+    if !missing_or_wrong.is_empty() {
+        panic!(
+            "sync_disk_bin_dir: failed to sync {:?} onto {}:/bin (debugfs `ls -l /bin` follows)\n{}",
+            missing_or_wrong,
+            disk_path.display(),
+            relisting,
+        );
+    }
+
+    println!(
+        "cargo:warning=synced {} userspace program(s) into disk.img:/bin ({})",
+        entries.len(),
+        entries.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>().join(", "),
+    );
 }
 
 /// Builds the kernel crate for the bare-metal `x86_64-unknown-none` target

@@ -39,6 +39,12 @@
 # scripts/fetch-quake-shareware.sh) — same rationale as freedoom1.wad above.
 /disk-image-root/id1/
 
+# Userspace ELFs built straight here by kernel/build.rs (doom, quake, and
+# most of the old C test programs — see that file's module doc comment) —
+# a build artifact, rebuilt every `cargo build`, not source. Synced onto
+# disk.img's /bin by the root build.rs's sync_disk_bin_dir.
+/disk-image-root/bin/
+
 # Bootloader artifacts
 bootimage-*.bin
 *.img

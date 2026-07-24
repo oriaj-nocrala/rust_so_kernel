@@ -56,7 +56,25 @@ pub enum ProgramSource {
 /// To add an ELF program:
 ///   1. Build it (see workflow above)
 ///   2. Add: ("name", ProgramSource::Elf(include_bytes!("../../embedded/name.elf")))
-static PROGRAMS: [(&str, ProgramSource); 24] = [
+///
+/// Only boot-critical/small programs live here — `shell` (PID 1), `busybox`
+/// (ash + every applet, on the boot path via `busybox --install`), the
+/// small Rust smoke tests (all well under 50 KiB), and `kdebug` (the live
+/// tracing-control tool used in an ongoing debugging investigation
+/// alongside busybox — see CLAUDE.md). Everything else runnable-but-not-
+/// boot-critical (`doom`, `quake`, and most of the old C test programs —
+/// `hello`, `pthread_test`, `producer_consumer`, `mlibc_signal_test`,
+/// `stat_test`, `argv_test`, `jobctl_test`, `ext2_robust_test`, `fpu_test`)
+/// was moved off the kernel binary entirely and now lives at `/mnt/bin/` on
+/// the ext2 disk image instead (built straight there by `kernel/build.rs`'s
+/// `DISK_C_PROGRAMS`/`DOOM_NAME`/`QUAKE_NAME`, synced onto `disk.img` by the
+/// root `build.rs`'s `sync_disk_bin_dir`). `sys_exec` already resolves
+/// through the real VFS (see CLAUDE.md's Userspace Programs section), so
+/// they run identically once `$PATH` (set by `userspace/src/bin/shell.rs`)
+/// includes `/mnt/bin` — no special-casing needed here, they just aren't
+/// registered in this table at all, and so don't show up in initramfs's
+/// `/bin` (`ls /bin`) either, only in `/mnt/bin`.
+static PROGRAMS: [(&str, ProgramSource); 13] = [
     ("uname",     ProgramSource::Elf(include_bytes!("../../embedded/uname.elf"))),
     ("shell",     ProgramSource::Elf(include_bytes!("../../embedded/shell.elf"))),
     ("snake",     ProgramSource::Elf(include_bytes!("../../embedded/snake.elf"))),
@@ -65,19 +83,10 @@ static PROGRAMS: [(&str, ProgramSource); 24] = [
     ("ipc_ping",  ProgramSource::Elf(include_bytes!("../../embedded/ipc_ping.elf"))),
     ("mmap_test", ProgramSource::Elf(include_bytes!("../../embedded/mmap_test.elf"))),
     ("poll_test", ProgramSource::Elf(include_bytes!("../../embedded/poll_test.elf"))),
-    ("hello",     ProgramSource::Elf(include_bytes!("../../embedded/hello.elf"))),
-    ("pthread_test", ProgramSource::Elf(include_bytes!("../../embedded/pthread_test.elf"))),
-    ("producer_consumer", ProgramSource::Elf(include_bytes!("../../embedded/producer_consumer.elf"))),
     ("pipe_test", ProgramSource::Elf(include_bytes!("../../embedded/pipe_test.elf"))),
     ("signal_test", ProgramSource::Elf(include_bytes!("../../embedded/signal_test.elf"))),
-    ("mlibc_signal_test", ProgramSource::Elf(include_bytes!("../../embedded/mlibc_signal_test.elf"))),
     ("demo",      ProgramSource::Elf(include_bytes!("../../embedded/demo.elf"))),
-    ("stat_test", ProgramSource::Elf(include_bytes!("../../embedded/stat_test.elf"))),
-    ("argv_test", ProgramSource::Elf(include_bytes!("../../embedded/argv_test.elf"))),
-    ("jobctl_test", ProgramSource::Elf(include_bytes!("../../embedded/jobctl_test.elf"))),
     ("kdebug",    ProgramSource::Elf(include_bytes!("../../embedded/kdebug.elf"))),
-    ("ext2_robust_test", ProgramSource::Elf(include_bytes!("../../embedded/ext2_robust_test.elf"))),
-    ("fpu_test", ProgramSource::Elf(include_bytes!("../../embedded/fpu_test.elf"))),
     // Manually vendored (not built by kernel/build.rs — no Makefile-based
     // C_PROGRAMS support yet): busybox-1.36.1 built out-of-tree against
     // sysroot/ with CONFIG_TRUE=y (only the `true` applet) as a first
@@ -85,15 +94,6 @@ static PROGRAMS: [(&str, ProgramSource); 24] = [
     // the exact cross-compile recipe and every sysroot header gap it took
     // to get this far.
     ("busybox",   ProgramSource::Elf(include_bytes!("../../embedded/busybox.elf"))),
-    // doomgeneric (git submodule) + doom-port/doomgeneric_constanos.c (our
-    // platform port), built by scripts/build-doom.sh — same "external
-    // multi-file build, not the single-file C_PROGRAMS loop" shape as
-    // BusyBox above.
-    ("doom",      ProgramSource::Elf(include_bytes!("../../embedded/doom.elf"))),
-    // quakegeneric (git submodule) + quake-port/quakegeneric_constanos.c
-    // (our platform port), built by scripts/build-quake.sh — same shape
-    // as doom.elf above.
-    ("quake",     ProgramSource::Elf(include_bytes!("../../embedded/quake.elf"))),
 ];
 
 /// Print available programs to serial.

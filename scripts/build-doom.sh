@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# scripts/build-doom.sh
+# scripts/build-doom.sh [output-path]
 #
 # Cross-compiles doomgeneric (git submodule, upstream ozkl/doomgeneric) plus
 # our own platform port (doom-port/doomgeneric_constanos.c) against
-# sysroot/, dropping the resulting static ELF at kernel/embedded/doom.elf.
+# sysroot/, dropping the resulting static ELF at $1 (default:
+# kernel/embedded/doom.elf — kept as the default for anyone invoking this
+# script by hand; kernel/build.rs itself passes disk-image-root/bin/doom
+# explicitly, since doom is disk-resident, not embedded — see that file's
+# module doc comment).
 #
 # Requires sysroot/ to already exist — run scripts/setup-mlibc.sh (or just
 # `cargo build`, which does it automatically) first.
@@ -28,6 +32,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+
+OUT="${1:-$REPO_ROOT/kernel/embedded/doom.elf}"
 
 if [ ! -f sysroot/usr/lib/libc.a ]; then
     echo "build-doom: sysroot/ missing — run scripts/setup-mlibc.sh first" >&2
@@ -112,7 +118,7 @@ chmod +x "$CC_WRAPPER"
 
 # ── Build ────────────────────────────────────────────────────────────────
 
-mkdir -p kernel/embedded
-"$CC_WRAPPER" -I"$DG_SRC" -I"$REPO_ROOT/doom-port/stub-include" -O2 "${SOURCES[@]}" -o kernel/embedded/doom.elf
+mkdir -p "$(dirname "$OUT")"
+"$CC_WRAPPER" -I"$DG_SRC" -I"$REPO_ROOT/doom-port/stub-include" -O2 "${SOURCES[@]}" -o "$OUT"
 
-echo "build-doom: kernel/embedded/doom.elf ready"
+echo "build-doom: $OUT ready"
