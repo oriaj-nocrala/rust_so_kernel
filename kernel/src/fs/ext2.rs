@@ -115,10 +115,10 @@
 //     the one concrete gap the paragraph above used to describe as
 //     unrecoverable "in principle."
 
-use alloc::{boxed::Box, string::String, string::ToString, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use spin::{Mutex, Once};
 
-use crate::block::{BlockDevice, SECTOR_SIZE};
+use crate::block::BlockDevice;
 
 use crate::fs::{
     types::{DirEntry, Errno, FileType, OpenFlags, Stat},
@@ -132,35 +132,58 @@ use crate::process::file::{FileError, FileHandle, FileResult};
 // record), block/inode allocation + free-count bookkeeping, inode-table
 // read/write, direct/singly/doubly/triply-indirect block-pointer
 // addressing, file byte-range read/write, directory entry list/insert/
-// remove/".."-rewrite, and symlink fast/slow target read+write now live in
-// the standalone, host-testable `ext2` crate (`ext2/src/`, `cd ext2 &&
-// cargo test`) — see `docs/fs/ext2-extraction-plan.md` (migration steps
-// 1-4). This file keeps thin wrappers of the same name (`inode_location`/
-// `read_inode`/`write_inode`/`block_for_index`/`block_for_index_alloc`/
-// `read_file_range`/`write_file_range`/`read_dir_entries`/
-// `add_dir_entry`/`remove_dir_entry`/`set_dotdot`/`read_symlink_target`)
-// delegating straight to `self.core`, so every call site elsewhere in this
-// file (`create`/`mkdir`/`unlink`/`rmdir`/`take_child`/`insert_child`/
-// `lookup`, `Ext2FileHandle`) keeps working unchanged — same pattern
-// `read_block`/`write_block`/`block_vec` already established. The
-// directory-op wrappers additionally convert between the core's raw
+// remove/".."-rewrite, symlink fast/slow target read+write, and mount-time
+// consistency repair (`reconcile_free_counts`/`reclaim_orphans`, including
+// the recursive `mark_reachable` walk and the `inode_used`/`block_used`/
+// `inode_mode`/`sb_free_counts`/`bgd_free_counts`/`true_free_counts_group0`
+// test-inspection accessors) now all live in the standalone, host-testable
+// `ext2` crate (`ext2/src/`, `cd ext2 && cargo test`) — see
+// `docs/fs/ext2-extraction-plan.md` (migration steps 1-5, now complete).
+// The hand-built test disk images (`build_minimal_image`/
+// `build_image_with_orphans`) also moved there, into `ext2::testimg` (step
+// 6) — `kernel/src/hw_tests.rs`'s QEMU integration tests import them
+// directly instead of this file keeping its own `#[cfg(test)]` copies.
+//
+// What's left in *this* file (step 6, `docs/fs/ext2-extraction-plan.md`,
+// now closed) is a pure VFS adapter: thin wrappers of the same name
+// (`read_inode`/`write_inode`/`read_file_range`/`write_file_range`/
+// `read_dir_entries`/`add_dir_entry`/`remove_dir_entry`/`set_dotdot`/
+// `read_symlink_target`) delegating straight to `self.core`, so every call
+// site elsewhere in this file (`create`/`mkdir`/`unlink`/`rmdir`/
+// `take_child`/`insert_child`/`lookup`, `Ext2FileHandle`) keeps working
+// unchanged — same pattern `write_block`/`block_vec` already established.
+// (A handful of wrappers this file used to keep purely for symmetry with
+// their siblings — `read_block`/`block_for_index`/`block_for_index_alloc`
+// — turned out to have had no real caller at all since the migration steps
+// that introduced them: every actual file-data access in this file already
+// went through `read_file_range`/`write_file_range` instead, which call
+// `self.core.read_block`/`self.core.block_for_index*` directly. `cargo
+// build`'s dead-code lint caught all three once step 6 removed the last
+// thing that made them *look* used (the test-image builders sat right next
+// to them in this file, even though they never actually called them
+// either); step 6 deleted the three wrappers rather than keep dead code
+// around. Block/inode
+// bitmap allocation, by contrast, is genuinely NOT delegated to
+// `self.core`'s own copy of the same logic — `alloc_block`/`free_block`/
+// `alloc_inode`/`free_inode`/`read_bgd`/`adjust_bgd_counts`/
+// `adjust_sb_counts`/`blocks_in_group`/`inodes_in_group`/`bgd_location`
+// below are this file's own, actively-used implementation, predating this
+// extraction and left as-is: unifying them with `ext2::Ext2Core`'s
+// equivalent methods, which nothing in this file currently calls, is a
+// real behavior-preserving simplification but out of scope for this
+// "close the loose ends" pass — see `docs/fs/ext2-extraction-plan.md`.)
+// The directory-op wrappers additionally convert between the core's raw
 // on-disk `file_type: u8` and this file's own `fs::types::FileType` at the
 // boundary (`ext2_file_type_to_vfs`/`vfs_file_type_to_ext2`, which stay
 // here — the core crate never depends on `fs::types`, see its own crate
-// doc comment).
-//
-// Mount's own repair passes (`reconcile_free_counts`/`reclaim_orphans`,
-// migration step 5) moved too — into `ext2::repair`, as real methods on
-// `Ext2Core`, including the recursive `mark_reachable` walk and the
-// `inode_used`/`block_used`/`inode_mode`/`sb_free_counts`/
-// `bgd_free_counts`/`true_free_counts_group0` test-inspection accessors
-// `TestFs` below wraps. What's left here for those two is only the part
-// that can't move: emitting a `ktrace!` line + the permanent
-// `/proc/kdebug` counter from what the core methods report finding/fixing
-// — see those two wrapper methods' own doc comments below for the exact
-// split, and `ext2::repair`'s module doc comment for why this crate can't
-// call `ktrace!` directly. Step 6 (turning what's left of this file into a
-// pure VFS adapter) is unmigrated, per that plan.
+// doc comment). `reconcile_free_counts`/`reclaim_orphans` below are thin
+// wrappers too, but over `ext2::Ext2Core`'s methods of the same name —
+// what's left here for those two is only the part that can't move:
+// emitting a `ktrace!` line + the permanent `/proc/kdebug` counter from
+// what the core methods report finding/fixing (see those two wrapper
+// methods' own doc comments below for the exact split, and
+// `ext2::repair`'s module doc comment for why the core crate can't call
+// `ktrace!` directly, not depending on the kernel at all).
 //
 // `RawInode`/`BgdRaw` are re-exported/aliased here (not redefined) so every
 // existing call site in this file (`RawInode::parse(...)`, `bgd.
@@ -168,7 +191,7 @@ use crate::process::file::{FileError, FileHandle, FileResult};
 // definitions* moved, not how they're used.
 use ext2::RawInode;
 use ext2::BlockGroupDesc as BgdRaw;
-use ext2::{EXT2_MAGIC, ROOT_INO};
+use ext2::ROOT_INO;
 
 impl From<ext2::Ext2Error> for Errno {
     fn from(e: ext2::Ext2Error) -> Self {
@@ -321,56 +344,57 @@ impl Ext2Fs {
 
     // ── Raw block I/O ────────────────────────────────────────────────────
     //
-    // `read_block`/`block_vec`/`write_block` below are thin wrappers over
+    // `block_vec`/`write_block` below are thin wrappers over
     // `ext2::Ext2Core` (migration step 1/2 — see the "ext2 core crate"
     // note near the top of this file); every other method in this file
-    // keeps calling `self.read_block(...)`/`self.write_block(...)`/
-    // `self.block_vec(...)` exactly as before, unaware anything moved.
-
-    /// Read one filesystem block (`self.core.sb.block_size` bytes) into
-    /// `buf`. Propagates an ATA failure as `Errno::EIO` instead of
-    /// panicking — every caller in this file ultimately funnels a failure
-    /// here up through the VFS's own `Result<_, Errno>` surface. Also rejects any
-    /// `block_num` outside `0..blocks_count` — the single choke point
-    /// every on-disk pointer passes through, so a corrupted BGD/inode
-    /// pointer can't turn into a wild read at an arbitrary LBA (see the
-    /// module-level ROBUSTNESS comment).
-    fn read_block(&self, block_num: u32, buf: &mut [u8]) -> Result<(), Errno> {
-        self.core.read_block(block_num, buf).map_err(Into::into)
-    }
+    // keeps calling `self.write_block(...)`/`self.block_vec(...)` exactly
+    // as before, unaware anything moved. `read_block`/`block_for_index`/
+    // `block_for_index_alloc` used to have wrappers here too, but nothing
+    // in this file ever called them through the wrapper (every real
+    // caller goes through `read_file_range`/`write_file_range`, which call
+    // `self.core.read_block`/`self.core.block_for_index*` directly) — step
+    // 6 cleanup (`docs/fs/ext2-extraction-plan.md`) removed the three dead
+    // wrappers rather than keep them "just in case".
 
     fn block_vec(&self, block_num: u32) -> Result<Vec<u8>, Errno> {
         self.core.block_vec(block_num).map_err(Into::into)
     }
 
     /// Write one filesystem block (`self.core.sb.block_size` bytes) from
-    /// `buf`. Same EIO-not-panic contract and out-of-range-`block_num`
-    /// rejection as `read_block`.
+    /// `buf`. Propagates an ATA failure as `Errno::EIO` instead of
+    /// panicking, and rejects any `block_num` outside `0..blocks_count` —
+    /// the single choke point every on-disk pointer passes through, so a
+    /// corrupted BGD/inode pointer can't turn into a wild write at an
+    /// arbitrary LBA (see the module-level ROBUSTNESS comment).
     fn write_block(&self, block_num: u32, buf: &[u8]) -> Result<(), Errno> {
         self.core.write_block(block_num, buf).map_err(Into::into)
     }
 
-    // ── Inode table / indirect block addressing / file byte-range I/O ────
+    // ── Inode table / file byte-range I/O ─────────────────────────────────
     //
-    // All thin wrappers over `ext2::Ext2Core` (migration step 3 — see the
+    // Thin wrappers over `ext2::Ext2Core` (migration step 3 — see the
     // "ext2 core crate" note near the top of this file): inode-table
-    // read/write, direct/singly/doubly/triply-indirect block-pointer
-    // addressing, and file byte-range read/write all moved verbatim into
+    // read/write and file byte-range read/write moved verbatim into
     // `Ext2Core` (same on-disk format, same write ordering — "allocate &
     // write content, then link" — same error conditions, including the
     // `ENOSPC`/`EFBIG` distinctions `ext2::Ext2Error::NoSpace`/`TooLarge`
     // now carry through the `From<Ext2Error> for Errno` impl above).
     // Every other method in this file keeps calling `self.read_inode(...)`/
-    // `self.write_inode(...)`/`self.block_for_index(...)`/`self.
-    // block_for_index_alloc(...)`/`self.read_file_range(...)`/`self.
+    // `self.write_inode(...)`/`self.read_file_range(...)`/`self.
     // write_file_range(...)` exactly as before, unaware anything moved.
-    // `inode_location` (only ever a helper shared by `read_inode`/
-    // `write_inode` themselves, never called from anywhere else in this
-    // file even before extraction) has no wrapper here for the same reason
-    // `visit_inode_blocks`/`visit_pointer_block_targets`/`read_block_ptr`/
-    // `get_or_alloc_ptr` don't: no external call site in this file needs
-    // one — `free_all_blocks` and `mark_reachable` (still here, steps 4/5)
-    // call `self.core.visit_inode_blocks(...)` directly instead.
+    // Direct/singly/doubly/triply-indirect block-pointer addressing
+    // (`block_for_index`/`block_for_index_alloc`) has no wrapper here (step
+    // 6 cleanup removed the unused ones — see the "Raw block I/O" note
+    // above): every real call site in this file reaches file data through
+    // `read_file_range`/`write_file_range` instead, which call
+    // `self.core.block_for_index*` directly. `inode_location` (only ever a
+    // helper shared by `read_inode`/`write_inode` themselves, never called
+    // from anywhere else in this file even before extraction) has no
+    // wrapper for the same reason `visit_inode_blocks`/
+    // `visit_pointer_block_targets`/`read_block_ptr`/`get_or_alloc_ptr`
+    // don't: no external call site in this file needs one — `free_all_blocks`
+    // and `mark_reachable` (still here, steps 4/5) call `self.core.
+    // visit_inode_blocks(...)` directly instead.
 
     /// Read the raw on-disk inode record for `ino`.
     ///
@@ -387,23 +411,6 @@ impl Ext2Fs {
     /// block must survive untouched.
     fn write_inode(&self, ino: u32, raw: &RawInode) -> Result<(), Errno> {
         self.core.write_inode(ino, raw).map_err(Into::into)
-    }
-
-    /// Map a file-relative block index to a filesystem block number.
-    /// Direct (0..12), singly-indirect, doubly-indirect, and triply-
-    /// indirect — returns `Ok(None)` if the block is a hole (not yet
-    /// allocated) or beyond what this driver supports (see module doc
-    /// comment).
-    fn block_for_index(&self, raw: &RawInode, index: u32) -> Result<Option<u32>, Errno> {
-        self.core.block_for_index(raw, index).map_err(Into::into)
-    }
-
-    /// Like `block_for_index`, but allocates whatever's missing (data
-    /// block, and any indirect/doubly-indirect pointer blocks along the
-    /// way) instead of returning `None`. Mutates `raw`'s direct pointers
-    /// in place — caller is responsible for persisting `raw` afterward.
-    fn block_for_index_alloc(&self, raw: &mut RawInode, index: u32) -> Result<u32, Errno> {
-        self.core.block_for_index_alloc(raw, index).map_err(Into::into)
     }
 
     /// Read `buf.len()` bytes of file data starting at byte `offset`.
@@ -1253,479 +1260,4 @@ impl FileHandle for Ext2DirHandle {
     }
 
     fn name(&self) -> &str { "ext2/dir" }
-}
-
-// ── Test-only: minimal hand-built ext2 image ────────────────────────────────
-//
-// Backs the QEMU integration test in `kernel/src/hw_tests.rs`
-// (`ext2_memdisk_roundtrip`). Building a real on-disk image from scratch is
-// normally `mke2fs`'s job (the root `build.rs` already shells out to it for
-// `disk.img`) — this doesn't duplicate that to work around a missing tool.
-// The point is a *self-contained* image with zero host-tool dependency,
-// built at kernel **runtime**, inside the test itself, instead of an
-// embedded build-time artifact. That keeps the QEMU test binary buildable
-// on any machine (no `mke2fs`/`e2fsprogs` requirement beyond what the root
-// build already needs for `disk.img`) and, more importantly, means the test
-// never touches the real disk.img at all.
-//
-// The image is deliberately the smallest thing that satisfies every field
-// `Ext2Fs::mount()`/`read_bgd`/`alloc_block`/`alloc_inode`/
-// `reconcile_free_counts`/`reclaim_orphans` actually read: revision 0 (so
-// `inode_size`=128 and `first_ino`=11 are the fixed rev-0 defaults, and
-// `s_feature_incompat` can stay all-zero — no FILETYPE feature needed for
-// this driver's own read/write round trip, see the module doc comment on
-// that field), a single block group, and free-count fields computed to
-// exactly match what's actually marked used — so `reconcile_free_counts`
-// and `reclaim_orphans` both find nothing to repair on a fresh mount,
-// exactly like a real freshly-`mke2fs`'d image would.
-//
-// Layout (1024-byte blocks):
-//   block 0        — boot block (unused)
-//   block 1        — superblock          (first_data_block)
-//   block 2        — block group descriptor table (1 group fits in 1 block)
-//   block 3        — block bitmap
-//   block 4        — inode bitmap
-//   blocks 5..=20  — inode table (128 inodes * 128 bytes = 16 blocks)
-//   block 21       — root directory data ("." and ".." only)
-//   blocks 22..255 — free data blocks (234 of them — plenty for a test that
-//                    creates a handful of files/dirs)
-#[cfg(test)]
-pub(crate) fn build_minimal_image() -> Vec<u8> {
-    const BLOCK_SIZE: u32 = 1024;
-    const TOTAL_BLOCKS: u32 = 256; // 256 KiB image
-    const INODES_COUNT: u32 = 128;
-    const INODE_SIZE: u32 = 128; // rev 0, fixed
-    const FIRST_DATA_BLOCK: u32 = 1; // always 1 when block_size == 1024
-    const BGDT_BLOCK: u32 = FIRST_DATA_BLOCK + 1;
-    const BLOCK_BITMAP_BLOCK: u32 = 3;
-    const INODE_BITMAP_BLOCK: u32 = 4;
-    const INODE_TABLE_START: u32 = 5;
-
-    let inodes_per_block = BLOCK_SIZE / INODE_SIZE; // 8
-    let inode_table_blocks = (INODES_COUNT + inodes_per_block - 1) / inodes_per_block; // 16
-    let root_data_block = INODE_TABLE_START + inode_table_blocks; // 21
-
-    let mut img = alloc::vec![0u8; (TOTAL_BLOCKS * BLOCK_SIZE) as usize];
-    let put_block = |img: &mut Vec<u8>, block_num: u32, data: &[u8]| {
-        let off = (block_num * BLOCK_SIZE) as usize;
-        img[off..off + data.len()].copy_from_slice(data);
-    };
-
-    // Every block from FIRST_DATA_BLOCK..=root_data_block is metadata the
-    // block bitmap must mark used; group 0 covers all of `blocks_count`
-    // here (a single group), so this is also the group's whole "used"
-    // footprint before any test writes happen.
-    let used_block_bits = root_data_block - FIRST_DATA_BLOCK + 1; // 21
-    let blocks_per_group = TOTAL_BLOCKS; // one group covers the whole image
-    let blocks_in_group0 = TOTAL_BLOCKS - FIRST_DATA_BLOCK; // 255 (block 0 excluded)
-    let free_blocks = blocks_in_group0 - used_block_bits;
-    let free_inodes = INODES_COUNT - 1; // only root (ino 2) is used
-
-    // ── Superblock (lives at block FIRST_DATA_BLOCK, i.e. byte 1024) ──
-    let mut sb = alloc::vec![0u8; BLOCK_SIZE as usize];
-    sb[0..4].copy_from_slice(&INODES_COUNT.to_le_bytes());
-    sb[4..8].copy_from_slice(&TOTAL_BLOCKS.to_le_bytes());
-    sb[12..16].copy_from_slice(&free_blocks.to_le_bytes());
-    sb[16..20].copy_from_slice(&free_inodes.to_le_bytes());
-    sb[20..24].copy_from_slice(&FIRST_DATA_BLOCK.to_le_bytes());
-    sb[24..28].copy_from_slice(&0u32.to_le_bytes()); // s_log_block_size = 0 -> 1024-byte blocks
-    sb[32..36].copy_from_slice(&blocks_per_group.to_le_bytes());
-    sb[40..44].copy_from_slice(&INODES_COUNT.to_le_bytes()); // inodes_per_group (1 group)
-    sb[56..58].copy_from_slice(&EXT2_MAGIC.to_le_bytes());
-    // s_rev_level (offset 76) left at 0 (rev 0) — see doc comment above for
-    // why that's the simplest valid choice here.
-    put_block(&mut img, FIRST_DATA_BLOCK, &sb);
-
-    // ── Block group descriptor (block BGDT_BLOCK, offset 0 — only 1 group) ──
-    let mut bgd = alloc::vec![0u8; 32];
-    bgd[0..4].copy_from_slice(&BLOCK_BITMAP_BLOCK.to_le_bytes());
-    bgd[4..8].copy_from_slice(&INODE_BITMAP_BLOCK.to_le_bytes());
-    bgd[8..12].copy_from_slice(&INODE_TABLE_START.to_le_bytes());
-    bgd[12..14].copy_from_slice(&(free_blocks as u16).to_le_bytes());
-    bgd[14..16].copy_from_slice(&(free_inodes as u16).to_le_bytes());
-    bgd[16..18].copy_from_slice(&1u16.to_le_bytes()); // bg_used_dirs_count (root)
-    let mut bgdt_block_buf = alloc::vec![0u8; BLOCK_SIZE as usize];
-    bgdt_block_buf[0..32].copy_from_slice(&bgd);
-    put_block(&mut img, BGDT_BLOCK, &bgdt_block_buf);
-
-    // ── Block bitmap: bits 0..used_block_bits (blocks FIRST_DATA_BLOCK..=root_data_block) ──
-    let mut block_bitmap = alloc::vec![0u8; BLOCK_SIZE as usize];
-    for bit in 0..used_block_bits {
-        block_bitmap[(bit / 8) as usize] |= 1u8 << (bit % 8);
-    }
-    put_block(&mut img, BLOCK_BITMAP_BLOCK, &block_bitmap);
-
-    // ── Inode bitmap: only ino 2 (root) is used ──
-    let mut inode_bitmap = alloc::vec![0u8; BLOCK_SIZE as usize];
-    inode_bitmap[0] |= 1u8 << (ROOT_INO - 1); // ino is 1-based; bit 0 = ino 1
-    put_block(&mut img, INODE_BITMAP_BLOCK, &inode_bitmap);
-
-    // ── Inode table: root's record only, everything else zeroed ──
-    let mut root_raw = RawInode::zeroed(INODE_SIZE as usize);
-    root_raw.set_i_mode(0x4000 | 0o755);
-    root_raw.set_links_count(2); // "." + being a directory's own self-link
-    root_raw.set_i_block(0, root_data_block);
-    root_raw.set_size(BLOCK_SIZE as u64);
-    root_raw.set_blocks_512(BLOCK_SIZE / SECTOR_SIZE as u32);
-
-    let index_in_group = ROOT_INO - 1; // 1
-    let table_block = INODE_TABLE_START + index_in_group / inodes_per_block;
-    let offset_in_block = ((index_in_group % inodes_per_block) * INODE_SIZE) as usize;
-    let mut table_block_buf = alloc::vec![0u8; BLOCK_SIZE as usize];
-    table_block_buf[offset_in_block..offset_in_block + INODE_SIZE as usize]
-        .copy_from_slice(&root_raw.buf);
-    put_block(&mut img, table_block, &table_block_buf);
-
-    // ── Root directory data: "." and ".." (both -> ROOT_INO, root has no parent) ──
-    let mut root_dir = alloc::vec![0u8; BLOCK_SIZE as usize];
-    let dot_len = dirent_len(1);
-    write_dirent(&mut root_dir[0..dot_len], ROOT_INO, dot_len as u16, ".", FileType::Directory);
-    let remaining = BLOCK_SIZE as usize - dot_len;
-    write_dirent(&mut root_dir[dot_len..dot_len + remaining], ROOT_INO, remaining as u16, "..", FileType::Directory);
-    put_block(&mut img, root_data_block, &root_dir);
-
-    img
-}
-
-// ── Test-only: a minimal image with two orphans baked in ───────────────────
-//
-// Backs `hw_tests.rs`'s diagnostic for whether `reclaim_orphans` actually
-// closes the gap `e2fsck -fn disk.img` reports against the real disk (an
-// inode + a block marked used in the bitmaps with nothing reachable from
-// root pointing at them) — without ever touching that disk. Same base
-// layout as `build_minimal_image` (see its doc comment for the block map),
-// extended with two more inodes/data-blocks marked used in the bitmaps but
-// **not** linked from root's directory data — i.e. deliberately orphaned
-// by construction, the same shape an interrupted write or an out-of-band
-// tool (`debugfs -w`) can leave behind:
-//
-//   - ino `ORPHAN_FILE_INO` (20): a plain regular file with one data
-//     block — the simplest possible orphan.
-//   - ino `ORPHAN_DIR_INO` (31 — deliberately the same inode number
-//     `e2fsck -fn disk.img` reported disconnected, so this reproduces that
-//     report's exact shape, not just "some orphan"): a *directory* whose
-//     own data block has "." pointing at itself and ".." pointing at root
-//     (ino 2), exactly like a real subdirectory — but with no directory
-//     entry anywhere under root pointing back at it. This is the precise
-//     on-disk shape behind e2fsck's report: "El directorio del nodo-i 31
-//     está desconectado (estaba en /)" + "'..' ... es / (2) y debería ser
-//     <El nodo-i NULO> (0)".
-//
-// Both orphan inodes/blocks live in table/data regions `build_minimal_image`
-// already reserves as valid-but-unused (inode table blocks 5..=20, free
-// data blocks from 22 on), so no metadata region needs resizing. The
-// superblock/BGD free-block/free-inode counters are set to already agree
-// with the bitmaps as modified here (root + 2 orphan inodes used; root +
-// both orphan data blocks used) — deliberately isolating what's under test
-// to `reclaim_orphans` alone. `reconcile_free_counts` already has its own
-// coverage via `build_minimal_image`'s normal use in
-// `ext2_memdisk_roundtrip`.
-#[cfg(test)]
-/// Regular-file orphan inode number baked into `build_image_with_orphans`:
-/// unreachable from root, no directory entry anywhere points at it.
-pub(crate) const ORPHAN_FILE_INO: u32 = 20;
-#[cfg(test)]
-/// Directory orphan inode number baked into `build_image_with_orphans`:
-/// matches the exact inode number from the real `e2fsck -fn disk.img`
-/// report (see that function's doc comment).
-pub(crate) const ORPHAN_DIR_INO: u32 = 31;
-#[cfg(test)]
-/// Data block backing `ORPHAN_FILE_INO`, marked used in the block bitmap
-/// with nothing under root pointing at it.
-pub(crate) const ORPHAN_FILE_BLOCK: u32 = 22;
-#[cfg(test)]
-/// Data block backing `ORPHAN_DIR_INO`'s own "."/".." directory data.
-pub(crate) const ORPHAN_DIR_BLOCK: u32 = 23;
-#[cfg(test)]
-/// The *actual* shape found by reproducing the real `debugfs -w mkdir`
-/// leak this module's doc comment on `build_image_with_orphans`
-/// describes: a real, fully-formed directory inode (mode/links/block
-/// pointer all set, a real "."/".."->root data block written) that is
-/// disconnected from root the same way `ORPHAN_DIR_INO` is — but with its
-/// inode-bitmap bit and block-bitmap bit both left **clear** (i.e.
-/// "free"), not set. This is the opposite polarity from
-/// `ORPHAN_FILE_INO`/`ORPHAN_DIR_INO` above, and it is deliberately
-/// outside what `reclaim_orphans`'s sweep can touch: that sweep only ever
-/// *clears* a bit that starts out set (see its inner loop's `if ... == 0
-/// { continue; }` skip on an already-clear bit) — a bit that's already
-/// clear, no matter what stale content sits behind it, is invisible to
-/// it by construction, not by omission.
-pub(crate) const PHANTOM_DIR_INO: u32 = 45;
-#[cfg(test)]
-/// Data block backing `PHANTOM_DIR_INO`'s own "."/".." directory data —
-/// real content, bitmap bit left clear (see `PHANTOM_DIR_INO`).
-pub(crate) const PHANTOM_DIR_BLOCK: u32 = 24;
-
-/// Set bit `n` (0-based) in a byte-packed bitmap — used only by
-/// `build_image_with_orphans` below to hand-construct its block/inode
-/// bitmaps. The equivalent (and, since migration step 5, the *only*
-/// production) copy of this helper now lives in `ext2::repair` — this one
-/// stays here, `#[cfg(test)]`-only, purely because `ext2::repair`'s copy is
-/// `pub(crate)` to that crate, not visible from here, and this file's own
-/// `build_image_with_orphans` is itself an accepted, `#[cfg(test)]`-only
-/// duplicate of `ext2::test_support`'s copy of the same fixture (see that
-/// function's doc comment for why both exist).
-#[cfg(test)]
-fn mark_bit(bitmap: &mut [u8], n: u32) {
-    let byte = (n / 8) as usize;
-    if byte < bitmap.len() {
-        bitmap[byte] |= 1u8 << (n % 8);
-    }
-}
-
-/// Same as `mark_bit`, but for a 1-based inode number (real ext2's own
-/// convention — inode 0 doesn't exist, inode 1 is bit 0). Same
-/// test-only-duplicate rationale as `mark_bit` above.
-#[cfg(test)]
-fn mark_bit_1based(bitmap: &mut [u8], ino: u32) {
-    if ino >= 1 {
-        mark_bit(bitmap, ino - 1);
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn build_image_with_orphans() -> Vec<u8> {
-    const BLOCK_SIZE: u32 = 1024;
-    const TOTAL_BLOCKS: u32 = 256;
-    const INODES_COUNT: u32 = 128;
-    const INODE_SIZE: u32 = 128;
-    const FIRST_DATA_BLOCK: u32 = 1;
-    const BGDT_BLOCK: u32 = FIRST_DATA_BLOCK + 1;
-    const BLOCK_BITMAP_BLOCK: u32 = 3;
-    const INODE_BITMAP_BLOCK: u32 = 4;
-    const INODE_TABLE_START: u32 = 5;
-
-    let inodes_per_block = BLOCK_SIZE / INODE_SIZE; // 8
-    let inode_table_blocks = (INODES_COUNT + inodes_per_block - 1) / inodes_per_block; // 16
-    let root_data_block = INODE_TABLE_START + inode_table_blocks; // 21
-    let orphan_file_block = ORPHAN_FILE_BLOCK;
-    let orphan_dir_block = ORPHAN_DIR_BLOCK;
-    debug_assert_eq!(orphan_file_block, root_data_block + 1);
-    debug_assert_eq!(orphan_dir_block, root_data_block + 2);
-
-    let mut img = alloc::vec![0u8; (TOTAL_BLOCKS * BLOCK_SIZE) as usize];
-    let put_block = |img: &mut Vec<u8>, block_num: u32, data: &[u8]| {
-        let off = (block_num * BLOCK_SIZE) as usize;
-        img[off..off + data.len()].copy_from_slice(data);
-    };
-
-    // root's own metadata footprint (same as build_minimal_image), plus
-    // the two orphan data blocks.
-    let used_block_bits = root_data_block - FIRST_DATA_BLOCK + 1; // 21
-    let blocks_per_group = TOTAL_BLOCKS;
-    let blocks_in_group0 = TOTAL_BLOCKS - FIRST_DATA_BLOCK; // 255
-    let free_blocks = blocks_in_group0 - used_block_bits - 2; // minus both orphan blocks
-    let free_inodes = INODES_COUNT - 1 - 2; // minus root and both orphan inodes
-
-    // ── Superblock ──
-    let mut sb = alloc::vec![0u8; BLOCK_SIZE as usize];
-    sb[0..4].copy_from_slice(&INODES_COUNT.to_le_bytes());
-    sb[4..8].copy_from_slice(&TOTAL_BLOCKS.to_le_bytes());
-    sb[12..16].copy_from_slice(&free_blocks.to_le_bytes());
-    sb[16..20].copy_from_slice(&free_inodes.to_le_bytes());
-    sb[20..24].copy_from_slice(&FIRST_DATA_BLOCK.to_le_bytes());
-    sb[24..28].copy_from_slice(&0u32.to_le_bytes());
-    sb[32..36].copy_from_slice(&blocks_per_group.to_le_bytes());
-    sb[40..44].copy_from_slice(&INODES_COUNT.to_le_bytes());
-    sb[56..58].copy_from_slice(&EXT2_MAGIC.to_le_bytes());
-    put_block(&mut img, FIRST_DATA_BLOCK, &sb);
-
-    // ── Block group descriptor ──
-    let mut bgd = alloc::vec![0u8; 32];
-    bgd[0..4].copy_from_slice(&BLOCK_BITMAP_BLOCK.to_le_bytes());
-    bgd[4..8].copy_from_slice(&INODE_BITMAP_BLOCK.to_le_bytes());
-    bgd[8..12].copy_from_slice(&INODE_TABLE_START.to_le_bytes());
-    bgd[12..14].copy_from_slice(&(free_blocks as u16).to_le_bytes());
-    bgd[14..16].copy_from_slice(&(free_inodes as u16).to_le_bytes());
-    // bg_used_dirs_count: root + the orphan directory (it IS a directory
-    // on disk, even though nothing links to it — a real mke2fs/e2fsck
-    // would count it here too).
-    bgd[16..18].copy_from_slice(&2u16.to_le_bytes());
-    let mut bgdt_block_buf = alloc::vec![0u8; BLOCK_SIZE as usize];
-    bgdt_block_buf[0..32].copy_from_slice(&bgd);
-    put_block(&mut img, BGDT_BLOCK, &bgdt_block_buf);
-
-    // ── Block bitmap: metadata footprint + both orphan data blocks ──
-    let mut block_bitmap = alloc::vec![0u8; BLOCK_SIZE as usize];
-    for bit in 0..used_block_bits {
-        block_bitmap[(bit / 8) as usize] |= 1u8 << (bit % 8);
-    }
-    mark_bit(&mut block_bitmap, orphan_file_block - FIRST_DATA_BLOCK);
-    mark_bit(&mut block_bitmap, orphan_dir_block - FIRST_DATA_BLOCK);
-    put_block(&mut img, BLOCK_BITMAP_BLOCK, &block_bitmap);
-
-    // ── Inode bitmap: root + both orphans ──
-    let mut inode_bitmap = alloc::vec![0u8; BLOCK_SIZE as usize];
-    inode_bitmap[0] |= 1u8 << (ROOT_INO - 1);
-    mark_bit_1based(&mut inode_bitmap, ORPHAN_FILE_INO);
-    mark_bit_1based(&mut inode_bitmap, ORPHAN_DIR_INO);
-    put_block(&mut img, INODE_BITMAP_BLOCK, &inode_bitmap);
-
-    // Helper: write one inode record into whatever inode-table block it
-    // belongs to (each orphan lands in its own previously-all-zero table
-    // block here, so a single put_block of that whole block is enough —
-    // same pattern build_minimal_image uses for root's own record).
-    let write_inode_record = |img: &mut Vec<u8>, ino: u32, raw: &RawInode| {
-        let index_in_group = ino - 1;
-        let table_block = INODE_TABLE_START + index_in_group / inodes_per_block;
-        let offset_in_block = ((index_in_group % inodes_per_block) * INODE_SIZE) as usize;
-        let mut table_block_buf = alloc::vec![0u8; BLOCK_SIZE as usize];
-        table_block_buf[offset_in_block..offset_in_block + INODE_SIZE as usize]
-            .copy_from_slice(&raw.buf);
-        put_block(img, table_block, &table_block_buf);
-    };
-
-    // ── Root's own inode + directory data (identical to build_minimal_image) ──
-    let mut root_raw = RawInode::zeroed(INODE_SIZE as usize);
-    root_raw.set_i_mode(0x4000 | 0o755);
-    root_raw.set_links_count(2);
-    root_raw.set_i_block(0, root_data_block);
-    root_raw.set_size(BLOCK_SIZE as u64);
-    root_raw.set_blocks_512(BLOCK_SIZE / SECTOR_SIZE as u32);
-    write_inode_record(&mut img, ROOT_INO, &root_raw);
-
-    let mut root_dir = alloc::vec![0u8; BLOCK_SIZE as usize];
-    let dot_len = dirent_len(1);
-    write_dirent(&mut root_dir[0..dot_len], ROOT_INO, dot_len as u16, ".", FileType::Directory);
-    let remaining = BLOCK_SIZE as usize - dot_len;
-    write_dirent(&mut root_dir[dot_len..dot_len + remaining], ROOT_INO, remaining as u16, "..", FileType::Directory);
-    // Deliberately NOT adding entries for either orphan here — that
-    // omission is exactly what makes them orphans.
-    put_block(&mut img, root_data_block, &root_dir);
-
-    // ── Orphan regular file: ino 20, one data block, no directory entry ──
-    let mut file_raw = RawInode::zeroed(INODE_SIZE as usize);
-    file_raw.set_i_mode(0x8000 | 0o644);
-    file_raw.set_links_count(1);
-    file_raw.set_i_block(0, orphan_file_block);
-    file_raw.set_size(BLOCK_SIZE as u64);
-    file_raw.set_blocks_512(BLOCK_SIZE / SECTOR_SIZE as u32);
-    write_inode_record(&mut img, ORPHAN_FILE_INO, &file_raw);
-    // Data block content is irrelevant to the reachability question —
-    // leave it zeroed (already is).
-
-    // ── Orphan directory: ino 31, "." -> self, ".." -> root, no entry
-    // anywhere under root pointing at it ──
-    let mut dir_raw = RawInode::zeroed(INODE_SIZE as usize);
-    dir_raw.set_i_mode(0x4000 | 0o755);
-    dir_raw.set_links_count(2); // "." + its own directory-ness, same as root
-    dir_raw.set_i_block(0, orphan_dir_block);
-    dir_raw.set_size(BLOCK_SIZE as u64);
-    dir_raw.set_blocks_512(BLOCK_SIZE / SECTOR_SIZE as u32);
-    write_inode_record(&mut img, ORPHAN_DIR_INO, &dir_raw);
-
-    let mut orphan_dir_data = alloc::vec![0u8; BLOCK_SIZE as usize];
-    write_dirent(&mut orphan_dir_data[0..dot_len], ORPHAN_DIR_INO, dot_len as u16, ".", FileType::Directory);
-    write_dirent(&mut orphan_dir_data[dot_len..dot_len + remaining], ROOT_INO, remaining as u16, "..", FileType::Directory);
-    put_block(&mut img, orphan_dir_block, &orphan_dir_data);
-
-    // ── Phantom directory: same disconnected shape as ORPHAN_DIR_INO —
-    // real inode-table record + real "."/".."->root data block — but
-    // *neither* bitmap bit is set, reproducing the actual shape found by
-    // empirically reproducing the real `debugfs -w`/`mkdir` leak (see
-    // PHANTOM_DIR_INO's doc comment): `ext2fs_mkdir2()` writes the new
-    // inode record and its directory data block before it ever attempts
-    // to link the name into the parent, and its EEXIST error path leaves
-    // that already-written content behind WITHOUT ever marking either
-    // bitmap bit — the opposite polarity from a crash-interrupted normal
-    // allocation, which sets the bitmap bit before/while writing content.
-    let mut phantom_raw = RawInode::zeroed(INODE_SIZE as usize);
-    phantom_raw.set_i_mode(0x4000 | 0o755);
-    phantom_raw.set_links_count(2);
-    phantom_raw.set_i_block(0, PHANTOM_DIR_BLOCK);
-    phantom_raw.set_size(BLOCK_SIZE as u64);
-    phantom_raw.set_blocks_512(BLOCK_SIZE / SECTOR_SIZE as u32);
-    write_inode_record(&mut img, PHANTOM_DIR_INO, &phantom_raw);
-
-    let mut phantom_dir_data = alloc::vec![0u8; BLOCK_SIZE as usize];
-    write_dirent(&mut phantom_dir_data[0..dot_len], PHANTOM_DIR_INO, dot_len as u16, ".", FileType::Directory);
-    write_dirent(&mut phantom_dir_data[dot_len..dot_len + remaining], ROOT_INO, remaining as u16, "..", FileType::Directory);
-    put_block(&mut img, PHANTOM_DIR_BLOCK, &phantom_dir_data);
-    // Deliberately NOT marking PHANTOM_DIR_INO/PHANTOM_DIR_BLOCK used in
-    // either bitmap, and NOT accounted for in free_blocks/free_inodes
-    // above — the bitmaps already (accidentally) agree this is "free",
-    // which is exactly the point.
-
-    img
-}
-
-/// Test-only: mount a `BlockDevice` as a *standalone* `Ext2Fs`, entirely
-/// bypassing the `EXT2` global `Once` (see `init_with_device`'s doc
-/// comment for why that global exists and what it costs a test that needs
-/// more than one fresh mount per QEMU boot). `ext2_memdisk_roundtrip`
-/// (`hw_tests.rs`) drives the real VFS through the global and that's the
-/// right tool for exercising the read-write path end to end — but a test
-/// that specifically wants to inspect *this* image's own bitmap state
-/// before and after `reclaim_orphans`/`reconcile_free_counts`, independent
-/// of whatever the global happens to hold from another test case in the
-/// same boot, needs its own private `Ext2Fs` instead. Never used by
-/// production code (`init()`/`init_with_device()`/`mount_and_repair()` are
-/// untouched by this) — `#[cfg(test)]`, same gate as `init_with_device`.
-///
-/// Deliberately does NOT call `reconcile_free_counts`/`reclaim_orphans`
-/// itself the way `mount_and_repair` does — the caller drives those
-/// explicitly so it can observe bitmap/counter state at each step.
-#[cfg(test)]
-pub(crate) struct TestFs(Ext2Fs);
-
-#[cfg(test)]
-impl TestFs {
-    pub(crate) fn mount(device: Box<dyn BlockDevice>) -> Result<Self, &'static str> {
-        Ext2Fs::mount(device).map(TestFs)
-    }
-
-    pub(crate) fn reconcile_free_counts(&self) -> Result<(), Errno> {
-        self.0.reconcile_free_counts()
-    }
-
-    pub(crate) fn reclaim_orphans(&self) -> Result<(), Errno> {
-        self.0.reclaim_orphans()
-    }
-
-    // All six accessors below are thin wrappers over `ext2::Ext2Core`
-    // (migration step 5 — see the "ext2 core crate" note near the top of
-    // this file): moved verbatim, same on-disk reads, no behavior change.
-    // Kept on `TestFs` rather than called directly as `self.0.core....` at
-    // each `hw_tests.rs` call site purely so that file doesn't need to
-    // change at all.
-
-    /// Whether `ino` (1-based) is marked used in its group's on-disk
-    /// inode bitmap right now.
-    pub(crate) fn inode_used(&self, ino: u32) -> Result<bool, Errno> {
-        self.0.core.inode_used(ino).map_err(Into::into)
-    }
-
-    /// Whether `block` (absolute block number) is marked used in its
-    /// group's on-disk block bitmap right now.
-    pub(crate) fn block_used(&self, block: u32) -> Result<bool, Errno> {
-        self.0.core.block_used(block).map_err(Into::into)
-    }
-
-    /// Raw `i_mode` of `ino`'s on-disk inode record, read directly (not
-    /// gated on the bitmap at all) — lets a test prove a "phantom" inode's
-    /// real content (mode/links/block pointer) is still sitting there
-    /// untouched after a repair pass that, by design, never looks at
-    /// content behind an already-clear bitmap bit.
-    pub(crate) fn inode_mode(&self, ino: u32) -> Result<u16, Errno> {
-        self.0.core.inode_mode(ino).map_err(Into::into)
-    }
-
-    /// `(free_blocks, free_inodes)` straight off the on-disk superblock.
-    pub(crate) fn sb_free_counts(&self) -> Result<(u32, u32), Errno> {
-        self.0.core.sb_free_counts().map_err(Into::into)
-    }
-
-    /// `(free_blocks, free_inodes)` straight off group `group`'s on-disk
-    /// BGD entry.
-    pub(crate) fn bgd_free_counts(&self, group: u32) -> Result<(u16, u16), Errno> {
-        self.0.core.bgd_free_counts(group).map_err(Into::into)
-    }
-
-    /// Recompute the *true* free block/inode counts directly from the
-    /// bitmaps (same formula `reconcile_free_counts` uses internally) —
-    /// lets a test assert the on-disk counters are self-consistent with
-    /// the bitmaps, not just with what the test expects.
-    pub(crate) fn true_free_counts_group0(&self) -> Result<(u16, u16), Errno> {
-        self.0.core.true_free_counts_group0().map_err(Into::into)
-    }
 }

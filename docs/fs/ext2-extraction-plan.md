@@ -1,8 +1,20 @@
 # Plan: extraer `fs::ext2` a un crate host-testeable
 
-Estado: **plan, sin empezar.** Escrito 2026-07-23, tras cerrar el seam
-`hal::block::BlockDevice` (commit `dd2463d`) y descartar el falso bug de
-`reclaim_orphans` (`0f16839`, `fdc9f11`).
+> **Estado: COMPLETADO** (2026-07-24). Los 6 pasos de la migración están
+> hechos: 1-2 en `47f65aa`, 3 en `1e0f22a`, 4 en `0e48928`, 5 en `3c72370`,
+> y 6 (consolidar los image builders de test en `ext2::testimg`, borrar
+> `TestFs` del kernel, y podar los wrappers de `Ext2Fs` que quedaron sin
+> uso) sin commitear todavía al momento de escribir esta nota.
+> `kernel/src/fs/ext2.rs` es ya el adaptador VFS puro descrito más abajo en
+> "Forma final" — el core (layout on-disk, bitmaps, indirectos, dirents,
+> symlinks, mount/repair) vive entero en el crate `ext2/`, con 89 tests de
+> host (`cd ext2 && cargo test`). Ver el doc comment de `ext2/src/lib.rs`
+> para el detalle línea por línea de qué vive dónde.
+
+Estado original del plan (histórico, ver nota arriba): **plan, sin
+empezar.** Escrito 2026-07-23, tras cerrar el seam `hal::block::BlockDevice`
+(commit `dd2463d`) y descartar el falso bug de `reclaim_orphans`
+(`0f16839`, `fdc9f11`).
 
 ## Por qué
 

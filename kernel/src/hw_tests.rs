@@ -32,7 +32,7 @@ fn acpi_selftest_passes() {
 /// Case 2: the storage-stack seam (`hal::block::BlockDevice`, see
 /// `hal/src/block.rs`, `kernel/src/block/mod.rs`, and
 /// `docs/drivers/architecture.md`'s storage-stack section). Mounts a
-/// hand-built minimal ext2 image (`fs::ext2::build_minimal_image` — no
+/// hand-built minimal ext2 image (`ext2::testimg::build_minimal_image` — no
 /// `mke2fs`/host-tool dependency, no real disk touched at all) on a
 /// `hal::block::MemDisk`, then drives create/write/read/mkdir/rename/
 /// symlink/unlink/rmdir through the same real VFS free functions
@@ -57,7 +57,7 @@ fn ext2_memdisk_roundtrip() {
     use crate::fs::types::OpenFlags;
     use crate::process::file::FileHandle;
 
-    let image = crate::fs::ext2::build_minimal_image();
+    let image = ext2::testimg::build_minimal_image();
     let device: Box<dyn BlockDevice> = Box::new(MemDisk::from_vec(image));
     crate::fs::ext2::init_with_device(device)
         .expect("mounting ext2 on a freshly hand-built MemDisk image should succeed");
@@ -186,49 +186,54 @@ fn ext2_memdisk_roundtrip() {
 /// ("frees any block/inode the bitmaps mark used that the walk never
 /// reached" — shape 2 isn't marked used to begin with).
 ///
-/// Uses `fs::ext2::TestFs` (mounts a private `Ext2Fs`, bypassing the
-/// `EXT2` global `Once`) rather than `init_with_device`/the VFS —
-/// `ext2_memdisk_roundtrip` above already claimed the global for this
-/// boot, and a second `init_with_device()` call would silently no-op
-/// instead of mounting this fresh image (see that function's doc
-/// comment). This also means this test needs no VFS mount at all: it only
-/// cares about on-disk bitmap/counter state before and after
-/// `reclaim_orphans`, not filesystem operations through it.
+/// Mounts a standalone `ext2::Ext2Core` directly (bypassing the kernel's
+/// `EXT2` global `Once` and the VFS entirely) rather than
+/// `init_with_device`/the VFS — `ext2_memdisk_roundtrip` above already
+/// claimed the global for this boot, and a second `init_with_device()`
+/// call would silently no-op instead of mounting this fresh image (see
+/// that function's doc comment). This also means this test needs no VFS
+/// mount at all: it only cares about on-disk bitmap/counter state before
+/// and after `reclaim_orphans`, not filesystem operations through it. Prior
+/// to the ext2-extraction-plan step 6 cleanup this went through a
+/// kernel-local `fs::ext2::TestFs` wrapper around a private `Ext2Fs`; that
+/// wrapper's methods were all thin pass-throughs to `ext2::Ext2Core` (the
+/// same type this test mounts now), so removing it changes nothing about
+/// what's being exercised.
 #[test_case]
 fn ext2_reclaim_orphans_clears_injected_disk_img_shape() {
     use alloc::boxed::Box;
     use crate::block::{BlockDevice, MemDisk};
-    use crate::fs::ext2::{
-        self, ORPHAN_DIR_BLOCK, ORPHAN_DIR_INO, ORPHAN_FILE_BLOCK, ORPHAN_FILE_INO,
-        PHANTOM_DIR_BLOCK, PHANTOM_DIR_INO,
+    use ext2::testimg::{
+        build_image_with_orphans, ORPHAN_DIR_BLOCK, ORPHAN_DIR_INO, ORPHAN_FILE_BLOCK,
+        ORPHAN_FILE_INO, PHANTOM_DIR_BLOCK, PHANTOM_DIR_INO,
     };
 
-    let image = ext2::build_image_with_orphans();
+    let image = build_image_with_orphans();
     let device: Box<dyn BlockDevice> = Box::new(MemDisk::from_vec(image));
-    let fs = ext2::TestFs::mount(device)
+    let core = ext2::Ext2Core::mount(device)
         .expect("mounting the hand-built orphan image should succeed");
 
     // Sanity: the image really does start with both orphans marked used —
     // if this fails, the image builder itself doesn't reproduce the bug
     // shape and the rest of this test is meaningless.
-    assert!(fs.inode_used(ORPHAN_FILE_INO).unwrap(), "orphan file inode must start marked used");
-    assert!(fs.block_used(ORPHAN_FILE_BLOCK).unwrap(), "orphan file block must start marked used");
-    assert!(fs.inode_used(ORPHAN_DIR_INO).unwrap(), "orphan dir inode (31) must start marked used");
-    assert!(fs.block_used(ORPHAN_DIR_BLOCK).unwrap(), "orphan dir block must start marked used");
+    assert!(core.inode_used(ORPHAN_FILE_INO).unwrap(), "orphan file inode must start marked used");
+    assert!(core.block_used(ORPHAN_FILE_BLOCK).unwrap(), "orphan file block must start marked used");
+    assert!(core.inode_used(ORPHAN_DIR_INO).unwrap(), "orphan dir inode (31) must start marked used");
+    assert!(core.block_used(ORPHAN_DIR_BLOCK).unwrap(), "orphan dir block must start marked used");
 
     // Sanity for the phantom shape: bitmap bits already clear (free) even
     // though real directory content sits behind them.
-    assert!(!fs.inode_used(PHANTOM_DIR_INO).unwrap(), "phantom dir inode must start marked FREE despite real content");
-    assert!(!fs.block_used(PHANTOM_DIR_BLOCK).unwrap(), "phantom dir block must start marked FREE despite real content");
-    let phantom_mode_before = fs.inode_mode(PHANTOM_DIR_INO).unwrap();
+    assert!(!core.inode_used(PHANTOM_DIR_INO).unwrap(), "phantom dir inode must start marked FREE despite real content");
+    assert!(!core.block_used(PHANTOM_DIR_BLOCK).unwrap(), "phantom dir block must start marked FREE despite real content");
+    let phantom_mode_before = core.inode_mode(PHANTOM_DIR_INO).unwrap();
     assert_eq!(phantom_mode_before, 0x4000 | 0o755, "phantom inode record must start with real directory content");
 
     // The image is built with free-count fields already consistent with
     // the (orphan-including) bitmaps, so this should be a no-op — isolates
     // what's under test to reclaim_orphans, not reconcile_free_counts.
-    fs.reconcile_free_counts().expect("reconcile_free_counts should succeed against a consistent image");
-    let (sb_free_blocks_before, sb_free_inodes_before) = fs.sb_free_counts().unwrap();
-    let (true_free_blocks_before, true_free_inodes_before) = fs.true_free_counts_group0().unwrap();
+    let _ = core.reconcile_free_counts().expect("reconcile_free_counts should succeed against a consistent image");
+    let (sb_free_blocks_before, sb_free_inodes_before) = core.sb_free_counts().unwrap();
+    let (true_free_blocks_before, true_free_inodes_before) = core.true_free_counts_group0().unwrap();
     assert_eq!(
         sb_free_blocks_before, true_free_blocks_before as u32,
         "reconcile_free_counts should have left the superblock's free-block count matching the bitmap"
@@ -241,12 +246,12 @@ fn ext2_reclaim_orphans_clears_injected_disk_img_shape() {
     // This is the real question: does the mount-time orphan sweep clear
     // an inode 31-shaped orphan (a disconnected directory whose ".."
     // points at root) the same way it clears a plain orphan file?
-    fs.reclaim_orphans().expect("reclaim_orphans should complete without an I/O error against this image");
+    let _ = core.reclaim_orphans().expect("reclaim_orphans should complete without an I/O error against this image");
 
-    assert!(!fs.inode_used(ORPHAN_FILE_INO).unwrap(), "reclaim_orphans should have freed the orphan file inode");
-    assert!(!fs.block_used(ORPHAN_FILE_BLOCK).unwrap(), "reclaim_orphans should have freed the orphan file block");
-    assert!(!fs.inode_used(ORPHAN_DIR_INO).unwrap(), "reclaim_orphans should have freed the orphan dir inode (31)");
-    assert!(!fs.block_used(ORPHAN_DIR_BLOCK).unwrap(), "reclaim_orphans should have freed the orphan dir block");
+    assert!(!core.inode_used(ORPHAN_FILE_INO).unwrap(), "reclaim_orphans should have freed the orphan file inode");
+    assert!(!core.block_used(ORPHAN_FILE_BLOCK).unwrap(), "reclaim_orphans should have freed the orphan file block");
+    assert!(!core.inode_used(ORPHAN_DIR_INO).unwrap(), "reclaim_orphans should have freed the orphan dir inode (31)");
+    assert!(!core.block_used(ORPHAN_DIR_BLOCK).unwrap(), "reclaim_orphans should have freed the orphan dir block");
 
     // Root itself, and its own data block, must NOT have been swept —
     // reclaim_orphans clearing everything (including root) would trivially
@@ -255,16 +260,16 @@ fn ext2_reclaim_orphans_clears_injected_disk_img_shape() {
     // pre-marked reserved before the reachability walk ran made the very
     // first `mark_reachable` call a no-op, so the sweep freed almost
     // everything, root included.
-    assert!(fs.inode_used(2).unwrap(), "root's own inode must still be marked used after reclaim");
-    assert!(fs.block_used(21).unwrap(), "root's own directory data block must still be marked used after reclaim");
+    assert!(core.inode_used(2).unwrap(), "root's own inode must still be marked used after reclaim");
+    assert!(core.block_used(21).unwrap(), "root's own directory data block must still be marked used after reclaim");
 
     // Free counters must reflect the 2 reclaimed inodes / 2 reclaimed
     // blocks, and stay self-consistent with the bitmaps they summarize —
     // reclaim_orphans re-runs reconcile_free_counts internally when it
     // changes anything, so this checks that path too, not just the sweep.
-    let (sb_free_blocks_after, sb_free_inodes_after) = fs.sb_free_counts().unwrap();
-    let (bgd_free_blocks_after, bgd_free_inodes_after) = fs.bgd_free_counts(0).unwrap();
-    let (true_free_blocks_after, true_free_inodes_after) = fs.true_free_counts_group0().unwrap();
+    let (sb_free_blocks_after, sb_free_inodes_after) = core.sb_free_counts().unwrap();
+    let (bgd_free_blocks_after, bgd_free_inodes_after) = core.bgd_free_counts(0).unwrap();
+    let (true_free_blocks_after, true_free_inodes_after) = core.true_free_counts_group0().unwrap();
 
     assert_eq!(sb_free_blocks_after, sb_free_blocks_before + 2, "2 blocks should have been reclaimed");
     assert_eq!(sb_free_inodes_after, sb_free_inodes_before + 2, "2 inodes should have been reclaimed");
@@ -280,10 +285,10 @@ fn ext2_reclaim_orphans_clears_injected_disk_img_shape() {
     // shape. If either assertion below ever fails, `reclaim_orphans`
     // changed behavior in a way that would need re-auditing against this
     // diagnosis.
-    assert!(!fs.inode_used(PHANTOM_DIR_INO).unwrap(), "phantom dir inode must still read as free after reclaim (out of scope for the sweep)");
-    assert!(!fs.block_used(PHANTOM_DIR_BLOCK).unwrap(), "phantom dir block must still read as free after reclaim (out of scope for the sweep)");
+    assert!(!core.inode_used(PHANTOM_DIR_INO).unwrap(), "phantom dir inode must still read as free after reclaim (out of scope for the sweep)");
+    assert!(!core.block_used(PHANTOM_DIR_BLOCK).unwrap(), "phantom dir block must still read as free after reclaim (out of scope for the sweep)");
     assert_eq!(
-        fs.inode_mode(PHANTOM_DIR_INO).unwrap(), phantom_mode_before,
+        core.inode_mode(PHANTOM_DIR_INO).unwrap(), phantom_mode_before,
         "phantom inode's real content must be completely untouched by reclaim_orphans — it never reads a bit it didn't find set"
     );
 }

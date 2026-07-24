@@ -330,11 +330,15 @@ impl Ext2Core {
     //
     // Not gated `#[cfg(test)]`: cheap, read-only bitmap/inode inspection
     // with no on-disk side effects, kept as ordinary `pub fn`s so both this
-    // crate's own host tests (`repair::tests` below) and the kernel's
-    // `#[cfg(test)]`-only `TestFs` wrapper (`kernel/src/fs/ext2.rs`, which
-    // `kernel/src/hw_tests.rs`'s QEMU integration test drives) can call
-    // them directly instead of each keeping its own copy. Moved verbatim
-    // out of what used to be `kernel::fs::ext2::TestFs`'s own methods.
+    // crate's own host tests (`repair::tests` below) and
+    // `kernel/src/hw_tests.rs`'s QEMU integration test (which mounts an
+    // `Ext2Core` directly — see `ext2_reclaim_orphans_clears_injected_
+    // disk_img_shape`) can call them without either side keeping its own
+    // copy. These used to be duplicated on a kernel-local `#[cfg(test)]`
+    // `TestFs` wrapper (`kernel/src/fs/ext2.rs`) that existed purely to
+    // expose them to `hw_tests.rs`; migration step 6
+    // (`docs/fs/ext2-extraction-plan.md`) deleted that wrapper once
+    // `hw_tests.rs` could call these directly on `Ext2Core` instead.
 
     /// Whether `ino` (1-based) is marked used in its group's on-disk
     /// inode bitmap right now.
@@ -434,7 +438,8 @@ fn bit_set_1based(bitmap: &[u8], ino: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{build_image_with_orphans, mount, ORPHAN_DIR_BLOCK, ORPHAN_DIR_INO,
+    use crate::test_support::mount;
+    use crate::testimg::{build_image_with_orphans, ORPHAN_DIR_BLOCK, ORPHAN_DIR_INO,
         ORPHAN_FILE_BLOCK, ORPHAN_FILE_INO, PHANTOM_DIR_BLOCK, PHANTOM_DIR_INO};
     use hal::block::MemDisk;
 
