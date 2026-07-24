@@ -23,4 +23,19 @@ pub enum Ext2Error {
     /// misinterpret `i_block` completely, so mounting refuses outright
     /// rather than guess.
     UnsupportedFeature,
+    /// `Ext2Core::block_for_index_alloc`/`get_or_alloc_ptr`: `alloc_block()`
+    /// returned `Ok(None)` — the filesystem has no free blocks left. Kept
+    /// distinct from `Io` (rather than collapsed into it) because the
+    /// kernel adapter's `From<Ext2Error> for Errno` maps this to
+    /// `Errno::ENOSPC` specifically — `Ext2FileHandle::write` pattern-
+    /// matches on that exact value to report `FileError::NoSpace` instead
+    /// of a generic I/O error, and losing the distinction here would
+    /// silently turn "disk full" into "I/O error" for every caller.
+    NoSpace,
+    /// `Ext2Core::block_for_index_alloc`: `index` is beyond even
+    /// triply-indirect capacity (~16 GiB+ at this driver's 1024-byte block
+    /// size) — genuinely unsupported, not a transient condition. Maps to
+    /// `Errno::EFBIG` in the kernel adapter, same reasoning as `NoSpace`
+    /// above for why this isn't just `Io`.
+    TooLarge,
 }

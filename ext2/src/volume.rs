@@ -2,15 +2,25 @@
 //
 // `Ext2Core` — the device-backed half of migration steps 1 (raw block I/O,
 // needed to actually read/write the superblock/BGD/bitmap bytes the parse
-// functions elsewhere in this crate decode) and 2 (block/inode allocation
-// and freeing, including the block-group-descriptor + superblock free-
-// count bookkeeping). Moved verbatim out of `kernel::fs::ext2::Ext2Fs` —
-// same on-disk format, same write ordering, same error conditions. See the
-// crate doc comment for why every method here takes `&self` rather than
-// splitting `&self`/`&mut self` by read/write.
+// functions elsewhere in this crate decode), 2 (block/inode allocation and
+// freeing, including the block-group-descriptor + superblock free-count
+// bookkeeping), and 3 (inode-table read/write, direct/singly/doubly/triply
+// -indirect block-pointer addressing, and file byte-range read/write).
+// Moved verbatim out of `kernel::fs::ext2::Ext2Fs` — same on-disk format,
+// same write ordering, same error conditions. See the crate doc comment for
+// why every method here takes `&self` rather than splitting `&self`/
+// `&mut self` by read/write.
+//
+// Inode-table read/write (`inode_location`/`read_inode`/`write_inode`)
+// moved as part of step 3, not step 1/2, even though `RawInode` itself
+// (the pure record format) has lived here since step 1 — see that struct's
+// doc comment in `inode.rs`. They weren't needed until `write_file_range`
+// below needed somewhere to persist a growing file's size, and moving them
+// now (rather than leaving them one more layer removed in the kernel
+// adapter) means `write_file_range` can call `self.write_inode(...)`
+// directly, exactly mirroring how it worked before extraction.
 //
 // What is deliberately NOT here (still in `kernel::fs::ext2`, unmigrated):
-// indirect block addressing + file byte-range read/write (step 3),
 // directory operations (step 4), and `mount`'s own repair passes
 // (`reconcile_free_counts`/`reclaim_orphans`, step 5) — `mount` below only
 // parses the superblock and constructs `Self`, matching what
@@ -25,6 +35,7 @@ use hal::block::{BlockDevice, SECTOR_SIZE};
 use crate::bgd::{self, BlockGroupDesc};
 use crate::bitmap;
 use crate::error::Ext2Error;
+use crate::inode::RawInode;
 use crate::superblock::Superblock;
 
 /// The device-backed half of ext2: raw block I/O plus block/inode bitmap
@@ -239,6 +250,374 @@ impl Ext2Core {
         self.write_block(bgd.inode_bitmap, &bmap)?;
         self.adjust_bgd_counts(group, 0, 1, if is_dir { -1 } else { 0 })?;
         self.adjust_sb_counts(0, 1)
+    }
+
+    // ── Inode table ──────────────────────────────────────────────────
+
+    /// Locate the inode table block + byte offset for `ino` — shared by
+    /// `read_inode` and `write_inode` so the two can never disagree about
+    /// where an inode lives.
+    pub fn inode_location(&self, ino: u32) -> Result<(u32, usize), Ext2Error> {
+        // Real check, not `debug_assert!` — this driver trusts `ino`
+        // values read back out of directory entries on disk, so a
+        // corrupted dirent must not reach the `ino - 1` subtraction below
+        // (a `u32` underflow: a panic in debug builds, a wraparound to a
+        // huge-but-in-range-looking group index in release).
+        if ino < 1 || ino > self.sb.inodes_count {
+            return Err(Ext2Error::Io);
+        }
+        let group = (ino - 1) / self.sb.inodes_per_group;
+        if group >= self.sb.num_groups {
+            return Err(Ext2Error::Io);
+        }
+        let index_in_group = (ino - 1) % self.sb.inodes_per_group;
+
+        // Block Group Descriptor for `group` (32 bytes each). bg_inode_table
+        // is the THIRD u32 field (bg_block_bitmap, bg_inode_bitmap, then
+        // bg_inode_table) — +8 bytes into the descriptor, not +0.
+        let (bgd_block, bgd_off) = self.bgd_location(group);
+        let bgd_buf = self.block_vec(bgd_block)?;
+        let inode_table_block = u32::from_le_bytes(bgd_buf[bgd_off + 8..bgd_off + 12].try_into().unwrap());
+
+        let inodes_per_block = self.sb.block_size / self.sb.inode_size as u32;
+        let table_block = inode_table_block + index_in_group / inodes_per_block;
+        let offset_in_block = ((index_in_group % inodes_per_block) * self.sb.inode_size as u32) as usize;
+        Ok((table_block, offset_in_block))
+    }
+
+    /// Read the raw on-disk inode record for `ino`.
+    ///
+    /// `ino` should always be a value read out of this same filesystem (a
+    /// directory entry, or the well-known root inode 2) — bounds-checked
+    /// against the superblock's own counts as a corruption tripwire, not
+    /// because callers are expected to pass arbitrary numbers.
+    pub fn read_inode(&self, ino: u32) -> Result<RawInode, Ext2Error> {
+        let (table_block, offset_in_block) = self.inode_location(ino)?;
+        let block_buf = self.block_vec(table_block)?;
+        Ok(RawInode::parse(&block_buf[offset_in_block..offset_in_block + self.sb.inode_size as usize]))
+    }
+
+    /// Write `raw` back to `ino`'s on-disk inode record. Read-modify-write:
+    /// the inode table block holds several inodes, so the rest of the
+    /// block must survive untouched.
+    pub fn write_inode(&self, ino: u32, raw: &RawInode) -> Result<(), Ext2Error> {
+        let (table_block, offset_in_block) = self.inode_location(ino)?;
+        let mut block_buf = self.block_vec(table_block)?;
+        block_buf[offset_in_block..offset_in_block + self.sb.inode_size as usize].copy_from_slice(&raw.buf);
+        self.write_block(table_block, &block_buf)
+    }
+
+    // ── Block-pointer mapping (read-only lookup) ────────────────────────
+
+    /// Map a file-relative block index to a filesystem block number.
+    /// Direct (0..12), singly-indirect, and doubly-indirect — returns
+    /// `Ok(None)` if the block is a hole (not yet allocated) or beyond what
+    /// this driver supports (see the crate doc comment / module doc
+    /// comment on indirect-block capacity).
+    pub fn block_for_index(&self, raw: &RawInode, index: u32) -> Result<Option<u32>, Ext2Error> {
+        if index < 12 {
+            let b = raw.i_block(index as usize);
+            return Ok(if b == 0 { None } else { Some(b) });
+        }
+        let ptrs_per_block = self.sb.block_size / 4;
+
+        let indirect_index = index - 12;
+        if indirect_index < ptrs_per_block {
+            let indirect_block = raw.i_block(12);
+            if indirect_block == 0 {
+                return Ok(None);
+            }
+            return self.read_block_ptr(indirect_block, indirect_index);
+        }
+
+        let dbl_index = indirect_index - ptrs_per_block;
+        let dbl_capacity = ptrs_per_block * ptrs_per_block;
+        if dbl_index < dbl_capacity {
+            let dbl_indirect_block = raw.i_block(13);
+            if dbl_indirect_block == 0 {
+                return Ok(None);
+            }
+            let first_level_index = dbl_index / ptrs_per_block;
+            let second_level_index = dbl_index % ptrs_per_block;
+            let Some(first_level_block) = self.read_block_ptr(dbl_indirect_block, first_level_index)? else {
+                return Ok(None);
+            };
+            return self.read_block_ptr(first_level_block, second_level_index);
+        }
+
+        let tpl_index = dbl_index - dbl_capacity;
+        let tpl_capacity = dbl_capacity * ptrs_per_block;
+        if tpl_index < tpl_capacity {
+            let tpl_block = raw.i_block(14);
+            if tpl_block == 0 {
+                return Ok(None);
+            }
+            let first_level_index = tpl_index / dbl_capacity;
+            let rem = tpl_index % dbl_capacity;
+            let second_level_index = rem / ptrs_per_block;
+            let third_level_index = rem % ptrs_per_block;
+            let Some(first_level_block) = self.read_block_ptr(tpl_block, first_level_index)? else {
+                return Ok(None);
+            };
+            let Some(second_level_block) = self.read_block_ptr(first_level_block, second_level_index)? else {
+                return Ok(None);
+            };
+            return self.read_block_ptr(second_level_block, third_level_index);
+        }
+
+        Ok(None) // beyond even triply-indirect capacity
+    }
+
+    /// Read the `index`-th block-pointer `u32` out of an indirect (or
+    /// doubly-indirect first-level) pointer block — shared by both levels
+    /// of `block_for_index` above.
+    fn read_block_ptr(&self, block_num: u32, index: u32) -> Result<Option<u32>, Ext2Error> {
+        let buf = self.block_vec(block_num)?;
+        let off = (index * 4) as usize;
+        let b = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        Ok(if b == 0 { None } else { Some(b) })
+    }
+
+    // ── Block-pointer mapping (allocate-on-demand) ──────────────────────
+
+    /// Read (or allocate, if zero) the `index`-th pointer slot in an
+    /// indirect/doubly-indirect pointer block, writing the new pointer back
+    /// immediately — shared by both levels of `block_for_index_alloc`.
+    fn get_or_alloc_ptr(&self, container_block: u32, index: u32) -> Result<u32, Ext2Error> {
+        let mut buf = self.block_vec(container_block)?;
+        let off = (index * 4) as usize;
+        let existing = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        if existing != 0 {
+            return Ok(existing);
+        }
+        let new_block = self.alloc_block()?.ok_or(Ext2Error::NoSpace)?;
+        buf[off..off + 4].copy_from_slice(&new_block.to_le_bytes());
+        self.write_block(container_block, &buf)?;
+        Ok(new_block)
+    }
+
+    /// Like `block_for_index`, but allocates whatever's missing (data
+    /// block, and any indirect/doubly-indirect pointer blocks along the
+    /// way) instead of returning `None`. Mutates `raw`'s direct pointers
+    /// in place — caller is responsible for persisting `raw` afterward.
+    pub fn block_for_index_alloc(&self, raw: &mut RawInode, index: u32) -> Result<u32, Ext2Error> {
+        if index < 12 {
+            let b = raw.i_block(index as usize);
+            if b != 0 {
+                return Ok(b);
+            }
+            let nb = self.alloc_block()?.ok_or(Ext2Error::NoSpace)?;
+            raw.set_i_block(index as usize, nb);
+            return Ok(nb);
+        }
+
+        let ptrs_per_block = self.sb.block_size / 4;
+        let indirect_index = index - 12;
+        if indirect_index < ptrs_per_block {
+            let indirect_block = raw.i_block(12);
+            let indirect_block = if indirect_block == 0 {
+                let nb = self.alloc_block()?.ok_or(Ext2Error::NoSpace)?;
+                raw.set_i_block(12, nb);
+                nb
+            } else {
+                indirect_block
+            };
+            return self.get_or_alloc_ptr(indirect_block, indirect_index);
+        }
+
+        let dbl_index = indirect_index - ptrs_per_block;
+        let dbl_capacity = ptrs_per_block * ptrs_per_block;
+        if dbl_index < dbl_capacity {
+            let dbl_block = raw.i_block(13);
+            let dbl_block = if dbl_block == 0 {
+                let nb = self.alloc_block()?.ok_or(Ext2Error::NoSpace)?;
+                raw.set_i_block(13, nb);
+                nb
+            } else {
+                dbl_block
+            };
+            let first_level_index = dbl_index / ptrs_per_block;
+            let second_level_index = dbl_index % ptrs_per_block;
+            let first_level_block = self.get_or_alloc_ptr(dbl_block, first_level_index)?;
+            return self.get_or_alloc_ptr(first_level_block, second_level_index);
+        }
+
+        let tpl_index = dbl_index - dbl_capacity;
+        let tpl_capacity = dbl_capacity * ptrs_per_block;
+        if tpl_index < tpl_capacity {
+            let tpl_block = raw.i_block(14);
+            let tpl_block = if tpl_block == 0 {
+                let nb = self.alloc_block()?.ok_or(Ext2Error::NoSpace)?;
+                raw.set_i_block(14, nb);
+                nb
+            } else {
+                tpl_block
+            };
+            let first_level_index = tpl_index / dbl_capacity;
+            let rem = tpl_index % dbl_capacity;
+            let second_level_index = rem / ptrs_per_block;
+            let third_level_index = rem % ptrs_per_block;
+            let first_level_block = self.get_or_alloc_ptr(tpl_block, first_level_index)?;
+            let second_level_block = self.get_or_alloc_ptr(first_level_block, second_level_index)?;
+            return self.get_or_alloc_ptr(second_level_block, third_level_index);
+        }
+
+        Err(Ext2Error::TooLarge) // beyond even triply-indirect capacity — genuinely unsupported
+    }
+
+    // ── File data read/write ─────────────────────────────────────────────
+
+    /// Read `buf.len()` bytes of file data starting at byte `offset`.
+    pub fn read_file_range(&self, raw: &RawInode, offset: usize, buf: &mut [u8]) -> Result<(), Ext2Error> {
+        let bs = self.sb.block_size as usize;
+        let mut done = 0;
+        while done < buf.len() {
+            let file_pos = offset + done;
+            let block_index = (file_pos / bs) as u32;
+            let block_off = file_pos % bs;
+            let n = (bs - block_off).min(buf.len() - done);
+
+            match self.block_for_index(raw, block_index)? {
+                Some(block_num) => {
+                    let block_buf = self.block_vec(block_num)?;
+                    buf[done..done + n].copy_from_slice(&block_buf[block_off..block_off + n]);
+                }
+                None => {
+                    // Hole (sparse file) or past what block_for_index supports — zero-fill.
+                    for b in &mut buf[done..done + n] { *b = 0; }
+                }
+            }
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// Write `data` at byte `offset`, allocating whatever blocks are
+    /// needed (including growing the file past its current size — a
+    /// "hole" between the old EOF and `offset` reads back as zeros, same
+    /// as any real sparse file, since unallocated `block_for_index` reads
+    /// already zero-fill). Updates and persists `raw`'s size + on-disk
+    /// inode record before returning.
+    pub fn write_file_range(&self, ino: u32, raw: &mut RawInode, offset: usize, data: &[u8]) -> Result<usize, Ext2Error> {
+        if data.is_empty() {
+            return Ok(0); // true no-op — access(2)'s W_OK probe relies on this
+        }
+
+        let bs = self.sb.block_size as usize;
+        let mut done = 0;
+        while done < data.len() {
+            let file_pos = offset + done;
+            let block_index = (file_pos / bs) as u32;
+            let block_off = file_pos % bs;
+            let n = (bs - block_off).min(data.len() - done);
+
+            let block_num = self.block_for_index_alloc(raw, block_index)?;
+            if n == bs {
+                self.write_block(block_num, &data[done..done + n])?;
+            } else {
+                // Partial-block write — preserve the rest of the block's content.
+                let mut block_buf = self.block_vec(block_num)?;
+                block_buf[block_off..block_off + n].copy_from_slice(&data[done..done + n]);
+                self.write_block(block_num, &block_buf)?;
+            }
+            done += n;
+        }
+
+        let new_size = (offset + data.len()) as u64;
+        if new_size > raw.size() {
+            raw.set_size(new_size);
+        }
+        self.write_inode(ino, raw)?;
+        Ok(data.len())
+    }
+
+    // ── Block tree walk ──────────────────────────────────────────────────
+
+    /// Call `visit(block_num)` for every block number this inode owns —
+    /// direct, singly-, doubly-, and triply-indirect, pointer blocks
+    /// themselves as well as their leaf targets. Shared tree-walk shape
+    /// behind both `kernel::fs::ext2::Ext2Fs::free_all_blocks` (frees what
+    /// it visits) and the mount-time orphan scan `reclaim_orphans`/
+    /// `mark_reachable` (marks what it visits as reachable, never frees
+    /// anything itself, both still unmigrated) — same traversal, different
+    /// action per block, so the shape only needs to be right in one place.
+    ///
+    /// Callers are responsible for the `has_block_pointers()` guard (see
+    /// `free_all_blocks`'s doc comment in the kernel adapter — a fast
+    /// symlink's `i_block` bytes are inline text, not real pointers, and
+    /// walking them as if they were would try to "free"/"mark" whatever
+    /// garbage block numbers the text happens to decode to) — this
+    /// function trusts `i_block` to hold real pointers unconditionally.
+    pub fn visit_inode_blocks(&self, raw: &RawInode, mut visit: impl FnMut(u32) -> Result<(), Ext2Error>) -> Result<(), Ext2Error> {
+        for i in 0..12 {
+            let b = raw.i_block(i);
+            if b != 0 {
+                visit(b)?;
+            }
+        }
+
+        let ptrs_per_block = self.sb.block_size / 4;
+
+        let indirect = raw.i_block(12);
+        if indirect != 0 {
+            visit(indirect)?;
+            self.visit_pointer_block_targets(indirect, &mut visit)?;
+        }
+
+        let dbl = raw.i_block(13);
+        if dbl != 0 {
+            visit(dbl)?;
+            let buf = self.block_vec(dbl)?;
+            for idx in 0..ptrs_per_block {
+                let off = (idx * 4) as usize;
+                let first_level = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+                if first_level != 0 {
+                    visit(first_level)?;
+                    self.visit_pointer_block_targets(first_level, &mut visit)?;
+                }
+            }
+        }
+
+        let tpl = raw.i_block(14);
+        if tpl != 0 {
+            visit(tpl)?;
+            let buf = self.block_vec(tpl)?;
+            for idx in 0..ptrs_per_block {
+                let off = (idx * 4) as usize;
+                let second_level = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+                if second_level != 0 {
+                    visit(second_level)?;
+                    let buf2 = self.block_vec(second_level)?;
+                    for idx2 in 0..ptrs_per_block {
+                        let off2 = (idx2 * 4) as usize;
+                        let first_level = u32::from_le_bytes(buf2[off2..off2 + 4].try_into().unwrap());
+                        if first_level != 0 {
+                            visit(first_level)?;
+                            self.visit_pointer_block_targets(first_level, &mut visit)?;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Call `visit` for every block number a pointer block (indirect, or
+    /// one doubly-/triply-indirect first-level block) itself points at —
+    /// NOT the pointer block's own number. Shared leaf-level step of
+    /// `visit_inode_blocks`.
+    fn visit_pointer_block_targets(&self, block_num: u32, visit: &mut impl FnMut(u32) -> Result<(), Ext2Error>) -> Result<(), Ext2Error> {
+        let buf = self.block_vec(block_num)?;
+        let ptrs_per_block = self.sb.block_size / 4;
+        for idx in 0..ptrs_per_block {
+            let off = (idx * 4) as usize;
+            let b = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+            if b != 0 {
+                visit(b)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -500,5 +879,235 @@ mod tests {
     fn inodes_in_group_matches_total_for_single_group() {
         let core = mount(minimal_image());
         assert_eq!(core.inodes_in_group(0), 32);
+    }
+
+    // ── Migration step 3: inode table + indirect addressing + byte-range
+    // read/write ──────────────────────────────────────────────────────
+    //
+    // `minimal_image()` is 1024-byte blocks, so `ptrs_per_block` = 256:
+    //   direct:          block index  0..12
+    //   singly-indirect: block index 12..268    (12 + 256)
+    //   doubly-indirect: block index 268..65804  (268 + 256*256)
+    //   triply-indirect: block index 65804..     (65804 + 256*256*256)
+    // These tests write/read at a handful of individual indices near each
+    // boundary rather than filling a whole region — `write_file_range`
+    // only ever allocates blocks actually covered by the requested byte
+    // range (see its own doc comment), so exercising index 268 costs 3
+    // fresh blocks (doubly-indirect pointer block + one first-level
+    // pointer block + one data block), not 65536 of them — the 64-block
+    // `minimal_image()` fixture has more than enough headroom for every
+    // test below, even a triply-indirect one.
+
+    const BS: usize = 1024; // minimal_image()'s block_size, as a byte count
+    // `write_file_range`/`write_inode`/`read_inode` all need a real,
+    // already-allocated `ino` to write through — root (2) is the one
+    // `minimal_image()` marks used in the inode bitmap, so it's reused
+    // here purely as a valid inode number, unrelated to its real root-
+    // directory role.
+    const ROOT_INO: u32 = crate::superblock::ROOT_INO;
+
+    #[test]
+    fn block_for_index_direct_returns_i_block_entry_or_none() {
+        let core = mount(minimal_image());
+        let mut raw = RawInode::zeroed(128);
+        raw.set_i_block(5, 42);
+        assert_eq!(core.block_for_index(&raw, 5), Ok(Some(42)));
+        assert_eq!(core.block_for_index(&raw, 6), Ok(None)); // hole
+    }
+
+    #[test]
+    fn write_file_range_crosses_into_singly_indirect_block() {
+        let core = mount(minimal_image());
+        let mut raw = RawInode::zeroed(128);
+        let data = b"cross-1";
+        let offset = 12 * BS; // first singly-indirect index (12)
+        core.write_file_range(ROOT_INO, &mut raw, offset, data).expect("write");
+
+        // i_block(12) is the indirect pointer block itself, not the data
+        // block written to — must be nonzero (allocated) but distinct from
+        // whatever `block_for_index` resolves index 12 to.
+        assert_ne!(raw.i_block(12), 0);
+        let data_block = core.block_for_index(&raw, 12).unwrap().expect("data block mapped");
+        assert_ne!(data_block, raw.i_block(12));
+
+        let mut readback = alloc::vec![0u8; data.len()];
+        core.read_file_range(&raw, offset, &mut readback).expect("read");
+        assert_eq!(&readback, data);
+    }
+
+    #[test]
+    fn write_file_range_crosses_into_doubly_indirect_block() {
+        let core = mount(minimal_image());
+        let mut raw = RawInode::zeroed(128);
+        let data = b"cross-2";
+        let offset = (12 + 256) * BS; // first doubly-indirect index (268)
+        core.write_file_range(ROOT_INO, &mut raw, offset, data).expect("write");
+
+        assert_ne!(raw.i_block(13), 0, "doubly-indirect pointer block must be allocated");
+
+        let mut readback = alloc::vec![0u8; data.len()];
+        core.read_file_range(&raw, offset, &mut readback).expect("read");
+        assert_eq!(&readback, data);
+    }
+
+    #[test]
+    fn write_file_range_crosses_into_triply_indirect_block() {
+        let core = mount(minimal_image());
+        let mut raw = RawInode::zeroed(128);
+        let data = b"cross-3";
+        let offset = (12 + 256 + 256 * 256) * BS; // first triply-indirect index (65804)
+        core.write_file_range(ROOT_INO, &mut raw, offset, data).expect("write");
+
+        assert_ne!(raw.i_block(14), 0, "triply-indirect pointer block must be allocated");
+
+        let mut readback = alloc::vec![0u8; data.len()];
+        core.read_file_range(&raw, offset, &mut readback).expect("read");
+        assert_eq!(&readback, data);
+    }
+
+    #[test]
+    fn get_or_alloc_ptr_reuses_the_same_pointer_block_for_neighboring_indices() {
+        // Two writes landing in the same singly-indirect pointer block
+        // (indices 12 and 13, both < 12 + ptrs_per_block) must share one
+        // allocated indirect block, not allocate a fresh one each time.
+        let core = mount(minimal_image());
+        let mut raw = RawInode::zeroed(128);
+        core.write_file_range(ROOT_INO, &mut raw, 12 * BS, b"a").expect("write 1");
+        let indirect_after_first = raw.i_block(12);
+        assert_ne!(indirect_after_first, 0);
+
+        core.write_file_range(ROOT_INO, &mut raw, 13 * BS, b"b").expect("write 2");
+        assert_eq!(raw.i_block(12), indirect_after_first, "must reuse the same indirect block");
+    }
+
+    #[test]
+    fn read_file_range_partial_read_spans_two_blocks() {
+        let core = mount(minimal_image());
+        let mut raw = RawInode::zeroed(128);
+        // Write a distinctive byte pattern covering all of block 0 and the
+        // start of block 1.
+        let mut pattern = alloc::vec![0u8; BS + 16];
+        for (i, b) in pattern.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        core.write_file_range(ROOT_INO, &mut raw, 0, &pattern).expect("write");
+
+        // Read a small window straddling the block-0/block-1 boundary.
+        let mut readback = alloc::vec![0u8; 8];
+        core.read_file_range(&raw, BS - 4, &mut readback).expect("read");
+        assert_eq!(&readback, &pattern[BS - 4..BS + 4]);
+    }
+
+    #[test]
+    fn write_file_range_extends_file_size_but_never_shrinks_it() {
+        let core = mount(minimal_image());
+        let mut raw = RawInode::zeroed(128);
+        core.write_file_range(ROOT_INO, &mut raw, 100, &[1u8; 50]).expect("write");
+        assert_eq!(raw.size(), 150);
+
+        // A second, entirely-earlier write must not shrink the recorded size.
+        core.write_file_range(ROOT_INO, &mut raw, 0, &[2u8; 10]).expect("write");
+        assert_eq!(raw.size(), 150);
+    }
+
+    #[test]
+    fn write_file_range_persists_size_to_the_on_disk_inode() {
+        let core = mount(minimal_image());
+        let mut raw = RawInode::zeroed(128);
+        raw.set_i_mode(0x8000 | 0o644); // regular file, needed for is_reg()-gated size fields
+        core.write_file_range(ROOT_INO, &mut raw, 0, b"hello").expect("write");
+
+        let reread = core.read_inode(ROOT_INO).expect("read_inode");
+        assert_eq!(reread.size(), 5);
+    }
+
+    #[test]
+    fn read_file_range_beyond_eof_zero_fills_the_hole() {
+        // A byte range past the last block `write_file_range` ever touched
+        // is an unallocated hole — `block_for_index` returns `None` for it,
+        // and `read_file_range` must zero-fill rather than error, exactly
+        // like a real sparse file.
+        let core = mount(minimal_image());
+        let mut raw = RawInode::zeroed(128);
+        core.write_file_range(ROOT_INO, &mut raw, 0, b"hi").expect("write");
+
+        let mut readback = alloc::vec![0xAAu8; 16]; // poisoned, so a bug would be visible
+        core.read_file_range(&raw, 10 * BS, &mut readback).expect("read past EOF");
+        assert!(readback.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn write_file_range_partial_block_write_preserves_the_rest_of_the_block() {
+        let core = mount(minimal_image());
+        let mut raw = RawInode::zeroed(128);
+        core.write_file_range(ROOT_INO, &mut raw, 0, &[0xFFu8; BS]).expect("fill block");
+        // Overwrite 4 bytes in the middle — the rest of the block must survive.
+        core.write_file_range(ROOT_INO, &mut raw, 100, &[0x11, 0x22, 0x33, 0x44]).expect("partial write");
+
+        let mut readback = alloc::vec![0u8; BS];
+        core.read_file_range(&raw, 0, &mut readback).expect("read");
+        assert_eq!(&readback[0..100], &[0xFFu8; 100][..]);
+        assert_eq!(&readback[100..104], &[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(&readback[104..], &alloc::vec![0xFFu8; BS - 104][..]);
+    }
+
+    #[test]
+    fn write_file_range_empty_data_is_a_true_no_op() {
+        // access(2)'s W_OK probe (kernel adapter) relies on this exact
+        // behavior — see write_file_range's own doc comment.
+        let core = mount(minimal_image());
+        let mut raw = RawInode::zeroed(128);
+        let n = core.write_file_range(ROOT_INO, &mut raw, 0, &[]).expect("empty write");
+        assert_eq!(n, 0);
+        assert_eq!(raw.size(), 0);
+    }
+
+    #[test]
+    fn visit_inode_blocks_visits_pointer_blocks_and_leaf_data_blocks() {
+        let core = mount(minimal_image());
+        let mut raw = RawInode::zeroed(128);
+        // One direct block, one singly-indirect data block, one
+        // doubly-indirect data block.
+        core.write_file_range(ROOT_INO, &mut raw, 0, b"direct").expect("direct");
+        core.write_file_range(ROOT_INO, &mut raw, 12 * BS, b"indirect").expect("indirect");
+        core.write_file_range(ROOT_INO, &mut raw, (12 + 256) * BS, b"dbl-indirect").expect("dbl indirect");
+
+        let mut visited = alloc::vec::Vec::new();
+        core.visit_inode_blocks(&raw, |b| { visited.push(b); Ok(()) }).expect("visit");
+
+        // Expect: 1 direct data block, 1 indirect pointer block + its 1
+        // leaf data block, 1 doubly-indirect pointer block + 1 first-level
+        // pointer block + its 1 leaf data block = 6 total.
+        assert_eq!(visited.len(), 6, "expected every pointer block AND every leaf data block visited");
+        assert!(visited.contains(&raw.i_block(0)));
+        assert!(visited.contains(&raw.i_block(12)), "indirect pointer block itself must be visited");
+        assert!(visited.contains(&raw.i_block(13)), "doubly-indirect pointer block itself must be visited");
+
+        // No duplicates, and no zero/sentinel entries.
+        let mut sorted = visited.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), visited.len(), "no block should be visited twice");
+        assert!(visited.iter().all(|&b| b != 0));
+    }
+
+    #[test]
+    fn inode_location_rejects_out_of_range_ino() {
+        let core = mount(minimal_image());
+        assert_eq!(core.inode_location(0), Err(Ext2Error::Io));
+        assert_eq!(core.inode_location(1000), Err(Ext2Error::Io));
+    }
+
+    #[test]
+    fn read_write_inode_round_trips() {
+        let core = mount(minimal_image());
+        let mut raw = RawInode::zeroed(128);
+        raw.set_i_mode(0x8000 | 0o600);
+        raw.set_links_count(3);
+        core.write_inode(ROOT_INO, &raw).expect("write_inode");
+
+        let reread = core.read_inode(ROOT_INO).expect("read_inode");
+        assert_eq!(reread.i_mode(), 0x8000 | 0o600);
+        assert_eq!(reread.links_count(), 3);
     }
 }

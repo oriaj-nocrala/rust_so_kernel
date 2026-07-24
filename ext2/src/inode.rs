@@ -4,11 +4,10 @@
 // `kernel::fs::ext2::RawInode` — migration step 1, no behavior change.
 // Every method here is pure byte manipulation; nothing in this file
 // touches a `BlockDevice`. Locating/reading/writing an inode record on an
-// actual device (`inode_location`/`read_inode`/`write_inode`) stays in
-// `kernel::fs::ext2` for now — it isn't needed by block/inode allocation
-// (migration step 2 doesn't touch the inode table at all, only the inode
-// *bitmap*), and moving it isn't required to keep this crate self-
-// contained for what it does cover.
+// actual device (`inode_location`/`read_inode`/`write_inode`) moved later,
+// as part of migration step 3 (`volume::Ext2Core`) — `write_file_range`
+// needed somewhere to persist a growing file's new size, which is what
+// finally required it. See `volume.rs`'s module doc comment.
 
 use alloc::vec::Vec;
 

@@ -14,7 +14,7 @@
 //!
 //! ## Scope (as of this extraction pass)
 //!
-//! Only migration steps 1 and 2 from the extraction plan:
+//! Migration steps 1-3 from the extraction plan:
 //!
 //! 1. **On-disk structs + parsing** — [`Superblock`], [`BlockGroupDesc`],
 //!    [`RawInode`], [`dirent`]'s pure record format. No behavior change:
@@ -26,12 +26,21 @@
 //!    block group descriptor and superblock ([`Ext2Core::adjust_bgd_counts`]/
 //!    [`Ext2Core::adjust_sb_counts`]) their bitmap scan
 //!    ([`bitmap::find_first_free_bit`]) relies on.
+//! 3. **Inode-table read/write + indirect block addressing + file
+//!    byte-range read/write** — [`Ext2Core::inode_location`]/
+//!    [`Ext2Core::read_inode`]/[`Ext2Core::write_inode`],
+//!    [`Ext2Core::block_for_index`]/[`Ext2Core::block_for_index_alloc`]
+//!    (direct, singly-, doubly-, and triply-indirect pointers),
+//!    [`Ext2Core::read_file_range`]/[`Ext2Core::write_file_range`], and the
+//!    shared block-tree walk [`Ext2Core::visit_inode_blocks`] (used by both
+//!    freeing a file's blocks and the mount-time orphan scan, still
+//!    unmigrated — see below).
 //!
-//! Steps 3-6 (indirect block addressing, directory operations, `mount` +
-//! the mount-time repair passes `reconcile_free_counts`/`reclaim_orphans`)
-//! deliberately have **not** moved yet and still live in
-//! `kernel::fs::ext2` — see the plan document for why each is its own
-//! step, verified green independently.
+//! Steps 4-6 (directory operations, `mount` + the mount-time repair passes
+//! `reconcile_free_counts`/`reclaim_orphans`, and turning what's left of
+//! `kernel::fs::ext2` into a pure VFS adapter) deliberately have **not**
+//! moved yet and still live in `kernel::fs::ext2` — see the plan document
+//! for why each is its own step, verified green independently.
 //!
 //! ## Error type and locking (design decisions carried over from the plan)
 //!
