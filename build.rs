@@ -217,9 +217,39 @@ fn sync_disk_bin_dir(disk_path: &std::path::Path) {
         return;
     }
 
+    // Only create /bin if it isn't already there. This is NOT a cosmetic
+    // guard: `disk.img` is create-once, so on every rebuild after the first
+    // an unconditional `mkdir /bin` hits an e2fsprogs bug (reproduced
+    // directly against 1.47.4). `ext2fs_mkdir2()` allocates an inode, writes
+    // its `.`/`..` data block and its inode-table record, and only THEN
+    // fails the link-into-parent step with "Ext2 directory already exists" —
+    // leaving that inode and block behind as live content whose bitmap bits
+    // were never set. `e2fsck -fn disk.img` then reports a disconnected
+    // directory on every single build.
+    //
+    // The kernel cannot clean that up, and it isn't a kernel bug:
+    // `fs::ext2`'s `reclaim_orphans` sweeps for bits that are *set* but
+    // unreachable, so content whose bits are already clear is invisible to
+    // it by construction — the opposite shape, outside its contract.
+    //
+    // Probe by content, not exit code (debugfs exits 0 unconditionally — see
+    // the verification pass below) and not by matching the error text (which
+    // is localized): a directory that exists always lists at least `.` and
+    // `..` on stdout, a missing one prints nothing there.
+    let bin_dir_exists = Command::new("debugfs")
+        .arg("-R").arg("ls -l /bin")
+        .arg(disk_path)
+        .output()
+        .map(|out| !out.stdout.is_empty())
+        .unwrap_or(false);
+
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     let script_path = out_dir.join("sync_disk_bin.debugfs");
-    let mut script = String::from("mkdir /bin\ncd /bin\n");
+    let mut script = String::new();
+    if !bin_dir_exists {
+        script.push_str("mkdir /bin\n");
+    }
+    script.push_str("cd /bin\n");
     for (name, host_path, _) in &entries {
         script.push_str(&format!("rm {name}\nwrite {} {name}\n", host_path.display()));
     }
