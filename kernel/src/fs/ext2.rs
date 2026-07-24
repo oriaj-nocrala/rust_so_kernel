@@ -5,7 +5,7 @@
 // (block::ata) attached to the secondary IDE channel (see src/main.rs for
 // how that disk image gets created and attached, and scripts docs there for
 // how its content is seeded via `mke2fs -d`). Every disk access in this
-// file goes through `Ext2Fs::device` (`self.device.read_sectors`/
+// file goes through `Ext2Fs::device` (`self.core.device.read_sectors`/
 // `write_sectors`), not `block::ata` directly — this is what lets the QEMU
 // integration test (`kernel/src/hw_tests.rs`) mount an entirely different
 // `BlockDevice` (`hal::block::MemDisk`, a hand-built image, see
@@ -126,9 +126,37 @@ use crate::fs::{
 };
 use crate::process::file::{FileError, FileHandle, FileResult};
 
-const EXT2_MAGIC: u16 = 0xEF53;
-const ROOT_INO: u32 = 2;
-const FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
+// ── ext2 core crate ─────────────────────────────────────────────────────────
+//
+// On-disk structs + parsing (superblock, block group descriptor, raw inode
+// record) and block/inode allocation + free-count bookkeeping now live in
+// the standalone, host-testable `ext2` crate (`ext2/src/`, `cd ext2 &&
+// cargo test`) — see `docs/fs/ext2-extraction-plan.md` (migration steps 1
+// and 2). Everything else in this file (indirect block addressing,
+// directory operations, mount + its repair passes) is unmigrated and stays
+// here, per that plan's steps 3-6.
+//
+// `RawInode`/`BgdRaw` are re-exported/aliased here (not redefined) so every
+// existing call site in this file (`RawInode::parse(...)`, `bgd.
+// block_bitmap`, etc.) keeps working unchanged — only the *type
+// definitions* moved, not how they're used.
+use ext2::RawInode;
+use ext2::BlockGroupDesc as BgdRaw;
+use ext2::{EXT2_MAGIC, ROOT_INO};
+
+impl From<ext2::Ext2Error> for Errno {
+    fn from(e: ext2::Ext2Error) -> Self {
+        match e {
+            // BadMagic/UnsupportedFeature only ever occur inside
+            // `Ext2Core::mount()`, which this adapter's own `Ext2Fs::mount()`
+            // maps to a `&'static str` directly (see below) rather than
+            // through this impl — EIO is a reasonable fallback all the same,
+            // since every one of these is fundamentally "the disk didn't
+            // give us what we expected."
+            ext2::Ext2Error::Io | ext2::Ext2Error::BadMagic | ext2::Ext2Error::UnsupportedFeature => Errno::EIO,
+        }
+    }
+}
 
 // ── Global mount state ──────────────────────────────────────────────────────
 //
@@ -203,135 +231,64 @@ fn fs() -> &'static Ext2Fs {
 
 // ── Superblock / filesystem-wide state ──────────────────────────────────────
 
+/// Thin adapter over `ext2::Ext2Core` — see the "ext2 core crate" note
+/// above. `core.sb` carries every geometry field this driver used to keep
+/// as its own flat fields (`block_size`, `inodes_count`, ...); `core.
+/// device` is the `BlockDevice` every sector read/write goes through
+/// (`crate::block::AtaBlockDevice` at real boot, `hal::block::MemDisk`
+/// under the QEMU integration test — see the module doc comment).
 struct Ext2Fs {
-    /// The `BlockDevice` this filesystem's every sector read/write goes
-    /// through — `crate::block::AtaBlockDevice` at real boot,
-    /// `hal::block::MemDisk` under the QEMU integration test. See the
-    /// module doc comment.
-    device: Box<dyn BlockDevice>,
-    block_size: u32,
-    inodes_count: u32,
-    blocks_count: u32,
-    inodes_per_group: u32,
-    blocks_per_group: u32,
-    first_data_block: u32,
-    inode_size: u16,
-    bgdt_block: u32,
-    num_groups: u32,
-    /// First non-reserved inode number (`s_first_ino`, rev>=1 only; fixed
-    /// at 11 for rev 0) — inodes below this (root's own ino=2 among them)
-    /// are always "in use" by convention, even though nothing walks a
-    /// directory entry to them. Used by `reclaim_orphans` so it doesn't
-    /// mistake a reserved inode for an orphan.
-    first_ino: u32,
-}
-
-/// The subset of a block group descriptor's fields this driver reads/writes.
-struct BgdRaw {
-    block_bitmap: u32,
-    inode_bitmap: u32,
-    inode_table: u32,
-    free_blocks: u16,
-    free_inodes: u16,
+    core: ext2::Ext2Core,
 }
 
 impl Ext2Fs {
+    /// Parse the superblock (delegated to `ext2::Ext2Core::mount` —
+    /// migration step 1) and construct the adapter. Does NOT run the
+    /// mount-time repair passes (`reconcile_free_counts`/
+    /// `reclaim_orphans`, migration step 5, unmigrated) — `mount_and_repair`
+    /// above calls those right after this returns, before publishing the
+    /// result anywhere shared. Error strings match exactly what this
+    /// function used to produce inline, one per `ext2::Ext2Error` variant.
     fn mount(device: Box<dyn BlockDevice>) -> Result<Self, &'static str> {
-        // Superblock is always at byte 1024, regardless of block size —
-        // read it directly by sector before we know the block size at all.
-        let mut raw = [0u8; 1024];
-        device.read_sectors(2, 2, &mut raw)
-            .map_err(|_| "block device read of superblock failed")?;
-
-        let magic = u16::from_le_bytes([raw[56], raw[57]]);
-        if magic != EXT2_MAGIC {
-            return Err("bad ext2 magic (not an ext2 filesystem, or wrong LBA)");
-        }
-
-        let log_block_size = u32::from_le_bytes(raw[24..28].try_into().unwrap());
-        let block_size = 1024u32 << log_block_size;
-        let blocks_per_group = u32::from_le_bytes(raw[32..36].try_into().unwrap());
-        let inodes_per_group = u32::from_le_bytes(raw[40..44].try_into().unwrap());
-        let inodes_count = u32::from_le_bytes(raw[0..4].try_into().unwrap());
-        let blocks_count = u32::from_le_bytes(raw[4..8].try_into().unwrap());
-        let first_data_block = u32::from_le_bytes(raw[20..24].try_into().unwrap());
-        let rev_level = u32::from_le_bytes(raw[76..80].try_into().unwrap());
-
-        let inode_size = if rev_level == 0 {
-            128
-        } else {
-            u16::from_le_bytes(raw[88..90].try_into().unwrap())
-        };
-        let feature_incompat = if rev_level == 0 {
-            0
-        } else {
-            u32::from_le_bytes(raw[96..100].try_into().unwrap())
-        };
-        let first_ino = if rev_level == 0 {
-            11
-        } else {
-            u32::from_le_bytes(raw[84..88].try_into().unwrap())
-        };
-
-        if feature_incompat & !FEATURE_INCOMPAT_FILETYPE != 0 {
-            return Err("unsupported ext2 incompat features (ext4 extents? journal?) — refusing to mount");
-        }
-
-        let num_groups = (blocks_count + blocks_per_group - 1) / blocks_per_group;
-        let bgdt_block = first_data_block + 1;
-
-        Ok(Self {
-            device,
-            block_size,
-            inodes_count,
-            blocks_count,
-            inodes_per_group: inodes_per_group.max(1),
-            blocks_per_group: blocks_per_group.max(1),
-            first_data_block,
-            inode_size: if inode_size == 0 { 128 } else { inode_size },
-            bgdt_block,
-            num_groups: num_groups.max(1),
-            first_ino: if first_ino == 0 { 11 } else { first_ino },
-        })
+        let core = ext2::Ext2Core::mount(device).map_err(|e| match e {
+            ext2::Ext2Error::Io => "block device read of superblock failed",
+            ext2::Ext2Error::BadMagic => "bad ext2 magic (not an ext2 filesystem, or wrong LBA)",
+            ext2::Ext2Error::UnsupportedFeature => {
+                "unsupported ext2 incompat features (ext4 extents? journal?) — refusing to mount"
+            }
+        })?;
+        Ok(Self { core })
     }
 
     // ── Raw block I/O ────────────────────────────────────────────────────
+    //
+    // `read_block`/`block_vec`/`write_block` below are thin wrappers over
+    // `ext2::Ext2Core` (migration step 1/2 — see the "ext2 core crate"
+    // note near the top of this file); every other method in this file
+    // keeps calling `self.read_block(...)`/`self.write_block(...)`/
+    // `self.block_vec(...)` exactly as before, unaware anything moved.
 
-    /// Read one filesystem block (`self.block_size` bytes) into `buf`.
-    /// Propagates an ATA failure as `Errno::EIO` instead of panicking —
-    /// every caller in this file ultimately funnels a failure here up
-    /// through the VFS's own `Result<_, Errno>` surface. Also rejects any
+    /// Read one filesystem block (`self.core.sb.block_size` bytes) into
+    /// `buf`. Propagates an ATA failure as `Errno::EIO` instead of
+    /// panicking — every caller in this file ultimately funnels a failure
+    /// here up through the VFS's own `Result<_, Errno>` surface. Also rejects any
     /// `block_num` outside `0..blocks_count` — the single choke point
     /// every on-disk pointer passes through, so a corrupted BGD/inode
     /// pointer can't turn into a wild read at an arbitrary LBA (see the
     /// module-level ROBUSTNESS comment).
     fn read_block(&self, block_num: u32, buf: &mut [u8]) -> Result<(), Errno> {
-        debug_assert!(buf.len() >= self.block_size as usize);
-        if block_num >= self.blocks_count {
-            return Err(Errno::EIO);
-        }
-        let sectors_per_block = (self.block_size / SECTOR_SIZE as u32) as u8;
-        let lba = block_num * sectors_per_block as u32;
-        self.device.read_sectors(lba, sectors_per_block, buf).map_err(|_| Errno::EIO)
+        self.core.read_block(block_num, buf).map_err(Into::into)
     }
 
     fn block_vec(&self, block_num: u32) -> Result<Vec<u8>, Errno> {
-        let mut buf = alloc::vec![0u8; self.block_size as usize];
-        self.read_block(block_num, &mut buf)?;
-        Ok(buf)
+        self.core.block_vec(block_num).map_err(Into::into)
     }
 
-    /// Write one filesystem block (`self.block_size` bytes) from `buf`.
-    /// Same EIO-not-panic contract and out-of-range-`block_num` rejection
-    /// as `read_block`.
+    /// Write one filesystem block (`self.core.sb.block_size` bytes) from
+    /// `buf`. Same EIO-not-panic contract and out-of-range-`block_num`
+    /// rejection as `read_block`.
     fn write_block(&self, block_num: u32, buf: &[u8]) -> Result<(), Errno> {
-        debug_assert!(buf.len() >= self.block_size as usize);
-        if block_num >= self.blocks_count {
-            return Err(Errno::EIO);
-        }
-        let sectors_per_block = (self.block_size / SECTOR_SIZE as u32) as u8;
-        let lba = block_num * sectors_per_block as u32;
-        self.device.write_sectors(lba, sectors_per_block, buf).map_err(|_| Errno::EIO)
+        self.core.write_block(block_num, buf).map_err(Into::into)
     }
 
     // ── Inode table ──────────────────────────────────────────────────────
@@ -345,14 +302,14 @@ impl Ext2Fs {
         // corrupted dirent must not reach the `ino - 1` subtraction below
         // (a `u32` underflow: a panic in debug builds, a wraparound to a
         // huge-but-in-range-looking group index in release).
-        if ino < 1 || ino > self.inodes_count {
+        if ino < 1 || ino > self.core.sb.inodes_count {
             return Err(Errno::EIO);
         }
-        let group = (ino - 1) / self.inodes_per_group;
-        if group >= self.num_groups {
+        let group = (ino - 1) / self.core.sb.inodes_per_group;
+        if group >= self.core.sb.num_groups {
             return Err(Errno::EIO);
         }
-        let index_in_group = (ino - 1) % self.inodes_per_group;
+        let index_in_group = (ino - 1) % self.core.sb.inodes_per_group;
 
         // Block Group Descriptor for `group` (32 bytes each). bg_inode_table
         // is the THIRD u32 field (bg_block_bitmap, bg_inode_bitmap, then
@@ -361,9 +318,9 @@ impl Ext2Fs {
         let bgd_buf = self.block_vec(bgd_block)?;
         let inode_table_block = u32::from_le_bytes(bgd_buf[bgd_off + 8..bgd_off + 12].try_into().unwrap());
 
-        let inodes_per_block = self.block_size / self.inode_size as u32;
+        let inodes_per_block = self.core.sb.block_size / self.core.sb.inode_size as u32;
         let table_block = inode_table_block + index_in_group / inodes_per_block;
-        let offset_in_block = ((index_in_group % inodes_per_block) * self.inode_size as u32) as usize;
+        let offset_in_block = ((index_in_group % inodes_per_block) * self.core.sb.inode_size as u32) as usize;
         Ok((table_block, offset_in_block))
     }
 
@@ -376,7 +333,7 @@ impl Ext2Fs {
     fn read_inode(&self, ino: u32) -> Result<RawInode, Errno> {
         let (table_block, offset_in_block) = self.inode_location(ino)?;
         let block_buf = self.block_vec(table_block)?;
-        Ok(RawInode::parse(&block_buf[offset_in_block..offset_in_block + self.inode_size as usize]))
+        Ok(RawInode::parse(&block_buf[offset_in_block..offset_in_block + self.core.sb.inode_size as usize]))
     }
 
     /// Write `raw` back to `ino`'s on-disk inode record. Read-modify-write:
@@ -385,7 +342,7 @@ impl Ext2Fs {
     fn write_inode(&self, ino: u32, raw: &RawInode) -> Result<(), Errno> {
         let (table_block, offset_in_block) = self.inode_location(ino)?;
         let mut block_buf = self.block_vec(table_block)?;
-        block_buf[offset_in_block..offset_in_block + self.inode_size as usize].copy_from_slice(&raw.buf);
+        block_buf[offset_in_block..offset_in_block + self.core.sb.inode_size as usize].copy_from_slice(&raw.buf);
         self.write_block(table_block, &block_buf)
     }
 
@@ -400,7 +357,7 @@ impl Ext2Fs {
             let b = raw.i_block(index as usize);
             return Ok(if b == 0 { None } else { Some(b) });
         }
-        let ptrs_per_block = self.block_size / 4;
+        let ptrs_per_block = self.core.sb.block_size / 4;
 
         let indirect_index = index - 12;
         if indirect_index < ptrs_per_block {
@@ -492,7 +449,7 @@ impl Ext2Fs {
             return Ok(nb);
         }
 
-        let ptrs_per_block = self.block_size / 4;
+        let ptrs_per_block = self.core.sb.block_size / 4;
         let indirect_index = index - 12;
         if indirect_index < ptrs_per_block {
             let indirect_block = raw.i_block(12);
@@ -550,7 +507,7 @@ impl Ext2Fs {
 
     /// Read `buf.len()` bytes of file data starting at byte `offset`.
     fn read_file_range(&self, raw: &RawInode, offset: usize, buf: &mut [u8]) -> Result<(), Errno> {
-        let bs = self.block_size as usize;
+        let bs = self.core.sb.block_size as usize;
         let mut done = 0;
         while done < buf.len() {
             let file_pos = offset + done;
@@ -584,7 +541,7 @@ impl Ext2Fs {
             return Ok(0); // true no-op — access(2)'s W_OK probe relies on this
         }
 
-        let bs = self.block_size as usize;
+        let bs = self.core.sb.block_size as usize;
         let mut done = 0;
         while done < data.len() {
             let file_pos = offset + done;
@@ -659,7 +616,7 @@ impl Ext2Fs {
             }
         }
 
-        let ptrs_per_block = self.block_size / 4;
+        let ptrs_per_block = self.core.sb.block_size / 4;
 
         let indirect = raw.i_block(12);
         if indirect != 0 {
@@ -712,7 +669,7 @@ impl Ext2Fs {
     /// `visit_inode_blocks`.
     fn visit_pointer_block_targets(&self, block_num: u32, visit: &mut impl FnMut(u32) -> Result<(), Errno>) -> Result<(), Errno> {
         let buf = self.block_vec(block_num)?;
-        let ptrs_per_block = self.block_size / 4;
+        let ptrs_per_block = self.core.sb.block_size / 4;
         for idx in 0..ptrs_per_block {
             let off = (idx * 4) as usize;
             let b = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
@@ -764,7 +721,7 @@ impl Ext2Fs {
     /// indirect, same limit as file reads).
     fn read_dir_entries(&self, raw: &RawInode) -> Result<Vec<Ext2DirEntry>, Errno> {
         let mut entries = Vec::new();
-        let bs = self.block_size;
+        let bs = self.core.sb.block_size;
         let num_blocks = (raw.size() + bs as u64 - 1) / bs as u64;
 
         for block_index in 0..num_blocks as u32 {
@@ -801,7 +758,7 @@ impl Ext2Fs {
     /// slot, or — only if nothing fits — allocating and appending a whole
     /// new directory block.
     fn add_dir_entry(&self, dir_ino: u32, dir_raw: &mut RawInode, name: &str, ino: u32, kind: FileType) -> Result<(), Errno> {
-        let bs = self.block_size as usize;
+        let bs = self.core.sb.block_size as usize;
         let needed = dirent_len(name.len());
         let num_blocks = ((dir_raw.size() as usize) + bs - 1) / bs;
 
@@ -854,7 +811,7 @@ impl Ext2Fs {
     /// just zeroes its inode field, leaving a reusable deleted slot.
     /// Returns the removed entry's inode number and kind.
     fn remove_dir_entry(&self, dir_raw: &RawInode, name: &str) -> Result<(u32, FileType), Errno> {
-        let bs = self.block_size as usize;
+        let bs = self.core.sb.block_size as usize;
         let num_blocks = ((dir_raw.size() as usize) + bs - 1) / bs;
 
         for block_index in 0..num_blocks as u32 {
@@ -916,8 +873,8 @@ impl Ext2Fs {
     // ── Block group descriptors / bitmaps ───────────────────────────────
 
     fn bgd_location(&self, group: u32) -> (u32, usize) {
-        let bgd_per_block = self.block_size / 32;
-        let bgd_block = self.bgdt_block + group / bgd_per_block;
+        let bgd_per_block = self.core.sb.block_size / 32;
+        let bgd_block = self.core.sb.bgdt_block + group / bgd_per_block;
         let bgd_offset = ((group % bgd_per_block) * 32) as usize;
         (bgd_block, bgd_offset)
     }
@@ -961,7 +918,7 @@ impl Ext2Fs {
     /// the only mutable superblock state this driver tracks.
     fn adjust_sb_counts(&self, free_blocks_delta: i32, free_inodes_delta: i32) -> Result<(), Errno> {
         let mut raw = [0u8; 1024];
-        self.device.read_sectors(2, 2, &mut raw).map_err(|_| Errno::EIO)?;
+        self.core.device.read_sectors(2, 2, &mut raw).map_err(|_| Errno::EIO)?;
         if free_blocks_delta != 0 {
             let cur = u32::from_le_bytes(raw[12..16].try_into().unwrap());
             let new = (cur as i64 + free_blocks_delta as i64) as u32;
@@ -972,17 +929,17 @@ impl Ext2Fs {
             let new = (cur as i64 + free_inodes_delta as i64) as u32;
             raw[16..20].copy_from_slice(&new.to_le_bytes());
         }
-        self.device.write_sectors(2, 2, &raw).map_err(|_| Errno::EIO)
+        self.core.device.write_sectors(2, 2, &raw).map_err(|_| Errno::EIO)
     }
 
     fn blocks_in_group(&self, group: u32) -> u32 {
-        let start = self.first_data_block + group * self.blocks_per_group;
-        self.blocks_count.saturating_sub(start).min(self.blocks_per_group)
+        let start = self.core.sb.first_data_block + group * self.core.sb.blocks_per_group;
+        self.core.sb.blocks_count.saturating_sub(start).min(self.core.sb.blocks_per_group)
     }
 
     fn inodes_in_group(&self, group: u32) -> u32 {
-        let start = group * self.inodes_per_group;
-        self.inodes_count.saturating_sub(start).min(self.inodes_per_group)
+        let start = group * self.core.sb.inodes_per_group;
+        self.core.sb.inodes_count.saturating_sub(start).min(self.core.sb.inodes_per_group)
     }
 
     /// Allocate a free data block: scan each group's block bitmap for a
@@ -991,7 +948,7 @@ impl Ext2Fs {
     /// exposes stale disk data). Returns `Ok(None)` when the filesystem is
     /// full (`ENOSPC`), `Err` on an I/O failure.
     fn alloc_block(&self) -> Result<Option<u32>, Errno> {
-        for group in 0..self.num_groups {
+        for group in 0..self.core.sb.num_groups {
             let bgd = self.read_bgd(group)?;
             if bgd.free_blocks == 0 {
                 continue;
@@ -1006,8 +963,8 @@ impl Ext2Fs {
                     self.write_block(bgd.block_bitmap, &bitmap)?;
                     self.adjust_bgd_counts(group, -1, 0, 0)?;
                     self.adjust_sb_counts(-1, 0)?;
-                    let block_num = self.first_data_block + group * self.blocks_per_group + bit;
-                    let zeros = alloc::vec![0u8; self.block_size as usize];
+                    let block_num = self.core.sb.first_data_block + group * self.core.sb.blocks_per_group + bit;
+                    let zeros = alloc::vec![0u8; self.core.sb.block_size as usize];
                     self.write_block(block_num, &zeros)?;
                     return Ok(Some(block_num));
                 }
@@ -1022,11 +979,11 @@ impl Ext2Fs {
         // `free_all_blocks`/`free_pointer_block_targets`), so a corrupted
         // value below `first_data_block` must not underflow the `u32`
         // group/bit computation below.
-        if block_num < self.first_data_block || block_num >= self.blocks_count {
+        if block_num < self.core.sb.first_data_block || block_num >= self.core.sb.blocks_count {
             return Err(Errno::EIO);
         }
-        let group = (block_num - self.first_data_block) / self.blocks_per_group;
-        let bit = (block_num - self.first_data_block) % self.blocks_per_group;
+        let group = (block_num - self.core.sb.first_data_block) / self.core.sb.blocks_per_group;
+        let bit = (block_num - self.core.sb.first_data_block) % self.core.sb.blocks_per_group;
         let bgd = self.read_bgd(group)?;
         let mut bitmap = self.block_vec(bgd.block_bitmap)?;
         let byte = (bit / 8) as usize;
@@ -1041,7 +998,7 @@ impl Ext2Fs {
     /// count (`bg_used_dirs_count`) — cosmetic bookkeeping real ext2 tools
     /// (e2fsck, `df -i` equivalents) rely on, harmless if never read here.
     fn alloc_inode(&self, is_dir: bool) -> Result<Option<u32>, Errno> {
-        for group in 0..self.num_groups {
+        for group in 0..self.core.sb.num_groups {
             let bgd = self.read_bgd(group)?;
             if bgd.free_inodes == 0 {
                 continue;
@@ -1056,7 +1013,7 @@ impl Ext2Fs {
                     self.write_block(bgd.inode_bitmap, &bitmap)?;
                     self.adjust_bgd_counts(group, 0, -1, if is_dir { 1 } else { 0 })?;
                     self.adjust_sb_counts(0, -1)?;
-                    return Ok(Some(group * self.inodes_per_group + bit + 1));
+                    return Ok(Some(group * self.core.sb.inodes_per_group + bit + 1));
                 }
             }
         }
@@ -1065,11 +1022,11 @@ impl Ext2Fs {
 
     fn free_inode(&self, ino: u32, is_dir: bool) -> Result<(), Errno> {
         // Same corrupted-input-before-underflow guard as `free_block`.
-        if ino < 1 || ino > self.inodes_count {
+        if ino < 1 || ino > self.core.sb.inodes_count {
             return Err(Errno::EIO);
         }
-        let group = (ino - 1) / self.inodes_per_group;
-        let bit = (ino - 1) % self.inodes_per_group;
+        let group = (ino - 1) / self.core.sb.inodes_per_group;
+        let bit = (ino - 1) % self.core.sb.inodes_per_group;
         let bgd = self.read_bgd(group)?;
         let mut bitmap = self.block_vec(bgd.inode_bitmap)?;
         let byte = (bit / 8) as usize;
@@ -1105,14 +1062,14 @@ impl Ext2Fs {
     /// kernel.
     fn reconcile_free_counts(&self) -> Result<(), Errno> {
         let mut sb_raw = [0u8; 1024];
-        self.device.read_sectors(2, 2, &mut sb_raw).map_err(|_| Errno::EIO)?;
+        self.core.device.read_sectors(2, 2, &mut sb_raw).map_err(|_| Errno::EIO)?;
         let sb_free_blocks = u32::from_le_bytes(sb_raw[12..16].try_into().unwrap());
         let sb_free_inodes = u32::from_le_bytes(sb_raw[16..20].try_into().unwrap());
 
         let mut total_free_blocks: u32 = 0;
         let mut total_free_inodes: u32 = 0;
 
-        for group in 0..self.num_groups {
+        for group in 0..self.core.sb.num_groups {
             let bgd = self.read_bgd(group)?;
 
             let block_bitmap = self.block_vec(bgd.block_bitmap)?;
@@ -1170,8 +1127,8 @@ impl Ext2Fs {
     /// or a still-live block/inode could be freed out from under a file
     /// that's simply reached through a deep path.
     fn reclaim_orphans(&self) -> Result<(), Errno> {
-        let block_bytes = ((self.blocks_count as usize) + 7) / 8;
-        let inode_bytes = ((self.inodes_count as usize) + 7) / 8;
+        let block_bytes = ((self.core.sb.blocks_count as usize) + 7) / 8;
+        let inode_bytes = ((self.core.sb.inodes_count as usize) + 7) / 8;
         let mut used_blocks = alloc::vec![0u8; block_bytes];
         let mut used_inodes = alloc::vec![0u8; inode_bytes];
 
@@ -1187,20 +1144,20 @@ impl Ext2Fs {
         // sweep below "reclaim" the superblock's block as an orphan on
         // first mount, and the very next allocation handed it out to real
         // file data, corrupting the superblock.
-        for b in 0..=self.first_data_block {
+        for b in 0..=self.core.sb.first_data_block {
             mark_bit(&mut used_blocks, b);
         }
-        let bgd_per_block = self.block_size / 32;
-        let bgdt_blocks = (self.num_groups + bgd_per_block - 1) / bgd_per_block;
-        for b in self.bgdt_block..self.bgdt_block + bgdt_blocks {
+        let bgd_per_block = self.core.sb.block_size / 32;
+        let bgdt_blocks = (self.core.sb.num_groups + bgd_per_block - 1) / bgd_per_block;
+        for b in self.core.sb.bgdt_block..self.core.sb.bgdt_block + bgdt_blocks {
             mark_bit(&mut used_blocks, b);
         }
-        let inodes_per_block = self.block_size / self.inode_size as u32;
-        for group in 0..self.num_groups {
+        let inodes_per_block = self.core.sb.block_size / self.core.sb.inode_size as u32;
+        for group in 0..self.core.sb.num_groups {
             let bgd = self.read_bgd(group)?;
             mark_bit(&mut used_blocks, bgd.block_bitmap);
             mark_bit(&mut used_blocks, bgd.inode_bitmap);
-            let inode_table_blocks = (self.inodes_per_group + inodes_per_block - 1) / inodes_per_block;
+            let inode_table_blocks = (self.core.sb.inodes_per_group + inodes_per_block - 1) / inodes_per_block;
             for b in bgd.inode_table..bgd.inode_table + inode_table_blocks {
                 mark_bit(&mut used_blocks, b);
             }
@@ -1218,7 +1175,7 @@ impl Ext2Fs {
             // reason to expect specifically — can never be misread as an
             // orphan and freed into real file data the way group 0's own
             // primary copy already was (see the loop above this one).
-            let group_start = self.first_data_block + group * self.blocks_per_group;
+            let group_start = self.core.sb.first_data_block + group * self.core.sb.blocks_per_group;
             for b in group_start..group_start + 1 + bgdt_blocks {
                 mark_bit(&mut used_blocks, b);
             }
@@ -1252,7 +1209,7 @@ impl Ext2Fs {
         // are always "in use" even though this driver never reaches most
         // of them (1, 3..=10 have no directory entry pointing at them at
         // all, ever) via the walk above.
-        for ino in 1..self.first_ino {
+        for ino in 1..self.core.sb.first_ino {
             mark_bit_1based(&mut used_inodes, ino);
         }
 
@@ -1264,7 +1221,7 @@ impl Ext2Fs {
         // the end if anything actually changed.
         let mut freed_blocks: u32 = 0;
         let mut freed_inodes: u32 = 0;
-        for group in 0..self.num_groups {
+        for group in 0..self.core.sb.num_groups {
             let bgd = self.read_bgd(group)?;
 
             let mut block_bitmap = self.block_vec(bgd.block_bitmap)?;
@@ -1275,7 +1232,7 @@ impl Ext2Fs {
                 if block_bitmap[byte] & mask == 0 {
                     continue;
                 }
-                let block_num = self.first_data_block + group * self.blocks_per_group + bit;
+                let block_num = self.core.sb.first_data_block + group * self.core.sb.blocks_per_group + bit;
                 if !bit_set(&used_blocks, block_num) {
                     block_bitmap[byte] &= !mask;
                     changed = true;
@@ -1294,7 +1251,7 @@ impl Ext2Fs {
                 if inode_bitmap[byte] & mask == 0 {
                     continue;
                 }
-                let ino = group * self.inodes_per_group + bit + 1;
+                let ino = group * self.core.sb.inodes_per_group + bit + 1;
                 if !bit_set_1based(&used_inodes, ino) {
                     inode_bitmap[byte] &= !mask;
                     ichanged = true;
@@ -1444,127 +1401,10 @@ struct Ext2DirEntry {
 }
 
 // ── Raw inode (subset of fields we use) ─────────────────────────────────────
-
-/// A raw on-disk inode record, kept as its exact `inode_size` bytes rather
-/// than a handful of decoded fields — so a write-back only patches the
-/// fields this driver actually understands/manages (mode, size, links
-/// count, block count, block pointers) and leaves everything else (times,
-/// uid/gid, ACL/generation fields) exactly as read, instead of silently
-/// zeroing them.
-#[derive(Clone)]
-struct RawInode {
-    buf: Vec<u8>,
-}
-
-impl RawInode {
-    fn parse(buf: &[u8]) -> Self {
-        Self { buf: buf.to_vec() }
-    }
-
-    /// A brand-new, all-zero inode record of `size` bytes (`inode_size`) —
-    /// used by `create`/`mkdir` before filling in mode/links/blocks.
-    fn zeroed(size: usize) -> Self {
-        Self { buf: alloc::vec![0u8; size] }
-    }
-
-    fn i_mode(&self) -> u16 {
-        u16::from_le_bytes(self.buf[0..2].try_into().unwrap())
-    }
-
-    fn set_i_mode(&mut self, v: u16) {
-        self.buf[0..2].copy_from_slice(&v.to_le_bytes());
-    }
-
-    fn links_count(&self) -> u16 {
-        u16::from_le_bytes(self.buf[26..28].try_into().unwrap())
-    }
-
-    fn set_links_count(&mut self, v: u16) {
-        self.buf[26..28].copy_from_slice(&v.to_le_bytes());
-    }
-
-    fn set_blocks_512(&mut self, v: u32) {
-        self.buf[28..32].copy_from_slice(&v.to_le_bytes());
-    }
-
-    /// `i_dtime` (deletion time, real Unix epoch seconds) — real ext2
-    /// stamps this when an inode's last link is removed. Earlier this
-    /// wrote a raw boot-relative uptime value here instead (this kernel
-    /// had no RTC at the time), which is small enough (single/double-digit
-    /// seconds) to collide with a *different* on-disk use of this same
-    /// field: ext3+ threads its in-progress orphan-inode list through
-    /// `i_dtime` as a next-inode-number link while a deletion is
-    /// mid-flight across a crash, and `e2fsck` tells the two uses apart
-    /// purely by plausibility (a real calendar time is ~10 digits; a small
-    /// value reads as a link, not a timestamp) — so that raw uptime got
-    /// misdiagnosed as "part of a corrupted orphan inode list" and
-    /// silently rewritten. Now backed by a real CMOS RTC reading (see
-    /// `crate::rtc`/`crate::time::now_unix_secs`), so this is a genuine
-    /// wall-clock timestamp and the collision doesn't come up.
-    fn set_dtime(&mut self, unix_secs: u32) {
-        self.buf[20..24].copy_from_slice(&unix_secs.to_le_bytes());
-    }
-
-    /// `size_hi` (`i_dir_acl`/`i_size_high`) only means "upper size bits"
-    /// for regular files under the large_file feature; for directories
-    /// it's genuinely the (unused, by us) ACL block pointer, so it's only
-    /// read/written when this inode is a regular file.
-    fn size(&self) -> u64 {
-        let size_lo = u32::from_le_bytes(self.buf[4..8].try_into().unwrap());
-        if self.is_reg() {
-            let size_hi = u32::from_le_bytes(self.buf[108..112].try_into().unwrap());
-            ((size_hi as u64) << 32) | size_lo as u64
-        } else {
-            size_lo as u64
-        }
-    }
-
-    fn set_size(&mut self, v: u64) {
-        self.buf[4..8].copy_from_slice(&((v & 0xFFFF_FFFF) as u32).to_le_bytes());
-        if self.is_reg() {
-            self.buf[108..112].copy_from_slice(&((v >> 32) as u32).to_le_bytes());
-        }
-    }
-
-    fn i_block(&self, i: usize) -> u32 {
-        let off = 40 + i * 4;
-        u32::from_le_bytes(self.buf[off..off + 4].try_into().unwrap())
-    }
-
-    fn set_i_block(&mut self, i: usize, v: u32) {
-        let off = 40 + i * 4;
-        self.buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
-    }
-
-    fn is_dir(&self) -> bool {
-        (self.i_mode() & 0xF000) == 0x4000
-    }
-
-    fn is_reg(&self) -> bool {
-        (self.i_mode() & 0xF000) == 0x8000
-    }
-
-    fn is_symlink(&self) -> bool {
-        (self.i_mode() & 0xF000) == 0xA000
-    }
-
-    /// A symlink short enough that its target lives inline in `i_block`'s
-    /// own bytes instead of a real data block — see module doc comment.
-    fn is_fast_symlink(&self) -> bool {
-        self.is_symlink() && self.size() < 60
-    }
-
-    /// True if `i_block`'s 15 slots hold real block-number pointers safe
-    /// to walk (`visit_inode_blocks`/`free_all_blocks`) — false for a
-    /// fast symlink (inline text, not pointers) and for any inode type
-    /// this driver never creates itself (char/block device, FIFO,
-    /// socket), whose `i_block` encoding means something else entirely
-    /// (e.g. a device's major/minor pair) that would misread as wild
-    /// pointers if walked the same way.
-    fn has_block_pointers(&self) -> bool {
-        (self.is_dir() || self.is_reg() || self.is_symlink()) && !self.is_fast_symlink()
-    }
-}
+//
+// `RawInode` itself now lives in the `ext2` crate (migration step 1 — see
+// the "ext2 core crate" note near the top of this file) and is imported
+// there (`use ext2::RawInode;`). Nothing here redefines it.
 
 // ── VFS glue ─────────────────────────────────────────────────────────────────
 
@@ -1695,7 +1535,7 @@ impl Inode for Ext2Inode {
 
         let f = fs();
         let new_ino = f.alloc_inode(false)?.ok_or(Errno::ENOSPC)?;
-        let mut new_raw = RawInode::zeroed(f.inode_size as usize);
+        let mut new_raw = RawInode::zeroed(f.core.sb.inode_size as usize);
         new_raw.set_i_mode(0x8000 | 0o644);
         new_raw.set_links_count(1);
         f.write_inode(new_ino, &new_raw)?;
@@ -1724,13 +1564,13 @@ impl Inode for Ext2Inode {
             None => { let _ = f.free_inode(new_ino, true); return Err(Errno::ENOSPC); }
         };
 
-        let mut new_raw = RawInode::zeroed(f.inode_size as usize);
+        let mut new_raw = RawInode::zeroed(f.core.sb.inode_size as usize);
         new_raw.set_i_mode(0x4000 | 0o755);
         new_raw.set_links_count(2);
         new_raw.set_i_block(0, new_block);
-        new_raw.set_size(f.block_size as u64);
+        new_raw.set_size(f.core.sb.block_size as u64);
 
-        let bs = f.block_size as usize;
+        let bs = f.core.sb.block_size as usize;
         let mut buf = alloc::vec![0u8; bs];
         let dot_len = dirent_len(1);
         write_dirent(&mut buf[0..dot_len], new_ino, dot_len as u16, ".", FileType::Directory);
@@ -1889,7 +1729,7 @@ impl Inode for Ext2Inode {
 
         let f = fs();
         let new_ino = f.alloc_inode(false)?.ok_or(Errno::ENOSPC)?;
-        let mut new_raw = RawInode::zeroed(f.inode_size as usize);
+        let mut new_raw = RawInode::zeroed(f.core.sb.inode_size as usize);
         new_raw.set_i_mode(0xA000 | 0o777);
         new_raw.set_links_count(1);
 
@@ -2433,8 +2273,8 @@ impl TestFs {
     /// Whether `ino` (1-based) is marked used in its group's on-disk
     /// inode bitmap right now.
     pub(crate) fn inode_used(&self, ino: u32) -> Result<bool, Errno> {
-        let group = (ino - 1) / self.0.inodes_per_group;
-        let bit = (ino - 1) % self.0.inodes_per_group;
+        let group = (ino - 1) / self.0.core.sb.inodes_per_group;
+        let bit = (ino - 1) % self.0.core.sb.inodes_per_group;
         let bgd = self.0.read_bgd(group)?;
         let bitmap = self.0.block_vec(bgd.inode_bitmap)?;
         Ok(bit_set(&bitmap, bit))
@@ -2443,8 +2283,8 @@ impl TestFs {
     /// Whether `block` (absolute block number) is marked used in its
     /// group's on-disk block bitmap right now.
     pub(crate) fn block_used(&self, block: u32) -> Result<bool, Errno> {
-        let group = (block - self.0.first_data_block) / self.0.blocks_per_group;
-        let bit = (block - self.0.first_data_block) % self.0.blocks_per_group;
+        let group = (block - self.0.core.sb.first_data_block) / self.0.core.sb.blocks_per_group;
+        let bit = (block - self.0.core.sb.first_data_block) % self.0.core.sb.blocks_per_group;
         let bgd = self.0.read_bgd(group)?;
         let bitmap = self.0.block_vec(bgd.block_bitmap)?;
         Ok(bit_set(&bitmap, bit))
@@ -2462,7 +2302,7 @@ impl TestFs {
     /// `(free_blocks, free_inodes)` straight off the on-disk superblock.
     pub(crate) fn sb_free_counts(&self) -> Result<(u32, u32), Errno> {
         let mut raw = [0u8; 1024];
-        self.0.device.read_sectors(2, 2, &mut raw).map_err(|_| Errno::EIO)?;
+        self.0.core.device.read_sectors(2, 2, &mut raw).map_err(|_| Errno::EIO)?;
         let free_blocks = u32::from_le_bytes(raw[12..16].try_into().unwrap());
         let free_inodes = u32::from_le_bytes(raw[16..20].try_into().unwrap());
         Ok((free_blocks, free_inodes))

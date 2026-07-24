@@ -1,0 +1,18 @@
+[package]
+name = "ext2"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately detached from the parent workspace (empty `[workspace]` table
+# below), same shape as `hal/Cargo.toml` — see that file's comment for the
+# full reasoning. Short version: the parent root `Cargo.toml` sets
+# `panic = "abort"` for the bare-metal kernel binary, which would break this
+# crate's own unwinding `cargo test` harness; the parent's root `Cargo.toml`
+# excludes this directory from its `[workspace] members` for the same
+# "multiple workspace roots" reason `hal`/`qemu-test-runner` are excluded.
+[workspace]
+
+[dependencies]
+hal = { path = "../hal" }
+
+[dev-dependencies]

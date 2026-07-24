@@ -13,19 +13,21 @@ ovmf-prebuilt = "0.2.3"
 
 [workspace]
 members = ["kernel"]
-# `hal` and `qemu-test-runner` live in this directory tree but are each
-# deliberately their OWN workspace root (empty `[workspace]` table in
+# `hal`, `ext2`, and `qemu-test-runner` live in this directory tree but are
+# each deliberately their OWN workspace root (empty `[workspace]` table in
 # their own Cargo.toml) so their `cargo build`/`cargo test` don't inherit
 # this workspace's `panic = "abort"` profiles below (which would break a
 # unwinding test harness) and, for `qemu-test-runner` specifically, so
 # building it never triggers this package's `build.rs` (which does its
 # own slow nested `cargo build` of the whole kernel — see `build_kernel()`
-# there). Both must be excluded here or cargo errors with "multiple
+# there). All three must be excluded here or cargo errors with "multiple
 # workspace roots found in the same workspace" — `kernel` depends on `hal`
-# via a plain `path` dependency; `qemu-test-runner` is invoked as an
-# external binary (see `scripts/run-kernel-tests.sh`), not depended on by
-# anything in this workspace.
-exclude = ["hal", "qemu-test-runner"]
+# and `ext2` via plain `path` dependencies (`ext2` itself also depends on
+# `hal` the same way — see `docs/fs/ext2-extraction-plan.md`);
+# `qemu-test-runner` is invoked as an external binary (see
+# `scripts/run-kernel-tests.sh`), not depended on by anything in this
+# workspace.
+exclude = ["hal", "ext2", "qemu-test-runner"]
 
 [profile.dev]
 panic = "abort"

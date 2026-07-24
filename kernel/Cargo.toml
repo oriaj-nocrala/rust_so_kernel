@@ -20,6 +20,7 @@ bootloader_api = "0.11"  # mantén esta para la API
 font8x8 = { version = "0.3.1", default-features = false, features = ["unicode"] }
 x86_64 = "0.15.4"
 hal = { path = "../hal" }
+ext2 = { path = "../ext2" }
 
 # Para manejo de interrupciones y excepciones
 spin = "0.10.0"
