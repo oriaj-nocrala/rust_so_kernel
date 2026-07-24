@@ -14,7 +14,7 @@
 //!
 //! ## Scope (as of this extraction pass)
 //!
-//! Migration steps 1-3 from the extraction plan:
+//! Migration steps 1-4 from the extraction plan:
 //!
 //! 1. **On-disk structs + parsing** — [`Superblock`], [`BlockGroupDesc`],
 //!    [`RawInode`], [`dirent`]'s pure record format. No behavior change:
@@ -35,12 +35,18 @@
 //!    shared block-tree walk [`Ext2Core::visit_inode_blocks`] (used by both
 //!    freeing a file's blocks and the mount-time orphan scan, still
 //!    unmigrated — see below).
+//! 4. **Directory operations + symlink fast/slow target read+write** —
+//!    [`Ext2Core::read_dir_entries`]/[`Ext2Core::add_dir_entry`]/
+//!    [`Ext2Core::remove_dir_entry`]/[`Ext2Core::set_dotdot`] (module
+//!    [`dir`], speaking in the raw on-disk `file_type` byte, never the
+//!    kernel's `fs::types::FileType`) and [`Ext2Core::read_symlink_target`]/
+//!    [`Ext2Core::write_symlink_target`].
 //!
-//! Steps 4-6 (directory operations, `mount` + the mount-time repair passes
-//! `reconcile_free_counts`/`reclaim_orphans`, and turning what's left of
-//! `kernel::fs::ext2` into a pure VFS adapter) deliberately have **not**
-//! moved yet and still live in `kernel::fs::ext2` — see the plan document
-//! for why each is its own step, verified green independently.
+//! Steps 5-6 (`mount`'s own repair passes `reconcile_free_counts`/
+//! `reclaim_orphans`, and turning what's left of `kernel::fs::ext2` into a
+//! pure VFS adapter) deliberately have **not** moved yet and still live in
+//! `kernel::fs::ext2` — see the plan document for why each is its own
+//! step, verified green independently.
 //!
 //! ## Error type and locking (design decisions carried over from the plan)
 //!
@@ -75,13 +81,17 @@ extern crate alloc;
 
 pub mod bgd;
 pub mod bitmap;
+pub mod dir;
 pub mod dirent;
 pub mod error;
 pub mod inode;
 pub mod superblock;
+#[cfg(test)]
+mod test_support;
 pub mod volume;
 
 pub use bgd::{bgd_location, BlockGroupDesc};
+pub use dir::DirEntry;
 pub use error::Ext2Error;
 pub use inode::RawInode;
 pub use superblock::{Superblock, EXT2_MAGIC, FEATURE_INCOMPAT_FILETYPE, ROOT_INO};

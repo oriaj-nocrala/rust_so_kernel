@@ -131,18 +131,25 @@ use crate::process::file::{FileError, FileHandle, FileResult};
 // On-disk structs + parsing (superblock, block group descriptor, raw inode
 // record), block/inode allocation + free-count bookkeeping, inode-table
 // read/write, direct/singly/doubly/triply-indirect block-pointer
-// addressing, and file byte-range read/write now live in the standalone,
-// host-testable `ext2` crate (`ext2/src/`, `cd ext2 && cargo test`) — see
-// `docs/fs/ext2-extraction-plan.md` (migration steps 1-3). This file keeps
-// thin wrappers of the same name (`inode_location`/`read_inode`/
-// `write_inode`/`block_for_index`/`block_for_index_alloc`/
-// `read_file_range`/`write_file_range`) delegating straight to `self.core`,
-// so every call site elsewhere in this file (directory operations,
-// symlinks, `Ext2FileHandle`) keeps working unchanged — same pattern
-// `read_block`/`write_block`/`block_vec` already established. Directory
-// operations, mount + its repair passes (`reconcile_free_counts`/
+// addressing, file byte-range read/write, directory entry list/insert/
+// remove/".."-rewrite, and symlink fast/slow target read+write now live in
+// the standalone, host-testable `ext2` crate (`ext2/src/`, `cd ext2 &&
+// cargo test`) — see `docs/fs/ext2-extraction-plan.md` (migration steps
+// 1-4). This file keeps thin wrappers of the same name (`inode_location`/
+// `read_inode`/`write_inode`/`block_for_index`/`block_for_index_alloc`/
+// `read_file_range`/`write_file_range`/`read_dir_entries`/
+// `add_dir_entry`/`remove_dir_entry`/`set_dotdot`/`read_symlink_target`)
+// delegating straight to `self.core`, so every call site elsewhere in this
+// file (`create`/`mkdir`/`unlink`/`rmdir`/`take_child`/`insert_child`/
+// `lookup`/`mark_reachable`, `Ext2FileHandle`) keeps working unchanged —
+// same pattern `read_block`/`write_block`/`block_vec` already established.
+// The directory-op wrappers additionally convert between the core's raw
+// on-disk `file_type: u8` and this file's own `fs::types::FileType` at the
+// boundary (`ext2_file_type_to_vfs`/`vfs_file_type_to_ext2`, which stay
+// here — the core crate never depends on `fs::types`, see its own crate
+// doc comment). Mount + its repair passes (`reconcile_free_counts`/
 // `reclaim_orphans`) are unmigrated and stay here, per that plan's steps
-// 4-6.
+// 5-6.
 //
 // `RawInode`/`BgdRaw` are re-exported/aliased here (not redefined) so every
 // existing call site in this file (`RawInode::parse(...)`, `bgd.
@@ -170,6 +177,12 @@ impl From<ext2::Ext2Error> for Errno {
             // doc comment on these two variants for the full reasoning).
             ext2::Ext2Error::NoSpace => Errno::ENOSPC,
             ext2::Ext2Error::TooLarge => Errno::EFBIG,
+            // `Ext2Core::remove_dir_entry` (migration step 4) — the
+            // adapter's `unlink`/`rmdir`/`take_child` need this exact
+            // `Errno` value, not a generic I/O error, since it's what a
+            // real `unlink(2)`/`rmdir(2)` reports for a name that doesn't
+            // exist.
+            ext2::Ext2Error::NotFound => Errno::ENOENT,
         }
     }
 }
@@ -274,13 +287,15 @@ impl Ext2Fs {
             }
             // `Ext2Core::mount()` itself can never produce these — they're
             // only ever returned by `block_for_index_alloc` (migration
-            // step 3), reachable solely through a live, already-mounted
-            // filesystem. Matched here anyway because `Ext2Error` is a
-            // single enum shared across every method in the crate, so this
-            // `match` must stay exhaustive; `unreachable!()` documents that
-            // exhaustiveness rather than silently falling back to a
-            // misleading message.
-            ext2::Ext2Error::NoSpace | ext2::Ext2Error::TooLarge => unreachable!("mount() cannot produce this error"),
+            // step 3) or `remove_dir_entry` (migration step 4), reachable
+            // solely through a live, already-mounted filesystem. Matched
+            // here anyway because `Ext2Error` is a single enum shared
+            // across every method in the crate, so this `match` must stay
+            // exhaustive; `unreachable!()` documents that exhaustiveness
+            // rather than silently falling back to a misleading message.
+            ext2::Ext2Error::NoSpace | ext2::Ext2Error::TooLarge | ext2::Ext2Error::NotFound => {
+                unreachable!("mount() cannot produce this error")
+            }
         })?;
         Ok(Self { core })
     }
@@ -434,187 +449,48 @@ impl Ext2Fs {
         self.write_inode(ino, raw)
     }
 
-    /// Read a symlink inode's target string. Real ext2 has two on-disk
-    /// representations, and this driver reads both (see module doc
-    /// comment): "fast" — target under 60 bytes, stored directly in the
-    /// inode's `i_block` bytes, no data block ever allocated — and "slow"
-    /// — target stored as ordinary file content, same as a regular file.
-    /// `size < 60` (not, say, `i_block(0) == 0`) is the only reliable way
-    /// to tell them apart *while reading*: the fast representation's inline
-    /// storage bytes physically alias `i_block`'s own byte range (that's
-    /// the whole space-saving trick — see `Ext2Inode::symlink`), so a
-    /// short target whose own bytes happen to decode to a nonzero
-    /// `i_block(0)` would otherwise be misread as a slow symlink and its
-    /// text bytes reinterpreted as real block pointers. `size < 60` has no
-    /// such ambiguity: a target that size can only ever have been written
-    /// as "fast" (60 bytes is the hard physical limit of the inline area,
-    /// on any ext2 image, not just this driver's own writes), so this
-    /// matches both this driver's own symlinks and a real `mke2fs`/host-
-    /// authored image's.
+    /// Read a symlink inode's target string — thin wrapper over
+    /// `ext2::Ext2Core::read_symlink_target` (migration step 4, see the
+    /// "ext2 core crate" note near the top of this file).
     fn read_symlink_target(&self, raw: &RawInode) -> Result<String, Errno> {
-        let size = raw.size() as usize;
-        if raw.is_fast_symlink() {
-            let bytes = &raw.buf[40..40 + size];
-            return Ok(String::from_utf8_lossy(bytes).to_string());
-        }
-        let mut buf = alloc::vec![0u8; size];
-        self.read_file_range(raw, 0, &mut buf)?;
-        Ok(String::from_utf8_lossy(&buf).to_string())
+        self.core.read_symlink_target(raw).map_err(Into::into)
     }
 
     // ── Directory entries ────────────────────────────────────────────────
+    //
+    // All thin wrappers over `ext2::Ext2Core` (migration step 4, see the
+    // "ext2 core crate" note near the top of this file). Each one converts
+    // between the core's raw on-disk `file_type: u8` and this file's own
+    // `fs::types::FileType` at the boundary — the mapping functions
+    // (`ext2_file_type_to_vfs`/`vfs_file_type_to_ext2`) live below,
+    // unchanged, still used directly by `mkdir`/the test image builders for
+    // their own inline dirent construction.
 
     /// Parse every directory entry out of `raw`'s data blocks (direct +
     /// indirect, same limit as file reads).
     fn read_dir_entries(&self, raw: &RawInode) -> Result<Vec<Ext2DirEntry>, Errno> {
-        let mut entries = Vec::new();
-        let bs = self.core.sb.block_size;
-        let num_blocks = (raw.size() + bs as u64 - 1) / bs as u64;
-
-        for block_index in 0..num_blocks as u32 {
-            let Some(block_num) = self.block_for_index(raw, block_index)? else { continue };
-            let buf = self.block_vec(block_num)?;
-            let mut off = 0usize;
-            while off + 8 <= buf.len() {
-                let inode = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-                let rec_len = u16::from_le_bytes(buf[off + 4..off + 6].try_into().unwrap());
-                let name_len = buf[off + 6] as usize;
-                let file_type = buf[off + 7];
-                if rec_len < 8 {
-                    break; // corrupt — stop rather than loop forever
-                }
-                if inode != 0 && name_len > 0 && off + 8 + name_len <= buf.len() {
-                    let name = String::from_utf8_lossy(&buf[off + 8..off + 8 + name_len]).to_string();
-                    if name != "." && name != ".." {
-                        entries.push(Ext2DirEntry {
-                            ino: inode,
-                            kind: ext2_file_type_to_vfs(file_type),
-                            name,
-                        });
-                    }
-                }
-                off += rec_len as usize;
-            }
-        }
-        Ok(entries)
+        Ok(self.core.read_dir_entries(raw)?
+            .into_iter()
+            .map(|e| Ext2DirEntry { ino: e.ino, kind: ext2_file_type_to_vfs(e.file_type), name: e.name })
+            .collect())
     }
 
-    /// Insert a new `(name -> ino)` directory entry into `dir_raw`'s data,
-    /// splitting an existing entry's slack space (real ext2's own
-    /// approach) if one is big enough, or reusing a deleted (`inode == 0`)
-    /// slot, or — only if nothing fits — allocating and appending a whole
-    /// new directory block.
+    /// Insert a new `(name -> ino)` directory entry into `dir_raw`'s data.
     fn add_dir_entry(&self, dir_ino: u32, dir_raw: &mut RawInode, name: &str, ino: u32, kind: FileType) -> Result<(), Errno> {
-        let bs = self.core.sb.block_size as usize;
-        let needed = dirent_len(name.len());
-        let num_blocks = ((dir_raw.size() as usize) + bs - 1) / bs;
-
-        for block_index in 0..num_blocks as u32 {
-            let Some(block_num) = self.block_for_index(dir_raw, block_index)? else { continue };
-            let mut buf = self.block_vec(block_num)?;
-            let mut off = 0usize;
-            while off + 8 <= buf.len() {
-                let entry_ino = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-                let rec_len = u16::from_le_bytes(buf[off + 4..off + 6].try_into().unwrap()) as usize;
-                if rec_len < 8 {
-                    return Err(Errno::EIO); // corrupt directory
-                }
-                let name_len = buf[off + 6] as usize;
-                let used_len = if entry_ino == 0 { 0 } else { dirent_len(name_len) };
-                let slack = rec_len - used_len;
-
-                if slack >= needed {
-                    if entry_ino != 0 {
-                        // Split: shrink the existing entry to its real
-                        // length, place the new one in the freed tail.
-                        buf[off + 4..off + 6].copy_from_slice(&(used_len as u16).to_le_bytes());
-                        let new_off = off + used_len;
-                        write_dirent(&mut buf[new_off..new_off + slack], ino, slack as u16, name, kind);
-                    } else {
-                        // Reuse a deleted slot in place, keeping its rec_len.
-                        write_dirent(&mut buf[off..off + rec_len], ino, rec_len as u16, name, kind);
-                    }
-                    self.write_block(block_num, &buf)?;
-                    return Ok(());
-                }
-                off += rec_len;
-            }
-        }
-
-        // No room anywhere — grow the directory by one block.
-        let new_block_index = num_blocks as u32;
-        let new_block = self.block_for_index_alloc(dir_raw, new_block_index)?;
-        let mut buf = alloc::vec![0u8; bs];
-        write_dirent(&mut buf[..], ino, bs as u16, name, kind);
-        self.write_block(new_block, &buf)?;
-        dir_raw.set_size((new_block_index as u64 + 1) * bs as u64);
-        self.write_inode(dir_ino, dir_raw)?;
-        Ok(())
+        self.core.add_dir_entry(dir_ino, dir_raw, name, ino, vfs_file_type_to_ext2(kind)).map_err(Into::into)
     }
 
     /// Remove the directory entry named `name` from `dir_raw`'s data.
-    /// Merges its `rec_len` into the previous entry in the same block
-    /// (real ext2's approach), or — if it's the first entry in the block —
-    /// just zeroes its inode field, leaving a reusable deleted slot.
     /// Returns the removed entry's inode number and kind.
     fn remove_dir_entry(&self, dir_raw: &RawInode, name: &str) -> Result<(u32, FileType), Errno> {
-        let bs = self.core.sb.block_size as usize;
-        let num_blocks = ((dir_raw.size() as usize) + bs - 1) / bs;
-
-        for block_index in 0..num_blocks as u32 {
-            let Some(block_num) = self.block_for_index(dir_raw, block_index)? else { continue };
-            let mut buf = self.block_vec(block_num)?;
-            let mut off = 0usize;
-            let mut prev_off: Option<usize> = None;
-            while off + 8 <= buf.len() {
-                let entry_ino = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-                let rec_len = u16::from_le_bytes(buf[off + 4..off + 6].try_into().unwrap()) as usize;
-                if rec_len < 8 {
-                    break;
-                }
-                let name_len = buf[off + 6] as usize;
-                let file_type = buf[off + 7];
-                if entry_ino != 0 && name_len == name.len() && off + 8 + name_len <= buf.len()
-                    && &buf[off + 8..off + 8 + name_len] == name.as_bytes()
-                {
-                    if let Some(p) = prev_off {
-                        let p_rec_len = u16::from_le_bytes(buf[p + 4..p + 6].try_into().unwrap()) as usize;
-                        buf[p + 4..p + 6].copy_from_slice(&((p_rec_len + rec_len) as u16).to_le_bytes());
-                    } else {
-                        buf[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
-                    }
-                    self.write_block(block_num, &buf)?;
-                    return Ok((entry_ino, ext2_file_type_to_vfs(file_type)));
-                }
-                prev_off = Some(off);
-                off += rec_len;
-            }
-        }
-        Err(Errno::ENOENT)
+        let (ino, file_type) = self.core.remove_dir_entry(dir_raw, name)?;
+        Ok((ino, ext2_file_type_to_vfs(file_type)))
     }
 
     /// Rewrite a directory's `".."` entry to point at `new_parent_ino` —
     /// used when moving (rename) a subdirectory to a different parent.
-    /// `".."` is always in the directory's first data block (it's written
-    /// there by `mkdir` and this driver never reorders entries).
     fn set_dotdot(&self, dir_raw: &RawInode, new_parent_ino: u32) -> Result<(), Errno> {
-        let Some(block_num) = self.block_for_index(dir_raw, 0)? else { return Err(Errno::EIO) };
-        let mut buf = self.block_vec(block_num)?;
-        let mut off = 0usize;
-        while off + 8 <= buf.len() {
-            let rec_len = u16::from_le_bytes(buf[off + 4..off + 6].try_into().unwrap()) as usize;
-            if rec_len < 8 {
-                break;
-            }
-            let name_len = buf[off + 6] as usize;
-            if name_len == 2 && off + 8 + 2 <= buf.len() && &buf[off + 8..off + 10] == b".." {
-                buf[off..off + 4].copy_from_slice(&new_parent_ino.to_le_bytes());
-                self.write_block(block_num, &buf)?;
-                return Ok(());
-            }
-            off += rec_len;
-        }
-        Err(Errno::EIO)
+        self.core.set_dotdot(dir_raw, new_parent_ino).map_err(Into::into)
     }
 
     // ── Block group descriptors / bitmaps ───────────────────────────────
@@ -1484,28 +1360,27 @@ impl Inode for Ext2Inode {
         new_raw.set_i_mode(0xA000 | 0o777);
         new_raw.set_links_count(1);
 
-        if target.len() < 60 {
-            // Fast symlink: target lives directly in the i_block bytes,
-            // no data block allocated — see module doc comment.
-            new_raw.buf[40..40 + target.len()].copy_from_slice(target.as_bytes());
-            new_raw.set_size(target.len() as u64);
-            if let Err(e) = f.write_inode(new_ino, &new_raw) {
-                let _ = f.free_inode(new_ino, false);
-                return Err(e);
-            }
-        } else {
-            // Slow symlink: persist mode/links first (same "write content
-            // before linking" ordering as `create`), then grow it exactly
-            // like a regular file's content.
-            if let Err(e) = f.write_inode(new_ino, &new_raw) {
-                let _ = f.free_inode(new_ino, false);
-                return Err(e);
-            }
-            if let Err(e) = f.write_file_range(new_ino, &mut new_raw, 0, target.as_bytes()) {
-                let _ = f.free_all_blocks(&mut new_raw);
-                let _ = f.free_inode(new_ino, false);
-                return Err(e);
-            }
+        // Fast (target inline in `i_block`, no data block allocated) vs
+        // slow (ordinary file content) representation — whichever fits —
+        // now decided by `ext2::Ext2Core::write_symlink_target` (migration
+        // step 4, see the "ext2 core crate" note near the top of this
+        // file). `free_all_blocks` is a safe no-op here whichever step
+        // failed: on a fast-representation failure `new_raw`'s mode marks
+        // it a symlink whose `size()` is still < 60 (either 0, if the
+        // failure was in the inode write itself, or the target's own
+        // length, if that write actually landed), so `has_block_pointers()`
+        // is false and the walk it would otherwise drive never runs; on a
+        // slow-representation failure partway through `write_file_range`,
+        // `size` isn't updated until that call fully succeeds (see its own
+        // doc comment), so the same `size < 60` short-circuit applies even
+        // though some block pointers may already be set — a pre-existing
+        // leak in this exact narrow window, not something this refactor
+        // changes (see `write_symlink_target`'s doc comment in the `ext2`
+        // crate).
+        if let Err(e) = f.core.write_symlink_target(&mut new_raw, new_ino, target) {
+            let _ = f.free_all_blocks(&mut new_raw);
+            let _ = f.free_inode(new_ino, false);
+            return Err(e.into());
         }
 
         let mut dir_raw = self.raw.clone();

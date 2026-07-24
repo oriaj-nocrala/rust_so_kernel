@@ -7,13 +7,15 @@
 // behavior change.
 //
 // Directory *operations* (walking a directory's data blocks to list,
-// insert, or remove entries — `read_dir_entries`/`add_dir_entry`/
-// `remove_dir_entry`/`set_dotdot`) are migration step 4 and deliberately
-// have NOT moved: they stay in `kernel::fs::ext2`, still with their own
-// inline record parsing (unchanged, not perturbed by this module's
-// existence). `ParsedDirent::parse` below exists so this crate can test
-// the record format in isolation now; step 4 can adopt it later to
-// de-duplicate that inline parsing, but that's out of scope here.
+// insert, or remove entries — `Ext2Core::read_dir_entries`/`add_dir_entry`/
+// `remove_dir_entry`/`set_dotdot`, migration step 4) now live in `dir.rs`,
+// one layer up. `read_dir_entries` reuses `ParsedDirent::parse` below to
+// decode each record; `add_dir_entry`/`remove_dir_entry`/`set_dotdot` still
+// parse inline (their loops need to see a corrupt/oversized entry's
+// `rec_len` even when the rest of the record fails to parse, to keep
+// advancing instead of stopping — see `dir.rs`'s `read_dir_entries` doc
+// comment for why that rules out a blind `ParsedDirent::parse` swap
+// everywhere).
 //
 // This module deliberately works in terms of the raw on-disk `file_type`
 // byte (1=regular, 2=dir, 3=block dev, 4=char dev, 7=symlink), not the

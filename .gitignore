@@ -6,6 +6,7 @@
 # root Cargo.toml's `exclude`), so each grows its own target/ dir rather
 # than sharing the root one above.
 /hal/target/
+/ext2/target/
 /qemu-test-runner/target/
 
 # Claude Code local state. `.claude/skills/` IS tracked (project tooling,

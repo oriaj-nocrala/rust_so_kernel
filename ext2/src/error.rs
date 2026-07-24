@@ -38,4 +38,12 @@ pub enum Ext2Error {
     /// `Errno::EFBIG` in the kernel adapter, same reasoning as `NoSpace`
     /// above for why this isn't just `Io`.
     TooLarge,
+    /// `Ext2Core::remove_dir_entry` (migration step 4): no entry named
+    /// `name` exists in the scanned directory data. Kept distinct from
+    /// `Io` for the same reason `NoSpace`/`TooLarge` are — the kernel
+    /// adapter's `From<Ext2Error> for Errno` maps this to `Errno::ENOENT`
+    /// specifically, which `unlink`/`rmdir`/`take_child` need verbatim
+    /// (not a generic I/O error) since it's exactly the error a real
+    /// `unlink(2)`/`rmdir(2)` reports for a name that doesn't exist.
+    NotFound,
 }
