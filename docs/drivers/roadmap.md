@@ -94,7 +94,32 @@ PASS/FAIL exit code.
 that logic, and a repeatable integration test for the hardware path. This is the phase that
 pays down the "no tests" debt.
 
+**A related seam, added after the six drivers above: the storage stack.** `fs::ext2` (the
+read-write ext2 filesystem, mounted at `/mnt`) used to call `block::ata::{read_sectors,
+write_sectors,present}` directly at 9 call sites. `hal::block::BlockDevice` (`hal/src/
+block.rs`) now sits between them — the same seam shape as `PortIo`/`PhysMem`, sector-granular
+rather than filesystem-block-granular (see that file's doc comment for why). `kernel::block::
+AtaBlockDevice` is the production implementation `fs::ext2::init()` mounts against at real
+boot; `hal::block::MemDisk` (`Vec<u8>`-backed, 7 host tests) is what the QEMU integration test
+(`hw_tests.rs::ext2_memdisk_roundtrip`) mounts instead, exercising ext2's full read-write path
+— create/mkdir/rename/symlink/unlink/rmdir through the real VFS — with zero risk to the real
+`disk.img`.
+
+This is explicitly a **partial** migration, stated honestly: `block::ata.rs` itself is not
+seamed onto `PortIo` the way the six drivers above are — its LBA28 PIO command sequencing is
+just as untestable on the host today as before this work. Only the layer *above* it moved.
+Migrating `ata.rs` itself, and extracting `fs::ext2`'s ~2000 lines of pure bitmap/inode/
+directory logic into something host-testable (it currently lives in the `kernel` crate because
+it depends on `Inode`/`FileHandle`, which live there too), are both real future work — see
+`docs/drivers/architecture.md`'s storage-stack section for the reasoning on why neither was
+folded into this pass.
+
 ## Phase 3 — A Linux-class device model *(medium-term)*
+
+(This phase is about the `Bus`/`Device`/`probe` model for *hardware* enumeration — PCI/APIC.
+The storage stack's own seam, `hal::block::BlockDevice`, is a separate, already-done track
+described at the end of Phase 2 above; finishing it — migrating `block::ata.rs` itself onto
+`PortIo`, and any future filesystem beyond ext2 — doesn't depend on this phase landing first.)
 
 This is where the trait layer grows from "an init registry" into a real **device model**. The
 concepts, roughly mirroring Linux's `struct device`/`struct driver`/`struct bus_type` (and

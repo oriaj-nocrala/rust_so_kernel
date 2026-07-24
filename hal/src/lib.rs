@@ -22,6 +22,7 @@ extern crate alloc;
 
 pub mod acpi;
 pub mod ac97;
+pub mod block;
 pub mod keyboard;
 pub mod mouse;
 pub mod pit;

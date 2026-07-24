@@ -78,6 +78,49 @@ boot (init/mod.rs)
 The same shape generalizes to any driver: the kernel adapter owns hardware access + logging
 + any global, and calls into pure `hal` logic across the seam.
 
+## The storage stack — a second, related seam
+
+Everything above is about *hardware* drivers (`hal::PortIo`/`hal::PhysMem`) feeding pure
+parser/register logic. The storage stack is a sibling seam with the same shape but a
+different pair of endpoints: `hal::block::BlockDevice` (`hal/src/block.rs`) sits between a
+filesystem and whatever provides its sectors, exactly like `PortIo` sits between a driver and
+its registers.
+
+- **`hal::block::BlockDevice`** — `present()`/`read_sectors(lba, count, buf)`/
+  `write_sectors(lba, count, buf)`, sector-granular (512 bytes, `hal::block::SECTOR_SIZE`) and
+  LBA28-shaped, not filesystem-block-shaped. See that file's module doc comment for why
+  sectors and not blocks: a real block layer is sector-granular underneath any filesystem's
+  own block size, and keeping the trait's shape identical to the `block::ata` free functions
+  it replaces made migrating `fs::ext2` onto it a mechanical rename at each of its 9 call
+  sites instead of a structural rewrite of an already invariant-heavy (~2000-line) file.
+- **`kernel::block::AtaBlockDevice`** (`kernel/src/block/mod.rs`) — the production
+  implementation, a zero-sized wrapper around `block::ata`'s existing free functions. This is
+  what `fs::ext2::init()` mounts against at real boot.
+- **`hal::block::MemDisk`** — a `Vec<u8>`-backed disk implementing the same trait, host-tested
+  in `hal` (7 tests: round-trip, out-of-range/too-small-buffer error paths, `present()`,
+  snapshotting) and reused by the kernel's QEMU integration test to mount ext2 without
+  touching real hardware or `disk.img` — see Testing below.
+- **`fs::ext2::Ext2Fs`** now holds a `device: Box<dyn BlockDevice>` field instead of calling
+  `block::ata::*` directly; `fs::ext2::init()` constructs an `AtaBlockDevice` for real boot,
+  and a `#[cfg(test)]`-only `fs::ext2::init_with_device()` accepts any `BlockDevice` for the
+  integration test.
+
+**Important asymmetry, stated plainly:** unlike the six hardware drivers above,
+`kernel/src/block/ata.rs` itself is **not** migrated onto the `hal::PortIo` seam — its port
+I/O (`Port<u8>`/`Port<u16>` reads/writes for LBA28 PIO transfers) still lives directly in that
+file, untouched by this work. What *is* seamed off is the layer immediately above it: `fs::ext2`
+no longer names `block::ata` at all, but `block::ata` itself is exactly as untestable as before.
+Migrating `ata.rs` onto `PortIo` (so its command-sequencing logic — drive-select, LBA
+programming, DRQ/BSY polling — gets host tests the way ac97's register protocol did) is real,
+separate future work, not a gap this refactor silently left.
+
+`fs::ext2` also stays inside the `kernel` crate, not `hal` — it depends on the `Inode`/
+`FileHandle` traits that live there, and extracting its ~2000 lines (bitmap/inode/directory
+logic, much of it entangled with the `EXT2_LOCK` coarse-locking discipline and the
+`reclaim_orphans` mount-time repair pass) into a host-testable pure-logic crate is a
+substantial, separate undertaking — noted as future work, not started here. The `BlockDevice`
+trait living in `hal` now is what a future extraction would need already in place.
+
 ## Testing
 
 - **Host unit tests (fast) — in `hal`.** Build synthetic input (a byte image for a parser, a
@@ -108,6 +151,17 @@ The same shape generalizes to any driver: the kernel adapter owns hardware acces
     `[acpi] SELFTEST PASS/FAIL` boot log; `hw_tests.rs`'s `acpi_selftest_passes` is the same
     checks (`acpi::selftest_ok`) as a real assertion. Later hardware-path tests (APIC) add
     more `#[test_case]`s the same way rather than a new mechanism.
+  - `hw_tests.rs::ext2_memdisk_roundtrip` is the storage-stack seam's own case: it mounts
+    `fs::ext2` on a `hal::block::MemDisk` carrying a small (256 KiB) ext2 image built by hand
+    at kernel *runtime* (`fs::ext2::build_minimal_image` — deliberately not `mke2fs`-generated
+    and embedded at build time, so the test binary has zero host-tool dependency beyond what
+    the root build already needs), then drives create/write/read/mkdir/rename/symlink/
+    unlink/rmdir through the real VFS free functions (`fs::vfs::{mkdir,symlink,rename,
+    unlink,rmdir,open,stat}`) — the same path every syscall handler uses. `disk.img` is never
+    touched. `fs::ext2::EXT2` is a single `spin::Once` global, so this is deliberately one
+    large `#[test_case]` scripting the whole scenario rather than several independent ones —
+    a second `init_with_device()` call from a separate test case would silently no-op instead
+    of mounting a fresh image (see that function's doc comment).
 
 ## Current status
 
@@ -115,8 +169,11 @@ All six hardware drivers are migrated onto this pattern: **ACPI** (`PhysMem`, th
 **ac97** (`PortIo` register protocol + the pure `plan_fill` ring state machine), **keyboard**
 and **mouse** (pure decoders needing no seam at all — mouse also has a `PortIo` 8042 enable
 sequence), and **PIT**/**RTC** (`PortIo`; PIT's divisor arithmetic and RTC's whole CMOS
-protocol, including `days_from_civil`, are pure and directly testable). 64 host tests in `hal`
-at last count (`cd hal && cargo test`).
+protocol, including `days_from_civil`, are pure and directly testable). **ATA
+(`kernel/src/block/ata.rs`) is the one hardware driver still outside this pattern** — see the
+storage stack section above for what *is* seamed (the layer above it, `fs::ext2`) versus what
+isn't (the driver itself). 71 host tests in `hal` at last count (`cd hal && cargo test`; 64
+from the six hardware drivers + 7 for `hal::block::MemDisk`).
 
 Neither PIT nor RTC joined the `Driver` trait / boot registry: `Driver::init()` takes no
 arguments, but PIT's rate is caller-supplied (`init_hardware_interrupts` always passes

@@ -1,9 +1,19 @@
 // kernel/src/fs/ext2.rs
 //
-// Read-write ext2, mounted at /mnt over the ATA disk (block::ata) attached
-// to the secondary IDE channel — see src/main.rs for how that disk image
-// gets created and attached, and scripts docs there for how its content is
-// seeded via `mke2fs -d`.
+// Read-write ext2, mounted at /mnt over a `hal::block::BlockDevice` — at
+// real boot that's `crate::block::AtaBlockDevice`, wrapping the ATA disk
+// (block::ata) attached to the secondary IDE channel (see src/main.rs for
+// how that disk image gets created and attached, and scripts docs there for
+// how its content is seeded via `mke2fs -d`). Every disk access in this
+// file goes through `Ext2Fs::device` (`self.device.read_sectors`/
+// `write_sectors`), not `block::ata` directly — this is what lets the QEMU
+// integration test (`kernel/src/hw_tests.rs`) mount an entirely different
+// `BlockDevice` (`hal::block::MemDisk`, a hand-built image, see
+// `build_minimal_image` below) and exercise this same read-write path with
+// zero risk to the real disk.img. See `hal/src/block.rs`'s module doc
+// comment for why the seam speaks in raw 512-byte sectors rather than
+// filesystem blocks, and `docs/drivers/architecture.md`'s storage-stack
+// section for the bigger picture.
 //
 // SCOPE
 // ─────
@@ -108,6 +118,8 @@
 use alloc::{boxed::Box, string::String, string::ToString, sync::Arc, vec::Vec};
 use spin::{Mutex, Once};
 
+use crate::block::{BlockDevice, SECTOR_SIZE};
+
 use crate::fs::{
     types::{DirEntry, Errno, FileType, OpenFlags, Stat},
     vfs::{Filesystem, Inode},
@@ -133,19 +145,46 @@ static EXT2: Once<Ext2Fs> = Once::new();
 /// don't take it.
 static EXT2_LOCK: Mutex<()> = Mutex::new(());
 
-/// Mount the ext2 filesystem from the ATA disk. Call once, before the VFS
-/// mounts `/mnt`. Returns `Err` (not panics) on any problem — a missing or
-/// unreadable disk shouldn't take down boot, just leave `/mnt` unmounted.
+/// Mount the ext2 filesystem from the real ATA disk (`crate::block::
+/// AtaBlockDevice`). Call once, before the VFS mounts `/mnt`. Returns `Err`
+/// (not panics) on any problem — a missing or unreadable disk shouldn't
+/// take down boot, just leave `/mnt` unmounted.
 pub fn init() -> Result<(), &'static str> {
-    if !crate::block::ata::present() {
+    let device: Box<dyn BlockDevice> = Box::new(crate::block::AtaBlockDevice);
+    if !device.present() {
         return Err("no disk on the secondary IDE channel");
     }
-    let fs = Ext2Fs::mount()?;
+    mount_and_repair(device)
+}
+
+/// Alternate entry point used only by the QEMU integration test
+/// (`kernel/src/hw_tests.rs`): mounts ext2 against an arbitrary
+/// `BlockDevice` — a `hal::block::MemDisk` backed by a hand-built image
+/// (`build_minimal_image` below) in practice — instead of the real ATA
+/// disk. This is the whole point of the `BlockDevice` seam: exercising
+/// ext2's create/mkdir/unlink/rename/symlink path end to end with zero risk
+/// to the real `disk.img`. Real boot always goes through `init()` above.
+/// `#[cfg(test)]` because it's only ever called from `hw_tests.rs`, which
+/// is itself `#[cfg(test)]`-only (see `main.rs`).
+#[cfg(test)]
+pub(crate) fn init_with_device(device: Box<dyn BlockDevice>) -> Result<(), &'static str> {
+    if !device.present() {
+        return Err("block device not present");
+    }
+    mount_and_repair(device)
+}
+
+/// Shared tail of `init()`/`init_with_device()`: parse the superblock,
+/// repair any drift an unclean shutdown left behind, and publish the
+/// result as the global singleton. Split out so both entry points run the
+/// exact same mount-time repair sequence — nothing here is ATA-specific.
+fn mount_and_repair(device: Box<dyn BlockDevice>) -> Result<(), &'static str> {
+    let fs = Ext2Fs::mount(device)?;
     // Repair any free-count drift left by an unclean shutdown before this
     // filesystem is exposed to the VFS — see `reconcile_free_counts`'s doc
     // comment for why this matters beyond cosmetics.
     fs.reconcile_free_counts()
-        .map_err(|_| "ext2: mount-time free-count reconciliation failed (ATA I/O error)")?;
+        .map_err(|_| "ext2: mount-time free-count reconciliation failed (I/O error)")?;
     // Reclaim any block/inode an unclean shutdown left allocated but never
     // linked into the directory tree — see `reclaim_orphans`'s doc
     // comment. Also before `/mnt` is exposed to the VFS: if this can't
@@ -165,6 +204,11 @@ fn fs() -> &'static Ext2Fs {
 // ── Superblock / filesystem-wide state ──────────────────────────────────────
 
 struct Ext2Fs {
+    /// The `BlockDevice` this filesystem's every sector read/write goes
+    /// through — `crate::block::AtaBlockDevice` at real boot,
+    /// `hal::block::MemDisk` under the QEMU integration test. See the
+    /// module doc comment.
+    device: Box<dyn BlockDevice>,
     block_size: u32,
     inodes_count: u32,
     blocks_count: u32,
@@ -192,12 +236,12 @@ struct BgdRaw {
 }
 
 impl Ext2Fs {
-    fn mount() -> Result<Self, &'static str> {
+    fn mount(device: Box<dyn BlockDevice>) -> Result<Self, &'static str> {
         // Superblock is always at byte 1024, regardless of block size —
         // read it directly by sector before we know the block size at all.
         let mut raw = [0u8; 1024];
-        crate::block::ata::read_sectors(2, 2, &mut raw)
-            .map_err(|_| "ATA read of superblock failed")?;
+        device.read_sectors(2, 2, &mut raw)
+            .map_err(|_| "block device read of superblock failed")?;
 
         let magic = u16::from_le_bytes([raw[56], raw[57]]);
         if magic != EXT2_MAGIC {
@@ -237,6 +281,7 @@ impl Ext2Fs {
         let bgdt_block = first_data_block + 1;
 
         Ok(Self {
+            device,
             block_size,
             inodes_count,
             blocks_count,
@@ -265,9 +310,9 @@ impl Ext2Fs {
         if block_num >= self.blocks_count {
             return Err(Errno::EIO);
         }
-        let sectors_per_block = (self.block_size / crate::block::ata::SECTOR_SIZE as u32) as u8;
+        let sectors_per_block = (self.block_size / SECTOR_SIZE as u32) as u8;
         let lba = block_num * sectors_per_block as u32;
-        crate::block::ata::read_sectors(lba, sectors_per_block, buf).map_err(|_| Errno::EIO)
+        self.device.read_sectors(lba, sectors_per_block, buf).map_err(|_| Errno::EIO)
     }
 
     fn block_vec(&self, block_num: u32) -> Result<Vec<u8>, Errno> {
@@ -284,9 +329,9 @@ impl Ext2Fs {
         if block_num >= self.blocks_count {
             return Err(Errno::EIO);
         }
-        let sectors_per_block = (self.block_size / crate::block::ata::SECTOR_SIZE as u32) as u8;
+        let sectors_per_block = (self.block_size / SECTOR_SIZE as u32) as u8;
         let lba = block_num * sectors_per_block as u32;
-        crate::block::ata::write_sectors(lba, sectors_per_block, buf).map_err(|_| Errno::EIO)
+        self.device.write_sectors(lba, sectors_per_block, buf).map_err(|_| Errno::EIO)
     }
 
     // ── Inode table ──────────────────────────────────────────────────────
@@ -916,7 +961,7 @@ impl Ext2Fs {
     /// the only mutable superblock state this driver tracks.
     fn adjust_sb_counts(&self, free_blocks_delta: i32, free_inodes_delta: i32) -> Result<(), Errno> {
         let mut raw = [0u8; 1024];
-        crate::block::ata::read_sectors(2, 2, &mut raw).map_err(|_| Errno::EIO)?;
+        self.device.read_sectors(2, 2, &mut raw).map_err(|_| Errno::EIO)?;
         if free_blocks_delta != 0 {
             let cur = u32::from_le_bytes(raw[12..16].try_into().unwrap());
             let new = (cur as i64 + free_blocks_delta as i64) as u32;
@@ -927,7 +972,7 @@ impl Ext2Fs {
             let new = (cur as i64 + free_inodes_delta as i64) as u32;
             raw[16..20].copy_from_slice(&new.to_le_bytes());
         }
-        crate::block::ata::write_sectors(2, 2, &raw).map_err(|_| Errno::EIO)
+        self.device.write_sectors(2, 2, &raw).map_err(|_| Errno::EIO)
     }
 
     fn blocks_in_group(&self, group: u32) -> u32 {
@@ -1060,7 +1105,7 @@ impl Ext2Fs {
     /// kernel.
     fn reconcile_free_counts(&self) -> Result<(), Errno> {
         let mut sb_raw = [0u8; 1024];
-        crate::block::ata::read_sectors(2, 2, &mut sb_raw).map_err(|_| Errno::EIO)?;
+        self.device.read_sectors(2, 2, &mut sb_raw).map_err(|_| Errno::EIO)?;
         let sb_free_blocks = u32::from_le_bytes(sb_raw[12..16].try_into().unwrap());
         let sb_free_inodes = u32::from_le_bytes(sb_raw[16..20].try_into().unwrap());
 
@@ -1983,4 +2028,136 @@ impl FileHandle for Ext2DirHandle {
     }
 
     fn name(&self) -> &str { "ext2/dir" }
+}
+
+// ── Test-only: minimal hand-built ext2 image ────────────────────────────────
+//
+// Backs the QEMU integration test in `kernel/src/hw_tests.rs`
+// (`ext2_memdisk_roundtrip`). Building a real on-disk image from scratch is
+// normally `mke2fs`'s job (the root `build.rs` already shells out to it for
+// `disk.img`) — this doesn't duplicate that to work around a missing tool.
+// The point is a *self-contained* image with zero host-tool dependency,
+// built at kernel **runtime**, inside the test itself, instead of an
+// embedded build-time artifact. That keeps the QEMU test binary buildable
+// on any machine (no `mke2fs`/`e2fsprogs` requirement beyond what the root
+// build already needs for `disk.img`) and, more importantly, means the test
+// never touches the real disk.img at all.
+//
+// The image is deliberately the smallest thing that satisfies every field
+// `Ext2Fs::mount()`/`read_bgd`/`alloc_block`/`alloc_inode`/
+// `reconcile_free_counts`/`reclaim_orphans` actually read: revision 0 (so
+// `inode_size`=128 and `first_ino`=11 are the fixed rev-0 defaults, and
+// `s_feature_incompat` can stay all-zero — no FILETYPE feature needed for
+// this driver's own read/write round trip, see the module doc comment on
+// that field), a single block group, and free-count fields computed to
+// exactly match what's actually marked used — so `reconcile_free_counts`
+// and `reclaim_orphans` both find nothing to repair on a fresh mount,
+// exactly like a real freshly-`mke2fs`'d image would.
+//
+// Layout (1024-byte blocks):
+//   block 0        — boot block (unused)
+//   block 1        — superblock          (first_data_block)
+//   block 2        — block group descriptor table (1 group fits in 1 block)
+//   block 3        — block bitmap
+//   block 4        — inode bitmap
+//   blocks 5..=20  — inode table (128 inodes * 128 bytes = 16 blocks)
+//   block 21       — root directory data ("." and ".." only)
+//   blocks 22..255 — free data blocks (234 of them — plenty for a test that
+//                    creates a handful of files/dirs)
+#[cfg(test)]
+pub(crate) fn build_minimal_image() -> Vec<u8> {
+    const BLOCK_SIZE: u32 = 1024;
+    const TOTAL_BLOCKS: u32 = 256; // 256 KiB image
+    const INODES_COUNT: u32 = 128;
+    const INODE_SIZE: u32 = 128; // rev 0, fixed
+    const FIRST_DATA_BLOCK: u32 = 1; // always 1 when block_size == 1024
+    const BGDT_BLOCK: u32 = FIRST_DATA_BLOCK + 1;
+    const BLOCK_BITMAP_BLOCK: u32 = 3;
+    const INODE_BITMAP_BLOCK: u32 = 4;
+    const INODE_TABLE_START: u32 = 5;
+
+    let inodes_per_block = BLOCK_SIZE / INODE_SIZE; // 8
+    let inode_table_blocks = (INODES_COUNT + inodes_per_block - 1) / inodes_per_block; // 16
+    let root_data_block = INODE_TABLE_START + inode_table_blocks; // 21
+
+    let mut img = alloc::vec![0u8; (TOTAL_BLOCKS * BLOCK_SIZE) as usize];
+    let put_block = |img: &mut Vec<u8>, block_num: u32, data: &[u8]| {
+        let off = (block_num * BLOCK_SIZE) as usize;
+        img[off..off + data.len()].copy_from_slice(data);
+    };
+
+    // Every block from FIRST_DATA_BLOCK..=root_data_block is metadata the
+    // block bitmap must mark used; group 0 covers all of `blocks_count`
+    // here (a single group), so this is also the group's whole "used"
+    // footprint before any test writes happen.
+    let used_block_bits = root_data_block - FIRST_DATA_BLOCK + 1; // 21
+    let blocks_per_group = TOTAL_BLOCKS; // one group covers the whole image
+    let blocks_in_group0 = TOTAL_BLOCKS - FIRST_DATA_BLOCK; // 255 (block 0 excluded)
+    let free_blocks = blocks_in_group0 - used_block_bits;
+    let free_inodes = INODES_COUNT - 1; // only root (ino 2) is used
+
+    // ── Superblock (lives at block FIRST_DATA_BLOCK, i.e. byte 1024) ──
+    let mut sb = alloc::vec![0u8; BLOCK_SIZE as usize];
+    sb[0..4].copy_from_slice(&INODES_COUNT.to_le_bytes());
+    sb[4..8].copy_from_slice(&TOTAL_BLOCKS.to_le_bytes());
+    sb[12..16].copy_from_slice(&free_blocks.to_le_bytes());
+    sb[16..20].copy_from_slice(&free_inodes.to_le_bytes());
+    sb[20..24].copy_from_slice(&FIRST_DATA_BLOCK.to_le_bytes());
+    sb[24..28].copy_from_slice(&0u32.to_le_bytes()); // s_log_block_size = 0 -> 1024-byte blocks
+    sb[32..36].copy_from_slice(&blocks_per_group.to_le_bytes());
+    sb[40..44].copy_from_slice(&INODES_COUNT.to_le_bytes()); // inodes_per_group (1 group)
+    sb[56..58].copy_from_slice(&EXT2_MAGIC.to_le_bytes());
+    // s_rev_level (offset 76) left at 0 (rev 0) — see doc comment above for
+    // why that's the simplest valid choice here.
+    put_block(&mut img, FIRST_DATA_BLOCK, &sb);
+
+    // ── Block group descriptor (block BGDT_BLOCK, offset 0 — only 1 group) ──
+    let mut bgd = alloc::vec![0u8; 32];
+    bgd[0..4].copy_from_slice(&BLOCK_BITMAP_BLOCK.to_le_bytes());
+    bgd[4..8].copy_from_slice(&INODE_BITMAP_BLOCK.to_le_bytes());
+    bgd[8..12].copy_from_slice(&INODE_TABLE_START.to_le_bytes());
+    bgd[12..14].copy_from_slice(&(free_blocks as u16).to_le_bytes());
+    bgd[14..16].copy_from_slice(&(free_inodes as u16).to_le_bytes());
+    bgd[16..18].copy_from_slice(&1u16.to_le_bytes()); // bg_used_dirs_count (root)
+    let mut bgdt_block_buf = alloc::vec![0u8; BLOCK_SIZE as usize];
+    bgdt_block_buf[0..32].copy_from_slice(&bgd);
+    put_block(&mut img, BGDT_BLOCK, &bgdt_block_buf);
+
+    // ── Block bitmap: bits 0..used_block_bits (blocks FIRST_DATA_BLOCK..=root_data_block) ──
+    let mut block_bitmap = alloc::vec![0u8; BLOCK_SIZE as usize];
+    for bit in 0..used_block_bits {
+        block_bitmap[(bit / 8) as usize] |= 1u8 << (bit % 8);
+    }
+    put_block(&mut img, BLOCK_BITMAP_BLOCK, &block_bitmap);
+
+    // ── Inode bitmap: only ino 2 (root) is used ──
+    let mut inode_bitmap = alloc::vec![0u8; BLOCK_SIZE as usize];
+    inode_bitmap[0] |= 1u8 << (ROOT_INO - 1); // ino is 1-based; bit 0 = ino 1
+    put_block(&mut img, INODE_BITMAP_BLOCK, &inode_bitmap);
+
+    // ── Inode table: root's record only, everything else zeroed ──
+    let mut root_raw = RawInode::zeroed(INODE_SIZE as usize);
+    root_raw.set_i_mode(0x4000 | 0o755);
+    root_raw.set_links_count(2); // "." + being a directory's own self-link
+    root_raw.set_i_block(0, root_data_block);
+    root_raw.set_size(BLOCK_SIZE as u64);
+    root_raw.set_blocks_512(BLOCK_SIZE / SECTOR_SIZE as u32);
+
+    let index_in_group = ROOT_INO - 1; // 1
+    let table_block = INODE_TABLE_START + index_in_group / inodes_per_block;
+    let offset_in_block = ((index_in_group % inodes_per_block) * INODE_SIZE) as usize;
+    let mut table_block_buf = alloc::vec![0u8; BLOCK_SIZE as usize];
+    table_block_buf[offset_in_block..offset_in_block + INODE_SIZE as usize]
+        .copy_from_slice(&root_raw.buf);
+    put_block(&mut img, table_block, &table_block_buf);
+
+    // ── Root directory data: "." and ".." (both -> ROOT_INO, root has no parent) ──
+    let mut root_dir = alloc::vec![0u8; BLOCK_SIZE as usize];
+    let dot_len = dirent_len(1);
+    write_dirent(&mut root_dir[0..dot_len], ROOT_INO, dot_len as u16, ".", FileType::Directory);
+    let remaining = BLOCK_SIZE as usize - dot_len;
+    write_dirent(&mut root_dir[dot_len..dot_len + remaining], ROOT_INO, remaining as u16, "..", FileType::Directory);
+    put_block(&mut img, root_data_block, &root_dir);
+
+    img
 }
