@@ -204,15 +204,23 @@ static SLAB_ALLOCATOR: Mutex<mm::slab::SlabAllocator> = Mutex::new(mm::slab::Sla
 
 pub struct SlabGlobalAlloc;
 
-// TEMPORARY (hang-hunt investigation, 2026-07-25): non-blocking probe run
-// before every real lock acquisition below — see `kernel::debug::
-// SLAB_LOCK_CONTENDED`'s doc comment for the full mechanism this detects
-// (a single-core self-deadlock: the timer ISR's own context-switch path can
-// need to allocate, reentering this same non-reentrant lock while this very
-// code — interrupted mid-critical-section, since neither this allocator nor
-// `BUDDY` ever does `cli` — still holds it). Deliberately allocation-free
-// (`serial_println_raw!` + a plain atomic) so it can't recurse into this
-// same allocator from inside itself.
+// Always-on canary for a reentrant acquisition of this lock — see
+// `kernel::debug::SLAB_LOCK_CONTENDED`. Allocation-free on purpose
+// (`serial_println_raw!` + a plain atomic) so it cannot recurse into the
+// allocator it is watching.
+//
+// **Must be called with interrupts already disabled**, i.e. from inside the
+// `without_interrupts` block that guards the real acquisition — never before
+// it. This originally ran *outside*, on the reasoning that a momentary
+// `try_lock` probe is self-contained. It is not: when `try_lock` *succeeds*
+// it really does hold the lock until the returned guard drops, and doing that
+// with interrupts enabled recreates precisely the window the `without_interrupts`
+// discipline exists to close. A timer landing in it sends the ISR's own
+// allocation into the reentrant `.lock()` that spins forever — so the canary
+// caused the very deadlock it was added to detect, at a measured ~2 boots in
+// 24. From in here it can no longer open that window, and it still catches the
+// case that remains possible: a *direct* reentrant allocation from within the
+// allocator's own critical section, which no `cli` can prevent.
 #[inline]
 fn probe_contention() {
     if SLAB_ALLOCATOR.try_lock().is_none() {
@@ -221,22 +229,12 @@ fn probe_contention() {
             "[ALLOC] SLAB_ALLOCATOR already held on this CPU — reentrant lock, about to spin (self-deadlock signature)"
         );
     }
-    // If try_lock() *succeeded* above, the guard it returned is dropped
-    // immediately (end of this fn) — this is purely a probe, the real
-    // acquisition happens at each call site right after, same as before
-    // this existed.
 }
 
 unsafe impl GlobalAlloc for SlabGlobalAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // `probe_contention()` stays outside the `without_interrupts` below
-        // on purpose — it's a self-contained, momentary `try_lock` used only
-        // as an always-on canary (see its doc comment). With every real
-        // acquisition now interrupt-protected, this should never fire again;
-        // if it ever does, that's a real, actionable signal something still
-        // isn't covered.
-        probe_contention();
         let result = without_interrupts(|| {
+            probe_contention();
             SLAB_ALLOCATOR.lock().allocate(&KernelPhysMap, &KernelFrameSource, layout)
         });
         log_alloc_event(&result.event);
@@ -244,8 +242,8 @@ unsafe impl GlobalAlloc for SlabGlobalAlloc {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        probe_contention();
         let event = without_interrupts(|| {
+            probe_contention();
             SLAB_ALLOCATOR.lock().deallocate(&KernelPhysMap, &KernelFrameSource, ptr, layout)
         });
         log_dealloc_event(&event);
