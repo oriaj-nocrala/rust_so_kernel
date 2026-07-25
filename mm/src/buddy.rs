@@ -213,12 +213,67 @@ impl BuddyAllocator {
     }
 
     /// Check if a block is in the free list — O(1) via bitmap.
+    ///
+    /// Read-only inspection accessor (made `pub` — was previously private —
+    /// for property tests exercising invariant 5, bitmap-vs-free-list
+    /// coherence: see `mm/tests/buddy_invariants.rs`). Combined with
+    /// [`Self::walk_free_list`] (which enumerates the free list's own
+    /// truth) and [`Self::free_bit_count`] (a popcount over the bitmap,
+    /// independent of the list), a caller outside this crate can prove the
+    /// bitmap and the free list describe exactly the same set of blocks at
+    /// a given order, not just that every list entry happens to have its
+    /// bit set.
     #[inline]
-    fn is_free(&self, order: usize, addr: PhysAddr) -> bool {
+    pub fn is_free(&self, order: usize, addr: PhysAddr) -> bool {
         match Self::bitmap_pos(order, addr) {
             Some((byte, mask)) => self.bitmap[byte] & mask != 0,
             None => false,
         }
+    }
+
+    /// Walk `order`'s free list in list order, calling `visit` once per
+    /// block address currently linked into it. Read-only — no allocation,
+    /// no mutation (same "just expose the walk `order_stats`/`free_bytes`
+    /// already do" shape, just handing the caller each address instead of
+    /// reducing the walk to a count/sum).
+    ///
+    /// Added as an inspection accessor for property tests proving
+    /// invariant 5 (bitmap ⟺ free-list coherence) from outside this crate
+    /// — see [`Self::is_free`]'s doc comment and
+    /// `mm/tests/buddy_invariants.rs`.
+    pub fn walk_free_list(&self, mem: &dyn PhysMap, order: usize, mut visit: impl FnMut(PhysAddr)) {
+        let idx = self.order_to_index(order);
+        unsafe {
+            let mut current = self.free_lists[idx].head;
+            while let Some(addr) = current {
+                visit(addr);
+                let block = &*(mem.virt_for(addr) as *const FreeBlock);
+                current = block.next;
+            }
+        }
+    }
+
+    /// Number of set ("free") bits in `order`'s region of the bitmap — a
+    /// plain popcount, computed independently of walking the free list.
+    ///
+    /// Read-only inspection accessor added for the same invariant-5
+    /// property tests as [`Self::is_free`]/[`Self::walk_free_list`]: if
+    /// every address [`Self::walk_free_list`] yields for `order` has its
+    /// bit set (checked via [`Self::is_free`]) *and* the list's length
+    /// equals this popcount, the list can contain no fewer and no more
+    /// entries than the bitmap claims — together that proves the two
+    /// structures agree exactly, not just that the list is a subset of
+    /// the bitmap's claimed free set.
+    pub fn free_bit_count(&self, order: usize) -> usize {
+        let idx = order - MIN_ORDER;
+        let start = BITMAP_OFFSETS[idx];
+        let bits = (MAX_PHYS_ADDR as usize) >> order;
+        let end_byte = start + (bits + 7) / 8;
+        let mut count = 0usize;
+        for byte in &self.bitmap[start..end_byte] {
+            count += byte.count_ones() as usize;
+        }
+        count
     }
 
     // ====================================================================

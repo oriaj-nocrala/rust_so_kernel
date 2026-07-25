@@ -21,3 +21,13 @@ edition = "2021"
 # actually uses) have no bare-metal-only code path, so the crate builds and
 # runs identically on the host.
 x86_64 = "=0.15.4"
+
+[dev-dependencies]
+# Integration tests under `tests/` compile as separate crates that only see
+# `mm`'s public API plus `[dev-dependencies]` — a plain `[dependencies]`
+# entry (above) isn't automatically visible there. The property tests in
+# `tests/buddy_invariants.rs`/`tests/slab_frame_source.rs` need to *name*
+# `x86_64::PhysAddr` themselves (constructing addresses to pass back into
+# `deallocate`/`is_free`/etc.), so it's pinned here too — same exact version
+# as above, so there's only ever one `x86_64` in the dependency graph.
+x86_64 = "=0.15.4"
