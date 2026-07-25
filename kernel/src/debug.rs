@@ -277,6 +277,24 @@ static ORPHAN_INODES_RECLAIMED: AtomicU64 = AtomicU64::new(0);
 /// instrumentation around instead of deleting it, useful for the next
 /// scheduler investigation too).
 static SWITCHES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// TEMPORARY (hang-hunt investigation, 2026-07-25, see the
+/// `debug_hang_selfdeadlock` session): counts every time `SlabGlobalAlloc::
+/// alloc`/`dealloc` found `SLAB_ALLOCATOR` already locked via a non-blocking
+/// `try_lock()` probe, immediately before falling back to the real blocking
+/// `.lock()`. This kernel is single-core, and neither `SLAB_ALLOCATOR` nor
+/// the global allocator critical section ever does `cli` — so the *only*
+/// way this lock can ever be found already held is if the holder is the
+/// same CPU, interrupted mid-critical-section by the timer ISR, whose own
+/// `Scheduler::switch_to_next` → `VecDeque::push_back` path can itself need
+/// to allocate (growing a run queue). `spin::Mutex` isn't reentrant, so
+/// that reentrant `.lock()` call spins forever — this counter fires at the
+/// exact instant that fatal reentrant acquisition begins, before it starts
+/// spinning, turning what previously needed a live gdbstub session to catch
+/// into a plain, always-on, zero-cost (one extra `try_lock` per allocation)
+/// counter. A nonzero value here after a hang is direct, deterministic
+/// confirmation of this exact mechanism, independent of whatever backtrace
+/// gdb happens to show once attached.
+static SLAB_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
 
 pub fn inc_forks()         { FORKS_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_execs()         { EXECS_TOTAL.fetch_add(1, Ordering::Relaxed); }
@@ -284,6 +302,11 @@ pub fn inc_reaps()         { REAPS_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_cow_resolved()  { COW_FAULTS_RESOLVED.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_cow_failed()    { COW_FAULTS_FAILED.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_switches()      { SWITCHES_TOTAL.fetch_add(1, Ordering::Relaxed); }
+/// See `SLAB_LOCK_CONTENDED`'s doc comment. Deliberately allocation-free
+/// (a single atomic increment) — called from inside the global allocator
+/// itself, so anything that allocated here would recurse.
+pub fn inc_slab_lock_contended() { SLAB_LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed); }
+pub fn slab_lock_contended_count() -> u64 { SLAB_LOCK_CONTENDED.load(Ordering::Relaxed) }
 pub fn add_orphans_reclaimed(blocks: u64, inodes: u64) {
     ORPHAN_BLOCKS_RECLAIMED.fetch_add(blocks, Ordering::Relaxed);
     ORPHAN_INODES_RECLAIMED.fetch_add(inodes, Ordering::Relaxed);
@@ -317,6 +340,7 @@ pub fn render_report() -> alloc::string::String {
          orphan_blocks_reclaimed: {}\n\
          orphan_inodes_reclaimed: {}\n\
          switches_total: {}\n\
+         slab_lock_contended: {}\n\
          {}{}",
         mask, enabled,
         FORKS_TOTAL.load(Ordering::Relaxed),
@@ -327,6 +351,7 @@ pub fn render_report() -> alloc::string::String {
         ORPHAN_BLOCKS_RECLAIMED.load(Ordering::Relaxed),
         ORPHAN_INODES_RECLAIMED.load(Ordering::Relaxed),
         SWITCHES_TOTAL.load(Ordering::Relaxed),
+        SLAB_LOCK_CONTENDED.load(Ordering::Relaxed),
         SCHEDULER_LOCK.render("scheduler"),
         alloc::format!(
             "{}{}{}{}",
@@ -352,6 +377,7 @@ pub fn print_panic_snapshot() {
     crate::serial_println_raw!("  cow_faults_resolved: {}", COW_FAULTS_RESOLVED.load(Ordering::Relaxed));
     crate::serial_println_raw!("  cow_faults_failed: {}", COW_FAULTS_FAILED.load(Ordering::Relaxed));
     crate::serial_println_raw!("  switches_total: {}", SWITCHES_TOTAL.load(Ordering::Relaxed));
+    crate::serial_println_raw!("  slab_lock_contended: {}", SLAB_LOCK_CONTENDED.load(Ordering::Relaxed));
     let acq = SCHEDULER_LOCK.acquires.load(Ordering::Relaxed);
     let rel = SCHEDULER_LOCK.releases.load(Ordering::Relaxed);
     crate::serial_println_raw!("  scheduler_lock: acquires={} releases={} outstanding={}", acq, rel, acq.saturating_sub(rel));

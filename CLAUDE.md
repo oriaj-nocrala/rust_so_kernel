@@ -31,6 +31,17 @@ scripts/qemu-debug.sh log 50                                   # tail serial.log
 scripts/qemu-debug.sh stop
 ```
 
+**Measuring an intermittent boot failure:** `scripts/boot-matrix.sh N M` runs N QEMU
+instances in parallel, M boots each, classifies every boot (`OK`/`HANG`/`PANIC`/
+`DOUBLE_FAULT`) by grepping its own serial.log, and prints an aggregate. Isolation per
+instance composes the overrides above plus a qcow2 overlay per instance
+(`qemu-img create -f qcow2 -b disk.img -F raw`) — kilobytes each, base image untouched, and
+one per instance is mandatory since mounting `/mnt` writes to it. Parallelising QEMU is the
+right lever here because it costs no extra tokens (same command, same aggregated output) and
+turns a 20-boot measurement from ~15 minutes into ~2. Serial logs of non-OK boots are
+preserved for inspection. **Read the preserved log before believing a failure verdict** — a
+harness that classifies boots can be wrong about them, and has been.
+
 **Concurrent sessions:** `STATE_DIR` (serial.log/monitor.sock/qemu.pid) defaults to
 `/tmp/qemu-debug-rust_so_kernel` but is overridable via `QEMU_DEBUG_STATE_DIR` — set it to a
 different path so two independent investigations in the same checkout don't clobber each
@@ -334,4 +345,5 @@ Sysdeps added beyond the original bootstrap set (all in `generic/generic.cpp` un
 - **Buddy is the only physical frame allocator** after `init_core`. Do not create a second `BootInfoFrameAllocator` over the same memory regions.
 - **`memory` module does NOT import `process`**. Demand paging is kept dependency-free from the process layer; the fault handler in `init/devices.rs` bridges them.
 - **Interrupt safety:** Always `cli` before acquiring `SCHEDULER` and `sti` after releasing it. The timer ISR acquires the lock; holding it with interrupts enabled causes a deadlock.
+- **The same rule covers the allocators, and this one was learned the hard way.** `BUDDY` and `SLAB_ALLOCATOR` (`kernel/src/allocator/mod.rs`) are plain `spin::Mutex`es, so every acquisition wraps its critical section in `x86_64::instructions::interrupts::without_interrupts` — use that, not a bare `cli`/`sti` pair, since it restores the *previous* state and is therefore safe to call from a context that already has interrupts off (the timer ISR itself). Why it matters: ordinary interruptible kernel code allocates all the time — `vfs::resolve_inner` allocates a `Vec<&str>` just to split a path — and if the timer fires while that code holds the allocator lock, `timer_preempt_handler` → `Scheduler::switch_to_next` can itself need to allocate (growing a run queue's `VecDeque`), reentering the same non-reentrant lock on the same CPU and spinning forever at 100% CPU. That was the real cause of a ~1-in-10 debug-boot hang that went unexplained for months while being blamed on `fork`/COW/the physical allocator; it needs no `fork` and no `exec` at all. `kernel::debug`'s `SLAB_LOCK_CONTENDED` canary (`/proc/kdebug`) stays on permanently to catch any path that ever escapes this rule. **Any new global taken on an allocating path needs the same treatment.**
 - **Context switches restore all GPRs** via `jump_to_trapframe` (asm `pop` sequence + `iretq`). Never use partial restores that leave callee registers from the killed process.

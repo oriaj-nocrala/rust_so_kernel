@@ -228,7 +228,18 @@ cmd_start() {
         -device "AC97,audiodev=snd0"
     )
     if [ -f "$ext2_disk" ]; then
-        qemu_args+=(-drive "file=$ext2_disk,format=raw,if=none,id=ext2disk" -device "ide-hd,drive=ext2disk,bus=ide.1")
+        # QEMU_DEBUG_DISK_IMG can point at a qcow2 overlay instead of the
+        # real raw disk.img (see boot-matrix.sh: `qemu-img create -f qcow2
+        # -b disk.img -F raw overlay.qcow2` — kilobytes instead of copying
+        # the whole 96 MiB image, one overlay per parallel instance since
+        # the kernel mounts /mnt read-write). Detect by extension rather
+        # than probing the file (`-f raw` would otherwise misread a qcow2
+        # overlay's header as ext2 filesystem garbage).
+        local ext2_fmt="raw"
+        case "$ext2_disk" in
+            *.qcow2) ext2_fmt="qcow2" ;;
+        esac
+        qemu_args+=(-drive "file=$ext2_disk,format=$ext2_fmt,if=none,id=ext2disk" -device "ide-hd,drive=ext2disk,bus=ide.1")
     fi
 
     if [ "$enable_gdb" = 1 ]; then
