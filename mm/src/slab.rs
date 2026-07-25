@@ -299,13 +299,28 @@ impl SlabCache {
 
         #[cfg(debug_assertions)]
         {
-            // ✅ Verificar que no está corrupto
+            // ✅ Verificar que nadie escribió en el objeto mientras estaba
+            // libre (use-after-free real). Los primeros
+            // `size_of::<FreeObject>()` bytes contienen el puntero `next`
+            // de la free list, escrito por `deallocate` encima del poison
+            // 0xDD — no son poison y no se pueden comprobar contra nada.
+            // Todo lo que queda del objeto sí debe seguir siendo 0xDD tal
+            // como `deallocate` lo dejó; cualquier otro valor ahí significa
+            // que algo escribió en memoria ya liberada. (Antes este chequeo
+            // miraba esos mismos primeros bytes del puntero buscando 0xAA,
+            // así que en realidad nunca miraba el poison — cualquier objeto
+            // libre cuyo sucesor cayera en una dirección con un byte 0xAA
+            // disparaba un panic falso, y un UAF real quedaba indetectable
+            // porque el propio puntero `next` ya pisaba el poison.)
             let ptr = free_obj.as_ptr() as *mut u8;
-            for i in 0..object_size.min(8) {
-                let val = ptr.add(i).read();
-                // Si no es 0xDD (free poison), está OK o es primera vez
-                if val == 0xAA {
-                    panic!("Use-after-free detected at {:#x}", ptr as u64);
+            let ptr_size = core::mem::size_of::<FreeObject>();
+            let poisoned_len = object_size.min(256);
+            if poisoned_len > ptr_size {
+                for i in ptr_size..poisoned_len {
+                    let val = ptr.add(i).read();
+                    if val != 0xDD {
+                        panic!("Use-after-free detected at {:#x}", ptr as u64);
+                    }
                 }
             }
         }
@@ -360,7 +375,20 @@ impl SlabCache {
         let objects_per_page = PAGE_SIZE / object_size;
 
         for i in 0..objects_per_page {
-            let obj_ptr = page_ptr.add(i * object_size) as *mut FreeObject;
+            let obj_ptr = page_ptr.add(i * object_size) as *mut u8;
+
+            #[cfg(debug_assertions)]
+            {
+                // ✅ Poison con el mismo patrón "freed" que `deallocate` usa,
+                // para que el chequeo de UAF en `allocate` tenga un
+                // invariante uniforme que verificar independientemente de
+                // si el objeto viene de una página recién expandida o de
+                // una liberación real: "todo objeto en la free list, más
+                // allá de los bytes del puntero `next`, es 0xDD".
+                core::ptr::write_bytes(obj_ptr, 0xDD, object_size.min(256));
+            }
+
+            let obj_ptr = obj_ptr as *mut FreeObject;
             let free_obj = NonNull::new_unchecked(obj_ptr);
 
             // Link a la free list
