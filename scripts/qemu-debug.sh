@@ -9,7 +9,7 @@
 # needs pacing; backgrounding across separate shell calls needs nohup+disown).
 #
 # Usage:
-#   scripts/qemu-debug.sh start [--no-build] [--release]
+#   scripts/qemu-debug.sh start [--no-build] [--release] [--gdb] [--gdb-freeze]
 #   scripts/qemu-debug.sh stop
 #   scripts/qemu-debug.sh status
 #   scripts/qemu-debug.sh send "text to type"      # maps chars -> sendkey, paced
@@ -35,6 +35,9 @@
 #                                                    # confirm what SGR codes got emitted.
 #   scripts/qemu-debug.sh dlog [N]                  # tail -n N debug.log (-d int trace)
 #   scripts/qemu-debug.sh wait-for PATTERN [TIMEOUT_SECS]   # poll serial.log for a regex
+#   scripts/qemu-debug.sh gdb ["cmd" "cmd" ...]      # batch gdb against a running instance
+#                                                    # (needs `start --gdb`/`--gdb-freeze` first)
+#                                                    # — see the GDB section below
 #
 # Common flow:
 #   scripts/qemu-debug.sh start
@@ -45,17 +48,69 @@
 #   scripts/qemu-debug.sh enter
 #   scripts/qemu-debug.sh log 50
 #   scripts/qemu-debug.sh stop
+#
+# GDB support:
+#
+#   `start --gdb` adds QEMU's `-gdb tcp::<port>` (port from $QEMU_GDB_PORT,
+#   default 1234) — the guest boots completely normally, no frozen CPU, and
+#   the stub just sits there accepting a connection at any later time. This
+#   is the flag for the actual motivating use case: a boot that hangs with
+#   the CPU spinning at ~1-in-N — start normally, wait for (or detect) the
+#   hang, then attach and ask it where it is. `start --gdb-freeze` additionally
+#   passes `-S`, halting the CPU at the reset vector until a debugger
+#   continues it — useful for single-stepping *early* boot, but deliberately
+#   NOT the default (it would hang every `start` call waiting for a debugger
+#   that usually isn't there).
+#
+#   The `gdb` subcommand is the non-interactive half: it runs
+#   `gdb -batch -ex ...` (or `rust-gdb`, whichever is on $PATH — see below)
+#   against `target remote localhost:<port>` with the kernel's own debug
+#   symbols loaded, and prints the result to stdout. Built for an agent
+#   without an interactive terminal — no interactive prompt, no TUI, just
+#   one-shot commands in, text out:
+#
+#     scripts/qemu-debug.sh gdb "info registers" "bt" "p \$rip"
+#
+#   With no arguments it runs a reasonable default hang-diagnosis set
+#   (registers, backtrace, symbol-for-RIP). Debugger choice: `rust-gdb`
+#   (a thin wrapper around `gdb` that adds Rust pretty-printers) is
+#   preferred when present on $PATH, else plain `gdb`; if neither exists
+#   the subcommand fails with a clear message instead of half-working.
+#   No lldb support — not attempted (this only ports the gdbstub flow).
+#
+#   Symbol loading needs one extra step because the kernel ELF is a PIE
+#   (`bootloader` 0.11 loads it as ET_DYN at a runtime-chosen
+#   "virtual_address_offset", not the addresses recorded in the file, and
+#   that offset can differ boot to boot depending on the UEFI memory map).
+#   The bootloader logs the exact offset it picked to serial at boot
+#   (`virtual_address_offset: 0x...`); `gdb` subcommand greps the current
+#   $STATE_DIR/serial.log for the most recent one and loads symbols via
+#   `add-symbol-file <kernel elf> -o <offset>` so addresses actually line
+#   up. The kernel ELF itself is never stripped (see CLAUDE.md) — whichever
+#   of kernel/target/x86_64-unknown-none/{debug,release}/kernel was built
+#   most recently is used automatically.
+#
+#   GDB example flow:
+#     scripts/qemu-debug.sh start --gdb
+#     scripts/qemu-debug.sh wait-for "About to start first process"
+#     scripts/qemu-debug.sh gdb "info registers" "bt"
+#     scripts/qemu-debug.sh stop
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-STATE_DIR="/tmp/qemu-debug-rust_so_kernel"
+# Overridable so multiple independent debug sessions (e.g. concurrent
+# investigations in the same checkout) don't share — and clobber — the
+# same serial.log/monitor.sock/qemu.pid. Default preserved for anyone not
+# opting in.
+STATE_DIR="${QEMU_DEBUG_STATE_DIR:-/tmp/qemu-debug-rust_so_kernel}"
 SOCK="$STATE_DIR/monitor.sock"
 SERIAL_LOG="$STATE_DIR/serial.log"
 DEBUG_LOG="$STATE_DIR/debug.log"
 QEMU_STDOUT="$STATE_DIR/qemu-stdout.log"
 PID_FILE="$STATE_DIR/qemu.pid"
 KEY_DELAY="${QEMU_KEY_DELAY:-0.15}"
+GDB_PORT="${QEMU_GDB_PORT:-1234}"
 
 mkdir -p "$STATE_DIR"
 
@@ -78,17 +133,40 @@ find_output_file() {
         | sort -rn | head -1 | cut -d' ' -f2-
 }
 
+find_kernel_elf() {
+    # Newest kernel ELF across debug/release profiles — same "newest wins"
+    # convention as find_output_file(). Per CLAUDE.md the kernel binary is
+    # never stripped, so this always has full debug symbols for gdb.
+    find "$REPO_ROOT/kernel/target/x86_64-unknown-none" -maxdepth 2 -type f -name kernel -printf '%T@ %p\n' 2>/dev/null \
+        | sort -rn | head -1 | cut -d' ' -f2-
+}
+
+find_debugger() {
+    # rust-gdb is a thin wrapper around gdb that also loads Rust's
+    # pretty-printers — strictly better than plain gdb when present, same
+    # -batch/-ex CLI otherwise. No lldb support here.
+    if command -v rust-gdb >/dev/null 2>&1; then
+        echo rust-gdb
+    elif command -v gdb >/dev/null 2>&1; then
+        echo gdb
+    else
+        echo ""
+    fi
+}
+
 cmd_start() {
     if is_running; then
         echo "Already running (pid $(cat "$PID_FILE")). Use 'stop' first." >&2
         exit 1
     fi
 
-    local do_build=1 profile_flag=()
+    local do_build=1 profile_flag=() enable_gdb=0 freeze_gdb=0
     for arg in "$@"; do
         case "$arg" in
             --no-build) do_build=0 ;;
             --release) profile_flag=(--release) ;;
+            --gdb) enable_gdb=1 ;;
+            --gdb-freeze) enable_gdb=1; freeze_gdb=1 ;;
             *) echo "Unknown start arg: $arg" >&2; exit 1 ;;
         esac
     done
@@ -110,6 +188,10 @@ cmd_start() {
     ovmf_code="$(grep -oP 'OVMF_CODE=\K.*' "$out_file")"
     ovmf_vars_src="$(grep -oP 'OVMF_VARS=\K.*' "$out_file")"
     ext2_disk="$(grep -oP 'EXT2_DISK_PATH=\K.*' "$out_file")"
+    # Overridable: point this at a scratch copy (`cp disk.img /tmp/foo.img`)
+    # for any session that shouldn't write to the shared disk.img — two
+    # QEMUs writing the same ext2 image concurrently can corrupt it.
+    ext2_disk="${QEMU_DEBUG_DISK_IMG:-$ext2_disk}"
 
     rm -f "$SOCK"
     : > "$SERIAL_LOG"
@@ -123,8 +205,19 @@ cmd_start() {
 
     local qemu_args=(
         -drive "if=pflash,format=raw,readonly=on,file=$ovmf_code"
-        -drive "if=pflash,format=raw,file=$ovmf_vars_src"
-        -drive "format=raw,file=$uefi_path"
+        # file.locking=off on the VARS pflash and the UEFI boot image: both
+        # live under the shared build output dir (not overridable the way
+        # the ext2 disk is, since they're build.rs's own outputs, not a
+        # standalone file a caller can just point elsewhere), so a second
+        # concurrent qemu-debug.sh session against the same build — a
+        # different STATE_DIR, same $REPO_ROOT/target — would otherwise
+        # fail to launch at all with QEMU's "Failed to get write lock"
+        # (verified: this is exactly what happens without it). Both are
+        # effectively read-only in practice for this kernel (no meaningful
+        # UEFI NVRAM writes, boot image content never changes at runtime),
+        # so disabling QEMU's advisory lock here doesn't add real risk.
+        -drive "if=pflash,format=raw,file=$ovmf_vars_src,file.locking=off"
+        -drive "format=raw,file=$uefi_path,file.locking=off"
         -m 512M
         -cpu max
         -serial "file:$SERIAL_LOG"
@@ -136,6 +229,17 @@ cmd_start() {
     )
     if [ -f "$ext2_disk" ]; then
         qemu_args+=(-drive "file=$ext2_disk,format=raw,if=none,id=ext2disk" -device "ide-hd,drive=ext2disk,bus=ide.1")
+    fi
+
+    if [ "$enable_gdb" = 1 ]; then
+        # Equivalent to -s (which is hardcoded to port 1234) but with a
+        # configurable port so multiple sessions don't collide.
+        qemu_args+=(-gdb "tcp::$GDB_PORT")
+        echo "gdbstub listening on tcp::$GDB_PORT (attach with '$0 gdb ...')" >&2
+    fi
+    if [ "$freeze_gdb" = 1 ]; then
+        qemu_args+=(-S)
+        echo "CPU frozen at reset (-S) — nothing boots until a debugger connects and continues it" >&2
     fi
 
     echo "Launching qemu (state dir: $STATE_DIR)..." >&2
@@ -299,6 +403,68 @@ cmd_wait_for() {
     echo "matched: $pattern" >&2
 }
 
+cmd_gdb() {
+    is_running || { echo "Not running. Start with '$0 start --gdb' first." >&2; exit 1; }
+
+    local dbg
+    dbg="$(find_debugger)"
+    if [ -z "$dbg" ]; then
+        echo "No debugger found on host (checked: rust-gdb, gdb). Install gdb to use this subcommand." >&2
+        exit 1
+    fi
+
+    local kernel_elf
+    kernel_elf="$(find_kernel_elf)"
+    if [ -z "$kernel_elf" ] || [ ! -f "$kernel_elf" ]; then
+        echo "No kernel ELF found under $REPO_ROOT/kernel/target/x86_64-unknown-none/{debug,release}/kernel — build first (plain 'start' builds it)." >&2
+        exit 1
+    fi
+
+    # bootloader 0.11 loads the kernel as a PIE (ET_DYN) at a runtime-chosen
+    # virtual_address_offset (bootloader-x86_64-common's load_kernel.rs),
+    # NOT the addresses recorded in the ELF, and it isn't necessarily the
+    # same across boots — it depends on which regions the UEFI memory map
+    # leaves free. The bootloader logs the exact offset it picked to serial
+    # at boot ("virtual_address_offset: 0x..."); pull the most recent one
+    # out of this session's serial.log so gdb shifts the whole symbol table
+    # to match where the kernel actually landed in guest memory this run.
+    local offset
+    offset="$(grep -oP 'virtual_address_offset: \K0x[0-9a-fA-F]+' "$SERIAL_LOG" 2>/dev/null | tail -1)"
+    if [ -z "$offset" ]; then
+        echo "warning: 'virtual_address_offset' not found yet in $SERIAL_LOG (kernel may not have reached that boot log line) — loading symbols unshifted; addresses/backtraces will likely be wrong" >&2
+        offset="0x0"
+    fi
+
+    local commands=("$@")
+    if [ ${#commands[@]} -eq 0 ]; then
+        # Reasonable default for "the kernel is hung, where is it": full
+        # register dump, backtrace, and which function RIP currently falls
+        # inside of.
+        commands=("info registers" "bt" "info symbol \$pc")
+    fi
+
+    local gdb_args=(
+        -batch -nx
+        -ex "set pagination off"
+        -ex "set confirm off"
+        -ex "target remote localhost:$GDB_PORT"
+        -ex "add-symbol-file $kernel_elf -o $offset"
+    )
+    local c
+    for c in "${commands[@]}"; do
+        gdb_args+=(-ex "$c")
+    done
+    # Detach rather than let batch-mode exit implicitly kill/disconnect the
+    # target ungracefully — the whole point is to inspect a still-running
+    # (possibly hung) QEMU and leave it running afterward.
+    gdb_args+=(-ex "detach")
+
+    echo "debugger: $dbg" >&2
+    echo "kernel ELF: $kernel_elf" >&2
+    echo "virtual_address_offset: $offset" >&2
+    "$dbg" "${gdb_args[@]}"
+}
+
 case "${1:-}" in
     start) shift; cmd_start "$@" ;;
     stop) cmd_stop ;;
@@ -313,8 +479,9 @@ case "${1:-}" in
     rawlog) cmd_rawlog "${2:-}" ;;
     dlog) cmd_dlog "${2:-}" ;;
     wait-for) cmd_wait_for "$2" "${3:-}" ;;
+    gdb) shift; cmd_gdb "$@" ;;
     *)
-        echo "Usage: $0 {start|stop|status|send TEXT|key KEY...|enter|screendump [out]|log [N]|rawlog [N]|dlog [N]|wait-for PATTERN [TIMEOUT]}" >&2
+        echo "Usage: $0 {start [--gdb|--gdb-freeze]|stop|status|send TEXT|key KEY...|enter|screendump [out]|log [N]|rawlog [N]|dlog [N]|wait-for PATTERN [TIMEOUT]|gdb [\"cmd\" ...]}" >&2
         exit 1
         ;;
 esac

@@ -31,6 +31,40 @@ scripts/qemu-debug.sh log 50                                   # tail serial.log
 scripts/qemu-debug.sh stop
 ```
 
+**Concurrent sessions:** `STATE_DIR` (serial.log/monitor.sock/qemu.pid) defaults to
+`/tmp/qemu-debug-rust_so_kernel` but is overridable via `QEMU_DEBUG_STATE_DIR` — set it to a
+different path so two independent investigations in the same checkout don't clobber each
+other's log/socket/pid or kill each other's QEMU. The ext2 disk image is likewise overridable
+via `QEMU_DEBUG_DISK_IMG` (point it at a `cp disk.img /tmp/foo.img` scratch copy) — two QEMUs
+writing the real `disk.img` at once can corrupt it. The shared UEFI boot image and OVMF VARS
+pflash (under `target/*/build/so2-*/out/`, not independently overridable since they're
+build.rs's own outputs) are opened with `file.locking=off` for exactly this reason — both are
+effectively read-only at runtime, so two sessions reading the same build concurrently is safe.
+
+**GDB.** `start --gdb` adds QEMU's gdbstub (`-gdb tcp::1234`, port via `QEMU_GDB_PORT`) without
+freezing the CPU — boots normally, stub just sits there so you can attach at any later point
+(e.g. once a hang is detected). `start --gdb-freeze` additionally passes `-S` to halt at the
+reset vector for early-boot single-stepping — not the default, since it would hang every
+`start` waiting for a debugger that usually isn't there. The `gdb` subcommand is the
+non-interactive half, built for agents without an interactive terminal: it runs
+`rust-gdb`/`gdb` (whichever is on `$PATH`, `rust-gdb` preferred for its Rust pretty-printers;
+errors out with a clear message if neither exists) in `-batch` mode against
+`target remote localhost:<port>`, with the kernel's own (never-stripped, see Userspace
+Programs below) debug symbols loaded from whichever of
+`kernel/target/x86_64-unknown-none/{debug,release}/kernel` was built most recently, and prints
+the result to stdout:
+
+```bash
+scripts/qemu-debug.sh gdb "info registers" "bt" "p \$rip"   # no args: same 3 as a default
+```
+
+Symbol loading needs one extra step because the kernel ELF is a PIE — `bootloader` 0.11 loads
+it as `ET_DYN` at a runtime-chosen `virtual_address_offset` (not the addresses recorded in the
+file, and not necessarily the same across boots). The bootloader logs the exact offset it
+picked to serial at boot (`virtual_address_offset: 0x...`); the `gdb` subcommand greps the
+current session's serial.log for it and loads symbols via `add-symbol-file <elf> -o <offset>`
+so addresses actually resolve to real function names instead of bare hex.
+
 ### QEMU integration tests
 
 Real hardware-path behavior (drivers that need actual QEMU devices, not just host-testable
