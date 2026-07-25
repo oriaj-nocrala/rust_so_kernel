@@ -31,6 +31,7 @@
 
 use crate::bitmap::count_free_bits;
 use crate::error::Ext2Error;
+use crate::inode::RawInode;
 use crate::superblock::ROOT_INO;
 use crate::volume::Ext2Core;
 
@@ -125,10 +126,19 @@ impl Ext2Core {
     /// every inode actually reachable from the root directory (fixed
     /// metadata + reserved inodes are seeded in as used up front, same
     /// convention real ext2 tools use), then clears any bit the real
-    /// on-disk bitmaps mark used that the walk never reached. Returns
+    /// on-disk bitmaps mark used that the walk never reached — zeroing
+    /// each reclaimed inode's own on-disk record as it goes, the same way
+    /// `unlink`/`rmdir` do for an ordinary deletion (see the sweep's own
+    /// comment for why the bitmap bit alone isn't enough, and for the
+    /// crash-ordering rule the two sweep phases encode). Returns
     /// `(freed_blocks, freed_inodes)` — the kernel adapter traces/counts
     /// these itself (see module doc comment) rather than this crate doing
     /// it directly.
+    ///
+    /// Only ever touches content behind a bit it found *set*: an inode
+    /// whose bitmap bit is already clear is out of scope by construction,
+    /// however live its record looks (see `PHANTOM_DIR_INO` in
+    /// `crate::testimg` for the real-world shape that matters for).
     ///
     /// Safety-critical property: the sweep only ever runs if the walk
     /// completed with no error at all (`?` on every fallible step here
@@ -138,7 +148,15 @@ impl Ext2Core {
     /// incomplete "should be used" picture must never be swept against,
     /// or a still-live block/inode could be freed out from under a file
     /// that's simply reached through a deep path.
-    pub fn reclaim_orphans(&self) -> Result<(u32, u32), Ext2Error> {
+    ///
+    /// `now_unix_secs` is stamped into each reclaimed inode's `i_dtime`,
+    /// exactly as a normal `unlink`/`rmdir` does. This crate has no clock
+    /// of its own (see the crate doc comment) — the kernel adapter passes
+    /// `kernel::time::now_unix_secs()`, host tests pass a fixed plausible
+    /// epoch. It matters that it *is* plausible: see
+    /// [`RawInode::set_dtime`] on why a small value gets misread as an
+    /// ext3 orphan-list link rather than a timestamp.
+    pub fn reclaim_orphans(&self, now_unix_secs: u32) -> Result<(u32, u32), Ext2Error> {
         let block_bytes = ((self.sb.blocks_count as usize) + 7) / 8;
         let inode_bytes = ((self.sb.inodes_count as usize) + 7) / 8;
         let mut used_blocks = alloc::vec![0u8; block_bytes];
@@ -233,9 +251,66 @@ impl Ext2Core {
         // the end if anything actually changed.
         let mut freed_blocks: u32 = 0;
         let mut freed_inodes: u32 = 0;
+
+        // Inodes first, all groups, *before* a single block bit is
+        // cleared below — this ordering is load-bearing, not stylistic.
+        // Each reclaimed inode's own record is zeroed and `i_dtime`-
+        // stamped (mirroring `unlink`/`rmdir`, see `CLAUDE.md`'s ext2
+        // section) and that write lands before the bitmap write that
+        // frees it, so this driver's "a crash can only ever leak, never
+        // dangle" rule survives a crash at any point inside this sweep:
+        //
+        //  - crash after zeroing an inode record, before its bitmap bit
+        //    clears → an all-zero record still marked used. The next
+        //    mount's walk can't reach it either, so it's swept again.
+        //  - crash after the inode phase, before the block phase → the
+        //    orphan's data blocks stay marked used with nothing pointing
+        //    at them. A leak, reclaimed on the next mount.
+        //
+        // Sweeping blocks first (what this did originally) inverts that:
+        // it frees the blocks an orphan inode's still-intact record
+        // points at, and a crash right there leaves a live-looking
+        // record with dangling pointers into blocks a later allocation
+        // will legitimately hand to someone else — the exact shape
+        // `unlink`'s own write ordering exists to rule out.
         for group in 0..self.sb.num_groups {
             let bgd = self.read_bgd(group)?;
+            let mut inode_bitmap = self.block_vec(bgd.inode_bitmap)?;
+            let mut ichanged = false;
+            for bit in 0..self.inodes_in_group(group) {
+                let byte = (bit / 8) as usize;
+                let mask = 1u8 << (bit % 8);
+                if inode_bitmap[byte] & mask == 0 {
+                    continue;
+                }
+                let ino = group * self.sb.inodes_per_group + bit + 1;
+                if !bit_set_1based(&used_inodes, ino) {
+                    // Clearing the bitmap bit alone is not enough: real
+                    // `e2fsck`'s Pass 1 scans the raw inode table, not
+                    // the bitmap, so a reclaimed-but-untouched record
+                    // (nonzero mode, nonzero links, real block pointers)
+                    // still reads as a live file needing reconnection to
+                    // `lost+found` — an image this pass had "repaired"
+                    // failed `e2fsck -fn` with exit 4 for exactly that.
+                    // Zeroing the record is what `unlink`/`rmdir` already
+                    // do for an ordinary deletion; this makes the orphan
+                    // path agree with them.
+                    let mut dead = RawInode::zeroed(self.sb.inode_size as usize);
+                    dead.set_dtime(now_unix_secs);
+                    self.write_inode(ino, &dead)?;
 
+                    inode_bitmap[byte] &= !mask;
+                    ichanged = true;
+                    freed_inodes += 1;
+                }
+            }
+            if ichanged {
+                self.write_block(bgd.inode_bitmap, &inode_bitmap)?;
+            }
+        }
+
+        for group in 0..self.sb.num_groups {
+            let bgd = self.read_bgd(group)?;
             let mut block_bitmap = self.block_vec(bgd.block_bitmap)?;
             let mut changed = false;
             for bit in 0..self.blocks_in_group(group) {
@@ -253,25 +328,6 @@ impl Ext2Core {
             }
             if changed {
                 self.write_block(bgd.block_bitmap, &block_bitmap)?;
-            }
-
-            let mut inode_bitmap = self.block_vec(bgd.inode_bitmap)?;
-            let mut ichanged = false;
-            for bit in 0..self.inodes_in_group(group) {
-                let byte = (bit / 8) as usize;
-                let mask = 1u8 << (bit % 8);
-                if inode_bitmap[byte] & mask == 0 {
-                    continue;
-                }
-                let ino = group * self.sb.inodes_per_group + bit + 1;
-                if !bit_set_1based(&used_inodes, ino) {
-                    inode_bitmap[byte] &= !mask;
-                    ichanged = true;
-                    freed_inodes += 1;
-                }
-            }
-            if ichanged {
-                self.write_block(bgd.inode_bitmap, &inode_bitmap)?;
             }
         }
 
@@ -443,6 +499,13 @@ mod tests {
         ORPHAN_FILE_BLOCK, ORPHAN_FILE_INO, PHANTOM_DIR_BLOCK, PHANTOM_DIR_INO};
     use hal::block::MemDisk;
 
+    /// A plausible wall-clock epoch to stamp reclaimed inodes' `i_dtime`
+    /// with (2025-07-25). Plausibility is the point — see
+    /// [`RawInode::set_dtime`]: a small value reads as an ext3
+    /// orphan-list link rather than a timestamp, which is precisely the
+    /// misdiagnosis this driver already got bitten by once.
+    const TEST_DTIME: u32 = 1_753_400_000;
+
     /// `reconcile_free_counts` against an already-consistent image (the
     /// plain `minimal_image()` fixture, untouched) must report no drift
     /// and leave every counter exactly as it found it.
@@ -499,7 +562,7 @@ mod tests {
         assert_eq!(sb_free_blocks_before, true_free_blocks_before as u32);
         assert_eq!(sb_free_inodes_before, true_free_inodes_before as u32);
 
-        let (freed_blocks, freed_inodes) = core.reclaim_orphans().expect("reclaim_orphans");
+        let (freed_blocks, freed_inodes) = core.reclaim_orphans(TEST_DTIME).expect("reclaim_orphans");
         assert_eq!(freed_blocks, 2, "both orphan data blocks must be reclaimed");
         assert_eq!(freed_inodes, 2, "both orphan inodes must be reclaimed");
 
@@ -507,6 +570,18 @@ mod tests {
         assert!(!core.block_used(ORPHAN_FILE_BLOCK).unwrap());
         assert!(!core.inode_used(ORPHAN_DIR_INO).unwrap());
         assert!(!core.block_used(ORPHAN_DIR_BLOCK).unwrap());
+
+        // Freeing the bitmap bit is only half of it — the record itself
+        // must be retired too, or `e2fsck`'s Pass 1 (a raw inode-table
+        // scan) still sees a live-looking file. See the sweep's comment.
+        for ino in [ORPHAN_FILE_INO, ORPHAN_DIR_INO] {
+            let raw = core.read_inode(ino).unwrap();
+            assert_eq!(raw.i_mode(), 0, "reclaimed inode {ino}'s mode must be cleared");
+            assert_eq!(raw.links_count(), 0, "reclaimed inode {ino}'s link count must be cleared");
+            assert_eq!(raw.size(), 0, "reclaimed inode {ino}'s size must be cleared");
+            assert_eq!(raw.i_block(0), 0, "reclaimed inode {ino}'s block pointers must be cleared");
+            assert_eq!(raw.dtime(), TEST_DTIME, "reclaimed inode {ino} must carry a real deletion timestamp");
+        }
 
         // Root itself must never be swept.
         assert!(core.inode_used(ROOT_INO).unwrap());
@@ -548,38 +623,35 @@ mod tests {
     // `reconcile_free_counts`/`reclaim_orphans` at all. So the oracle test
     // below builds a *real* `mke2fs` image at test time instead.
     //
-    // `reconcile_free_counts` gets a real, passing oracle test: it only
-    // ever touches free-count bookkeeping, never bitmaps or inode records,
-    // so repairing pure counter drift on top of an otherwise-untouched
-    // real `mke2fs` image is exactly the kind of fix `e2fsck -fn` confirms
-    // clean.
+    // Both repair passes now get a real, passing oracle test against a
+    // genuine `mke2fs` image. `reconcile_free_counts` only ever touches
+    // free-count bookkeeping, never bitmaps or inode records, so pure
+    // counter drift is the obvious fixture for it. `reclaim_orphans` gets
+    // its fixture from `debugfs -w`'s own `unlink` command, which "does
+    // not adjust the inode reference counts, so this can be used to
+    // create an orphan inode by hand" — exactly this pass's target shape,
+    // built by the tool that defines it rather than by hand.
     //
-    // `reclaim_orphans` deliberately does NOT get an equivalent "exit 0"
-    // oracle test. Building a real `mke2fs` + `debugfs -w` orphan fixture
-    // during this migration (`mkdir` two directories, then `debugfs`'s own
-    // `unlink` command — "does not adjust the inode reference counts, so
-    // this can be used to create an orphan inode by hand", i.e. exactly
-    // this driver's target shape) and running the full repair pipeline
-    // against it surfaced a genuine, pre-existing property of
-    // `reclaim_orphans`'s design: it only ever clears the orphan's bitmap
-    // bit (by design — see `reclaim_orphans`'s and `PHANTOM_DIR_INO`'s own
-    // doc comments: it must never look at, let alone alter, content behind
-    // a bit it didn't find set), and never zeroes/stamps `i_dtime` on the
-    // orphaned inode's own record the way `unlink`/`rmdir` do for a
-    // normal deletion (see `CLAUDE.md`'s ext2 section on why that ordering
-    // matters there). Real `e2fsck`'s Pass 1 scans the raw inode table
-    // directly, not just the bitmap — it still finds the reclaimed
-    // inode's well-formed-looking record (nonzero mode, nonzero links,
-    // real block pointers) and reports it as a disconnected directory
-    // needing reconnection to `lost+found`, `e2fsck -fn` exit code 4, same
-    // complaint it would raise before any repair at all. This is not a
-    // regression from this migration (the pre-extraction kernel code had
-    // the exact same bitmap-only sweep, just never checked against a real
-    // `e2fsck` because no host-side test existed to run one) and fixing it
-    // is a genuine behavior change to `reclaim_orphans`'s on-disk writes —
-    // explicitly out of scope for a "no behavior change" extraction step
-    // (see `docs/fs/ext2-extraction-plan.md`'s "Fuera de alcance" section).
-    // Flagged here as a real follow-up, not silently dropped.
+    // That oracle is what caught the bug the sweep's own comment now
+    // documents: clearing only the bitmap bit left the orphan's record
+    // intact in the inode table, `e2fsck`'s Pass 1 scans that table
+    // directly, and a "repaired" image still came back as a disconnected
+    // inode needing reconnection to `lost+found` — exit code 4, the same
+    // complaint as before any repair at all. Worth stating plainly since
+    // the fixture below can't show it: this was pre-existing (the
+    // pre-extraction kernel code had the identical bitmap-only sweep), and
+    // it went unnoticed for as long as it did purely because no host-side
+    // test could run a real `e2fsck`.
+    //
+    // The orphan fixture is a regular *file*, not a directory, and that's
+    // deliberate: `debugfs`'s `unlink` of a directory leaves the parent's
+    // `i_links_count` still counting the removed child's `".."`, so
+    // `e2fsck` would report a root ref-count mismatch no matter how
+    // correctly the orphan itself were reclaimed. Adjusting a parent's
+    // link count for a child it no longer has any entry for is a repair
+    // this pass doesn't attempt at all (it has no way to know which
+    // directory that was), so pointing the oracle at that shape would be
+    // asserting a property `reclaim_orphans` never claimed.
 
     /// Build a real, `mke2fs`-created minimal ext2 image (`total_blocks`
     /// 1024-byte blocks, default `mke2fs` geometry otherwise) and return
@@ -605,6 +677,54 @@ mod tests {
         let ok = matches!(status, Ok(s) if s.success());
         let result = if ok { std::fs::read(&path).ok() } else { None };
         let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    /// Hand `bytes` to `debugfs -w` and have it create a real orphan
+    /// inode: write a file in, then `unlink` it — `debugfs`'s `unlink`
+    /// "does not adjust the inode reference counts", leaving the inode
+    /// marked used in the bitmap, its record intact, and nothing in any
+    /// directory pointing at it. Returns the resulting image bytes, or
+    /// `None` if `debugfs` isn't runnable here.
+    ///
+    /// The caller must not trust a successful return on its own:
+    /// `debugfs -f` exits 0 regardless of whether the individual commands
+    /// in its script worked (verified directly — the same trap the root
+    /// `build.rs` documents around `sync_disk_bin_dir`). The test below
+    /// checks for real by asserting `e2fsck` is *unhappy* with the
+    /// fixture before any repair runs.
+    fn inject_orphan_file_with_debugfs(bytes: &[u8]) -> Option<Vec<u8>> {
+        use std::io::Write;
+        let pid = std::process::id();
+        let dir = std::env::temp_dir();
+        let img = dir.join(format!("ext2_orphan_fixture_{pid}.img"));
+        let payload = dir.join(format!("ext2_orphan_payload_{pid}.bin"));
+        let script = dir.join(format!("ext2_orphan_script_{pid}.txt"));
+
+        let build = || -> Option<()> {
+            std::fs::File::create(&img).ok()?.write_all(bytes).ok()?;
+            // Two 1024-byte blocks' worth, so the sweep has real data
+            // blocks to reclaim alongside the inode, not just the inode.
+            std::fs::File::create(&payload).ok()?.write_all(&[0xABu8; 2048]).ok()?;
+            std::fs::File::create(&script)
+                .ok()?
+                .write_all(format!("write {} orphanfile\nunlink orphanfile\nquit\n", payload.display()).as_bytes())
+                .ok()?;
+            let status = std::process::Command::new("debugfs")
+                .arg("-w")
+                .arg("-f")
+                .arg(&script)
+                .arg(&img)
+                .output()
+                .ok()?;
+            status.status.success().then_some(())?;
+            Some(())
+        };
+        let result = build().and_then(|()| std::fs::read(&img).ok());
+
+        let _ = std::fs::remove_file(&img);
+        let _ = std::fs::remove_file(&payload);
+        let _ = std::fs::remove_file(&script);
         result
     }
 
@@ -684,6 +804,58 @@ mod tests {
                 "e2fsck -fn reported the repaired image as inconsistent:\nstdout: {stdout}\nstderr: {stderr}"
             ),
             None => eprintln!("skipping e2fsck oracle assertion: e2fsck not runnable on this host"),
+        }
+    }
+
+    /// The orphan-side oracle: a real `mke2fs` image, a real orphan
+    /// inode created by `debugfs` itself, the full repair pipeline, and
+    /// `e2fsck -fn` as the verdict. This is the test that fails if the
+    /// sweep goes back to clearing the bitmap bit without retiring the
+    /// inode record — `e2fsck` reports the leftover record as a
+    /// disconnected inode (exit 4) even though the bitmap looks right.
+    /// Skips gracefully if `mke2fs`/`debugfs`/`e2fsck` aren't on `$PATH`.
+    #[test]
+    fn reclaim_orphans_repairs_a_real_debugfs_orphan_e2fsck_clean() {
+        let Some(clean_image) = build_real_ext2_fixture(256) else {
+            eprintln!("skipping e2fsck orphan oracle: mke2fs not runnable on this host");
+            return;
+        };
+        let Some(bytes) = inject_orphan_file_with_debugfs(&clean_image) else {
+            eprintln!("skipping e2fsck orphan oracle: debugfs not runnable on this host");
+            return;
+        };
+
+        // The fixture is only worth anything if it really is broken to
+        // start with — this is also what catches a `debugfs` script that
+        // silently did nothing (see `inject_orphan_file_with_debugfs`).
+        match e2fsck_says_clean(&bytes) {
+            Some((clean, stdout, _)) => assert!(
+                !clean,
+                "the injected fixture must actually contain an orphan e2fsck objects to, \
+                 otherwise this test proves nothing:\n{stdout}"
+            ),
+            None => {
+                eprintln!("skipping e2fsck orphan oracle: e2fsck not runnable on this host");
+                return;
+            }
+        }
+
+        let core = Ext2Core::mount(alloc::boxed::Box::new(MemDisk::from_vec(bytes)))
+            .expect("mount a real mke2fs image carrying an orphan");
+
+        // Same order the kernel adapter's `mount_and_repair` uses.
+        core.reconcile_free_counts().expect("reconcile");
+        let (freed_blocks, freed_inodes) = core.reclaim_orphans(TEST_DTIME).expect("reclaim_orphans");
+        assert_eq!(freed_inodes, 1, "exactly the one injected orphan inode must be reclaimed");
+        assert_eq!(freed_blocks, 2, "its two data blocks must be reclaimed with it");
+
+        let dump = dump_core_to_bytes(&core);
+        match e2fsck_says_clean(&dump) {
+            Some((clean, stdout, stderr)) => assert!(
+                clean,
+                "e2fsck -fn still objects after reclaim_orphans:\nstdout: {stdout}\nstderr: {stderr}"
+            ),
+            None => eprintln!("skipping e2fsck orphan oracle assertion: e2fsck not runnable on this host"),
         }
     }
 }

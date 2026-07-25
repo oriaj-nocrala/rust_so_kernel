@@ -105,7 +105,13 @@
 //     blocks, etc.) a full e2fsck also performs. This is what actually
 //     reclaims a block/inode a crash left allocated-but-never-linked —
 //     the one concrete gap the paragraph above used to describe as
-//     unrecoverable "in principle."
+//     unrecoverable "in principle." A reclaimed inode's own record is
+//     zeroed and `i_dtime`-stamped as it goes, the same as an ordinary
+//     `unlink`/`rmdir` above — the bitmap bit alone isn't enough, since
+//     e2fsck's Pass 1 reads the inode table directly. See
+//     `ext2::Ext2Core::reclaim_orphans` for the mechanics and the sweep's
+//     own crash-ordering rule; the wall clock it stamps comes from this
+//     file's wrapper, since `ext2` has no clock of its own.
 
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use spin::{Mutex, Once};
@@ -442,9 +448,13 @@ impl Ext2Fs {
     /// for the full rationale, and `ext2::Ext2Core::reclaim_orphans`'s own
     /// doc comment for the full mechanics (the reachability walk, the
     /// sweep, and the safety-critical "only sweep if the walk completed
-    /// with no error at all" property).
+    /// with no error at all" property). The wall clock stamped into each
+    /// reclaimed inode's `i_dtime` is supplied from here for the same
+    /// reason the tracing below is: `ext2` has no clock of its own and
+    /// can't call into the kernel for one.
     fn reclaim_orphans(&self) -> Result<(), Errno> {
-        let (freed_blocks, freed_inodes) = self.core.reclaim_orphans()?;
+        let (freed_blocks, freed_inodes) =
+            self.core.reclaim_orphans(crate::time::now_unix_secs() as u32)?;
         if freed_blocks > 0 || freed_inodes > 0 {
             crate::ktrace!(
                 crate::debug::FS,

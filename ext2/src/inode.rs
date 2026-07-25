@@ -74,6 +74,14 @@ impl RawInode {
         self.buf[20..24].copy_from_slice(&unix_secs.to_le_bytes());
     }
 
+    /// Reads back what [`set_dtime`](Self::set_dtime) wrote. Zero on any
+    /// inode that was never deleted, which is what makes it a usable
+    /// "was this record actually retired, or just left behind?" check —
+    /// see `repair`'s orphan-sweep tests.
+    pub fn dtime(&self) -> u32 {
+        u32::from_le_bytes(self.buf[20..24].try_into().unwrap())
+    }
+
     /// `size_hi` (`i_dir_acl`/`i_size_high`) only means "upper size bits"
     /// for regular files under the large_file feature; for directories
     /// it's genuinely the (unused, by us) ACL block pointer, so it's only

@@ -106,6 +106,17 @@ Saltar con gracia si no hay `e2fsck` en el host, no fallar.
 Esto cubre lo que ninguna aserción a mano cubre bien: contadores del BGD contra
 bitmaps, link counts, `..` de directorios, `i_dtime`, huérfanos.
 
+**Cerrado después del refactor (no durante).** Durante la extracción solo
+`reconcile_free_counts` consiguió un oráculo en verde; el de `reclaim_orphans`
+destapó un bug real y preexistente — el barrido limpiaba el bit del bitmap pero
+dejaba intacto el registro del inodo, y el Pass 1 de `e2fsck` lee la tabla de
+inodos directamente, así que una imagen "reparada" seguía saliendo con exit 4.
+Arreglarlo era un cambio de comportamiento, explícitamente fuera del alcance de
+un refactor, así que se dejó documentado en `ext2/src/repair.rs` y se arregló en
+un commit aparte. Hoy ambos pasos tienen oráculo `e2fsck -fn` en verde; la
+fixture de huérfanos la construye el propio `debugfs` (`write` + `unlink`, que
+por diseño no ajusta los link counts).
+
 ## Fuera de alcance
 
 - **`block/ata.rs` → `PortIo`.** Ortogonal: ATA está *debajo* del filesystem.

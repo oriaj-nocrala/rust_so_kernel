@@ -246,12 +246,26 @@ fn ext2_reclaim_orphans_clears_injected_disk_img_shape() {
     // This is the real question: does the mount-time orphan sweep clear
     // an inode 31-shaped orphan (a disconnected directory whose ".."
     // points at root) the same way it clears a plain orphan file?
-    let _ = core.reclaim_orphans().expect("reclaim_orphans should complete without an I/O error against this image");
+    // A real wall clock is available here (unlike the `ext2` crate's own
+    // host tests) — this is the same value the kernel adapter passes at a
+    // real mount, so the dtime assertions below exercise the production
+    // path, not a test-only constant.
+    let dtime = crate::time::now_unix_secs() as u32;
+    let _ = core.reclaim_orphans(dtime).expect("reclaim_orphans should complete without an I/O error against this image");
 
     assert!(!core.inode_used(ORPHAN_FILE_INO).unwrap(), "reclaim_orphans should have freed the orphan file inode");
     assert!(!core.block_used(ORPHAN_FILE_BLOCK).unwrap(), "reclaim_orphans should have freed the orphan file block");
     assert!(!core.inode_used(ORPHAN_DIR_INO).unwrap(), "reclaim_orphans should have freed the orphan dir inode (31)");
     assert!(!core.block_used(ORPHAN_DIR_BLOCK).unwrap(), "reclaim_orphans should have freed the orphan dir block");
+
+    // Clearing the bitmap bit is only half the job: real `e2fsck`'s Pass 1
+    // scans the raw inode table, so a reclaimed inode whose record still
+    // looks live gets reported as a disconnected inode needing
+    // `lost+found` — see `ext2::repair`'s e2fsck-oracle tests, which catch
+    // that against a real `mke2fs`/`debugfs` image. This asserts the same
+    // property on the real hardware path.
+    assert_eq!(core.inode_mode(ORPHAN_FILE_INO).unwrap(), 0, "reclaimed orphan file's inode record must be zeroed, not just its bitmap bit");
+    assert_eq!(core.inode_mode(ORPHAN_DIR_INO).unwrap(), 0, "reclaimed orphan dir's inode record must be zeroed, not just its bitmap bit");
 
     // Root itself, and its own data block, must NOT have been swept —
     // reclaim_orphans clearing everything (including root) would trivially
