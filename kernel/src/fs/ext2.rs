@@ -9,7 +9,7 @@
 // `write_sectors`), not `block::ata` directly — this is what lets the QEMU
 // integration test (`kernel/src/hw_tests.rs`) mount an entirely different
 // `BlockDevice` (`hal::block::MemDisk`, a hand-built image, see
-// `build_minimal_image` below) and exercise this same read-write path with
+// `ext2::testimg::build_minimal_image`) and exercise this same read-write path with
 // zero risk to the real disk.img. See `hal/src/block.rs`'s module doc
 // comment for why the seam speaks in raw 512-byte sectors rather than
 // filesystem blocks, and `docs/drivers/architecture.md`'s storage-stack
@@ -32,23 +32,15 @@
 // 1024-byte block size (`EFBIG` beyond that is now purely theoretical: no
 // disk image this kernel builds is anywhere near that size).
 //
-// ext2-native symlinks ARE implemented (`Ext2Inode::symlink`/`readlink`),
-// matching real ext2's own two on-disk representations: "fast" (target
-// under 60 bytes, stored directly in the inode's `i_block` array, no data
-// block ever allocated) when it fits, "slow" (ordinary file content,
-// exactly like a regular file) otherwise. This driver always *writes*
-// whichever representation fits, and reads both — a real `mke2fs`/host-
-// authored image may contain either.
+// ext2-native symlinks ARE implemented (`Ext2Inode::symlink`/`readlink`) —
+// see CLAUDE.md's "Filesystem: ext2" section for the fast/slow on-disk
+// representation split.
 //
-// Permission bits: `Ext2Inode::stat()` reports the real on-disk `i_mode`
-// permission bits (not a hardcoded per-filesystem constant like every
-// other filesystem here — see `fs::types::Stat`'s doc comments) and
-// `Ext2Inode::chmod`/`Ext2FileHandle::chmod` persist real changes to them.
-// New files/dirs still get a fixed initial mode (`create`/`mkdir` have no
-// caller-supplied mode to honor — `sys_open`/`sys_mkdir` don't take one at
-// all, see their doc comments in `process/syscall/fs.rs`), but that mode
-// is now correctly round-tripped through `stat()` afterward, and `chmod`
-// can change it for real.
+// Permission bits: real on-disk `i_mode`, not a hardcoded per-filesystem
+// constant — see CLAUDE.md's "Filesystem: ext2" section. New files/dirs
+// still get a fixed initial mode (`create`/`mkdir` have no caller-supplied
+// mode to honor — `sys_open`/`sys_mkdir` don't take one at all, see their
+// doc comments in `process/syscall/fs.rs`); `chmod` can change it afterward.
 //
 // Requires `s_feature_incompat` to only have FILETYPE set — anything else
 // (in particular EXTENTS, i.e. an ext4 image) would misinterpret i_block
@@ -128,100 +120,54 @@ use crate::process::file::{FileError, FileHandle, FileResult};
 
 // ── ext2 core crate ─────────────────────────────────────────────────────────
 //
-// On-disk structs + parsing (superblock, block group descriptor, raw inode
-// record), block/inode allocation + free-count bookkeeping, inode-table
-// read/write, direct/singly/doubly/triply-indirect block-pointer
-// addressing, file byte-range read/write, directory entry list/insert/
-// remove/".."-rewrite, symlink fast/slow target read+write, and mount-time
-// consistency repair (`reconcile_free_counts`/`reclaim_orphans`, including
-// the recursive `mark_reachable` walk and the `inode_used`/`block_used`/
-// `inode_mode`/`sb_free_counts`/`bgd_free_counts`/`true_free_counts_group0`
-// test-inspection accessors) now all live in the standalone, host-testable
-// `ext2` crate (`ext2/src/`, `cd ext2 && cargo test`) — see
-// `docs/fs/ext2-extraction-plan.md` (migration steps 1-5, now complete).
-// The hand-built test disk images (`build_minimal_image`/
-// `build_image_with_orphans`) also moved there, into `ext2::testimg` (step
-// 6) — `kernel/src/hw_tests.rs`'s QEMU integration tests import them
-// directly instead of this file keeping its own `#[cfg(test)]` copies.
+// On-disk format/parsing, block/inode allocation + free-count bookkeeping,
+// indirect-block addressing, byte-range I/O, directory operations,
+// symlinks, and mount-time repair all live in the standalone, host-testable
+// `ext2` crate (`ext2/src/`, `cd ext2 && cargo test`), speaking only in
+// inode numbers/byte ranges/its own `Ext2Error`, never VFS types. This file
+// is a thin adapter over `ext2::Ext2Core`: most methods here just delegate
+// and convert between the core's `Ext2Error`/raw `file_type: u8` and this
+// crate's `Errno`/`fs::types::FileType` at the boundary
+// (`ext2_file_type_to_vfs`/`vfs_file_type_to_ext2`, also used directly by
+// `mkdir` and the test image builders).
 //
-// What's left in *this* file (step 6, `docs/fs/ext2-extraction-plan.md`,
-// now closed) is a pure VFS adapter: thin wrappers of the same name
-// (`read_inode`/`write_inode`/`read_file_range`/`write_file_range`/
-// `read_dir_entries`/`add_dir_entry`/`remove_dir_entry`/`set_dotdot`/
-// `read_symlink_target`) delegating straight to `self.core`, so every call
-// site elsewhere in this file (`create`/`mkdir`/`unlink`/`rmdir`/
-// `take_child`/`insert_child`/`lookup`, `Ext2FileHandle`) keeps working
-// unchanged — same pattern `write_block`/`block_vec` already established.
-// (A handful of wrappers this file used to keep purely for symmetry with
-// their siblings — `read_block`/`block_for_index`/`block_for_index_alloc`
-// — turned out to have had no real caller at all since the migration steps
-// that introduced them: every actual file-data access in this file already
-// went through `read_file_range`/`write_file_range` instead, which call
-// `self.core.read_block`/`self.core.block_for_index*` directly. `cargo
-// build`'s dead-code lint caught all three once step 6 removed the last
-// thing that made them *look* used (the test-image builders sat right next
-// to them in this file, even though they never actually called them
-// either); step 6 deleted the three wrappers rather than keep dead code
-// around. Block/inode
-// bitmap allocation, by contrast, is genuinely NOT delegated to
-// `self.core`'s own copy of the same logic — `alloc_block`/`free_block`/
-// `alloc_inode`/`free_inode`/`read_bgd`/`adjust_bgd_counts`/
-// `adjust_sb_counts`/`blocks_in_group`/`inodes_in_group`/`bgd_location`
-// below are this file's own, actively-used implementation, predating this
-// extraction and left as-is: unifying them with `ext2::Ext2Core`'s
-// equivalent methods, which nothing in this file currently calls, is a
-// real behavior-preserving simplification but out of scope for this
-// "close the loose ends" pass — see `docs/fs/ext2-extraction-plan.md`.)
-// The directory-op wrappers additionally convert between the core's raw
-// on-disk `file_type: u8` and this file's own `fs::types::FileType` at the
-// boundary (`ext2_file_type_to_vfs`/`vfs_file_type_to_ext2`, which stay
-// here — the core crate never depends on `fs::types`, see its own crate
-// doc comment). `reconcile_free_counts`/`reclaim_orphans` below are thin
-// wrappers too, but over `ext2::Ext2Core`'s methods of the same name —
-// what's left here for those two is only the part that can't move:
-// emitting a `ktrace!` line + the permanent `/proc/kdebug` counter from
-// what the core methods report finding/fixing (see those two wrapper
-// methods' own doc comments below for the exact split, and
-// `ext2::repair`'s module doc comment for why the core crate can't call
-// `ktrace!` directly, not depending on the kernel at all).
-//
-// `RawInode`/`BgdRaw` are re-exported/aliased here (not redefined) so every
-// existing call site in this file (`RawInode::parse(...)`, `bgd.
-// block_bitmap`, etc.) keeps working unchanged — only the *type
-// definitions* moved, not how they're used.
+// Block/inode bitmap allocation has no wrapper here: `create`/`mkdir`/
+// `unlink`/`rmdir`/`symlink` call `f.core.alloc_block`/`free_block`/
+// `alloc_inode`/`free_inode` directly, the same way `free_all_blocks` calls
+// `self.core.free_block`. Deliberately not duplicated in this file: an
+// earlier byte-identical copy of that same bitmap logic used to live here
+// too, live on the same mounted filesystem simultaneously with the core's
+// copy, harmless only because `EXT2_LOCK` serialized both — a bitmap fix
+// landing in only one of two identical allocators is silent corruption, so
+// don't reintroduce a second copy.
 use ext2::RawInode;
-use ext2::BlockGroupDesc as BgdRaw;
 use ext2::ROOT_INO;
 
 impl From<ext2::Ext2Error> for Errno {
     fn from(e: ext2::Ext2Error) -> Self {
         match e {
-            // BadMagic/UnsupportedFeature only ever occur inside
-            // `Ext2Core::mount()`, which this adapter's own `Ext2Fs::mount()`
-            // maps to a `&'static str` directly (see below) rather than
-            // through this impl — EIO is a reasonable fallback all the same,
-            // since every one of these is fundamentally "the disk didn't
-            // give us what we expected."
+            // Only ever occur inside `Ext2Core::mount()`, which this
+            // adapter's own `Ext2Fs::mount()` maps to a `&'static str`
+            // directly (see below) rather than through this impl — EIO is
+            // a reasonable fallback all the same, since every one of these
+            // is fundamentally "the disk didn't give us what we expected."
             ext2::Ext2Error::Io | ext2::Ext2Error::BadMagic | ext2::Ext2Error::UnsupportedFeature => Errno::EIO,
-            // NoSpace/TooLarge (migration step 3, `block_for_index_alloc`)
-            // must map to their own distinct `Errno` values, not collapse
+            // Must map to their own distinct `Errno` values, not collapse
             // into EIO — `Ext2FileHandle::write` pattern-matches on
             // `Errno::ENOSPC` specifically to report `FileError::NoSpace`
             // instead of a generic I/O error (see `ext2::Ext2Error`'s own
             // doc comment on these two variants for the full reasoning).
             ext2::Ext2Error::NoSpace => Errno::ENOSPC,
             ext2::Ext2Error::TooLarge => Errno::EFBIG,
-            // `Ext2Core::remove_dir_entry` (migration step 4) — the
-            // adapter's `unlink`/`rmdir`/`take_child` need this exact
-            // `Errno` value, not a generic I/O error, since it's what a
-            // real `unlink(2)`/`rmdir(2)` reports for a name that doesn't
-            // exist.
+            // What a real `unlink(2)`/`rmdir(2)` reports for a name that
+            // doesn't exist — `unlink`/`rmdir`/`take_child` need this exact
+            // value, not a generic I/O error.
             ext2::Ext2Error::NotFound => Errno::ENOENT,
-            // `Ext2Core::reclaim_orphans`'s `mark_reachable` (migration
-            // step 5) hit its hard recursion-depth guard — same `Errno`
-            // value a real deep-symlink-resolution guard uses, and the
-            // exact value `mount_and_repair`'s own doc comment already
-            // promises ("a directory tree too deep").
+            // `reclaim_orphans`'s `mark_reachable` hit its hard recursion-
+            // depth guard — same `Errno` value a real deep-symlink-
+            // resolution guard uses, and the exact value
+            // `mount_and_repair`'s own doc comment already promises ("a
+            // directory tree too deep").
             ext2::Ext2Error::TooDeep => Errno::ELOOP,
         }
     }
@@ -257,7 +203,7 @@ pub fn init() -> Result<(), &'static str> {
 /// Alternate entry point used only by the QEMU integration test
 /// (`kernel/src/hw_tests.rs`): mounts ext2 against an arbitrary
 /// `BlockDevice` — a `hal::block::MemDisk` backed by a hand-built image
-/// (`build_minimal_image` below) in practice — instead of the real ATA
+/// (`ext2::testimg::build_minimal_image`) in practice — instead of the real ATA
 /// disk. This is the whole point of the `BlockDevice` seam: exercising
 /// ext2's create/mkdir/unlink/rename/symlink path end to end with zero risk
 /// to the real `disk.img`. Real boot always goes through `init()` above.
@@ -311,13 +257,11 @@ struct Ext2Fs {
 }
 
 impl Ext2Fs {
-    /// Parse the superblock (delegated to `ext2::Ext2Core::mount` —
-    /// migration step 1) and construct the adapter. Does NOT run the
-    /// mount-time repair passes (`reconcile_free_counts`/
-    /// `reclaim_orphans`) — `mount_and_repair` above calls those right
-    /// after this returns, before publishing the
-    /// result anywhere shared. Error strings match exactly what this
-    /// function used to produce inline, one per `ext2::Ext2Error` variant.
+    /// Parse the superblock (delegated to `ext2::Ext2Core::mount`) and
+    /// construct the adapter. Does NOT run the mount-time repair passes
+    /// (`reconcile_free_counts`/`reclaim_orphans`) — `mount_and_repair`
+    /// above calls those right after this returns, before publishing the
+    /// result anywhere shared.
     fn mount(device: Box<dyn BlockDevice>) -> Result<Self, &'static str> {
         let core = ext2::Ext2Core::mount(device).map_err(|e| match e {
             ext2::Ext2Error::Io => "block device read of superblock failed",
@@ -326,15 +270,13 @@ impl Ext2Fs {
                 "unsupported ext2 incompat features (ext4 extents? journal?) — refusing to mount"
             }
             // `Ext2Core::mount()` itself can never produce these — they're
-            // only ever returned by `block_for_index_alloc` (migration
-            // step 3), `remove_dir_entry` (migration step 4), or
-            // `reclaim_orphans`'s `mark_reachable` (migration step 5),
-            // reachable solely through a live, already-mounted filesystem.
-            // Matched here anyway because `Ext2Error` is a single enum
-            // shared across every method in the crate, so this `match`
-            // must stay exhaustive; `unreachable!()` documents that
-            // exhaustiveness rather than silently falling back to a
-            // misleading message.
+            // only ever returned by other methods on an already-mounted
+            // filesystem (block allocation during a write, directory-entry
+            // removal, `reclaim_orphans`'s `mark_reachable`). Matched here
+            // anyway because `Ext2Error` is a single enum shared across
+            // every method in the crate, so this `match` must stay
+            // exhaustive; `unreachable!()` documents that exhaustiveness
+            // rather than silently falling back to a misleading message.
             ext2::Ext2Error::NoSpace | ext2::Ext2Error::TooLarge | ext2::Ext2Error::NotFound | ext2::Ext2Error::TooDeep => {
                 unreachable!("mount() cannot produce this error")
             }
@@ -343,22 +285,6 @@ impl Ext2Fs {
     }
 
     // ── Raw block I/O ────────────────────────────────────────────────────
-    //
-    // `block_vec`/`write_block` below are thin wrappers over
-    // `ext2::Ext2Core` (migration step 1/2 — see the "ext2 core crate"
-    // note near the top of this file); every other method in this file
-    // keeps calling `self.write_block(...)`/`self.block_vec(...)` exactly
-    // as before, unaware anything moved. `read_block`/`block_for_index`/
-    // `block_for_index_alloc` used to have wrappers here too, but nothing
-    // in this file ever called them through the wrapper (every real
-    // caller goes through `read_file_range`/`write_file_range`, which call
-    // `self.core.read_block`/`self.core.block_for_index*` directly) — step
-    // 6 cleanup (`docs/fs/ext2-extraction-plan.md`) removed the three dead
-    // wrappers rather than keep them "just in case".
-
-    fn block_vec(&self, block_num: u32) -> Result<Vec<u8>, Errno> {
-        self.core.block_vec(block_num).map_err(Into::into)
-    }
 
     /// Write one filesystem block (`self.core.sb.block_size` bytes) from
     /// `buf`. Propagates an ATA failure as `Errno::EIO` instead of
@@ -371,30 +297,6 @@ impl Ext2Fs {
     }
 
     // ── Inode table / file byte-range I/O ─────────────────────────────────
-    //
-    // Thin wrappers over `ext2::Ext2Core` (migration step 3 — see the
-    // "ext2 core crate" note near the top of this file): inode-table
-    // read/write and file byte-range read/write moved verbatim into
-    // `Ext2Core` (same on-disk format, same write ordering — "allocate &
-    // write content, then link" — same error conditions, including the
-    // `ENOSPC`/`EFBIG` distinctions `ext2::Ext2Error::NoSpace`/`TooLarge`
-    // now carry through the `From<Ext2Error> for Errno` impl above).
-    // Every other method in this file keeps calling `self.read_inode(...)`/
-    // `self.write_inode(...)`/`self.read_file_range(...)`/`self.
-    // write_file_range(...)` exactly as before, unaware anything moved.
-    // Direct/singly/doubly/triply-indirect block-pointer addressing
-    // (`block_for_index`/`block_for_index_alloc`) has no wrapper here (step
-    // 6 cleanup removed the unused ones — see the "Raw block I/O" note
-    // above): every real call site in this file reaches file data through
-    // `read_file_range`/`write_file_range` instead, which call
-    // `self.core.block_for_index*` directly. `inode_location` (only ever a
-    // helper shared by `read_inode`/`write_inode` themselves, never called
-    // from anywhere else in this file even before extraction) has no
-    // wrapper for the same reason `visit_inode_blocks`/
-    // `visit_pointer_block_targets`/`read_block_ptr`/`get_or_alloc_ptr`
-    // don't: no external call site in this file needs one — `free_all_blocks`
-    // and `mark_reachable` (still here, steps 4/5) call `self.core.
-    // visit_inode_blocks(...)` directly instead.
 
     /// Read the raw on-disk inode record for `ino`.
     ///
@@ -445,19 +347,12 @@ impl Ext2Fs {
     /// succeeding).
     fn free_all_blocks(&self, raw: &mut RawInode) -> Result<(), Errno> {
         if raw.has_block_pointers() {
-            // `visit_inode_blocks`/`visit_pointer_block_targets` (the
-            // shared tree-walk this closure drives) moved into
-            // `ext2::Ext2Core` — migration step 3, see the "ext2 core
-            // crate" note near the top of this file — so this calls
-            // `self.core.visit_inode_blocks` directly (no kernel-side thin
-            // wrapper: this and `mark_reachable` below are the only two
-            // call sites, and each needs a differently-typed closure —
-            // `self.core.free_block` here, an in-memory bitmap mark there
-            // — so a wrapper would just relay the same `Ext2Error`/`Errno`
-            // split `?` already handles for free via the `From` impl
-            // above). `self.core.free_block` (not `self.free_block`,
-            // this file's own separate copy — see that method's doc
-            // comment) is `ext2::Ext2Core::free_block`, migration step 2.
+            // No kernel-side wrapper for `visit_inode_blocks`: this and
+            // `mark_reachable` below are its only two call sites, and each
+            // needs a differently-typed closure — `self.core.free_block`
+            // here, an in-memory bitmap mark there — so a wrapper would
+            // just relay the same `Ext2Error`/`Errno` split `?` already
+            // handles for free via the `From` impl above.
             self.core.visit_inode_blocks(raw, |b| self.core.free_block(b))?;
             for i in 0..15 {
                 raw.set_i_block(i, 0);
@@ -475,22 +370,12 @@ impl Ext2Fs {
         self.write_inode(ino, raw)
     }
 
-    /// Read a symlink inode's target string — thin wrapper over
-    /// `ext2::Ext2Core::read_symlink_target` (migration step 4, see the
-    /// "ext2 core crate" note near the top of this file).
+    /// Read a symlink inode's target string.
     fn read_symlink_target(&self, raw: &RawInode) -> Result<String, Errno> {
         self.core.read_symlink_target(raw).map_err(Into::into)
     }
 
     // ── Directory entries ────────────────────────────────────────────────
-    //
-    // All thin wrappers over `ext2::Ext2Core` (migration step 4, see the
-    // "ext2 core crate" note near the top of this file). Each one converts
-    // between the core's raw on-disk `file_type: u8` and this file's own
-    // `fs::types::FileType` at the boundary — the mapping functions
-    // (`ext2_file_type_to_vfs`/`vfs_file_type_to_ext2`) live below,
-    // unchanged, still used directly by `mkdir`/the test image builders for
-    // their own inline dirent construction.
 
     /// Parse every directory entry out of `raw`'s data blocks (direct +
     /// indirect, same limit as file reads).
@@ -519,204 +404,28 @@ impl Ext2Fs {
         self.core.set_dotdot(dir_raw, new_parent_ino).map_err(Into::into)
     }
 
-    // ── Block group descriptors / bitmaps ───────────────────────────────
-
-    fn bgd_location(&self, group: u32) -> (u32, usize) {
-        let bgd_per_block = self.core.sb.block_size / 32;
-        let bgd_block = self.core.sb.bgdt_block + group / bgd_per_block;
-        let bgd_offset = ((group % bgd_per_block) * 32) as usize;
-        (bgd_block, bgd_offset)
-    }
-
-    fn read_bgd(&self, group: u32) -> Result<BgdRaw, Errno> {
-        let (blk, off) = self.bgd_location(group);
-        let buf = self.block_vec(blk)?;
-        Ok(BgdRaw {
-            block_bitmap: u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()),
-            inode_bitmap: u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap()),
-            inode_table: u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap()),
-            free_blocks: u16::from_le_bytes(buf[off + 12..off + 14].try_into().unwrap()),
-            free_inodes: u16::from_le_bytes(buf[off + 14..off + 16].try_into().unwrap()),
-        })
-    }
-
-    fn adjust_bgd_counts(&self, group: u32, free_blocks_delta: i32, free_inodes_delta: i32, used_dirs_delta: i32) -> Result<(), Errno> {
-        let (blk, off) = self.bgd_location(group);
-        let mut buf = self.block_vec(blk)?;
-        if free_blocks_delta != 0 {
-            let cur = u16::from_le_bytes(buf[off + 12..off + 14].try_into().unwrap());
-            let new = (cur as i32 + free_blocks_delta) as u16;
-            buf[off + 12..off + 14].copy_from_slice(&new.to_le_bytes());
-        }
-        if free_inodes_delta != 0 {
-            let cur = u16::from_le_bytes(buf[off + 14..off + 16].try_into().unwrap());
-            let new = (cur as i32 + free_inodes_delta) as u16;
-            buf[off + 14..off + 16].copy_from_slice(&new.to_le_bytes());
-        }
-        if used_dirs_delta != 0 {
-            let cur = u16::from_le_bytes(buf[off + 16..off + 18].try_into().unwrap());
-            let new = (cur as i32 + used_dirs_delta) as u16;
-            buf[off + 16..off + 18].copy_from_slice(&new.to_le_bytes());
-        }
-        self.write_block(blk, &buf)
-    }
-
-    /// Patch the superblock's free block/inode counts directly on disk —
-    /// re-reads the fixed byte-1024 superblock sectors fresh each time
-    /// (same as `mount()`) rather than keeping a cached copy, since this is
-    /// the only mutable superblock state this driver tracks.
-    fn adjust_sb_counts(&self, free_blocks_delta: i32, free_inodes_delta: i32) -> Result<(), Errno> {
-        let mut raw = [0u8; 1024];
-        self.core.device.read_sectors(2, 2, &mut raw).map_err(|_| Errno::EIO)?;
-        if free_blocks_delta != 0 {
-            let cur = u32::from_le_bytes(raw[12..16].try_into().unwrap());
-            let new = (cur as i64 + free_blocks_delta as i64) as u32;
-            raw[12..16].copy_from_slice(&new.to_le_bytes());
-        }
-        if free_inodes_delta != 0 {
-            let cur = u32::from_le_bytes(raw[16..20].try_into().unwrap());
-            let new = (cur as i64 + free_inodes_delta as i64) as u32;
-            raw[16..20].copy_from_slice(&new.to_le_bytes());
-        }
-        self.core.device.write_sectors(2, 2, &raw).map_err(|_| Errno::EIO)
-    }
-
-    fn blocks_in_group(&self, group: u32) -> u32 {
-        let start = self.core.sb.first_data_block + group * self.core.sb.blocks_per_group;
-        self.core.sb.blocks_count.saturating_sub(start).min(self.core.sb.blocks_per_group)
-    }
-
-    fn inodes_in_group(&self, group: u32) -> u32 {
-        let start = group * self.core.sb.inodes_per_group;
-        self.core.sb.inodes_count.saturating_sub(start).min(self.core.sb.inodes_per_group)
-    }
-
-    /// Allocate a free data block: scan each group's block bitmap for a
-    /// clear bit, set it, update the group + superblock free counts, and
-    /// zero the block's content (so a demand-paging-style hole never
-    /// exposes stale disk data). Returns `Ok(None)` when the filesystem is
-    /// full (`ENOSPC`), `Err` on an I/O failure.
-    fn alloc_block(&self) -> Result<Option<u32>, Errno> {
-        for group in 0..self.core.sb.num_groups {
-            let bgd = self.read_bgd(group)?;
-            if bgd.free_blocks == 0 {
-                continue;
-            }
-            let group_blocks = self.blocks_in_group(group);
-            let mut bitmap = self.block_vec(bgd.block_bitmap)?;
-            for bit in 0..group_blocks {
-                let byte = (bit / 8) as usize;
-                let mask = 1u8 << (bit % 8);
-                if bitmap[byte] & mask == 0 {
-                    bitmap[byte] |= mask;
-                    self.write_block(bgd.block_bitmap, &bitmap)?;
-                    self.adjust_bgd_counts(group, -1, 0, 0)?;
-                    self.adjust_sb_counts(-1, 0)?;
-                    let block_num = self.core.sb.first_data_block + group * self.core.sb.blocks_per_group + bit;
-                    let zeros = alloc::vec![0u8; self.core.sb.block_size as usize];
-                    self.write_block(block_num, &zeros)?;
-                    return Ok(Some(block_num));
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    fn free_block(&self, block_num: u32) -> Result<(), Errno> {
-        // Validate before subtracting — `block_num` here always originates
-        // from an on-disk `i_block`/indirect pointer (see callers in
-        // `free_all_blocks`/`free_pointer_block_targets`), so a corrupted
-        // value below `first_data_block` must not underflow the `u32`
-        // group/bit computation below.
-        if block_num < self.core.sb.first_data_block || block_num >= self.core.sb.blocks_count {
-            return Err(Errno::EIO);
-        }
-        let group = (block_num - self.core.sb.first_data_block) / self.core.sb.blocks_per_group;
-        let bit = (block_num - self.core.sb.first_data_block) % self.core.sb.blocks_per_group;
-        let bgd = self.read_bgd(group)?;
-        let mut bitmap = self.block_vec(bgd.block_bitmap)?;
-        let byte = (bit / 8) as usize;
-        let mask = 1u8 << (bit % 8);
-        bitmap[byte] &= !mask;
-        self.write_block(bgd.block_bitmap, &bitmap)?;
-        self.adjust_bgd_counts(group, 1, 0, 0)?;
-        self.adjust_sb_counts(1, 0)
-    }
-
-    /// Allocate a free inode. `is_dir` also bumps the group's directory
-    /// count (`bg_used_dirs_count`) — cosmetic bookkeeping real ext2 tools
-    /// (e2fsck, `df -i` equivalents) rely on, harmless if never read here.
-    fn alloc_inode(&self, is_dir: bool) -> Result<Option<u32>, Errno> {
-        for group in 0..self.core.sb.num_groups {
-            let bgd = self.read_bgd(group)?;
-            if bgd.free_inodes == 0 {
-                continue;
-            }
-            let group_inodes = self.inodes_in_group(group);
-            let mut bitmap = self.block_vec(bgd.inode_bitmap)?;
-            for bit in 0..group_inodes {
-                let byte = (bit / 8) as usize;
-                let mask = 1u8 << (bit % 8);
-                if bitmap[byte] & mask == 0 {
-                    bitmap[byte] |= mask;
-                    self.write_block(bgd.inode_bitmap, &bitmap)?;
-                    self.adjust_bgd_counts(group, 0, -1, if is_dir { 1 } else { 0 })?;
-                    self.adjust_sb_counts(0, -1)?;
-                    return Ok(Some(group * self.core.sb.inodes_per_group + bit + 1));
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    fn free_inode(&self, ino: u32, is_dir: bool) -> Result<(), Errno> {
-        // Same corrupted-input-before-underflow guard as `free_block`.
-        if ino < 1 || ino > self.core.sb.inodes_count {
-            return Err(Errno::EIO);
-        }
-        let group = (ino - 1) / self.core.sb.inodes_per_group;
-        let bit = (ino - 1) % self.core.sb.inodes_per_group;
-        let bgd = self.read_bgd(group)?;
-        let mut bitmap = self.block_vec(bgd.inode_bitmap)?;
-        let byte = (bit / 8) as usize;
-        let mask = 1u8 << (bit % 8);
-        bitmap[byte] &= !mask;
-        self.write_block(bgd.inode_bitmap, &bitmap)?;
-        self.adjust_bgd_counts(group, 0, 1, if is_dir { -1 } else { 0 })?;
-        self.adjust_sb_counts(0, 1)
-    }
-
     // ── Mount-time consistency repair ───────────────────────────────────
     //
-    // Both methods below are thin wrappers over `ext2::Ext2Core` (migration
-    // step 5 — see the "ext2 core crate" note near the top of this file):
+    // Both methods below wrap `ext2::Ext2Core` methods of the same name:
     // the bitmap walk, the write ordering, and — critically — the
     // reachability-walk-before-reserved-inodes ordering in
     // `reclaim_orphans` (see `CLAUDE.md`'s "Filesystem: ext2" section,
-    // "Critical ordering invariant in reclaim_orphans") all moved verbatim
-    // into `ext2::repair`. What stays here is exactly the part that
-    // can't move: this crate's `ktrace!`/`kernel::debug` tracing infra,
-    // which `ext2` doesn't (and can't, without depending on the kernel)
-    // call directly — see `ext2::repair`'s own module doc comment for the
-    // full split. Both core methods report what they found/fixed through
-    // their return values; these wrappers are the only place that turns
-    // that into a trace line + (for `reclaim_orphans`) the permanent
-    // `/proc/kdebug` counter.
+    // "Critical ordering invariant in reclaim_orphans") all live in
+    // `ext2::repair`. What stays here is the part that can't move: this
+    // crate's `ktrace!`/`kernel::debug` tracing infra, which `ext2` can't
+    // call without depending on the kernel — see `ext2::repair`'s own
+    // module doc comment. Both core methods report what they found/fixed
+    // through their return values; these wrappers turn that into a trace
+    // line + (for `reclaim_orphans`) the permanent `/proc/kdebug` counter.
 
     /// Recompute every group's true free block/inode counts directly from
     /// its bitmap and correct the stored BGD + superblock counters if they
     /// disagree. Called once from `init()`, before this filesystem is
     /// exposed to the VFS. See `ext2::Ext2Core::reconcile_free_counts`'s
     /// own doc comment for the full rationale (why drift happens, why it's
-    /// a real correctness bug and not just cosmetic).
-    ///
-    /// The per-group trace detail the pre-extraction version of this
-    /// method used to emit (group number, before/after block/inode counts)
-    /// is gone — `ext2::repair::ReconcileReport` deliberately collapses
-    /// that (diagnostic-only, gated off unless `kdebug fs on`) down to
-    /// "did anything drift" + the final corrected totals, see that
-    /// struct's own doc comment. Nothing about the repair itself changed,
-    /// only how much of it gets traced.
+    /// a real correctness bug and not just cosmetic). Only traces
+    /// (`kdebug fs on`) whether anything drifted and the final corrected
+    /// totals — see `ext2::repair::ReconcileReport`'s own doc comment.
     fn reconcile_free_counts(&self) -> Result<(), Errno> {
         let report = self.core.reconcile_free_counts()?;
         if report.bgd_drift || report.sb_drift {
@@ -792,12 +501,6 @@ struct Ext2DirEntry {
     kind: FileType,
     name: String,
 }
-
-// ── Raw inode (subset of fields we use) ─────────────────────────────────────
-//
-// `RawInode` itself now lives in the `ext2` crate (migration step 1 — see
-// the "ext2 core crate" note near the top of this file) and is imported
-// there (`use ext2::RawInode;`). Nothing here redefines it.
 
 // ── VFS glue ─────────────────────────────────────────────────────────────────
 
@@ -927,7 +630,7 @@ impl Inode for Ext2Inode {
         }
 
         let f = fs();
-        let new_ino = f.alloc_inode(false)?.ok_or(Errno::ENOSPC)?;
+        let new_ino = f.core.alloc_inode(false)?.ok_or(Errno::ENOSPC)?;
         let mut new_raw = RawInode::zeroed(f.core.sb.inode_size as usize);
         new_raw.set_i_mode(0x8000 | 0o644);
         new_raw.set_links_count(1);
@@ -935,7 +638,7 @@ impl Inode for Ext2Inode {
 
         let mut dir_raw = self.raw.clone();
         if let Err(e) = f.add_dir_entry(self.ino, &mut dir_raw, name, new_ino, FileType::Regular) {
-            let _ = f.free_inode(new_ino, false); // best-effort cleanup — original error wins either way
+            let _ = f.core.free_inode(new_ino, false); // best-effort cleanup — original error wins either way
             return Err(e);
         }
         Ok(Arc::new(Ext2Inode::new(new_ino)?))
@@ -951,10 +654,10 @@ impl Inode for Ext2Inode {
         }
 
         let f = fs();
-        let new_ino = f.alloc_inode(true)?.ok_or(Errno::ENOSPC)?;
-        let new_block = match f.alloc_block()? {
+        let new_ino = f.core.alloc_inode(true)?.ok_or(Errno::ENOSPC)?;
+        let new_block = match f.core.alloc_block()? {
             Some(b) => b,
-            None => { let _ = f.free_inode(new_ino, true); return Err(Errno::ENOSPC); }
+            None => { let _ = f.core.free_inode(new_ino, true); return Err(Errno::ENOSPC); }
         };
 
         let mut new_raw = RawInode::zeroed(f.core.sb.inode_size as usize);
@@ -974,8 +677,8 @@ impl Inode for Ext2Inode {
 
         let mut dir_raw = self.raw.clone();
         if let Err(e) = f.add_dir_entry(self.ino, &mut dir_raw, name, new_ino, FileType::Directory) {
-            let _ = f.free_block(new_block);
-            let _ = f.free_inode(new_ino, true);
+            let _ = f.core.free_block(new_block);
+            let _ = f.core.free_inode(new_ino, true);
             return Err(e);
         }
         // The new subdirectory's ".." counts as a link to this parent.
@@ -1016,7 +719,7 @@ impl Inode for Ext2Inode {
             // dangling pointers into blocks a later allocation could
             // legitimately reuse for something else.
             f.write_inode(child_ino, &child_raw)?;
-            f.free_inode(child_ino, false)?;
+            f.core.free_inode(child_ino, false)?;
         } else {
             f.write_inode(child_ino, &child_raw)?;
         }
@@ -1048,7 +751,7 @@ impl Inode for Ext2Inode {
         // Same "persist the zeroed record before freeing the bitmap bit"
         // fix as `unlink` above.
         f.write_inode(child_ino, &child_raw)?;
-        f.free_inode(child_ino, true)?;
+        f.core.free_inode(child_ino, true)?;
 
         // This directory loses the link the removed child's ".." held.
         let mut parent_raw = self.raw.clone();
@@ -1121,16 +824,15 @@ impl Inode for Ext2Inode {
         }
 
         let f = fs();
-        let new_ino = f.alloc_inode(false)?.ok_or(Errno::ENOSPC)?;
+        let new_ino = f.core.alloc_inode(false)?.ok_or(Errno::ENOSPC)?;
         let mut new_raw = RawInode::zeroed(f.core.sb.inode_size as usize);
         new_raw.set_i_mode(0xA000 | 0o777);
         new_raw.set_links_count(1);
 
         // Fast (target inline in `i_block`, no data block allocated) vs
         // slow (ordinary file content) representation — whichever fits —
-        // now decided by `ext2::Ext2Core::write_symlink_target` (migration
-        // step 4, see the "ext2 core crate" note near the top of this
-        // file). `free_all_blocks` is a safe no-op here whichever step
+        // decided by `ext2::Ext2Core::write_symlink_target`.
+        // `free_all_blocks` is a safe no-op here whichever step
         // failed: on a fast-representation failure `new_raw`'s mode marks
         // it a symlink whose `size()` is still < 60 (either 0, if the
         // failure was in the inode write itself, or the target's own
@@ -1145,14 +847,14 @@ impl Inode for Ext2Inode {
         // crate).
         if let Err(e) = f.core.write_symlink_target(&mut new_raw, new_ino, target) {
             let _ = f.free_all_blocks(&mut new_raw);
-            let _ = f.free_inode(new_ino, false);
+            let _ = f.core.free_inode(new_ino, false);
             return Err(e.into());
         }
 
         let mut dir_raw = self.raw.clone();
         if let Err(e) = f.add_dir_entry(self.ino, &mut dir_raw, name, new_ino, FileType::Symlink) {
             let _ = f.free_all_blocks(&mut new_raw); // no-op if it was a fast symlink (no blocks allocated)
-            let _ = f.free_inode(new_ino, false);
+            let _ = f.core.free_inode(new_ino, false);
             return Err(e);
         }
         Ok(Arc::new(Ext2Inode::new(new_ino)?))
