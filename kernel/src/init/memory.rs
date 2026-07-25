@@ -28,22 +28,19 @@ pub fn init_core(phys_mem_offset: VirtAddr, memory_regions: &'static MemoryRegio
 
     // Initialize Buddy allocator — sole owner of all usable physical memory.
     {
-        let mut buddy = allocator::buddy_allocator::BUDDY.lock();
+        let mut buddy = allocator::BUDDY.lock();
 
         for region in memory_regions.iter() {
             if region.kind == MemoryRegionKind::Usable {
                 unsafe {
-                    buddy.add_region(region.start, region.end);
+                    buddy.add_region(&allocator::KernelPhysMap, region.start, region.end);
                 }
             }
         }
     }
 
     serial_println!("Buddy stats:");
-    {
-        let buddy = allocator::buddy_allocator::BUDDY.lock();
-        buddy.debug_print_stats();
-    }
+    allocator::debug_print_buddy_stats();
 }
 
 /// Run allocator smoke tests (slab, Vec, String).
@@ -87,5 +84,5 @@ pub fn test_allocators() {
         serial_println!("  String test: {}", s);
     }
 
-    allocator::slab::slab_stats();
+    allocator::slab_stats();
 }

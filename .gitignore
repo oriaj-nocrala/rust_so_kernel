@@ -7,6 +7,7 @@
 # than sharing the root one above.
 /hal/target/
 /ext2/target/
+/mm/target/
 /qemu-test-runner/target/
 
 # Claude Code local state. `.claude/skills/` IS tracked (project tooling,

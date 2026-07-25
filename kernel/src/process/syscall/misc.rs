@@ -17,7 +17,7 @@ pub(super) fn sys_uptime_ms() -> SyscallResult {
 /// runs to catch a leak — see kernel_stack's `pending_stack_frees` /
 /// `free_kernel_stack` for the leak this was added to verify.
 pub(super) fn sys_meminfo_kb() -> SyscallResult {
-    (crate::allocator::buddy_allocator::BUDDY.lock().free_bytes() / 1024) as SyscallResult
+    (crate::allocator::free_bytes() / 1024) as SyscallResult
 }
 
 /// sys_kdebug_ctl (custom #403): long kdebug_ctl(int cmd, const char *name, int enable)

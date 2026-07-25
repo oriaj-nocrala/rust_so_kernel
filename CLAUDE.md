@@ -63,12 +63,18 @@ self-check against known QEMU i440fx values) is the first real test case
 the real VFS — see the storage-stack seam entry below. See `docs/drivers/architecture.md`'s
 Testing section and `docs/drivers/roadmap.md`'s Phase 2 for more.
 
-## Two-Crate Workspace
+## Crate Layout
 
 | Crate | Path | Purpose |
 |-------|------|---------|
 | `so2` | `/` (host) | Build script + QEMU launcher |
 | `kernel` | `kernel/` | Bare-metal kernel (`#![no_std]`, `x86_64-unknown-none`) |
+| `hal` | `hal/` | Host-testable hardware-access seams (`PortIo`/`PhysMem`) + pure driver logic (`cd hal && cargo test`) |
+| `ext2` | `ext2/` | Host-testable ext2 filesystem core (`cd ext2 && cargo test`) |
+| `mm` | `mm/` | Host-testable buddy (physical) + slab (heap) allocators (`cd mm && cargo test`) |
+| `qemu-test-runner` | `qemu-test-runner/` | Host-side driver for the QEMU integration tests (`scripts/run-kernel-tests.sh`) |
+
+Despite the heading, only `so2`+`kernel` form the actual Cargo workspace (`members = ["kernel"]` in the root `Cargo.toml`). `hal`/`ext2`/`mm`/`qemu-test-runner` are each deliberately their own workspace root (empty `[workspace]` table in their own `Cargo.toml`, see the root `Cargo.toml`'s `exclude` comment for why — mainly that this workspace's `panic = "abort"` profile would break their unwinding `cargo test` harnesses) and are pulled into `kernel` via plain `path` dependencies instead: `kernel` depends on `hal`, `ext2`, and `mm`; `ext2` also depends on `hal` (`hal::block::BlockDevice`). Each of the four extracted crates exists for the same reason: `kernel` itself cannot run `cargo test` on the host (see `## QEMU integration tests` above — the `-Z build-std` + double bin-target-build lang-item collision), so logic that can be made to speak in plain types instead of this kernel's concrete globals gets moved out where a plain `cargo test` reaches it.
 
 The host crate's `build.rs` creates a UEFI boot image; `src/main.rs` only launches QEMU with the image paths injected by the build script.
 
@@ -92,9 +98,16 @@ Kernel crate config in `kernel/.cargo/config.toml` enables `-Z build-std` to reb
 
 ## Memory Subsystem (`kernel/src/memory/`, `kernel/src/allocator/`)
 
-**Physical allocator:** Buddy allocator (`allocator/buddy_allocator.rs`), orders 12–28 (4 KiB–256 MiB). Single global `BUDDY: Mutex<BuddyAllocator>` is the **sole** owner of physical frames after boot. Uses a compile-time O(1) bitmap (covers 0–512 MiB) for fast free-block lookup.
+**Both allocators live in the standalone `mm` crate** (`mm/src/buddy.rs`, `mm/src/slab.rs`; `cd mm && cargo test` — 32 host tests, no QEMU), extracted out of `kernel/src/allocator/{buddy_allocator,slab}.rs` following the exact precedent the `ext2` crate extraction set (`docs/fs/ext2-extraction-plan.md`; see `mm`'s own crate doc comment for the full rationale). `kernel/src/allocator/mod.rs` is now a thin adapter, the same shape `kernel/src/fs/ext2.rs` became after its extraction: it owns the global state (`BUDDY`, `SLAB_ALLOCATOR`, the `#[global_allocator]` registration) and the two seams `mm` needed in place of calling straight into `crate::memory`/`crate::serial_println_raw!`. `mm` is `no_std` with **no `alloc` dependency at all** (unlike `hal`/`ext2`, which both link `alloc`) — the slab allocator *is* the kernel's global allocator, so any internal allocation there would recurse into itself before the first `Vec`/`Box`/`String` ever completed; both allocators stay built entirely out of fixed-size arrays and intrusive linked lists for exactly this reason, unchanged from before the extraction.
 
-**Heap allocator:** Slab allocator (`allocator/slab.rs`) backed by Buddy. Registered as the global `#[global_allocator]`, enabling `alloc` (Vec, Box, String, etc.) throughout the kernel.
+- **`mm::PhysMap`** (implemented kernel-side by `KernelPhysMap`, wrapping `physical_memory_offset()`) replaces the direct `crate::memory::physical_memory_offset()` calls — same shape as `hal::PhysMem`.
+- **Logging moved to the adapter.** `mm` can't call `crate::serial_println_raw!`, so recoverable conditions come back as data instead: `mm::buddy::PhantomEvent` (a stale/"phantom" bitmap entry found while coalescing on `deallocate` — bitmap said a buddy block was free but the intrusive free list didn't actually contain it) and `mm::slab::AllocEvent`/`DeallocEvent` (large-object alloc/dealloc, cache expansion). `kernel/src/allocator/mod.rs` matches on these and reproduces the exact pre-extraction `serial_println_raw!` text — verified byte-for-byte against the QEMU integration tests' serial output, not just read by eye. The one genuinely unrecoverable condition, a double-free caught by the bitmap, used to print then `loop { hlt }`; `kernel/src/panic.rs`'s handler is verified to touch neither `BUDDY` nor the heap, so `mm` just `panic!`s there now, the same way `ext2` panics/returns `Ext2Error` for its own hard errors.
+- **`mm::FrameSource`** is the slab allocator's only path to physical frames — `kernel::allocator::KernelFrameSource` forwards it straight through to `phys_alloc`/`phys_free`, preserving that two-function facade as the real slab↔buddy boundary instead of letting `mm::slab` call `mm::buddy` directly now that both live in one crate.
+- Addresses are `x86_64::PhysAddr`/`VirtAddr` (pinned to `=0.15.4`, matching the kernel's resolved version — `0.15.5` fails to build against this repo's pinned nightly, a real, verified incompatibility, not a hypothetical one), not raw `u64` like `hal`/`ext2` use — chosen because nearly every call site moving into `mm` already had a `PhysAddr` in hand, and converting all of them to/from `u64` at the boundary would have touched far more of `kernel/src/memory/page_table_manager.rs` than this move needed to.
+
+**Physical allocator:** Buddy allocator (`mm::buddy::BuddyAllocator`), orders 12–28 (4 KiB–256 MiB). Single global `BUDDY: Mutex<mm::buddy::BuddyAllocator>` (`kernel/src/allocator/mod.rs`) is the **sole** owner of physical frames after boot. Uses a compile-time O(1) bitmap (covers 0–512 MiB) for fast free-block lookup.
+
+**Heap allocator:** Slab allocator (`mm::slab::SlabAllocator`) backed by Buddy through `mm::FrameSource` (see above). Registered as the global `#[global_allocator]` (`kernel::allocator::SlabGlobalAlloc`), enabling `alloc` (Vec, Box, String, etc.) throughout the kernel.
 
 **Page tables:** `OwnedPageTable` (`memory/page_table_manager.rs`) wraps `x86_64::OffsetPageTable`. Kernel address space uses `from_current()` (captures CR3); new user spaces use `new_user()` which clones kernel mappings into a fresh PML4.
 

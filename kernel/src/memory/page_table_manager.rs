@@ -381,7 +381,7 @@ impl OwnedPageTable {
         &self,
         page: Page<Size2MiB>,
     ) -> Result<(), &'static str> {
-        let mut buddy = crate::allocator::buddy_allocator::BUDDY.lock();
+        let mut buddy = crate::allocator::BUDDY.lock();
         self.unmap_page_and_free_2m_with_buddy(page, &mut buddy)
     }
 
@@ -396,7 +396,7 @@ impl OwnedPageTable {
     pub unsafe fn unmap_page_and_free_2m_with_buddy(
         &self,
         page: Page<Size2MiB>,
-        buddy: &mut crate::allocator::buddy_allocator::BuddyAllocator,
+        buddy: &mut crate::allocator::BuddyAllocator,
     ) -> Result<(), &'static str> {
         let mut mapper = self.create_mapper();
         let (frame, flush) = match mapper.unmap(page) {
@@ -404,7 +404,8 @@ impl OwnedPageTable {
             Err(_) => return Ok(()),  // not mapped — nothing to free
         };
         flush.flush();
-        buddy.deallocate(frame.start_address(), 21);
+        let event = buddy.deallocate(&crate::allocator::KernelPhysMap, frame.start_address(), 21);
+        crate::allocator::log_phantom_event(event);
         Ok(())
     }
 

@@ -57,9 +57,9 @@ impl Filesystem for ProcFs {
 /// that grep/awk specific field names, which is the only thing that
 /// actually matters for compatibility.
 fn render_meminfo() -> String {
-    let buddy = crate::allocator::buddy_allocator::BUDDY.lock();
-    let total_kb = buddy.total_bytes() / 1024;
-    let free_kb = buddy.free_bytes() / 1024;
+    let (total, free) = crate::allocator::mem_stats();
+    let total_kb = total / 1024;
+    let free_kb = free / 1024;
     format!(
         "MemTotal:       {:>8} kB\nMemFree:        {:>8} kB\nMemAvailable:   {:>8} kB\n",
         total_kb, free_kb, free_kb

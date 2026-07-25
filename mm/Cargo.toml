@@ -1,0 +1,23 @@
+[package]
+name = "mm"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately detached from the parent workspace (empty `[workspace]` table
+# below), same shape as `hal/Cargo.toml`/`ext2/Cargo.toml` — see those files'
+# comments for the full reasoning (short version: the parent root
+# Cargo.toml's `panic = "abort"` profile would break this crate's own
+# unwinding `cargo test` harness). Not listed in the root Cargo.toml's
+# `members` for the same reason; the root `Cargo.toml`'s `exclude` comment
+# has the full list.
+[workspace]
+
+[dependencies]
+# Pinned to the EXACT version the kernel's own Cargo.lock already resolves
+# to, not just a compatible range: `0.15.5` fails to build against this
+# repo's pinned nightly (`nightly-2026-03-08`) — `Step` trait shape mismatch
+# in `x86_64`'s `paging::Page`/`PageTable` impls, verified directly by
+# trying it, not assumed. `x86_64::PhysAddr`/`VirtAddr` (all this crate
+# actually uses) have no bare-metal-only code path, so the crate builds and
+# runs identically on the host.
+x86_64 = "=0.15.4"

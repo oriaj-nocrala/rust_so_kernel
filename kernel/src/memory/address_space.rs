@@ -479,7 +479,7 @@ impl AddressSpace {
     /// doc comment) — no COW refcount involved, unlike the 4 KiB Anonymous
     /// path `sys_munmap` also supports.
     pub unsafe fn try_free_huge_vma(&self, start: u64, size_pages: usize) -> bool {
-        let mut buddy = match crate::allocator::buddy_allocator::BUDDY.try_lock() {
+        let mut buddy = match crate::allocator::BUDDY.try_lock() {
             Some(b) => b,
             None => return false,
         };

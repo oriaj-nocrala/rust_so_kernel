@@ -1018,10 +1018,9 @@ pub(super) fn sys_statvfs(path_ptr: usize, out_ptr: usize) -> SyscallResult {
     }
 
     const BLOCK: u64 = 4096;
-    let buddy = crate::allocator::buddy_allocator::BUDDY.lock();
-    let total_blocks = buddy.total_bytes() as u64 / BLOCK;
-    let free_blocks = buddy.free_bytes() as u64 / BLOCK;
-    drop(buddy);
+    let (total, free) = crate::allocator::mem_stats();
+    let total_blocks = total / BLOCK;
+    let free_blocks = free / BLOCK;
 
     let out = Statvfs {
         f_bsize: BLOCK,

@@ -133,14 +133,15 @@ pub fn free_kernel_stack(stack_top: VirtAddr) {
 /// within a second or two of boot.
 pub fn try_free_kernel_stack(stack_top: VirtAddr) -> bool {
     let (virt_base, phys_base) = kernel_stack_base(stack_top);
-    match crate::allocator::buddy_allocator::BUDDY.try_lock() {
+    match crate::allocator::BUDDY.try_lock() {
         Some(mut buddy) => {
             unsafe {
                 // Page-table-only, no locks involved — safe to do
                 // unconditionally before the try_lock'd deallocate below.
                 crate::memory::page_table_manager::remap_kernel_guard_page(virt_base)
                     .expect("Failed to remove kernel stack guard page before freeing");
-                buddy.deallocate(phys_base, KERNEL_STACK_ORDER);
+                let event = buddy.deallocate(&crate::allocator::KernelPhysMap, phys_base, KERNEL_STACK_ORDER);
+                crate::allocator::log_phantom_event(event);
             }
             true
         }
