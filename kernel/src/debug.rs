@@ -126,6 +126,207 @@ impl LockDiag {
 /// local_scheduler()`, which is the only thing that acquires it.
 pub static SCHEDULER_LOCK: LockDiag = LockDiag::new();
 
+/// Extends the `LockDiag` idea above to name *who* holds a lock, not just
+/// *where* it was acquired — built for `fs::ramfs::RamDirNode::entries`,
+/// found stuck taken during the 2026-08-05 hang hunt (RIP fixed at
+/// `_mm_pause+2` inside `SpinMutex::lock` inlined into `RamDirNode::mkdir`
+/// — a real spin on a lock nobody would ever release, not slowness). The
+/// root cause turned out to be a trapframe copy corrupted by DF=1, which
+/// resumed a process onto a stale frame and abandoned the syscall holding
+/// this guard (see docs/hang-hunt-bug2-findings.md; fixed by `tss.rs`'s
+/// FMASK DF bit plus the `cld` in both entry stubs). `file:line` alone —
+/// what `LockDiag` tracks — can't tell two `mkdir()` calls from different
+/// PIDs apart, since they all lock from the exact same inlined site; this
+/// tracks PID + operation name instead.
+///
+/// Kept as a permanent, passive counter: two relaxed atomics per lock/
+/// unlock, no prints, no panics, rendered by `/proc/kdebug` and the panic
+/// snapshot. An `outstanding` that never returns to 0 while the system is
+/// idle is the signature of exactly the abandonment above.
+///
+/// NOTE: unlike `LockDiag`, `outstanding` isn't strictly a 0-or-1 leak
+/// signal — every `RamDirNode` (one per ramfs directory) owns its own
+/// `Mutex`, and they all report into this one shared counter, so
+/// well-formed nesting (e.g. `rmdir` calling `readdir` on a *child* node
+/// while still holding the parent's lock) can transiently show
+/// `outstanding > 1` with nothing wrong.
+pub struct DirLockDiag {
+    acquires:     AtomicU64,
+    releases:     AtomicU64,
+    last_pid:     AtomicU64,
+    last_op_ptr:  AtomicUsize,
+    last_op_len:  AtomicU32,
+}
+
+impl DirLockDiag {
+    pub const fn new() -> Self {
+        Self {
+            acquires: AtomicU64::new(0),
+            releases: AtomicU64::new(0),
+            last_pid: AtomicU64::new(u64::MAX),
+            last_op_ptr: AtomicUsize::new(0),
+            last_op_len: AtomicU32::new(0),
+        }
+    }
+
+    /// Call once the real mutex is actually held — never before it, or a
+    /// caller still spinning for the lock gets recorded as its holder (one
+    /// of the ten defective instruments this hunt produced). `op` must be a
+    /// `'static` string constant (`"mkdir"`, `"symlink"`, ...).
+    /// Allocation-free and print-free, just atomic stores.
+    pub fn record_acquire(&self, pid: u64, op: &'static str) {
+        self.last_pid.store(pid, Ordering::Relaxed);
+        self.last_op_ptr.store(op.as_ptr() as usize, Ordering::Relaxed);
+        self.last_op_len.store(op.len() as u32, Ordering::Relaxed);
+        self.acquires.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Call from the guard wrapper's `Drop` impl — i.e. only when the
+    /// critical section actually finishes normally. If a process's
+    /// continuation is hijacked mid-critical-section (what the DF bug did),
+    /// this simply never fires for that acquire, which is exactly the
+    /// signal we want: `outstanding` stays nonzero forever and
+    /// `last_acquirer` still names the culprit.
+    pub fn record_release(&self) {
+        self.releases.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn last_op(&self) -> &'static str {
+        let ptr = self.last_op_ptr.load(Ordering::Relaxed);
+        let len = self.last_op_len.load(Ordering::Relaxed) as usize;
+        if ptr != 0 && len > 0 && len < 64 {
+            unsafe {
+                let bytes = core::slice::from_raw_parts(ptr as *const u8, len);
+                core::str::from_utf8(bytes).unwrap_or("<non-utf8>")
+            }
+        } else {
+            "<none yet>"
+        }
+    }
+
+    /// One `/proc/kdebug` line: acquires/releases/outstanding plus the last
+    /// acquirer's PID and operation — exactly what's needed to answer "who
+    /// left this held, doing what".
+    pub fn render(&self, name: &str) -> alloc::string::String {
+        use alloc::format;
+        let acq = self.acquires.load(Ordering::Relaxed);
+        let rel = self.releases.load(Ordering::Relaxed);
+        format!(
+            "{name}: acquires={} releases={} outstanding={} last_acquirer=pid={} op={}\n",
+            acq, rel, acq.saturating_sub(rel),
+            self.last_pid.load(Ordering::Relaxed), self.last_op(),
+        )
+    }
+
+    /// Allocation-free variant for the panic handler — see
+    /// `print_panic_snapshot`.
+    pub fn print_panic_line(&self, name: &str) {
+        crate::serial_println_raw!(
+            "  {}: acquires={} releases={} outstanding={} last_acquirer pid={} op={}",
+            name,
+            self.acquires.load(Ordering::Relaxed),
+            self.releases.load(Ordering::Relaxed),
+            self.acquires.load(Ordering::Relaxed).saturating_sub(self.releases.load(Ordering::Relaxed)),
+            self.last_pid.load(Ordering::Relaxed),
+            self.last_op(),
+        );
+    }
+}
+
+/// See `DirLockDiag`'s doc comment. `fs::ramfs::RamDirNode::lock_entries`
+/// is the only thing that acquires it.
+pub static RAMFS_ENTRIES_LOCK: DirLockDiag = DirLockDiag::new();
+
+/// Detects a resumed/saved `TrapFrame` sequence going backward, or a
+/// double-save with no intervening resume — see each `Process`'s own
+/// `tf_seq`/`tf_awaiting_resume`/`tf_last_resumed_seq` fields and
+/// `process::scheduler::tf_note_save`/`tf_note_resume`, which call
+/// `record()` here the instant either anomaly is detected. A nonzero count
+/// is direct, mechanical confirmation that some process's execution got
+/// "rewound" onto a stale copy of its own `TrapFrame` — the mechanism
+/// behind the 2026-08-05 DF bug (a `rep movsb` copying backward wrote the
+/// 160 bytes *before* the trapframe box instead of into it, leaving the box
+/// holding an older frame). Permanent: three plain field updates per
+/// context switch, and it prints only when a rewind actually happens, which
+/// should be never.
+pub struct TfRewindDiag {
+    count:         AtomicU64,
+    last_pid:      AtomicU64,
+    last_site_ptr: AtomicUsize,
+    last_site_len: AtomicU32,
+    last_old_seq:  AtomicU64,
+    last_new_seq:  AtomicU64,
+}
+
+impl TfRewindDiag {
+    pub const fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            last_pid: AtomicU64::new(u64::MAX),
+            last_site_ptr: AtomicUsize::new(0),
+            last_site_len: AtomicU32::new(0),
+            last_old_seq: AtomicU64::new(0),
+            last_new_seq: AtomicU64::new(0),
+        }
+    }
+
+    pub fn record(&self, pid: u64, site: &'static str, old_seq: u64, new_seq: u64) {
+        self.last_pid.store(pid, Ordering::Relaxed);
+        self.last_site_ptr.store(site.as_ptr() as usize, Ordering::Relaxed);
+        self.last_site_len.store(site.len() as u32, Ordering::Relaxed);
+        self.last_old_seq.store(old_seq, Ordering::Relaxed);
+        self.last_new_seq.store(new_seq, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        // Loud and immediate, not just recorded for later — a rewind is
+        // rare enough (should be zero, ever) that the cost of printing on
+        // every occurrence is irrelevant, unlike the per-acquire prints
+        // this investigation already learned to avoid (see `RAMFS_ENTRIES_
+        // LOCK`'s doc comment and the module-level "watch the cost" note).
+        crate::serial_println_raw!(
+            "[HANGHUNT-DIAG] TF-REWIND: pid={} site={} seq {} -> {} (stale/rewound trapframe)",
+            pid, site, old_seq, new_seq,
+        );
+    }
+
+    fn last_site(&self) -> &'static str {
+        let ptr = self.last_site_ptr.load(Ordering::Relaxed);
+        let len = self.last_site_len.load(Ordering::Relaxed) as usize;
+        if ptr != 0 && len > 0 && len < 64 {
+            unsafe {
+                let bytes = core::slice::from_raw_parts(ptr as *const u8, len);
+                core::str::from_utf8(bytes).unwrap_or("<non-utf8>")
+            }
+        } else {
+            "<none yet>"
+        }
+    }
+
+    pub fn render(&self) -> alloc::string::String {
+        use alloc::format;
+        format!(
+            "tf_rewind: count={} last_pid={} last_site={} last_seq={}->{}\n",
+            self.count.load(Ordering::Relaxed),
+            self.last_pid.load(Ordering::Relaxed),
+            self.last_site(),
+            self.last_old_seq.load(Ordering::Relaxed),
+            self.last_new_seq.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn print_panic_line(&self) {
+        crate::serial_println_raw!(
+            "  tf_rewind: count={} last_pid={} last_site={} last_seq={}->{}",
+            self.count.load(Ordering::Relaxed),
+            self.last_pid.load(Ordering::Relaxed),
+            self.last_site(),
+            self.last_old_seq.load(Ordering::Relaxed),
+            self.last_new_seq.load(Ordering::Relaxed),
+        );
+    }
+}
+
+pub static TF_REWIND: TfRewindDiag = TfRewindDiag::new();
+
 /// Always-on check for `memory::cow.rs`'s stated invariant ("all accesses
 /// must be under `cli` — single CPU, no atomics needed"). Every public
 /// accessor (`inc_ref`/`dec_ref`/`set_ref`/`get_ref`) reports here on
@@ -341,7 +542,7 @@ pub fn render_report() -> alloc::string::String {
          orphan_inodes_reclaimed: {}\n\
          switches_total: {}\n\
          slab_lock_contended: {}\n\
-         {}{}",
+         {}{}{}{}",
         mask, enabled,
         FORKS_TOTAL.load(Ordering::Relaxed),
         EXECS_TOTAL.load(Ordering::Relaxed),
@@ -353,6 +554,8 @@ pub fn render_report() -> alloc::string::String {
         SWITCHES_TOTAL.load(Ordering::Relaxed),
         SLAB_LOCK_CONTENDED.load(Ordering::Relaxed),
         SCHEDULER_LOCK.render("scheduler"),
+        RAMFS_ENTRIES_LOCK.render("ramfs_entries_lock"),
+        TF_REWIND.render(),
         alloc::format!(
             "{}{}{}{}",
             COW_IF_VIOLATIONS_SET_REF.render("cow_if_violations_set_ref"),
@@ -381,6 +584,8 @@ pub fn print_panic_snapshot() {
     let acq = SCHEDULER_LOCK.acquires.load(Ordering::Relaxed);
     let rel = SCHEDULER_LOCK.releases.load(Ordering::Relaxed);
     crate::serial_println_raw!("  scheduler_lock: acquires={} releases={} outstanding={}", acq, rel, acq.saturating_sub(rel));
+    RAMFS_ENTRIES_LOCK.print_panic_line("ramfs_entries_lock");
+    TF_REWIND.print_panic_line();
     crate::serial_println_raw!(
         "  cow_if_violations: set_ref count={} last_line={} | inc_ref count={} last_line={} | dec_ref count={} last_line={} | get_ref count={} last_line={}",
         COW_IF_VIOLATIONS_SET_REF.count.load(Ordering::Relaxed), COW_IF_VIOLATIONS_SET_REF.last_line.load(Ordering::Relaxed),

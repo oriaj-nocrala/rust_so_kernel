@@ -126,6 +126,51 @@ use crate::memory::address_space::AddressSpace;
 use crate::memory::vma::Vma;
 
 // ============================================================================
+// TrapFrame SAVE/RESUME sequence tracking
+// ============================================================================
+//
+// See `Process::tf_seq`/`tf_awaiting_resume`/`tf_last_resumed_seq`'s doc
+// comments. Every place that overwrites a process's `trapframe` Box wholesale
+// from a live register snapshot (a "SAVE") must call `tf_note_save`; every
+// place that hands that Box's contents to `jump_to_trapframe`/`jump_to_user`
+// (a "RESUME") must call `tf_note_resume`. Together they catch two shapes of
+// "rewind":
+//   1. A SAVE that clobbers a previous SAVE's content before any RESUME
+//      ever consumed it (saved twice with no RESUME in between).
+//   2. A RESUME that reads back a sequence number no greater than the last
+//      one this same process actually resumed (stale/rewound content).
+// Both call `debug::TF_REWIND.record(...)`, which prints immediately and
+// unconditionally (a real rewind should never happen, so the print-cost
+// concern that keeps `ktrace!` gated doesn't apply here) plus keeps the last
+// occurrence around for `/proc/kdebug` and the panic snapshot. This is the
+// permanent net under the 2026-08-05 DF bug, whose whole signature was a
+// process resumed from a frame older than its last save.
+
+/// Call immediately before (or as part of) a full `*proc.trapframe = *tf`
+/// copy. `site` names the call site (`"switch_to_next"`, `"block_current"`,
+/// ...) for the printed/rendered diagnostic.
+pub(crate) fn tf_note_save(proc: &mut Process, site: &'static str) {
+    if proc.tf_awaiting_resume {
+        crate::debug::TF_REWIND.record(proc.pid.0 as u64, site, proc.tf_seq, proc.tf_seq + 1);
+    }
+    proc.tf_seq = proc.tf_seq.wrapping_add(1);
+    proc.tf_awaiting_resume = true;
+}
+
+/// Call immediately before handing `&*proc.trapframe` to
+/// `jump_to_trapframe`/`jump_to_user` (including indirectly, via returning
+/// the pointer up to a caller that will). `site` names the call site.
+pub(crate) fn tf_note_resume(proc: &mut Process, site: &'static str) {
+    if let Some(prev) = proc.tf_last_resumed_seq {
+        if proc.tf_seq <= prev {
+            crate::debug::TF_REWIND.record(proc.pid.0 as u64, site, prev, proc.tf_seq);
+        }
+    }
+    proc.tf_last_resumed_seq = Some(proc.tf_seq);
+    proc.tf_awaiting_resume = false;
+}
+
+// ============================================================================
 // Per-CPU fast-path pointers (updated on every context switch, IF=0)
 // ============================================================================
 //
@@ -515,6 +560,7 @@ impl Scheduler {
 
                 self.remaining_ticks = Self::quantum_for(proc.effective_priority);
 
+                tf_note_resume(&mut proc, "kill_and_switch_tf");
                 let tf_ptr = &*proc.trapframe as *const TrapFrame;
                 update_current_fast(&proc);
                 self.running = Some(proc);
@@ -539,6 +585,7 @@ impl Scheduler {
     /// later exactly where it left off.
     pub fn stop_and_switch_tf(&mut self, tf: *const TrapFrame) -> *const TrapFrame {
         if let Some(mut proc) = self.running.take() {
+            tf_note_save(&mut proc, "stop_and_switch_tf");
             unsafe { *proc.trapframe = *tf; }
             proc.fs_base = read_fs_base();
             unsafe { super::fpu::save(&mut proc.fpu_state); }
@@ -560,6 +607,7 @@ impl Scheduler {
                 write_fs_base(proc.fs_base);
                 unsafe { super::fpu::restore(&proc.fpu_state); }
                 self.remaining_ticks = Self::quantum_for(proc.effective_priority);
+                tf_note_resume(&mut proc, "stop_and_switch_tf");
                 let tf_ptr = &*proc.trapframe as *const TrapFrame;
                 update_current_fast(&proc);
                 self.running = Some(proc);
@@ -627,6 +675,7 @@ impl Scheduler {
     /// Panics if no Ready process exists (idle must always be ready).
     pub fn block_current(&mut self, current_tf: *const TrapFrame) -> *const TrapFrame {
         if let Some(mut proc) = self.running.take() {
+            tf_note_save(&mut proc, "block_current");
             unsafe { *proc.trapframe = *current_tf; }
             proc.fs_base = read_fs_base();
             unsafe { super::fpu::save(&mut proc.fpu_state); }
@@ -644,6 +693,7 @@ impl Scheduler {
                 write_fs_base(proc.fs_base);
                 unsafe { super::fpu::restore(&proc.fpu_state); }
                 self.remaining_ticks = Self::quantum_for(proc.effective_priority);
+                tf_note_resume(&mut proc, "block_current");
                 let tf_ptr = &*proc.trapframe as *const TrapFrame;
                 update_current_fast(&proc);
                 self.running = Some(proc);
@@ -826,14 +876,26 @@ impl Scheduler {
 
     /// Called on every timer tick.  Returns true if a context switch
     /// should happen (time slice exhausted).
-    pub fn tick(&mut self) -> bool {
+    ///
+    /// `interrupted_rsp` is the interrupted frame's saved RSP — the deepest
+    /// address the preempted code had pushed to. It guards the deferred
+    /// kernel-stack frees below.
+    pub fn tick(&mut self, interrupted_rsp: u64) -> bool {
         self.global_ticks = self.global_ticks.wrapping_add(1);
 
-        // Safe w.r.t. *which* stacks these are: reaching a new timer tick
-        // means the CPU already executed some process's iretq since any
-        // pending_stack_frees entry was queued (interrupts are off from
-        // kill_current through that iretq, so no tick can land in between)
-        // — so none of these can be the stack we're currently running on.
+        // Deferred kernel-stack frees. The old comment here claimed reaching
+        // a new tick means the CPU already executed some process's iretq since
+        // any pending_stack_frees entry was queued ("interrupts are off from
+        // kill_current through that iretq, so no tick can land in between").
+        // That is FALSE: `sys_exit`'s epilogue re-enables interrupts (the
+        // interrupt guard's `sti`) BEFORE `jump_to_user` switches stacks, so
+        // a tick CAN land while the CPU is still running on the dying
+        // process's kernel stack — freeing it out from under the epilogue
+        // (and, on the switch path, saving the next process's trapframe with
+        // a dangling RSP that later resumes onto the recycled-as-heap page).
+        // So the free is now guarded at runtime: if `interrupted_rsp` falls
+        // inside a queued kstack, that stack is still in use and its free is
+        // deferred to a later tick (once the CPU has actually left it).
         //
         // Still must use try_free (non-blocking): this runs inside the
         // timer ISR, which can interrupt code that already holds the
@@ -841,6 +903,11 @@ impl Scheduler {
         // this ever called into Buddy from an ISR). Entries that lose the
         // race just stay queued for the next tick.
         self.pending_stack_frees.retain(|&stack_top| {
+            let top = stack_top.as_u64();
+            let lo = top - (1u64 << crate::init::processes::KERNEL_STACK_ORDER);
+            if (lo..top).contains(&interrupted_rsp) {
+                return true;
+            }
             !crate::init::processes::try_free_kernel_stack(stack_top)
         });
         // Same reasoning as pending_stack_frees above — see try_free_huge_vma's
@@ -899,9 +966,8 @@ impl Scheduler {
         // ── 1. Save current process back to its run queue ─────────────
 
         if let Some(mut proc) = self.running.take() {
-            unsafe {
-                *proc.trapframe = *current_tf;
-            }
+            tf_note_save(&mut proc, "switch_to_next");
+            unsafe { *proc.trapframe = *current_tf; }
             proc.fs_base = read_fs_base();
             unsafe { super::fpu::save(&mut proc.fpu_state); }
 
@@ -949,6 +1015,7 @@ impl Scheduler {
 
                 self.remaining_ticks = Self::quantum_for(proc.effective_priority);
 
+                tf_note_resume(&mut proc, "switch_to_next");
                 let tf_ptr = &*proc.trapframe as *const TrapFrame;
                 update_current_fast(&proc);
                 self.running = Some(proc);
@@ -1005,6 +1072,7 @@ impl Scheduler {
 
                     self.remaining_ticks = Self::quantum_for(proc.effective_priority);
 
+                    tf_note_resume(&mut proc, "start_first");
                     let tf_ptr = &*proc.trapframe as *const TrapFrame;
                     update_current_fast(&proc);
                     self.running = Some(proc);

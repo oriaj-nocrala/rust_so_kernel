@@ -119,6 +119,12 @@ const SYS_UPTIME_SEC: u64 = 401;
 const SYS_MEMINFO_KB: u64 = 402;
 const SYS_KDEBUG_CTL: u64 = 403;
 const SYS_MKDIR: u64 = 83;
+const SYS_SYMLINK: u64 = 88;
+
+/// `target` is stored verbatim, unresolved (real `symlink(2)` semantics).
+pub fn symlink(target_cstr: &[u8], linkpath_cstr: &[u8]) -> i64 {
+    unsafe { syscall2(SYS_SYMLINK, target_cstr.as_ptr() as u64, linkpath_cstr.as_ptr() as u64) }
+}
 
 // ── File I/O ─────────────────────────────────────────────────────────────
 

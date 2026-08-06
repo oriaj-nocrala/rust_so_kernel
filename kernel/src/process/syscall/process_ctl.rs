@@ -158,7 +158,7 @@ pub(super) fn sys_exit(status: i32) -> SyscallResult {
 
     let reason = format!("exit({})", status);
 
-    let irq = crate::process::irq_guard::InterruptGuard::new();
+    let _irq = crate::process::irq_guard::InterruptGuard::new();
 
     let (dead_pid, parent_to_notify, tf_ptr, old_files) = {
         let mut scheduler = crate::process::scheduler::local_scheduler();
@@ -205,18 +205,26 @@ pub(super) fn sys_exit(status: i32) -> SyscallResult {
     // `kill_and_switch_tf` above just picked it as the next process to
     // schedule, so `notify_child_death` checks that case itself.
     crate::process::scheduler::local_scheduler().notify_child_death(dead_pid, parent_to_notify);
-    drop(irq); // interrupts back on from here — matches pre-refactor sti() placement
 
-    // Cancel any pending poll/epoll wait and clear side tables
+    // Cancel any pending poll/epoll wait and clear side tables. Deliberately
+    // runs with interrupts STILL OFF (`irq` is not dropped until the RSP
+    // switch inside `jump_to_user`): all three cleanups are non-blocking
+    // spin-lock critical sections over fixed arrays (POLL_WAITERS /
+    // EPOLL_FD_MAP / FUTEX_WAITERS) — nothing here needs IF=1. Keeping IF=0
+    // closes the bug-2 window where a timer tick lands while the CPU is still
+    // on the dying process's kernel stack (queued for deferred free by
+    // `kill_and_switch_tf`), freeing that stack out from under this epilogue
+    // and, on the switch path, saving the next process's trapframe with a
+    // dangling RSP.
     cancel_all_waiters(dead_pid);
 
-    // Explicit terminal `sti` (redundant with the target trapframe's own
-    // saved RFLAGS, which `iretq` restores regardless — kept only to
-    // preserve pre-refactor behavior exactly). Not wrapped in a guard on
-    // purpose: this is a one-shot action immediately followed by a
-    // diverging call, not a scope with multiple exit paths to protect.
+    // Deliberately no `drop(irq)` and no explicit `sti` before the switch:
+    // either one re-enables interrupts here, re-opening exactly the window
+    // above (the interrupt guard's Drop does `sti`). `jump_to_user` does its
+    // own `cli`, and its iretq restores the target process's own saved
+    // RFLAGS (IF set), so interrupts come back on from the resumed process's
+    // state and the guard's Drop never needs to run — this function diverges.
     unsafe {
-        core::arch::asm!("sti");
         crate::process::trapframe::jump_to_user(tf_ptr);
     }
 }
@@ -583,6 +591,21 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
                 crate::ktrace!(crate::debug::SCHED, "exec: activating new CR3");
                 unsafe { proc.address_space.activate(); }
                 crate::ktrace!(crate::debug::SCHED, "exec: CR3 active, jumping to entry={:#x}", proc.trapframe.rip);
+                // This direct field-by-field rewrite (above) discards
+                // whatever trapframe content this process had before exec —
+                // and the very next thing this function does is jump
+                // straight into it via `jump_to_user`, with no intervening
+                // scheduler SAVE/RESUME. Tag it as a save+resume pair for
+                // `tf_note_save`/`tf_note_resume`'s bookkeeping (see
+                // scheduler.rs's 2026-07-25 hang-hunt section) so this
+                // process's `tf_seq`/`tf_awaiting_resume` stay consistent
+                // for whatever scheduler SAVE/RESUME comes next — e.g. if a
+                // timer interrupt preempts mid-ELF-load (interrupts are
+                // enabled during that phase, only `cli`'d right before this
+                // block), the resulting SAVE/RESUME pair around *that*
+                // preemption already ran before this point and is unrelated.
+                crate::process::scheduler::tf_note_save(proc, "sys_exec");
+                crate::process::scheduler::tf_note_resume(proc, "sys_exec");
                 &*proc.trapframe as *const TrapFrame
             }
             None => return errno::ESRCH,

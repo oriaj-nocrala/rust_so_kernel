@@ -49,6 +49,136 @@ const _: () = {
 };
 
 // ============================================================================
+// Redzone (debug-only, 2026-08-05 bug-2 hunt)
+// ============================================================================
+//
+// Each slab object's SLOT is 2*object_size wide in debug builds: the
+// caller-visible data region [slot, slot+object_size) followed by an
+// object_size-byte trailing redzone [slot+object_size, slot+2*object_size).
+//
+// Why doubling, not a fixed-size redzone: the caches are power-of-2 object
+// sizes and serve layouts with align up to object_size, so the object data
+// pointers must stay object_size-aligned across the page. A fixed redzone
+// would make the slot non-multiple of object_size and drift the alignment.
+// A full object_size of redzone keeps every slot a multiple of object_size.
+//
+// Checked at `allocate` (the object must still be intact while it was free)
+// and at `deallocate` (the caller must not have written past its data
+// region) — the overflow-into-neighbor corruption mode this hunt suspects
+// would trip it at the overflower's own free, before the neighbor is used.
+//
+// Pattern 0xC5: deliberately distinct from 0xAA (allocated poison) and 0xDD
+// (freed poison) — 0xAA caused historical false positives in the UAF check,
+// and 0xDD is the free-list invariant. 0xC5 collides with neither.
+#[cfg(all(debug_assertions, feature = "slab-debug"))]
+const REDZONE_PATTERN: u8 = 0xC5;
+
+#[cfg(all(debug_assertions, feature = "slab-debug"))]
+#[inline]
+unsafe fn redzone_check(ptr: *mut u8, object_size: usize) {
+    let rz = ptr.add(object_size);
+    for i in 0..object_size {
+        let found = rz.add(i).read();
+        if found != REDZONE_PATTERN {
+            panic!(
+                "SLAB REDZONE BROKEN: obj={:#x} cache={} side=trailing offset={} found=0x{:02x} expected=0x{:02x}",
+                ptr as u64, object_size, i, found, REDZONE_PATTERN
+            );
+        }
+    }
+}
+
+#[cfg(all(debug_assertions, feature = "slab-debug"))]
+#[inline]
+unsafe fn redzone_set(ptr: *mut u8, object_size: usize) {
+    core::ptr::write_bytes(ptr.add(object_size), REDZONE_PATTERN, object_size);
+}
+
+// ============================================================================
+// Quarantine (debug-only, 2026-08-05 bug-2 hunt)
+// ============================================================================
+//
+// Delayed reuse: a freed object does NOT go straight back onto the free list.
+// It enters a per-cache FIFO quarantine and only becomes reusable after
+// QUARANTINE_CAP more frees have pushed through (or the free list runs dry).
+// While quarantined it keeps its full 0xDD poison, and on the way out it is
+// verified WHOLE — any byte that is no longer 0xDD means a stale owner wrote
+// into a freed object (use-after-free with recycling in between), which the
+// redzone cannot catch (the write lands inside the recycled object's own data
+// region) and the allocate-time UAF check cannot either (it only inspects at
+// allocate, and here the write happened after reallocation).
+//
+// Discriminates the UAF-by-recycling hypothesis: if a stale owner is writing
+// into recycled memory, the quarantine either (a) catches the poison break at
+// drain, or (b) changes which object gets recycled, which moves the flake rate
+// (the bug is layout-sensitive — the redzone already moved it ~8%→58%).
+// Release builds reuse immediately (no quarantine struct, no code path change).
+#[cfg(all(debug_assertions, feature = "slab-debug"))]
+const QUARANTINE_CAP: usize = 128;
+
+#[cfg(all(debug_assertions, feature = "slab-debug"))]
+struct Quarantine {
+    buf: [Option<NonNull<FreeObject>>; QUARANTINE_CAP],
+    head: usize,
+    len: usize,
+}
+
+#[cfg(all(debug_assertions, feature = "slab-debug"))]
+impl Quarantine {
+    const fn new() -> Self {
+        Self {
+            buf: [None; QUARANTINE_CAP],
+            head: 0,
+            len: 0,
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    fn is_full(&self) -> bool {
+        self.len == QUARANTINE_CAP
+    }
+    fn push(&mut self, obj: NonNull<FreeObject>) {
+        let idx = (self.head + self.len) % QUARANTINE_CAP;
+        self.buf[idx] = Some(obj);
+        self.len += 1;
+    }
+    fn pop(&mut self) -> Option<NonNull<FreeObject>> {
+        if self.len == 0 {
+            return None;
+        }
+        let obj = self.buf[self.head].take();
+        self.head = (self.head + 1) % QUARANTINE_CAP;
+        self.len -= 1;
+        obj
+    }
+}
+
+/// Verify a quarantined object is still fully 0xDD-poisoned before it is
+/// allowed back onto the free list. A break means a stale owner wrote into
+/// freed memory — freeze the instant, dumping the object's first bytes (a
+/// pointer / filename / counter in there usually identifies the writer).
+#[cfg(all(debug_assertions, feature = "slab-debug"))]
+unsafe fn verify_quarantined(obj: *mut u8, object_size: usize) {
+    let region = object_size.min(256);
+    for i in 0..region {
+        let found = obj.add(i).read();
+        if found != 0xDD {
+            let n = region.min(32);
+            let mut dump = [0u8; 32];
+            for j in 0..n {
+                dump[j] = obj.add(j).read();
+            }
+            panic!(
+                "SLAB QUARANTINE VIOLATION: obj={:#x} cache={} offset={} found=0x{:02x} expected=0xDD bytes={:02x?}",
+                obj as u64, object_size, i, found, &dump[..n]
+            );
+        }
+    }
+}
+
+
+// ============================================================================
 // Reported-by-value events — see crate doc comment's "Two seams" section.
 // This mechanically replaces the pre-extraction `serial_println_raw!` calls
 // scattered through `allocate`/`allocate_large`/`deallocate_large`/`expand`
@@ -268,6 +398,8 @@ struct SlabCache {
     free_list: Option<NonNull<FreeObject>>,
     total_objects: usize,
     used_objects: usize,
+    #[cfg(all(debug_assertions, feature = "slab-debug"))]
+    quarantine: Quarantine,
 }
 
 impl SlabCache {
@@ -276,6 +408,8 @@ impl SlabCache {
             free_list: None,
             total_objects: 0,
             used_objects: 0,
+            #[cfg(all(debug_assertions, feature = "slab-debug"))]
+            quarantine: Quarantine::new(),
         }
     }
 
@@ -285,6 +419,20 @@ impl SlabCache {
     unsafe fn allocate(&mut self, mem: &dyn PhysMap, frames: &dyn FrameSource, object_size: usize) -> (*mut u8, Option<ExpandTrace>) {
         // Si no hay objetos libres, expandir el cache
         let mut expand_trace = None;
+        if self.free_list.is_none() {
+            #[cfg(all(debug_assertions, feature = "slab-debug"))]
+            {
+                // Quarantine: feed one drained (verified) object into the
+                // free list before expanding — objects are only reused after
+                // they have spent QUARANTINE_CAP frees in quarantine.
+                if let Some(head) = self.quarantine.pop() {
+                    verify_quarantined(head.as_ptr() as *mut u8, object_size);
+                    let old_head = self.free_list;
+                    head.as_ptr().write(FreeObject { next: old_head });
+                    self.free_list = Some(head);
+                }
+            }
+        }
         if self.free_list.is_none() {
             let trace = self.expand(mem, frames, object_size);
             let ok = trace.ok;
@@ -323,6 +471,14 @@ impl SlabCache {
                     }
                 }
             }
+            // The object was free; its trailing redzone must still be intact.
+            // A broken one means something wrote past an adjacent object into
+            // this one's redzone while it sat on the free list — freeze that
+            // instant instead of handing out a neighbour-corrupted object.
+            #[cfg(all(debug_assertions, feature = "slab-debug"))]
+            {
+                redzone_check(ptr, object_size);
+            }
         }
 
         self.free_list = free_obj.as_ref().next;
@@ -341,13 +497,39 @@ impl SlabCache {
 
     /// Deallocate un objeto
     unsafe fn deallocate(&mut self, ptr: *mut u8, object_size: usize) {
-
         #[cfg(debug_assertions)]
         {
-            // ✅ Poison con patrón de "freed"
+            // Debug poison for the always-on UAF check.
             core::ptr::write_bytes(ptr, 0xDD, object_size.min(256));
         }
+        #[cfg(all(debug_assertions, feature = "slab-debug"))]
+        {
+            // The caller is done with the object: its trailing redzone must
+            // be intact. A broken one means the caller (or a neighbour) wrote
+            // past this object's data region — the overflow-into-neighbour
+            // mode this hunt suspects. Freeze the instant.
+            redzone_check(ptr, object_size);
 
+            // Quarantine (feature-gated): delay reuse. When the quarantine is
+            // full, the oldest object is drained first and verified WHOLE — a
+            // stale owner's write into freed memory shows up here as a broken
+            // 0xDD pattern.
+            let obj = NonNull::new_unchecked(ptr as *mut FreeObject);
+            if self.quarantine.is_full() {
+                if let Some(head) = self.quarantine.pop() {
+                    verify_quarantined(head.as_ptr() as *mut u8, object_size);
+                    let old_head = self.free_list;
+                    head.as_ptr().write(FreeObject { next: old_head });
+                    self.free_list = Some(head);
+                }
+            }
+            self.quarantine.push(obj);
+            self.used_objects = self.used_objects.saturating_sub(1);
+            return;
+        }
+
+        // Normal path (release, or debug without the slab-debug feature):
+        // immediate free-list reuse.
         let free_obj = NonNull::new_unchecked(ptr as *mut FreeObject);
 
         // Agregar al inicio de la free list
@@ -370,12 +552,21 @@ impl SlabCache {
 
         let page_ptr = mem.virt_for(page_phys);
 
-        // Dividir la página en objetos
+        // Dividir la página en objetos. DEBUG: cada slot es 2*object_size
+        // (objeto + redzone del mismo tamaño) — la alineación se preserva
+        // porque el slot es múltiplo de object_size. Release: sin redzone.
         const PAGE_SIZE: usize = 4096;
-        let objects_per_page = PAGE_SIZE / object_size;
+        // DEBUG + feature: slot is 2*object_size (object + redzone). With the
+        // feature off the layout is the reference (slot == object_size).
+        let slot_size = if cfg!(all(debug_assertions, feature = "slab-debug")) {
+            2 * object_size
+        } else {
+            object_size
+        };
+        let objects_per_page = PAGE_SIZE / slot_size;
 
         for i in 0..objects_per_page {
-            let obj_ptr = page_ptr.add(i * object_size) as *mut u8;
+            let obj_ptr = page_ptr.add(i * slot_size) as *mut u8;
 
             #[cfg(debug_assertions)]
             {
@@ -386,6 +577,11 @@ impl SlabCache {
                 // una liberación real: "todo objeto en la free list, más
                 // allá de los bytes del puntero `next`, es 0xDD".
                 core::ptr::write_bytes(obj_ptr, 0xDD, object_size.min(256));
+                #[cfg(all(debug_assertions, feature = "slab-debug"))]
+                {
+                    // Redzone: el segundo object_size del slot.
+                    redzone_set(obj_ptr, object_size);
+                }
             }
 
             let obj_ptr = obj_ptr as *mut FreeObject;
@@ -558,7 +754,10 @@ mod tests {
         let a = unsafe { slab.allocate(&mem, &frames, layout) };
         unsafe { slab.deallocate(&mem, &frames, a.ptr, layout); }
         let b = unsafe { slab.allocate(&mem, &frames, layout) };
-        assert_eq!(a.ptr, b.ptr, "freed object should be handed back out again");
+        // With the slab-debug feature the quarantine delays reuse (b != a);
+        // without it the freed object is reused immediately (b == a).
+        assert_eq!(a.ptr != b.ptr, cfg!(feature = "slab-debug"),
+            "quarantine must delay reuse iff the slab-debug feature is on");
     }
 
     #[test]
@@ -637,5 +836,272 @@ mod tests {
         assert_eq!(size_class, 8);
         assert_eq!(used, 2);
         assert!(total >= 2);
+    }
+
+    // ── Free-list integrity / corruption-mode tests (2026-08-05 bug-2 hunt) ──
+    //
+    // The buddy allocator has a property-test suite (buddy.rs::tests); the
+    // slab does not. These close that gap for the three corruption modes the
+    // hunt considers: a caller double-free, the free-list integrity under
+    // correct usage, and the overflow-into-neighbor risk (there is no
+    // redzone/canary between slab objects).
+
+    #[test]
+    #[should_panic(expected = "SLAB QUARANTINE VIOLATION")]
+    #[cfg(feature = "slab-debug")]
+    fn double_free_is_detected_by_the_uaf_check_in_debug() {        // `deallocate` pushes the object onto the free list unconditionally,
+        // with no dedicated double-free detection. With the quarantine active,
+        // the double-free's duplicate entry is caught when the second copy of
+        // the object is drained from quarantine: the object was allocated once
+        // (re-poisoned 0xAA) by the first hand-out, so the drain verification
+        // finds non-0xDD bytes → "SLAB QUARANTINE VIOLATION". (The allocation-
+        // time UAF check would also catch it were it reached first; either
+        // way a double-free is a loud panic in debug — not the observed hang
+        // nor the heap-jump page-fault panic.)
+        let mem = VecMem::new(TEST_MEM_SIZE as usize);
+        let frames = BumpFrames::new(TEST_MEM_SIZE);
+        let mut slab = SlabAllocator::new();
+
+        // Fill the cache's first page so the free list is empty and the next
+        // allocate drains the quarantine deterministically.
+        let mut objs = fill_first_page(&mut slab, &mem, &frames, 16);
+        let a = objs.pop().unwrap();
+
+        unsafe { slab.deallocate(&mem, &frames, a, layout16()); }
+        unsafe { slab.deallocate(&mem, &frames, a, layout16()); } // double-free
+        // First hand-out drains the first copy (still 0xDD)…
+        let c = unsafe { slab.allocate(&mem, &frames, layout16()) };
+        assert_eq!(c.ptr, a);
+        // …second hand-out drains the duplicate: the object is now 0xAA → panic.
+        let _ = unsafe { slab.allocate(&mem, &frames, layout16()) };
+    }
+
+    fn layout16() -> core::alloc::Layout {
+        Layout::from_size_align(16, 16).unwrap()
+    }
+
+    #[test]
+    #[cfg(feature = "slab-debug")]
+    fn double_free_with_reallocation_in_between_does_not_reuse_twice() {
+        // Supervisor's degradation scenario tested directly: free A,
+        // reallocate (legitimately reusing A's slot, overwriting it with
+        // valid data), free it AGAIN. In this free-list + quarantine
+        // implementation, the reallocation consumes the quarantine entry, so
+        // the second free adds the object exactly ONCE — two later allocates
+        // yield different objects, not overlapping ones.
+        let mem = VecMem::new(TEST_MEM_SIZE as usize);
+        let frames = BumpFrames::new(TEST_MEM_SIZE);
+        let mut slab = SlabAllocator::new();
+        let layout = layout16();
+
+        let mut objs = fill_first_page(&mut slab, &mem, &frames, 16);
+        let a = objs.pop().unwrap();
+        unsafe { slab.deallocate(&mem, &frames, a, layout); }
+
+        // Reallocate (reuses a's slot), write valid data.
+        let b = unsafe { slab.allocate(&mem, &frames, layout) };
+        assert_eq!(b.ptr, a);
+        unsafe { b.ptr.write_bytes(0x42, 16); }
+
+        // Double-free: free b (== a) again.
+        unsafe { slab.deallocate(&mem, &frames, b.ptr, layout); }
+
+        // No overlap: the reallocation consumed the quarantine entry.
+        let c = unsafe { slab.allocate(&mem, &frames, layout) };
+        let d = unsafe { slab.allocate(&mem, &frames, layout) };
+        assert_eq!(c.ptr, a);
+        assert_ne!(c.ptr, d.ptr, "reallocation removed the first free entry — no overlap");
+    }
+
+    #[test]
+    fn free_list_yields_unique_objects_under_correct_usage() {
+        // Under correct (no double-free) usage, cycling a cache through
+        // allocate-all / free-all / allocate-all must never hand out the same
+        // object twice while it's live.
+        let mem = VecMem::new(TEST_MEM_SIZE as usize);
+        let frames = BumpFrames::new(TEST_MEM_SIZE);
+        let mut slab = SlabAllocator::new();
+        let layout = Layout::from_size_align(8, 8).unwrap();
+        const N: usize = 256;
+
+        let mut ptrs = std::vec::Vec::with_capacity(N);
+        for _ in 0..N {
+            let r = unsafe { slab.allocate(&mem, &frames, layout) };
+            assert!(!r.ptr.is_null());
+            ptrs.push(r.ptr as usize);
+        }
+        for &p in &ptrs {
+            unsafe { slab.deallocate(&mem, &frames, p as *mut u8, layout); }
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..N {
+            let r = unsafe { slab.allocate(&mem, &frames, layout) };
+            assert!(
+                seen.insert(r.ptr as usize),
+                "free list handed out a duplicate live object"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "SLAB REDZONE BROKEN")]
+    #[cfg(feature = "slab-debug")]
+    fn redzone_detects_overflow_past_object_end() {
+        // The canary's core calibration: write one byte past the caller's
+        // data region (into the trailing redzone) and verify the slab panics
+        // at the object's deallocate — freezing the overflower instead of
+        // letting it silently corrupt the neighbour.
+        let mem = VecMem::new(TEST_MEM_SIZE as usize);
+        let frames = BumpFrames::new(TEST_MEM_SIZE);
+        let mut slab = SlabAllocator::new();
+        let layout = Layout::from_size_align(16, 16).unwrap();
+
+        let a = unsafe { slab.allocate(&mem, &frames, layout) };
+        unsafe {
+            // One byte past the 16-byte data region → the trailing redzone.
+            a.ptr.add(16).write(0xAB);
+        }
+        // Deallocate checks the redzone first → "SLAB REDZONE BROKEN".
+        unsafe { slab.deallocate(&mem, &frames, a.ptr, layout); }
+    }
+
+    #[test]
+    #[should_panic(expected = "SLAB REDZONE BROKEN")]
+    #[cfg(feature = "slab-debug")]
+    fn redzone_detects_overflow_into_free_object_neighbour() {
+        // A neighbour overflow lands in the next slot's data region; while
+        // that next object is FREE, its trailing redzone is the first thing
+        // an even larger overflow from the other side could hit, and the
+        // allocate-time check must catch a broken redzone before handing the
+        // corrupted object out.
+        let mem = VecMem::new(TEST_MEM_SIZE as usize);
+        let frames = BumpFrames::new(TEST_MEM_SIZE);
+        let mut slab = SlabAllocator::new();
+        let layout = layout16();
+
+        // Fill the page so the free list is empty: the next allocate drains
+        // the quarantined victim (free list empty), hitting its redzone check.
+        let mut objs = fill_first_page(&mut slab, &mem, &frames, 16);
+        let a = objs.pop().unwrap();
+        unsafe { slab.deallocate(&mem, &frames, a, layout); }
+        // a is free: data region [a, a+16), trailing redzone [a+16, a+32).
+        // Break the redzone as an external overflow would.
+        unsafe { a.add(16).write(0xAB); }
+        // Allocating must drain a and trip the allocate-time redzone check.
+        let _ = unsafe { slab.allocate(&mem, &frames, layout) };
+    }
+
+    // ── Quarantine calibration (2026-08-05 bug-2 hunt) ───────────────────────
+
+    /// Allocate every object in the cache's first page (leaving the free list
+    /// empty, so the next allocate drains the quarantine or expands). Returns
+    /// the pointers. The per-page count accounts for the debug redzone
+    /// (slot = 2*obj_size).
+    fn fill_first_page(
+        slab: &mut SlabAllocator,
+        mem: &VecMem,
+        frames: &BumpFrames,
+        obj_size: usize,
+    ) -> std::vec::Vec<*mut u8> {
+        let layout = Layout::from_size_align(obj_size, obj_size).unwrap();
+        let slot = if cfg!(feature = "slab-debug") { 2 * obj_size } else { obj_size };
+        let per_page = 4096 / slot;
+        let mut objs = std::vec::Vec::with_capacity(per_page);
+        for _ in 0..per_page {
+            let r = unsafe { slab.allocate(mem, frames, layout) };
+            assert!(!r.ptr.is_null());
+            objs.push(r.ptr);
+        }
+        objs
+    }
+
+    #[test]
+    #[cfg(feature = "slab-debug")]
+    fn quarantine_delays_reuse_until_drain() {
+        // A freed object must NOT be handed back out immediately — it sits in
+        // quarantine until it has aged QUARANTINE_CAP frees (or the free list
+        // runs dry). This is what makes a stale owner's write into freed
+        // memory detectable.
+        let mem = VecMem::new(TEST_MEM_SIZE as usize);
+        let frames = BumpFrames::new(TEST_MEM_SIZE);
+        let mut slab = SlabAllocator::new();
+        let layout = Layout::from_size_align(8, 8).unwrap();
+
+        let a = unsafe { slab.allocate(&mem, &frames, layout) };
+        unsafe { slab.deallocate(&mem, &frames, a.ptr, layout); }
+        // Immediately reallocating must NOT return the just-freed object.
+        let b = unsafe { slab.allocate(&mem, &frames, layout) };
+        assert!(!b.ptr.is_null());
+        assert_ne!(a.ptr, b.ptr, "quarantine must delay reuse");
+    }
+
+    #[test]
+    #[should_panic(expected = "SLAB QUARANTINE VIOLATION")]
+    #[cfg(feature = "slab-debug")]
+    fn quarantine_detects_stale_owner_write_into_freed_object() {
+        // The UAF discriminator: free an object, then have a stale owner
+        // write into it (the write lands inside the recycled object's own
+        // data region — invisible to the redzone and to the allocate-time UAF
+        // check). When the object ages out of quarantine, the whole-object
+        // 0xDD verification finds the foreign byte → panic.
+        let mem = VecMem::new(TEST_MEM_SIZE as usize);
+        let frames = BumpFrames::new(TEST_MEM_SIZE);
+        let mut slab = SlabAllocator::new();
+        let layout = Layout::from_size_align(8, 8).unwrap();
+
+        // QUARANTINE_CAP + 1 objects: the victim plus enough churn to push it
+        // through the quarantine (the 8-cache page holds 256 slots here).
+        let mut objs = std::vec::Vec::new();
+        for _ in 0..(QUARANTINE_CAP + 1) {
+            let r = unsafe { slab.allocate(&mem, &frames, layout) };
+            assert!(!r.ptr.is_null());
+            objs.push(r.ptr);
+        }
+
+        // Free the victim, then write into it as a stale owner would.
+        let victim = objs.pop().unwrap();
+        unsafe { slab.deallocate(&mem, &frames, victim, layout); }
+        unsafe { victim.add(4).write(0x41); } // 'A' — a stale owner's data
+
+        // Free QUARANTINE_CAP more objects: the last one fills the quarantine
+        // and drains the victim (the head) → verification finds 0x41 → panic.
+        for o in objs {
+            unsafe { slab.deallocate(&mem, &frames, o, layout); }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "slab-debug")]
+    fn quarantine_reuses_drained_object_after_churn() {
+        // After enough churn, the freed object ages out of quarantine and IS
+        // reused — the quarantine delays, it does not leak. The victim must
+        // come back (as some allocate's result) once drained.
+        let mem = VecMem::new(TEST_MEM_SIZE as usize);
+        let frames = BumpFrames::new(TEST_MEM_SIZE);
+        let mut slab = SlabAllocator::new();
+        let layout = Layout::from_size_align(8, 8).unwrap();
+
+        let mut objs = std::vec::Vec::new();
+        for _ in 0..(QUARANTINE_CAP + 1) {
+            let r = unsafe { slab.allocate(&mem, &frames, layout) };
+            objs.push(r.ptr);
+        }
+        let victim = objs.pop().unwrap();
+        unsafe { slab.deallocate(&mem, &frames, victim, layout); }
+        // Free everything else; then allocate QUARANTINE_CAP more. The victim
+        // must appear among the reallocated pointers once it drains.
+        for o in objs {
+            unsafe { slab.deallocate(&mem, &frames, o, layout); }
+        }
+        let mut saw_victim = false;
+        for _ in 0..QUARANTINE_CAP {
+            let r = unsafe { slab.allocate(&mem, &frames, layout) };
+            assert!(!r.ptr.is_null());
+            if r.ptr == victim {
+                saw_victim = true;
+            }
+        }
+        assert!(saw_victim, "drained object must be reused");
     }
 }

@@ -212,6 +212,34 @@ pub struct Process {
     /// `fork()` in this implementation (every new `Process` starts with all
     /// `Default` — a simplification vs. real POSIX, which does inherit).
     pub signal_handlers: [SignalAction; signal::NUM_SIGNALS],
+
+    // ── TrapFrame SAVE/RESUME sequence tracking ───────────────────────────
+    // See `process::scheduler::tf_note_save`/`tf_note_resume` and
+    // `debug::TfRewindDiag`. These three fields exist only to answer one
+    // question: does this process ever get resumed from a `TrapFrame` that
+    // isn't the last one actually saved for it? (It did, for months — see
+    // docs/hang-hunt-bug2-findings.md.) Everything here runs under the
+    // single-core `SCHEDULER` lock (never touched from two contexts at
+    // once), so plain fields suffice — no atomics needed.
+    /// Bumped by 1 every time `trapframe` is overwritten wholesale from a
+    /// live register snapshot (a "SAVE" — `switch_to_next`/`block_current`/
+    /// `stop_and_switch_tf`/`sys_exec`'s direct rewrite). Never touched by
+    /// process construction (`new_user`/`new_user_from_fork`/`new_thread`
+    /// all start it at 0) — a fresh process has never been "saved" yet, it
+    /// starts pre-loaded with its initial trapframe.
+    pub tf_seq: u64,
+    /// True from the moment a SAVE bumps `tf_seq` until the matching RESUME
+    /// consumes it (starts `false`: the initial trapframe from construction
+    /// counts as pre-consumed, needing no RESUME to "unlock" it). Finding
+    /// this already `true` at the start of a *new* SAVE means the previous
+    /// SAVE's content was never resumed — one of the two rewind signatures.
+    pub tf_awaiting_resume: bool,
+    /// `tf_seq` as of this process's last RESUME, or `None` before its
+    /// first one (`start_first`, or a freshly `fork()`/`clone()`d process's
+    /// first ever scheduling). A RESUME whose *current* `tf_seq` isn't
+    /// strictly greater than this is resuming stale/already-consumed
+    /// content — the other rewind signature.
+    pub tf_last_resumed_seq: Option<u64>,
 }
 
 impl Process {
@@ -281,6 +309,9 @@ impl Process {
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
             pending_signals: 0,
+            tf_seq: 0,
+            tf_awaiting_resume: false,
+            tf_last_resumed_seq: None,
         }
     }
 
@@ -351,6 +382,9 @@ impl Process {
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
             pending_signals: 0,
+            tf_seq: 0,
+            tf_awaiting_resume: false,
+            tf_last_resumed_seq: None,
         }
     }
 
@@ -411,6 +445,9 @@ impl Process {
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
             pending_signals: 0,
+            tf_seq: 0,
+            tf_awaiting_resume: false,
+            tf_last_resumed_seq: None,
         }
     }
 
@@ -498,6 +535,9 @@ impl Process {
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
             pending_signals: 0,
+            tf_seq: 0,
+            tf_awaiting_resume: false,
+            tf_last_resumed_seq: None,
         }
     }
 

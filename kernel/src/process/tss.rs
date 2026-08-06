@@ -145,8 +145,13 @@ pub fn init_syscall_msrs() {
         // LSTAR: 64-bit kernel entry point
         wrmsr(IA32_LSTAR, syscall_entry_fast as u64);
 
-        // SFMASK: clear IF on entry (bit 9)
-        wrmsr(IA32_FMASK, 1 << 9);
+        // SFMASK: clear IF (bit 9) so we enter with interrupts disabled.
+        // ALSO clear DF (bit 10): user space may leave it set (e.g. a memmove
+        // interrupted between std/cld); a `rep movsb` executed by the kernel
+        // with DF=1 would copy BACKWARD (the root cause of the 2026-08-05
+        // box-copy corruption — see docs/hang-hunt-bug2-findings.md). Linux
+        // masks DF in FMASK for exactly this reason.
+        wrmsr(IA32_FMASK, (1 << 9) | (1 << 10));
     }
 
     crate::serial_println!("syscall MSRs configured (LSTAR={:#x})", syscall_entry_fast as u64);

@@ -22,6 +22,17 @@ edition = "2021"
 # runs identically on the host.
 x86_64 = "=0.15.4"
 
+[features]
+default = []
+# Debug-only slab instrumentation (redzone + quarantine, 2026-08-05 bug-2
+# hunt). OFF by default: with it off, the slot layout is the pre-instrumentation
+# reference (slot = object_size) so the kernel's heap addresses and flake/PANIC
+# rates return to the baseline that the rest of the investigation measured.
+# Flip it on (debug builds) to re-enable the redzone/quarantine; the host tests
+# exercise both under `cargo test --features slab-debug` (and are `#[cfg]`'d
+# out otherwise — `cargo test` stays green without the feature).
+slab-debug = []
+
 [dev-dependencies]
 # Integration tests under `tests/` compile as separate crates that only see
 # `mm`'s public API plus `[dev-dependencies]` — a plain `[dependencies]`

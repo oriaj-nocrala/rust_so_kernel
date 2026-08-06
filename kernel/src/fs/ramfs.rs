@@ -84,6 +84,57 @@ impl RamDirNode {
             mode: AtomicU32::new(0o755),
         }
     }
+
+    /// Locks `entries`, reporting the acquisition through
+    /// `debug::RAMFS_ENTRIES_LOCK` (see that type's doc comment — built
+    /// after this exact lock was found stuck taken forever during the
+    /// 2026-08-05 hang hunt, RIP parked in `SpinMutex::lock`'s `_mm_pause`
+    /// inlined into `mkdir` below; the root cause was DF-corrupted trapframe
+    /// copies abandoning the syscall that held it, fixed in `tss.rs`'s FMASK
+    /// and the two entry stubs' `cld`). `op` names the calling method
+    /// (`"mkdir"`, `"symlink"`, ...) so `/proc/kdebug` can say *who* holds
+    /// it, which `LockDiag`'s file:line can't (every op locks from the same
+    /// inlined site). Returns a guard that reports the matching release on
+    /// `Drop`, so call sites read exactly like the plain guard they replaced
+    /// — `self.entries.lock()` → `self.lock_entries(op)`.
+    ///
+    /// The acquire is recorded *after* the lock is actually taken, never
+    /// before: recording first would name a spinning-but-not-yet-holding
+    /// caller as the holder (one of the defective instruments this hunt
+    /// produced — see docs/hang-hunt-bug2-findings.md). The pid, on the
+    /// other hand, is read *before*: `current_pid_safe` takes the
+    /// `SCHEDULER` lock and ends with an unconditional `sti`, neither of
+    /// which may happen inside this critical section.
+    fn lock_entries(&self, op: &'static str) -> TrackedEntriesGuard<'_> {
+        let pid = crate::process::scheduler::current_pid_safe().map(|p| p as u64).unwrap_or(u64::MAX);
+        let guard = self.entries.lock();
+        crate::debug::RAMFS_ENTRIES_LOCK.record_acquire(pid, op);
+        TrackedEntriesGuard { guard }
+    }
+}
+
+/// RAII wrapper around `RamDirNode::entries`'s real `MutexGuard` that
+/// records the matching release for `debug::RAMFS_ENTRIES_LOCK` on `Drop`
+/// — see `RamDirNode::lock_entries`. `Deref`/`DerefMut` straight through to
+/// the `BTreeMap` so callers use it exactly like the plain guard they used
+/// to hold.
+struct TrackedEntriesGuard<'a> {
+    guard: spin::MutexGuard<'a, BTreeMap<String, Arc<dyn Inode>>>,
+}
+
+impl<'a> core::ops::Deref for TrackedEntriesGuard<'a> {
+    type Target = BTreeMap<String, Arc<dyn Inode>>;
+    fn deref(&self) -> &Self::Target { &self.guard }
+}
+
+impl<'a> core::ops::DerefMut for TrackedEntriesGuard<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.guard }
+}
+
+impl<'a> Drop for TrackedEntriesGuard<'a> {
+    fn drop(&mut self) {
+        crate::debug::RAMFS_ENTRIES_LOCK.record_release();
+    }
 }
 
 impl Inode for RamDirNode {
@@ -93,7 +144,7 @@ impl Inode for RamDirNode {
         // Real link count (2 + subdirectory count), same "report the
         // actual state, not a fixed default" fix applied to permission
         // bits below and to ext2's own `stat()`.
-        let nlink = 2 + self.entries.lock().values()
+        let nlink = 2 + self.lock_entries("stat").values()
             .filter(|v| v.file_type() == FileType::Directory)
             .count() as u64;
         Stat::dir(self.ino).with_perm_bits(self.mode.load(Ordering::Relaxed)).with_nlink(nlink)
@@ -102,7 +153,7 @@ impl Inode for RamDirNode {
     fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
         // Snapshot: this handle's getdents64 walks a fixed Vec, not the live
         // map, so files created after opendir() won't retroactively appear.
-        let entries = self.entries.lock();
+        let entries = self.lock_entries("open");
         let mut snapshot: Vec<DirEntry> = Vec::with_capacity(entries.len() + 2);
         snapshot.push(DirEntry::new(self.ino, FileType::Directory, b"."));
         snapshot.push(DirEntry::new(self.ino, FileType::Directory, b".."));
@@ -113,7 +164,7 @@ impl Inode for RamDirNode {
     }
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, Errno> {
-        self.entries.lock().get(name).cloned().ok_or(Errno::ENOENT)
+        self.lock_entries("lookup").get(name).cloned().ok_or(Errno::ENOENT)
     }
 
     fn readdir(&self, offset: u64) -> Result<Option<DirEntry>, Errno> {
@@ -122,7 +173,7 @@ impl Inode for RamDirNode {
             1 => Ok(Some(DirEntry::new(self.ino, FileType::Directory, b".."))),
             n => {
                 let idx = (n - 2) as usize;
-                let entries = self.entries.lock();
+                let entries = self.lock_entries("readdir");
                 match entries.iter().nth(idx) {
                     Some((name, node)) => Ok(Some(DirEntry::new(node.stat().st_ino, node.file_type(), name.as_bytes()))),
                     None => Ok(None),
@@ -132,7 +183,7 @@ impl Inode for RamDirNode {
     }
 
     fn create(&self, name: &str) -> Result<Arc<dyn Inode>, Errno> {
-        let mut entries = self.entries.lock();
+        let mut entries = self.lock_entries("create");
         if let Some(existing) = entries.get(name) {
             if existing.file_type() == FileType::Directory {
                 return Err(Errno::EISDIR);
@@ -149,7 +200,7 @@ impl Inode for RamDirNode {
     }
 
     fn mkdir(&self, name: &str) -> Result<Arc<dyn Inode>, Errno> {
-        let mut entries = self.entries.lock();
+        let mut entries = self.lock_entries("mkdir");
         if entries.contains_key(name) {
             return Err(Errno::EEXIST);
         }
@@ -159,7 +210,7 @@ impl Inode for RamDirNode {
     }
 
     fn unlink(&self, name: &str) -> Result<(), Errno> {
-        let mut entries = self.entries.lock();
+        let mut entries = self.lock_entries("unlink");
         match entries.get(name) {
             None => Err(Errno::ENOENT),
             Some(node) if node.file_type() == FileType::Directory => Err(Errno::EISDIR),
@@ -168,7 +219,7 @@ impl Inode for RamDirNode {
     }
 
     fn rmdir(&self, name: &str) -> Result<(), Errno> {
-        let mut entries = self.entries.lock();
+        let mut entries = self.lock_entries("rmdir");
         let node = match entries.get(name) {
             None => return Err(Errno::ENOENT),
             Some(node) => node,
@@ -186,11 +237,11 @@ impl Inode for RamDirNode {
     }
 
     fn take_child(&self, name: &str) -> Result<Arc<dyn Inode>, Errno> {
-        self.entries.lock().remove(name).ok_or(Errno::ENOENT)
+        self.lock_entries("take_child").remove(name).ok_or(Errno::ENOENT)
     }
 
     fn insert_child(&self, name: &str, node: Arc<dyn Inode>) -> Result<(), Errno> {
-        let mut entries = self.entries.lock();
+        let mut entries = self.lock_entries("insert_child");
         if entries.contains_key(name) {
             return Err(Errno::EEXIST);
         }
@@ -199,7 +250,7 @@ impl Inode for RamDirNode {
     }
 
     fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn Inode>, Errno> {
-        let mut entries = self.entries.lock();
+        let mut entries = self.lock_entries("symlink");
         if entries.contains_key(name) {
             return Err(Errno::EEXIST);
         }

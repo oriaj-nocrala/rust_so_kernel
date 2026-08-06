@@ -70,6 +70,15 @@ global_asm!(
     ".global syscall_entry_fast",
     "syscall_entry_fast:",
 
+    // The `syscall` instruction only clears the RFLAGS bits present in
+    // IA32_FMASK — which does include DF (bit 10) since `tss.rs`'s
+    // `init_syscall_msrs`. Belt and braces: clear DF here too, so a
+    // `rep movsb` executed by a syscall handler with DF=1 (user left it set,
+    // e.g. preempted mid-memmove between its `std` and its `cld`) can never
+    // copy backward. See docs/hang-hunt-bug2-findings.md — this was the root
+    // cause of months of intermittent hangs and heap-jump faults.
+    "cld",
+
     // On entry (CPU): %rcx=user RIP, %r11=user RFLAGS, %rsp=user RSP, IF=0.
 
     // 1. Save user RFLAGS (%r11) before repurposing %r11 for user RSP.

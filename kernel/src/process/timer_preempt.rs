@@ -22,6 +22,15 @@ global_asm!(
     ".global timer_interrupt_entry",
     "timer_interrupt_entry:",
     
+    // The direction flag (DF) is NOT cleared by interrupt delivery: a tick
+    // landing between a memmove's `std` and its `cld` would otherwise run the
+    // whole ISR (and its memcpys — including the trapframe box copy) with
+    // DF=1, copying BACKWARD. That was the root cause of months of
+    // intermittent hangs and heap-jump faults; see
+    // docs/hang-hunt-bug2-findings.md. The rustc x86-interrupt shims emit
+    // `cld` for the IDT handlers; this hand-written asm must too.
+    "cld",
+    
     // Save ALL registers
     "push rax",
     "push rbx",
@@ -72,6 +81,73 @@ extern "C" {
     pub fn timer_interrupt_entry();
 }
 
+/// Validate a TrapFrame that `timer_interrupt_entry`'s asm is about to iretq
+/// from. Cheap permanent safety net kept from the 2026-08-05 hang hunt, where
+/// the failure mode was exactly this: a corrupted boxed trapframe gets
+/// restored and the iretq jumps into the heap (instruction fetch inside the
+/// /tmp entries BTreeMap), destroying the CPU state that would have explained
+/// it. If the frame is corrupt, panic immediately with full context —
+/// freezing the seed instant is worth far more than surviving it. The asm is
+/// deliberately untouched; this runs in Rust on the pointer
+/// `switch_to_next`/`resolve_signals` returned, on BOTH the switch resume and
+/// the no-switch return.
+///
+/// O(1), no allocation: pure comparisons against values already in hand
+/// (`kstack_top` is the running process's kernel stack top, read once). The
+/// code-region boundary uses the real runtime `physical_memory_offset()`
+/// (kernel code is never mapped at/above it — that region is the physical-map
+/// heap), not a hardcoded .text range.
+fn validate_resume_frame(tf: *const TrapFrame, kstack_top: u64, site: &'static str) {
+    const USER_CS: u64 = 0x23;
+    const KERNEL_CS: u64 = 0x08;
+    const KERNEL_SS: u64 = 0x10;
+    const USER_SS: u64 = 0x1b;
+    const USER_SPACE_MAX: u64 = 0x0000_8000_0000_0000;
+
+    let frame = unsafe { &*tf };
+    let (cs, ss, rip, rflags, rsp) = (frame.cs, frame.ss, frame.rip, frame.rflags, frame.rsp);
+
+    // RFLAGS bit 1 is architecturally reserved and always 1.
+    let bad_rflags = rflags & 0x2 == 0;
+
+    let phys_offset = crate::memory::physical_memory_offset().as_u64();
+    let kstack_lo = kstack_top - (1u64 << crate::init::processes::KERNEL_STACK_ORDER);
+
+    let bad = match cs {
+        // Ring-0 frame: kernel code is below the physical-map offset and
+        // above the null page. The interrupted stack pointer must be inside
+        // this process's own kernel stack (kstacks live at/above the
+        // physical-map offset) — with ONE legitimate exception: the boot
+        // transition (the first tick right after `start_first_process`'s
+        // `sti`) still runs on the bootloader's boot stack, which is BELOW
+        // the physical-map offset (e.g. 0x18000014df0 in these boots). So:
+        // tiny rsp (< 0x100000) or heap rsp (>= phys_offset and outside this
+        // kstack) is corrupt; the [0x100000, phys_offset) band is the boot
+        // stack and is allowed.
+        KERNEL_CS => {
+            ss != KERNEL_SS
+                || rip >= phys_offset
+                || rip < 0x1000
+                || rsp < 0x100000
+                || (rsp >= phys_offset && (rsp < kstack_lo || rsp >= kstack_top))
+        }
+        // Ring-3 frame: both RIP and RSP must be in user space.
+        USER_CS => ss != USER_SS || rip >= USER_SPACE_MAX || rsp >= USER_SPACE_MAX,
+        // Anything else (the panic's cs=0x3) is invalid on its face.
+        _ => true,
+    } || bad_rflags;
+
+    if bad {
+        crate::serial_println_raw!(
+            "\n=== HANGHUNT BAD RESUME FRAME ===\n  tf={:#x} kstack=[{:#x},{:#x})\n  cs={:#x} ss={:#x} rip={:#x} rflags={:#x} rsp={:#x}\n  pid={}",
+            tf as u64, kstack_lo, kstack_top,
+            cs, ss, rip, rflags, rsp,
+            super::scheduler::current_pid_fast(),
+        );
+        panic!("corrupt resume frame at {} (bad iretq target)", site);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> *const TrapFrame {
     // ── 1. EOI (must be first — acknowledge interrupt) ────────────────
@@ -112,7 +188,7 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> *const 
             scheduler.wake(pid);
         }
 
-        if !scheduler.tick() {
+        if !scheduler.tick(unsafe { (*current_tf).rsp }) {
             // Slice still has ticks remaining — continue current process,
             // but it may have just been sent a signal (e.g. by another
             // process's kill() while this one was running) — check before
@@ -120,10 +196,12 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> *const 
             // hrtimer either way.
             let tf = scheduler.resolve_signals(current_tf);
             scheduler.resolve_wait_status();
+            let kstack_top = scheduler.running_ref().map(|p| p.kernel_stack.as_u64()).unwrap_or(0);
             drop(scheduler);
             for &pid in &wake_pids[..wake_count] {
                 crate::process::syscall::poll_clear_on_timeout(pid);
             }
+            validate_resume_frame(tf, kstack_top, "timer-no-switch");
             return tf;
         }
 
@@ -137,6 +215,8 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> *const 
         // status now, same as every other "about to return to user mode"
         // site (`trapframe::jump_to_user`, the syscall-return epilogue).
         scheduler.resolve_wait_status();
+        let kstack_top = scheduler.running_ref().map(|p| p.kernel_stack.as_u64()).unwrap_or(0);
+        validate_resume_frame(tf, kstack_top, "timer-switch");
         tf
         // scheduler lock released here
     };
