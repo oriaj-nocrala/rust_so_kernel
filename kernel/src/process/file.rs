@@ -8,132 +8,14 @@
 
 use alloc::boxed::Box;
 
-// ============================================================================
-// ERRORS
-// ============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileError {
-    BadFileDescriptor,
-    InvalidArgument,
-    IOError,
-    NotSupported,
-    EndOfFile,
-    /// Write to a pipe with no open read ends (maps to EPIPE, and the
-    /// caller additionally raises SIGPIPE — see `pipe.rs`/`sys_write`).
-    BrokenPipe,
-    /// Backing store (ext2 block/inode bitmap) is full — maps to ENOSPC,
-    /// distinct from `IOError` so `sys_write` can report the real reason a
-    /// write to a disk-backed filesystem failed.
-    NoSpace,
-    /// The operation would block (empty pipe on read, full pipe on write).
-    /// `sys_read`/`sys_write` catch this, drop the fd-table lock, and
-    /// perform the actual block_current/jump_to_trapframe themselves — see
-    /// their doc comments for why this can't happen inside `read`/`write`.
-    WouldBlock,
-}
-
-pub type FileResult<T> = Result<T, FileError>;
-
-/// Shared `lseek(2)` offset arithmetic for regular-file handles (ramfs,
-/// initramfs, ext2) — same SEEK_SET/SEEK_CUR/SEEK_END semantics, only the
-/// "current position" and "file size" inputs differ per filesystem.
-/// Negative results (seeking before byte 0) are rejected; seeking past
-/// EOF is allowed (real `lseek` permits it — the next `read()` just
-/// returns 0, or, for filesystems with write support, a later `write()`
-/// there would create a hole).
-pub fn compute_seek(current: i64, size: i64, offset: i64, whence: i32) -> FileResult<i64> {
-    const SEEK_SET: i32 = 0;
-    const SEEK_CUR: i32 = 1;
-    const SEEK_END: i32 = 2;
-
-    let base = match whence {
-        SEEK_SET => 0,
-        SEEK_CUR => current,
-        SEEK_END => size,
-        _ => return Err(FileError::InvalidArgument),
-    };
-    let new_pos = base.checked_add(offset).ok_or(FileError::InvalidArgument)?;
-    if new_pos < 0 {
-        return Err(FileError::InvalidArgument);
-    }
-    Ok(new_pos)
-}
-
-// ============================================================================
-// TRAIT: FileHandle
-// ============================================================================
-
-/// Trait representing any "file" in the system.
-///
-/// Implementations include device drivers (/dev/null, /dev/console, etc.),
-/// VFS-opened files (initramfs, future ext2), pipes, sockets, etc.
-///
-/// Optional VFS extensions (`stat`, `getdents64`) have default implementations
-/// that are safe to ignore by device drivers.
-pub trait FileHandle: Send {
-    /// Read up to `buf.len()` bytes.  Returns bytes read.
-    fn read(&mut self, buf: &mut [u8]) -> FileResult<usize>;
-
-    /// Write up to `buf.len()` bytes.  Returns bytes written.
-    fn write(&mut self, buf: &[u8]) -> FileResult<usize>;
-
-    /// Close the file (optional, default no-op).
-    fn close(&mut self) -> FileResult<()> {
-        Ok(())
-    }
-
-    /// Return file metadata.  `None` for handles that don't support stat
-    /// (e.g. legacy device handles opened before the VFS was initialised).
-    fn stat(&self) -> Option<crate::fs::types::Stat> {
-        None
-    }
-
-    /// Fill `buf` with `linux_dirent64` records.  Returns bytes written, or a
-    /// negative errno on error.  Default returns `-ENOTDIR` (not a directory).
-    ///
-    /// Directory handles opened via the VFS override this.
-    fn getdents64(&mut self, _buf: &mut [u8]) -> i64 {
-        crate::fs::types::Errno::ENOTDIR.as_i64()
-    }
-
-    /// Name for debugging.
-    fn name(&self) -> &str {
-        "<unknown>"
-    }
-
-    /// Duplicate this handle for inheritance across `fork()`.
-    ///
-    /// Default `None` means "not inheritable" — matches today's behavior
-    /// for device handles (fork only special-cases stdio, see
-    /// `FileDescriptorTable::clone`). Handles backed by shared state (e.g.
-    /// pipe ends) override this to clone their `Arc` and bump the relevant
-    /// refcount, so both parent and child end up sharing the same
-    /// underlying buffer — required for pipe semantics across fork.
-    fn dup(&self) -> Option<Box<dyn FileHandle>> {
-        None
-    }
-
-    /// Reposition the file offset. `whence` uses the same values as real
-    /// `lseek(2)`: 0 = SEEK_SET, 1 = SEEK_CUR, 2 = SEEK_END. Returns the
-    /// new absolute offset.
-    ///
-    /// Default `NotSupported` — correct for character devices and pipes
-    /// (no meaningful position). Regular-file handles (ramfs, initramfs,
-    /// ext2) override this.
-    fn seek(&mut self, _offset: i64, _whence: i32) -> FileResult<i64> {
-        Err(FileError::NotSupported)
-    }
-
-    /// Change this open file's permission bits — `fchmod(2)`. Default
-    /// `Ok(())` matches `Inode::chmod`'s same "pre-existing stub behavior"
-    /// default (see its doc comment); only `ext2::Ext2FileHandle`
-    /// overrides it, since ext2 is the only filesystem here with a real
-    /// on-disk mode field to persist the change into.
-    fn chmod(&mut self, _mode: u32) -> FileResult<()> {
-        Ok(())
-    }
-}
+// `FileError`/`FileResult`/`compute_seek`/`FileHandle` now live in the
+// standalone, host-testable `vfs` crate (`vfs/src/file.rs`, `cd vfs &&
+// cargo test`) — see `docs/fs/vfs-extraction-plan.md`. This re-export
+// exists so no `use crate::process::file::...` anywhere in the kernel has
+// to change. `FileDescriptorTable` below stays here: it needs
+// `crate::drivers` (the device registry) and `crate::serial_println!`
+// (debug logging), neither of which `vfs` can reach.
+pub use vfs::file::{compute_seek, FileError, FileHandle, FileResult};
 
 // ============================================================================
 // FILE DESCRIPTOR TABLE

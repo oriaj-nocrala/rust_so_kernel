@@ -8,14 +8,16 @@
 //! `cargo test` reaches it — the same extraction shape `hal`/`ext2`/`mm`
 //! already went through.
 //!
-//! Right now this crate only holds [`types`] (`Errno`, `FileType`,
-//! `OpenFlags`, `Stat`, `DirEntry`) — the plain data types every VFS trait
-//! and adapter speaks in. The remaining pieces (`FileHandle`, `Inode`/
-//! `Filesystem`, path resolution, the mount table, `ramfs`) move here in
-//! later steps — see `docs/fs/vfs-extraction-plan.md` for the full six-step
-//! migration.
+//! Right now this crate holds [`types`] (`Errno`, `FileType`, `OpenFlags`,
+//! `Stat`, `DirEntry` — the plain data types every VFS trait and adapter
+//! speaks in) and [`file`] (`FileError`, `FileResult`, `compute_seek`, and
+//! the `FileHandle` trait — the coupling point between processes, drivers,
+//! and filesystems). The remaining pieces (`Inode`/`Filesystem`, path
+//! resolution, the mount table, `ramfs`) move here in later steps — see
+//! `docs/fs/vfs-extraction-plan.md` for the full six-step migration.
 #![no_std]
 
 extern crate alloc;
 
+pub mod file;
 pub mod types;
