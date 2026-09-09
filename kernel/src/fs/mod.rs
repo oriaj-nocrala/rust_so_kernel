@@ -40,7 +40,7 @@ pub fn init() {
     // /dev — character devices from the driver registry
     vfs::mount("/dev", Arc::new(devfs::DevFs));
     // /tmp — writable scratch space (ramfs)
-    vfs::mount("/tmp", Arc::new(ramfs::RamFs::new()));
+    vfs::mount("/tmp", Arc::new(ramfs::new()));
     // /mnt — real disk, writable ext2 (best-effort: no disk / bad image just
     // means no /mnt, not a boot failure).
     match ext2::init() {

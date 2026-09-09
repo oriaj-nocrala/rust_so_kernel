@@ -127,7 +127,7 @@ impl LockDiag {
 pub static SCHEDULER_LOCK: LockDiag = LockDiag::new();
 
 /// Extends the `LockDiag` idea above to name *who* holds a lock, not just
-/// *where* it was acquired — built for `fs::ramfs::RamDirNode::entries`,
+/// *where* it was acquired — built for `vfs::ramfs::RamDirNode::entries`,
 /// found stuck taken during the 2026-08-05 hang hunt (RIP fixed at
 /// `_mm_pause+2` inside `SpinMutex::lock` inlined into `RamDirNode::mkdir`
 /// — a real spin on a lock nobody would ever release, not slowness). The
@@ -145,7 +145,7 @@ pub static SCHEDULER_LOCK: LockDiag = LockDiag::new();
 /// idle is the signature of exactly the abandonment above.
 ///
 /// NOTE: unlike `LockDiag`, `outstanding` isn't strictly a 0-or-1 leak
-/// signal — every `RamDirNode` (one per ramfs directory) owns its own
+/// signal — every `vfs::ramfs::RamDirNode` (one per ramfs directory) owns its own
 /// `Mutex`, and they all report into this one shared counter, so
 /// well-formed nesting (e.g. `rmdir` calling `readdir` on a *child* node
 /// while still holding the parent's lock) can transiently show
@@ -233,8 +233,9 @@ impl DirLockDiag {
     }
 }
 
-/// See `DirLockDiag`'s doc comment. `fs::ramfs::RamDirNode::lock_entries`
-/// is the only thing that acquires it.
+/// See `DirLockDiag`'s doc comment. `vfs::ramfs::RamDirNode::lock_entries`
+/// (via the `KernelDirLockObserver` seam in `kernel/src/fs/ramfs.rs`) is
+/// the only thing that acquires it.
 pub static RAMFS_ENTRIES_LOCK: DirLockDiag = DirLockDiag::new();
 
 /// Detects a resumed/saved `TrapFrame` sequence going backward, or a

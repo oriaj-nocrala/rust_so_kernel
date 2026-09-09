@@ -16,10 +16,14 @@
 //! concrete filesystem implements), [`dirent`] (the shared
 //! `getdents64_via_readdir`/`getdents64_from_snapshot` packing helpers),
 //! [`path`] (`normalize_path`, the `..`/`.`-collapsing helper; and
-//! `split_parent`, crate-private) and [`mount`] (`MountTable` — longest-
+//! `split_parent`, crate-private), [`mount`] (`MountTable` — longest-
 //! prefix-match path resolution, symlink following with an `ELOOP` guard,
-//! and the mutating VFS ops). `ramfs` moves here in the last step — see
-//! `docs/fs/vfs-extraction-plan.md` for the full six-step migration.
+//! and the mutating VFS ops) and [`ramfs`] (`RamFs` — the one writable
+//! in-memory filesystem, `/tmp`'s implementation, behind a
+//! `DirLockObserver` seam so its directory-lock diagnostic can be injected
+//! by the kernel without this crate calling into the scheduler or
+//! `kernel::debug` directly). See `docs/fs/vfs-extraction-plan.md` for the
+//! full six-step migration this crate came out of.
 #![no_std]
 
 extern crate alloc;
@@ -29,4 +33,5 @@ pub mod file;
 pub mod inode;
 pub mod mount;
 pub mod path;
+pub mod ramfs;
 pub mod types;

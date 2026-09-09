@@ -25,7 +25,7 @@
 // could only ever be a synthetic, computed-on-the-fly stand-in for a real
 // one. Real symlinks belong on a writable mount: `init::processes`'s PID 1
 // runs actual `busybox --install -s /tmp/bin` at boot (real `symlink(2)`,
-// see `ramfs::RamDirNode::symlink`), the same mechanism a real Linux install
+// see `vfs::ramfs::RamDirNode::symlink`), the same mechanism a real Linux install
 // uses (one multi-call binary + real symlinks + argv[0] dispatch) — nothing
 // synthetic, no kernel-side awareness of the applet list required.
 //
