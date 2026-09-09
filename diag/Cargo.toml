@@ -13,6 +13,11 @@ edition = "2021"
 [workspace]
 
 [dependencies]
-# No external dependencies — every diagnostic here is built entirely out of
-# `core::sync::atomic` + `alloc::format`/`String`, same as the pre-extraction
-# code in `kernel/src/debug.rs`.
+# The four diagnostic counters need nothing but `core::sync::atomic` +
+# `alloc::format`/`String`, same as the pre-extraction code in
+# `kernel/src/debug.rs`. `spin` is here only for `tracked::TrackedMutex`,
+# which wraps a real `spin::Mutex` so the acquire/release *ordering* around
+# it can be enforced in one place instead of re-derived at every call site.
+# Same version the rest of this repo already resolves to (`hal`, `vfs`), so
+# there is only ever one `spin` in the dependency graph.
+spin = "0.10.0"

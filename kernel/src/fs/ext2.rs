@@ -69,6 +69,21 @@
 // mutating method above *while already holding the lock*, and
 // `spin::Mutex` isn't reentrant — locking there would deadlock.
 //
+// That last sentence is not just a convention maintained by hand: it is
+// actually guarded, though only implicitly and only under QEMU. This
+// crate's half of ext2 (the `ext2` crate) contains no locks at all — every
+// `EXT2_LOCK` acquisition is in this adapter — so no host test can reach
+// the invariant. What does reach it is
+// `kernel::hw_tests::ext2_memdisk_roundtrip`, which drives
+// create/mkdir/rename/symlink/unlink/rmdir through the real VFS; `rename`
+// goes through `take_child`, which locks and *then* calls `self.lookup`.
+// Verified by sabotage, not by reading: adding `let _g = EXT2_LOCK.lock();`
+// to `Ext2Inode::lookup` makes that test hang mid-run — it prints its name
+// and never reports `[ok]`, and the third test never starts — instead of
+// failing. So the failure mode here is a HANG, not a red test; if
+// `run-kernel-tests.sh` ever stops with `ext2_memdisk_roundtrip` as the
+// last line printed, suspect a lock added to a read-only ext2 path first.
+//
 // `read_block`/`write_block` reject any block number `>= blocks_count`
 // before ever issuing the ATA command — this is the single choke point
 // every on-disk pointer (BGD block/inode-table pointers, direct/indirect

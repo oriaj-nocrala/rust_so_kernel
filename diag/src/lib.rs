@@ -82,8 +82,10 @@ pub mod dirlock;
 pub mod ifviolation;
 pub mod lock;
 pub mod tfrewind;
+pub mod tracked;
 
 pub use dirlock::DirLockDiag;
 pub use ifviolation::IfViolationDiag;
 pub use lock::LockDiag;
+pub use tracked::{LockObserver, TrackedGuard, TrackedMutex};
 pub use tfrewind::{RewindEvent, TfRewindDiag};
