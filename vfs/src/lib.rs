@@ -113,6 +113,13 @@
 
 extern crate alloc;
 
+// Los tests de host de este crate necesitan hilos reales (`std::thread`) para
+// hacer observable la contención sobre un lock — sin un segundo hilo
+// compitiendo de verdad, el orden entre `record_acquire` y la adquisición
+// real del `spin::Mutex` no es observable desde el observador. El harness de
+// `cargo test` enlaza std en el host aunque el crate sea `#![no_std]`.
+#[cfg(test)] extern crate std;
+
 pub mod dirent;
 pub mod file;
 pub mod inode;

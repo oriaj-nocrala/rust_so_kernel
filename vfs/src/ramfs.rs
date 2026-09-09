@@ -1033,7 +1033,11 @@ mod tests {
         // precisely the failure mode that hunt was about. Closing it for
         // real needs a second thread genuinely contending for `entries` so
         // the observer's acquire-vs-lock ordering becomes actually
-        // observable — not attempted here, left as future work.
+        // observable — see
+        // `record_acquire_never_fires_while_another_thread_holds_the_same_entries_lock`
+        // immediately below, which is the test that actually closes this
+        // gap using two real host threads and a `Barrier` to force genuine
+        // contention on the same `RamDirNode`'s `entries` lock.
         let observer: &'static RecordingObserver =
             Box::leak(Box::new(RecordingObserver { calls: Mutex::new(Vec::new()) }));
         let dir = RamDirNode::new(alloc_ino(), observer);
@@ -1045,6 +1049,147 @@ mod tests {
             &calls[..],
             &[Call::CurrentPid, Call::Acquire("mkdir"), Call::Release],
             "lock_entries must call current_pid, then record_acquire, then record_release, in that order"
+        );
+    }
+
+    /// Observer used only by the contention test below. Pure atomics — no
+    /// `Mutex` of its own, so this instrument doesn't introduce a second
+    /// lock that could itself skew the timing it's trying to measure.
+    struct ContendingObserver {
+        /// Threads currently between `record_acquire` and `record_release`.
+        inside: core::sync::atomic::AtomicUsize,
+        /// Set once, if ever, `inside` is observed to exceed 1 — i.e. two
+        /// threads both believe they hold the (single, non-reentrant)
+        /// `entries` lock at the same time.
+        overlap_seen: core::sync::atomic::AtomicBool,
+        /// Only the first thread to reach `record_acquire` does the bounded
+        /// wait below; the second just proceeds.
+        first: core::sync::atomic::AtomicBool,
+        /// Rendezvous point *before* either thread calls `entries.lock()`
+        /// (see `current_pid`'s doc comment) — this is the real
+        /// synchronization mechanism, not the bounded wait in
+        /// `record_acquire`.
+        gate: std::sync::Barrier,
+    }
+
+    impl DirLockObserver for ContendingObserver {
+        fn current_pid(&self) -> u64 {
+            // `current_pid()` is always called before `entries.lock()` in
+            // `lock_entries` (both the real, correct version and the
+            // saboteur below preserve that much). Blocking here on a
+            // 2-count barrier guarantees both threads are released
+            // together, right before they actually race for the real
+            // `spin::Mutex` — genuine contention, not a hope-it-happens
+            // race. This is synchronization, not the observation budget
+            // below.
+            self.gate.wait();
+            7
+        }
+
+        fn record_acquire(&self, _pid: u64, _op: &'static str) {
+            use core::sync::atomic::Ordering::SeqCst;
+            let n = self.inside.fetch_add(1, SeqCst) + 1;
+            if n > 1 {
+                self.overlap_seen.store(true, SeqCst);
+            }
+            if self.first.swap(false, SeqCst) {
+                // Only the first thread to arrive here waits, and only to
+                // give the *correct* implementation's real mutual
+                // exclusion a chance to be violated observably by the
+                // saboteur. This bound is not flaky: in the sabotaged
+                // implementation, the other thread only has to travel from
+                // the barrier (which both threads just left together) to
+                // its own `record_acquire` call — a handful of atomic ops,
+                // nanoseconds. 500ms is roughly six orders of magnitude
+                // more than that needs, and the wait exits immediately
+                // (via `yield_now`, not a sleep) the moment overlap is
+                // actually observed, so the common (correct) case pays
+                // ~nothing. The barrier above is what makes the race
+                // deterministic; this wait is purely an observation
+                // window, not the synchronization.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+                while std::time::Instant::now() < deadline {
+                    if self.inside.load(SeqCst) > 1 {
+                        self.overlap_seen.store(true, SeqCst);
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        }
+
+        fn record_release(&self) {
+            self.inside.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn record_acquire_never_fires_while_another_thread_holds_the_same_entries_lock() {
+        // Family B: a contention probe using real host threads. This
+        // models host-level contention (two `std::thread`s racing a
+        // `spin::Mutex` on the host scheduler), not the kernel's own
+        // single-core execution model — the kernel never actually runs two
+        // CPUs through `lock_entries` on the same `RamDirNode`
+        // concurrently the way this test forces. What it fixes that
+        // `lock_entries_calls_observer_in_the_exact_required_order` does
+        // not: that half of `lock_entries`'s invariant is entirely about
+        // *timing relative to a real lock acquisition under contention* —
+        // a property that is, by construction, unobservable from a single
+        // thread with no contender. This test manufactures a real
+        // contender (via the `Barrier` in `current_pid`, not a sleep) so
+        // that "record_acquire fired while another thread was already
+        // inside" becomes something that can actually be measured, not
+        // just asserted in prose.
+        use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+
+        let observer: &'static ContendingObserver = Box::leak(Box::new(ContendingObserver {
+            inside: AtomicUsize::new(0),
+            overlap_seen: AtomicBool::new(false),
+            first: AtomicBool::new(true),
+            gate: std::sync::Barrier::new(2),
+        }));
+        let dir: &'static RamDirNode = Box::leak(Box::new(RamDirNode::new(alloc_ino(), observer)));
+
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+
+        let tx_a = tx.clone();
+        std::thread::spawn(move || {
+            let ok = dir.mkdir("a").is_ok();
+            tx_a.send(ok).expect("send from thread a");
+        });
+        let tx_b = tx.clone();
+        std::thread::spawn(move || {
+            let ok = dir.mkdir("b").is_ok();
+            tx_b.send(ok).expect("send from thread b");
+        });
+        drop(tx);
+
+        // Watchdog: never `join()` bare here. If `lock_entries` deadlocks
+        // (e.g. a saboteur that also breaks real mutual exclusion in a way
+        // that wedges the mutex), a bare `join()` would hang this test
+        // forever instead of failing it.
+        let ok_a = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_else(|_| {
+            panic!("watchdog: un hilo no terminó en 10s — lock_entries probablemente se autobloqueó")
+        });
+        let ok_b = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_else(|_| {
+            panic!("watchdog: un hilo no terminó en 10s — lock_entries probablemente se autobloqueó")
+        });
+
+        assert!(ok_a, "thread a's mkdir(\"a\") must succeed");
+        assert!(ok_b, "thread b's mkdir(\"b\") must succeed");
+        assert_eq!(
+            observer.inside.load(SeqCst),
+            0,
+            "both critical sections must have released by the time both threads reported back"
+        );
+        assert!(
+            !observer.overlap_seen.load(SeqCst),
+            "two threads recorded an acquire simultaneously on the SAME RamDirNode's entries lock — \
+             impossible if record_acquire is only ever called after the caller actually holds the \
+             mutex, since spin::Mutex guarantees mutual exclusion. This means the instrument itself \
+             (or lock_entries) named a still-spinning thread as the lock holder — exactly the \
+             misattribution failure mode described in lock_entries's own doc comment and in \
+             docs/hang-hunt-bug2-findings.md."
         );
     }
 
