@@ -22,6 +22,7 @@ x86_64 = "0.15.4"
 hal = { path = "../hal" }
 ext2 = { path = "../ext2" }
 mm = { path = "../mm" }
+vfs = { path = "../vfs" }
 
 # Para manejo de interrupciones y excepciones
 spin = "0.10.0"

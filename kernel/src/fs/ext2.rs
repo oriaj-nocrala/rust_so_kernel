@@ -149,9 +149,19 @@ use crate::process::file::{FileError, FileHandle, FileResult};
 use ext2::RawInode;
 use ext2::ROOT_INO;
 
-impl From<ext2::Ext2Error> for Errno {
-    fn from(e: ext2::Ext2Error) -> Self {
-        match e {
+/// Local wrapper that exists purely to keep the `Ext2Error` → `Errno`
+/// conversion legal: since the `vfs` crate extraction, `Errno` lives in
+/// `vfs::types` and `Ext2Error` lives in the `ext2` crate, so a direct
+/// `impl From<ext2::Ext2Error> for Errno` here would violate the orphan
+/// rule (E0117) — neither type is local to this crate. Wrapping the
+/// foreign error in a local type restores the "at least one local type"
+/// requirement, and `.map_err(ExtErr)?` at call sites keeps `?` working
+/// exactly as before.
+struct ExtErr(ext2::Ext2Error);
+
+impl From<ExtErr> for Errno {
+    fn from(e: ExtErr) -> Self {
+        match e.0 {
             // Only ever occur inside `Ext2Core::mount()`, which this
             // adapter's own `Ext2Fs::mount()` maps to a `&'static str`
             // directly (see below) rather than through this impl — EIO is
@@ -299,7 +309,7 @@ impl Ext2Fs {
     /// corrupted BGD/inode pointer can't turn into a wild write at an
     /// arbitrary LBA (see the module-level ROBUSTNESS comment).
     fn write_block(&self, block_num: u32, buf: &[u8]) -> Result<(), Errno> {
-        self.core.write_block(block_num, buf).map_err(Into::into)
+        self.core.write_block(block_num, buf).map_err(|e| Errno::from(ExtErr(e)))
     }
 
     // ── Inode table / file byte-range I/O ─────────────────────────────────
@@ -311,19 +321,19 @@ impl Ext2Fs {
     /// against the superblock's own counts as a corruption tripwire, not
     /// because callers are expected to pass arbitrary numbers.
     fn read_inode(&self, ino: u32) -> Result<RawInode, Errno> {
-        self.core.read_inode(ino).map_err(Into::into)
+        self.core.read_inode(ino).map_err(|e| Errno::from(ExtErr(e)))
     }
 
     /// Write `raw` back to `ino`'s on-disk inode record. Read-modify-write:
     /// the inode table block holds several inodes, so the rest of the
     /// block must survive untouched.
     fn write_inode(&self, ino: u32, raw: &RawInode) -> Result<(), Errno> {
-        self.core.write_inode(ino, raw).map_err(Into::into)
+        self.core.write_inode(ino, raw).map_err(|e| Errno::from(ExtErr(e)))
     }
 
     /// Read `buf.len()` bytes of file data starting at byte `offset`.
     fn read_file_range(&self, raw: &RawInode, offset: usize, buf: &mut [u8]) -> Result<(), Errno> {
-        self.core.read_file_range(raw, offset, buf).map_err(Into::into)
+        self.core.read_file_range(raw, offset, buf).map_err(|e| Errno::from(ExtErr(e)))
     }
 
     /// Write `data` at byte `offset`, allocating whatever blocks are
@@ -333,7 +343,7 @@ impl Ext2Fs {
     /// already zero-fill). Updates and persists `raw`'s size + on-disk
     /// inode record before returning.
     fn write_file_range(&self, ino: u32, raw: &mut RawInode, offset: usize, data: &[u8]) -> Result<usize, Errno> {
-        self.core.write_file_range(ino, raw, offset, data).map_err(Into::into)
+        self.core.write_file_range(ino, raw, offset, data).map_err(|e| Errno::from(ExtErr(e)))
     }
 
     /// Free every block this inode owns (direct, singly-, doubly-, and
@@ -357,9 +367,10 @@ impl Ext2Fs {
             // `mark_reachable` below are its only two call sites, and each
             // needs a differently-typed closure — `self.core.free_block`
             // here, an in-memory bitmap mark there — so a wrapper would
-            // just relay the same `Ext2Error`/`Errno` split `?` already
-            // handles for free via the `From` impl above.
-            self.core.visit_inode_blocks(raw, |b| self.core.free_block(b))?;
+            // just relay the same `Ext2Error`/`Errno` split `.map_err(ExtErr)?`
+            // already handles via the `From<ExtErr>` impl above (see that
+            // impl's doc comment for why it's not a direct `From<Ext2Error>`).
+            self.core.visit_inode_blocks(raw, |b| self.core.free_block(b)).map_err(ExtErr)?;
             for i in 0..15 {
                 raw.set_i_block(i, 0);
             }
@@ -378,7 +389,7 @@ impl Ext2Fs {
 
     /// Read a symlink inode's target string.
     fn read_symlink_target(&self, raw: &RawInode) -> Result<String, Errno> {
-        self.core.read_symlink_target(raw).map_err(Into::into)
+        self.core.read_symlink_target(raw).map_err(|e| Errno::from(ExtErr(e)))
     }
 
     // ── Directory entries ────────────────────────────────────────────────
@@ -386,7 +397,7 @@ impl Ext2Fs {
     /// Parse every directory entry out of `raw`'s data blocks (direct +
     /// indirect, same limit as file reads).
     fn read_dir_entries(&self, raw: &RawInode) -> Result<Vec<Ext2DirEntry>, Errno> {
-        Ok(self.core.read_dir_entries(raw)?
+        Ok(self.core.read_dir_entries(raw).map_err(ExtErr)?
             .into_iter()
             .map(|e| Ext2DirEntry { ino: e.ino, kind: ext2_file_type_to_vfs(e.file_type), name: e.name })
             .collect())
@@ -394,20 +405,20 @@ impl Ext2Fs {
 
     /// Insert a new `(name -> ino)` directory entry into `dir_raw`'s data.
     fn add_dir_entry(&self, dir_ino: u32, dir_raw: &mut RawInode, name: &str, ino: u32, kind: FileType) -> Result<(), Errno> {
-        self.core.add_dir_entry(dir_ino, dir_raw, name, ino, vfs_file_type_to_ext2(kind)).map_err(Into::into)
+        self.core.add_dir_entry(dir_ino, dir_raw, name, ino, vfs_file_type_to_ext2(kind)).map_err(|e| Errno::from(ExtErr(e)))
     }
 
     /// Remove the directory entry named `name` from `dir_raw`'s data.
     /// Returns the removed entry's inode number and kind.
     fn remove_dir_entry(&self, dir_raw: &RawInode, name: &str) -> Result<(u32, FileType), Errno> {
-        let (ino, file_type) = self.core.remove_dir_entry(dir_raw, name)?;
+        let (ino, file_type) = self.core.remove_dir_entry(dir_raw, name).map_err(ExtErr)?;
         Ok((ino, ext2_file_type_to_vfs(file_type)))
     }
 
     /// Rewrite a directory's `".."` entry to point at `new_parent_ino` —
     /// used when moving (rename) a subdirectory to a different parent.
     fn set_dotdot(&self, dir_raw: &RawInode, new_parent_ino: u32) -> Result<(), Errno> {
-        self.core.set_dotdot(dir_raw, new_parent_ino).map_err(Into::into)
+        self.core.set_dotdot(dir_raw, new_parent_ino).map_err(|e| Errno::from(ExtErr(e)))
     }
 
     // ── Mount-time consistency repair ───────────────────────────────────
@@ -433,7 +444,7 @@ impl Ext2Fs {
     /// (`kdebug fs on`) whether anything drifted and the final corrected
     /// totals — see `ext2::repair::ReconcileReport`'s own doc comment.
     fn reconcile_free_counts(&self) -> Result<(), Errno> {
-        let report = self.core.reconcile_free_counts()?;
+        let report = self.core.reconcile_free_counts().map_err(ExtErr)?;
         if report.bgd_drift || report.sb_drift {
             crate::ktrace!(
                 crate::debug::FS,
@@ -454,7 +465,7 @@ impl Ext2Fs {
     /// can't call into the kernel for one.
     fn reclaim_orphans(&self) -> Result<(), Errno> {
         let (freed_blocks, freed_inodes) =
-            self.core.reclaim_orphans(crate::time::now_unix_secs() as u32)?;
+            self.core.reclaim_orphans(crate::time::now_unix_secs() as u32).map_err(ExtErr)?;
         if freed_blocks > 0 || freed_inodes > 0 {
             crate::ktrace!(
                 crate::debug::FS,
@@ -640,7 +651,7 @@ impl Inode for Ext2Inode {
         }
 
         let f = fs();
-        let new_ino = f.core.alloc_inode(false)?.ok_or(Errno::ENOSPC)?;
+        let new_ino = f.core.alloc_inode(false).map_err(ExtErr)?.ok_or(Errno::ENOSPC)?;
         let mut new_raw = RawInode::zeroed(f.core.sb.inode_size as usize);
         new_raw.set_i_mode(0x8000 | 0o644);
         new_raw.set_links_count(1);
@@ -664,8 +675,8 @@ impl Inode for Ext2Inode {
         }
 
         let f = fs();
-        let new_ino = f.core.alloc_inode(true)?.ok_or(Errno::ENOSPC)?;
-        let new_block = match f.core.alloc_block()? {
+        let new_ino = f.core.alloc_inode(true).map_err(ExtErr)?.ok_or(Errno::ENOSPC)?;
+        let new_block = match f.core.alloc_block().map_err(ExtErr)? {
             Some(b) => b,
             None => { let _ = f.core.free_inode(new_ino, true); return Err(Errno::ENOSPC); }
         };
@@ -729,7 +740,7 @@ impl Inode for Ext2Inode {
             // dangling pointers into blocks a later allocation could
             // legitimately reuse for something else.
             f.write_inode(child_ino, &child_raw)?;
-            f.core.free_inode(child_ino, false)?;
+            f.core.free_inode(child_ino, false).map_err(ExtErr)?;
         } else {
             f.write_inode(child_ino, &child_raw)?;
         }
@@ -761,7 +772,7 @@ impl Inode for Ext2Inode {
         // Same "persist the zeroed record before freeing the bitmap bit"
         // fix as `unlink` above.
         f.write_inode(child_ino, &child_raw)?;
-        f.core.free_inode(child_ino, true)?;
+        f.core.free_inode(child_ino, true).map_err(ExtErr)?;
 
         // This directory loses the link the removed child's ".." held.
         let mut parent_raw = self.raw.clone();
@@ -834,7 +845,7 @@ impl Inode for Ext2Inode {
         }
 
         let f = fs();
-        let new_ino = f.core.alloc_inode(false)?.ok_or(Errno::ENOSPC)?;
+        let new_ino = f.core.alloc_inode(false).map_err(ExtErr)?.ok_or(Errno::ENOSPC)?;
         let mut new_raw = RawInode::zeroed(f.core.sb.inode_size as usize);
         new_raw.set_i_mode(0xA000 | 0o777);
         new_raw.set_links_count(1);
@@ -858,7 +869,7 @@ impl Inode for Ext2Inode {
         if let Err(e) = f.core.write_symlink_target(&mut new_raw, new_ino, target) {
             let _ = f.free_all_blocks(&mut new_raw);
             let _ = f.core.free_inode(new_ino, false);
-            return Err(e.into());
+            return Err(Errno::from(ExtErr(e)));
         }
 
         let mut dir_raw = self.raw.clone();

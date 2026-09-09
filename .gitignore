@@ -8,6 +8,7 @@
 /hal/target/
 /ext2/target/
 /mm/target/
+/vfs/target/
 /qemu-test-runner/target/
 
 # Claude Code local state. `.claude/skills/` IS tracked (project tooling,
