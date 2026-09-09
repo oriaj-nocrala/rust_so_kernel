@@ -1001,13 +1001,39 @@ mod tests {
 
     #[test]
     fn lock_entries_calls_observer_in_the_exact_required_order() {
-        // Fixes the invariant `RamDirNode::lock_entries`'s doc comment
-        // describes: current_pid() is read BEFORE the lock is taken,
-        // record_acquire() fires AFTER the lock is actually held, and
-        // record_release() fires when the guard drops. If this ordering
-        // is ever changed (e.g. someone "simplifies" lock_entries and
-        // moves current_pid() after the lock, or drops record_acquire
-        // before actually holding the mutex), this test must fail.
+        // What this actually pins down: current_pid() is called before
+        // record_acquire(), record_acquire() receives the correct `op`,
+        // and record_release() fires exactly once, after both, from the
+        // guard's Drop. That's a real invariant and worth keeping.
+        //
+        // What it does NOT pin down, despite `lock_entries`'s doc comment
+        // describing it as a hard rule: that record_acquire() actually runs
+        // *after* the real `self.entries.lock()` call has returned the
+        // lock. Verified empirically — moving
+        // `self.observer.record_acquire(pid, op)` to *before*
+        // `let guard = self.entries.lock();` in `lock_entries` (i.e.
+        // deliberately violating that half of the invariant) still passes
+        // all 150 tests in this crate, this one included. The observer
+        // only ever sees the relative order of its own three calls, never
+        // their position relative to the real lock acquisition; without a
+        // second thread actually contending for `entries`, "recorded after
+        // the lock" and "recorded before the lock" produce byte-identical
+        // call sequences from a single thread's point of view. Today, that
+        // second half of the invariant is held up only by reading
+        // `lock_entries`'s source and its doc comment — not by this test,
+        // not by anything that runs.
+        //
+        // This gap matters enough to write down, not just leave silently
+        // true-in-practice: this repo already paid once for an instrument
+        // that claimed to guard more than it measured (see
+        // `docs/hang-hunt-bug2-findings.md`, and `lock_entries`'s own doc
+        // comment, which explains why recording the acquire too early
+        // would misattribute a still-spinning caller as the lock holder).
+        // A test that *looks* like it closes that exact gap but doesn't is
+        // precisely the failure mode that hunt was about. Closing it for
+        // real needs a second thread genuinely contending for `entries` so
+        // the observer's acquire-vs-lock ordering becomes actually
+        // observable — not attempted here, left as future work.
         let observer: &'static RecordingObserver =
             Box::leak(Box::new(RecordingObserver { calls: Mutex::new(Vec::new()) }));
         let dir = RamDirNode::new(alloc_ino(), observer);
