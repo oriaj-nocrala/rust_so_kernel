@@ -139,7 +139,7 @@ use crate::memory::vma::Vma;
 //      ever consumed it (saved twice with no RESUME in between).
 //   2. A RESUME that reads back a sequence number no greater than the last
 //      one this same process actually resumed (stale/rewound content).
-// Both call `debug::TF_REWIND.record(...)`, which prints immediately and
+// Both call `debug::tf_record(...)`, which prints immediately and
 // unconditionally (a real rewind should never happen, so the print-cost
 // concern that keeps `ktrace!` gated doesn't apply here) plus keeps the last
 // occurrence around for `/proc/kdebug` and the panic snapshot. This is the
@@ -151,7 +151,7 @@ use crate::memory::vma::Vma;
 /// ...) for the printed/rendered diagnostic.
 pub(crate) fn tf_note_save(proc: &mut Process, site: &'static str) {
     if proc.tf_awaiting_resume {
-        crate::debug::TF_REWIND.record(proc.pid.0 as u64, site, proc.tf_seq, proc.tf_seq + 1);
+        crate::debug::tf_record(proc.pid.0 as u64, site, proc.tf_seq, proc.tf_seq + 1);
     }
     proc.tf_seq = proc.tf_seq.wrapping_add(1);
     proc.tf_awaiting_resume = true;
@@ -163,7 +163,7 @@ pub(crate) fn tf_note_save(proc: &mut Process, site: &'static str) {
 pub(crate) fn tf_note_resume(proc: &mut Process, site: &'static str) {
     if let Some(prev) = proc.tf_last_resumed_seq {
         if proc.tf_seq <= prev {
-            crate::debug::TF_REWIND.record(proc.pid.0 as u64, site, prev, proc.tf_seq);
+            crate::debug::tf_record(proc.pid.0 as u64, site, prev, proc.tf_seq);
         }
     }
     proc.tf_last_resumed_seq = Some(proc.tf_seq);

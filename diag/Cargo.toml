@@ -1,0 +1,18 @@
+[package]
+name = "diag"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately detached from the parent workspace (empty `[workspace]` table
+# below), same shape as `hal/Cargo.toml`/`ext2/Cargo.toml`/`mm/Cargo.toml`/
+# `vfs/Cargo.toml` — see those files' comments for the full reasoning (short
+# version: the parent root Cargo.toml's `panic = "abort"` profile would break
+# this crate's own unwinding `cargo test` harness). Not listed in the root
+# Cargo.toml's `members` for the same reason; the root `Cargo.toml`'s
+# `exclude` comment has the full list.
+[workspace]
+
+[dependencies]
+# No external dependencies — every diagnostic here is built entirely out of
+# `core::sync::atomic` + `alloc::format`/`String`, same as the pre-extraction
+# code in `kernel/src/debug.rs`.
