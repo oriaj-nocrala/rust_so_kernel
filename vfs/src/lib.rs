@@ -13,11 +13,13 @@
 //! speaks in), [`file`] (`FileError`, `FileResult`, `compute_seek`, and
 //! the `FileHandle` trait — the coupling point between processes, drivers,
 //! and filesystems), [`inode`] (`Inode`, `Filesystem` — the traits every
-//! concrete filesystem implements) and [`dirent`] (the shared
-//! `getdents64_via_readdir`/`getdents64_from_snapshot` packing helpers).
-//! The remaining pieces (path resolution, the mount table, `ramfs`) move
-//! here in later steps — see `docs/fs/vfs-extraction-plan.md` for the full
-//! six-step migration.
+//! concrete filesystem implements), [`dirent`] (the shared
+//! `getdents64_via_readdir`/`getdents64_from_snapshot` packing helpers),
+//! [`path`] (`normalize_path`, the `..`/`.`-collapsing helper; and
+//! `split_parent`, crate-private) and [`mount`] (`MountTable` — longest-
+//! prefix-match path resolution, symlink following with an `ELOOP` guard,
+//! and the mutating VFS ops). `ramfs` moves here in the last step — see
+//! `docs/fs/vfs-extraction-plan.md` for the full six-step migration.
 #![no_std]
 
 extern crate alloc;
@@ -25,4 +27,6 @@ extern crate alloc;
 pub mod dirent;
 pub mod file;
 pub mod inode;
+pub mod mount;
+pub mod path;
 pub mod types;

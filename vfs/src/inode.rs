@@ -6,8 +6,8 @@
 //                Filesystems implement this trait to expose their nodes.
 //   Filesystem — a mounted filesystem instance with a root Inode.
 //
-// The mount table (longest-prefix matching, path resolution, mutations) is
-// NOT here yet — it stays in `kernel/src/fs/vfs.rs` until step 4 of
+// The mount table (longest-prefix matching, path resolution, mutations)
+// lives in `crate::mount` (`MountTable`) — see
 // `docs/fs/vfs-extraction-plan.md`.
 
 use alloc::{boxed::Box, string::String, sync::Arc};
