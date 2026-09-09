@@ -653,13 +653,40 @@ mod tests {
     // directory that was), so pointing the oracle at that shape would be
     // asserting a property `reclaim_orphans` never claimed.
 
+    /// Unique discriminant *per call*, on top of the process id, for the
+    /// fixture-helper temp-file paths below. The PID alone doesn't
+    /// discriminate anything here: `cargo test` runs every test in a
+    /// thread of the *same* process, so two different tests calling
+    /// `build_real_ext2_fixture`/`e2fsck_says_clean` with identical
+    /// arguments used to resolve to the identical path and step on each
+    /// other's fixture mid-flight (one truncates the image the other is
+    /// reading, or deletes it before the other's external `e2fsck`/
+    /// `debugfs` process opens it) — see `docs/fs/ext2-test-flake.md`.
+    /// The PID itself is kept alongside this counter so two independent
+    /// `cargo test` *processes* running concurrently still don't collide.
+    static FIXTURE_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    /// Next unique id, one per call — never cache the result across calls.
+    fn next_fixture_id() -> u64 {
+        FIXTURE_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Build one temp-file path under `$TMPDIR`, discriminated by the
+    /// current process id *and* a fresh per-call sequence number (see
+    /// [`next_fixture_id`]) so no two calls — even with identical `kind`/
+    /// `suffix` — ever collide, in-process or cross-process.
+    fn fixture_path(kind: &str, suffix: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("ext2_{kind}_{}_{}{suffix}", std::process::id(), next_fixture_id()));
+        path
+    }
+
     /// Build a real, `mke2fs`-created minimal ext2 image (`total_blocks`
     /// 1024-byte blocks, default `mke2fs` geometry otherwise) and return
     /// its raw bytes. `None` if `mke2fs` isn't runnable on this host — the
     /// caller must skip gracefully, not fail, in that case.
     fn build_real_ext2_fixture(total_blocks: u32) -> Option<Vec<u8>> {
-        let mut path = std::env::temp_dir();
-        path.push(format!("ext2_repair_fixture_{}_{}.img", std::process::id(), total_blocks));
+        let path = fixture_path("repair_fixture", &format!("_{total_blocks}.img"));
         let size_bytes = total_blocks as u64 * 1024;
         {
             let f = std::fs::File::create(&path).ok()?;
@@ -695,11 +722,15 @@ mod tests {
     /// fixture before any repair runs.
     fn inject_orphan_file_with_debugfs(bytes: &[u8]) -> Option<Vec<u8>> {
         use std::io::Write;
+        // One shared id for this whole triple, so the three paths stay
+        // visibly related on disk, but still unique per *call* of this
+        // function (not just per process) — see `fixture_path`.
+        let id = next_fixture_id();
         let pid = std::process::id();
         let dir = std::env::temp_dir();
-        let img = dir.join(format!("ext2_orphan_fixture_{pid}.img"));
-        let payload = dir.join(format!("ext2_orphan_payload_{pid}.bin"));
-        let script = dir.join(format!("ext2_orphan_script_{pid}.txt"));
+        let img = dir.join(format!("ext2_orphan_fixture_{pid}_{id}.img"));
+        let payload = dir.join(format!("ext2_orphan_payload_{pid}_{id}.bin"));
+        let script = dir.join(format!("ext2_orphan_script_{pid}_{id}.txt"));
 
         let build = || -> Option<()> {
             std::fs::File::create(&img).ok()?.write_all(bytes).ok()?;
@@ -755,8 +786,7 @@ mod tests {
     /// not fail, on `None`.
     fn e2fsck_says_clean(bytes: &[u8]) -> Option<(bool, String, String)> {
         use std::io::Write;
-        let mut path = std::env::temp_dir();
-        path.push(format!("ext2_repair_check_{}.img", std::process::id()));
+        let path = fixture_path("repair_check", ".img");
         {
             let mut f = std::fs::File::create(&path).ok()?;
             f.write_all(bytes).ok()?;
@@ -857,5 +887,32 @@ mod tests {
             ),
             None => eprintln!("skipping e2fsck orphan oracle assertion: e2fsck not runnable on this host"),
         }
+    }
+
+    /// Regression test for `docs/fs/ext2-test-flake.md`: two calls to
+    /// [`fixture_path`] with *identical* `kind`/`suffix` arguments must
+    /// still produce different paths. Without this uniqueness, two tests
+    /// racing on the same temp path can have `e2fsck_says_clean` dictate a
+    /// verdict on the *other* test's image — one truncates the file the
+    /// other is mid-read on, or deletes it before the other's external
+    /// `e2fsck`/`debugfs` process ever opens it — which is exactly how the
+    /// e2fsck oracle these fixtures back can return a false "clean" and
+    /// pass without having checked anything at all.
+    ///
+    /// Deliberately does not shell out to `mke2fs`/`e2fsck`/`debugfs` — it
+    /// only exercises the path-construction helper, so it always runs
+    /// (never skips) regardless of what's on this host's `$PATH`.
+    #[test]
+    fn fixture_paths_are_unique_per_call_not_just_per_process() {
+        let a = fixture_path("regression_probe", ".img");
+        let b = fixture_path("regression_probe", ".img");
+        assert_ne!(
+            a, b,
+            "two calls to fixture_path with identical arguments produced the same path \
+             ({a:?}) — this is exactly the collision docs/fs/ext2-test-flake.md diagnoses: \
+             relying on the process id alone doesn't discriminate between two tests running \
+             as threads of the same `cargo test` process, so they'd step on each other's \
+             fixture file and the e2fsck oracle could silently verdict on the wrong image"
+        );
     }
 }
