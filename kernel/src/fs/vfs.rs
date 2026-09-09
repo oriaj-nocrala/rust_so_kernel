@@ -2,14 +2,6 @@
 //
 // Virtual File System core.
 //
-// ABSTRACTIONS
-// ────────────
-//   Inode      — a file or directory in a filesystem (reference-counted).
-//                Filesystems implement this trait to expose their nodes.
-//   Filesystem — a mounted filesystem instance with a root Inode.
-//   MountTable — ordered list of (prefix, Filesystem) pairs; resolved by
-//                longest-prefix match.
-//
 // PATH RESOLUTION
 // ───────────────
 //   resolve("/dev/console")
@@ -21,176 +13,26 @@
 // ────
 //   open(path, flags) = resolve(path)?.open(flags)
 //   Returns a Box<dyn FileHandle> ready for read/write in the FD table.
+//
+// MountTable — ordered list of (prefix, Filesystem) pairs; resolved by
+// longest-prefix match. See below for `Inode`/`Filesystem`, which no
+// longer live in this file.
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use spin::{Mutex, Once};
 
-use crate::fs::types::{DirEntry, Errno, FileType, OpenFlags, Stat};
+use crate::fs::types::{Errno, FileType, OpenFlags, Stat};
 use crate::process::file::FileHandle;
 
-// ── Inode ────────────────────────────────────────────────────────────────────
-
-/// A VFS inode — the identity and metadata of a file or directory.
-///
-/// Inodes are reference-counted so they can be shared (e.g. two open FDs on
-/// the same file share the inode but each has its own `FileHandle` cursor).
-///
-/// Default implementations for `lookup` and `readdir` return `ENOTDIR`; only
-/// directory inodes need to override them.
-pub trait Inode: Send + Sync {
-    /// Inode metadata (type, size, permissions, …).
-    fn stat(&self) -> Stat;
-
-    /// Open this inode, producing an independent `FileHandle` with its own
-    /// cursor.  Called by `vfs::open` and `sys_open`.
-    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno>;
-
-    /// Look up a child by name.  Valid only on directory inodes.
-    fn lookup(&self, _name: &str) -> Result<Arc<dyn Inode>, Errno> {
-        Err(Errno::ENOTDIR)
-    }
-
-    /// Iterate directory entries.
-    ///
-    /// `offset` is an opaque, monotonically-increasing index (starts at 0).
-    /// Returns `Ok(None)` when the directory is exhausted.
-    /// Returns `Err(ENOTDIR)` for non-directory inodes.
-    fn readdir(&self, _offset: u64) -> Result<Option<DirEntry>, Errno> {
-        Err(Errno::ENOTDIR)
-    }
-
-    /// Create a new child `name` under this (directory) inode and return it.
-    ///
-    /// Called by `vfs::open` when `O_CREAT` is set and the target path
-    /// doesn't exist yet. Read-only filesystems (initramfs, devfs) keep the
-    /// default, which rejects with `EROFS`; writable ones (ramfs) override
-    /// it.
-    fn create(&self, _name: &str) -> Result<Arc<dyn Inode>, Errno> {
-        Err(Errno::EROFS)
-    }
-
-    /// This inode's type, derived from `stat().st_mode`'s type bits.
-    ///
-    /// Lets directory implementations that store heterogeneous children as
-    /// `Arc<dyn Inode>` (files and subdirectories side by side, e.g. ramfs)
-    /// tell them apart without needing a parallel enum or downcasting.
-    fn file_type(&self) -> FileType {
-        match self.stat().st_mode & 0o170000 {
-            0o040000 => FileType::Directory,
-            0o020000 => FileType::CharDevice,
-            0o060000 => FileType::BlockDevice,
-            0o120000 => FileType::Symlink,
-            _        => FileType::Regular,
-        }
-    }
-
-    /// Create a new subdirectory `name` under this (directory) inode.
-    ///
-    /// Same read-only-by-default convention as `create()`.
-    fn mkdir(&self, _name: &str) -> Result<Arc<dyn Inode>, Errno> {
-        Err(Errno::EROFS)
-    }
-
-    /// Remove a non-directory child `name`. Must fail with `EISDIR` if
-    /// `name` refers to a directory (use `rmdir` for those instead).
-    fn unlink(&self, _name: &str) -> Result<(), Errno> {
-        Err(Errno::EROFS)
-    }
-
-    /// Remove an empty directory child `name`. Must fail with `ENOTDIR` if
-    /// `name` isn't a directory, or `ENOTEMPTY` if it has entries.
-    fn rmdir(&self, _name: &str) -> Result<(), Errno> {
-        Err(Errno::EROFS)
-    }
-
-    /// Detach and return child `name` (file or directory, empty or not) —
-    /// the "remove" half of a rename. Unlike `unlink`/`rmdir`, this never
-    /// checks emptiness: POSIX `rename()` allows moving non-empty
-    /// directories, only `rmdir()` requires them empty.
-    fn take_child(&self, _name: &str) -> Result<Arc<dyn Inode>, Errno> {
-        Err(Errno::EROFS)
-    }
-
-    /// Insert an already-existing inode under a new name — the "attach"
-    /// half of a rename. Fails with `EEXIST` if `name` is already taken
-    /// (this VFS doesn't support rename-clobbering an existing target).
-    fn insert_child(&self, _name: &str, _node: Arc<dyn Inode>) -> Result<(), Errno> {
-        Err(Errno::EROFS)
-    }
-
-    /// Read this inode's symlink target — a path string, either absolute
-    /// or relative to the symlink's own containing directory. Only
-    /// meaningful on `Symlink`-type inodes (see `file_type`); the default
-    /// matches `readlink(2)` on a non-symlink.
-    fn readlink(&self) -> Result<alloc::string::String, Errno> {
-        Err(Errno::EINVAL)
-    }
-
-    /// Create a new symlink child `name` under this (directory) inode,
-    /// pointing at `target` (an arbitrary string — not resolved or checked
-    /// to exist, matching real `symlink(2)`: a dangling target is legal).
-    ///
-    /// Same read-only-by-default convention as `create()`/`mkdir()`.
-    fn symlink(&self, _name: &str, _target: &str) -> Result<Arc<dyn Inode>, Errno> {
-        Err(Errno::EROFS)
-    }
-
-    /// Change this inode's permission bits (the low 12 bits of `st_mode`
-    /// — `chmod(2)`'s `mode` argument). Default `Ok(())` matches the
-    /// pre-existing "validity-checked stub" behavior every filesystem had
-    /// before this method existed (`sys_chmod`/`sys_fchmod` used to just
-    /// confirm the path/fd resolved and otherwise no-op) — filesystems
-    /// with no real per-inode permission storage (ramfs, devfs,
-    /// initramfs, procfs) keep exactly that behavior by inheriting this
-    /// default. Only `ext2::Ext2Inode` overrides it: it has a real on-disk
-    /// `i_mode` field to persist the change into.
-    fn chmod(&self, _mode: u32) -> Result<(), Errno> {
-        Ok(())
-    }
-
-    /// Type-erased downcast handle. Lets a filesystem whose directory
-    /// entries can only reference its own inodes (ext2: a dirent is
-    /// literally an inode *number*, meaningless outside that filesystem)
-    /// verify, inside `insert_child`, that a node handed across the
-    /// generic `Arc<dyn Inode>` VFS boundary during `rename()` is actually
-    /// one of its own before trusting its inode number — otherwise a
-    /// cross-filesystem rename could write a dirent pointing at whatever
-    /// inode number happens to collide in the wrong filesystem.
-    ///
-    /// No default body: `Self` has no implicit `Sized` bound inside a
-    /// trait definition (traits stay dyn-compatible by default), so a
-    /// shared `{ self }` default can't coerce `&Self` to `&dyn Any`
-    /// without also adding `where Self: Sized` — which would exclude the
-    /// method from the vtable entirely, making it uncallable through
-    /// `Arc<dyn Inode>` (the whole point). Every implementor below adds
-    /// the same one-line `{ self }` body instead, where `Self` is the
-    /// concrete, `Sized` type.
-    fn as_any(&self) -> &dyn core::any::Any;
-}
-
-// ── Filesystem ───────────────────────────────────────────────────────────────
-
-/// A mounted filesystem instance.
-///
-/// Implement this trait to plug a new filesystem (initramfs, ext2, tmpfs, …)
-/// into the VFS mount table.
-pub trait Filesystem: Send + Sync {
-    /// Human-readable filesystem type name (shown in mount listings).
-    fn name(&self) -> &str;
-
-    /// Root inode of this filesystem.
-    ///
-    /// `Result`-returning (not a bare `Arc<dyn Inode>`) because this is
-    /// re-invoked on *every* path resolution into this mount (see
-    /// `resolve_inner` below), not just at mount time — for most
-    /// filesystems here (ramfs, devfs, initramfs, procfs) the root inode
-    /// can never fail to produce, so they just wrap it in `Ok`. `ext2` is
-    /// the exception: its root is a real disk read that can genuinely
-    /// fail, and this `Result` is what lets that failure propagate as a
-    /// clean `EIO` through `resolve()` like any other failed path-
-    /// resolution step, instead of needing a synthetic stand-in inode.
-    fn root(&self) -> Result<Arc<dyn Inode>, Errno>;
-}
+// `Inode`/`Filesystem` and the getdents64 packing helpers now live in the
+// host-testable `vfs` crate (`vfs::inode`/`vfs::dirent` — see
+// `docs/fs/vfs-extraction-plan.md`, step 3). This re-export leaves every
+// `use crate::fs::vfs::{Inode, Filesystem}` (and the `getdents64_*` call
+// sites) in `fs/devfs.rs`, `fs/initramfs.rs`, `fs/procfs.rs`,
+// `fs/ramfs.rs`, `fs/ext2.rs` untouched. The mount table and path
+// resolution below still live here for now — they move in step 4.
+pub use vfs::dirent::{getdents64_from_snapshot, getdents64_via_readdir};
+pub use vfs::inode::{Filesystem, Inode};
 
 // ── Mount table ──────────────────────────────────────────────────────────────
 
@@ -474,57 +316,4 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), Errno> {
         return Err(e);
     }
     Ok(())
-}
-
-// ── Shared getdents64 helpers ───────────────────────────────────────────────
-//
-// Every directory `FileHandle` in this VFS packs `DirEntry`s into
-// `linux_dirent64` records the same way — only *where the entries come
-// from* differs, which is why this is two helpers, not one. Before these
-// existed, seven directory handles (devfs x2, initramfs, procfs x2, ramfs,
-// ext2) each hand-rolled an identical packing loop.
-
-/// Walk `dir.readdir(offset)` one entry at a time, packing each into `buf`
-/// as a `linux_dirent64` record, until either the directory is exhausted
-/// or the next entry wouldn't fit. For directory handles backed by a
-/// cheap-to-call-repeatedly `Inode::readdir` (devfs, initramfs, procfs) —
-/// see `getdents64_from_snapshot` for handles that pre-collect their
-/// listing into a `Vec<DirEntry>` at `open()` time instead (ramfs, ext2).
-pub fn getdents64_via_readdir(dir: &dyn Inode, offset: &mut u64, buf: &mut [u8]) -> i64 {
-    let mut written: usize = 0;
-    loop {
-        let entry = match dir.readdir(*offset) {
-            Ok(Some(e)) => e,
-            Ok(None) => break,
-            Err(e) => return e.as_i64(),
-        };
-        let needed = entry.dirent64_size();
-        if written + needed > buf.len() {
-            break;
-        }
-        let next_off = *offset as i64 + 1;
-        entry.write_dirent64(next_off, &mut buf[written..written + needed]);
-        written += needed;
-        *offset += 1;
-    }
-    written as i64
-}
-
-/// Same packing loop as `getdents64_via_readdir`, indexed by position
-/// through an already-collected `Vec<DirEntry>` snapshot instead of
-/// re-querying `readdir()` per entry.
-pub fn getdents64_from_snapshot(entries: &[crate::fs::types::DirEntry], offset: &mut usize, buf: &mut [u8]) -> i64 {
-    let mut written: usize = 0;
-    while *offset < entries.len() {
-        let entry = &entries[*offset];
-        let needed = entry.dirent64_size();
-        if written + needed > buf.len() {
-            break;
-        }
-        let next_off = *offset as i64 + 1;
-        entry.write_dirent64(next_off, &mut buf[written..written + needed]);
-        written += needed;
-        *offset += 1;
-    }
-    written as i64
 }
