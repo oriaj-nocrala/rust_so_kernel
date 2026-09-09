@@ -22,12 +22,15 @@ fn frame_idx(frame: PhysFrame) -> usize {
     (frame.start_address().as_u64() / 4096) as usize
 }
 
-/// Check the module's stated invariant ("all accesses must be under
-/// `cli`") on every accessor call, reporting any violation into the
-/// per-accessor counter passed in (see `debug::COW_IF_VIOLATIONS_*`)
-/// instead of just asserting/panicking — this is a bug hunt, not a case
-/// where crashing harder helps, and a live counter survives to be read
-/// from `/proc/kdebug`/the panic snapshot even on a run that goes on to
+/// Check whether the calling accessor's invariant ("must be called with
+/// interrupts disabled") actually holds, recording anything that doesn't
+/// into the per-accessor counter passed in (see `debug::COW_IF_VIOLATIONS_*`
+/// for `inc_ref`/`dec_ref`/`get_ref`, and `debug::COW_IF_ENABLED_SET_REF`
+/// for `set_ref`, which is instrumented the same way despite not being a
+/// real violation — see its own doc comment) instead of just
+/// asserting/panicking — this is a bug hunt, not a case where crashing
+/// harder helps, and a live counter survives to be read from
+/// `/proc/kdebug`/the panic snapshot even on a run that goes on to
 /// hang/double-fault before a fix could ever print anything. Split by
 /// accessor (rather than one shared counter) because `set_ref` (a plain
 /// write — always into a just-allocated, exclusively-owned frame index,
@@ -49,10 +52,32 @@ fn check_if_disabled(diag: &crate::debug::IfViolationDiag) {
 /// Called after allocating a new data frame (set to 1).
 ///
 /// # Safety
-/// Must be called with interrupts disabled (single CPU).
+/// Unlike `inc_ref`/`dec_ref` below, this one does NOT actually require
+/// interrupts disabled, and callers running with IF=1 are not a bug.
+/// `FRAME_REFCOUNTS[idx] = count` is a single-byte store — indivisible on
+/// this architecture regardless of interrupt state — and every call site
+/// writes into a frame index that was *just* allocated and is exclusively
+/// owned by the caller at that point (no other code path can be racing to
+/// touch the same index), so there is no read-modify-write sequence for a
+/// timer tick to land in the middle of and no lost update to lose. This
+/// was originally documented the same as the other three accessors, on
+/// the theory that "all `cow.rs` accessors" shared one invariant; measured
+/// instead of assumed: `sys_exec`/`memory/elf_loader.rs` legitimately call
+/// this with interrupts enabled ~675 times per boot in the normal ELF-load
+/// path (`elf_loader.rs`'s PT_LOAD segment loop), and every one of those is
+/// correct, not a race. Note the counter's `last_caller` reports
+/// `page_table_manager.rs`'s `map_user_page`, not `elf_loader` — that is
+/// the immediate call site, one frame below where the IF=1 actually
+/// originates; don't read the mismatch as the counter pointing somewhere
+/// unexpected. The accompanying
+/// `debug::COW_IF_ENABLED_SET_REF` counter is informational — evidence of
+/// how this accessor is actually used — not a fault detector; see its own
+/// doc comment. `inc_ref`/`dec_ref` (real non-atomic read-modify-write) and
+/// `get_ref` (a plain read, tracked for completeness) still have a genuine
+/// "interrupts disabled" contract — see their doc comments below.
 #[track_caller]
 pub unsafe fn set_ref(frame: PhysFrame, count: u8) {
-    check_if_disabled(&crate::debug::COW_IF_VIOLATIONS_SET_REF);
+    check_if_disabled(&crate::debug::COW_IF_ENABLED_SET_REF);
     let idx = frame_idx(frame);
     if idx < MAX_FRAMES {
         FRAME_REFCOUNTS[idx] = count;
