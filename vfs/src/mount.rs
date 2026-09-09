@@ -906,4 +906,428 @@ mod tests {
         let node = table.resolve("/probe").expect("resolves through the callback lookup");
         assert_eq!(node.file_type(), FileType::Regular);
     }
+
+    // ── Mutating-op reentrancy probes (family A) ────────────────────────
+    //
+    // The template test above (`direct_children_callback_from_lookup_does_
+    // not_self_deadlock`) only exercises `resolve()`'s read-only path via
+    // `Inode::lookup`. `MountTable`'s mutating methods (`rename`, `mkdir`,
+    // `symlink`, `unlink`, `rmdir`) each call `self.resolve(...)` to get a
+    // parent `Inode` *and then* call one or more further `Inode` trait
+    // methods (`take_child`/`insert_child`/`mkdir`/`symlink`/`unlink`/
+    // `rmdir`) on the result — a second wave of calls into arbitrary
+    // filesystem code that `find()`'s doc comment never explicitly
+    // discusses, because at the time it was written none of those callers
+    // existed yet. Every probe below is family A: reentrancy probes,
+    // deterministic, no threads — a toy `Inode` reenters the very
+    // `MountTable` it is mounted on, from inside one of these second-wave
+    // calls. They model this kernel's single-core failure mode (the same
+    // thread reentering a `spin::Mutex` it already holds), not SMP
+    // contention — there is no second vCPU here to contend with. Per the
+    // template test's own convention: if any of `MountTable`'s methods
+    // ever starts holding `entries` locked across one of these calls, the
+    // affected test HANGS rather than failing cleanly — that hang is the
+    // signal, not a bug in the test.
+
+    /// A toy directory whose every mutating operation first makes a
+    /// reentrant call back into the same `MountTable` it is mounted on,
+    /// before touching its own state. Models the real kernel shape where
+    /// a directory op reaches back into VFS-global state mid-operation —
+    /// `fs::initramfs::RootDirInode::lookup` calling `vfs::direct_children`
+    /// from inside `resolve_inner`'s walk, or `fs::procfs` needing a fresh
+    /// `SCHEDULER` lock of its own from inside a call the VFS is already
+    /// in the middle of (see `sys_getdents64`'s doc comment in
+    /// `kernel/src/process/syscall.rs` for that second example).
+    struct ReentrantOpsDir {
+        table: &'static MountTable,
+        children: Mutex<BTreeMap<String, Arc<dyn Inode>>>,
+    }
+
+    impl ReentrantOpsDir {
+        fn new(table: &'static MountTable) -> Arc<Self> {
+            Arc::new(Self { table, children: Mutex::new(BTreeMap::new()) })
+        }
+
+        /// The reentrant call itself. Result ignored — the only thing
+        /// under test is that it *returns* (rather than hanging) and
+        /// that the assertion inside it holds, proving `entries` was
+        /// actually unlocked at this point, not just that the call
+        /// happened to not need the lock.
+        fn probe(&self) {
+            let children = self.table.direct_children("/");
+            assert!(
+                children.contains(&"dev"),
+                "reentrant direct_children(\"/\") must still see /dev — proves \
+                 the table lock was free, not just that this call got lucky"
+            );
+        }
+    }
+
+    impl Inode for ReentrantOpsDir {
+        fn stat(&self) -> Stat {
+            Stat::dir(1)
+        }
+        fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+            Err(Errno::ENOSYS)
+        }
+        fn mkdir(&self, name: &str) -> Result<Arc<dyn Inode>, Errno> {
+            self.probe();
+            let node: Arc<dyn Inode> = TestDir::new();
+            self.children.lock().insert(name.to_string(), node.clone());
+            Ok(node)
+        }
+        fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn Inode>, Errno> {
+            self.probe();
+            let node: Arc<dyn Inode> = TestLink::new(target);
+            self.children.lock().insert(name.to_string(), node.clone());
+            Ok(node)
+        }
+        fn unlink(&self, name: &str) -> Result<(), Errno> {
+            self.probe();
+            let mut children = self.children.lock();
+            match children.get(name) {
+                Some(n) if n.file_type() == FileType::Directory => Err(Errno::EISDIR),
+                Some(_) => { children.remove(name); Ok(()) }
+                None => Err(Errno::ENOENT),
+            }
+        }
+        fn rmdir(&self, name: &str) -> Result<(), Errno> {
+            self.probe();
+            let mut children = self.children.lock();
+            match children.get(name) {
+                Some(n) if n.file_type() != FileType::Directory => Err(Errno::ENOTDIR),
+                Some(n) => {
+                    let sub = n.as_any().downcast_ref::<TestDir>().expect("TestDir child");
+                    if !sub.children.lock().is_empty() {
+                        return Err(Errno::ENOTEMPTY);
+                    }
+                    children.remove(name);
+                    Ok(())
+                }
+                None => Err(Errno::ENOENT),
+            }
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    struct ReentrantOpsFs {
+        root: Arc<ReentrantOpsDir>,
+    }
+
+    impl Filesystem for ReentrantOpsFs {
+        fn name(&self) -> &str {
+            "reentrant-ops-fs"
+        }
+        fn root(&self) -> Result<Arc<dyn Inode>, Errno> {
+            Ok(self.root.clone() as Arc<dyn Inode>)
+        }
+    }
+
+    /// Family A reentrancy probe (deterministic, no threads).
+    ///
+    /// Models `MountTable::mkdir` calling `Inode::mkdir` on a parent
+    /// directory that itself reaches back into the same `MountTable` mid-
+    /// call (the `fs::initramfs`/`fs::procfs` shape described above the
+    /// `ReentrantOpsDir` definition). Not SMP contention — this kernel is
+    /// single-core; the risk modeled is the same thread reentering a
+    /// `spin::Mutex` it already holds.
+    ///
+    /// If `MountTable::mkdir` (or `resolve`, which it calls first) is ever
+    /// changed to hold `entries` locked across the `Inode::mkdir` call,
+    /// this test HANGS instead of failing — that hang is the signal, same
+    /// convention as the template test above.
+    #[test]
+    fn mkdir_reentrant_probe_does_not_self_deadlock() {
+        let table: &'static MountTable = Box::leak(Box::new(MountTable::new()));
+        let root = ReentrantOpsDir::new(table);
+        table.mount("/", Arc::new(ReentrantOpsFs { root: root.clone() }));
+        table.mount("/dev", TestFs::new(TestDir::new()));
+
+        table.mkdir("/sub").expect("mkdir completes without self-deadlock");
+
+        let child = root.children.lock().get("sub").cloned().expect("sub was created");
+        assert_eq!(child.file_type(), FileType::Directory);
+    }
+
+    /// Family A reentrancy probe (deterministic, no threads). Same shape
+    /// as `mkdir_reentrant_probe_does_not_self_deadlock`, for
+    /// `MountTable::symlink` → `Inode::symlink`. Models single-core
+    /// reentrancy, not SMP contention. Expected failure mode if the
+    /// invariant is ever broken: a HANG, not a normal test failure.
+    #[test]
+    fn symlink_reentrant_probe_does_not_self_deadlock() {
+        let table: &'static MountTable = Box::leak(Box::new(MountTable::new()));
+        let root = ReentrantOpsDir::new(table);
+        table.mount("/", Arc::new(ReentrantOpsFs { root: root.clone() }));
+        table.mount("/dev", TestFs::new(TestDir::new()));
+
+        table.symlink("target.txt", "/link").expect("symlink completes without self-deadlock");
+
+        let child = root.children.lock().get("link").cloned().expect("link was created");
+        assert_eq!(child.file_type(), FileType::Symlink);
+        assert_eq!(child.readlink().unwrap(), "target.txt");
+    }
+
+    /// Family A reentrancy probe (deterministic, no threads). Same shape
+    /// as the two probes above, for `MountTable::unlink` → `Inode::unlink`.
+    /// Models single-core reentrancy (the same thread re-locking
+    /// `MountTable::entries`), not SMP contention. Expected failure mode
+    /// if the invariant is ever broken: a HANG, not a normal test failure.
+    #[test]
+    fn unlink_reentrant_probe_does_not_self_deadlock() {
+        let table: &'static MountTable = Box::leak(Box::new(MountTable::new()));
+        let root = ReentrantOpsDir::new(table);
+        root.children.lock().insert("f".to_string(), TestFile::new(b"x") as Arc<dyn Inode>);
+        table.mount("/", Arc::new(ReentrantOpsFs { root: root.clone() }));
+        table.mount("/dev", TestFs::new(TestDir::new()));
+
+        table.unlink("/f").expect("unlink completes without self-deadlock");
+
+        assert!(!root.children.lock().contains_key("f"));
+    }
+
+    /// Family A reentrancy probe (deterministic, no threads). Same shape
+    /// as the probes above, for `MountTable::rmdir` → `Inode::rmdir`.
+    /// Models single-core reentrancy, not SMP contention. Expected failure
+    /// mode if the invariant is ever broken: a HANG, not a normal test
+    /// failure.
+    #[test]
+    fn rmdir_reentrant_probe_does_not_self_deadlock() {
+        let table: &'static MountTable = Box::leak(Box::new(MountTable::new()));
+        let root = ReentrantOpsDir::new(table);
+        root.children.lock().insert("sub".to_string(), TestDir::new() as Arc<dyn Inode>);
+        table.mount("/", Arc::new(ReentrantOpsFs { root: root.clone() }));
+        table.mount("/dev", TestFs::new(TestDir::new()));
+
+        table.rmdir("/sub").expect("rmdir completes without self-deadlock");
+
+        assert!(!root.children.lock().contains_key("sub"));
+    }
+
+    // ── rename: reentrancy + rollback probes (family A) ─────────────────
+
+    /// A toy directory used only for `rename` reentrancy probes: like
+    /// `ReentrantOpsDir`, its `take_child`/`insert_child` each make a
+    /// reentrant call back into the same `MountTable` before touching
+    /// their own state — modeling `MountTable::rename`'s two calls into
+    /// arbitrary `Inode` code (the "detach" and "attach" halves) reaching
+    /// back into VFS-global state mid-rename.
+    struct ReentrantRenameDir {
+        table: &'static MountTable,
+        children: Mutex<BTreeMap<String, Arc<dyn Inode>>>,
+    }
+
+    impl ReentrantRenameDir {
+        fn new(table: &'static MountTable) -> Arc<Self> {
+            Arc::new(Self { table, children: Mutex::new(BTreeMap::new()) })
+        }
+    }
+
+    impl Inode for ReentrantRenameDir {
+        fn stat(&self) -> Stat {
+            Stat::dir(1)
+        }
+        fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+            Err(Errno::ENOSYS)
+        }
+        fn take_child(&self, name: &str) -> Result<Arc<dyn Inode>, Errno> {
+            // Reentrant call from the "detach" half of rename.
+            let children = self.table.direct_children("/");
+            assert!(children.contains(&"dev"), "reentrant call must see /dev");
+            self.children.lock().remove(name).ok_or(Errno::ENOENT)
+        }
+        fn insert_child(&self, name: &str, node: Arc<dyn Inode>) -> Result<(), Errno> {
+            // Reentrant call from the "attach" half of rename.
+            let children = self.table.direct_children("/");
+            assert!(children.contains(&"dev"), "reentrant call must see /dev");
+            let mut children = self.children.lock();
+            if children.contains_key(name) {
+                return Err(Errno::EEXIST);
+            }
+            children.insert(name.to_string(), node);
+            Ok(())
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    struct ReentrantRenameFs {
+        root: Arc<ReentrantRenameDir>,
+    }
+
+    impl Filesystem for ReentrantRenameFs {
+        fn name(&self) -> &str {
+            "reentrant-rename-fs"
+        }
+        fn root(&self) -> Result<Arc<dyn Inode>, Errno> {
+            Ok(self.root.clone() as Arc<dyn Inode>)
+        }
+    }
+
+    /// Family A reentrancy probe (deterministic, no threads).
+    ///
+    /// `MountTable::rename` calls `old_parent.take_child(...)` and then
+    /// `new_parent.insert_child(...)` — here both are the *same*
+    /// `ReentrantRenameDir`, each of whose implementations reenters the
+    /// table via `direct_children("/")` before doing anything else. Models
+    /// this kernel's single-core reentrancy failure mode (the same thread
+    /// re-locking `MountTable::entries`), not SMP contention — by the time
+    /// `rename` calls `take_child`/`insert_child`, `resolve()`'s own
+    /// internal `find()` has already locked-and-dropped the table guard
+    /// (see `find()`'s doc comment) — this probe exists to keep it that
+    /// way as `rename` itself evolves.
+    ///
+    /// If `rename` (or `resolve`) is ever changed to hold `entries` locked
+    /// across either call, this test HANGS instead of failing — that hang
+    /// is the signal, same convention as the template test.
+    #[test]
+    fn rename_reentrant_take_child_and_insert_child_does_not_self_deadlock() {
+        let table: &'static MountTable = Box::leak(Box::new(MountTable::new()));
+        let root = ReentrantRenameDir::new(table);
+        root.children.lock().insert("old.txt".to_string(), TestFile::new(b"payload") as Arc<dyn Inode>);
+        table.mount("/", Arc::new(ReentrantRenameFs { root: root.clone() }));
+        table.mount("/dev", TestFs::new(TestDir::new()));
+
+        table.rename("/old.txt", "/new.txt").expect("rename completes without self-deadlock");
+
+        let moved = root.children.lock().get("new.txt").cloned().expect("new.txt present");
+        let file = moved.as_any().downcast_ref::<TestFile>().expect("TestFile");
+        assert_eq!(&file.content.lock()[..], b"payload");
+    }
+
+    /// A directory whose `insert_child` always fails — regardless of
+    /// whether the name is already taken — modeling a filesystem-level
+    /// insert failure unrelated to `EEXIST` (e.g. ext2 running out of
+    /// directory blocks/inodes mid-rename). Used to probe `rename`'s
+    /// rollback path independently of the pre-existing
+    /// `rename_failure_rolls_back_to_the_original_name` test above, which
+    /// only exercises the `EEXIST` failure — this makes sure the rollback
+    /// isn't accidentally coupled to that one specific error.
+    struct AlwaysFailInsertDir;
+
+    impl Inode for AlwaysFailInsertDir {
+        fn stat(&self) -> Stat {
+            Stat::dir(1)
+        }
+        fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+            Err(Errno::ENOSYS)
+        }
+        fn insert_child(&self, _name: &str, _node: Arc<dyn Inode>) -> Result<(), Errno> {
+            Err(Errno::EIO)
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    struct AlwaysFailInsertFs {
+        root: Arc<AlwaysFailInsertDir>,
+    }
+
+    impl Filesystem for AlwaysFailInsertFs {
+        fn name(&self) -> &str {
+            "always-fail-insert-fs"
+        }
+        fn root(&self) -> Result<Arc<dyn Inode>, Errno> {
+            Ok(self.root.clone() as Arc<dyn Inode>)
+        }
+    }
+
+    /// Family A probe — not a reentrancy probe by itself (no callback into
+    /// `MountTable`), but the rollback counterpart the task asks for
+    /// alongside the reentrancy probes above: a cross-directory rename
+    /// whose destination `insert_child` fails for a reason that has
+    /// nothing to do with `EEXIST`. Asserts on observable state (the file
+    /// is back under its original name, holding its original content),
+    /// not on the returned `Errno` — a rollback that silently drops the
+    /// node would still return the same `Err(EIO)` here, so only checking
+    /// the error value would miss exactly the bug this probe is for.
+    #[test]
+    fn rename_rollback_restores_source_when_destination_insert_always_fails() {
+        let table = MountTable::new();
+        let old_root = TestDir::new().with("old.txt", TestFile::new(b"payload"));
+        table.mount("/olddir", TestFs::new(old_root.clone()));
+        table.mount("/newdir", Arc::new(AlwaysFailInsertFs { root: Arc::new(AlwaysFailInsertDir) }));
+
+        let err = table.rename("/olddir/old.txt", "/newdir/new.txt").err();
+        assert!(err.is_some(), "rename must fail since the destination always rejects the insert");
+
+        let restored = old_root.children.lock().get("old.txt").cloned()
+            .expect("old.txt must be restored by rollback, not lost");
+        let file = restored.as_any().downcast_ref::<TestFile>().expect("TestFile");
+        assert_eq!(&file.content.lock()[..], b"payload");
+    }
+
+    /// A directory combining both toy behaviors above: its `insert_child`
+    /// reentrantly calls back into the same `MountTable` *and* always
+    /// fails afterward. Models the bonus case the task calls out
+    /// explicitly: a rollback path that is both reentrant-unsafe and
+    /// buggy at once — exactly where a badly-written rollback is most
+    /// likely to either lose the file or hang.
+    struct ReentrantAlwaysFailInsertDir {
+        table: &'static MountTable,
+    }
+
+    impl Inode for ReentrantAlwaysFailInsertDir {
+        fn stat(&self) -> Stat {
+            Stat::dir(1)
+        }
+        fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+            Err(Errno::ENOSYS)
+        }
+        fn insert_child(&self, _name: &str, _node: Arc<dyn Inode>) -> Result<(), Errno> {
+            let children = self.table.direct_children("/");
+            assert!(children.contains(&"dev"), "reentrant call must see /dev");
+            Err(Errno::EIO)
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    struct ReentrantAlwaysFailInsertFs {
+        root: Arc<ReentrantAlwaysFailInsertDir>,
+    }
+
+    impl Filesystem for ReentrantAlwaysFailInsertFs {
+        fn name(&self) -> &str {
+            "reentrant-always-fail-insert-fs"
+        }
+        fn root(&self) -> Result<Arc<dyn Inode>, Errno> {
+            Ok(self.root.clone() as Arc<dyn Inode>)
+        }
+    }
+
+    /// Family A reentrancy + rollback probe combined (deterministic, no
+    /// threads) — the bonus case. Models single-core reentrancy, not SMP
+    /// contention. Two things must both hold, and the doc comments on the
+    /// two probes above explain why each matters on its own:
+    /// - No self-deadlock: if `rename`'s rollback call ever holds
+    ///   `entries` locked across `insert_child`, this test HANGS instead
+    ///   of failing — that hang is the signal.
+    /// - No lost file: the rollback must still restore `old.txt` to its
+    ///   original directory even though the failing `insert_child` also
+    ///   made a reentrant call on its way to failing.
+    #[test]
+    fn rename_rollback_with_reentrant_failing_insert_child_restores_source_without_hanging() {
+        let table: &'static MountTable = Box::leak(Box::new(MountTable::new()));
+        let old_root = TestDir::new().with("old.txt", TestFile::new(b"payload"));
+        table.mount("/olddir", TestFs::new(old_root.clone()));
+        table.mount(
+            "/newdir",
+            Arc::new(ReentrantAlwaysFailInsertFs { root: Arc::new(ReentrantAlwaysFailInsertDir { table }) }),
+        );
+        table.mount("/dev", TestFs::new(TestDir::new()));
+
+        let err = table.rename("/olddir/old.txt", "/newdir/new.txt").err();
+        assert!(err.is_some(), "rename must fail since the destination always rejects the insert");
+
+        let restored = old_root.children.lock().get("old.txt").cloned()
+            .expect("old.txt must be restored by rollback, not lost");
+        let file = restored.as_any().downcast_ref::<TestFile>().expect("TestFile");
+        assert_eq!(&file.content.lock()[..], b"payload");
+    }
 }
