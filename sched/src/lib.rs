@@ -108,28 +108,50 @@
 //!
 //! ## Known limitations
 //!
-//! Aging (`age_processes`) restores a Ready entity's effective priority all
-//! the way to its base priority within a single call, not one step per
-//! epoch as the surrounding module comment in
-//! `kernel/src/process/scheduler.rs` describes; because `pop_next_ready` is
-//! strict-priority, this makes low-base-priority starvation reachable in
-//! practice once anything creates processes at different base priorities
-//! (today's kernel only ever creates base 5 and base 0, so it is latent,
-//! not yet observed in production). Measured against this crate directly,
-//! not a reimplementation: with bases `[1, 3, 6, 10]` continuously ready,
-//! the base-1 entity was never picked in 200,000 iterations with aging on,
-//! versus iteration 16 with aging off. Two related pieces of code are
-//! consequently inert — the `.min(base_priority())` clamp in
-//! `age_processes` is unreachable, and no test can distinguish
-//! `queue_index(effective)` from `queue_index(base)` in that loop's
-//! enqueue — and `property_no_ready_entity_starves`
-//! (`invariants.rs`) does not guard what its name claims: disabling aging
-//! does not make it fail, because disabling aging does not by itself
-//! produce starvation under that test's configuration.
+//! **Base priority does not determine steady-state CPU share.** This is the
+//! most surprising property of this scheduler and the one most likely to
+//! mislead someone "improving" it, so it is stated first. Decay-on-preemption
+//! (`requeue_preempted`, one step per time slice) outruns aging (one step per
+//! `AGING_EPOCH` ticks), so under sustained contention every non-idle entity
+//! collapses to `MIN_EFFECTIVE_PRIORITY` and rotates FIFO from there,
+//! regardless of what its base priority is. Measured against this crate,
+//! steady-state share over a run with the warm-up discarded: four CPU-bound
+//! entities at base 5 get 25/25/25/25, and four at bases `[1, 3, 6, 10]` get
+//! 24/24/26/26 — very nearly the same. The eleven priority queues are
+//! effectively decorative past the transient. See `fairness.rs`, whose tests
+//! pin exactly this.
 //!
-//! A fix is planned (`docs/sched/sched-bugs-plan.md`) but **not yet
-//! implemented** — this crate's current behavior is a faithful copy of what
-//! shipped before the extraction, not a corrected scheduler.
+//! A consequence worth stating plainly: raising an entity's base priority
+//! buys it a longer time slice (`quantum_for`) and a better position while
+//! the system is transient, but not a larger share of a busy CPU. If
+//! priorities ever need to mean something in steady state, that calls for a
+//! virtual-time model, not more aging heuristics — see
+//! `docs/sched/sched-bugs-plan.md`, which records an MLFQ rework that was
+//! implemented, measured to be indistinguishable from having no aging at
+//! all, and discarded.
+//!
+//! **Aging is not, today, worth what it costs.** In every measured
+//! configuration it is either identical to having no aging (equal bases) or
+//! slightly worse for the lowest-base entity (distinct bases). It also walks
+//! all eleven queues every `AGING_EPOCH` ticks while the kernel adapter holds
+//! its scheduler lock, which is O(entities) under a lock — a real obstacle if
+//! this ever runs on more than one CPU.
+//!
+//! **`.min(base_priority())` in `age_processes` is unreachable code.** The
+//! branch only runs when `effective < base` and adds exactly one, so
+//! `effective + 1 <= base` always holds. Deleting the clamp leaves the whole
+//! suite green; it is not a coverage gap, it is dead code kept only because
+//! removing it is a behavior-neutral change nobody has made yet.
+//!
+//! **What the tests do and do not guard.** `property_no_ready_entity_starves`
+//! does guard a real property, but not the one its history suggests: it is
+//! insensitive to aging being disabled (disabling aging does not produce
+//! starvation, because decay alone still rotates entities fairly), and it is
+//! sensitive to the *decay* being removed, which makes the highest-base
+//! entity monopolize the CPU forever. If aging silently stopped running
+//! altogether, only the unit tests of `advance_ticks` would notice — no
+//! property test of scheduler behavior would. That gap is open.
+//!
 #![no_std]
 
 extern crate alloc;
@@ -146,6 +168,9 @@ pub mod core;
 pub use core::SchedCore;
 
 pub mod invariants;
+
+#[cfg(test)]
+mod fairness;
 
 /// Number of priority-indexed run queues (effective priorities 0..=10).
 pub const NUM_PRIORITIES: usize = 11;
