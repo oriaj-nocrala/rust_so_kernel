@@ -222,12 +222,11 @@ fn clear_current_fast() {
     CURRENT_PID_FAST[cpu].store(0, Ordering::Release);
 }
 
-// Moved to the `sched` crate so the host-testable core and this kernel
-// adapter share a single source of truth for these values instead of each
-// keeping its own copy that could silently drift apart — see
-// `docs/sched/sched-extraction-plan.md`. `BASE_QUANTUM`/`PRIORITY_QUANTUM_BONUS`
-// are only used by `sched::quantum_for` itself, so they aren't imported here.
-use sched::AGING_EPOCH;
+// The tick-accounting constants (`BASE_QUANTUM`, `PRIORITY_QUANTUM_BONUS`,
+// `AGING_EPOCH`) and their arithmetic (`quantum_for`) now live entirely
+// behind `SchedCore::start_slice`/`advance_ticks`/`consume_quantum` — see
+// `docs/sched/sched-extraction-plan.md` step 4 — so none of them need to be
+// imported here anymore.
 
 static SCHEDULERS: [Mutex<Scheduler>; crate::cpu::MAX_CPUS] = [
     Mutex::new(Scheduler::new()),
@@ -260,20 +259,15 @@ pub fn local_scheduler() -> TrackedSchedulerGuard {
 
 pub struct Scheduler {
     /// Per-priority run queues (ONLY Ready processes), the wait queue
-    /// (Blocked and Zombie processes, not scanned during scheduling), and
-    /// the monotonic PID counter (0 is reserved for idle) — moved into the
-    /// host-testable `sched` crate's generic core. See
-    /// `docs/sched/sched-extraction-plan.md`.
+    /// (Blocked and Zombie processes, not scanned during scheduling), the
+    /// monotonic PID counter (0 is reserved for idle), and the tick
+    /// accounting (remaining ticks in the current slice, global tick
+    /// counter for aging epochs) — moved into the host-testable `sched`
+    /// crate's generic core. See `docs/sched/sched-extraction-plan.md`.
     core: sched::SchedCore<Process>,
 
     /// Currently executing process.
     running: Option<Box<Process>>,
-
-    /// Remaining ticks for the running process.
-    remaining_ticks: u32,
-
-    /// Global tick counter for aging epochs.
-    global_ticks: u32,
 
     /// Kernel stacks awaiting `phys_free` — populated by `kill_current`'s
     /// thread-reap path, which runs *on the dying thread's own kernel
@@ -301,8 +295,6 @@ impl Scheduler {
         Self {
             core: sched::SchedCore::new(),
             running: None,
-            remaining_ticks: 0,
-            global_ticks: 0,
             pending_stack_frees: Vec::new(),
             pending_vma_frees: Vec::new(),
         }
@@ -545,7 +537,7 @@ impl Scheduler {
             super::tss::set_kernel_stack(proc.kernel_stack);
             unsafe { super::fpu::restore(&proc.fpu_state); }
 
-            self.remaining_ticks = sched::quantum_for(proc.effective_priority);
+            self.core.start_slice(proc.effective_priority);
 
             tf_note_resume(&mut proc, "kill_and_switch_tf");
             let tf_ptr = &*proc.trapframe as *const TrapFrame;
@@ -591,7 +583,7 @@ impl Scheduler {
             super::tss::set_kernel_stack(proc.kernel_stack);
             write_fs_base(proc.fs_base);
             unsafe { super::fpu::restore(&proc.fpu_state); }
-            self.remaining_ticks = sched::quantum_for(proc.effective_priority);
+            self.core.start_slice(proc.effective_priority);
             tf_note_resume(&mut proc, "stop_and_switch_tf");
             let tf_ptr = &*proc.trapframe as *const TrapFrame;
             update_current_fast(&proc);
@@ -665,7 +657,7 @@ impl Scheduler {
             super::tss::set_kernel_stack(proc.kernel_stack);
             write_fs_base(proc.fs_base);
             unsafe { super::fpu::restore(&proc.fpu_state); }
-            self.remaining_ticks = sched::quantum_for(proc.effective_priority);
+            self.core.start_slice(proc.effective_priority);
             tf_note_resume(&mut proc, "block_current");
             let tf_ptr = &*proc.trapframe as *const TrapFrame;
             update_current_fast(&proc);
@@ -847,7 +839,7 @@ impl Scheduler {
     /// address the preempted code had pushed to. It guards the deferred
     /// kernel-stack frees below.
     pub fn tick(&mut self, interrupted_rsp: u64) -> bool {
-        self.global_ticks = self.global_ticks.wrapping_add(1);
+        let aging_due = self.core.advance_ticks();
 
         // Deferred kernel-stack frees. The old comment here claimed reaching
         // a new tick means the CPU already executed some process's iretq since
@@ -882,15 +874,11 @@ impl Scheduler {
             !unsafe { address_space.try_free_huge_vma(*start, *size_pages) }
         });
 
-        if self.global_ticks % AGING_EPOCH == 0 {
+        if aging_due {
             self.core.age_processes();
         }
 
-        if self.remaining_ticks > 0 {
-            self.remaining_ticks -= 1;
-        }
-
-        self.remaining_ticks == 0
+        self.core.consume_quantum()
     }
 
     // ====================================================================
@@ -942,7 +930,7 @@ impl Scheduler {
             unsafe { super::fpu::restore(&proc.fpu_state); }
             crate::debug::inc_switches();
 
-            self.remaining_ticks = sched::quantum_for(proc.effective_priority);
+            self.core.start_slice(proc.effective_priority);
 
             tf_note_resume(&mut proc, "switch_to_next");
             let tf_ptr = &*proc.trapframe as *const TrapFrame;
@@ -991,7 +979,7 @@ impl Scheduler {
             }
             unsafe { super::fpu::restore(&proc.fpu_state); }
 
-            self.remaining_ticks = sched::quantum_for(proc.effective_priority);
+            self.core.start_slice(proc.effective_priority);
 
             tf_note_resume(&mut proc, "start_first");
             let tf_ptr = &*proc.trapframe as *const TrapFrame;

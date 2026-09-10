@@ -13,7 +13,7 @@
 
 use alloc::{boxed::Box, collections::VecDeque};
 
-use crate::{queue_index, SchedEntity, MIN_EFFECTIVE_PRIORITY, NUM_PRIORITIES};
+use crate::{queue_index, quantum_for, SchedEntity, AGING_EPOCH, MIN_EFFECTIVE_PRIORITY, NUM_PRIORITIES};
 
 /// The run queues, wait queue, and pid counter for one scheduler instance.
 ///
@@ -43,6 +43,14 @@ pub struct SchedCore<E: SchedEntity> {
     /// Monotonic pid counter. Starts at 1; 0 is reserved for idle. Moved out
     /// of `Scheduler::next_pid`.
     next_pid: usize,
+
+    /// Remaining ticks for the running process. Moved out of
+    /// `Scheduler::remaining_ticks`.
+    remaining_ticks: u32,
+
+    /// Global tick counter for aging epochs. Moved out of
+    /// `Scheduler::global_ticks`.
+    global_ticks: u32,
 }
 
 impl<E: SchedEntity> SchedCore<E> {
@@ -57,6 +65,8 @@ impl<E: SchedEntity> SchedCore<E> {
             run_queues: [const { VecDeque::new() }; NUM_PRIORITIES],
             wait_queue: VecDeque::new(),
             next_pid: 1,
+            remaining_ticks: 0,
+            global_ticks: 0,
         }
     }
 
@@ -351,6 +361,48 @@ impl<E: SchedEntity> SchedCore<E> {
                 }
             }
         }
+    }
+
+    // ========================================================================
+    // Tick accounting (step 4)
+    // ========================================================================
+
+    /// Grant a fresh time slice sized for `effective_priority`. Replaces the
+    /// five `self.remaining_ticks = sched::quantum_for(...)` assignments in
+    /// the kernel adapter.
+    pub fn start_slice(&mut self, effective_priority: u8) {
+        self.remaining_ticks = quantum_for(effective_priority);
+    }
+
+    /// Advance the global tick counter by one and report whether this tick
+    /// lands on an aging epoch.
+    ///
+    /// Split out of the kernel's old `Scheduler::tick` as its own method,
+    /// rather than folded into one `tick()` here, because the kernel's tick
+    /// handler interleaves two `retain` passes over `pending_stack_frees` /
+    /// `pending_vma_frees` between the global-counter bump and the
+    /// aging-epoch check — both of those call into real physical-memory
+    /// freeing that cannot leave the kernel (they're not expressible in
+    /// terms of `SchedEntity`). Splitting `tick` into `advance_ticks`, the
+    /// kernel's own retain passes, then `age_processes`/`consume_quantum`
+    /// preserves that exact ordering instead of forcing it all into one
+    /// opaque call.
+    pub fn advance_ticks(&mut self) -> bool {
+        self.global_ticks = self.global_ticks.wrapping_add(1);
+        self.global_ticks % AGING_EPOCH == 0
+    }
+
+    /// Consume one tick of the running entity's slice. Returns whether the
+    /// slice is now exhausted (i.e. a context switch is due).
+    ///
+    /// The `> 0` guard is what stops a `u32` underflow when a tick arrives
+    /// with no slice outstanding (e.g. before `start_slice` has ever been
+    /// called) — keep it.
+    pub fn consume_quantum(&mut self) -> bool {
+        if self.remaining_ticks > 0 {
+            self.remaining_ticks -= 1;
+        }
+        self.remaining_ticks == 0
     }
 }
 
@@ -828,5 +880,147 @@ mod tests {
 
         let pids: alloc::vec::Vec<usize> = core.iter_ready_desc().map(|e| e.pid()).collect();
         assert_eq!(pids, alloc::vec![3, 1, 2], "highest queue first, insertion order within a queue, no wait-queue entries");
+    }
+
+    // ========================================================================
+    // Tick accounting: start_slice / advance_ticks / consume_quantum (step 4)
+    // ========================================================================
+
+    /// 28. `start_slice` grants exactly `quantum_for(eff)` ticks: calling
+    /// `consume_quantum` that many times returns `false` every time except
+    /// the last, where it returns `true`. Checked at effective priority 0
+    /// (quantum 2) and effective priority 10 (quantum 12). Sabotage E
+    /// (`start_slice` always granting `BASE_QUANTUM`) targets exactly this at
+    /// priority 10, where `BASE_QUANTUM` (2) and `quantum_for(10)` (12)
+    /// diverge.
+    #[test]
+    fn start_slice_grants_exactly_quantum_for_ticks() {
+        for eff in [0u8, 10u8] {
+            let mut core = SchedCore::<Ent>::new();
+            core.start_slice(eff);
+            let quantum = quantum_for(eff);
+            for i in 0..quantum {
+                let exhausted = core.consume_quantum();
+                if i + 1 == quantum {
+                    assert!(exhausted, "eff={eff}: last of {quantum} ticks must report exhausted");
+                } else {
+                    assert!(!exhausted, "eff={eff}: tick {} of {quantum} must not yet report exhausted", i + 1);
+                }
+            }
+        }
+    }
+
+    /// 29. `consume_quantum` on a fresh core (no `start_slice` ever called,
+    /// so `remaining_ticks` starts at 0) returns `true` every time and never
+    /// panics from `u32` underflow. This is the test that guards the `> 0`
+    /// guard in `consume_quantum` — sabotage C (dropping that guard) either
+    /// fails this as a wrong assertion or panics outright on underflow,
+    /// depending on build profile (debug vs release overflow checks).
+    #[test]
+    fn consume_quantum_on_fresh_core_never_underflows() {
+        let mut core = SchedCore::<Ent>::new();
+        for i in 0..5 {
+            assert!(core.consume_quantum(), "call {i}: an empty slice must always report exhausted");
+        }
+    }
+
+    /// 30. `advance_ticks` returns `false` for the first `AGING_EPOCH - 1`
+    /// calls and `true` on exactly the `AGING_EPOCH`-th, then `false` again
+    /// right after. Pins "increment before the modulo": sabotage A (modulo
+    /// before increment) would report `true` on call 1 (0 % AGING_EPOCH ==
+    /// 0) instead of call `AGING_EPOCH`.
+    #[test]
+    fn advance_ticks_first_true_is_at_aging_epoch() {
+        let mut core = SchedCore::<Ent>::new();
+        let mut first_true = None;
+        for i in 1..=AGING_EPOCH {
+            if core.advance_ticks() {
+                first_true = Some(i);
+                break;
+            }
+        }
+        assert_eq!(first_true, Some(AGING_EPOCH), "the first `true` must land exactly on the AGING_EPOCH-th call");
+        assert!(!core.advance_ticks(), "the very next call after an epoch must be false again");
+    }
+
+    /// 31. `advance_ticks` returns `true` on exactly the multiples of
+    /// `AGING_EPOCH`, across 3 full epochs. Sabotage B (`!= 0` instead of
+    /// `== 0`) would flip this to true everywhere EXCEPT the multiples,
+    /// producing a vector nothing like `[AGING_EPOCH, 2*AGING_EPOCH,
+    /// 3*AGING_EPOCH]`.
+    #[test]
+    fn advance_ticks_true_on_every_multiple_of_aging_epoch() {
+        let mut core = SchedCore::<Ent>::new();
+        let mut true_indices = alloc::vec::Vec::new();
+        for i in 1..=(3 * AGING_EPOCH) {
+            if core.advance_ticks() {
+                true_indices.push(i);
+            }
+        }
+        assert_eq!(true_indices, alloc::vec![AGING_EPOCH, 2 * AGING_EPOCH, 3 * AGING_EPOCH]);
+    }
+
+    /// 32. `advance_ticks` and `consume_quantum` are independent counters:
+    /// interleaving calls to one does not perturb the other. Built by
+    /// driving `consume_quantum` down from a 3-tick slice with an
+    /// `advance_ticks` call before each one (none of which reach an aging
+    /// epoch), and separately verifying that a burst of `consume_quantum`
+    /// calls exhausting the slice doesn't move `advance_ticks` off its own
+    /// expected schedule.
+    #[test]
+    fn advance_ticks_and_consume_quantum_are_independent() {
+        let mut core = SchedCore::<Ent>::new();
+        core.start_slice(1); // quantum_for(1) == 3
+
+        // Interleave: advance_ticks (never hits an epoch here, well below
+        // AGING_EPOCH) then consume_quantum, three times — the slice must
+        // still take exactly 3 consume_quantum calls to exhaust, unaffected
+        // by the interleaved advance_ticks calls.
+        assert!(!core.advance_ticks());
+        assert!(!core.consume_quantum());
+        assert!(!core.advance_ticks());
+        assert!(!core.consume_quantum());
+        assert!(!core.advance_ticks());
+        assert!(core.consume_quantum(), "third consume_quantum must exhaust the quantum_for(1) == 3 slice");
+
+        // Now drive advance_ticks the rest of the way to its own epoch,
+        // calling consume_quantum (on an already-exhausted, unre-armed
+        // slice) in between each — the aging epoch must still land exactly
+        // on the AGING_EPOCH-th advance_ticks call, unaffected by the
+        // interleaved consume_quantum calls.
+        let mut first_true = None;
+        for i in 4..=AGING_EPOCH {
+            let aging_due = core.advance_ticks();
+            assert!(core.consume_quantum(), "an exhausted, never-rearmed slice must keep reporting exhausted");
+            if aging_due {
+                first_true = Some(i);
+                break;
+            }
+        }
+        assert_eq!(first_true, Some(AGING_EPOCH), "consume_quantum calls must not shift when the aging epoch lands");
+    }
+
+    /// 33. `start_slice` re-arms a partially-consumed slice back to the FULL
+    /// quantum, not just topping up the remainder: consume 1 of 3 ticks,
+    /// call `start_slice` again, and the slice must once again take the
+    /// full `quantum_for(eff)` calls to exhaust — not just the 2 remaining
+    /// before the re-arm.
+    #[test]
+    fn start_slice_rearms_a_partially_consumed_slice_to_full_quantum() {
+        let mut core = SchedCore::<Ent>::new();
+        let eff = 1u8;
+        let quantum = quantum_for(eff);
+        core.start_slice(eff);
+        assert!(!core.consume_quantum(), "one tick consumed out of quantum_for(1) == 3 must not yet exhaust");
+
+        core.start_slice(eff); // re-arm to the FULL quantum, discarding the partial consumption
+        for i in 0..quantum {
+            let exhausted = core.consume_quantum();
+            if i + 1 == quantum {
+                assert!(exhausted, "re-armed slice's last tick must report exhausted");
+            } else {
+                assert!(!exhausted, "re-armed slice must not exhaust early, at tick {}", i + 1);
+            }
+        }
     }
 }
