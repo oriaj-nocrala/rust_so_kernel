@@ -312,7 +312,7 @@ pub(super) fn sys_connect(fd: i32, path_ptr: usize, _addrlen: usize) -> SyscallR
             CHANNELS.lock().get_mut(server_channel_id)
                 .map(|ch| ch.server_state = Some(ServerState::Listening));
 
-            for proc in sched.wait_queue.iter_mut() {
+            for proc in sched.wait_queue_mut().iter_mut() {
                 if proc.pid.0 == waiter.pid
                     && matches!(proc.state, crate::process::ProcessState::Blocked)
                 {

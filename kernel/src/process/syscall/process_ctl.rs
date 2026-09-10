@@ -713,13 +713,13 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
             p => crate::process::WaitTarget::Pgid((-p) as u32),
         };
 
-        let zombie_pos = scheduler.wait_queue.iter().position(|p| {
+        let zombie_pos = scheduler.wait_queue().iter().position(|p| {
             matches!(p.state, crate::process::ProcessState::Zombie)
                 && p.parent_pid == caller_pid
                 && target.matches(p.pid.0, p.pgid)
         });
         let stopped_pos = if zombie_pos.is_none() && options & WUNTRACED != 0 {
-            scheduler.wait_queue.iter().position(|p| {
+            scheduler.wait_queue().iter().position(|p| {
                 matches!(p.state, crate::process::ProcessState::Stopped)
                     && !p.stop_reported
                     && p.parent_pid == caller_pid
@@ -734,7 +734,7 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
             // straight into `status_ptr` right here: we're running on the
             // *parent's* stack in the parent's own address space (this is
             // its own waitpid() syscall), never the dead child's.
-            let proc = scheduler.wait_queue.remove(pos).unwrap();
+            let proc = scheduler.wait_queue_mut().remove(pos).unwrap();
             let status = proc.wait_status_word();
             let pid = proc.pid.0;
             crate::init::processes::free_kernel_stack(proc.kernel_stack);
@@ -753,9 +753,9 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
             }
             Outcome::Return(pid as SyscallResult)
         } else if let Some(pos) = stopped_pos {
-            let status = scheduler.wait_queue[pos].stop_status_word();
-            let pid = scheduler.wait_queue[pos].pid.0;
-            scheduler.wait_queue[pos].stop_reported = true;
+            let status = scheduler.wait_queue()[pos].stop_status_word();
+            let pid = scheduler.wait_queue()[pos].pid.0;
+            scheduler.wait_queue_mut()[pos].stop_reported = true;
             if status_ptr != 0 {
                 // write_unaligned: see the zombie_pos branch above for why.
                 unsafe { core::ptr::write_unaligned(status_ptr as *mut i32, status); }
@@ -848,7 +848,7 @@ pub(super) fn sys_kill(target_pid: i64, sig: u32) -> SyscallResult {
                 (-target_pid) as u32
             };
             if sig == crate::process::signal::SIGCONT {
-                let stopped: alloc::vec::Vec<usize> = sched.wait_queue.iter()
+                let stopped: alloc::vec::Vec<usize> = sched.wait_queue().iter()
                     .filter(|p| p.pgid == pgid && matches!(p.state, crate::process::ProcessState::Stopped))
                     .map(|p| p.pid.0)
                     .collect();

@@ -143,11 +143,11 @@ unsafe fn copy_from_user(proc: &Process, user_addr: u64, dst: &mut [u8]) -> usiz
 /// its syscall return value, then wake it. `f` returns the `rax` value.
 fn deliver_and_wake(pid: usize, f: impl FnOnce(&super::Process) -> u64) {
     let mut sched = super::scheduler::local_scheduler();
-    if let Some(idx) = sched.wait_queue.iter().position(|p| {
+    if let Some(idx) = sched.wait_queue().iter().position(|p| {
         p.pid.0 == pid && matches!(p.state, ProcessState::Blocked)
     }) {
-        let rax = f(&sched.wait_queue[idx]);
-        sched.wait_queue[idx].trapframe.rax = rax;
+        let rax = f(&sched.wait_queue()[idx]);
+        sched.wait_queue_mut()[idx].trapframe.rax = rax;
     }
     sched.wake(pid);
 }
@@ -168,11 +168,11 @@ fn collect_from_writer(waiter: PipeWaiter, dst: &mut [u8]) -> usize {
     let want = core::cmp::min(dst.len(), waiter.count);
     let mut sched = super::scheduler::local_scheduler();
     let mut got = 0usize;
-    if let Some(idx) = sched.wait_queue.iter().position(|p| {
+    if let Some(idx) = sched.wait_queue().iter().position(|p| {
         p.pid.0 == waiter.pid && matches!(p.state, ProcessState::Blocked)
     }) {
-        got = unsafe { copy_from_user(&sched.wait_queue[idx], waiter.user_buf, &mut dst[..want]) };
-        sched.wait_queue[idx].trapframe.rax = got as u64;
+        got = unsafe { copy_from_user(&sched.wait_queue()[idx], waiter.user_buf, &mut dst[..want]) };
+        sched.wait_queue_mut()[idx].trapframe.rax = got as u64;
     }
     sched.wake(waiter.pid);
     got

@@ -181,7 +181,7 @@ pub(crate) fn stdin_wakeup() {
 
     // Find the blocked process, translate its user buffer to a kernel VA,
     // write the character, and set rax=1 as the syscall return value.
-    for proc in sched.wait_queue.iter_mut() {
+    for proc in sched.wait_queue_mut().iter_mut() {
         if proc.pid.0 == pid && matches!(proc.state, crate::process::ProcessState::Blocked) {
             use x86_64::{VirtAddr, structures::paging::{Page, Size4KiB}};
 

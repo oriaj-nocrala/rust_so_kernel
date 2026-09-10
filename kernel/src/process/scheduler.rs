@@ -227,7 +227,7 @@ fn clear_current_fast() {
 // keeping its own copy that could silently drift apart — see
 // `docs/sched/sched-extraction-plan.md`. `BASE_QUANTUM`/`PRIORITY_QUANTUM_BONUS`
 // are only used by `sched::quantum_for` itself, so they aren't imported here.
-use sched::{NUM_PRIORITIES, AGING_EPOCH, MIN_EFFECTIVE_PRIORITY};
+use sched::{NUM_PRIORITIES, AGING_EPOCH};
 
 static SCHEDULERS: [Mutex<Scheduler>; crate::cpu::MAX_CPUS] = [
     Mutex::new(Scheduler::new()),
@@ -259,11 +259,12 @@ pub fn local_scheduler() -> TrackedSchedulerGuard {
 }
 
 pub struct Scheduler {
-    /// Per-priority run queues — ONLY Ready processes.
-    run_queues: [VecDeque<Box<Process>>; NUM_PRIORITIES],
-
-    /// Blocked and Zombie processes.  Not scanned during scheduling.
-    pub wait_queue: VecDeque<Box<Process>>,
+    /// Per-priority run queues (ONLY Ready processes), the wait queue
+    /// (Blocked and Zombie processes, not scanned during scheduling), and
+    /// the monotonic PID counter (0 is reserved for idle) — moved into the
+    /// host-testable `sched` crate's generic core. See
+    /// `docs/sched/sched-extraction-plan.md`.
+    core: sched::SchedCore<Process>,
 
     /// Currently executing process.
     running: Option<Box<Process>>,
@@ -273,9 +274,6 @@ pub struct Scheduler {
 
     /// Global tick counter for aging epochs.
     global_ticks: u32,
-
-    /// Monotonic PID counter (0 is reserved for idle).
-    next_pid: usize,
 
     /// Kernel stacks awaiting `phys_free` — populated by `kill_current`'s
     /// thread-reap path, which runs *on the dying thread's own kernel
@@ -301,17 +299,10 @@ pub struct Scheduler {
 impl Scheduler {
     pub const fn new() -> Self {
         Self {
-            run_queues: [
-                VecDeque::new(), VecDeque::new(), VecDeque::new(),
-                VecDeque::new(), VecDeque::new(), VecDeque::new(),
-                VecDeque::new(), VecDeque::new(), VecDeque::new(),
-                VecDeque::new(), VecDeque::new(),
-            ],
-            wait_queue: VecDeque::new(),
+            core: sched::SchedCore::new(),
             running: None,
             remaining_ticks: 0,
             global_ticks: 0,
-            next_pid: 1,
             pending_stack_frees: Vec::new(),
             pending_vma_frees: Vec::new(),
         }
@@ -322,23 +313,41 @@ impl Scheduler {
     // ====================================================================
 
     pub fn allocate_pid(&mut self) -> Pid {
-        let pid = Pid(self.next_pid);
-        self.next_pid += 1;
-        pid
+        Pid(self.core.allocate_pid())
     }
 
     // ====================================================================
     // Process insertion
     // ====================================================================
 
-    pub fn add_process(&mut self, mut process: Box<Process>) {
-        process.effective_priority = process.priority;
-        let pri = sched::queue_index(process.effective_priority);
+    pub fn add_process(&mut self, process: Box<Process>) {
+        let (pid, base) = (process.pid.0, process.priority);
+        let pri = self.core.add_reset_to_base(process);
+        // `add_reset_to_base` just set `effective_priority = base_priority`,
+        // so the third logged value (the process's now-current effective
+        // priority) is by definition equal to `base` here — this print
+        // used to run *before* the push (reading `process.effective_priority`
+        // directly); it now runs after, with the same values, since the push
+        // itself has no observable output of its own.
         crate::serial_println!(
             "Scheduler: Added PID {} (base pri {}, effective {}) to queue[{}]",
-            process.pid.0, process.priority, process.effective_priority, pri
+            pid, base, base, pri
         );
-        self.run_queues[pri].push_back(process);
+    }
+
+    /// The blocked/zombie/stopped queue. This used to be a `pub` field; it is
+    /// now reached through the core so that `run_queues` — which the core keeps
+    /// private — cannot be reached from outside at all. That is what makes the
+    /// "queue index == queue_index(effective priority)" invariant enforceable
+    /// instead of a convention. See docs/sched/sched-extraction-plan.md,
+    /// decision 1.
+    pub fn wait_queue(&self) -> &VecDeque<Box<Process>> {
+        self.core.wait_queue()
+    }
+
+    /// Mutable counterpart of [`Self::wait_queue`].
+    pub fn wait_queue_mut(&mut self) -> &mut VecDeque<Box<Process>> {
+        self.core.wait_queue_mut()
     }
 
     // ====================================================================
@@ -363,15 +372,7 @@ impl Scheduler {
 
     /// Iterate over ALL processes: running + run queues + wait queue.
     pub fn iter_all(&self) -> impl Iterator<Item = &Process> + '_ {
-        self.running.as_deref().into_iter()
-            .chain(
-                self.run_queues.iter()
-                    .flat_map(|q| q.iter())
-                    .map(|b| b.as_ref())
-            )
-            .chain(
-                self.wait_queue.iter().map(|b| b.as_ref())
-            )
+        self.running.as_deref().into_iter().chain(self.core.iter_queued())
     }
 
     /// Check the currently-`running` process's pending signals against `tf`
@@ -463,12 +464,7 @@ impl Scheduler {
     /// callers (e.g. `sys_kill`) handle separately via `running_mut()`.
     /// Used to deliver a signal to a process other than the caller itself.
     pub fn find_process_mut(&mut self, pid: usize) -> Option<&mut Process> {
-        for queue in self.run_queues.iter_mut() {
-            if let Some(proc) = queue.iter_mut().find(|p| p.pid.0 == pid) {
-                return Some(proc.as_mut());
-            }
-        }
-        self.wait_queue.iter_mut().find(|p| p.pid.0 == pid).map(|p| p.as_mut())
+        self.core.find_mut(|p| p.pid.0 == pid)
     }
 
     // ====================================================================
@@ -516,7 +512,7 @@ impl Scheduler {
                 // kernel-heap memory, not the stack this code is executing on).
             } else {
                 proc.state = ProcessState::Zombie;
-                self.wait_queue.push_back(proc);
+                self.core.park(proc);
             }
             true
         } else {
@@ -541,7 +537,7 @@ impl Scheduler {
 
         // Find and schedule next Ready process
         for priority in (0..NUM_PRIORITIES).rev() {
-            if let Some(mut proc) = self.run_queues[priority].pop_front() {
+            if let Some(mut proc) = self.core.run_queue_mut(priority).pop_front() {
                 proc.state = ProcessState::Running;
 
                 unsafe {
@@ -587,12 +583,12 @@ impl Scheduler {
                 core::str::from_utf8(&proc.name).unwrap_or("<?>").trim_end_matches('\0'),
             );
             proc.state = ProcessState::Stopped;
-            self.wait_queue.push_back(proc);
+            self.core.park(proc);
         }
         clear_current_fast();
 
         for priority in (0..NUM_PRIORITIES).rev() {
-            if let Some(mut proc) = self.run_queues[priority].pop_front() {
+            if let Some(mut proc) = self.core.run_queue_mut(priority).pop_front() {
                 proc.state = ProcessState::Running;
                 unsafe { proc.address_space.activate(); }
                 super::tss::set_kernel_stack(proc.kernel_stack);
@@ -622,14 +618,10 @@ impl Scheduler {
                 super::signal::queue_signal(proc, sig);
             }
         }
-        for queue in self.run_queues.iter_mut() {
-            for proc in queue.iter_mut() {
-                if proc.pgid == pgid {
-                    super::signal::queue_signal(proc, sig);
-                }
-            }
-        }
-        for proc in self.wait_queue.iter_mut() {
+        // `iter_queued_mut` yields run queues then wait queue, i.e. the same
+        // order as the two separate loops (run queues, then wait queue) this
+        // replaces.
+        for proc in self.core.iter_queued_mut() {
             if proc.pgid == pgid {
                 super::signal::queue_signal(proc, sig);
             }
@@ -642,19 +634,13 @@ impl Scheduler {
     /// — it can't wake itself the way a Blocked process does when its I/O
     /// completes, since being stopped isn't waiting on anything.
     pub fn wake_stopped(&mut self, pid: usize) -> bool {
-        if let Some(pos) = self.wait_queue.iter().position(|p| {
-            p.pid.0 == pid && matches!(p.state, ProcessState::Stopped)
-        }) {
-            if let Some(mut proc) = self.wait_queue.remove(pos) {
-                proc.state = ProcessState::Ready;
-                proc.stopped_by_signal = None;
-                let pri = sched::queue_index(proc.effective_priority);
-                self.run_queues[pri].push_back(proc);
-            }
-            true
-        } else {
-            false
-        }
+        self.core.wake_matching(
+            |p| p.pid.0 == pid && matches!(p.state, ProcessState::Stopped),
+            |p| {
+                p.state = ProcessState::Ready;
+                p.stopped_by_signal = None;
+            },
+        )
     }
 
     // ====================================================================
@@ -672,13 +658,13 @@ impl Scheduler {
             proc.fs_base = read_fs_base();
             unsafe { super::fpu::save(&mut proc.fpu_state); }
             proc.state = ProcessState::Blocked;
-            self.wait_queue.push_back(proc);
+            self.core.park(proc);
         }
         // No process running on this CPU until we schedule the next one.
         clear_current_fast();
 
         for priority in (0..NUM_PRIORITIES).rev() {
-            if let Some(mut proc) = self.run_queues[priority].pop_front() {
+            if let Some(mut proc) = self.core.run_queue_mut(priority).pop_front() {
                 proc.state = ProcessState::Running;
                 unsafe { proc.address_space.activate(); }
                 super::tss::set_kernel_stack(proc.kernel_stack);
@@ -698,15 +684,12 @@ impl Scheduler {
 
     /// Wake a Blocked process: move it from wait_queue to its run_queue.
     pub fn wake(&mut self, pid: usize) {
-        if let Some(pos) = self.wait_queue.iter().position(|p| {
-            p.pid.0 == pid && matches!(p.state, ProcessState::Blocked)
-        }) {
-            if let Some(mut proc) = self.wait_queue.remove(pos) {
-                proc.state = ProcessState::Ready;
-                let pri = sched::queue_index(proc.effective_priority);
-                self.run_queues[pri].push_back(proc);
-            }
-        }
+        let _ = self.core.wake_matching(
+            |p| p.pid.0 == pid && matches!(p.state, ProcessState::Blocked),
+            |p| {
+                p.state = ProcessState::Ready;
+            },
+        );
     }
 
     /// Wake a Blocked process and set its syscall return value in one scan.
@@ -715,16 +698,13 @@ impl Scheduler {
     /// path (set trapframe.rax then call wake()) into a single wait_queue scan,
     /// halving the linear-search overhead for IPC hot paths.
     pub fn wake_with_retval(&mut self, pid: usize, rax: u64) {
-        if let Some(pos) = self.wait_queue.iter().position(|p| {
-            p.pid.0 == pid && matches!(p.state, ProcessState::Blocked)
-        }) {
-            if let Some(mut proc) = self.wait_queue.remove(pos) {
-                proc.trapframe.rax = rax;
-                proc.state = ProcessState::Ready;
-                let pri = sched::queue_index(proc.effective_priority);
-                self.run_queues[pri].push_back(proc);
-            }
-        }
+        let _ = self.core.wake_matching(
+            |p| p.pid.0 == pid && matches!(p.state, ProcessState::Blocked),
+            |p| {
+                p.trapframe.rax = rax;
+                p.state = ProcessState::Ready;
+            },
+        );
     }
 
     /// Called once `dead_pid` is fully dead (either already zombie-parked
@@ -757,7 +737,7 @@ impl Scheduler {
         // aren't (reaped immediately in `kill_current`), so this stays at
         // the "exited(0)" default for them — matches this kernel's existing
         // stance that nothing meaningful ever `waitpid()`s a thread's tid.
-        let dead = self.wait_queue.iter()
+        let dead = self.core.wait_queue().iter()
             .find(|p| p.pid.0 == dead_pid && matches!(p.state, ProcessState::Zombie));
         let status_word = dead.map(|p| p.wait_status_word()).unwrap_or(0x200);
         let dead_pgid = dead.map(|p| p.pgid).unwrap_or(0);
@@ -766,7 +746,7 @@ impl Scheduler {
         // still must not wake an unrelated process just because its own
         // `waitpid()` target happens to match by pid/pgid coincidence.
         let mut waker_pid: Option<usize> = None;
-        for proc in self.wait_queue.iter_mut() {
+        for proc in self.core.wait_queue_mut().iter_mut() {
             if Some(proc.pid) == parent_pid
                 && matches!(proc.state, ProcessState::Blocked)
                 && proc.waiting_for.map(|t| t.matches(dead_pid, dead_pgid)).unwrap_or(false)
@@ -801,7 +781,7 @@ impl Scheduler {
             }
         }
 
-        let Some((stopped_pgid, status_word)) = self.wait_queue.iter()
+        let Some((stopped_pgid, status_word)) = self.core.wait_queue().iter()
             .find(|p| p.pid.0 == stopped_pid && matches!(p.state, ProcessState::Stopped))
             .map(|p| (p.pgid, p.stop_status_word()))
         else {
@@ -810,7 +790,7 @@ impl Scheduler {
 
         const WUNTRACED: i32 = 4;
         let mut waker_pid: Option<usize> = None;
-        for proc in self.wait_queue.iter_mut() {
+        for proc in self.core.wait_queue_mut().iter_mut() {
             if Some(proc.pid) == parent_pid
                 && matches!(proc.state, ProcessState::Blocked)
                 && proc.waiting_options & WUNTRACED != 0
@@ -826,7 +806,7 @@ impl Scheduler {
         if let Some(pid) = waker_pid {
             // One-shot: don't let a future waitpid() scan re-report the
             // same stop event (see `Process::stop_reported`'s doc comment).
-            if let Some(p) = self.wait_queue.iter_mut().find(|p| p.pid.0 == stopped_pid) {
+            if let Some(p) = self.core.wait_queue_mut().iter_mut().find(|p| p.pid.0 == stopped_pid) {
                 p.stop_reported = true;
             }
             self.wake(pid);
@@ -928,8 +908,8 @@ impl Scheduler {
     fn age_processes(&mut self) {
         for pri in 0..NUM_PRIORITIES {
             let mut i = 0;
-            while i < self.run_queues[pri].len() {
-                let proc = &self.run_queues[pri][i];
+            while i < self.core.run_queue(pri).len() {
+                let proc = &self.core.run_queue(pri)[i];
 
                 if proc.pid.0 == 0 {
                     i += 1;
@@ -937,10 +917,10 @@ impl Scheduler {
                 }
 
                 if proc.effective_priority < proc.priority {
-                    let mut proc = self.run_queues[pri].remove(i).unwrap();
+                    let mut proc = self.core.run_queue_mut(pri).remove(i).unwrap();
                     proc.effective_priority = (proc.effective_priority + 1).min(proc.priority);
                     let new_pri = sched::queue_index(proc.effective_priority);
-                    self.run_queues[new_pri].push_back(proc);
+                    self.core.run_queue_mut(new_pri).push_back(proc);
                     // Don't increment i — next element shifted into position i
                 } else {
                     i += 1;
@@ -965,25 +945,19 @@ impl Scheduler {
 
             match proc.state {
                 ProcessState::Running => {
-                    // Normal preemption — put back in run queue as Ready
+                    // Normal preemption — put back in run queue as Ready.
+                    // Priority decay itself now lives in
+                    // `SchedCore::requeue_preempted`.
                     proc.state = ProcessState::Ready;
-
-                    // Decay effective priority (not idle)
-                    if proc.pid.0 != 0 && proc.effective_priority > MIN_EFFECTIVE_PRIORITY {
-                        proc.effective_priority -= 1;
-                    }
-
-                    let pri = sched::queue_index(proc.effective_priority);
-                    self.run_queues[pri].push_back(proc);
+                    self.core.requeue_preempted(proc);
                 }
                 ProcessState::Zombie | ProcessState::Blocked | ProcessState::Stopped => {
                     // Process was killed, blocked, or stopped (job control)
                     // during its slice.
-                    self.wait_queue.push_back(proc);
+                    self.core.park(proc);
                 }
                 ProcessState::Ready => {
-                    let pri = sched::queue_index(proc.effective_priority);
-                    self.run_queues[pri].push_back(proc);
+                    self.core.requeue_ready(proc);
                 }
             }
         }
@@ -994,7 +968,7 @@ impl Scheduler {
         // Blocked/Zombie.  Just pop from front.
 
         for priority in (0..NUM_PRIORITIES).rev() {
-            if let Some(mut proc) = self.run_queues[priority].pop_front() {
+            if let Some(mut proc) = self.core.run_queue_mut(priority).pop_front() {
                 proc.state = ProcessState::Running;
 
                 unsafe {
@@ -1026,7 +1000,7 @@ impl Scheduler {
     pub fn start_first(&mut self) -> *const TrapFrame {
         crate::serial_println!("Available processes:");
         for pri in (0..NUM_PRIORITIES).rev() {
-            for proc in self.run_queues[pri].iter() {
+            for proc in self.core.run_queue(pri).iter() {
                 crate::serial_println!(
                     "  PID {} (base pri {}, eff {}): {:?} - {:?}",
                     proc.pid.0,
@@ -1041,7 +1015,7 @@ impl Scheduler {
         }
 
         for priority in (1..NUM_PRIORITIES).rev() {
-            let queue = &mut self.run_queues[priority];
+            let queue = self.core.run_queue_mut(priority);
 
             for i in 0..queue.len() {
                 if queue[i].state == ProcessState::Ready && queue[i].pid.0 != 0 {

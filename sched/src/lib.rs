@@ -68,6 +68,9 @@ extern crate alloc;
 pub mod entity;
 pub use entity::SchedEntity;
 
+pub mod core;
+pub use core::SchedCore;
+
 /// Number of priority-indexed run queues (effective priorities 0..=10).
 pub const NUM_PRIORITIES: usize = 11;
 
