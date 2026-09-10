@@ -1,9 +1,36 @@
 # Plan: cerrar la extracción del scheduler y arreglar lo que destapó
 
-> **Estado: plan, sin empezar.** Escrito 2026-09-10, justo después de cerrar
-> los 5 pasos de refactor de `docs/sched/sched-extraction-plan.md`
-> (`4738fa1`..`4db1cd1`). La regla de aquella sesión era "refactor primero,
-> bugs después"; esto es el después.
+> **Estado: EJECUTADO** (2026-09-10), en 8 commits, `a7fdbb5`..`477c8f3`. Con
+> una desviación grande respecto al plan original: **el MLFQ se descartó a
+> mitad, ya implementado**, al medirlo mejor y ver que era indistinguible de
+> no tener aging (ver "Revisión de esa decisión" más abajo). En su lugar se
+> construyó el reloj inyectable que esta línea de trabajo prometía en su
+> propio nombre y nunca había construido.
+>
+> | commit | qué |
+> |---|---|
+> | `a7fdbb5` | este plan |
+> | `f82826c` | paso 1: cerrar la extracción (docs) + el hallazgo del build que miente |
+> | `e631131` | paso 2: retirar `SLAB_LOCK_CONTENDED` |
+> | `be42427` | paso 3: adoptar `diag::IrqMutex` (primera adopción real del tipo) |
+> | `52e7d00` | paso 4: `age_processes` sube +1 de verdad |
+> | `33d528b` | `sched::Clock`/`FakeClock` — el reloj falso, en lugar del MLFQ |
+> | `64245d8` | tests de reparto de CPU (`fairness.rs`) + qué guardan los tests de verdad |
+> | `477c8f3` | paso 7: el hueco de seeds y un warning que `cargo test` no puede ver |
+>
+> **Conteos finales:** `sched` 43 → **52**, `hal` 71, `ext2` 91, `mm` 39,
+> `vfs` 158, `diag` 30 (los cinco últimos sin cambio, verificados al cerrar).
+> `cd kernel && cargo build --target x86_64-unknown-none` exit 0 y 0 errores;
+> `scripts/run-kernel-tests.sh` PASS 3/3; `scripts/boot-matrix.sh 4 5` → 20/20
+> OK, 0 hang / 0 panic / 0 double fault. `cargo build` en `sched/` sin ningún
+> warning.
+>
+> **Lo que NO se hizo, explícitamente:** el MLFQ (descartado con datos), y el
+> bug 1 tal como estaba planteado (resultó estar ya cerrado por el paso 4).
+> `TrackedSchedulerGuard` y sus aserciones de IF=0 **siguen sin ningún test**;
+> `EXT2_LOCK` sigue guardado solo implícitamente; y si el aging dejara de
+> correr en silencio, **ninguna property test de comportamiento lo notaría**
+> (solo los tests unitarios de `advance_ticks`).
 
 ## Línea base medida al empezar (no heredada del doc anterior)
 
@@ -293,3 +320,76 @@ Sin ejecutar todavía; es el primer trabajo de este paso.
 - Un `cargo build` de 0.03 s no prueba que compilara nada.
 - `mlibc` y `quakegeneric` aparecen modificados desde antes: no tocarlos ni
   añadirlos a ningún commit.
+
+---
+
+## Los sabotajes ejecutados, y qué cazó cada uno
+
+Todos reproducidos por el orquestador, no aceptados del reporte del agente que
+los implementó. "0" no es un fallo del sabotaje: es el hallazgo.
+
+| # | Sabotaje | Tests caídos |
+|---|---|---|
+| S1 | bucle de aging ascendente otra vez | 4 |
+| S2 | `+1` → `+2` en el aging | 4 |
+| S3 | quitar `.min(base_priority())` | **0** — código inalcanzable, ver abajo |
+| S4 | `queue_index(base)` en el `push_back` del aging | 4, incl. un property test preexistente |
+| S7 | quitar el decay de `requeue_preempted` | 5, incl. `property_no_ready_entity_starves` |
+| S8 | `advance_ticks` siempre `false` (aging nunca corre) | 4 — **todos unitarios de `advance_ticks`** |
+| S9 | `advance_ticks` siempre `true` | 5 |
+| S10 | `>=` → `>` en el cruce de epoch | 4 |
+| S11 | no actualizar `last_epoch_tick` al disparar | 4 |
+| S12 | `park` descarta la entidad | 8, incl. la conservación de B1 |
+| S13 | `wake_matching` devuelve `true` sin mover nada | 3 — **la conservación de B1 NO lo caza** |
+| S14 | quitar el suelo de `requeue_preempted` | 1, y **solo gracias al seed 24** |
+
+## Qué queda guardado y qué no
+
+**Guardado de verdad:**
+
+- Índice de cola == `queue_index(prioridad efectiva)` de cada entidad
+  (`MisplacedEntity`), prioridad dentro de rango (`PriorityOutOfRange`), y
+  ningún pid duplicado (`DuplicatePid`). Los tres, por `check_invariants` y las
+  property tests.
+- El aging sube exactamente un paso por llamada, y converge (S1, S2, S4).
+- La mecánica del cruce de epoch (S8-S11).
+- El decay, y que es él —no el aging— quien evita la inanición (S7).
+- El suelo del decay, ahora también desde la suite aleatoria (S14 + seed 24).
+- El reparto de CPU en régimen permanente, incl. el camino `park`/
+  `wake_matching`, que hasta ahora no ejercitaba ningún test (`fairness.rs`).
+
+**NO guardado, y hay que decirlo:**
+
+- **Que el aging corra.** S8 (aging desactivado del todo) solo lo cazan los
+  tests unitarios de `advance_ticks`. Ninguna propiedad de comportamiento del
+  scheduler lo nota, porque —medido— desactivar el aging no cambia el reparto
+  de CPU ni produce inanición. El hueco es real, pero cerrarlo exigiría que el
+  aging hiciera algo observable, y hoy no lo hace.
+- **`TrackedSchedulerGuard` y sus aserciones de IF=0.** Sin test de ninguna
+  clase, igual que antes de esta sesión. Vive en el adaptador, con el `Mutex` y
+  los `cli`/`sti`. `diag::IrqMutex` (paso 3) cerró el problema equivalente para
+  `BUDDY`/`SLAB_ALLOCATOR` de forma estructural en vez de con un test; aplicar
+  la misma idea aquí es el camino natural.
+- **`EXT2_LOCK`**, guardado solo implícitamente, y cuyo fallo es un cuelgue.
+  Sin cambios.
+- **Que `wake_matching` encole donde debe.** S13 no lo caza la conservación de
+  B1: la entidad sigue contada, solo que en la cola equivocada. Lo cazan tests
+  concretos, no la propiedad general.
+
+## Instrumentos retirados o corregidos
+
+- **`SLAB_LOCK_CONTENDED`: retirado** (`e631131`). No porque el bug esté
+  arreglado sino porque **no puede disparar**, con las cuatro patas verificadas
+  por lectura. Su doc comment era además factualmente falso desde `ab58dba`.
+- **`switches_total` bajo una carga fija: no vale como evidencia de cambios
+  pequeños.** Cuatro corridas de la carga idéntica en el mismo arranque dieron
+  2141, 2969, 2063, 2068 — más varianza que cualquier diferencia entre
+  versiones. Se usó (mal) en `52e7d00` para afirmar un "+5%"; corregido en
+  `33d528b`.
+- **`.min(base_priority())` en `age_processes`: código inalcanzable.** No es un
+  hueco de cobertura. Se documenta como tal en `sched/src/lib.rs`; borrarlo es
+  un cambio neutro que nadie ha hecho aún.
+- **`property_no_ready_entity_starves`: NO retirarlo.** El encargo pedía
+  renombrarlo o rehacerlo por "no guardar lo que dice". Medido: sí guarda algo
+  real. Lo que estaba mal era el sabotaje con que se validó (quitar el aging);
+  el correcto es quitar el decay, y con ese cae.
