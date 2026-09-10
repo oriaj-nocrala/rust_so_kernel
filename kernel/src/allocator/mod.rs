@@ -204,37 +204,24 @@ static SLAB_ALLOCATOR: Mutex<mm::slab::SlabAllocator> = Mutex::new(mm::slab::Sla
 
 pub struct SlabGlobalAlloc;
 
-// Always-on canary for a reentrant acquisition of this lock — see
-// `kernel::debug::SLAB_LOCK_CONTENDED`. Allocation-free on purpose
-// (`serial_println_raw!` + a plain atomic) so it cannot recurse into the
-// allocator it is watching.
-//
-// **Must be called with interrupts already disabled**, i.e. from inside the
-// `without_interrupts` block that guards the real acquisition — never before
-// it. This originally ran *outside*, on the reasoning that a momentary
-// `try_lock` probe is self-contained. It is not: when `try_lock` *succeeds*
-// it really does hold the lock until the returned guard drops, and doing that
-// with interrupts enabled recreates precisely the window the `without_interrupts`
-// discipline exists to close. A timer landing in it sends the ISR's own
-// allocation into the reentrant `.lock()` that spins forever — so the canary
-// caused the very deadlock it was added to detect, at a measured ~2 boots in
-// 24. From in here it can no longer open that window, and it still catches the
-// case that remains possible: a *direct* reentrant allocation from within the
-// allocator's own critical section, which no `cli` can prevent.
-#[inline]
-fn probe_contention() {
-    if SLAB_ALLOCATOR.try_lock().is_none() {
-        crate::debug::inc_slab_lock_contended();
-        crate::serial_println_raw!(
-            "[ALLOC] SLAB_ALLOCATOR already held on this CPU — reentrant lock, about to spin (self-deadlock signature)"
-        );
-    }
-}
+// A `try_lock()` canary for a reentrant acquisition of `SLAB_ALLOCATOR`
+// (`probe_contention`, feeding `kernel::debug`'s former `SLAB_LOCK_CONTENDED`
+// counter) used to sit here. Removed not because the bug it caught is fixed,
+// but because it can no longer fire: `mm` links no `alloc` at all (can't
+// allocate), `KernelPhysMap::virt_for` is pure address arithmetic,
+// `KernelFrameSource` forwards to `phys_alloc`/`phys_free` which take
+// `BUDDY` — a different lock — and `serial_println_raw!` writes through a
+// zero-sized `core::fmt::Write` with no allocation. Nothing that runs while
+// `SLAB_ALLOCATOR` is held can re-enter it. It also has a worse-than-neutral
+// history: placed outside `without_interrupts` it once *caused* the
+// reentrant-lock deadlock it existed to detect, ~2 boots in 24. The
+// `without_interrupts` wrapping below is the real, still-active protection
+// (see CLAUDE.md's "Key Design Invariants") — this comment marks only where
+// the extra probe used to sit.
 
 unsafe impl GlobalAlloc for SlabGlobalAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let result = without_interrupts(|| {
-            probe_contention();
             SLAB_ALLOCATOR.lock().allocate(&KernelPhysMap, &KernelFrameSource, layout)
         });
         log_alloc_event(&result.event);
@@ -243,7 +230,6 @@ unsafe impl GlobalAlloc for SlabGlobalAlloc {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let event = without_interrupts(|| {
-            probe_contention();
             SLAB_ALLOCATOR.lock().deallocate(&KernelPhysMap, &KernelFrameSource, ptr, layout)
         });
         log_dealloc_event(&event);
