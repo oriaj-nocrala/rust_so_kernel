@@ -11,8 +11,9 @@
 //! specifically does NOT move the tick counters (`remaining_ticks`,
 //! `global_ticks` — step 4) or the pick-next scans (step 3).
 
-use alloc::{boxed::Box, collections::VecDeque};
+use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 
+use crate::invariants::Violation;
 use crate::{queue_index, quantum_for, SchedEntity, AGING_EPOCH, MIN_EFFECTIVE_PRIORITY, NUM_PRIORITIES};
 
 /// The run queues, wait queue, and pid counter for one scheduler instance.
@@ -404,16 +405,148 @@ impl<E: SchedEntity> SchedCore<E> {
         }
         self.remaining_ticks == 0
     }
+
+    // ========================================================================
+    // Invariant checking (step 5)
+    // ========================================================================
+
+    /// Check every structural invariant this type is responsible for,
+    /// returning the first violation found.
+    ///
+    /// Lives here rather than in `invariants.rs` (where [`Violation`] itself
+    /// lives) because it needs direct access to the private `run_queues`
+    /// field. The alternative — a `pub(crate)` accessor onto `run_queues` so
+    /// `invariants.rs` could implement this itself — was rejected: it would
+    /// add API surface whose only purpose is letting one file reach across a
+    /// module boundary this crate deliberately drew (see the doc comment on
+    /// the `run_queues` field itself: it "is reachable from nowhere outside
+    /// this module"). Keeping the method beside the field it reads keeps
+    /// that sentence true in the strongest sense — not just "outside the
+    /// crate", but "outside this one module" — for zero extra surface.
+    ///
+    /// Checks, strictly in this order (each check runs to completion over
+    /// every relevant entity before the next one starts, so if multiple
+    /// violations exist simultaneously, the earlier-numbered check's is
+    /// always the one returned):
+    ///
+    /// 1. **`MisplacedEntity`** — every entity in `run_queues[i]` must have
+    ///    `queue_index(effective_priority()) == i`. This is the invariant
+    ///    the whole extraction exists to buy: the clamp used to be
+    ///    copy-pasted at 7 call sites in the kernel with nothing checking
+    ///    they agreed.
+    ///
+    /// 2. **`PriorityOutOfRange`** — **run queues only**. For every run-queue
+    ///    entity, `floor <= effective_priority() <= base_priority()`, where
+    ///    `floor = MIN_EFFECTIVE_PRIORITY.min(base_priority())`. The floor is
+    ///    written that way, not simply `MIN_EFFECTIVE_PRIORITY`, because the
+    ///    idle entity has base priority 0 (`kernel/src/init/processes.rs`
+    ///    gives idle priority 0, and `Process::set_priority` sets base and
+    ///    effective to the same clamped value) — strictly below
+    ///    `MIN_EFFECTIVE_PRIORITY` (1). A plain floor of 1 would flag idle on
+    ///    every real boot.
+    ///
+    ///    **The wait queue is deliberately excluded from this check.** The
+    ///    core only takes custody of parked entities — `park`/`wake_matching`
+    ///    never touch a parked entity's priority — so there is no band a
+    ///    parked entity's priority is obliged to sit in. This is a scoping
+    ///    decision, not an oversight: applying the run-queue band to the wait
+    ///    queue would mean enforcing an invariant this type never actually
+    ///    maintains there.
+    ///
+    /// 3. **`DuplicatePid`** — no pid appears twice across the run queues
+    ///    plus the wait queue. Most of today's operations genuinely cannot
+    ///    trip this: each one moves an **owned** `Box<E>` from one container
+    ///    to another, never `Clone`s it, so producing a duplicate pid out of
+    ///    a single already-unique population is not something
+    ///    `requeue_ready`/`requeue_preempted`/`wake_matching`/`park`/
+    ///    `age_processes` can do by themselves. But pid uniqueness in the
+    ///    first place is [`Self::allocate_pid`]'s job, not something this
+    ///    check re-derives from nothing — and sabotaging *that* one
+    ///    operation (removing its `next_pid += 1`, so two calls hand out the
+    ///    same pid) reliably trips this check: verified directly, not
+    ///    assumed (Sabotage F, this step's report) — `check_invariants`
+    ///    reports `DuplicatePid` the moment a second same-pid entity is
+    ///    created and both are simultaneously queued.
+    ///
+    /// **What this cannot see:** an entity the adapter is holding outside
+    /// the core — the kernel's `running: Option<Box<Process>>` slot
+    /// deliberately stays in `kernel/src/process/scheduler.rs` (see the
+    /// extraction plan's decision 2). "Every entity is in exactly one
+    /// container" — counting `running` as a container — is therefore NOT a
+    /// property this method can verify on its own: while an entity sits in
+    /// `running`, this core does not know it exists at all. Conservation
+    /// across that boundary can only be checked by a harness that models the
+    /// running slot itself, which is exactly what this crate's property test
+    /// `property_random_operations_preserve_invariants_and_conservation`
+    /// (in `invariants.rs`) does, by keeping its own `Option<Box<Ent>>`
+    /// stand-in and asserting `iter_queued().count() + running.is_some() as
+    /// usize` equals the number of entities ever created.
+    pub fn check_invariants(&self) -> Result<(), Violation> {
+        // (1) MisplacedEntity — over ALL run-queue entities before (2) ever
+        // starts, so a misplaced entity is always reported ahead of an
+        // out-of-range one when both exist.
+        for (found_in, queue) in self.run_queues.iter().enumerate() {
+            for entity in queue.iter() {
+                let effective = entity.effective_priority();
+                let expected = queue_index(effective);
+                if found_in != expected {
+                    return Err(Violation::MisplacedEntity {
+                        pid: entity.pid(),
+                        found_in,
+                        expected,
+                        effective,
+                    });
+                }
+            }
+        }
+
+        // (2) PriorityOutOfRange — run queues only, see doc comment above.
+        for queue in self.run_queues.iter() {
+            for entity in queue.iter() {
+                let effective = entity.effective_priority();
+                let base = entity.base_priority();
+                let floor = MIN_EFFECTIVE_PRIORITY.min(base);
+                if effective < floor || effective > base {
+                    return Err(Violation::PriorityOutOfRange {
+                        pid: entity.pid(),
+                        effective,
+                        base,
+                        floor,
+                    });
+                }
+            }
+        }
+
+        // (3) DuplicatePid — across run queues plus the wait queue.
+        let mut seen: Vec<usize> = Vec::new();
+        for entity in self.iter_queued() {
+            let pid = entity.pid();
+            if seen.contains(&pid) {
+                return Err(Violation::DuplicatePid { pid });
+            }
+            seen.push(pid);
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Minimal test entity — same role as `lib.rs`'s `TestEntity`, kept
     /// separate (and named differently) since this module tests the core's
     /// queue behavior, not just the trait's plain accessors.
-    struct Ent {
+    ///
+    /// `pub(crate)` (along with [`ent`]/[`parked`] below): step 5's property
+    /// tests in `invariants.rs` reuse this exact type rather than defining an
+    /// equivalent of their own, so both test suites exercise `SchedCore`
+    /// through the identical `SchedEntity` impl. Its fields stay private —
+    /// nothing outside this module needs them; `invariants.rs` only ever
+    /// touches `Ent` through the `SchedEntity` trait and the two
+    /// constructors.
+    pub(crate) struct Ent {
         pid: usize,
         base: u8,
         eff: u8,
@@ -460,11 +593,11 @@ mod tests {
         assert_eq!(core.run_queues[idx][0].effective_priority(), eff);
     }
 
-    fn ent(pid: usize, base: u8, eff: u8) -> Box<Ent> {
+    pub(crate) fn ent(pid: usize, base: u8, eff: u8) -> Box<Ent> {
         Box::new(Ent { pid, base, eff, ready: true })
     }
 
-    fn parked(pid: usize, base: u8, eff: u8) -> Box<Ent> {
+    pub(crate) fn parked(pid: usize, base: u8, eff: u8) -> Box<Ent> {
         Box::new(Ent { pid, base, eff, ready: false })
     }
 
