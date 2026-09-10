@@ -14,7 +14,7 @@
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 
 use crate::invariants::Violation;
-use crate::{queue_index, quantum_for, SchedEntity, AGING_EPOCH, MIN_EFFECTIVE_PRIORITY, NUM_PRIORITIES};
+use crate::{queue_index, quantum_for, Clock, SchedEntity, AGING_EPOCH, MIN_EFFECTIVE_PRIORITY, NUM_PRIORITIES};
 
 /// The run queues, wait queue, and pid counter for one scheduler instance.
 ///
@@ -49,9 +49,20 @@ pub struct SchedCore<E: SchedEntity> {
     /// `Scheduler::remaining_ticks`.
     remaining_ticks: u32,
 
-    /// Global tick counter for aging epochs. Moved out of
-    /// `Scheduler::global_ticks`.
-    global_ticks: u32,
+    /// The [`Clock`] reading at which the most recent aging epoch was
+    /// declared (or 0, if none ever has been).
+    ///
+    /// Replaces the old free-running `global_ticks: u32` counter this core
+    /// used to own and increment itself. That counter is gone, not renamed
+    /// — ticks now live wherever the injected `Clock` says they live (a
+    /// kernel-owned `AtomicU64` in production, a `FakeClock` in tests, see
+    /// `crate::clock`), and this field only remembers the one thing
+    /// `advance_ticks` needs to detect the next crossing: where the last one
+    /// happened. `u64`, matching `Clock::now_ticks`'s return type, not the
+    /// old field's `u32` — there is no longer a wrapping-every-~4-billion-
+    /// ticks concern to inherit from a counter this type doesn't own
+    /// anymore.
+    last_epoch_tick: u64,
 }
 
 impl<E: SchedEntity> SchedCore<E> {
@@ -67,7 +78,7 @@ impl<E: SchedEntity> SchedCore<E> {
             wait_queue: VecDeque::new(),
             next_pid: 1,
             remaining_ticks: 0,
-            global_ticks: 0,
+            last_epoch_tick: 0,
         }
     }
 
@@ -378,22 +389,57 @@ impl<E: SchedEntity> SchedCore<E> {
         self.remaining_ticks = quantum_for(effective_priority);
     }
 
-    /// Advance the global tick counter by one and report whether this tick
-    /// lands on an aging epoch.
+    /// Read `clock` and report whether an aging epoch has been crossed
+    /// since the last time this returned `true` (or since this `SchedCore`
+    /// was created, if it never has).
     ///
     /// Split out of the kernel's old `Scheduler::tick` as its own method,
     /// rather than folded into one `tick()` here, because the kernel's tick
     /// handler interleaves two `retain` passes over `pending_stack_frees` /
-    /// `pending_vma_frees` between the global-counter bump and the
+    /// `pending_vma_frees` between the tick-counter read and the
     /// aging-epoch check — both of those call into real physical-memory
     /// freeing that cannot leave the kernel (they're not expressible in
     /// terms of `SchedEntity`). Splitting `tick` into `advance_ticks`, the
     /// kernel's own retain passes, then `age_processes`/`consume_quantum`
     /// preserves that exact ordering instead of forcing it all into one
     /// opaque call.
-    pub fn advance_ticks(&mut self) -> bool {
-        self.global_ticks = self.global_ticks.wrapping_add(1);
-        self.global_ticks % AGING_EPOCH == 0
+    ///
+    /// **Why this is a crossing check (`now - last >= AGING_EPOCH`), not the
+    /// modulo check (`ticks % AGING_EPOCH == 0`) this replaced.** The old
+    /// check was only ever correct because its own counter guaranteed the
+    /// precondition it silently relied on: `global_ticks` was incremented by
+    /// exactly 1 on every single call, so it visited every integer in
+    /// sequence and a modulo test was equivalent to "did we just cross a
+    /// multiple". Reading an injected [`Clock`] instead breaks that
+    /// precondition on purpose — a real clock backing a coalesced or
+    /// missed-tick path, and deliberately a `FakeClock` under test (see
+    /// `crate::clock`), can both report a jump of more than one tick between
+    /// two calls. A modulo check over such a jump can step over the exact
+    /// multiple and silently skip an entire aging epoch (e.g. `last = 40`,
+    /// `now = 61`: no value in `41..=61` is a multiple of `AGING_EPOCH`
+    /// (50), so `now % AGING_EPOCH == 0` never fires even though a whole
+    /// epoch boundary — 50 — was crossed). The crossing check instead asks
+    /// the only question that stays correct regardless of step size: "is the
+    /// distance since the last declared epoch at least one epoch's worth",
+    /// which is true exactly when a boundary was passed, jumped over or
+    /// landed on exactly. `wrapping_sub`, to stay well-defined across a
+    /// `u64` wraparound the same way the old field's `wrapping_add` did
+    /// (`now` can never lie behind `last_epoch_tick` in practice — `Clock`'s
+    /// own contract forbids going backwards — but wrapping arithmetic keeps
+    /// this total rather than leaning on that guarantee to avoid a panic).
+    ///
+    /// See `advance_ticks_matches_old_modulo_formula_under_one_tick_per_call`
+    /// (below) for the proof that this and the old formula agree exactly
+    /// when ticks really do arrive one at a time, which is what production
+    /// does today (see the kernel adapter's `KernelClock`).
+    pub fn advance_ticks(&mut self, clock: &impl Clock) -> bool {
+        let now = clock.now_ticks();
+        if now.wrapping_sub(self.last_epoch_tick) >= AGING_EPOCH as u64 {
+            self.last_epoch_tick = now;
+            true
+        } else {
+            false
+        }
     }
 
     /// Consume one tick of the running entity's slice. Returns whether the
@@ -537,6 +583,7 @@ impl<E: SchedEntity> SchedCore<E> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::FakeClock;
 
     /// Minimal test entity — same role as `lib.rs`'s `TestEntity`, kept
     /// separate (and named differently) since this module tests the core's
@@ -1132,38 +1179,72 @@ pub(crate) mod tests {
 
     /// 30. `advance_ticks` returns `false` for the first `AGING_EPOCH - 1`
     /// calls and `true` on exactly the `AGING_EPOCH`-th, then `false` again
-    /// right after. Pins "increment before the modulo": sabotage A (modulo
-    /// before increment) would report `true` on call 1 (0 % AGING_EPOCH ==
-    /// 0) instead of call `AGING_EPOCH`.
+    /// right after, when the clock is advanced by exactly one tick between
+    /// calls (the kernel's real cadence — see `KernelClock` in the kernel
+    /// adapter). Pins "crossing, not modulo, relative to the last declared
+    /// epoch": sabotage S10 (`>` instead of `>=`) would push the first
+    /// `true` to call `AGING_EPOCH + 1` instead of `AGING_EPOCH`.
     #[test]
     fn advance_ticks_first_true_is_at_aging_epoch() {
         let mut core = SchedCore::<Ent>::new();
+        let clock = FakeClock::new();
         let mut first_true = None;
         for i in 1..=AGING_EPOCH {
-            if core.advance_ticks() {
+            clock.advance(1);
+            if core.advance_ticks(&clock) {
                 first_true = Some(i);
                 break;
             }
         }
         assert_eq!(first_true, Some(AGING_EPOCH), "the first `true` must land exactly on the AGING_EPOCH-th call");
-        assert!(!core.advance_ticks(), "the very next call after an epoch must be false again");
+        clock.advance(1);
+        assert!(!core.advance_ticks(&clock), "the very next call after an epoch must be false again");
     }
 
     /// 31. `advance_ticks` returns `true` on exactly the multiples of
-    /// `AGING_EPOCH`, across 3 full epochs. Sabotage B (`!= 0` instead of
-    /// `== 0`) would flip this to true everywhere EXCEPT the multiples,
-    /// producing a vector nothing like `[AGING_EPOCH, 2*AGING_EPOCH,
-    /// 3*AGING_EPOCH]`.
+    /// `AGING_EPOCH`, across 3 full epochs, under the same one-tick-per-call
+    /// cadence as test 30. Sabotage S11 (not updating `last_epoch_tick` when
+    /// it fires) would make every call after the first epoch return `true`
+    /// forever instead of only on later multiples, producing a vector
+    /// nothing like `[AGING_EPOCH, 2*AGING_EPOCH, 3*AGING_EPOCH]`.
     #[test]
     fn advance_ticks_true_on_every_multiple_of_aging_epoch() {
         let mut core = SchedCore::<Ent>::new();
+        let clock = FakeClock::new();
         let mut true_indices = alloc::vec::Vec::new();
         for i in 1..=(3 * AGING_EPOCH) {
-            if core.advance_ticks() {
+            clock.advance(1);
+            if core.advance_ticks(&clock) {
                 true_indices.push(i);
             }
         }
         assert_eq!(true_indices, alloc::vec![AGING_EPOCH, 2 * AGING_EPOCH, 3 * AGING_EPOCH]);
+    }
+
+    /// New: equivalence with the old `global_ticks % AGING_EPOCH == 0`
+    /// formula, under the one-tick-per-call cadence production actually
+    /// uses. This is the test that justifies the crossing-check rewrite as a
+    /// pure refactor rather than a behavior change: it drives a `FakeClock`
+    /// through 1, 2, 3, ..., 500 — exactly mirroring `global_ticks` after
+    /// each of the old code's `wrapping_add(1)` calls — and asserts
+    /// `advance_ticks` returns `true` at exactly the same call indices the
+    /// old modulo formula would have. See `advance_ticks`'s doc comment for
+    /// why the two formulas can diverge once ticks stop arriving one at a
+    /// time (they never do here) — this test is the evidence for the "when
+    /// they do arrive one at a time" half of that claim.
+    #[test]
+    fn advance_ticks_matches_old_modulo_formula_under_one_tick_per_call() {
+        let mut core = SchedCore::<Ent>::new();
+        let clock = FakeClock::new();
+        for n in 1u64..=500 {
+            clock.advance(1);
+            let new_behavior = core.advance_ticks(&clock);
+            let old_behavior = n % AGING_EPOCH as u64 == 0;
+            assert_eq!(
+                new_behavior, old_behavior,
+                "tick {n}: new crossing-check result must match the old `global_ticks % AGING_EPOCH == 0` formula"
+            );
+        }
     }
 
     /// 32. `advance_ticks` and `consume_quantum` are independent counters:
@@ -1176,17 +1257,21 @@ pub(crate) mod tests {
     #[test]
     fn advance_ticks_and_consume_quantum_are_independent() {
         let mut core = SchedCore::<Ent>::new();
+        let clock = FakeClock::new();
         core.start_slice(1); // quantum_for(1) == 3
 
         // Interleave: advance_ticks (never hits an epoch here, well below
         // AGING_EPOCH) then consume_quantum, three times — the slice must
         // still take exactly 3 consume_quantum calls to exhaust, unaffected
         // by the interleaved advance_ticks calls.
-        assert!(!core.advance_ticks());
+        clock.advance(1);
+        assert!(!core.advance_ticks(&clock));
         assert!(!core.consume_quantum());
-        assert!(!core.advance_ticks());
+        clock.advance(1);
+        assert!(!core.advance_ticks(&clock));
         assert!(!core.consume_quantum());
-        assert!(!core.advance_ticks());
+        clock.advance(1);
+        assert!(!core.advance_ticks(&clock));
         assert!(core.consume_quantum(), "third consume_quantum must exhaust the quantum_for(1) == 3 slice");
 
         // Now drive advance_ticks the rest of the way to its own epoch,
@@ -1196,7 +1281,8 @@ pub(crate) mod tests {
         // interleaved consume_quantum calls.
         let mut first_true = None;
         for i in 4..=AGING_EPOCH {
-            let aging_due = core.advance_ticks();
+            clock.advance(1);
+            let aging_due = core.advance_ticks(&clock);
             assert!(core.consume_quantum(), "an exhausted, never-rearmed slice must keep reporting exhausted");
             if aging_due {
                 first_true = Some(i);

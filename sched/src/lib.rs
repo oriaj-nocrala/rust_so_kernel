@@ -139,6 +139,9 @@ extern crate alloc;
 pub mod entity;
 pub use entity::SchedEntity;
 
+pub mod clock;
+pub use clock::{Clock, FakeClock};
+
 pub mod core;
 pub use core::SchedCore;
 

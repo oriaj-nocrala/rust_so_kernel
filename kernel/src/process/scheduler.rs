@@ -27,7 +27,7 @@
 //     leaking RAX..R15 from the killed process into the next one.
 
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Thin wrapper around `spin::MutexGuard<Scheduler>` that (1) reports every
 /// acquire/release through `debug::SCHEDULER_LOCK` — permanent, always-on
@@ -227,6 +227,58 @@ fn clear_current_fast() {
 // behind `SchedCore::start_slice`/`advance_ticks`/`consume_quantum` — see
 // `docs/sched/sched-extraction-plan.md` step 4 — so none of them need to be
 // imported here anymore.
+
+// ============================================================================
+// Tick source for SchedCore::advance_ticks (docs/prompt-sched-bugs.md's
+// injectable-clock step)
+// ============================================================================
+//
+// `SchedCore` no longer owns a tick counter itself — `advance_ticks` now
+// takes a `&impl sched::Clock` and only remembers *where* the last aging
+// epoch was declared (see that method's doc comment in `sched/src/core.rs`).
+// Something has to own the counter it used to own internally, and that
+// something is here, in the adapter, not in `sched`, for the same reason
+// `TrapFrame`/`fxsave`/CR3 stay here: it's real hardware-adjacent state, not
+// plain data the host-testable core can hold.
+//
+// One `AtomicU64` PER CPU, not one shared counter — `SCHEDULERS[cpu]` is
+// already itself per-CPU (each entry owns an entirely independent
+// `SchedCore`, hence an entirely independent `global_ticks` before this
+// change), so a single shared tick source would let one CPU's ticks push
+// another CPU's `SchedCore` across an aging-epoch boundary it never actually
+// reached — a real behavior change, not just a refactor, the moment more
+// than one entry in `SCHEDULERS` is ever actually ticking (today's kernel is
+// single-CPU — `cpu::cpu_id()` always returns 0 — so this array has exactly
+// one live element in practice, but the shape must still match `SCHEDULERS`
+// to stay correct if/when that changes).
+static TICKS: [AtomicU64; crate::cpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
+
+/// Adapts `TICKS` to `sched::Clock`.
+///
+/// This is deliberately option (a) from the two considered for this step —
+/// a plain kernel-owned counter, incremented once per `Scheduler::tick()`
+/// call, reproducing `global_ticks`'s exact "one call, one tick" cadence —
+/// and NOT option (b), hooking the real clocksource `kernel::time`
+/// already has (TSC-backed, jiffies fallback — see CLAUDE.md's "Time
+/// Subsystem" section). (b) is more honest about what "50 ticks" should
+/// mean (wall-clock time instead of "50 timer-ISR firings, however long
+/// those actually took"), but it changes the aging cadence the moment a
+/// tick is ever coalesced, delayed, or skipped relative to real time — and
+/// this step's whole point is proving the clock-injection refactor changes
+/// nothing about production behavior. (a) has zero behavior-change risk by
+/// construction: it counts exactly what `global_ticks` used to count, just
+/// one call frame further out. (b) is left as a documented, deliberately
+/// NOT taken next step, same as the crate-level doc comment's "Known
+/// limitations" section already does for the aging bug this crate
+/// inherited unfixed.
+struct KernelClock;
+
+impl sched::Clock for KernelClock {
+    fn now_ticks(&self) -> u64 {
+        TICKS[crate::cpu::cpu_id()].load(Ordering::Relaxed)
+    }
+}
 
 static SCHEDULERS: [Mutex<Scheduler>; crate::cpu::MAX_CPUS] = [
     Mutex::new(Scheduler::new()),
@@ -839,7 +891,12 @@ impl Scheduler {
     /// address the preempted code had pushed to. It guards the deferred
     /// kernel-stack frees below.
     pub fn tick(&mut self, interrupted_rsp: u64) -> bool {
-        let aging_due = self.core.advance_ticks();
+        // Bump this CPU's own tick counter BEFORE reading it back through
+        // `KernelClock` — same order as the old `self.global_ticks =
+        // self.global_ticks.wrapping_add(1)` this replaces (increment,
+        // then the epoch check sees the post-increment value).
+        TICKS[crate::cpu::cpu_id()].fetch_add(1, Ordering::Relaxed);
+        let aging_due = self.core.advance_ticks(&KernelClock);
 
         // Deferred kernel-stack frees. The old comment here claimed reaching
         // a new tick means the CPU already executed some process's iretq since

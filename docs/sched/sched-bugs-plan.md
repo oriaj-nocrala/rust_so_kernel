@@ -33,10 +33,76 @@ Verificado además, a mano, lo que el encargo afirmaba:
 
 ## Decisión del usuario (2026-09-10)
 
-**Bug 1+2 → MLFQ real: el aging puede elevar la prioridad efectiva POR ENCIMA
-de la base.** El decay por preempción la devuelve. Entran también el paso 6
-(docs), el bug 4 (retirar `SLAB_LOCK_CONTENDED`), el bug 5 (adoptar
-`diag::IrqMutex`) y el bug 6 (los huecos de test).
+**Bug 1+2 → MLFQ real**, más el paso 6 (docs), el bug 4 (retirar
+`SLAB_LOCK_CONTENDED`), el bug 5 (adoptar `diag::IrqMutex`) y el bug 6 (los
+huecos de test).
+
+## Revisión de esa decisión, a mitad de sesión (2026-09-10, tras `52e7d00`)
+
+**El MLFQ se descartó, ya empezado, y el trabajo se tiró.** No por cambiar de
+opinión: porque medirlo mejor lo desmontó. Queda escrito aquí entero porque el
+camino a la conclusión vale más que la conclusión.
+
+El paso 4 (arreglar el bucle de aging) **por sí solo eliminó la inanición
+perpetua**, que era la razón de ser del MLFQ:
+
+| bases | antes del paso 4 | después |
+|---|---|---|
+| `[1,3,6,10]` | pid1 **NUNCA** en 200.000 | pid1@19 |
+| `[2,4,6,8,10]` | pid1 y pid2 **NUNCA** | pid1@26, pid2@15 |
+
+Con la inanición ya cerrada, la pregunta pasó a ser qué aportaba el MLFQ, y
+para responderla hubo que admitir que **el instrumento era malo**. El harness
+de inanición (heredado de la sesión anterior, y reproducido tal cual al
+principio de esta) mide un único escenario degenerado: N entidades siempre
+ejecutables que nunca bloquean, y una métrica *transitoria* y binaria — "¿en
+qué iteración fue elegida cada una la primera vez?". Cuatro agujeros
+concretos:
+
+- **`park`/`wake_matching` no se ejercitan jamás.** Nada bloquea. Pero el
+  camino que más pesa en la interactividad real es el despertar.
+- **No mide régimen permanente.** `@19` frente a `@16` no dice nada sobre qué
+  fracción de CPU acaba recibiendo cada entidad, que es lo que importa.
+- **No hay oráculo.** Los tests fijan lo que el código hace, no lo que debería
+  hacer. Por eso "mentían": todos se derivaron del comportamiento observado.
+- **No hay reloj falso.** El de esta misma línea de trabajo. Solo se puede
+  medir en iteraciones, no en tiempo, así que no hay latencias.
+
+Con un instrumento nuevo (reparto de CPU en régimen permanente + latencia de
+despertar, sobre un mix con tareas que **sí** bloquean, 2.000.000 de ticks,
+200.000 descartados de warm-up), el resultado fue:
+
+| escenario | aging ON | aging OFF | MLFQ |
+|---|---|---|---|
+| 4 CPU-bound, base 5 | `25/25/25/25` | `25/25/25/25` | `25/25/25/25` |
+| 4 CPU-bound, bases `[1,3,6,10]` | `24/24/26/26` | `25/25/25/25` | `25/25/25/25` |
+| 3 CPU-bound + 1 interactiva | idéntico | idéntico | idéntico |
+| hogs base 8 + interactiva base 3 | idéntico | idéntico | idéntico |
+
+**En régimen permanente la prioridad base no hace nada.** El decay arrastra a
+todo el mundo al suelo (`MIN_EFFECTIVE_PRIORITY`) y allí rotan FIFO por igual;
+las 11 colas son decorativas pasado el transitorio. Y **MLFQ ≡ aging OFF** en
+los cuatro escenarios. El aging actual es el único de los tres que se desvía,
+y lo hace en la dirección equivocada (`24/24/26/26`: favorece a los de base
+alta).
+
+Sobre escalar/SMP, que fue la pregunta que disparó la revisión: el MLFQ es
+política *intra*-CPU y no aporta nada ahí. El estado real es que
+`cpu::cpu_id()` devuelve la constante `0` (`kernel/src/cpu/mod.rs:13`), no hay
+arranque de APs (ni un `INIT_IPI`/`SIPI` en el árbol), y no hay balanceo ni
+afinidad; `SCHEDULERS[MAX_CPUS]` es andamiaje con un solo elemento vivo.
+Además el aging tal como está es **hostil** a SMP: recorre las 11 colas
+enteras cada `AGING_EPOCH` ticks con el lock del scheduler tomado, O(procesos)
+bajo lock. Y el obstáculo serio para SMP no son las atómicas sino que
+`SchedCore` usa `VecDeque<Box<E>>`, que **asigna** — asignar bajo el lock del
+scheduler es exactamente el deadlock que costó meses (`slab_lock_self_deadlock`).
+
+**Rumbo elegido en su lugar:** construir primero el reloj inyectable que esta
+línea prometió y no entregó, y promover el harness de equidad a tests reales
+del crate. Es el prerequisito para evaluar cualquier política —incluida la
+actual— y deja el terreno listo tanto para un modelo de tiempo virtual
+(vruntime, que haría que las prioridades signifiquen algo en régimen
+permanente y es *menos* código que lo que hay) como para SMP de verdad.
 
 ## Hallazgo que reordena el trabajo
 
@@ -129,7 +195,12 @@ CPU-bound del paso 1.
 equivocado: se reescribe para fijar el correcto, y se deja escrito en su doc
 comment que fijaba lo contrario y por qué.
 
-### Paso 5 — el techo pasa de la base a `NUM_PRIORITIES - 1` (bug 1, MLFQ)
+### Paso 5 — DESCARTADO (era: el techo pasa de la base a `NUM_PRIORITIES - 1`)
+
+> Sustituido por **el reloj inyectable** — ver "Revisión de esa decisión" arriba.
+> Lo que sigue es el encargo original, conservado porque su punto crítico (el
+> invariante que el MLFQ rompe) sigue siendo cierto y volverá a aparecer si
+> alguien retoma esta idea.
 
 El cambio de política. `age_processes` sube hacia el techo global, no hacia la
 base; `requeue_preempted` baja hasta `MIN_EFFECTIVE_PRIORITY`, sin cambios. Sin
@@ -151,9 +222,27 @@ Arrastra, y por eso va aquí y no en otro sitio:
   carga idéntica, y se comprueba que el sistema sigue respondiendo
   (Ctrl-Z/`fg`, un job en background, `ps` mientras gira un bucle CPU-bound).
 
-### Paso 6 — los dos trozos inertes (bug 3)
+### Paso 6 — los dos trozos inertes (bug 3) — PARCIALMENTE HECHO EN EL PASO 4
 
-Solo tiene sentido después del 5, porque el 5 es lo que los despierta:
+Corrección medida: **el paso 4 despertó uno de los dos, sin necesidad del 5.**
+Sustituir `queue_index(effective)` por `queue_index(base)` en el `push_back`
+de `age_processes` (el sabotaje S4) pasó de no tumbar nada a **tumbar 4
+tests**, uno de ellos el property test preexistente
+`property_random_operations_preserve_invariants_and_conservation`, vía
+`MisplacedEntity`. Era indistinguible **porque** el bucle ascendente convergía
+a `effective == base` antes de acabar la pasada, haciendo ambas expresiones el
+mismo valor en el momento de encolar; con el ascenso gradual difieren mientras
+la entidad sube. Así que el encargo se equivocaba al llamarlo "hueco no
+cerrable": estaba tapado por el bug 2, y arreglar el bug 2 lo cerró solo.
+
+**Sigue inerte** `.min(base_priority())` (sabotaje S3: quitarlo deja los 45
+tests en verde). Y seguirá inerte mientras el techo del aging sea la base: la
+rama solo entra cuando `eff < base` y suma exactamente 1, así que
+`eff + 1 <= base` siempre. No es un hueco de cobertura, es código
+inalcanzable — o se borra, o se cambia el techo (que era lo que hacía el
+MLFQ descartado).
+
+Lo que sigue es el encargo original:
 
 - `.min(base_priority())` desaparece, sustituido por un clamp al techo global.
   El test renombrado a `age_processes_stops_exactly_at_base` cambia de
@@ -165,6 +254,18 @@ Solo tiene sentido después del 5, porque el 5 es lo que los despierta:
   hallazgo, y se dice.
 
 ### Paso 7 — los huecos de test que quedan (bug 6)
+
+**Corrección medida sobre `property_no_ready_entity_starves`.** El encargo
+decía que con MLFQ desactivar el aging la tumbaría. Es falso, y no por el
+MLFQ: **desactivar el aging no produce inanición en ningún modo** (la entidad
+de base más baja se elige en la iteración 16 de las 200 que el test permite,
+con aging ON, OFF o MLFQ). Ese sabotaje no puede validar ese test nunca.
+
+La razón, y es el hallazgo que hay que fijar: **lo que evita la inanición no
+es el aging, es el decay de `requeue_preempted`** — la entidad de base alta
+que monopoliza la CPU decae hasta el suelo y deja de ganar. El sabotaje que
+debería validar ese test es por tanto **quitar el decay**, no quitar el aging.
+Sin ejecutar todavía; es el primer trabajo de este paso.
 
 - Seeds de `property_random_operations_preserve_invariants_and_conservation`
   que **sí** alcancen una entidad en `effective == base == MIN` vuelta a

@@ -46,7 +46,7 @@ mod tests {
     use super::*;
     use crate::core::tests::{ent, parked, Ent};
     use crate::core::SchedCore;
-    use crate::{SchedEntity, MIN_EFFECTIVE_PRIORITY, NUM_PRIORITIES};
+    use crate::{FakeClock, SchedEntity, MIN_EFFECTIVE_PRIORITY, NUM_PRIORITIES};
     use alloc::boxed::Box;
 
     // ========================================================================
@@ -115,6 +115,7 @@ mod tests {
         for seed in seeds {
             let mut rng = Xorshift64::new(seed);
             let mut core = SchedCore::<Ent>::new();
+            let clock = FakeClock::new();
             let mut running: Option<Box<Ent>> = None;
             let mut created_pids: Vec<usize> = Vec::new();
 
@@ -180,7 +181,12 @@ mod tests {
                     }
                     7 => core.age_processes(),
                     8 => {
-                        core.advance_ticks();
+                        // One tick per op-8 draw, same "one call == one
+                        // tick" cadence the old owned counter had — the
+                        // fake clock is what now provides that cadence
+                        // instead of `advance_ticks` incrementing it itself.
+                        clock.advance(1);
+                        core.advance_ticks(&clock);
                     }
                     9 => {
                         core.consume_quantum();
@@ -256,6 +262,7 @@ mod tests {
         const ITERATIONS: usize = 200;
 
         let mut core = SchedCore::<Ent>::new();
+        let clock = FakeClock::new();
         core.add_reset_to_base(ent(0, 0, 0)); // idle: pid 0, base 0
 
         let bases: [u8; 3] = [1, 5, 10];
@@ -287,7 +294,8 @@ mod tests {
             let eff = entity.effective_priority();
             core.start_slice(eff);
             loop {
-                let epoch_due = core.advance_ticks();
+                clock.advance(1);
+                let epoch_due = core.advance_ticks(&clock);
                 let exhausted = core.consume_quantum();
                 if epoch_due {
                     core.age_processes();
