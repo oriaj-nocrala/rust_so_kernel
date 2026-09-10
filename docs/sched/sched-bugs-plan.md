@@ -393,3 +393,44 @@ los implementó. "0" no es un fallo del sabotaje: es el hallazgo.
   renombrarlo o rehacerlo por "no guardar lo que dice". Medido: sí guarda algo
   real. Lo que estaba mal era el sabotaje con que se validó (quitar el aging);
   el correcto es quitar el decay, y con ese cae.
+
+---
+
+## Siguiente paso propuesto: vruntime — alcance medido (2026-09-10)
+
+Decidido no empezarlo en esta sesión. Estos números se midieron al evaluarlo,
+para que la próxima no tenga que re-derivarlos.
+
+**Por qué vruntime y no más heurísticas de aging:** hoy la prioridad base **no
+determina el reparto de CPU en régimen permanente** (ver la tabla de arriba y
+`sched/src/fairness.rs`). Un modelo de tiempo virtual es lo que hace que sí lo
+determine, y es *menos* código que las 11 colas + decay + aging que hay ahora.
+El instrumento para evaluarlo ya existe: `fairness.rs` + `sched::FakeClock`.
+
+**Superficie a tocar, contada:**
+
+- **18 métodos** distintos de `SchedCore` usados por el adaptador, en **31 call
+  sites** (`grep -oE "\.core\.[a-z_]+\(" kernel/src/process/scheduler.rs`).
+- **25 usos** de `priority`/`effective_priority` en `kernel/src/`, más el campo
+  en `Process` y el trait `SchedEntity`.
+- `kernel/src/process/scheduler.rs` son 1232 líneas; `sched/src/core.rs`, 1318.
+
+**Cuatro cosas que NO son opcionales** si se quiere que quede mejor que lo
+actual, y no peor:
+
+1. **`min_vruntime` + `place_entity`.** Sin esto, un proceso que ha dormido
+   mucho despierta con un vruntime bajísimo y monopoliza la CPU. Es el punto
+   donde un vruntime a medias es peor que el decay+aging de hoy.
+2. **El idle necesita tratamiento aparte.** En CFS es una clase de scheduling
+   distinta, no una entidad con peso muy bajo. Aquí hoy se distingue por
+   `is_idle()` (`pid == 0`) en `age_processes`/`requeue_preempted`/
+   `take_first_startable`.
+3. **`take_first_startable`** tiene semántica propia de arranque (salta la cola
+   0, salta el idle, puede sacar del medio de una cola) y está documentado por
+   qué unificarlo con `pop_next_ready` arrancaría el sistema en el idle.
+4. **El slice deja de ser `quantum_for`** (`BASE_QUANTUM + eff_pri * BONUS`) y
+   pasa a ser latencia objetivo / nº de ejecutables, ponderado.
+
+**Lo que vruntime NO arregla:** la estructura ordenada sigue asignando, así que
+el obstáculo real para SMP —asignar bajo el lock del scheduler— sigue ahí. Eso
+es trabajo aparte, igual que `cpu_id()` real, el arranque de APs y el balanceo.
