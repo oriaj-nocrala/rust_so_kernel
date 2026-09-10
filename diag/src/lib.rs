@@ -80,12 +80,14 @@ extern crate alloc;
 
 pub mod dirlock;
 pub mod ifviolation;
+pub mod irqmutex;
 pub mod lock;
 pub mod tfrewind;
 pub mod tracked;
 
 pub use dirlock::DirLockDiag;
 pub use ifviolation::IfViolationDiag;
+pub use irqmutex::{IrqControl, IrqMutex};
 pub use lock::LockDiag;
 pub use tracked::{LockObserver, TrackedGuard, TrackedMutex};
 pub use tfrewind::{RewindEvent, TfRewindDiag};
