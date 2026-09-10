@@ -20,8 +20,6 @@
 //! six-line xorshift64 PRNG seeded with fixed constants, so every run is
 //! exactly as deterministic as any other test in this crate.
 
-use alloc::vec::Vec;
-
 /// A structural invariant of [`crate::SchedCore`] that does not hold.
 ///
 /// Returned by `SchedCore::check_invariants`. See that method's doc comment
@@ -44,6 +42,11 @@ pub enum Violation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Lives here rather than at module scope: `Violation` itself needs no
+    // `Vec`, so a top-level import was unused in every non-test build — a
+    // warning `cargo test` structurally cannot show, since the module that
+    // uses it only exists under `cfg(test)`.
+    use alloc::vec::Vec;
     use crate::core::tests::{ent, parked, Ent};
     use crate::core::SchedCore;
     use crate::{FakeClock, SchedEntity, MIN_EFFECTIVE_PRIORITY, NUM_PRIORITIES};
@@ -110,7 +113,17 @@ mod tests {
     #[test]
     fn property_random_operations_preserve_invariants_and_conservation() {
         const OPS_PER_SEED: usize = 2000;
-        let seeds: [u64; 5] = [1, 2, 3, 12345, 0xDEAD_BEEF];
+        // Seed 24 is not decorative: it is the only one of these that ever
+        // reaches an entity with `effective == base == MIN_EFFECTIVE_PRIORITY`
+        // being preempted again (at op 37), i.e. the one state where
+        // `requeue_preempted`'s floor guard is what stops a decay below the
+        // legal range. Found by probing, not by taste — the original five
+        // seeds never reach it, because `pop_next_ready` is strict-priority
+        // and a base-1 entity is almost never the one running. The floor
+        // itself is also covered directly by
+        // `requeue_preempted_does_not_decay_below_floor`; this makes the
+        // randomized suite reach it too.
+        let seeds: [u64; 6] = [1, 2, 3, 12345, 0xDEAD_BEEF, 24];
 
         for seed in seeds {
             let mut rng = Xorshift64::new(seed);
