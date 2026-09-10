@@ -27,9 +27,7 @@ pub fn init_core(phys_mem_offset: VirtAddr, memory_regions: &'static MemoryRegio
     memory::init(phys_mem_offset);
 
     // Initialize Buddy allocator — sole owner of all usable physical memory.
-    {
-        let mut buddy = allocator::BUDDY.lock();
-
+    allocator::BUDDY.with(|buddy| {
         for region in memory_regions.iter() {
             if region.kind == MemoryRegionKind::Usable {
                 unsafe {
@@ -37,7 +35,7 @@ pub fn init_core(phys_mem_offset: VirtAddr, memory_regions: &'static MemoryRegio
                 }
             }
         }
-    }
+    });
 
     serial_println!("Buddy stats:");
     allocator::debug_print_buddy_stats();

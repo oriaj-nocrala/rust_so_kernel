@@ -381,15 +381,14 @@ impl OwnedPageTable {
         &self,
         page: Page<Size2MiB>,
     ) -> Result<(), &'static str> {
-        let mut buddy = crate::allocator::BUDDY.lock();
-        self.unmap_page_and_free_2m_with_buddy(page, &mut buddy)
+        crate::allocator::BUDDY.with(|buddy| self.unmap_page_and_free_2m_with_buddy(page, buddy))
     }
 
     /// Same as `unmap_page_and_free_2m`, but takes an already-locked Buddy
     /// instead of locking it itself — lets a caller that obtained the lock
-    /// via `try_lock()` (because blocking isn't safe in its context, e.g.
+    /// via `try_with()` (because blocking isn't safe in its context, e.g.
     /// ISR/tick — see `AddressSpace::try_free_huge_vma`) reuse this without
-    /// a second, nested `lock()` call.
+    /// a second, nested acquisition.
     ///
     /// # Safety
     /// Must be called with interrupts disabled (cli).

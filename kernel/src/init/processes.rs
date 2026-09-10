@@ -123,30 +123,27 @@ pub fn free_kernel_stack(stack_top: VirtAddr) {
 /// `pending_stack_frees` drain): that ISR can interrupt *any* kernel code,
 /// including a heap allocation that's mid-way through a slab→Buddy refill
 /// with the Buddy lock already held and interrupts still enabled (nothing
-/// before this ever called `BUDDY.lock()` from an ISR, so ordinary heap
-/// allocations were never written to guard against that reentrancy). A
-/// blocking `.lock()` there spins forever: the interrupted code can't run
-/// again to release the lock until this same ISR returns, which it never
-/// does. Confirmed live — the very first version of this code (calling
-/// `free_kernel_stack` unconditionally from `tick()`) froze the kernel
-/// solid (idle task never reached its `hlt`, vCPU pegged at ~25% CPU)
-/// within a second or two of boot.
+/// before this ever called `BUDDY.with(...)` blockingly from an ISR, so
+/// ordinary heap allocations were never written to guard against that
+/// reentrancy). A blocking acquisition there spins forever: the interrupted
+/// code can't run again to release the lock until this same ISR returns,
+/// which it never does. Confirmed live — the very first version of this
+/// code (calling `free_kernel_stack` unconditionally from `tick()`) froze
+/// the kernel solid (idle task never reached its `hlt`, vCPU pegged at
+/// ~25% CPU) within a second or two of boot.
 pub fn try_free_kernel_stack(stack_top: VirtAddr) -> bool {
     let (virt_base, phys_base) = kernel_stack_base(stack_top);
-    match crate::allocator::BUDDY.try_lock() {
-        Some(mut buddy) => {
-            unsafe {
-                // Page-table-only, no locks involved — safe to do
-                // unconditionally before the try_lock'd deallocate below.
-                crate::memory::page_table_manager::remap_kernel_guard_page(virt_base)
-                    .expect("Failed to remove kernel stack guard page before freeing");
-                let event = buddy.deallocate(&crate::allocator::KernelPhysMap, phys_base, KERNEL_STACK_ORDER);
-                crate::allocator::log_phantom_event(event);
-            }
-            true
+    let result = crate::allocator::BUDDY.try_with(|buddy| {
+        unsafe {
+            // Page-table-only, no locks involved — safe to do
+            // unconditionally before the try_with'd deallocate below.
+            crate::memory::page_table_manager::remap_kernel_guard_page(virt_base)
+                .expect("Failed to remove kernel stack guard page before freeing");
+            let event = buddy.deallocate(&crate::allocator::KernelPhysMap, phys_base, KERNEL_STACK_ORDER);
+            crate::allocator::log_phantom_event(event);
         }
-        None => false,
-    }
+    });
+    result.is_some()
 }
 
 // ============================================================================

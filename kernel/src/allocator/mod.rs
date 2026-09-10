@@ -28,8 +28,7 @@
 //   - Page table operations go through OwnedPageTable (page_table_manager.rs).
 
 use core::alloc::{GlobalAlloc, Layout};
-use spin::Mutex;
-use x86_64::instructions::interrupts::without_interrupts;
+use diag::{IrqControl, IrqMutex};
 use x86_64::PhysAddr;
 
 // Re-exported so existing call sites can keep saying
@@ -60,6 +59,24 @@ impl mm::FrameSource for KernelFrameSource {
     }
     unsafe fn free_order(&self, addr: PhysAddr, order: usize) {
         phys_free(addr, order)
+    }
+}
+
+/// Production [`diag::IrqControl`]: forwards straight to
+/// `x86_64::instructions::interrupts`, the same idiom `KernelPhysMap`/
+/// `KernelFrameSource` above use for their own seams. Literal forwarding
+/// only — this exists so `BUDDY`/`SLAB_ALLOCATOR` can be `diag::IrqMutex`s
+/// with byte-for-byte the same runtime behavior the hand-written
+/// `without_interrupts` call sites had before.
+pub(crate) struct KernelIrq;
+
+impl IrqControl for KernelIrq {
+    fn are_enabled() -> bool {
+        x86_64::instructions::interrupts::are_enabled()
+    }
+
+    fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
+        x86_64::instructions::interrupts::without_interrupts(f)
     }
 }
 
@@ -95,31 +112,36 @@ pub(crate) fn log_phantom_event(event: Option<mm::buddy::PhantomEvent>) {
 
 // Global instance — the sole owner of physical frames after init (see
 // CLAUDE.md's "Key Design Invariants").
-pub static BUDDY: Mutex<BuddyAllocator> = Mutex::new(BuddyAllocator::new());
+pub static BUDDY: IrqMutex<BuddyAllocator, KernelIrq> = IrqMutex::new(BuddyAllocator::new());
 
 // ── Interrupt safety ────────────────────────────────────────────────────────
 //
-// `BUDDY` and `SLAB_ALLOCATOR` are both plain `spin::Mutex`es with no `cli`
-// discipline of their own — every acquisition site below wraps its critical
-// section in `without_interrupts` instead. This is the same invariant
-// CLAUDE.md already documents for `SCHEDULER` ("always cli before acquiring
-// it, sti after releasing — the timer ISR acquires the lock too"), applied
-// here for the first time: found missing via a real, reproducible ~1-in-10
-// debug-build boot hang (`busybox --install` at boot, see the
-// `debug_hang_selfdeadlock` session). Mechanism, confirmed live via
-// gdbstub: ordinary (interruptible) kernel code — e.g. `sys_mkdir` →
-// `vfs::resolve_inner`, which allocates a `Vec<&str>` to split the path —
-// can hold one of these locks when the timer fires; `timer_preempt_handler`
-// → `Scheduler::switch_to_next` can itself need to allocate (growing a run
-// queue's `VecDeque`), reentering the SAME non-reentrant `spin::Mutex` on
-// the SAME CPU. Since this kernel is single-core, that reentrant `.lock()`
-// call can only ever be from the code it just interrupted — it spins
-// forever, 100% CPU, no progress, matching the reported symptom exactly.
+// `BUDDY` and `SLAB_ALLOCATOR` are both `diag::IrqMutex<_, KernelIrq>` —
+// not plain `spin::Mutex`es — so the "disable interrupts, then lock" order
+// is the type's own job rather than a discipline every call site has to
+// remember. There is no `.lock()`/`.try_lock()` on either static; the only
+// way to reach the protected value is `with`/`try_with`, which disable
+// interrupts first and take the real lock only inside that closure. This is
+// the same invariant CLAUDE.md already documents for `SCHEDULER` ("always
+// cli before acquiring it, sti after releasing — the timer ISR acquires the
+// lock too"), made structural here instead of convention-only: found
+// missing via a real, reproducible ~1-in-10 debug-build boot hang
+// (`busybox --install` at boot, see the `debug_hang_selfdeadlock` session).
+// Mechanism, confirmed live via gdbstub: ordinary (interruptible) kernel
+// code — e.g. `sys_mkdir` → `vfs::resolve_inner`, which allocates a
+// `Vec<&str>` to split the path — can hold one of these locks when the
+// timer fires; `timer_preempt_handler` → `Scheduler::switch_to_next` can
+// itself need to allocate (growing a run queue's `VecDeque`), reentering
+// the SAME non-reentrant lock on the SAME CPU. Since this kernel is
+// single-core, that reentrant acquisition can only ever be from the code it
+// just interrupted — it spins forever, 100% CPU, no progress, matching the
+// reported symptom exactly.
 //
-// `without_interrupts` (not a bare `cli`/`sti` pair) because it saves and
-// restores the *previous* interrupt-enable state rather than unconditionally
-// forcing interrupts back on — safe to call from a context that already has
-// them disabled (the timer ISR itself, or any other `without_interrupts`/
+// `IrqMutex::with`/`try_with` disable interrupts via `without_interrupts`
+// (not a bare `cli`/`sti` pair) because that saves and restores the
+// *previous* interrupt-enable state rather than unconditionally forcing
+// interrupts back on — safe to call from a context that already has them
+// disabled (the timer ISR itself, or any other `with`/`without_interrupts`/
 // `cli`-protected caller), which a hand-rolled `cli; ...; sti` would not be.
 // Accepted cost: interrupt latency around every kernel heap/physical-frame
 // allocation — the correct trade for closing a self-deadlock that a purely
@@ -130,7 +152,7 @@ pub static BUDDY: Mutex<BuddyAllocator> = Mutex::new(BuddyAllocator::new());
 
 /// Allocate 2^order bytes of physical memory from the global buddy allocator.
 pub unsafe fn phys_alloc(order: usize) -> Option<PhysAddr> {
-    let result = without_interrupts(|| BUDDY.lock().allocate(&KernelPhysMap, order));
+    let result = BUDDY.with(|b| b.allocate(&KernelPhysMap, order));
     if result.is_none() {
         crate::serial_println_raw!("Buddy: OOM for order {}", order);
     }
@@ -139,24 +161,21 @@ pub unsafe fn phys_alloc(order: usize) -> Option<PhysAddr> {
 
 /// Return 2^order bytes of physical memory to the buddy allocator.
 pub unsafe fn phys_free(addr: PhysAddr, order: usize) {
-    let event = without_interrupts(|| BUDDY.lock().deallocate(&KernelPhysMap, addr, order));
+    let event = BUDDY.with(|b| b.deallocate(&KernelPhysMap, addr, order));
     log_phantom_event(event);
 }
 
 /// (total_bytes, free_bytes) read from a single `BUDDY` lock acquisition —
 /// used wherever both figures need to come from the same instant
-/// (`/proc/meminfo`, `statvfs`). Same values `BUDDY.lock().total_bytes()` /
+/// (`/proc/meminfo`, `statvfs`). Same values `BUDDY.with(|b| b.total_bytes())` /
 /// `.free_bytes(&KernelPhysMap)` always returned.
 pub fn mem_stats() -> (u64, u64) {
-    without_interrupts(|| {
-        let buddy = BUDDY.lock();
-        (buddy.total_bytes(), buddy.free_bytes(&KernelPhysMap))
-    })
+    BUDDY.with(|buddy| (buddy.total_bytes(), buddy.free_bytes(&KernelPhysMap)))
 }
 
 /// Free physical memory, in bytes. See `mem_stats` if you also need the total.
 pub fn free_bytes() -> u64 {
-    without_interrupts(|| BUDDY.lock().free_bytes(&KernelPhysMap))
+    BUDDY.with(|b| b.free_bytes(&KernelPhysMap))
 }
 
 /// Debug: print Buddy allocator statistics (was `BuddyAllocator::
@@ -169,8 +188,7 @@ pub fn free_bytes() -> u64 {
 /// the actual `serial_println_raw!` calls happen afterward, with
 /// interrupts back on.
 pub fn debug_print_buddy_stats() {
-    let (total, bitmap_bytes, stats) = without_interrupts(|| {
-        let buddy = BUDDY.lock();
+    let (total, bitmap_bytes, stats) = BUDDY.with(|buddy| {
         (buddy.total_bytes(), buddy.bitmap_bytes(), buddy.order_stats(&KernelPhysMap))
     });
 
@@ -200,7 +218,8 @@ pub fn debug_print_buddy_stats() {
 // Slab / GlobalAlloc
 // ============================================================================
 
-static SLAB_ALLOCATOR: Mutex<mm::slab::SlabAllocator> = Mutex::new(mm::slab::SlabAllocator::new());
+static SLAB_ALLOCATOR: IrqMutex<mm::slab::SlabAllocator, KernelIrq> =
+    IrqMutex::new(mm::slab::SlabAllocator::new());
 
 pub struct SlabGlobalAlloc;
 
@@ -214,24 +233,20 @@ pub struct SlabGlobalAlloc;
 // zero-sized `core::fmt::Write` with no allocation. Nothing that runs while
 // `SLAB_ALLOCATOR` is held can re-enter it. It also has a worse-than-neutral
 // history: placed outside `without_interrupts` it once *caused* the
-// reentrant-lock deadlock it existed to detect, ~2 boots in 24. The
-// `without_interrupts` wrapping below is the real, still-active protection
-// (see CLAUDE.md's "Key Design Invariants") — this comment marks only where
-// the extra probe used to sit.
+// reentrant-lock deadlock it existed to detect, ~2 boots in 24. `IrqMutex`'s
+// `with`/`try_with` (see CLAUDE.md's "Key Design Invariants") are the real,
+// still-active protection now — this comment marks only where the extra
+// probe used to sit.
 
 unsafe impl GlobalAlloc for SlabGlobalAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let result = without_interrupts(|| {
-            SLAB_ALLOCATOR.lock().allocate(&KernelPhysMap, &KernelFrameSource, layout)
-        });
+        let result = SLAB_ALLOCATOR.with(|s| s.allocate(&KernelPhysMap, &KernelFrameSource, layout));
         log_alloc_event(&result.event);
         result.ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let event = without_interrupts(|| {
-            SLAB_ALLOCATOR.lock().deallocate(&KernelPhysMap, &KernelFrameSource, ptr, layout)
-        });
+        let event = SLAB_ALLOCATOR.with(|s| s.deallocate(&KernelPhysMap, &KernelFrameSource, ptr, layout));
         log_dealloc_event(&event);
     }
 }
@@ -293,7 +308,7 @@ pub fn slab_stats() {
     // `cache_stats()` returns an owned, fixed-size array (see mm::slab), so
     // — same as `debug_print_buddy_stats` above — the interrupts-disabled
     // window only needs to cover the lock + the call itself, not the prints.
-    let stats = without_interrupts(|| SLAB_ALLOCATOR.lock().cache_stats());
+    let stats = SLAB_ALLOCATOR.with(|s| s.cache_stats());
     crate::serial_println_raw!("Slab Allocator Stats:");
     for (size_class, total, used) in stats {
         if total > 0 {

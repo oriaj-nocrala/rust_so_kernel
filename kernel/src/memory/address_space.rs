@@ -479,18 +479,15 @@ impl AddressSpace {
     /// doc comment) — no COW refcount involved, unlike the 4 KiB Anonymous
     /// path `sys_munmap` also supports.
     pub unsafe fn try_free_huge_vma(&self, start: u64, size_pages: usize) -> bool {
-        let mut buddy = match crate::allocator::BUDDY.try_lock() {
-            Some(b) => b,
-            None => return false,
-        };
-
-        let n_huge = size_pages / 512;
-        for i in 0..n_huge {
-            let va = start + i as u64 * 0x200_000;
-            let page = Page::<Size2MiB>::containing_address(VirtAddr::new(va));
-            let _ = self.page_table.unmap_page_and_free_2m_with_buddy(page, &mut buddy);
-        }
-        let _ = self.vmas.lock().remove(start);
-        true
+        let result = crate::allocator::BUDDY.try_with(|buddy| {
+            let n_huge = size_pages / 512;
+            for i in 0..n_huge {
+                let va = start + i as u64 * 0x200_000;
+                let page = Page::<Size2MiB>::containing_address(VirtAddr::new(va));
+                let _ = self.page_table.unmap_page_and_free_2m_with_buddy(page, buddy);
+            }
+            let _ = self.vmas.lock().remove(start);
+        });
+        result.is_some()
     }
 }
