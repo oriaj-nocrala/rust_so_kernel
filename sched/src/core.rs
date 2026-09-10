@@ -305,42 +305,45 @@ impl<E: SchedEntity> SchedCore<E> {
     // ========================================================================
 
     /// Boost every Ready entity's effective priority toward its base
-    /// priority — except this is not quite what it looks like it does.
-    /// Read the second subtlety below before touching this method.
+    /// priority, one step per call — exactly what the `+1` right here and
+    /// the module comment in `kernel/src/process/scheduler.rs` ("Every
+    /// AGING_EPOCH ticks: boost waiting processes' eff_pri toward base")
+    /// both say it does.
     ///
     /// Moved verbatim out of `Scheduler::age_processes`, translating field
     /// access to this core's own `run_queues` and the trait accessors
     /// (`pid.0 == 0` → `is_idle()`, `effective_priority`/`priority` →
-    /// `effective_priority()`/`base_priority()`).
+    /// `effective_priority()`/`base_priority()`) — except for the outer
+    /// loop's direction, fixed here (see subtlety (b)).
     ///
-    /// Two subtleties, preserved deliberately here, not cleaned up:
+    /// Two subtleties:
     ///
     /// (a) `i` is NOT incremented after a requeue
     /// (`self.run_queues[pri].remove(i)`) — `remove(i)` shifts every later
     /// element down by one, so the next entity to examine has already
-    /// shifted into position `i`. Incrementing `i` here would skip it.
+    /// shifted into position `i`. Incrementing `i` here would skip it. This
+    /// stays correct under the descending outer loop too: nothing about it
+    /// depends on which direction the outer loop runs.
     ///
-    /// (b) **The important one, and it is not what the code looks like it
-    /// does.** The outer loop runs ASCENDING (`0..NUM_PRIORITIES`) while
-    /// aging moves entities UPWARD into queues the loop has not visited
-    /// yet — so the same entity gets found again at its new, higher index
-    /// and aged again, repeatedly, within this single call. The net effect
-    /// of one `age_processes()` call is therefore NOT "+1 toward base": it
-    /// restores an entity all the way TO its base priority in a single
-    /// pass. This contradicts the natural reading of both the `+1` right
-    /// here and the module comment in `kernel/src/process/scheduler.rs`
-    /// ("Every AGING_EPOCH ticks: boost waiting processes' eff_pri toward
-    /// base" reads like a gradual, one-step-per-epoch climb, not an
-    /// immediate full restoration). This has been verified by actually
-    /// executing a verbatim replica of this loop — not merely by reading
-    /// the code — that an entity with base 8 sitting at effective priority
-    /// 1 in queue 1 ends the single pass at effective priority 8, in queue
-    /// 8 (see the `age_processes_pins_multi_boost_within_single_call`
-    /// test below). This is preserved here deliberately BECAUSE this step
-    /// is a mechanical refactor, not because it is endorsed as correct
-    /// scheduling behavior.
+    /// (b) **The important one.** The outer loop runs DESCENDING
+    /// (`(0..NUM_PRIORITIES).rev()`), not ascending. Aging only ever moves
+    /// an entity UPWARD (into `queue_index(effective + 1)`, which is always
+    /// `>=` its current queue), so a descending outer loop has already
+    /// finished visiting every queue index an entity could be promoted
+    /// into by the time it processes that entity — the promoted entity
+    /// lands in an already-visited queue and is never found again this
+    /// call. An ascending loop (the bug this replaced — see git history /
+    /// the doc comment this one overwrote) does the opposite: it moves a
+    /// promoted entity into a queue the loop has NOT visited yet, so the
+    /// same entity gets re-found and re-aged repeatedly within one call,
+    /// turning "+1 per call" into "restore all the way to base in one
+    /// call". Verified directly, not just reasoned about: an entity with
+    /// base 8 sitting at effective priority 1 in queue 1 now ends a single
+    /// `age_processes()` call at effective priority 2, in queue 2 (see
+    /// `age_processes_boosts_exactly_one_step_per_call` below), where the
+    /// old ascending loop drove it all the way to 8.
     pub fn age_processes(&mut self) {
-        for pri in 0..NUM_PRIORITIES {
+        for pri in (0..NUM_PRIORITIES).rev() {
             let mut i = 0;
             while i < self.run_queues[pri].len() {
                 let entity = &self.run_queues[pri][i];
@@ -923,25 +926,30 @@ pub(crate) mod tests {
         assert_eq!(queued[0].effective_priority(), 2, "idle entity must never be aged");
     }
 
-    /// 24. The multi-boost behavior, pinned explicitly: an entity with base
-    /// 8 sitting at effective priority 1 in queue 1 ends a SINGLE
-    /// `age_processes()` call at effective priority 8, in queue 8.
+    /// 24. The one-step-per-call behavior, pinned explicitly: an entity
+    /// with base 8 sitting at effective priority 1 in queue 1 ends a SINGLE
+    /// `age_processes()` call at effective priority 2, in queue 2 — not at
+    /// its base.
     ///
-    /// This pins TODAY's behavior. It is NOT the "+1 per epoch" that the
-    /// `+1` in `age_processes`'s own body and the module comment in
+    /// This test used to be named
+    /// `age_processes_pins_multi_boost_within_single_call` and asserted the
+    /// entity landed at effective priority 8 (its base) after one call.
+    /// That pinned a real bug: the outer loop ran ASCENDING
+    /// (`0..NUM_PRIORITIES`), so aging (which only ever moves an entity
+    /// UPWARD to a higher queue index) kept re-finding and re-promoting the
+    /// same entity within one call, all the way to base, instead of the
+    /// single `+1` the code's own arithmetic and the module comment in
     /// `kernel/src/process/scheduler.rs` ("boost waiting processes' eff_pri
-    /// toward base") both suggest a reader should expect — the ascending
-    /// outer loop re-finds this same entity in every queue it gets promoted
-    /// into within this one call, aging it again each time, all the way to
-    /// base. Preserved here because this step is a mechanical refactor, not
-    /// because this is endorsed as correct scheduling behavior.
+    /// toward base") both describe. Fixed by making the outer loop
+    /// DESCENDING (`(0..NUM_PRIORITIES).rev()`) — see `age_processes`'s doc
+    /// comment for why that direction change is what stops the re-find.
     #[test]
-    fn age_processes_pins_multi_boost_within_single_call() {
+    fn age_processes_boosts_exactly_one_step_per_call() {
         let mut core = SchedCore::<Ent>::new();
         core.requeue_ready(ent(1, 8, 1)); // lands in queue 1
         core.age_processes();
-        // Queue 8, not queue 2: one pass, seven promotions.
-        assert_only_entity_at(&core, 8, 8);
+        // Queue 2, not queue 8: one call, exactly one promotion.
+        assert_only_entity_at(&core, 2, 2);
     }
 
     /// 25. Every entity in a queue gets processed exactly once by a single
@@ -954,10 +962,19 @@ pub(crate) mod tests {
     /// sabotage of this step.
     ///
     /// All four entities start in the same queue (index 2). Given today's
-    /// "restores fully to base within one call" behavior (test 24 above),
-    /// each of the three agable entities ends this single pass at its own
-    /// base priority; the one already at base is left untouched. Four in,
-    /// four out.
+    /// "+1 per call" behavior (test 24 above), each of the three agable
+    /// entities ends this single pass exactly one step above where it
+    /// started; the one already at base is left untouched. Four in, four
+    /// out.
+    ///
+    /// This test's expected values changed when `age_processes` was fixed
+    /// to age by one step per call instead of restoring all the way to
+    /// base within a single call (see `age_processes`'s doc comment and
+    /// `age_processes_boosts_exactly_one_step_per_call` above) — it used to
+    /// assert each agable entity landed on its own base priority
+    /// (`[(1, 4), (2, 6), (3, 9), (10, 2)]`); what it actually guards
+    /// (every entity visited exactly once, none skipped or duplicated) is
+    /// unchanged by that fix, only the per-entity post-aging value is.
     #[test]
     fn age_processes_processes_every_entity_in_a_queue_exactly_once() {
         let mut core = SchedCore::<Ent>::new();
@@ -970,7 +987,7 @@ pub(crate) mod tests {
         let mut result: alloc::vec::Vec<(usize, u8)> =
             core.iter_queued().map(|e| (e.pid(), e.effective_priority())).collect();
         result.sort();
-        assert_eq!(result, alloc::vec![(1, 4), (2, 6), (3, 9), (10, 2)]);
+        assert_eq!(result, alloc::vec![(1, 3), (2, 3), (3, 3), (10, 2)]);
     }
 
     /// 26. Aging stops exactly at base priority: an entity with base 3 at
@@ -994,6 +1011,62 @@ pub(crate) mod tests {
         core.requeue_ready(ent(1, 3, 2));
         core.age_processes();
         assert_only_entity_at(&core, 3, 3);
+    }
+
+    /// New: the outer loop's traversal direction matters. Three entities
+    /// start in three distinct, non-adjacent queues, all below their base
+    /// by more than one step. After a SINGLE `age_processes()` call, each
+    /// must have moved by exactly one step, landing in the queue matching
+    /// its new effective priority — no more.
+    ///
+    /// This is exactly the test an ascending outer loop (the old bug) would
+    /// fail: promoting the lowest entity moves it into a queue the
+    /// ascending scan has not visited yet, so the scan re-finds and
+    /// re-promotes it as it walks upward, cascading it (and anything it
+    /// meets along the way) toward base well past a single `+1`. A
+    /// descending loop never revisits a queue it already passed, so no
+    /// entity here can be found twice in one call. Sabotage S1 (reverting
+    /// the outer loop to ascending) targets exactly this.
+    #[test]
+    fn age_processes_outer_loop_order_determines_single_step_boost() {
+        let mut core = SchedCore::<Ent>::new();
+        core.requeue_ready(ent(1, 9, 2)); // queue 2, far below base 9
+        core.requeue_ready(ent(2, 9, 5)); // queue 5, far below base 9
+        core.requeue_ready(ent(3, 9, 7)); // queue 7, far below base 9
+        core.age_processes();
+
+        let mut result: alloc::vec::Vec<(usize, u8)> =
+            core.iter_queued().map(|e| (e.pid(), e.effective_priority())).collect();
+        result.sort();
+        assert_eq!(
+            result,
+            alloc::vec![(1, 3), (2, 6), (3, 8)],
+            "each entity must move by exactly one step, not cascade toward base"
+        );
+        core.check_invariants().expect("every entity must also sit in the queue matching its new priority");
+    }
+
+    /// New: repeated `age_processes()` calls converge an entity to its base
+    /// one step at a time, and further calls after it arrives are no-ops —
+    /// the gradual counterpart of the old (wrong) "one call restores fully"
+    /// behavior pinned by `age_processes_boosts_exactly_one_step_per_call`
+    /// above.
+    #[test]
+    fn age_processes_converges_to_base_over_repeated_calls_then_stops() {
+        let mut core = SchedCore::<Ent>::new();
+        core.requeue_ready(ent(1, 6, 1)); // 5 steps needed to reach base 6
+
+        for step in 1..=5 {
+            core.age_processes();
+            let eff = 1 + step;
+            assert_only_entity_at(&core, eff as usize, eff);
+        }
+
+        // Already at base -- further calls must not move it past base.
+        core.age_processes();
+        assert_only_entity_at(&core, 6, 6);
+        core.age_processes();
+        assert_only_entity_at(&core, 6, 6);
     }
 
     // ========================================================================

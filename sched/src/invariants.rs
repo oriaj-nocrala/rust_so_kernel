@@ -311,19 +311,28 @@ mod tests {
     // B3: age_processes restores every decayed entity to its base
     // ========================================================================
 
-    /// B3. Per `age_processes`'s doc comment in `core.rs`: a single call
-    /// does not nudge an entity one step toward its base — it restores it
-    /// **all the way** to base, because the outer loop's ascending scan
-    /// re-finds a just-boosted entity at its new, higher queue index within
-    /// the same call. This test pins that exact behavior at scale, across
-    /// several entities decayed all the way to the floor first.
+    /// B3. Per `age_processes`'s doc comment in `core.rs`, a single call
+    /// nudges each decayed entity exactly one step toward its base, not all
+    /// the way there. This test proves aging still reaches the base
+    /// eventually — by calling `age_processes()` repeatedly (once per
+    /// decayed step) and checking every entity lands exactly on its own
+    /// base, and that further calls afterward are no-ops — across several
+    /// entities decayed all the way to the floor first.
     ///
-    /// This pins TODAY's behavior, not endorsed scheduling semantics — same
-    /// caveat `age_processes`'s own doc comment and its
-    /// `age_processes_pins_multi_boost_within_single_call` test in `core.rs`
-    /// carry.
+    /// This test used to be named
+    /// `property_age_processes_restores_every_decayed_entity_to_base` and
+    /// called `age_processes()` exactly **once**, asserting that single
+    /// call alone restored every entity to base. That pinned a real bug in
+    /// the outer loop's direction (ascending, so a just-promoted entity got
+    /// re-found and re-promoted within the same call — see the "one step
+    /// per call" fix noted in `age_processes`'s doc comment and
+    /// `age_processes_boosts_exactly_one_step_per_call` in `core.rs`).
+    /// Rewritten to call `age_processes()` once per needed step instead of
+    /// once total — this is the more valuable shape: it proves aging still
+    /// *converges* to base under the fixed, gradual behavior, rather than
+    /// re-asserting the old (now wrong) "one call is enough" claim.
     #[test]
-    fn property_age_processes_restores_every_decayed_entity_to_base() {
+    fn property_age_processes_converges_every_decayed_entity_to_base() {
         let mut core = SchedCore::<Ent>::new();
         core.add_reset_to_base(ent(0, 0, 0)); // idle
 
@@ -364,15 +373,21 @@ mod tests {
             }
         }
 
-        // The actual property: ONE age_processes() call, not several.
-        core.age_processes();
+        // The actual property: REPEATED age_processes() calls converge
+        // every decayed entity to its base, one step per call. The highest
+        // base above is 10, decayed to the floor (1), so it needs 9 calls
+        // to reach base; 20 calls is deliberately generous headroom over
+        // that, not a tight bound, same style as the decay loop above.
+        for _ in 0..20 {
+            core.age_processes();
+        }
 
         for &(pid, base) in &pids {
             let found = core.iter_queued().find(|e| e.pid() == pid).expect("pid must still be queued");
             assert_eq!(
                 found.effective_priority(),
                 base,
-                "pid {pid} not restored all the way to its base {base} by a single age_processes() pass"
+                "pid {pid} did not converge to its base {base} under repeated age_processes() calls"
             );
         }
 
@@ -380,6 +395,19 @@ mod tests {
         // matching its new (== base) effective priority, not just that the
         // stored priority value itself is right.
         core.check_invariants().expect("restored entities must also sit in the queue matching their new priority");
+
+        // Further calls, once every entity already sits at its base, must
+        // be no-ops -- proves aging actually stops at the ceiling under
+        // repeated calls rather than drifting past it.
+        core.age_processes();
+        for &(pid, base) in &pids {
+            let found = core.iter_queued().find(|e| e.pid() == pid).expect("pid must still be queued");
+            assert_eq!(
+                found.effective_priority(),
+                base,
+                "pid {pid} moved off its base on a call after already reaching it"
+            );
+        }
     }
 
     // Sanity: `ent`/`parked` from `core::tests` really are usable from here,
