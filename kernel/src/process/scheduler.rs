@@ -227,7 +227,7 @@ fn clear_current_fast() {
 // keeping its own copy that could silently drift apart — see
 // `docs/sched/sched-extraction-plan.md`. `BASE_QUANTUM`/`PRIORITY_QUANTUM_BONUS`
 // are only used by `sched::quantum_for` itself, so they aren't imported here.
-use sched::{NUM_PRIORITIES, AGING_EPOCH};
+use sched::AGING_EPOCH;
 
 static SCHEDULERS: [Mutex<Scheduler>; crate::cpu::MAX_CPUS] = [
     Mutex::new(Scheduler::new()),
@@ -536,24 +536,22 @@ impl Scheduler {
         self.kill_current(reason);
 
         // Find and schedule next Ready process
-        for priority in (0..NUM_PRIORITIES).rev() {
-            if let Some(mut proc) = self.core.run_queue_mut(priority).pop_front() {
-                proc.state = ProcessState::Running;
+        if let Some(mut proc) = self.core.pop_next_ready() {
+            proc.state = ProcessState::Running;
 
-                unsafe {
-                    proc.address_space.activate();
-                }
-                super::tss::set_kernel_stack(proc.kernel_stack);
-                unsafe { super::fpu::restore(&proc.fpu_state); }
-
-                self.remaining_ticks = sched::quantum_for(proc.effective_priority);
-
-                tf_note_resume(&mut proc, "kill_and_switch_tf");
-                let tf_ptr = &*proc.trapframe as *const TrapFrame;
-                update_current_fast(&proc);
-                self.running = Some(proc);
-                return tf_ptr;
+            unsafe {
+                proc.address_space.activate();
             }
+            super::tss::set_kernel_stack(proc.kernel_stack);
+            unsafe { super::fpu::restore(&proc.fpu_state); }
+
+            self.remaining_ticks = sched::quantum_for(proc.effective_priority);
+
+            tf_note_resume(&mut proc, "kill_and_switch_tf");
+            let tf_ptr = &*proc.trapframe as *const TrapFrame;
+            update_current_fast(&proc);
+            self.running = Some(proc);
+            return tf_ptr;
         }
 
         panic!("No process to switch to after killing user process");
@@ -587,20 +585,18 @@ impl Scheduler {
         }
         clear_current_fast();
 
-        for priority in (0..NUM_PRIORITIES).rev() {
-            if let Some(mut proc) = self.core.run_queue_mut(priority).pop_front() {
-                proc.state = ProcessState::Running;
-                unsafe { proc.address_space.activate(); }
-                super::tss::set_kernel_stack(proc.kernel_stack);
-                write_fs_base(proc.fs_base);
-                unsafe { super::fpu::restore(&proc.fpu_state); }
-                self.remaining_ticks = sched::quantum_for(proc.effective_priority);
-                tf_note_resume(&mut proc, "stop_and_switch_tf");
-                let tf_ptr = &*proc.trapframe as *const TrapFrame;
-                update_current_fast(&proc);
-                self.running = Some(proc);
-                return tf_ptr;
-            }
+        if let Some(mut proc) = self.core.pop_next_ready() {
+            proc.state = ProcessState::Running;
+            unsafe { proc.address_space.activate(); }
+            super::tss::set_kernel_stack(proc.kernel_stack);
+            write_fs_base(proc.fs_base);
+            unsafe { super::fpu::restore(&proc.fpu_state); }
+            self.remaining_ticks = sched::quantum_for(proc.effective_priority);
+            tf_note_resume(&mut proc, "stop_and_switch_tf");
+            let tf_ptr = &*proc.trapframe as *const TrapFrame;
+            update_current_fast(&proc);
+            self.running = Some(proc);
+            return tf_ptr;
         }
 
         panic!("No process to switch to after stopping process");
@@ -663,20 +659,18 @@ impl Scheduler {
         // No process running on this CPU until we schedule the next one.
         clear_current_fast();
 
-        for priority in (0..NUM_PRIORITIES).rev() {
-            if let Some(mut proc) = self.core.run_queue_mut(priority).pop_front() {
-                proc.state = ProcessState::Running;
-                unsafe { proc.address_space.activate(); }
-                super::tss::set_kernel_stack(proc.kernel_stack);
-                write_fs_base(proc.fs_base);
-                unsafe { super::fpu::restore(&proc.fpu_state); }
-                self.remaining_ticks = sched::quantum_for(proc.effective_priority);
-                tf_note_resume(&mut proc, "block_current");
-                let tf_ptr = &*proc.trapframe as *const TrapFrame;
-                update_current_fast(&proc);
-                self.running = Some(proc);
-                return tf_ptr;
-            }
+        if let Some(mut proc) = self.core.pop_next_ready() {
+            proc.state = ProcessState::Running;
+            unsafe { proc.address_space.activate(); }
+            super::tss::set_kernel_stack(proc.kernel_stack);
+            write_fs_base(proc.fs_base);
+            unsafe { super::fpu::restore(&proc.fpu_state); }
+            self.remaining_ticks = sched::quantum_for(proc.effective_priority);
+            tf_note_resume(&mut proc, "block_current");
+            let tf_ptr = &*proc.trapframe as *const TrapFrame;
+            update_current_fast(&proc);
+            self.running = Some(proc);
+            return tf_ptr;
         }
 
         panic!("No process to switch to after blocking");
@@ -889,7 +883,7 @@ impl Scheduler {
         });
 
         if self.global_ticks % AGING_EPOCH == 0 {
-            self.age_processes();
+            self.core.age_processes();
         }
 
         if self.remaining_ticks > 0 {
@@ -897,36 +891,6 @@ impl Scheduler {
         }
 
         self.remaining_ticks == 0
-    }
-
-    // ====================================================================
-    // Priority aging
-    // ====================================================================
-
-    /// Boost effective_priority of all Ready processes in run queues
-    /// toward their base_priority.
-    fn age_processes(&mut self) {
-        for pri in 0..NUM_PRIORITIES {
-            let mut i = 0;
-            while i < self.core.run_queue(pri).len() {
-                let proc = &self.core.run_queue(pri)[i];
-
-                if proc.pid.0 == 0 {
-                    i += 1;
-                    continue;
-                }
-
-                if proc.effective_priority < proc.priority {
-                    let mut proc = self.core.run_queue_mut(pri).remove(i).unwrap();
-                    proc.effective_priority = (proc.effective_priority + 1).min(proc.priority);
-                    let new_pri = sched::queue_index(proc.effective_priority);
-                    self.core.run_queue_mut(new_pri).push_back(proc);
-                    // Don't increment i — next element shifted into position i
-                } else {
-                    i += 1;
-                }
-            }
-        }
     }
 
     // ====================================================================
@@ -967,26 +931,24 @@ impl Scheduler {
         // Run queues contain ONLY Ready processes, so no need to skip
         // Blocked/Zombie.  Just pop from front.
 
-        for priority in (0..NUM_PRIORITIES).rev() {
-            if let Some(mut proc) = self.core.run_queue_mut(priority).pop_front() {
-                proc.state = ProcessState::Running;
+        if let Some(mut proc) = self.core.pop_next_ready() {
+            proc.state = ProcessState::Running;
 
-                unsafe {
-                    proc.address_space.activate();
-                }
-                super::tss::set_kernel_stack(proc.kernel_stack);
-                write_fs_base(proc.fs_base);
-                unsafe { super::fpu::restore(&proc.fpu_state); }
-                crate::debug::inc_switches();
-
-                self.remaining_ticks = sched::quantum_for(proc.effective_priority);
-
-                tf_note_resume(&mut proc, "switch_to_next");
-                let tf_ptr = &*proc.trapframe as *const TrapFrame;
-                update_current_fast(&proc);
-                self.running = Some(proc);
-                return tf_ptr;
+            unsafe {
+                proc.address_space.activate();
             }
+            super::tss::set_kernel_stack(proc.kernel_stack);
+            write_fs_base(proc.fs_base);
+            unsafe { super::fpu::restore(&proc.fpu_state); }
+            crate::debug::inc_switches();
+
+            self.remaining_ticks = sched::quantum_for(proc.effective_priority);
+
+            tf_note_resume(&mut proc, "switch_to_next");
+            let tf_ptr = &*proc.trapframe as *const TrapFrame;
+            update_current_fast(&proc);
+            self.running = Some(proc);
+            return tf_ptr;
         }
 
         // ── 3. Nothing Ready (shouldn't happen if idle exists) ────────
@@ -999,52 +961,43 @@ impl Scheduler {
 
     pub fn start_first(&mut self) -> *const TrapFrame {
         crate::serial_println!("Available processes:");
-        for pri in (0..NUM_PRIORITIES).rev() {
-            for proc in self.core.run_queue(pri).iter() {
-                crate::serial_println!(
-                    "  PID {} (base pri {}, eff {}): {:?} - {:?}",
-                    proc.pid.0,
-                    proc.priority,
-                    proc.effective_priority,
-                    core::str::from_utf8(&proc.name)
-                        .unwrap_or("<?>")
-                        .trim_end_matches('\0'),
-                    proc.privilege,
-                );
-            }
+        for proc in self.core.iter_ready_desc() {
+            crate::serial_println!(
+                "  PID {} (base pri {}, eff {}): {:?} - {:?}",
+                proc.pid.0,
+                proc.priority,
+                proc.effective_priority,
+                core::str::from_utf8(&proc.name)
+                    .unwrap_or("<?>")
+                    .trim_end_matches('\0'),
+                proc.privilege,
+            );
         }
 
-        for priority in (1..NUM_PRIORITIES).rev() {
-            let queue = self.core.run_queue_mut(priority);
+        if let Some(mut proc) = self.core.take_first_startable() {
+            proc.state = ProcessState::Running;
 
-            for i in 0..queue.len() {
-                if queue[i].state == ProcessState::Ready && queue[i].pid.0 != 0 {
-                    let mut proc = queue.remove(i).unwrap();
-                    proc.state = ProcessState::Running;
+            crate::serial_println!(
+                "\n🚀 Starting first process: PID {} ({})",
+                proc.pid.0,
+                core::str::from_utf8(&proc.name)
+                    .unwrap_or("<invalid>")
+                    .trim_end_matches('\0'),
+            );
 
-                    crate::serial_println!(
-                        "\n🚀 Starting first process: PID {} ({})",
-                        proc.pid.0,
-                        core::str::from_utf8(&proc.name)
-                            .unwrap_or("<invalid>")
-                            .trim_end_matches('\0'),
-                    );
-
-                    super::tss::set_kernel_stack(proc.kernel_stack);
-                    unsafe {
-                        proc.address_space.activate();
-                    }
-                    unsafe { super::fpu::restore(&proc.fpu_state); }
-
-                    self.remaining_ticks = sched::quantum_for(proc.effective_priority);
-
-                    tf_note_resume(&mut proc, "start_first");
-                    let tf_ptr = &*proc.trapframe as *const TrapFrame;
-                    update_current_fast(&proc);
-                    self.running = Some(proc);
-                    return tf_ptr;
-                }
+            super::tss::set_kernel_stack(proc.kernel_stack);
+            unsafe {
+                proc.address_space.activate();
             }
+            unsafe { super::fpu::restore(&proc.fpu_state); }
+
+            self.remaining_ticks = sched::quantum_for(proc.effective_priority);
+
+            tf_note_resume(&mut proc, "start_first");
+            let tf_ptr = &*proc.trapframe as *const TrapFrame;
+            update_current_fast(&proc);
+            self.running = Some(proc);
+            return tf_ptr;
         }
 
         panic!("No process to start!");

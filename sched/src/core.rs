@@ -22,12 +22,11 @@ use crate::{queue_index, SchedEntity, MIN_EFFECTIVE_PRIORITY, NUM_PRIORITIES};
 /// some separate table, so the kernel adapter keeps storing real `Box
 /// <Process>` values, unchanged.
 ///
-/// All three fields are private. In particular `run_queues` is reachable
-/// from nowhere outside this module (aside from the two TEMPORARY index
-/// accessors at the bottom, deleted in step 3) — that's what makes "queue
-/// index == queue_index(effective priority) of everything in it" an
-/// invariant this type can actually enforce, rather than a convention that
-/// used to be copy-pasted correctly (or not) at 7 call sites in the kernel.
+/// All three fields are private. `run_queues` is reachable from nowhere
+/// outside this module — that's what makes "queue index ==
+/// queue_index(effective priority) of everything in it" an invariant this
+/// type can actually enforce, rather than a convention that used to be
+/// copy-pasted correctly (or not) at 7 call sites in the kernel.
 pub struct SchedCore<E: SchedEntity> {
     /// Per-priority run queues — ONLY Ready entities, indexed by
     /// `queue_index(effective_priority)`. Moved verbatim out of
@@ -220,26 +219,138 @@ impl<E: SchedEntity> SchedCore<E> {
         &mut self.wait_queue
     }
 
-    // ── TEMPORARY, deleted in step 3 ──────────────────────────────────────
-    //
-    // Step 3 replaces every caller of these two with `pop_next_ready`/
-    // `take_first_startable` and deletes them — nothing new should start
-    // using them. They exist only so the five pick-next scans in
-    // `kernel/src/process/scheduler.rs` (`kill_and_switch_tf`,
-    // `stop_and_switch_tf`, `block_current`, `switch_to_next`, `start_first`,
-    // plus `start_first`'s logging loop) keep compiling in this step without
-    // being restructured.
+    // ========================================================================
+    // Pick next (preemption / boot)
+    // ========================================================================
 
-    /// TEMPORARY (see block comment above) — read-only access to one run
-    /// queue by index. Deleted in step 3.
-    pub fn run_queue(&self, index: usize) -> &VecDeque<Box<E>> {
-        &self.run_queues[index]
+    /// Highest-priority Ready entity, or `None` if every run queue is
+    /// empty.
+    ///
+    /// Scans queue indices high to low (`(0..NUM_PRIORITIES).rev()`) and
+    /// pops from the FRONT of the first non-empty queue (FIFO within a
+    /// queue). Never looks at `wait_queue` — only Ready entities are ever
+    /// queued in `run_queues` in the first place.
+    ///
+    /// Moved verbatim out of the four kernel call sites that shared this
+    /// exact scan: `kill_and_switch_tf`, `stop_and_switch_tf`,
+    /// `block_current`, and `switch_to_next`. See
+    /// [`Self::take_first_startable`] for the deliberately different scan
+    /// `start_first` uses instead, and why unifying the two would be wrong.
+    pub fn pop_next_ready(&mut self) -> Option<Box<E>> {
+        for priority in (0..NUM_PRIORITIES).rev() {
+            if let Some(entity) = self.run_queues[priority].pop_front() {
+                return Some(entity);
+            }
+        }
+        None
     }
 
-    /// TEMPORARY (see block comment above) — mutable access to one run
-    /// queue by index. Deleted in step 3.
-    pub fn run_queue_mut(&mut self, index: usize) -> &mut VecDeque<Box<E>> {
-        &mut self.run_queues[index]
+    /// The first entity `start_first` (boot) should run.
+    ///
+    /// Deliberately NOT the same scan as [`Self::pop_next_ready`], and must
+    /// stay that way:
+    ///
+    /// - Starts at priority **1**, not 0 — so it can never pick something
+    ///   sitting in queue 0.
+    /// - Requires `is_ready()` — a filter `pop_next_ready` doesn't need,
+    ///   since by construction every run queue holds only Ready entities;
+    ///   kept here as an explicit, defensive check for the one caller that
+    ///   runs before the rest of the scheduling machinery has ever moved
+    ///   anything.
+    /// - Skips the idle entity (`is_idle()`) — the idle entity must never
+    ///   be the first thing started, or the system boots straight into
+    ///   idle and never runs anything else.
+    /// - Uses `remove(i)`, not `pop_front()` — so it can take a startable
+    ///   entity out of the *middle* of a queue whose front entity is not
+    ///   startable (not ready, or idle), instead of being stuck on it.
+    ///
+    /// Unifying this with `pop_next_ready` would make the first process
+    /// started at boot the idle one.
+    pub fn take_first_startable(&mut self) -> Option<Box<E>> {
+        for priority in (1..NUM_PRIORITIES).rev() {
+            let queue = &mut self.run_queues[priority];
+            for i in 0..queue.len() {
+                if queue[i].is_ready() && !queue[i].is_idle() {
+                    return queue.remove(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// Every run-queue entity, highest queue index first, insertion order
+    /// within each queue. Run queues only — never the wait queue.
+    ///
+    /// Backs `start_first`'s "Available processes:" boot log, which scans
+    /// `(0..NUM_PRIORITIES).rev()` — starting at 0, unlike
+    /// [`Self::take_first_startable`]'s scan just above, because this is
+    /// only logging, not picking a candidate to start.
+    pub fn iter_ready_desc(&self) -> impl Iterator<Item = &E> + '_ {
+        self.run_queues.iter().rev().flat_map(|q| q.iter()).map(|b| b.as_ref())
+    }
+
+    // ========================================================================
+    // Priority aging
+    // ========================================================================
+
+    /// Boost every Ready entity's effective priority toward its base
+    /// priority — except this is not quite what it looks like it does.
+    /// Read the second subtlety below before touching this method.
+    ///
+    /// Moved verbatim out of `Scheduler::age_processes`, translating field
+    /// access to this core's own `run_queues` and the trait accessors
+    /// (`pid.0 == 0` → `is_idle()`, `effective_priority`/`priority` →
+    /// `effective_priority()`/`base_priority()`).
+    ///
+    /// Two subtleties, preserved deliberately here, not cleaned up:
+    ///
+    /// (a) `i` is NOT incremented after a requeue
+    /// (`self.run_queues[pri].remove(i)`) — `remove(i)` shifts every later
+    /// element down by one, so the next entity to examine has already
+    /// shifted into position `i`. Incrementing `i` here would skip it.
+    ///
+    /// (b) **The important one, and it is not what the code looks like it
+    /// does.** The outer loop runs ASCENDING (`0..NUM_PRIORITIES`) while
+    /// aging moves entities UPWARD into queues the loop has not visited
+    /// yet — so the same entity gets found again at its new, higher index
+    /// and aged again, repeatedly, within this single call. The net effect
+    /// of one `age_processes()` call is therefore NOT "+1 toward base": it
+    /// restores an entity all the way TO its base priority in a single
+    /// pass. This contradicts the natural reading of both the `+1` right
+    /// here and the module comment in `kernel/src/process/scheduler.rs`
+    /// ("Every AGING_EPOCH ticks: boost waiting processes' eff_pri toward
+    /// base" reads like a gradual, one-step-per-epoch climb, not an
+    /// immediate full restoration). This has been verified by actually
+    /// executing a verbatim replica of this loop — not merely by reading
+    /// the code — that an entity with base 8 sitting at effective priority
+    /// 1 in queue 1 ends the single pass at effective priority 8, in queue
+    /// 8 (see the `age_processes_pins_multi_boost_within_single_call`
+    /// test below). This is preserved here deliberately BECAUSE this step
+    /// is a mechanical refactor, not because it is endorsed as correct
+    /// scheduling behavior.
+    pub fn age_processes(&mut self) {
+        for pri in 0..NUM_PRIORITIES {
+            let mut i = 0;
+            while i < self.run_queues[pri].len() {
+                let entity = &self.run_queues[pri][i];
+
+                if entity.is_idle() {
+                    i += 1;
+                    continue;
+                }
+
+                if entity.effective_priority() < entity.base_priority() {
+                    let mut entity = self.run_queues[pri].remove(i).unwrap();
+                    let new_eff = (entity.effective_priority() + 1).min(entity.base_priority());
+                    entity.set_effective_priority(new_eff);
+                    let new_pri = queue_index(entity.effective_priority());
+                    self.run_queues[new_pri].push_back(entity);
+                    // Don't increment i — next element shifted into position i
+                } else {
+                    i += 1;
+                }
+            }
+        }
     }
 }
 
@@ -278,6 +389,25 @@ mod tests {
         }
     }
 
+    /// Assert that exactly one entity is queued anywhere, that it physically
+    /// sits in `run_queues[idx]`, and that its effective priority is `eff`.
+    ///
+    /// Reads the private `run_queues` field directly — legal because
+    /// `mod tests` is a child module of `core`, so it sees the field that
+    /// nothing outside this file can. This is deliberately stronger than
+    /// trusting the index a method *returned* plus a scan via
+    /// `iter_queued()`: a method that returned the right index while pushing
+    /// the entity into a different queue would sail through that weaker
+    /// check, because the entity's own `effective_priority` field reads the
+    /// same wherever it landed.
+    fn assert_only_entity_at(core: &SchedCore<Ent>, idx: usize, eff: u8) {
+        let total: usize =
+            core.run_queues.iter().map(|q| q.len()).sum::<usize>() + core.wait_queue.len();
+        assert_eq!(total, 1, "expected exactly one queued entity, found {total}");
+        assert_eq!(core.run_queues[idx].len(), 1, "entity is not in run_queues[{idx}]");
+        assert_eq!(core.run_queues[idx][0].effective_priority(), eff);
+    }
+
     fn ent(pid: usize, base: u8, eff: u8) -> Box<Ent> {
         Box::new(Ent { pid, base, eff, ready: true })
     }
@@ -295,8 +425,7 @@ mod tests {
         let mut core = SchedCore::<Ent>::new();
         let idx = core.add_reset_to_base(ent(1, 4, 9));
         assert_eq!(idx, 4);
-        assert_eq!(core.run_queue(4).len(), 1);
-        assert_eq!(core.run_queue(4)[0].effective_priority(), 4);
+        assert_only_entity_at(&core, 4, 4);
     }
 
     /// 2. `add_reset_to_base` with base priority 200: the entity lands in
@@ -308,7 +437,7 @@ mod tests {
         let mut core = SchedCore::<Ent>::new();
         let idx = core.add_reset_to_base(ent(1, 200, 0));
         assert_eq!(idx, NUM_PRIORITIES - 1);
-        assert_eq!(core.run_queue(NUM_PRIORITIES - 1)[0].effective_priority(), 200);
+        assert_only_entity_at(&core, NUM_PRIORITIES - 1, 200);
     }
 
     /// 3. `requeue_preempted` lowers effective priority by exactly 1 and
@@ -319,7 +448,7 @@ mod tests {
         let mut core = SchedCore::<Ent>::new();
         let idx = core.requeue_preempted(ent(1, 5, 5));
         assert_eq!(idx, 4);
-        assert_eq!(core.run_queue(4)[0].effective_priority(), 4);
+        assert_only_entity_at(&core, 4, 4);
     }
 
     /// 4. `requeue_preempted` on an entity already at `MIN_EFFECTIVE_PRIORITY`
@@ -329,10 +458,7 @@ mod tests {
         let mut core = SchedCore::<Ent>::new();
         let idx = core.requeue_preempted(ent(1, 5, MIN_EFFECTIVE_PRIORITY));
         assert_eq!(idx, MIN_EFFECTIVE_PRIORITY as usize);
-        assert_eq!(
-            core.run_queue(MIN_EFFECTIVE_PRIORITY as usize)[0].effective_priority(),
-            MIN_EFFECTIVE_PRIORITY
-        );
+        assert_only_entity_at(&core, MIN_EFFECTIVE_PRIORITY as usize, MIN_EFFECTIVE_PRIORITY);
     }
 
     /// 5. `requeue_preempted` on an idle entity (pid == 0) never decays it,
@@ -343,7 +469,7 @@ mod tests {
         let mut core = SchedCore::<Ent>::new();
         let idx = core.requeue_preempted(ent(0, 5, 5));
         assert_eq!(idx, 5);
-        assert_eq!(core.run_queue(5)[0].effective_priority(), 5);
+        assert_only_entity_at(&core, 5, 5);
     }
 
     /// 6. `requeue_ready` changes no priority. If it started decaying or
@@ -354,7 +480,7 @@ mod tests {
         let mut core = SchedCore::<Ent>::new();
         let idx = core.requeue_ready(ent(1, 5, 3));
         assert_eq!(idx, 3);
-        assert_eq!(core.run_queue(3)[0].effective_priority(), 3);
+        assert_only_entity_at(&core, 3, 3);
     }
 
     /// 7. `wake_matching` moves a matching entity out of the wait queue and
@@ -368,6 +494,14 @@ mod tests {
     /// left it green, because with the two equal the substitution is
     /// invisible. Keep them distinct — a wake must restore an entity to the
     /// priority it had decayed to, not to its base.
+    ///
+    /// A marker entity is planted at queue 7 — strictly between the wrong
+    /// index (base 9) and the right one (effective 5) — because `run_queue`/
+    /// `run_queue_mut` no longer exist to inspect a specific queue directly
+    /// (deleted in step 3): `iter_ready_desc`'s descending order is what
+    /// exposes which queue the woken entity actually landed in. If it were
+    /// enqueued by base priority (9), it would come out ahead of the marker;
+    /// enqueued correctly by effective priority (5), it comes out behind.
     #[test]
     fn wake_matching_moves_from_wait_to_run_queue() {
         let mut core = SchedCore::<Ent>::new();
@@ -375,9 +509,14 @@ mod tests {
         let found = core.wake_matching(|e| e.pid() == 1, |_| {});
         assert!(found);
         assert_eq!(core.wait_queue().len(), 0);
-        assert_eq!(core.run_queue(5).len(), 1);
-        assert_eq!(core.run_queue(5)[0].pid(), 1);
-        assert_eq!(core.run_queue(9).len(), 0, "enqueued by base priority, not effective");
+        // Asserted directly against the private field: `mod tests` is a child
+        // module of `core`, so it can see `run_queues` even though nothing
+        // outside this file can. That is stronger than inferring the index
+        // from the relative order of a planted marker entity — it pins the
+        // exact queue, which is the thing base-vs-effective gets wrong.
+        assert_eq!(core.run_queues[5].len(), 1);
+        assert_eq!(core.run_queues[5][0].pid(), 1);
+        assert_eq!(core.run_queues[9].len(), 0, "enqueued by base priority, not effective");
     }
 
     /// 8. `wake_matching` with a predicate matching nothing returns false
@@ -389,9 +528,7 @@ mod tests {
         let found = core.wake_matching(|e| e.pid() == 99, |_| {});
         assert!(!found);
         assert_eq!(core.wait_queue().len(), 1);
-        for i in 0..NUM_PRIORITIES {
-            assert_eq!(core.run_queue(i).len(), 0);
-        }
+        assert!(core.pop_next_ready().is_none(), "no run queue should have gained an entity");
     }
 
     /// 9. `wake_matching`'s `prepare` runs before the enqueue: `prepare`
@@ -400,14 +537,19 @@ mod tests {
     /// (computing the index before running `prepare`) targets exactly this
     /// — and only this: tests 7/8 still pass under that sabotage, which is
     /// the point of having this test separately.
+    ///
+    /// Same marker technique as test 7 above: queue 4 sits strictly between
+    /// the pre-`prepare` effective priority (2) and the post-`prepare` one
+    /// (7), so `iter_ready_desc`'s order reveals which one the enqueue index
+    /// was actually computed from.
     #[test]
     fn wake_matching_prepare_runs_before_enqueue() {
         let mut core = SchedCore::<Ent>::new();
         core.park(parked(1, 5, 2));
         let found = core.wake_matching(|e| e.pid() == 1, |e| e.set_effective_priority(7));
         assert!(found);
-        assert_eq!(core.run_queue(7).len(), 1);
-        assert_eq!(core.run_queue(2).len(), 0);
+        assert_eq!(core.run_queues[7].len(), 1, "prepare's priority change must be reflected in the enqueue index");
+        assert_eq!(core.run_queues[2].len(), 0);
     }
 
     /// 10. `iter_queued` visits every queued entity exactly once, run
@@ -443,5 +585,248 @@ mod tests {
         assert_eq!(core.find_mut(|e| e.pid() == 1).map(|e| e.pid()), Some(1));
         assert_eq!(core.find_mut(|e| e.pid() == 2).map(|e| e.pid()), Some(2));
         assert!(core.find_mut(|e| e.pid() == 99).is_none());
+    }
+
+    // ========================================================================
+    // pop_next_ready (step 3)
+    // ========================================================================
+
+    /// 13. `pop_next_ready` returns the entity from the highest-index
+    /// non-empty run queue. Sabotage A (ascending scan instead of `.rev()`)
+    /// targets exactly this.
+    #[test]
+    fn pop_next_ready_returns_from_highest_priority_queue() {
+        let mut core = SchedCore::<Ent>::new();
+        core.add_reset_to_base(ent(1, 3, 0));
+        core.add_reset_to_base(ent(2, 7, 0));
+        let popped = core.pop_next_ready().unwrap();
+        assert_eq!(popped.pid(), 2, "must prefer the higher-priority queue");
+    }
+
+    /// 14. `pop_next_ready` is FIFO within one queue: of two entities pushed
+    /// into the same queue, the first-pushed comes out first. Sabotage B
+    /// (`pop_back` instead of `pop_front`) targets exactly this.
+    #[test]
+    fn pop_next_ready_is_fifo_within_one_queue() {
+        let mut core = SchedCore::<Ent>::new();
+        core.add_reset_to_base(ent(1, 5, 0));
+        core.add_reset_to_base(ent(2, 5, 0));
+        let first = core.pop_next_ready().unwrap();
+        assert_eq!(first.pid(), 1, "first-pushed must come out first (FIFO)");
+        let second = core.pop_next_ready().unwrap();
+        assert_eq!(second.pid(), 2);
+    }
+
+    /// 15. `pop_next_ready` returns `None` when every run queue is empty.
+    #[test]
+    fn pop_next_ready_none_when_all_queues_empty() {
+        let mut core = SchedCore::<Ent>::new();
+        assert!(core.pop_next_ready().is_none());
+    }
+
+    /// 16. `pop_next_ready` never looks at the wait queue: with the wait
+    /// queue non-empty and every run queue empty, it returns `None` and
+    /// leaves the wait queue untouched. If this method started scanning
+    /// `wait_queue` too, a Blocked/Zombie/Stopped entity could get handed
+    /// back out as if it were Ready.
+    #[test]
+    fn pop_next_ready_ignores_wait_queue() {
+        let mut core = SchedCore::<Ent>::new();
+        core.park(parked(1, 5, 5));
+        assert!(core.pop_next_ready().is_none());
+        assert_eq!(core.wait_queue().len(), 1, "wait queue must be left untouched");
+    }
+
+    // ========================================================================
+    // take_first_startable (step 3)
+    // ========================================================================
+
+    /// 17. `take_first_startable` never returns an entity sitting in queue
+    /// 0, even when it is the only entity anywhere. Sabotage C (starting the
+    /// scan at priority 0 instead of 1) targets exactly this — the entity
+    /// must still be found afterward (via `pop_next_ready`, which DOES scan
+    /// queue 0), proving it was left in place rather than lost.
+    #[test]
+    fn take_first_startable_never_returns_queue_zero() {
+        let mut core = SchedCore::<Ent>::new();
+        core.add_reset_to_base(ent(1, 0, 0)); // lands in run_queue index 0
+        assert!(core.take_first_startable().is_none());
+        let popped = core.pop_next_ready().unwrap();
+        assert_eq!(popped.pid(), 1, "entity must still be queued, untouched, in queue 0");
+    }
+
+    /// 18. `take_first_startable` skips the idle entity (pid 0) even when it
+    /// sits in a higher-priority queue than a real, non-idle candidate.
+    /// Sabotage D (dropping the `!is_idle()` filter) targets exactly this.
+    #[test]
+    fn take_first_startable_skips_idle() {
+        let mut core = SchedCore::<Ent>::new();
+        core.add_reset_to_base(ent(0, 5, 0)); // idle, in the higher queue (5)
+        core.add_reset_to_base(ent(2, 3, 0)); // real process, in queue 3
+        let started = core.take_first_startable().unwrap();
+        assert_eq!(started.pid(), 2, "must skip the idle entity even though it outranks the real one");
+    }
+
+    /// 19. `take_first_startable` skips a non-ready entity and returns a
+    /// ready one instead, even from a lower-priority queue.
+    #[test]
+    fn take_first_startable_skips_non_ready() {
+        let mut core = SchedCore::<Ent>::new();
+        core.add_reset_to_base(parked(3, 5, 0)); // not ready, in the higher queue (5)
+        core.add_reset_to_base(ent(4, 3, 0));    // ready, in queue 3
+        let started = core.take_first_startable().unwrap();
+        assert_eq!(started.pid(), 4, "must skip the non-ready entity even though it outranks the ready one");
+    }
+
+    /// 20. `take_first_startable` takes from the *middle* of a queue: a
+    /// non-ready entity sits at the front, a ready one right behind it — the
+    /// ready one must come back, and the non-ready one must still be queued
+    /// afterward. This is what `remove(i)` buys over `pop_front()`. Sabotage
+    /// E (using a pop_front-equivalent instead of `remove(i)`) targets
+    /// exactly this: it would wrongly return/discard the front (non-ready)
+    /// entity instead of reaching past it.
+    #[test]
+    fn take_first_startable_takes_from_middle_of_queue() {
+        let mut core = SchedCore::<Ent>::new();
+        core.add_reset_to_base(parked(5, 4, 0)); // not ready, pushed first -> front
+        core.add_reset_to_base(ent(6, 4, 0));    // ready, pushed second -> behind it
+        let started = core.take_first_startable().unwrap();
+        assert_eq!(started.pid(), 6, "must reach past the non-ready front entity via remove(i)");
+        // The front entity (pid 5) must still be queued afterward.
+        let remaining = core.pop_next_ready().unwrap();
+        assert_eq!(remaining.pid(), 5, "the skipped entity must still be queued, not lost");
+    }
+
+    /// 21. `take_first_startable` prefers the higher-priority queue when
+    /// both have a startable entity.
+    #[test]
+    fn take_first_startable_prefers_higher_priority_queue() {
+        let mut core = SchedCore::<Ent>::new();
+        core.add_reset_to_base(ent(7, 3, 0));
+        core.add_reset_to_base(ent(8, 6, 0));
+        let started = core.take_first_startable().unwrap();
+        assert_eq!(started.pid(), 8);
+    }
+
+    // ========================================================================
+    // age_processes (step 3)
+    // ========================================================================
+
+    /// 22. An entity already at its base priority is left completely alone
+    /// by `age_processes`.
+    #[test]
+    fn age_processes_leaves_entity_at_base_alone() {
+        let mut core = SchedCore::<Ent>::new();
+        core.add_reset_to_base(ent(1, 5, 5));
+        core.age_processes();
+        let queued: alloc::vec::Vec<_> = core.iter_queued().collect();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].effective_priority(), 5);
+    }
+
+    /// 23. The idle entity is never aged, whatever its effective priority.
+    /// Sabotage H (dropping the `is_idle()` skip) targets exactly this.
+    #[test]
+    fn age_processes_never_ages_idle() {
+        let mut core = SchedCore::<Ent>::new();
+        // requeue_ready (unlike add_reset_to_base) does not reset effective
+        // priority to base, so this actually constructs the eff-below-base
+        // situation age_processes would otherwise act on.
+        core.requeue_ready(ent(0, 9, 2));
+        core.age_processes();
+        let queued: alloc::vec::Vec<_> = core.iter_queued().collect();
+        assert_eq!(queued[0].effective_priority(), 2, "idle entity must never be aged");
+    }
+
+    /// 24. The multi-boost behavior, pinned explicitly: an entity with base
+    /// 8 sitting at effective priority 1 in queue 1 ends a SINGLE
+    /// `age_processes()` call at effective priority 8, in queue 8.
+    ///
+    /// This pins TODAY's behavior. It is NOT the "+1 per epoch" that the
+    /// `+1` in `age_processes`'s own body and the module comment in
+    /// `kernel/src/process/scheduler.rs` ("boost waiting processes' eff_pri
+    /// toward base") both suggest a reader should expect — the ascending
+    /// outer loop re-finds this same entity in every queue it gets promoted
+    /// into within this one call, aging it again each time, all the way to
+    /// base. Preserved here because this step is a mechanical refactor, not
+    /// because this is endorsed as correct scheduling behavior.
+    #[test]
+    fn age_processes_pins_multi_boost_within_single_call() {
+        let mut core = SchedCore::<Ent>::new();
+        core.requeue_ready(ent(1, 8, 1)); // lands in queue 1
+        core.age_processes();
+        // Queue 8, not queue 2: one pass, seven promotions.
+        assert_only_entity_at(&core, 8, 8);
+    }
+
+    /// 25. Every entity in a queue gets processed exactly once by a single
+    /// `age_processes()` pass — none skipped, none lost — even though
+    /// entities are being removed from and re-inserted into the very queue
+    /// being iterated. This is the test that guards the deliberate "don't
+    /// increment i after a requeue" behavior (subtlety (a) in
+    /// `age_processes`'s doc comment). Sabotage F (incrementing `i` after a
+    /// requeue anyway) targets exactly this, and is the most important
+    /// sabotage of this step.
+    ///
+    /// All four entities start in the same queue (index 2). Given today's
+    /// "restores fully to base within one call" behavior (test 24 above),
+    /// each of the three agable entities ends this single pass at its own
+    /// base priority; the one already at base is left untouched. Four in,
+    /// four out.
+    #[test]
+    fn age_processes_processes_every_entity_in_a_queue_exactly_once() {
+        let mut core = SchedCore::<Ent>::new();
+        core.requeue_ready(ent(10, 2, 2)); // already at base — must stay untouched
+        core.requeue_ready(ent(1, 4, 2));
+        core.requeue_ready(ent(2, 6, 2));
+        core.requeue_ready(ent(3, 9, 2));
+        core.age_processes();
+
+        let mut result: alloc::vec::Vec<(usize, u8)> =
+            core.iter_queued().map(|e| (e.pid(), e.effective_priority())).collect();
+        result.sort();
+        assert_eq!(result, alloc::vec![(1, 4), (2, 6), (3, 9), (10, 2)]);
+    }
+
+    /// 26. Aging stops exactly at base priority: an entity with base 3 at
+    /// effective 2 ends at exactly 3, in queue 3.
+    ///
+    /// This does NOT guard the `.min(base_priority())` call in
+    /// `age_processes`, and it is worth being precise about why, because the
+    /// name it originally carried ("caps_at_base_does_not_overshoot")
+    /// claimed that it did. **Nothing guards that `.min()`, and nothing can:
+    /// it is unreachable defensive code.** The branch it sits in only runs
+    /// when `effective_priority() < base_priority()` has just been checked
+    /// true, and the value is incremented by exactly 1, so `eff + 1 <= base`
+    /// always holds and the clamp never has anything to clamp. Measured, not
+    /// argued: deleting the `.min()` entirely leaves the whole suite green
+    /// (33/33, exit 0). What this test really pins is the *terminal* step of
+    /// aging — that an entity one below its base lands on it and stops —
+    /// which is genuine behavior worth keeping asserted.
+    #[test]
+    fn age_processes_stops_exactly_at_base() {
+        let mut core = SchedCore::<Ent>::new();
+        core.requeue_ready(ent(1, 3, 2));
+        core.age_processes();
+        assert_only_entity_at(&core, 3, 3);
+    }
+
+    // ========================================================================
+    // iter_ready_desc (step 3)
+    // ========================================================================
+
+    /// 27. `iter_ready_desc` visits the highest queue index first, and
+    /// insertion order within a queue, and does NOT include a parked
+    /// (wait-queue) entity.
+    #[test]
+    fn iter_ready_desc_visits_highest_queue_first_in_insertion_order() {
+        let mut core = SchedCore::<Ent>::new();
+        core.add_reset_to_base(ent(1, 3, 0));
+        core.add_reset_to_base(ent(2, 3, 0)); // same queue as pid 1, inserted after
+        core.add_reset_to_base(ent(3, 7, 0));
+        core.park(parked(4, 1, 1));
+
+        let pids: alloc::vec::Vec<usize> = core.iter_ready_desc().map(|e| e.pid()).collect();
+        assert_eq!(pids, alloc::vec![3, 1, 2], "highest queue first, insertion order within a queue, no wait-queue entries");
     }
 }
