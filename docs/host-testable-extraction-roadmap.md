@@ -95,21 +95,32 @@ y, sobre todo, se puede escribir la property test que hoy no existe: secuencias
 aleatorias de `mkdir`/`symlink`/`rename`/`unlink` contra un modelo de
 referencia, comprobando invariantes tras cada operación.
 
-## Después — la lógica del scheduler contra un reloj falso
+## Hecho — la lógica del scheduler contra un reloj falso
 
-Qué se muda: run queues multinivel, decay de prioridad al ser expulsado, aging
+Ver [docs/sched/sched-extraction-plan.md](sched/sched-extraction-plan.md) para
+el precedente completo, en 5 commits (`4738fa1`..`4db1cd1`).
+
+Qué se mudó: run queues multinivel, decay de prioridad al ser expulsado, aging
 periódico contra la inanición, y el cálculo del cuanto
 (`BASE_QUANTUM + eff_pri * BONUS`) — todo con el tiempo **inyectado** en vez de
-leído de un global.
+leído de un global, al crate `sched` (43 tests de host).
 
-Qué se queda: `TrapFrame`, el cambio de contexto, el ISR del timer, la TSS.
+Qué se quedó: `TrapFrame`, el cambio de contexto, el ISR del timer, la TSS.
 Nada de eso puede salir del kernel, y es deliberado.
 
-Qué compra: las propiedades que hoy nadie comprueba — que ningún proceso listo
-se queda sin ejecutar indefinidamente, que el aging realmente rescata a los
-hambrientos, que las prioridades efectivas se mantienen en rango. Son
-exactamente el tipo de invariante que una property test verifica bien y que un
-arranque de QEMU verifica mal.
+Qué compró: las propiedades que antes nadie comprobaba — que el índice de cola
+siempre coincide con la prioridad efectiva clamped, que las prioridades
+efectivas se mantienen en rango, que ningún pid se duplica entre colas — ahora
+verificadas por `check_invariants()` y tres property tests. Son exactamente el
+tipo de invariante que una property test verifica bien y que un arranque de
+QEMU verifica mal.
+
+**Lo que la extracción destapó, no lo que compró**: el propio checker y sus
+property tests demostraron que el aging de hoy *no* rescata a los hambrientos
+de forma fiable — puede incluso agravar la inanición bajo contención
+sostenida con prioridades base distintas — un hallazgo real, medido contra el
+crate, no razonado; ver `docs/sched/sched-bugs-plan.md` para el detalle y el
+plan de arreglo, todavía sin ejecutar.
 
 ---
 
@@ -152,11 +163,11 @@ información que hoy no se tiene.
 
 | Paso | Qué se lleva | Compra | Estado |
 |------|--------------|--------|--------|
-| `hal` | Lógica de driver + seams de hardware | 64 tests sin QEMU | hecho |
-| `ext2` | Todo el detalle on-disk | 89 tests + oráculo `e2fsck` | hecho |
-| `mm` | Buddy + slab | 32 tests + property tests | hecho |
-| **`vfs` + `ramfs`** | Rutas, montajes, árbol en memoria | Property tests del VFS | **siguiente** |
-| Scheduler (reloj falso) | Colas, prioridad, aging, cuanto | Invariantes de equidad | después |
+| `hal` | Lógica de driver + seams de hardware | 71 tests sin QEMU | hecho |
+| `ext2` | Todo el detalle on-disk | 91 tests + oráculo `e2fsck` | hecho |
+| `mm` | Buddy + slab | 39 tests + property tests | hecho |
+| `vfs` + `ramfs` | Rutas, montajes, árbol en memoria | 158 tests, property tests del VFS | hecho |
+| **Scheduler (reloj falso)** | Colas, prioridad, aging, cuanto | 3 property tests + invariantes de equidad | **hecho** (destapó defectos reales de aging/inanición, ver `docs/sched/sched-bugs-plan.md`) |
 | Miri sobre lo extraído | — | Detección de UB de aliasing | barato, sin hacer |
 | Port estilo UML | El kernel entero | gdb nativo, N instancias | descartado (ver arriba) |
 

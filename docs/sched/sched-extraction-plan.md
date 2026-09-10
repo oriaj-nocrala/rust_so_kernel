@@ -1,5 +1,32 @@
 # Plan: extraer el núcleo de `process::scheduler` a un crate host-testeable
 
+> **Estado: COMPLETADO** (2026-09-10). Los 6 pasos de la migración están
+> hechos, en 5 commits: 1 (andamiaje del crate, `trait SchedEntity`,
+> constantes, `quantum_for`, el clamp `queue_index` — copiado en 7 sitios
+> antes de esto) en `6dde865`; 2 (`run_queues`/`wait_queue`/`next_pid` al
+> núcleo; `wait_queue` deja de ser campo público, 4 ficheros del kernel
+> migrados a `Scheduler::wait_queue()`/`wait_queue_mut()`) en `cb32d61`; 3
+> (los 4 pick-next → `pop_next_ready`, `start_first` → `take_first_startable`,
+> deliberadamente distinto y documentado por qué; `age_processes` al núcleo)
+> en `df1a9f5`; 4 (`remaining_ticks`/`global_ticks` →
+> `start_slice`/`advance_ticks`/`consume_quantum`, preservando el
+> interleaving exacto de `tick`) en `6ebe732`; y 5 (`check_invariants` + 3
+> property tests + los sabotajes que los prueban) en `4db1cd1`. `sched/`
+> tiene 43 tests de host (`cd sched && cargo test`), `cd kernel && cargo
+> build --target x86_64-unknown-none` compila limpio, y
+> `scripts/run-kernel-tests.sh` da PASS (3/3) — línea base de
+> `hal`/`ext2`/`mm`/`vfs`/`diag` (71/91/39/158/30) sin cambios. **Ojo con el
+> comando de build**: un `cargo build` en la raíz **no** vale como
+> verificación de este crate. El `build.rs` de la raíz no observa `sched/`
+> (ni `hal`/`ext2`/`mm`/`vfs`/`diag`), así que no se re-ejecuta y su `cargo
+> build` anidado del kernel no llega a correr — medido metiendo un error de
+> sintaxis en `sched/src/core.rs`: la raíz devolvió exit 0, y
+> `cd kernel && cargo build --target x86_64-unknown-none` devolvió 101. Ver el doc
+> comment de `sched/src/lib.rs` para el detalle módulo a módulo de qué vive
+> dónde, incluida una sección "Known limitations" sobre defectos de
+> aging/inanición que la propia extracción destapó y que siguen sin
+> arreglarse — ver `docs/sched/sched-bugs-plan.md`.
+
 > **Estado: plan, sin empezar.** Escrito 2026-09-10, tras cerrar la línea de
 > observabilidad/concurrencia (`e6624eb`..`13f9cef`). Es el **paso 2** de la
 > línea "host-testable extraction"
