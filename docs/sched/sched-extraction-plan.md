@@ -26,7 +26,7 @@ target ⇒ colisión de lang items en `core`; verificado, no asumido).
 Los bugs que la parte de contabilidad puede tener son exactamente los que un
 test de host caza barato y un arranque de QEMU caza tarde o nunca: un proceso
 encolado en `run_queues[i]` con `effective_priority != i` (el clamp está
-**copiado en 6 sitios**, nada comprueba que coincidan), un `wake` que saca de
+**copiado en 7 sitios**, nada comprueba que coincidan), un `wake` que saca de
 `wait_queue` y no vuelve a encolar, un aging que se salta elementos al
 re-encolar mientras itera, un proceso hambriento que nunca sube de prioridad.
 Ninguno de esos se ve en un arranque: se ve como "va lento" o como nada.
@@ -102,7 +102,7 @@ cinco ficheros más del kernel (`process/pipe.rs:146,171`,
     4 ficheros ganan un par de paréntesis, el cambio lo verifica el compilador
     entero, y `run_queues` queda **inalcanzable desde fuera del núcleo** — que
     es lo que hace que el invariante "índice de cola == prioridad efectiva" sea
-    sostenible en vez de una convención copiada 6 veces.
+    sostenible en vez de una convención copiada 7 veces.
 
 **2. `running` se queda en el kernel, y eso deja un hueco que hay que nombrar.**
 Lo exige el encargo y lo justifica el código: cada sitio que toca `running`
@@ -179,7 +179,7 @@ Property tests sobre secuencias aleatorias de operaciones (`add`/`preempt`/
 
 1. **El índice de cola siempre coincide** con la `effective_priority` clamped
    de la entidad que contiene. Hoy nada lo comprueba y el clamp está copiado
-   en 6 sitios.
+   en 7 sitios.
 2. **`effective_priority` ∈ `[MIN_EFFECTIVE_PRIORITY, base_priority]`** tras
    cualquier secuencia de preempt/aging.
 3. **Cada entidad está en exactamente un contenedor**, nunca en dos ni en

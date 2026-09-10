@@ -222,12 +222,12 @@ fn clear_current_fast() {
     CURRENT_PID_FAST[cpu].store(0, Ordering::Release);
 }
 
-const NUM_PRIORITIES: usize = 11;
-
-const BASE_QUANTUM: u32 = 2;
-const PRIORITY_QUANTUM_BONUS: u32 = 1;
-const AGING_EPOCH: u32 = 50;
-const MIN_EFFECTIVE_PRIORITY: u8 = 1;
+// Moved to the `sched` crate so the host-testable core and this kernel
+// adapter share a single source of truth for these values instead of each
+// keeping its own copy that could silently drift apart — see
+// `docs/sched/sched-extraction-plan.md`. `BASE_QUANTUM`/`PRIORITY_QUANTUM_BONUS`
+// are only used by `sched::quantum_for` itself, so they aren't imported here.
+use sched::{NUM_PRIORITIES, AGING_EPOCH, MIN_EFFECTIVE_PRIORITY};
 
 static SCHEDULERS: [Mutex<Scheduler>; crate::cpu::MAX_CPUS] = [
     Mutex::new(Scheduler::new()),
@@ -318,14 +318,6 @@ impl Scheduler {
     }
 
     // ====================================================================
-    // Time slice
-    // ====================================================================
-
-    fn quantum_for(effective_priority: u8) -> u32 {
-        BASE_QUANTUM + (effective_priority as u32) * PRIORITY_QUANTUM_BONUS
-    }
-
-    // ====================================================================
     // PID management
     // ====================================================================
 
@@ -341,7 +333,7 @@ impl Scheduler {
 
     pub fn add_process(&mut self, mut process: Box<Process>) {
         process.effective_priority = process.priority;
-        let pri = (process.effective_priority as usize).min(NUM_PRIORITIES - 1);
+        let pri = sched::queue_index(process.effective_priority);
         crate::serial_println!(
             "Scheduler: Added PID {} (base pri {}, effective {}) to queue[{}]",
             process.pid.0, process.priority, process.effective_priority, pri
@@ -558,7 +550,7 @@ impl Scheduler {
                 super::tss::set_kernel_stack(proc.kernel_stack);
                 unsafe { super::fpu::restore(&proc.fpu_state); }
 
-                self.remaining_ticks = Self::quantum_for(proc.effective_priority);
+                self.remaining_ticks = sched::quantum_for(proc.effective_priority);
 
                 tf_note_resume(&mut proc, "kill_and_switch_tf");
                 let tf_ptr = &*proc.trapframe as *const TrapFrame;
@@ -606,7 +598,7 @@ impl Scheduler {
                 super::tss::set_kernel_stack(proc.kernel_stack);
                 write_fs_base(proc.fs_base);
                 unsafe { super::fpu::restore(&proc.fpu_state); }
-                self.remaining_ticks = Self::quantum_for(proc.effective_priority);
+                self.remaining_ticks = sched::quantum_for(proc.effective_priority);
                 tf_note_resume(&mut proc, "stop_and_switch_tf");
                 let tf_ptr = &*proc.trapframe as *const TrapFrame;
                 update_current_fast(&proc);
@@ -656,7 +648,7 @@ impl Scheduler {
             if let Some(mut proc) = self.wait_queue.remove(pos) {
                 proc.state = ProcessState::Ready;
                 proc.stopped_by_signal = None;
-                let pri = (proc.effective_priority as usize).min(NUM_PRIORITIES - 1);
+                let pri = sched::queue_index(proc.effective_priority);
                 self.run_queues[pri].push_back(proc);
             }
             true
@@ -692,7 +684,7 @@ impl Scheduler {
                 super::tss::set_kernel_stack(proc.kernel_stack);
                 write_fs_base(proc.fs_base);
                 unsafe { super::fpu::restore(&proc.fpu_state); }
-                self.remaining_ticks = Self::quantum_for(proc.effective_priority);
+                self.remaining_ticks = sched::quantum_for(proc.effective_priority);
                 tf_note_resume(&mut proc, "block_current");
                 let tf_ptr = &*proc.trapframe as *const TrapFrame;
                 update_current_fast(&proc);
@@ -711,7 +703,7 @@ impl Scheduler {
         }) {
             if let Some(mut proc) = self.wait_queue.remove(pos) {
                 proc.state = ProcessState::Ready;
-                let pri = (proc.effective_priority as usize).min(NUM_PRIORITIES - 1);
+                let pri = sched::queue_index(proc.effective_priority);
                 self.run_queues[pri].push_back(proc);
             }
         }
@@ -729,7 +721,7 @@ impl Scheduler {
             if let Some(mut proc) = self.wait_queue.remove(pos) {
                 proc.trapframe.rax = rax;
                 proc.state = ProcessState::Ready;
-                let pri = (proc.effective_priority as usize).min(NUM_PRIORITIES - 1);
+                let pri = sched::queue_index(proc.effective_priority);
                 self.run_queues[pri].push_back(proc);
             }
         }
@@ -947,7 +939,7 @@ impl Scheduler {
                 if proc.effective_priority < proc.priority {
                     let mut proc = self.run_queues[pri].remove(i).unwrap();
                     proc.effective_priority = (proc.effective_priority + 1).min(proc.priority);
-                    let new_pri = (proc.effective_priority as usize).min(NUM_PRIORITIES - 1);
+                    let new_pri = sched::queue_index(proc.effective_priority);
                     self.run_queues[new_pri].push_back(proc);
                     // Don't increment i — next element shifted into position i
                 } else {
@@ -981,7 +973,7 @@ impl Scheduler {
                         proc.effective_priority -= 1;
                     }
 
-                    let pri = (proc.effective_priority as usize).min(NUM_PRIORITIES - 1);
+                    let pri = sched::queue_index(proc.effective_priority);
                     self.run_queues[pri].push_back(proc);
                 }
                 ProcessState::Zombie | ProcessState::Blocked | ProcessState::Stopped => {
@@ -990,7 +982,7 @@ impl Scheduler {
                     self.wait_queue.push_back(proc);
                 }
                 ProcessState::Ready => {
-                    let pri = (proc.effective_priority as usize).min(NUM_PRIORITIES - 1);
+                    let pri = sched::queue_index(proc.effective_priority);
                     self.run_queues[pri].push_back(proc);
                 }
             }
@@ -1013,7 +1005,7 @@ impl Scheduler {
                 unsafe { super::fpu::restore(&proc.fpu_state); }
                 crate::debug::inc_switches();
 
-                self.remaining_ticks = Self::quantum_for(proc.effective_priority);
+                self.remaining_ticks = sched::quantum_for(proc.effective_priority);
 
                 tf_note_resume(&mut proc, "switch_to_next");
                 let tf_ptr = &*proc.trapframe as *const TrapFrame;
@@ -1070,7 +1062,7 @@ impl Scheduler {
                     }
                     unsafe { super::fpu::restore(&proc.fpu_state); }
 
-                    self.remaining_ticks = Self::quantum_for(proc.effective_priority);
+                    self.remaining_ticks = sched::quantum_for(proc.effective_priority);
 
                     tf_note_resume(&mut proc, "start_first");
                     let tf_ptr = &*proc.trapframe as *const TrapFrame;
@@ -1233,4 +1225,36 @@ pub unsafe fn current_as_fast() -> Option<&'static AddressSpace> {
 /// Fast PID read for logging (no Mutex).
 pub fn current_pid_fast() -> usize {
     CURRENT_PID_FAST[crate::cpu::cpu_id()].load(Ordering::Relaxed)
+}
+
+/// The adapter half of the `sched::SchedEntity` seam (see that trait's doc
+/// comment). This impl must stay a pure field-accessor — no logic, no
+/// locking, nothing that could differ from what `sched`'s core assumes
+/// about how these methods behave. Any behavior beyond "read/write this one
+/// field" belongs in the core itself (once later extraction steps move it
+/// there), not here.
+impl sched::SchedEntity for Process {
+    fn pid(&self) -> usize {
+        self.pid.0
+    }
+
+    fn base_priority(&self) -> u8 {
+        self.priority
+    }
+
+    fn effective_priority(&self) -> u8 {
+        self.effective_priority
+    }
+
+    fn set_effective_priority(&mut self, pri: u8) {
+        self.effective_priority = pri;
+    }
+
+    fn is_idle(&self) -> bool {
+        self.pid.0 == 0
+    }
+
+    fn is_ready(&self) -> bool {
+        self.state == ProcessState::Ready
+    }
 }

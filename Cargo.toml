@@ -13,29 +13,32 @@ ovmf-prebuilt = "0.2.3"
 
 [workspace]
 members = ["kernel"]
-# `hal`, `ext2`, `mm`, `vfs`, `diag`, and `qemu-test-runner` live in this directory
-# tree but are each deliberately their OWN workspace root (empty
-# `[workspace]` table in their own Cargo.toml) so their `cargo build`/
+# `hal`, `ext2`, `mm`, `vfs`, `diag`, `sched`, and `qemu-test-runner` live in
+# this directory tree but are each deliberately their OWN workspace root
+# (empty `[workspace]` table in their own Cargo.toml) so their `cargo build`/
 # `cargo test` don't inherit this workspace's `panic = "abort"` profiles
 # below (which would break a unwinding test harness) and, for
 # `qemu-test-runner` specifically, so building it never triggers this
 # package's `build.rs` (which does its own slow nested `cargo build` of the
-# whole kernel — see `build_kernel()` there). All six must be excluded here
+# whole kernel — see `build_kernel()` there). All seven must be excluded here
 # or cargo errors with "multiple workspace roots found in the same
-# workspace" — `kernel` depends on `hal`, `ext2`, `mm`, `vfs`, and `diag` via plain
-# `path` dependencies (`ext2` itself also depends on `hal` the same way —
-# see `docs/fs/ext2-extraction-plan.md`; `mm` is the buddy/slab allocator
-# extraction, no cross-dependency on `hal`/`ext2`; `vfs` is the VFS-core
-# extraction, currently just the shared `Errno`/`FileType`/`OpenFlags`/
-# `Stat`/`DirEntry` types — see `docs/fs/vfs-extraction-plan.md`; `diag` is
-# the always-on lock/trapframe/IF-violation diagnostic instruments extracted
-# out of `kernel/src/debug.rs`, which owned real `unsafe` pointer-and-length
-# string reconstruction that no test had ever exercised — see that crate's
-# doc comment);
+# workspace" — `kernel` depends on `hal`, `ext2`, `mm`, `vfs`, `diag`, and
+# `sched` via plain `path` dependencies (`ext2` itself also depends on `hal`
+# the same way — see `docs/fs/ext2-extraction-plan.md`; `mm` is the
+# buddy/slab allocator extraction, no cross-dependency on `hal`/`ext2`; `vfs`
+# is the VFS-core extraction, currently just the shared `Errno`/`FileType`/
+# `OpenFlags`/`Stat`/`DirEntry` types — see `docs/fs/vfs-extraction-plan.md`;
+# `diag` is the always-on lock/trapframe/IF-violation diagnostic instruments
+# extracted out of `kernel/src/debug.rs`, which owned real `unsafe`
+# pointer-and-length string reconstruction that no test had ever exercised —
+# see that crate's doc comment; `sched` is the scheduler-core extraction,
+# generic over the scheduled entity rather than a flat concrete type, since
+# its queues own the entities themselves — see
+# `docs/sched/sched-extraction-plan.md`);
 # `qemu-test-runner` is invoked as an external binary (see
 # `scripts/run-kernel-tests.sh`), not depended on by anything in this
 # workspace.
-exclude = ["hal", "ext2", "mm", "vfs", "diag", "qemu-test-runner"]
+exclude = ["hal", "ext2", "mm", "vfs", "diag", "sched", "qemu-test-runner"]
 
 [profile.dev]
 panic = "abort"
