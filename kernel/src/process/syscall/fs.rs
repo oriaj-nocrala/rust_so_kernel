@@ -118,6 +118,7 @@ pub(super) fn sys_read(fd: i32, buf: usize, count: usize) -> SyscallResult {
 
         match result {
             Ok(n) => n as i64,
+            Err(crate::process::file::FileError::Again) => errno::EAGAIN,
             Err(crate::process::file::FileError::WouldBlock) => {
                 let tf_ptr = current_tf_ptr();
                 let next_tf = {
@@ -236,6 +237,7 @@ pub(super) fn sys_write(fd: i32, buf: usize, count: usize) -> SyscallResult {
 
     match result {
         Ok(n) => n as i64,
+        Err(crate::process::file::FileError::Again) => errno::EAGAIN,
         Err(crate::process::file::FileError::BrokenPipe) => errno::EPIPE,
         Err(crate::process::file::FileError::NoSpace) => errno::ENOSPC,
         Err(crate::process::file::FileError::WouldBlock) => {
@@ -656,10 +658,13 @@ const F_SETFD: i32 = 2;
 const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
 const F_DUPFD_CLOEXEC: i32 = 1030;
+/// `O_NONBLOCK`, the one status flag `F_SETFL` acts on for real.
+const O_NONBLOCK: i64 = 0o4000;
 
 /// fcntl(72): long fcntl(int fd, int cmd, unsigned long arg)
 ///
-/// Only F_DUPFD/F_DUPFD_CLOEXEC actually do something, and they do the
+/// F_DUPFD/F_DUPFD_CLOEXEC and F_GETFL/F_SETFL's O_NONBLOCK do something;
+/// the remaining commands are validity-checked stubs. F_DUPFD does the
 /// same thing: this kernel has no per-fd close-on-exec flag anywhere, so
 /// there's nothing for the CLOEXEC half to set differently. F_GETFD/
 /// F_SETFD/F_GETFL/F_SETFL are stubbed — `FileDescriptorTable` has no
@@ -678,7 +683,34 @@ pub(super) fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                 }
             })
         }
-        F_GETFD | F_SETFD | F_GETFL | F_SETFL => {
+        // O_NONBLOCK is real for handles that support it (sockets today);
+        // the rest of the status flags are still validity-checked stubs.
+        F_GETFL => {
+            with_current_process(|proc| {
+                match proc.files.lock().get(fd as usize) {
+                    Ok(h) => if h.nonblocking() { O_NONBLOCK as i64 } else { 0 },
+                    Err(_) => errno::EBADF,
+                }
+            })
+        }
+        F_SETFL => {
+            with_current_process(|proc| {
+                match proc.files.lock().get(fd as usize) {
+                    Ok(h) => {
+                        let want = arg as i64 & O_NONBLOCK != 0;
+                        // A handle with no notion of non-blocking silently
+                        // ignoring the request would be worse than saying so
+                        // — but only when the caller actually asked for it.
+                        if !h.set_nonblocking(want) && want {
+                            return errno::EINVAL;
+                        }
+                        0
+                    }
+                    Err(_) => errno::EBADF,
+                }
+            })
+        }
+        F_GETFD | F_SETFD => {
             with_current_process(|proc| {
                 match proc.files.lock().get(fd as usize) {
                     Ok(_)  => 0,

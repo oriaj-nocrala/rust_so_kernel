@@ -248,6 +248,9 @@ pub(crate) fn cancel_all_waiters(pid: usize) {
     super::poll::poll_cancel_waiter(pid);
     super::poll::clear_epoll_fd_all(pid);
     super::sync::futex_cancel_waiter(pid);
+    // A socket waiter left behind would later wake whatever process
+    // inherits this pid number.
+    crate::ipc::unix::cancel_waiters_for(pid);
 }
 
 pub(super) fn sys_fork() -> SyscallResult {

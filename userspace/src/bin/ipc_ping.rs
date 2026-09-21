@@ -1,46 +1,51 @@
 #![no_std]
 #![no_main]
 
-use userspace::{println, syscall};
-use userspace::syscall::IpcMsg;
+//! AF_UNIX stream round-trip: `socket`/`bind`/`listen`/`accept` on one side,
+//! `connect`/`send`/`recv` on the other, 100 times.
+//!
+//! Uses the **abstract namespace** (`sun_path[0] == '\0'`), so the address
+//! needs no filesystem node and the test leaves nothing behind. The server
+//! `listen()`s before it forks, which is what lets the client connect
+//! immediately instead of retry-looping the way this test had to when
+//! `accept()` couldn't block.
 
-const CHANNEL: &str = "/ipc/ping";
+use userspace::syscall::{SockAddrUn, AF_UNIX, SOCK_STREAM};
+use userspace::{println, syscall};
+
+const NAME: &[u8] = b"ipc-ping";
 const ROUNDS: u32 = 100;
 
 fn client() -> ! {
-    let fd = syscall::socket();
+    let fd = syscall::socket(AF_UNIX as i32, SOCK_STREAM, 0);
     if fd < 0 {
         println!("ipc_ping: client socket failed ({})", fd);
         syscall::exit(1);
     }
     let fd = fd as i32;
 
-    // Retry connect until the server has accepted (no blocking-accept
-    // guarantee before connect, so poll with a short sleep).
-    loop {
-        let r = syscall::with_cstr(CHANNEL, |p| syscall::connect(fd, p));
-        if r >= 0 {
-            break;
-        }
-        syscall::sleep_ms(10);
+    let (addr, len) = SockAddrUn::abstract_name(NAME);
+    let r = syscall::connect(fd, &addr, len);
+    if r < 0 {
+        println!("ipc_ping: connect failed ({})", r);
+        syscall::exit(1);
     }
 
     let mut ok = 0u32;
+    let mut reply = [0u8; 16];
     for i in 0..ROUNDS {
-        let payload = [b'p', b'i', b'n', b'g'];
-        let msg = IpcMsg::new(i, &payload);
-        let s = syscall::sendmsg(fd, &msg);
+        let payload = [b'p', b'i', b'n', b'g', i as u8];
+        let s = syscall::send(fd, &payload);
         if s < 0 {
             println!("ipc_ping: client send failed at round {} ({})", i, s);
             break;
         }
-        let mut reply = IpcMsg::new(0, &[]);
-        let r = syscall::recvmsg(fd, &mut reply);
+        let r = syscall::recv(fd, &mut reply);
         if r < 0 {
             println!("ipc_ping: client recv failed at round {} ({})", i, r);
             break;
         }
-        if reply.tag == i && reply.len == msg.len && reply.data[..reply.len as usize] == msg.data[..msg.len as usize] {
+        if r as usize == payload.len() && reply[..payload.len()] == payload {
             ok += 1;
         }
     }
@@ -51,16 +56,22 @@ fn client() -> ! {
 
 #[no_mangle]
 extern "C" fn _start() -> ! {
-    let fd = syscall::socket();
+    let fd = syscall::socket(AF_UNIX as i32, SOCK_STREAM, 0);
     if fd < 0 {
         println!("ipc_ping: server socket failed ({})", fd);
         syscall::exit(1);
     }
     let fd = fd as i32;
 
-    let b = syscall::with_cstr(CHANNEL, |p| syscall::bind(fd, p));
+    let (addr, len) = SockAddrUn::abstract_name(NAME);
+    let b = syscall::bind(fd, &addr, len);
     if b < 0 {
         println!("ipc_ping: bind failed ({})", b);
+        syscall::exit(1);
+    }
+    let l = syscall::listen(fd, 4);
+    if l < 0 {
+        println!("ipc_ping: listen failed ({})", l);
         syscall::exit(1);
     }
 
@@ -80,14 +91,18 @@ extern "C" fn _start() -> ! {
     let peer = peer as i32;
 
     let mut ok = 0u32;
+    let mut buf = [0u8; 16];
     for i in 0..ROUNDS {
-        let mut msg = IpcMsg::new(0, &[]);
-        let r = syscall::recvmsg(peer, &mut msg);
+        let r = syscall::recv(peer, &mut buf);
         if r < 0 {
             println!("ipc_ping: server recv failed at round {} ({})", i, r);
             break;
         }
-        let s = syscall::sendmsg(peer, &msg);
+        if r == 0 {
+            println!("ipc_ping: client hung up at round {}", i);
+            break;
+        }
+        let s = syscall::send(peer, &buf[..r as usize]);
         if s < 0 {
             println!("ipc_ping: server send failed at round {} ({})", i, s);
             break;

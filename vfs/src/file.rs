@@ -35,6 +35,13 @@ pub enum FileError {
     /// perform the actual block_current/jump_to_trapframe themselves — see
     /// their doc comments for why this can't happen inside `read`/`write`.
     WouldBlock,
+    /// The operation would have blocked, but the open file description is
+    /// `O_NONBLOCK`: report `EAGAIN` instead of parking the caller.
+    ///
+    /// Distinct from `WouldBlock` precisely because the two ask `sys_read`/
+    /// `sys_write` for opposite things — block, versus do not block. Only
+    /// sockets raise it today; pipes here have no `O_NONBLOCK` support.
+    Again,
 }
 
 pub type FileResult<T> = Result<T, FileError>;
@@ -116,6 +123,40 @@ pub trait FileHandle: Send {
     /// underlying buffer — required for pipe semantics across fork.
     fn dup(&self) -> Option<Box<dyn FileHandle>> {
         None
+    }
+
+    /// The socket this handle refers to, if it is one.
+    ///
+    /// Socket syscalls (`bind`, `listen`, `accept`, `sendto`, …) reach their
+    /// socket through an fd like any other file, but need the socket object
+    /// behind it, not just a byte stream. `dyn FileHandle` cannot be
+    /// downcast in `no_std` (no `Any`), so the id is published here instead.
+    ///
+    /// The previous answer to the same problem was a global
+    /// `[[ChannelId; MAX_FILES]; MAX_PROCS]` side table indexed by pid —
+    /// which silently stopped working for any pid past its fixed bound, and
+    /// had to be kept in sync by hand at every fd-allocating call site. One
+    /// default-`None` method replaces it: the mapping now lives in the
+    /// handle that actually owns it, and is inherited by `dup()` for free.
+    fn socket_id(&self) -> Option<usize> {
+        None
+    }
+
+    /// Whether this open file description is in non-blocking mode.
+    ///
+    /// Only sockets answer this today: every other handle here either never
+    /// blocks or (pipes) has no `O_NONBLOCK` support yet. It is a property
+    /// of the description, not of the descriptor, so a `dup()`ed handle
+    /// shares it.
+    fn nonblocking(&self) -> bool {
+        false
+    }
+
+    /// Set `O_NONBLOCK` (`fcntl(F_SETFL)`). Returns false if the handle has
+    /// no notion of it, which is what lets `fcntl` report `EINVAL` rather
+    /// than silently accepting a flag it will then ignore.
+    fn set_nonblocking(&self, _on: bool) -> bool {
+        false
     }
 
     /// Reposition the file offset. `whence` uses the same values as real

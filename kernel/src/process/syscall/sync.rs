@@ -6,7 +6,7 @@ use spin::Mutex;
 use core::sync::atomic::Ordering;
 use crate::process::TrapFrame;
 use super::{errno, SyscallResult, validate_user_buffer, CURRENT_SYSCALL_TF};
-use super::ipc::MAX_PROCS;
+use super::poll::MAX_PROCS;
 
 // ── futex(202) ─────────────────────────────────────────────────────────────
 

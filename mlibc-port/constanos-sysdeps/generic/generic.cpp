@@ -29,19 +29,25 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/sysinfo.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/utsname.h>
 #include <termios.h>
 
 namespace {
 
+// Six argument registers, not five: sendto(44)/recvfrom(45) are the first
+// syscalls in this port that use the full SysV syscall register set
+// (rdi, rsi, rdx, r10, r8, r9).
 inline long raw_syscall(long nr, long a1 = 0, long a2 = 0, long a3 = 0,
-                         long a4 = 0, long a5 = 0) {
+                         long a4 = 0, long a5 = 0, long a6 = 0) {
 	long ret;
 	register long r10 asm("r10") = a4;
 	register long r8  asm("r8")  = a5;
+	register long r9  asm("r9")  = a6;
 	asm volatile ("syscall"
 			: "=a"(ret)
-			: "a"(nr), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8)
+			: "a"(nr), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8), "r"(r9)
 			: "rcx", "r11", "memory");
 	return ret;
 }
@@ -76,6 +82,22 @@ constexpr long SYS_access = 21;
 constexpr long SYS_symlink = 88;
 constexpr long SYS_chmod = 90;
 constexpr long SYS_fchmod = 91;
+constexpr long SYS_socket = 41;
+constexpr long SYS_connect = 42;
+constexpr long SYS_accept = 43;
+constexpr long SYS_sendto = 44;
+constexpr long SYS_recvfrom = 45;
+constexpr long SYS_sendmsg = 46;
+constexpr long SYS_recvmsg = 47;
+constexpr long SYS_shutdown = 48;
+constexpr long SYS_bind = 49;
+constexpr long SYS_listen = 50;
+constexpr long SYS_getsockname = 51;
+constexpr long SYS_getpeername = 52;
+constexpr long SYS_socketpair = 53;
+constexpr long SYS_setsockopt = 54;
+constexpr long SYS_getsockopt = 55;
+constexpr long SYS_accept4 = 288;
 constexpr long SYS_statvfs = 404;
 constexpr long SYS_uptime_sec = 401;
 constexpr long SYS_dup = 32;
@@ -880,6 +902,132 @@ int sys_sigaction(int sig, const struct sigaction *__restrict act,
 int sys_sigprocmask(int how, const sigset_t *__restrict set,
 		sigset_t *__restrict old) {
 	long ret = raw_syscall(SYS_sigprocmask, how, (long)set, (long)old);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+
+// ── AF_UNIX sockets ─────────────────────────────────────────────────────
+//
+// These map one-to-one onto the kernel's socket syscalls (Linux numbers,
+// Linux argument order) — see kernel/src/process/syscall/ipc.rs, which sits
+// on the host-tested `usock` crate. AF_UNIX is the only family that exists
+// here: there is no network stack, and socket() answers EAFNOSUPPORT for
+// anything else rather than pretending.
+
+int sys_socket(int family, int type, int protocol, int *fd) {
+	long ret = raw_syscall(SYS_socket, family, type, protocol);
+	if (ret < 0)
+		return (int)-ret;
+	*fd = (int)ret;
+	return 0;
+}
+
+int sys_socketpair(int domain, int type_and_flags, int proto, int *fds) {
+	long ret = raw_syscall(SYS_socketpair, domain, type_and_flags, proto, (long)fds);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+int sys_bind(int fd, const struct sockaddr *addr_ptr, socklen_t addr_length) {
+	long ret = raw_syscall(SYS_bind, fd, (long)addr_ptr, addr_length);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+int sys_listen(int fd, int backlog) {
+	long ret = raw_syscall(SYS_listen, fd, backlog);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+int sys_connect(int fd, const struct sockaddr *addr_ptr, socklen_t addr_length) {
+	long ret = raw_syscall(SYS_connect, fd, (long)addr_ptr, addr_length);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+// mlibc folds accept() and accept4() into one sysdep; `flags` carries
+// SOCK_NONBLOCK/SOCK_CLOEXEC, which the kernel's accept4(288) understands.
+int sys_accept(int fd, int *newfd, struct sockaddr *addr_ptr, socklen_t *addr_length, int flags) {
+	long ret = raw_syscall(SYS_accept4, fd, (long)addr_ptr, (long)addr_length, flags);
+	if (ret < 0)
+		return (int)-ret;
+	*newfd = (int)ret;
+	return 0;
+}
+
+ssize_t sys_sendto(int fd, const void *buffer, size_t size, int flags,
+		const struct sockaddr *sock_addr, socklen_t addr_length, ssize_t *length) {
+	long ret = raw_syscall(SYS_sendto, fd, (long)buffer, (long)size, flags,
+			(long)sock_addr, (long)addr_length);
+	if (ret < 0)
+		return (int)-ret;
+	*length = (ssize_t)ret;
+	return 0;
+}
+
+ssize_t sys_recvfrom(int fd, void *buffer, size_t size, int flags,
+		struct sockaddr *sock_addr, socklen_t *addr_length, ssize_t *length) {
+	long ret = raw_syscall(SYS_recvfrom, fd, (long)buffer, (long)size, flags,
+			(long)sock_addr, (long)addr_length);
+	if (ret < 0)
+		return (int)-ret;
+	*length = (ssize_t)ret;
+	return 0;
+}
+
+// send()/recv() and sendmsg()/recvmsg() all land here or in sys_sendto
+// above; the kernel walks the iovec array and any SCM_RIGHTS control
+// message itself.
+int sys_msg_send(int fd, const struct msghdr *hdr, int flags, ssize_t *length) {
+	long ret = raw_syscall(SYS_sendmsg, fd, (long)hdr, flags);
+	if (ret < 0)
+		return (int)-ret;
+	*length = (ssize_t)ret;
+	return 0;
+}
+
+int sys_msg_recv(int fd, struct msghdr *hdr, int flags, ssize_t *length) {
+	long ret = raw_syscall(SYS_recvmsg, fd, (long)hdr, flags);
+	if (ret < 0)
+		return (int)-ret;
+	*length = (ssize_t)ret;
+	return 0;
+}
+
+int sys_shutdown(int sockfd, int how) {
+	long ret = raw_syscall(SYS_shutdown, sockfd, how);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+// getsockname(2)/getpeername(2). mlibc hands in the caller's buffer size and
+// wants the address's real length back; the kernel's own calls take a single
+// in/out socklen_t, so it is staged here.
+int sys_sockname(int fd, struct sockaddr *addr_ptr, socklen_t max_addr_length,
+		socklen_t *actual_length) {
+	socklen_t len = max_addr_length;
+	long ret = raw_syscall(SYS_getsockname, fd, (long)addr_ptr, (long)&len);
+	if (ret < 0)
+		return (int)-ret;
+	*actual_length = len;
+	return 0;
+}
+
+int sys_peername(int fd, struct sockaddr *addr_ptr, socklen_t max_addr_length,
+		socklen_t *actual_length) {
+	socklen_t len = max_addr_length;
+	long ret = raw_syscall(SYS_getpeername, fd, (long)addr_ptr, (long)&len);
+	if (ret < 0)
+		return (int)-ret;
+	*actual_length = len;
+	return 0;
+}
+
+int sys_getsockopt(int fd, int layer, int number,
+		void *__restrict buffer, socklen_t *__restrict size) {
+	long ret = raw_syscall(SYS_getsockopt, fd, layer, number, (long)buffer, (long)size);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+int sys_setsockopt(int fd, int layer, int number,
+		const void *buffer, socklen_t size) {
+	long ret = raw_syscall(SYS_setsockopt, fd, layer, number, (long)buffer, (long)size);
 	return ret < 0 ? (int)-ret : 0;
 }
 

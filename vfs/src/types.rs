@@ -18,6 +18,7 @@ impl Errno {
     pub const EPERM:   Self = Self(1);
     pub const ENOENT:  Self = Self(2);
     pub const EIO:     Self = Self(5);
+    pub const ENXIO:   Self = Self(6);
     pub const EBADF:   Self = Self(9);
     pub const ENOMEM:  Self = Self(12);
     pub const EFAULT:  Self = Self(14);
@@ -52,6 +53,10 @@ pub enum FileType {
     CharDevice,
     BlockDevice,
     Symlink,
+    /// A bound AF_UNIX socket's node. Carries no data and cannot be opened —
+    /// it exists so a socket's name is visible in the filesystem (`ls -l`
+    /// shows `s`) and can be removed with `unlink`, exactly as in Linux.
+    Socket,
 }
 
 impl FileType {
@@ -63,6 +68,7 @@ impl FileType {
             Self::CharDevice  => 2,  // DT_CHR
             Self::BlockDevice => 6,  // DT_BLK
             Self::Symlink     => 10, // DT_LNK
+            Self::Socket      => 12, // DT_SOCK
         }
     }
 
@@ -74,6 +80,7 @@ impl FileType {
             Self::CharDevice  => 0o020000,
             Self::BlockDevice => 0o060000,
             Self::Symlink     => 0o120000,
+            Self::Socket      => 0o140000, // S_IFSOCK
         }
     }
 }
@@ -224,6 +231,13 @@ impl Stat {
     /// Construct a character-device stat.
     pub fn chardev(ino: u64) -> Self {
         Self::base(ino, FileType::CharDevice.as_mode_bits() | 0o666, 1, 0, 0)
+    }
+
+    /// Construct an AF_UNIX socket-node stat. Always zero-sized: the node is
+    /// a name, not a file — the socket's data lives entirely in the kernel's
+    /// socket table.
+    pub fn socket(ino: u64) -> Self {
+        Self::base(ino, FileType::Socket.as_mode_bits() | 0o755, 1, 0, 0)
     }
 }
 

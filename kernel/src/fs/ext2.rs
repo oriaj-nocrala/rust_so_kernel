@@ -502,6 +502,7 @@ fn ext2_file_type_to_vfs(ft: u8) -> FileType {
         7 => FileType::Symlink,
         3 => FileType::BlockDevice,
         4 => FileType::CharDevice,
+        6 => FileType::Socket,
         _ => FileType::Regular,
     }
 }
@@ -512,6 +513,7 @@ fn vfs_file_type_to_ext2(kind: FileType) -> u8 {
         FileType::Symlink => 7,
         FileType::BlockDevice => 3,
         FileType::CharDevice => 4,
+        FileType::Socket => 6,
         FileType::Regular => 1,
     }
 }

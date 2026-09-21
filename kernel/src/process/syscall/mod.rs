@@ -23,7 +23,9 @@
 //   process_ctl  — fork/clone/exec/exit/waitpid/kill/getpid/setpgid/getpgid/
 //                  setsid/yield/nanosleep/arch_prctl/set_tid_address.
 //   signal       — sigaction/sigprocmask/sigreturn.
-//   ipc          — socket/connect/accept/bind/sendmsg/recvmsg.
+//   ipc          — the AF_UNIX socket calls: socket/socketpair/bind/listen/
+//                  connect/accept(4)/send{to,msg}/recv{from,msg}/shutdown/
+//                  getsockname/getpeername/get-setsockopt.
 //   sync         — futex.
 //   poll         — poll/epoll_create/epoll_ctl/epoll_wait.
 //   misc         — uptime/meminfo/kdebug_ctl/clock_gettime.
@@ -39,7 +41,7 @@ mod misc;
 
 pub(crate) use fs::{send_to_group, stdin_wakeup};
 pub(crate) use process_ctl::cancel_all_waiters;
-pub(crate) use poll::{poll_wakeup_for_fd0, poll_clear_on_timeout};
+pub(crate) use poll::{poll_wakeup_for_fd0, poll_clear_on_timeout, poll_wakeup_for_socket};
 
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -253,9 +255,18 @@ pub enum SyscallNumber {
     Socket = 41,
     Connect = 42,
     Accept = 43,
+    Sendto = 44,
+    Recvfrom = 45,
     Sendmsg = 46,
     Recvmsg = 47,
+    Shutdown = 48,
     Bind = 49,
+    Listen = 50,
+    Getsockname = 51,
+    Getpeername = 52,
+    Socketpair = 53,
+    Setsockopt = 54,
+    Getsockopt = 55,
     Clone = 56,
     Fork = 57,
     Exec = 59,
@@ -273,6 +284,7 @@ pub enum SyscallNumber {
     ClockGettime = 228,
     EpollWait = 232,
     EpollCtl = 233,
+    Accept4 = 288,
     // Custom kernel syscalls (above Linux range)
     UptimeMs = 400,
     UptimeSec = 401,
@@ -322,9 +334,18 @@ impl SyscallNumber {
             41 => Some(Self::Socket),
             42 => Some(Self::Connect),
             43 => Some(Self::Accept),
+            44 => Some(Self::Sendto),
+            45 => Some(Self::Recvfrom),
             46 => Some(Self::Sendmsg),
             47 => Some(Self::Recvmsg),
+            48 => Some(Self::Shutdown),
             49 => Some(Self::Bind),
+            50 => Some(Self::Listen),
+            51 => Some(Self::Getsockname),
+            52 => Some(Self::Getpeername),
+            53 => Some(Self::Socketpair),
+            54 => Some(Self::Setsockopt),
+            55 => Some(Self::Getsockopt),
             56 => Some(Self::Clone),
             57 => Some(Self::Fork),
             59 => Some(Self::Exec),
@@ -342,6 +363,7 @@ impl SyscallNumber {
             228 => Some(Self::ClockGettime),
             232 => Some(Self::EpollWait),
             233 => Some(Self::EpollCtl),
+            288 => Some(Self::Accept4),
             400 => Some(Self::UptimeMs),
             401 => Some(Self::UptimeSec),
             402 => Some(Self::MemInfoKb),
@@ -526,12 +548,22 @@ pub fn syscall_handler(
         SyscallNumber::Yield => process_ctl::sys_yield(),
         SyscallNumber::Nanosleep => process_ctl::sys_nanosleep(arg1),
         SyscallNumber::GetPid => process_ctl::sys_getpid(),
-        SyscallNumber::Socket  => ipc::sys_socket_impl(),
-        SyscallNumber::Connect => ipc::sys_connect(arg1 as i32, arg2 as usize, arg3 as usize),
-        SyscallNumber::Accept  => ipc::sys_accept(arg1 as i32),
+        SyscallNumber::Socket  => ipc::sys_socket(arg1 as i32, arg2 as i32, arg3 as i32),
+        SyscallNumber::Connect => ipc::sys_connect(arg1 as i32, arg2, arg3),
+        SyscallNumber::Accept  => ipc::sys_accept4(arg1 as i32, arg2, arg3, 0),
+        SyscallNumber::Accept4 => ipc::sys_accept4(arg1 as i32, arg2, arg3, arg4 as i32),
+        SyscallNumber::Sendto  => ipc::sys_sendto(arg1 as i32, arg2, arg3 as usize, arg4 as u32, arg5, _arg6),
+        SyscallNumber::Recvfrom => ipc::sys_recvfrom(arg1 as i32, arg2, arg3 as usize, arg4 as u32, arg5, _arg6),
         SyscallNumber::Sendmsg => ipc::sys_sendmsg(arg1 as i32, arg2, arg3 as u32),
         SyscallNumber::Recvmsg => ipc::sys_recvmsg(arg1 as i32, arg2, arg3 as u32),
-        SyscallNumber::Bind    => ipc::sys_bind_impl(arg1 as i32, arg2 as usize, arg3 as usize),
+        SyscallNumber::Shutdown => ipc::sys_shutdown(arg1 as i32, arg2 as i32),
+        SyscallNumber::Bind    => ipc::sys_bind(arg1 as i32, arg2, arg3),
+        SyscallNumber::Listen  => ipc::sys_listen(arg1 as i32, arg2 as i32),
+        SyscallNumber::Getsockname => ipc::sys_getsockname(arg1 as i32, arg2, arg3),
+        SyscallNumber::Getpeername => ipc::sys_getpeername(arg1 as i32, arg2, arg3),
+        SyscallNumber::Socketpair => ipc::sys_socketpair(arg1 as i32, arg2 as i32, arg3 as i32, arg4),
+        SyscallNumber::Setsockopt => ipc::sys_setsockopt(arg1 as i32, arg2 as i32, arg3 as i32, arg4, arg5 as u32),
+        SyscallNumber::Getsockopt => ipc::sys_getsockopt(arg1 as i32, arg2 as i32, arg3 as i32, arg4, arg5),
         SyscallNumber::Clone => process_ctl::sys_clone(arg1, arg2, arg3),
         SyscallNumber::Fork => process_ctl::sys_fork(),
         SyscallNumber::Exec => process_ctl::sys_exec(arg1 as usize, arg2 as usize, arg3 as usize),

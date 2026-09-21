@@ -19,7 +19,7 @@ cd kernel && cargo build --target x86_64-unknown-none
 
 The top-level `cargo run` builds the kernel ELF, wraps it in a UEFI disk image via the `bootloader` crate, then spawns `qemu-system-x86_64`. Serial output appears in the terminal. The kernel ELF is built by `build.rs` shelling out to a **nested** `cargo build` (not cargo's artifact-dependency/`bindeps` feature) — see `build_kernel()` in the root `build.rs` for why (`bindeps` + `-Z build-std` panics inside cargo itself on every nightly tested).
 
-**A root `cargo build` does NOT verify the six extracted crates.** `watch_dir_recursive` in the root `build.rs` (call sites at `build.rs:351-358`) watches `kernel/src`, `userspace/{src,c}`, `mlibc-port`, `doom-port`, `quake-port`, `scripts`, and `busybox-config` — but **not** `hal/`, `ext2/`, `mm/`, `vfs/`, `diag/`, or `sched/`. Editing any of those changes none of `build.rs`'s declared `rerun-if-changed` inputs, so cargo skips the build script entirely and its nested kernel build never runs: the root `cargo build` returns exit 0 without compiling the edited crate at all. Measured, not reasoned — appending a syntax error to `sched/src/core.rs` gave root `cargo build` exit **0** while `cd kernel && cargo build --target x86_64-unknown-none` gave exit **101**. **Verify changes to those crates with the `cd kernel` form** (or `touch build.rs` first); the same "a 0.03s build proves nothing" rule already documented for stale embedded ELFs applies here with a different cause.
+**A root `cargo build` does NOT verify the seven extracted crates.** `watch_dir_recursive` in the root `build.rs` (call sites at `build.rs:351-358`) watches `kernel/src`, `userspace/{src,c}`, `mlibc-port`, `doom-port`, `quake-port`, `scripts`, and `busybox-config` — but **not** `hal/`, `ext2/`, `mm/`, `vfs/`, `diag/`, `sched/`, or `usock/`. Editing any of those changes none of `build.rs`'s declared `rerun-if-changed` inputs, so cargo skips the build script entirely and its nested kernel build never runs: the root `cargo build` returns exit 0 without compiling the edited crate at all. Measured, not reasoned — appending a syntax error to `sched/src/core.rs` gave root `cargo build` exit **0** while `cd kernel && cargo build --target x86_64-unknown-none` gave exit **101**. **Verify changes to those crates with the `cd kernel` form** (or `touch build.rs` first); the same "a 0.03s build proves nothing" rule already documented for stale embedded ELFs applies here with a different cause.
 
 ### Headless interactive debugging (no display/keyboard)
 
@@ -107,7 +107,14 @@ self-check against known QEMU i440fx values) is the first real test case
 (`kernel/src/hw_tests.rs::acpi_selftest_passes`). The second, `ext2_memdisk_roundtrip`, mounts
 `fs::ext2` on a `hal::block::MemDisk` carrying a hand-built minimal image
 (`ext2::testimg::build_minimal_image`) and drives create/mkdir/rename/symlink/unlink/rmdir through
-the real VFS — see the storage-stack seam entry below. See `docs/drivers/architecture.md`'s
+the real VFS — see the storage-stack seam entry below. The third,
+`ext2_reclaim_orphans_clears_injected_disk_img_shape`, is described with the ext2 repair
+passes below. The fourth,
+`unix_socket_handle_roundtrip`, covers the AF_UNIX adapter (`kernel/src/ipc/unix.rs`) — the
+half of the socket stack the `usock` crate's host tests cannot reach: `UnixSocketHandle` as a
+real `FileHandle`, `socket_id()` reporting through a `Box<dyn FileHandle>`, and reference
+counting living in `Drop` rather than `close()`; see the AF_UNIX section below. See
+`docs/drivers/architecture.md`'s
 Testing section and `docs/drivers/roadmap.md`'s Phase 2 for more.
 
 ## Crate Layout
@@ -121,10 +128,11 @@ Testing section and `docs/drivers/roadmap.md`'s Phase 2 for more.
 | `mm` | `mm/` | Host-testable buddy (physical) + slab (heap) allocators (`cd mm && cargo test`; the optional `slab-debug` feature adds a redzone + free-object quarantine, off by default so the default slot layout stays the reference one) |
 | `vfs` | `vfs/` | Host-testable VFS core: `Inode`/`Filesystem`/`FileHandle` traits, mount table + path resolution, and ramfs (`cd vfs && cargo test`) |
 | `diag` | `diag/` | Host-testable always-on diagnostic instruments (`LockDiag`, `DirLockDiag`, `TfRewindDiag`, `IfViolationDiag`) extracted out of `kernel/src/debug.rs` (`cd diag && cargo test`) |
+| `usock` | `usock/` | Host-testable AF_UNIX socket core: socket state machines, stream/datagram queues, backlog, `sockaddr_un` parsing, the abstract namespace and `SCM_RIGHTS`, generic over the passed-descriptor type (`cd usock && cargo test`) |
 | `sched` | `sched/` | Host-testable scheduler core: priority run queues, wait queue, decay-on-preemption, aging, quantum arithmetic, and an invariant checker + property tests, generic over the scheduled entity (`cd sched && cargo test`) |
 | `qemu-test-runner` | `qemu-test-runner/` | Host-side driver for the QEMU integration tests (`scripts/run-kernel-tests.sh`) |
 
-Despite the heading, only `so2`+`kernel` form the actual Cargo workspace (`members = ["kernel"]` in the root `Cargo.toml`). `hal`/`ext2`/`mm`/`vfs`/`diag`/`sched`/`qemu-test-runner` are each deliberately their own workspace root (empty `[workspace]` table in their own `Cargo.toml`, see the root `Cargo.toml`'s `exclude` comment for why — mainly that this workspace's `panic = "abort"` profile would break their unwinding `cargo test` harnesses) and are pulled into `kernel` via plain `path` dependencies instead: `kernel` depends on `hal`, `ext2`, `mm`, `vfs`, `diag`, and `sched`; `ext2` also depends on `hal` (`hal::block::BlockDevice`). `vfs` depends on neither `hal`, `ext2`, nor `mm` — only `spin`. Each of the extracted logic crates (`hal`/`ext2`/`mm`/`vfs`/`diag`/`sched`) exists for the same reason: `kernel` itself cannot run `cargo test` on the host (see `## QEMU integration tests` above — the `-Z build-std` + double bin-target-build lang-item collision), so logic that can be made to speak in plain types instead of this kernel's concrete globals gets moved out where a plain `cargo test` reaches it.
+Despite the heading, only `so2`+`kernel` form the actual Cargo workspace (`members = ["kernel"]` in the root `Cargo.toml`). `hal`/`ext2`/`mm`/`vfs`/`diag`/`sched`/`usock`/`qemu-test-runner` are each deliberately their own workspace root (empty `[workspace]` table in their own `Cargo.toml`, see the root `Cargo.toml`'s `exclude` comment for why — mainly that this workspace's `panic = "abort"` profile would break their unwinding `cargo test` harnesses) and are pulled into `kernel` via plain `path` dependencies instead: `kernel` depends on `hal`, `ext2`, `mm`, `vfs`, `diag`, `sched`, and `usock`; `ext2` also depends on `hal` (`hal::block::BlockDevice`). `vfs` depends on neither `hal`, `ext2`, nor `mm` — only `spin`. Each of the extracted logic crates (`hal`/`ext2`/`mm`/`vfs`/`diag`/`sched`/`usock`) exists for the same reason: `kernel` itself cannot run `cargo test` on the host (see `## QEMU integration tests` above — the `-Z build-std` + double bin-target-build lang-item collision), so logic that can be made to speak in plain types instead of this kernel's concrete globals gets moved out where a plain `cargo test` reaches it.
 
 The host crate's `build.rs` creates a UEFI boot image; `src/main.rs` only launches QEMU with the image paths injected by the build script.
 
@@ -206,7 +214,7 @@ Implemented syscalls (Linux-compatible numbers — see `SyscallNumber` enum for 
 | 32/33 | `dup`/`dup2` | Duplicate fd (real shared-offset semantics) |
 | 35 | `nanosleep` | Sleep via hrtimer |
 | 39 | `getpid` | Return current PID |
-| 41/42/43/46/47/49 | `socket`/`connect`/`accept`/`sendmsg`/`recvmsg`/`bind` | Socket-style IPC channels |
+| 41-55, 288 | `socket`/`connect`/`accept`/`sendto`/`recvfrom`/`sendmsg`/`recvmsg`/`shutdown`/`bind`/`listen`/`getsockname`/`getpeername`/`socketpair`/`setsockopt`/`getsockopt`/`accept4` | Real AF_UNIX sockets — see the AF_UNIX section below. Linux signatures throughout (`struct sockaddr_un`, `struct msghdr` with a real iovec array and `SCM_RIGHTS` control messages); `AF_INET` is `EAFNOSUPPORT`, there being no network stack |
 | 56/57 | `clone`/`fork` | Threads (shared AddressSpace+fds) / COW process fork |
 | 59 | `exec` | `(path, argv, envp)` — real argc/argv/envp built onto the new stack, see `memory/elf_loader.rs::build_initial_stack` |
 | 60 | `exit` | Terminate process (immediate switch) |
@@ -229,6 +237,105 @@ Implemented syscalls (Linux-compatible numbers — see `SyscallNumber` enum for 
 | 404 | `statvfs` | Custom (real `statvfs(2)` has no fixed Linux syscall number of its own — glibc/mlibc implement it over `statfs`, which this port doesn't wire). One physical-memory pool backs every mount, so every path reports the same Buddy-allocator-derived total/free block counts — enough for `df` to run and show live numbers, not a real per-mount breakdown |
 
 Helpers `with_current_process` and `with_scheduler` guarantee `cli` before lock and `sti` after lock is dropped to prevent deadlocks with the timer ISR. `sys_close`/`sys_dup2` deliberately avoid `with_current_process` (see their doc comments) — closing a handle can run a `Drop` impl that needs a fresh `SCHEDULER` lock, which would self-deadlock if the outer helper were still holding it.
+
+## AF_UNIX Sockets (`usock/`, `kernel/src/ipc/unix.rs`, `kernel/src/process/syscall/ipc.rs`)
+
+Real AF_UNIX, replacing the former `kernel/src/ipc/channel.rs` — a bespoke
+IPC of fixed 64-byte messages whose `socket()` took no arguments at all (no
+domain, no type, no `sockaddr`, no `listen()`). Nothing about it was AF_UNIX
+except the syscall numbers it borrowed.
+
+**What lives where.** The `usock` crate (`cd usock && cargo test` — 71 host
+tests, no QEMU) owns every state machine: `SOCK_STREAM` byte streams and
+`SOCK_DGRAM` datagrams, the bind registry (filesystem paths and Linux's
+abstract namespace in one table), backlog/accept queues, half-close,
+`SO_*` options, `SCM_RIGHTS`, and `sockaddr_un` parsing. It is generic over
+the passed-descriptor payload (`SocketTable<F>`) exactly the way
+`sched::SchedCore<Process>` is generic over the scheduled entity: the kernel
+instantiates `F = Box<dyn FileHandle>`, host tests use integers, and fd
+passing becomes testable without a kernel. Two properties make that work:
+**nothing blocks** (an operation that can't complete returns
+`SockError::Again`) and **wakeups come back as data** (`Wakes`, naming the
+sockets that became readable/writable/acceptable — the same
+report-the-condition technique as `mm`'s `PhantomEvent`).
+
+`kernel/src/ipc/unix.rs` is the adapter: the global `SOCKETS` table,
+`UnixSocketHandle` (the `FileHandle` that puts a socket behind an fd, so
+plain `read`/`write`/`dup`/`poll` work on one), and blocking.
+`process/syscall/ipc.rs` is the syscall boundary — `sockaddr_un` in and out
+of user memory, iovec walking, `SCM_RIGHTS` parsing, and the
+`EAGAIN`-vs-park decision.
+
+**`SOCKETS` is a `diag::IrqMutex`, not a `spin::Mutex`** — same reasoning as
+`BUDDY`/`SLAB_ALLOCATOR` (see Key Design Invariants): it is taken on
+allocating paths, and `with`/`try_with` disable interrupts before touching
+the real lock. Lock order is `SOCKETS` → (release) → `SCHEDULER`, never
+nested.
+
+**Blocking restarts the syscall instead of completing it from the waker.**
+`pipe.rs` blocks by having whoever wakes the sleeper finish its work
+(translate its user buffer through its own `AddressSpace`, copy, set `rax`).
+Sockets instead rewind the saved TrapFrame's `rip` by 2 — the width of
+`syscall` — before parking, so the call re-executes from the beginning when
+the process runs again (`rax` still holds the syscall number: the entry stub
+only overwrites that slot on a normal return). Two reasons: `accept`,
+`connect`, `sendmsg` and `recvfrom` each have a different completion (install
+an fd; encode a `sockaddr`; consume an iovec), all of which would have to be
+reproduced from inside another process's address space; and the old channel
+code's single global `ACCEPT_WAITER`/`RECV_WAITER` slots meant a second
+process blocking on the same operation silently overwrote the first, which
+then never woke. Signals still work — a woken process passes through
+`scheduler::resolve_signals` on its way back to user mode, so a handler runs
+first and the rewound syscall re-executes after its `sigreturn`, which is
+Linux's `SA_RESTART` behavior. `register_retry` (the half `FileHandle::read`/
+`write` use, since they cannot block themselves) **requires every caller to
+genuinely block afterwards**: rewinding and then returning normally would
+re-enter `syscall` with `rax` holding a return value.
+
+**`FileHandle::socket_id()`** (`vfs/src/file.rs`) is how a socket syscall
+gets from an fd to a socket: `dyn FileHandle` can't be downcast in `no_std`.
+It replaced a global `[[ChannelId; MAX_FILES]; MAX_PROCS]` side table indexed
+by pid, which silently did nothing past its bound and had to be
+hand-maintained at every fd-allocating call site; `poll`/`epoll` snapshot the
+mapping into their waiter instead (`SocketMap` in `syscall/poll.rs`), since a
+wakeup can't reach another process's fd table.
+
+**`bind()` has two halves.** A pathname address gets a real `S_IFSOCK` node
+in the filesystem (`FileType::Socket`, `Inode::mksocket`, implemented by
+ramfs — so `ls -l` shows it, `stat` reports it, `unlink` removes it) *plus*
+an entry in `usock`'s bind registry, which is what `connect()` resolves.
+That split is what gives Linux's error semantics for free: `connect()` to a
+path with no node is `ENOENT` (the server was never started), to a node with
+no live socket is `ECONNREFUSED` (it died), and a second `bind()` to a name
+whose node still exists is `EADDRINUSE`. Abstract addresses
+(`sun_path[0] == '\0'`) skip the filesystem entirely and free their name
+when the socket closes.
+
+**Interrupts on the wake path are saved and restored, never unconditionally
+re-enabled** (`dispatch_wakes` uses `without_interrupts`, not
+`SchedGuard`/`InterruptGuard`). One caller is `UnixSocketHandle::drop`, which
+runs inside `sys_exit`, on the kernel stack of a process already queued for
+deferred free — and CLAUDE.md's "`sys_exit` must keep IF=0 all the way to the
+`iretq`" invariant is exactly that hazard. It was not theoretical: the first
+boot of this code panicked in `timer_preempt`'s corrupt-frame detector the
+moment a process holding a socket exited.
+
+**Out of scope, deliberately:** `SOCK_SEQPACKET`, `SO_PEERCRED`/
+`SCM_CREDENTIALS` (no uid model — every process is root), `MSG_OOB` (AF_UNIX
+has none in Linux either), and non-blocking `connect()` handshakes
+(`EINPROGRESS`): a stream connect completes or fails immediately here,
+because `connect()` itself creates the server-side socket and queues it,
+exactly as Linux's `unix_stream_connect` does.
+
+**Tests.** `cd usock && cargo test` (71, the state machines);
+`kernel/src/hw_tests.rs::unix_socket_handle_roundtrip` (the adapter, in a
+real boot: `FileHandle` behavior, `socket_id()` through a trait object,
+refcounting in `Drop`); `userspace/c/socket_test.c` (46 checks end-to-end
+through real mlibc — socketpair, datagram boundaries, a pathname server,
+the abstract namespace, error codes, `SO_*`, half-close, and passing a
+descriptor with `SCM_RIGHTS`); `ipc_ping` and `poll_test` (the blocking
+paths: 100 stream round-trips, and `poll()` woken by a socket rather than by
+its own timeout).
 
 ## Runtime Tracing & Counters (`kernel/src/debug.rs`)
 
@@ -284,7 +391,7 @@ and `include_bytes!`'d from `kernel/embedded/`. Everything else runnable-
 but-not-boot-critical — `doom`, `quake`, and most of the old C test
 programs (`hello`, `pthread_test`, `producer_consumer`,
 `mlibc_signal_test`, `stat_test`, `argv_test`, `jobctl_test`,
-`ext2_robust_test`, `fpu_test`) — is built straight to
+`ext2_robust_test`, `fpu_test`, `socket_test`) — is built straight to
 `disk-image-root/bin/` instead and shipped on the ext2 disk image
 (`disk.img`, mounted at `/mnt`) rather than baked into the kernel ELF.
 This split exists because `kernel/embedded/`'s ELFs (mostly `doom.elf`/
@@ -341,7 +448,7 @@ The fallback `ProgramSource::RawCode` embeds inline assembly tests from `process
 
 `scripts/setup-mlibc.sh` copies this into the `mlibc/` submodule checkout and rebuilds `sysroot/` — it's the only thing that survives a `git submodule update` reset of `mlibc/` itself, so **any fix that needs to live inside the `mlibc/` submodule tree goes through a patch step in `setup-mlibc.sh`, never a direct edit to the checkout** (see the `do_scanf` patch below for the pattern: idempotency-checked via `grep`, then a Python string-replace, with an explicit error if upstream's text ever stops matching).
 
-**ABI-constant hygiene:** the `abi-bits/*.h` headers were originally copied from non-Linux mlibc ports and have repeatedly disagreed with this kernel's Linux-numbered syscall ABI (`MAP_ANONYMOUS`, `O_CREAT`, `POLLOUT`, `F_DUPFD`, `WIFEXITED`, `ENOTEMPTY`, and most recently `SEEK_SET`, which was `3` — `lseek(fd, n, SEEK_SET)` returned EINVAL while SEEK_CUR/SEEK_END coincidentally worked, making files "go empty" after any `fseek(END)` size probe). When touching any of these headers, cross-check values against `mlibc/abis/linux/` and the kernel's own constants, rebuild the sysroot, **and delete `kernel/embedded/busybox.elf` + `doom.elf`** so the "only build if missing" binaries don't keep the old constants baked in.
+**ABI-constant hygiene:** the `abi-bits/*.h` headers were originally copied from non-Linux mlibc ports and have repeatedly disagreed with this kernel's Linux-numbered syscall ABI (`MAP_ANONYMOUS`, `O_CREAT`, `POLLOUT`, `F_DUPFD`, `WIFEXITED`, `ENOTEMPTY`, and `SEEK_SET`, which was `3` — `lseek(fd, n, SEEK_SET)` returned EINVAL while SEEK_CUR/SEEK_END coincidentally worked, making files "go empty" after any `fseek(END)` size probe). Two whole headers have since been replaced with mlibc's own `abis/linux/` versions rather than patched constant by constant: `socket.h` (where `sa_family_t` was `unsigned int`, shifting `sun_path` two bytes and breaking every `sockaddr_un`; `AF_UNIX` was 3; `SHUT_RD`/`WR` were swapped; `msghdr`/`cmsghdr` had the wrong field widths for x86-64) and `errno.h` (BSD-numbered, so it agreed with Linux only up to `ERANGE` — `EAGAIN` was 35 against the kernel's 11, making `errno == EAGAIN` a test that could never succeed, and every socket errno past 34 was wrong). When touching any of these headers, cross-check values against `mlibc/abis/linux/` and the kernel's own constants, rebuild the sysroot, **and delete `kernel/embedded/busybox.elf` + `doom.elf`** so the "only build if missing" binaries don't keep the old constants baked in.
 
 **Real upstream mlibc bug, patched here:** `options/ansi/generic/stdio.cpp`'s `do_scanf` only advanced its internal `count` inside the `if(typed_dest)` branch of the `append_to_buffer` lambda shared by the `%s`/`%c`/`%[` conversions. A *suppressed* conversion (`%*s` — `dest` deliberately null) never touched `count`, so the very next `NOMATCH_CHECK(count == 0)` read "matched nothing" regardless of what was actually consumed, and `do_scanf` returned early right at the first `%*s` in any format string — silently truncating the match count for everything after it. Found via BusyBox `ps`/`top`: `libbb/procps.c`'s `/proc/<pid>/stat` parser skips half its fields with exactly that conversion, so every pid was read correctly but `procps_scan` still reported zero matches (`n=5` instead of the required `11`). Not specific to this port or to BusyBox — any `sscanf`/`fscanf` call with a `%*s` anywhere in it was affected.
 

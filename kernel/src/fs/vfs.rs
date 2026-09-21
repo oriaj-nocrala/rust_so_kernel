@@ -82,6 +82,12 @@ pub fn symlink(target: &str, path: &str) -> Result<(), Errno> {
     MOUNTS.symlink(target, path)
 }
 
+/// Create an AF_UNIX socket node at `path` (what `bind()` does with a
+/// pathname address).
+pub fn mksocket(path: &str) -> Result<(), Errno> {
+    MOUNTS.mksocket(path)
+}
+
 /// Remove the file at `path` (fails with `EISDIR` on directories).
 pub fn unlink(path: &str) -> Result<(), Errno> {
     MOUNTS.unlink(path)

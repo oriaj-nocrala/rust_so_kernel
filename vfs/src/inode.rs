@@ -67,6 +67,7 @@ pub trait Inode: Send + Sync {
             0o020000 => FileType::CharDevice,
             0o060000 => FileType::BlockDevice,
             0o120000 => FileType::Symlink,
+            0o140000 => FileType::Socket,
             _        => FileType::Regular,
         }
     }
@@ -119,6 +120,21 @@ pub trait Inode: Send + Sync {
     ///
     /// Same read-only-by-default convention as `create()`/`mkdir()`.
     fn symlink(&self, _name: &str, _target: &str) -> Result<Arc<dyn Inode>, Errno> {
+        Err(Errno::EROFS)
+    }
+
+    /// Create an AF_UNIX socket node `name` under this (directory) inode —
+    /// what `bind()` does with a pathname address.
+    ///
+    /// The node holds no data of its own: it is a name in the filesystem
+    /// that a `connect()` can resolve and an `unlink()` can remove, while
+    /// the socket itself lives in the kernel's socket table. Opening one is
+    /// deliberately not supported (Linux answers `ENXIO`); the only way to
+    /// reach the socket is `connect()`/`sendto()` with its address.
+    ///
+    /// Same read-only-by-default convention as `create()`/`mkdir()`/
+    /// `symlink()`.
+    fn mksocket(&self, _name: &str) -> Result<Arc<dyn Inode>, Errno> {
         Err(Errno::EROFS)
     }
 
@@ -313,10 +329,15 @@ mod tests {
     }
 
     #[test]
+    fn file_type_socket() {
+        assert_eq!(ModeInode(0o140000).file_type(), FileType::Socket);
+    }
+
+    #[test]
     fn file_type_unknown_mode_defaults_to_regular() {
-        // A socket (0o140000) has no FileType variant of its own — the
-        // trait's `_ =>` arm falls back to Regular.
-        assert_eq!(ModeInode(0o140000).file_type(), FileType::Regular);
+        // A FIFO (0o010000) has no FileType variant of its own — this
+        // kernel has no named pipes — so the trait's `_ =>` arm applies.
+        assert_eq!(ModeInode(0o010000).file_type(), FileType::Regular);
     }
 
     #[test]

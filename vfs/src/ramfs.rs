@@ -315,6 +315,16 @@ impl Inode for RamDirNode {
         Ok(node as Arc<dyn Inode>)
     }
 
+    fn mksocket(&self, name: &str) -> Result<Arc<dyn Inode>, Errno> {
+        let mut entries = self.lock_entries("mksocket");
+        if entries.contains_key(name) {
+            return Err(Errno::EEXIST);
+        }
+        let node = Arc::new(RamSocketNode { ino: alloc_ino() });
+        entries.insert(name.to_string(), node.clone() as Arc<dyn Inode>);
+        Ok(node as Arc<dyn Inode>)
+    }
+
     fn chmod(&self, mode: u32) -> Result<(), Errno> {
         self.mode.store(mode & 0o7777, Ordering::Relaxed);
         Ok(())
@@ -421,6 +431,30 @@ impl Inode for RamSymlinkNode {
 
     fn readlink(&self) -> Result<String, Errno> {
         Ok(self.target.clone())
+    }
+}
+
+/// A bound AF_UNIX socket's name in the filesystem.
+///
+/// Holds nothing: the socket it names lives in the kernel's socket table,
+/// reachable only by `connect()`/`sendto()` with this path. The node exists
+/// so `ls -l` shows the socket, `stat()` reports `S_IFSOCK`, and `unlink()`
+/// can remove the name — exactly the role the same node plays in Linux.
+struct RamSocketNode {
+    ino: u64,
+}
+
+impl Inode for RamSocketNode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
+    fn stat(&self) -> Stat {
+        Stat::socket(self.ino)
+    }
+
+    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+        // Linux answers ENXIO for open() on a socket node: there is no file
+        // behind the name, and a socket is not something open() can produce.
+        Err(Errno::ENXIO)
     }
 }
 
@@ -871,6 +905,59 @@ mod tests {
         let r = root(&fs);
         r.create("taken").unwrap();
         assert_eq!(r.symlink("taken", "x").err(), Some(Errno::EEXIST));
+    }
+
+    // ── socket nodes (bind) ─────────────────────────────────────────────
+
+    #[test]
+    fn mksocket_creates_a_socket_typed_node() {
+        let fs = new_fs();
+        let r = root(&fs);
+        let s = r.mksocket("sock").unwrap();
+        assert_eq!(s.file_type(), FileType::Socket);
+        assert_eq!(s.stat().st_mode & 0o170000, 0o140000, "S_IFSOCK");
+        assert_eq!(s.stat().st_size, 0);
+    }
+
+    #[test]
+    fn a_socket_node_cannot_be_opened() {
+        let fs = new_fs();
+        let r = root(&fs);
+        let s = r.mksocket("sock").unwrap();
+        assert_eq!(s.open(OpenFlags::RDONLY).err(), Some(Errno::ENXIO));
+    }
+
+    #[test]
+    fn binding_over_an_existing_name_is_eexist() {
+        // What makes a second bind() to the same path fail even after the
+        // first socket has died: the node outlives it until unlinked.
+        let fs = new_fs();
+        let r = root(&fs);
+        r.mksocket("sock").unwrap();
+        assert_eq!(r.mksocket("sock").err(), Some(Errno::EEXIST));
+        assert_eq!(r.create("sock").err(), None, "create() still finds the name taken");
+    }
+
+    #[test]
+    fn a_socket_node_is_removed_by_unlink_like_any_other_name() {
+        let fs = new_fs();
+        let r = root(&fs);
+        r.mksocket("sock").unwrap();
+        r.unlink("sock").unwrap();
+        assert_eq!(r.lookup("sock").err(), Some(Errno::ENOENT));
+        assert!(r.mksocket("sock").is_ok(), "the name is free again");
+    }
+
+    #[test]
+    fn a_socket_node_is_listed_by_readdir_as_dt_sock() {
+        let fs = new_fs();
+        let r = root(&fs);
+        r.mksocket("sock").unwrap();
+        let entry = (0..)
+            .map_while(|i| r.readdir(i).ok().flatten())
+            .find(|e| &e.name[..e.name_len] == b"sock")
+            .expect("listed");
+        assert_eq!(entry.kind.as_dt_type(), 12, "DT_SOCK");
     }
 
     // ── take_child / insert_child (rename primitives) ───────────────────

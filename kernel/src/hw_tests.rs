@@ -306,3 +306,71 @@ fn ext2_reclaim_orphans_clears_injected_disk_img_shape() {
         "phantom inode's real content must be completely untouched by reclaim_orphans — it never reads a bit it didn't find set"
     );
 }
+
+/// Case 4: the AF_UNIX **adapter** (`kernel/src/ipc/unix.rs`) — the half of
+/// the socket stack the `usock` crate's 71 host tests cannot reach.
+///
+/// `usock` proves the state machines in plain types. What only a real boot
+/// can prove is the wiring around them: that the global table really is an
+/// `IrqMutex` a kernel path can take and release, that `UnixSocketHandle`
+/// behaves as a `FileHandle` (`read`/`write`/`dup`, and reference counting
+/// in `Drop` rather than in `close()`), and that `socket_id()` — the seam
+/// that replaced the old pid-indexed `FD_CHANNEL_MAP` — reports through a
+/// `Box<dyn FileHandle>`, where no downcast is possible.
+///
+/// Deliberately does not go through the syscall layer: there is no user
+/// process here to make a syscall, and the blocking paths end in
+/// `jump_to_user`, which would never come back to the test harness. The
+/// syscall layer is covered end-to-end instead by `userspace/c/socket_test.c`
+/// (46 checks through real mlibc), and the blocking paths by `ipc_ping`.
+#[test_case]
+fn unix_socket_handle_roundtrip() {
+    use alloc::boxed::Box;
+    use crate::ipc::unix::{UnixSocketHandle, SOCKETS};
+    use crate::process::file::{FileError, FileHandle};
+    use usock::SockType;
+
+    let (a, b) = SOCKETS
+        .with(|t| t.socketpair(SockType::Stream))
+        .expect("socketpair should succeed on a freshly booted kernel");
+
+    let mut left: Box<dyn FileHandle> = Box::new(UnixSocketHandle::new(a));
+    let mut right: Box<dyn FileHandle> = Box::new(UnixSocketHandle::new(b));
+
+    // The seam that replaced the pid-indexed side table: a socket behind a
+    // trait object can still name itself.
+    assert_eq!(left.socket_id(), Some(a), "socket_id() must survive the Box<dyn FileHandle>");
+    assert_eq!(right.socket_id(), Some(b));
+
+    assert_eq!(left.write(b"over the seam").expect("write"), 13);
+    let mut buf = [0u8; 32];
+    let n = right.read(&mut buf).expect("read");
+    assert_eq!(&buf[..n], b"over the seam", "bytes must cross the adapter intact");
+
+    // Nothing queued: a read reports WouldBlock rather than a short read,
+    // which is what tells `sys_read` to park the process.
+    assert!(
+        matches!(right.read(&mut buf), Err(FileError::WouldBlock)),
+        "an empty connected socket must report WouldBlock, not EOF"
+    );
+
+    // dup() shares the socket: closing one reference must not disconnect it.
+    let dup = right.dup().expect("a socket handle is dup-able (fork/dup2 depend on it)");
+    drop(right);
+    assert_eq!(left.write(b"still here").expect("write after partial close"), 10);
+    drop(dup);
+
+    // With the last reference gone, the peer sees a dead connection.
+    assert!(
+        matches!(left.write(b"x"), Err(FileError::BrokenPipe)),
+        "writing to a fully closed peer must be EPIPE"
+    );
+    let n = left.read(&mut buf).expect("reading a dead peer is EOF, not an error");
+    assert_eq!(n, 0);
+
+    drop(left);
+    assert!(
+        SOCKETS.with(|t| t.get(a).is_none() && t.get(b).is_none()),
+        "both sockets must be released once every handle is dropped"
+    );
+}

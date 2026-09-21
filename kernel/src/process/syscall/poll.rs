@@ -4,8 +4,48 @@ use spin::Mutex;
 use core::sync::atomic::Ordering;
 use crate::process::TrapFrame;
 use super::{errno, SyscallResult, validate_user_buffer, CURRENT_SYSCALL_TF};
-use crate::ipc::channel::{ChannelId, CHANNELS};
-use super::ipc::{MAX_PROCS, MAX_FILES_PER_PROC, FD_CHANNEL_MAP};
+use usock::SocketId;
+use crate::ipc::unix;
+
+/// Upper bound on pids tracked by the per-pid side tables below.
+pub(super) const MAX_PROCS: usize = 32;
+/// Must match `FileDescriptorTable`'s own `MAX_FILES`.
+pub(super) const MAX_FILES_PER_PROC: usize = 16;
+
+/// A process's fd → socket mapping, snapshotted at the moment it blocks.
+///
+/// Readiness for a blocked process has to be re-checked by whoever wakes it,
+/// from *their* context — and another process's fd table is not reachable
+/// without taking the scheduler lock, which the wakeup path (sometimes an
+/// ISR) cannot do at that point. Snapshotting the mapping into the waiter
+/// itself sidesteps that entirely.
+///
+/// This replaces the old global `FD_CHANNEL_MAP[pid][fd]`, which had to be
+/// hand-maintained at every fd-allocating call site and silently did nothing
+/// for pids past its bound. `FileHandle::socket_id()` is the source of truth
+/// now; this is only a cache of it, valid for the duration of one block.
+type SocketMap = [SocketId; MAX_FILES_PER_PROC];
+
+const NO_SOCKETS: SocketMap = [0; MAX_FILES_PER_PROC];
+
+/// Resolve every fd of the *running* process to a socket id (0 = not one).
+fn snapshot_sockets() -> SocketMap {
+    let mut map = NO_SOCKETS;
+    let files = {
+        let sched = crate::process::scheduler::local_scheduler();
+        match sched.running_ref() {
+            Some(proc) => proc.files.clone(),
+            None => return map,
+        }
+    };
+    let guard = files.lock();
+    for (fd, slot) in map.iter_mut().enumerate() {
+        if let Ok(h) = guard.get(fd) {
+            *slot = h.socket_id().unwrap_or(0);
+        }
+    }
+    map
+}
 
 // ============================================================================
 // POLL / EPOLL SYSCALLS
@@ -14,15 +54,15 @@ use super::ipc::{MAX_PROCS, MAX_FILES_PER_PROC, FD_CHANNEL_MAP};
 // poll(7), epoll_create(213), epoll_ctl(233), epoll_wait(232)
 //
 // Architecture:
-//   - `fd_check_ready(pid, fd, events)` checks FD readiness without consuming data.
+//   - `fd_check_ready(socks, fd, events)` checks FD readiness without consuming data.
 //   - `POLL_WAITERS[pid]` stores a blocked process's buffer info for wakeup delivery.
 //   - `EPOLL_INSTANCES` holds per-epoll-fd watch lists.
-//   - `EPOLL_FD_MAP[pid][fd]` maps epoll FDs to EpollInstanceIds (same pattern as FD_CHANNEL_MAP).
+//   - `EPOLL_FD_MAP[pid][fd]` maps epoll FDs to EpollInstanceIds.
 //   - Wakeup hooks: `poll_wakeup_for_fd0` (keyboard ISR) and
-//     `poll_wakeup_for_channel` (sys_sendmsg).
+//     `poll_wakeup_for_socket` (the socket layer).
 //
 // LOCKING ORDER (cli must be held):
-//   POLL_WAITERS → EPOLL_INSTANCES → FD_CHANNEL_MAP → CHANNELS → (release) → SCHEDULER
+//   POLL_WAITERS → EPOLL_INSTANCES → SOCKETS → (release) → SCHEDULER
 //   SCHEDULER is always acquired last.
 
 // ── Poll bitmasks (POSIX ABI) ──────────────────────────────────────────────
@@ -185,6 +225,8 @@ struct PollWaiter {
     kind:     PollWaiterKind,
     /// hrtimer ID for timeout; None = wait forever.
     timer_id: Option<u32>,
+    /// This process's fd → socket mapping at block time — see `SocketMap`.
+    socks:    SocketMap,
 }
 
 /// One slot per PID — a process can only have one outstanding poll/epoll_wait.
@@ -199,35 +241,27 @@ static POLL_WAITERS: Mutex<[Option<PollWaiter>; MAX_PROCS]> =
 /// is already set, and from ISR/wakeup context).
 ///
 /// Rules:
-///   - IPC channel fd: POLLIN if rx has messages; POLLOUT if peer's rx is not full.
+///   - socket fd: whatever `usock` says about it — data queued or a
+///     reportable EOF is POLLIN, room to send is POLLOUT, a dead peer is
+///     POLLHUP. A listening socket with a pending connection is POLLIN,
+///     which is what makes `poll()`-before-`accept()` work.
 ///   - stdin (fd=0): POLLIN if keyboard buffer has data.
 ///   - All other device fds: always ready for the requested events.
-fn fd_check_ready(pid: usize, fd: i32, events: i16) -> i16 {
+fn fd_check_ready(socks: &SocketMap, fd: i32, events: i16) -> i16 {
     if fd < 0 { return POLLNVAL; }
     let fd_usize = fd as usize;
 
-    // IPC channel?
-    if fd_usize < MAX_FILES_PER_PROC && pid < MAX_PROCS {
-        let channel_id = FD_CHANNEL_MAP.lock()[pid][fd_usize];
-        if channel_id != 0 {
-            let tbl = CHANNELS.lock();
-            let mut rev: i16 = 0;
-            if events & POLLIN != 0 {
-                if tbl.get(channel_id).map(|ch| ch.has_messages()).unwrap_or(false) {
-                    rev |= POLLIN;
-                }
-            }
-            if events & POLLOUT != 0 {
-                // POLLOUT ready if peer's rx buffer is not full
-                let peer_not_full = tbl.get(channel_id)
-                    .and_then(|ch| ch.peer)
-                    .and_then(|peer_id| tbl.get(peer_id))
-                    .map(|peer| !peer.is_rx_full())
-                    .unwrap_or(false);
-                if peer_not_full { rev |= POLLOUT; }
-            }
-            return rev;
-        }
+    // Socket?
+    if fd_usize < MAX_FILES_PER_PROC && socks[fd_usize] != 0 {
+        let Some(mask) = unix::poll_mask(socks[fd_usize]) else { return POLLNVAL };
+        let mut rev: i16 = 0;
+        if events & POLLIN != 0 && mask.readable { rev |= POLLIN; }
+        if events & POLLOUT != 0 && mask.writable { rev |= POLLOUT; }
+        // POLLHUP and POLLERR are reported whether or not they were asked
+        // for, exactly as poll(2) specifies.
+        if mask.hup { rev |= POLLHUP; }
+        if mask.err { rev |= POLLERR; }
+        return rev;
     }
 
     // stdin
@@ -253,7 +287,7 @@ fn fd_check_ready(pid: usize, fd: i32, events: i16) -> i16 {
 ///
 /// Called with cli held, after POLL_WAITERS has been released.
 fn deliver_poll_result_phys(waiter: &PollWaiter, phys_offset: u64) -> usize {
-    let pid = waiter.pid;
+    let socks = &waiter.socks;
     match waiter.kind {
         PollWaiterKind::Poll { nfds } => {
             // phys_buf → array of PollFd structs (8 bytes each)
@@ -261,7 +295,7 @@ fn deliver_poll_result_phys(waiter: &PollWaiter, phys_offset: u64) -> usize {
             let mut ready = 0usize;
             for i in 0..nfds as usize {
                 let pfd = unsafe { *base.add(i) };
-                let rev = fd_check_ready(pid, pfd.fd, pfd.events);
+                let rev = fd_check_ready(socks, pfd.fd, pfd.events);
                 unsafe { (*base.add(i)).revents = rev; }
                 if rev != 0 { ready += 1; }
             }
@@ -282,7 +316,7 @@ fn deliver_poll_result_phys(waiter: &PollWaiter, phys_offset: u64) -> usize {
                     let mut poll_ev: i16 = 0;
                     if watch.events & EPOLLIN  != 0 { poll_ev |= POLLIN; }
                     if watch.events & EPOLLOUT != 0 { poll_ev |= POLLOUT; }
-                    let rev = fd_check_ready(pid, watch.fd, poll_ev);
+                    let rev = fd_check_ready(socks, watch.fd, poll_ev);
                     let mut epoll_rev: u32 = 0;
                     if rev & POLLIN  != 0 { epoll_rev |= EPOLLIN; }
                     if rev & POLLOUT != 0 { epoll_rev |= EPOLLOUT; }
@@ -331,23 +365,20 @@ fn poll_waiter_watches_stdin(waiter: &PollWaiter, phys_offset: u64) -> bool {
     }
 }
 
-/// Check if a poll waiter is watching a specific IPC channel for POLLIN.
+/// Check if a poll waiter is watching `sock` for POLLIN.
 /// Called while POLL_WAITERS is held.
-fn poll_waiter_watches_channel(
+fn poll_waiter_watches_socket(
     waiter: &PollWaiter,
-    channel_id: ChannelId,
+    sock: SocketId,
     phys_offset: u64,
 ) -> bool {
-    let pid = waiter.pid;
-    if pid >= MAX_PROCS { return false; }
     match waiter.kind {
         PollWaiterKind::Poll { nfds } => {
-            let map = FD_CHANNEL_MAP.lock();
             let base = (phys_offset + waiter.phys_buf) as *const PollFd;
             for i in 0..nfds as usize {
                 let pfd = unsafe { *base.add(i) };
                 if pfd.fd >= 0 && (pfd.fd as usize) < MAX_FILES_PER_PROC {
-                    if map[pid][pfd.fd as usize] == channel_id && (pfd.events & POLLIN) != 0 {
+                    if waiter.socks[pfd.fd as usize] == sock && (pfd.events & POLLIN) != 0 {
                         return true;
                     }
                 }
@@ -355,13 +386,12 @@ fn poll_waiter_watches_channel(
             false
         }
         PollWaiterKind::EpollWait { epoll_id, .. } => {
-            // POLL_WAITERS → EPOLL_INSTANCES → FD_CHANNEL_MAP
+            // POLL_WAITERS → EPOLL_INSTANCES
             let instances = EPOLL_INSTANCES.lock();
-            let map = FD_CHANNEL_MAP.lock();
             if let Some(inst) = instances.get(epoll_id) {
                 for watch in inst.watches.iter().flatten() {
                     if watch.fd >= 0 && (watch.fd as usize) < MAX_FILES_PER_PROC {
-                        if map[pid][watch.fd as usize] == channel_id
+                        if waiter.socks[watch.fd as usize] == sock
                             && (watch.events & EPOLLIN) != 0
                         {
                             return true;
@@ -433,12 +463,23 @@ pub(crate) fn poll_wakeup_for_fd0() {
     // sched guard dropped; caller (keyboard ISR) still holds IF=0
 }
 
-/// Called from sys_sendmsg after enqueuing a message (CHANNELS released).
+/// Called by the socket layer after a socket became readable (`SOCKETS`
+/// already released — see `ipc/unix.rs`'s lock order).
 ///
-/// Wakes any process blocked in poll/epoll_wait watching `channel_id` for POLLIN.
-pub(crate) fn poll_wakeup_for_channel(channel_id: ChannelId) {
-    let _irq = crate::process::irq_guard::InterruptGuard::new();
+/// Wakes any process blocked in poll/epoll_wait watching `sock` for POLLIN.
+pub(crate) fn poll_wakeup_for_socket(sock: SocketId) {
+    // Save/restore rather than cli+sti: this runs under `dispatch_wakes`,
+    // which can be reached from a socket's `Drop` inside `sys_exit`, where
+    // re-enabling interrupts would let a timer tick free the kernel stack
+    // this code is standing on. See `ipc/unix.rs::dispatch_wakes`.
+    x86_64::instructions::interrupts::without_interrupts(poll_wakeup_for_socket_inner_call(sock));
+}
 
+fn poll_wakeup_for_socket_inner_call(sock: SocketId) -> impl FnOnce() {
+    move || poll_wakeup_for_socket_inner(sock)
+}
+
+fn poll_wakeup_for_socket_inner(sock: SocketId) {
     let phys_offset = crate::memory::physical_memory_offset().as_u64();
 
     let waiter = {
@@ -446,7 +487,7 @@ pub(crate) fn poll_wakeup_for_channel(channel_id: ChannelId) {
         let mut found = None;
         for (i, slot) in waiters.iter().enumerate() {
             if let Some(w) = slot {
-                if poll_waiter_watches_channel(w, channel_id, phys_offset) {
+                if poll_waiter_watches_socket(w, sock, phys_offset) {
                     found = Some(i);
                     break;
                 }
@@ -512,7 +553,7 @@ fn translate_user_buf_phys(user_va: u64, size: usize) -> Option<u64> {
 
 fn check_epoll_ready_uva(
     epoll_id: EpollInstanceId,
-    pid: usize,
+    socks: &SocketMap,
     events_ptr: u64,
     maxevents: usize,
 ) -> usize {
@@ -528,7 +569,7 @@ fn check_epoll_ready_uva(
             let mut poll_ev: i16 = 0;
             if watch.events & EPOLLIN  != 0 { poll_ev |= POLLIN; }
             if watch.events & EPOLLOUT != 0 { poll_ev |= POLLOUT; }
-            let rev = fd_check_ready(pid, watch.fd, poll_ev);
+            let rev = fd_check_ready(socks, watch.fd, poll_ev);
             let mut epoll_rev: u32 = 0;
             if rev & POLLIN  != 0 { epoll_rev |= EPOLLIN; }
             if rev & POLLOUT != 0 { epoll_rev |= EPOLLOUT; }
@@ -574,11 +615,12 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u32, timeout_ms: i32) -> SyscallResul
     let irq = crate::process::irq_guard::InterruptGuard::new();
 
     let pid = crate::process::scheduler::current_pid().unwrap_or(0);
+    let socks = snapshot_sockets();
 
     // Fast path: check all fds for immediate readiness
     let mut ready = 0i32;
     for i in 0..nfds as usize {
-        let rev = fd_check_ready(pid, fds[i].fd, fds[i].events);
+        let rev = fd_check_ready(&socks, fds[i].fd, fds[i].events);
         fds[i].revents = rev;
         if rev != 0 { ready += 1; }
     }
@@ -623,6 +665,7 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u32, timeout_ms: i32) -> SyscallResul
             phys_len: buf_size,
             kind: PollWaiterKind::Poll { nfds },
             timer_id,
+            socks,
         });
     }
 
@@ -772,7 +815,8 @@ pub(super) fn sys_epoll_wait(epfd: i32, events_ptr: u64, maxevents: i32, timeout
     let irq = crate::process::irq_guard::InterruptGuard::new();
 
     // Fast path: check readiness now
-    let ready = check_epoll_ready_uva(epoll_id, pid, events_ptr, maxevents as usize);
+    let socks = snapshot_sockets();
+    let ready = check_epoll_ready_uva(epoll_id, &socks, events_ptr, maxevents as usize);
 
     if ready > 0 || timeout_ms == 0 {
         drop(irq);
@@ -807,6 +851,7 @@ pub(super) fn sys_epoll_wait(epfd: i32, events_ptr: u64, maxevents: i32, timeout
             phys_len: buf_size,
             kind: PollWaiterKind::EpollWait { epoll_id, maxevents: maxevents as usize },
             timer_id,
+            socks,
         });
     }
 

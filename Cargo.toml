@@ -20,7 +20,7 @@ members = ["kernel"]
 # below (which would break a unwinding test harness) and, for
 # `qemu-test-runner` specifically, so building it never triggers this
 # package's `build.rs` (which does its own slow nested `cargo build` of the
-# whole kernel — see `build_kernel()` there). All seven must be excluded here
+# whole kernel — see `build_kernel()` there). All eight must be excluded here
 # or cargo errors with "multiple workspace roots found in the same
 # workspace" — `kernel` depends on `hal`, `ext2`, `mm`, `vfs`, `diag`, and
 # `sched` via plain `path` dependencies (`ext2` itself also depends on `hal`
@@ -34,11 +34,14 @@ members = ["kernel"]
 # see that crate's doc comment; `sched` is the scheduler-core extraction,
 # generic over the scheduled entity rather than a flat concrete type, since
 # its queues own the entities themselves — see
-# `docs/sched/sched-extraction-plan.md`);
+# `docs/sched/sched-extraction-plan.md`; `usock` is the AF_UNIX socket core
+# — socket state machines, queues, backlog, `sockaddr_un` parsing and
+# SCM_RIGHTS, generic over the passed-descriptor type the way `sched` is
+# generic over the scheduled entity — see that crate's doc comment);
 # `qemu-test-runner` is invoked as an external binary (see
 # `scripts/run-kernel-tests.sh`), not depended on by anything in this
 # workspace.
-exclude = ["hal", "ext2", "mm", "vfs", "diag", "sched", "qemu-test-runner"]
+exclude = ["hal", "ext2", "mm", "vfs", "diag", "sched", "usock", "qemu-test-runner"]
 
 [profile.dev]
 panic = "abort"

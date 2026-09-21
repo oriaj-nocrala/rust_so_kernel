@@ -262,6 +262,15 @@ impl MountTable {
         Ok(())
     }
 
+    /// Create an AF_UNIX socket node at `path` — `bind()` with a pathname
+    /// address. Fails with `EEXIST` if the name is taken, which is exactly
+    /// what makes a second `bind()` to the same path report `EADDRINUSE`.
+    pub fn mksocket(&self, path: &str) -> Result<(), Errno> {
+        let (dir_path, leaf) = split_parent(path)?;
+        self.resolve(dir_path)?.mksocket(leaf)?;
+        Ok(())
+    }
+
     /// Remove the file at `path` (fails with `EISDIR` on directories).
     pub fn unlink(&self, path: &str) -> Result<(), Errno> {
         let (dir_path, leaf) = split_parent(path)?;

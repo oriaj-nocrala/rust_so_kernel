@@ -59,6 +59,15 @@ unsafe fn syscall5(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 
     ret
 }
 
+#[inline(always)]
+unsafe fn syscall6(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> i64 {
+    let ret: i64;
+    asm!("syscall", inlateout("rax") nr as i64 => ret,
+        in("rdi") a1, in("rsi") a2, in("rdx") a3, in("r10") a4, in("r8") a5, in("r9") a6,
+        out("rcx") _, out("r11") _, options(nostack));
+    ret
+}
+
 // ── Syscall numbers (must match kernel/src/process/syscall.rs::SyscallNumber) ──
 
 const SYS_READ: u64 = 0;
@@ -83,9 +92,16 @@ const SYS_GETPID: u64 = 39;
 const SYS_SOCKET: u64 = 41;
 const SYS_CONNECT: u64 = 42;
 const SYS_ACCEPT: u64 = 43;
+const SYS_SENDTO: u64 = 44;
+const SYS_RECVFROM: u64 = 45;
 const SYS_SENDMSG: u64 = 46;
 const SYS_RECVMSG: u64 = 47;
+const SYS_SHUTDOWN: u64 = 48;
 const SYS_BIND: u64 = 49;
+const SYS_LISTEN: u64 = 50;
+const SYS_GETSOCKNAME: u64 = 51;
+const SYS_GETPEERNAME: u64 = 52;
+const SYS_SOCKETPAIR: u64 = 53;
 const SYS_PIPE: u64 = 22;
 const SYS_SIGACTION: u64 = 13;
 const SYS_SIGPROCMASK: u64 = 14;
@@ -119,6 +135,7 @@ const SYS_UPTIME_SEC: u64 = 401;
 const SYS_MEMINFO_KB: u64 = 402;
 const SYS_KDEBUG_CTL: u64 = 403;
 const SYS_MKDIR: u64 = 83;
+const SYS_UNLINK: u64 = 87;
 const SYS_SYMLINK: u64 = 88;
 
 /// `target` is stored verbatim, unresolved (real `symlink(2)` semantics).
@@ -144,6 +161,10 @@ pub fn write_str(fd: i32, s: &str) -> i64 {
 /// include a trailing NUL; use [`with_cstr`] to build one from a `&str`.
 pub fn open(path_cstr: &[u8], flags: i32) -> i64 {
     unsafe { syscall2(SYS_OPEN, path_cstr.as_ptr() as u64, flags as u64) }
+}
+
+pub fn unlink(path_cstr: &[u8]) -> i64 {
+    unsafe { syscall1(SYS_UNLINK, path_cstr.as_ptr() as u64) }
 }
 
 pub fn mkdir(path_cstr: &[u8]) -> i64 {
@@ -428,48 +449,127 @@ pub fn munmap(addr: u64, length: u64) -> i64 {
     unsafe { syscall2(SYS_MUNMAP, addr, length) }
 }
 
-// ── IPC (channels) ──────────────────────────────────────────────────────
+// ── AF_UNIX sockets ─────────────────────────────────────────────────────
+//
+// Real POSIX shapes, not the argument-less `socket()` this used to have:
+// the kernel speaks `struct sockaddr_un` (`kernel/src/ipc/unix.rs`, over the
+// host-tested `usock` crate), so these wrappers build one.
 
-pub fn socket() -> i64 {
-    unsafe { syscall0(SYS_SOCKET) }
-}
+pub const AF_UNIX: u16 = 1;
+pub const SOCK_STREAM: i32 = 1;
+pub const SOCK_DGRAM: i32 = 2;
 
-pub fn bind(fd: i32, path_cstr: &[u8]) -> i64 {
-    unsafe { syscall3(SYS_BIND, fd as u64, path_cstr.as_ptr() as u64, path_cstr.len() as u64) }
-}
+pub const SHUT_RD: i32 = 0;
+pub const SHUT_WR: i32 = 1;
+pub const SHUT_RDWR: i32 = 2;
 
-pub fn connect(fd: i32, path_cstr: &[u8]) -> i64 {
-    unsafe { syscall3(SYS_CONNECT, fd as u64, path_cstr.as_ptr() as u64, path_cstr.len() as u64) }
-}
-
-pub fn accept(fd: i32) -> i64 {
-    unsafe { syscall1(SYS_ACCEPT, fd as u64) }
-}
-
-/// Wire format for send/recv: `{ tag: u32, len: u32, data: [u8; 56] }` (64 bytes).
+/// `struct sockaddr_un { u16 sun_family; char sun_path[108]; }` — the real
+/// Linux layout, family field included, two bytes wide.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct IpcMsg {
-    pub tag: u32,
-    pub len: u32,
-    pub data: [u8; 56],
+pub struct SockAddrUn {
+    pub sun_family: u16,
+    pub sun_path: [u8; 108],
 }
 
-impl IpcMsg {
-    pub fn new(tag: u32, payload: &[u8]) -> Self {
-        let mut data = [0u8; 56];
-        let n = payload.len().min(56);
-        data[..n].copy_from_slice(&payload[..n]);
-        Self { tag, len: n as u32, data }
+impl SockAddrUn {
+    /// A pathname address. Returns the address and the `addrlen` to pass
+    /// alongside it (`sun_path`'s used bytes plus its terminating NUL).
+    pub fn path(path: &[u8]) -> (Self, u32) {
+        let mut a = Self { sun_family: AF_UNIX, sun_path: [0u8; 108] };
+        let n = path.len().min(107);
+        a.sun_path[..n].copy_from_slice(&path[..n]);
+        (a, (2 + n + 1) as u32)
+    }
+
+    /// An abstract-namespace address (`sun_path[0] == '\0'`): no filesystem
+    /// node, name visible only to other processes on this kernel.
+    pub fn abstract_name(name: &[u8]) -> (Self, u32) {
+        let mut a = Self { sun_family: AF_UNIX, sun_path: [0u8; 108] };
+        let n = name.len().min(106);
+        a.sun_path[1..1 + n].copy_from_slice(&name[..n]);
+        (a, (2 + 1 + n) as u32)
     }
 }
 
-pub fn sendmsg(fd: i32, msg: &IpcMsg) -> i64 {
-    unsafe { syscall3(SYS_SENDMSG, fd as u64, msg as *const IpcMsg as u64, 0) }
+pub fn socket(domain: i32, ty: i32, protocol: i32) -> i64 {
+    unsafe { syscall3(SYS_SOCKET, domain as u64, ty as u64, protocol as u64) }
 }
 
-pub fn recvmsg(fd: i32, msg: &mut IpcMsg) -> i64 {
-    unsafe { syscall3(SYS_RECVMSG, fd as u64, msg as *mut IpcMsg as u64, 0) }
+pub fn socketpair(domain: i32, ty: i32, protocol: i32, sv: &mut [i32; 2]) -> i64 {
+    unsafe {
+        syscall4(SYS_SOCKETPAIR, domain as u64, ty as u64, protocol as u64,
+                 sv.as_mut_ptr() as u64)
+    }
+}
+
+pub fn bind(fd: i32, addr: &SockAddrUn, addrlen: u32) -> i64 {
+    unsafe { syscall3(SYS_BIND, fd as u64, addr as *const SockAddrUn as u64, addrlen as u64) }
+}
+
+pub fn listen(fd: i32, backlog: i32) -> i64 {
+    unsafe { syscall2(SYS_LISTEN, fd as u64, backlog as u64) }
+}
+
+pub fn connect(fd: i32, addr: &SockAddrUn, addrlen: u32) -> i64 {
+    unsafe { syscall3(SYS_CONNECT, fd as u64, addr as *const SockAddrUn as u64, addrlen as u64) }
+}
+
+/// `accept(fd, NULL, NULL)` — the peer address of an AF_UNIX client is
+/// almost always unnamed, so callers rarely want it.
+pub fn accept(fd: i32) -> i64 {
+    unsafe { syscall3(SYS_ACCEPT, fd as u64, 0, 0) }
+}
+
+pub fn accept_from(fd: i32, addr: &mut SockAddrUn, addrlen: &mut u32) -> i64 {
+    unsafe {
+        syscall3(SYS_ACCEPT, fd as u64, addr as *mut SockAddrUn as u64,
+                 addrlen as *mut u32 as u64)
+    }
+}
+
+pub fn send(fd: i32, buf: &[u8]) -> i64 {
+    unsafe {
+        syscall6(SYS_SENDTO, fd as u64, buf.as_ptr() as u64, buf.len() as u64, 0, 0, 0)
+    }
+}
+
+pub fn sendto(fd: i32, buf: &[u8], addr: &SockAddrUn, addrlen: u32) -> i64 {
+    unsafe {
+        syscall6(SYS_SENDTO, fd as u64, buf.as_ptr() as u64, buf.len() as u64, 0,
+                 addr as *const SockAddrUn as u64, addrlen as u64)
+    }
+}
+
+pub fn recv(fd: i32, buf: &mut [u8]) -> i64 {
+    unsafe {
+        syscall6(SYS_RECVFROM, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0)
+    }
+}
+
+pub fn recvfrom(fd: i32, buf: &mut [u8], addr: &mut SockAddrUn, addrlen: &mut u32) -> i64 {
+    unsafe {
+        syscall6(SYS_RECVFROM, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0,
+                 addr as *mut SockAddrUn as u64, addrlen as *mut u32 as u64)
+    }
+}
+
+pub fn shutdown(fd: i32, how: i32) -> i64 {
+    unsafe { syscall2(SYS_SHUTDOWN, fd as u64, how as u64) }
+}
+
+pub fn getsockname(fd: i32, addr: &mut SockAddrUn, addrlen: &mut u32) -> i64 {
+    unsafe {
+        syscall3(SYS_GETSOCKNAME, fd as u64, addr as *mut SockAddrUn as u64,
+                 addrlen as *mut u32 as u64)
+    }
+}
+
+pub fn getpeername(fd: i32, addr: &mut SockAddrUn, addrlen: &mut u32) -> i64 {
+    unsafe {
+        syscall3(SYS_GETPEERNAME, fd as u64, addr as *mut SockAddrUn as u64,
+                 addrlen as *mut u32 as u64)
+    }
 }
 
 // ── poll ─────────────────────────────────────────────────────────────────
