@@ -27,9 +27,13 @@ pub fn init_core(phys_mem_offset: VirtAddr, memory_regions: &'static MemoryRegio
     memory::init(phys_mem_offset);
 
     // Initialize Buddy allocator — sole owner of all usable physical memory.
+    let mut max_usable_end: u64 = 0;
     allocator::BUDDY.with(|buddy| {
         for region in memory_regions.iter() {
             if region.kind == MemoryRegionKind::Usable {
+                if region.end > max_usable_end {
+                    max_usable_end = region.end;
+                }
                 unsafe {
                     buddy.add_region(&allocator::KernelPhysMap, region.start, region.end);
                 }
@@ -39,6 +43,14 @@ pub fn init_core(phys_mem_offset: VirtAddr, memory_regions: &'static MemoryRegio
 
     serial_println!("Buddy stats:");
     allocator::debug_print_buddy_stats();
+
+    // COW frame refcount table — sized to the highest usable physical
+    // address just measured, not to a constant. Must happen here, after
+    // the Buddy allocator can serve the table's own backing frames and
+    // before anything calls `fork()`; see `memory::cow`'s module comment
+    // for what a table that fails to cover all of RAM does instead of
+    // merely degrading.
+    unsafe { memory::cow::init_refcount_table(max_usable_end); }
 }
 
 /// Run allocator smoke tests (slab, Vec, String).

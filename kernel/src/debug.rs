@@ -252,6 +252,7 @@ pub fn render_report() -> alloc::string::String {
          orphan_blocks_reclaimed: {}\n\
          orphan_inodes_reclaimed: {}\n\
          switches_total: {}\n\
+         cow_tracked_frames: {} ({} MiB of RAM)\n\
          {}{}{}{}",
         mask, enabled,
         FORKS_TOTAL.load(Ordering::Relaxed),
@@ -262,6 +263,8 @@ pub fn render_report() -> alloc::string::String {
         ORPHAN_BLOCKS_RECLAIMED.load(Ordering::Relaxed),
         ORPHAN_INODES_RECLAIMED.load(Ordering::Relaxed),
         SWITCHES_TOTAL.load(Ordering::Relaxed),
+        crate::memory::cow::tracked_frames(),
+        (crate::memory::cow::tracked_frames() * 4096) / (1024 * 1024),
         SCHEDULER_LOCK.render("scheduler"),
         RAMFS_ENTRIES_LOCK.render("ramfs_entries_lock"),
         TF_REWIND.render(),
@@ -313,6 +316,11 @@ pub fn print_panic_snapshot() {
         TF_REWIND.last_site(),
         TF_REWIND.last_old_seq(),
         TF_REWIND.last_new_seq(),
+    );
+    crate::serial_println_raw!(
+        "  cow_tracked_frames: {} ({} MiB of RAM)",
+        crate::memory::cow::tracked_frames(),
+        (crate::memory::cow::tracked_frames() * 4096) / (1024 * 1024),
     );
     crate::serial_println_raw!(
         "  cow_if_violations: inc_ref count={} last_line={} | dec_ref count={} last_line={} | get_ref count={} last_line={}",
