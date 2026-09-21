@@ -145,9 +145,16 @@ pub const MM:    Subsystem = Subsystem { bit: 1 << 0, name: "mm" };
 pub const SCHED: Subsystem = Subsystem { bit: 1 << 1, name: "sched" };
 pub const FS:    Subsystem = Subsystem { bit: 1 << 2, name: "fs" };
 pub const PROC:  Subsystem = Subsystem { bit: 1 << 3, name: "proc" };
+/// USB/xHCI bring-up detail: register readbacks, DMA addresses, every event
+/// the driver did not act on. All of it was added to find one real bug (a
+/// torn event-TRB read, see `kernel/src/usb/xhci.rs::next_event`) and none
+/// of it is wanted on a working boot — but deleting it would mean building
+/// it again from scratch for the next xHCI problem, which is exactly the
+/// pattern this module exists to end. Off by default; `kdebug usb on`.
+pub const USB:   Subsystem = Subsystem { bit: 1 << 4, name: "usb" };
 
 /// All subsystems, for `kdebug list` / mask validation.
-pub const ALL_SUBSYSTEMS: &[&Subsystem] = &[&MM, &SCHED, &FS, &PROC];
+pub const ALL_SUBSYSTEMS: &[&Subsystem] = &[&MM, &SCHED, &FS, &PROC, &USB];
 
 /// Bitmask of currently-enabled subsystems. Off by default: tracing is
 /// opt-in, never spamming the log unless explicitly turned on.
@@ -213,12 +220,23 @@ static ORPHAN_INODES_RECLAIMED: AtomicU64 = AtomicU64::new(0);
 /// scheduler investigation too).
 static SWITCHES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+/// USB HID boot-keyboard reports decoded since boot (`usb::poll`). The
+/// counter that separates the two failure modes of a USB keyboard that
+/// types nothing: zero here means the controller is not delivering
+/// transfers at all (enumeration, endpoint configuration or the event
+/// ring), nonzero means reports arrive and the fault is in the decode or
+/// in the pipeline below it. That distinction is otherwise unobservable on
+/// a machine with no serial capture — `cat /proc/kdebug` is how it gets
+/// read there.
+static USB_KEY_REPORTS: AtomicU64 = AtomicU64::new(0);
+
 pub fn inc_forks()         { FORKS_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_execs()         { EXECS_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_reaps()         { REAPS_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_cow_resolved()  { COW_FAULTS_RESOLVED.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_cow_failed()    { COW_FAULTS_FAILED.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_switches()      { SWITCHES_TOTAL.fetch_add(1, Ordering::Relaxed); }
+pub fn inc_usb_key_reports() { USB_KEY_REPORTS.fetch_add(1, Ordering::Relaxed); }
 pub fn add_orphans_reclaimed(blocks: u64, inodes: u64) {
     ORPHAN_BLOCKS_RECLAIMED.fetch_add(blocks, Ordering::Relaxed);
     ORPHAN_INODES_RECLAIMED.fetch_add(inodes, Ordering::Relaxed);
@@ -253,6 +271,8 @@ pub fn render_report() -> alloc::string::String {
          orphan_inodes_reclaimed: {}\n\
          switches_total: {}\n\
          cow_tracked_frames: {} ({} MiB of RAM)\n\
+         usb_keyboards: {}\n\
+         usb_key_reports: {}\n\
          {}{}{}{}",
         mask, enabled,
         FORKS_TOTAL.load(Ordering::Relaxed),
@@ -265,6 +285,8 @@ pub fn render_report() -> alloc::string::String {
         SWITCHES_TOTAL.load(Ordering::Relaxed),
         crate::memory::cow::tracked_frames(),
         (crate::memory::cow::tracked_frames() * 4096) / (1024 * 1024),
+        crate::usb::keyboard_count(),
+        USB_KEY_REPORTS.load(Ordering::Relaxed),
         SCHEDULER_LOCK.render("scheduler"),
         RAMFS_ENTRIES_LOCK.render("ramfs_entries_lock"),
         TF_REWIND.render(),

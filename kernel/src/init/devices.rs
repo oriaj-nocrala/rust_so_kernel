@@ -380,6 +380,13 @@ pub fn draw_boot_screen() {
         fb.draw_text(10, 10, "ConstanOS v0.1", Color::rgb(0, 200, 255), Color::rgb(0, 0, 0), 2);
         fb.draw_text(10, 770, "Allocator: Ready", Color::rgb(0, 255, 0), Color::rgb(0, 0, 0), 2);
     }
+    drop(fb);
+    // This banner is drawn straight to the framebuffer, not through the
+    // text console, so the console's cursor is still at row 0 and the next
+    // kernel notice would land on top of it. Park the cursor below the
+    // banner instead — it made the first `kalert!` line genuinely hard to
+    // read on the one screen that matters.
+    crate::drivers::framebuffer_console::reserve_rows_at_top(2);
 }
 
 /// PIC + PIT + load IDT.

@@ -23,10 +23,14 @@ extern crate alloc;
 pub mod acpi;
 pub mod ac97;
 pub mod block;
+pub mod hid;
+pub mod i8042;
 pub mod keyboard;
 pub mod mouse;
 pub mod pit;
 pub mod rtc;
+pub mod usb;
+pub mod xhci;
 
 /// Legacy x86 port I/O seam. The production implementation (kernel side)
 /// wraps `x86_64::instructions::port::Port`; tests back it with `MockIo`

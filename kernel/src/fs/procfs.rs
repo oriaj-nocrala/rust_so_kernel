@@ -147,6 +147,7 @@ impl Inode for ProcDirInode {
             "meminfo" => Ok(Arc::new(MeminfoInode)),
             "kdebug" => Ok(Arc::new(KdebugInode)),
             "acpi" => Ok(Arc::new(AcpiInode)),
+            "dmesg" => Ok(Arc::new(DmesgInode)),
             "self" => Ok(Arc::new(SelfInode)),
             _ => {
                 let pid: usize = name.parse().map_err(|_| Errno::ENOENT)?;
@@ -167,13 +168,14 @@ impl Inode for ProcDirInode {
             3 => Ok(Some(DirEntry::new(202, FileType::Symlink, b"self"))),
             4 => Ok(Some(DirEntry::new(203, FileType::Regular, b"kdebug"))),
             5 => Ok(Some(DirEntry::new(204, FileType::Regular, b"acpi"))),
+            6 => Ok(Some(DirEntry::new(205, FileType::Regular, b"dmesg"))),
             n => {
                 // Live pids, appended after the always-present entries above
                 // — this is what makes `ls /proc` / BusyBox `ps`'s
                 // `opendir("/proc")` scan see every process (previously
                 // direct lookup like `cat /proc/3/exe` worked but nothing
                 // enumerated them, see this module's top doc comment).
-                let idx = (n - 6) as usize;
+                let idx = (n - 7) as usize;
                 let pids = crate::process::scheduler::all_pids();
                 let Some(&pid) = pids.get(idx) else { return Ok(None); };
                 let name = format!("{}", pid);
@@ -222,6 +224,34 @@ impl Inode for KdebugInode {
             return Err(Errno::EROFS);
         }
         Ok(Box::new(ProcFile { data: crate::debug::render_report().into_bytes(), offset: 0 }))
+    }
+}
+
+// ── dmesg file inode ─────────────────────────────────────────────────────────
+//
+// The kernel message ring (`crate::klog`) as a readable file: everything
+// `serial_println!` has emitted since boot, oldest first. Same
+// regenerate-on-every-`open()` convention as `/proc/meminfo` and
+// `/proc/kdebug`.
+//
+// Deliberately *not* the whole answer to "read the boot messages" on the
+// machine this was written for — reading it takes a shell, which takes a
+// keyboard, which is the thing that was broken. See
+// `init::show_boot_log_if_no_keyboard` for the half that needs no input.
+struct DmesgInode;
+
+impl Inode for DmesgInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
+    fn stat(&self) -> Stat {
+        Stat::regular(205, crate::klog::len() as i64)
+    }
+
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+        if flags.is_write() {
+            return Err(Errno::EROFS);
+        }
+        Ok(Box::new(ProcFile { data: crate::klog::render().into_bytes(), offset: 0 }))
     }
 }
 

@@ -158,6 +158,15 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> *const 
 
     crate::drivers::framebuffer_console::tick_cursor_blink();
 
+    // ── 1b. USB keyboard input ────────────────────────────────────────
+    // The xHCI driver has no interrupt of its own (see `usb/mod.rs`), so
+    // its event ring is drained here, at 100 Hz. Cheap in the common case:
+    // one uncached read of a TRB's cycle bit per controller. Runs before
+    // the scheduler lock is taken below — `poll` feeds decoded keys
+    // through `tty::feed_input`, which can take that same lock to deliver
+    // SIGINT, and a spin lock is not reentrant.
+    crate::usb::poll();
+
     // ── 2. Advance jiffies counter ────────────────────────────────────
     // crate::time::clockevent::tick();
 

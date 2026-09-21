@@ -46,6 +46,11 @@ impl Serial {
 
 impl fmt::Write for Serial {
     fn write_str(&mut self, s: &str) -> fmt::Result {
+        // Mirror into the in-memory ring before the UART sees it, so a
+        // machine with no serial capture can still read this back — see
+        // `crate::klog`. `push` takes no lock, so doing it under `SERIAL`
+        // adds no ordering constraint.
+        crate::klog::push(s.as_bytes());
         for byte in s.bytes() {
             self.write_byte(byte);
         }
@@ -95,6 +100,11 @@ pub struct RawSerialWriter;
 
 impl fmt::Write for RawSerialWriter {
     fn write_str(&mut self, s: &str) -> fmt::Result {
+        // Same mirror as the locked writer. Safe here for the same reason
+        // this writer is: `klog::push` is lock-free and allocation-free, so
+        // it inherits this path's "callable from any context" property
+        // rather than weakening it.
+        crate::klog::push(s.as_bytes());
         for byte in s.bytes() {
             unsafe {
                 Port::<u8>::new(0x3F8).write(byte);

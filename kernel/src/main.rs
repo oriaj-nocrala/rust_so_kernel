@@ -29,6 +29,7 @@ mod interrupts;
 mod ipc;
 mod keyboard;
 mod keyboard_buffer;
+mod klog;
 mod memory;
 mod mouse;
 #[cfg(not(test))]
@@ -42,6 +43,7 @@ mod serial;
 mod test_framework;
 mod time;
 mod tty;
+mod usb;
 
 use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
 

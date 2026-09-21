@@ -110,6 +110,11 @@ static FB_STATE: Mutex<FbState> = Mutex::new(FbState {
 });
 static FB_CLEARED: AtomicBool = AtomicBool::new(false);
 
+/// Set by [`kernel_alert`] / [`kernel_print`] — i.e. whenever the kernel
+/// itself has put text on the console. Read by `FramebufferConsole::new`,
+/// which must not clear the screen out from under it; see that function.
+static KERNEL_WROTE: AtomicBool = AtomicBool::new(false);
+
 /// Set by `FBIO_BLIT` (`sys_ioctl`) every time a raw-pixel client (e.g. the
 /// DOOM port) blits a frame directly onto the framebuffer, bypassing this
 /// driver's char/cursor tracking entirely. `FbState.row`/`col` are left
@@ -574,6 +579,64 @@ pub fn kernel_alert(args: core::fmt::Arguments) {
     let _ = w.write_str("\r\n\x1b[1;31m");
     let _ = w.write_fmt(args);
     let _ = w.write_str("\x1b[0m\r\n");
+    KERNEL_WROTE.store(true, Ordering::SeqCst);
+}
+
+/// Plain (uncoloured) kernel output on the console — [`kernel_alert`]'s
+/// quiet sibling, for text that is informative rather than alarming: the
+/// boot-log dump `init::boot` renders when the machine turns out to have no
+/// keyboard at all, which would be unreadable in all-red.
+///
+/// Same `try_lock`-never-`lock` discipline and the same reason. Marks the
+/// console as kernel-written so the first user process does not clear it.
+pub fn kernel_print(args: core::fmt::Arguments) {
+    use core::fmt::Write;
+
+    let Some(mut state) = FB_STATE.try_lock() else { return };
+    let Some(mut fb_guard) = FRAMEBUFFER.try_lock() else { return };
+    let Some(fb) = fb_guard.as_mut() else { return };
+
+    let mut w = ConsoleWriter { state: &mut state, fb };
+    let _ = w.write_fmt(args);
+    KERNEL_WROTE.store(true, Ordering::SeqCst);
+}
+
+/// Writes raw bytes to the console, translating bare `\n` into `\r\n` — the
+/// boot-log dump's path, since `klog`'s contents are newline-terminated
+/// lines as they were handed to the serial port, which has no notion of a
+/// carriage return being required.
+pub fn kernel_write_bytes(buf: &[u8]) {
+    let Some(mut state) = FB_STATE.try_lock() else { return };
+    let Some(mut fb_guard) = FRAMEBUFFER.try_lock() else { return };
+    let Some(fb) = fb_guard.as_mut() else { return };
+
+    for &b in buf {
+        if b == b'\n' {
+            render_bytes(&mut state, fb, b"\r\n");
+        } else {
+            render_bytes(&mut state, fb, &[b]);
+        }
+    }
+    KERNEL_WROTE.store(true, Ordering::SeqCst);
+}
+
+/// Moves the console's cursor down to `rows`, so text drawn directly onto
+/// the framebuffer above it (the boot banner) is not overprinted. Only ever
+/// moves the cursor forward.
+pub fn reserve_rows_at_top(rows: usize) {
+    let Some(mut state) = FB_STATE.try_lock() else { return };
+    if state.row < rows {
+        state.row = rows;
+        state.col = 0;
+    }
+}
+
+/// `kernel_print!`: [`kernel_alert`]'s uncoloured counterpart.
+#[macro_export]
+macro_rules! kprint {
+    ($($arg:tt)*) => {
+        $crate::drivers::framebuffer_console::kernel_print(format_args!($($arg)*))
+    };
 }
 
 /// `serial_println!`'s visible counterpart: renders one bright-red notice on
@@ -592,8 +655,23 @@ macro_rules! kalert {
 pub struct FramebufferConsole;
 
 impl FramebufferConsole {
+    /// Clears the screen once, the first time a process opens `/dev/fb` —
+    /// **unless the kernel has already written to the console itself**.
+    ///
+    /// That exception is not cosmetic. The clear runs when PID 1's stdout
+    /// is opened, which is after every driver has initialised, so it used
+    /// to erase every `kalert!` the boot had produced microseconds before
+    /// anyone could read it. On the machine those notices exist for — no
+    /// serial capture, screen only — the result was a driver that reported
+    /// its own failure into a buffer that was then wiped, which is
+    /// indistinguishable from a driver that said nothing at all. It cost a
+    /// full bare-metal debugging cycle to notice.
+    ///
+    /// When the kernel has drawn, the console instead continues below what
+    /// is already there: the shell's output scrolls up from the boot log
+    /// rather than replacing it.
     pub fn new() -> Self {
-        if !FB_CLEARED.swap(true, Ordering::SeqCst) {
+        if !FB_CLEARED.swap(true, Ordering::SeqCst) && !KERNEL_WROTE.load(Ordering::SeqCst) {
             if let Some(fb) = FRAMEBUFFER.lock().as_mut() {
                 fb.clear(DEFAULT_BG);
             }

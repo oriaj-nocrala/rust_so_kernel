@@ -97,6 +97,29 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     crate::time::init();
     serial_println!("clocksource: {}", crate::time::clocksource::clocksource_name());
 
+    // ── USB (xHCI) ─────────────────────────────────────────────────
+    // Best-effort, bounded, never hangs boot — same contract as mouse and
+    // AC97. Placed here rather than next to them because enumeration's
+    // mandatory settling delays (a port needs ~20 ms after reset) are
+    // waited out against the monotonic clock, which only exists once
+    // `time::init()` above has run; and before `fs::init()` so a keyboard
+    // is live by the time anything can ask to read one.
+    //
+    // Interrupts are still masked at this point in boot (the first `sti`
+    // is in `start_first_process`), so the busy-waits inside cannot be
+    // preempted — which is exactly why they are bounded by a spin count as
+    // well as by the clock. See `xhci::Xhci::wait_for`.
+    let mut usb_driver = crate::usb::UsbDriver::new();
+    crate::hal::run_all(&mut [&mut usb_driver]);
+
+    // ── No-input escape hatch ──────────────────────────────────────
+    // If nothing on this machine can type, the shell about to start is
+    // unreachable and the screen is the only diagnostic channel there is.
+    // Put the boot log on it and hold, rather than booting into something
+    // nobody can drive — a `cat /proc/dmesg` is worth nothing without a
+    // keyboard to invoke it with.
+    show_boot_log_if_no_keyboard();
+
     // ── VFS ────────────────────────────────────────────────────────
     crate::fs::init();
     serial_println!("VFS: initramfs @ /bin, devfs @ /dev");
@@ -119,4 +142,77 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
 
     serial_println!("DEBUG: About to start first process");
     process::start_first_process();
+}
+
+/// Renders the USB/PCI-relevant boot log to the screen and holds it there
+/// when the machine has no keyboard at all.
+///
+/// The gate is deliberately narrow: **no USB keyboard was enumerated and
+/// the legacy 8042 does not answer**. In QEMU the 8042 always answers, so
+/// this never fires there and no test flow pays for it; on a modern board
+/// with the legacy controller fused out and a USB keyboard that failed to
+/// come up, it is the only thing that can report why. It cannot detect the
+/// in-between case — a controller present but no keyboard on it — see
+/// `hal::i8042`'s module comment for why the probe stays read-only.
+///
+/// Holds for a fixed 30 s. There is nothing to wait *for*: interrupts are
+/// still masked at this point in boot, so no keypress could cancel it even
+/// if a keyboard existed. 30 s is long enough to read a screen or take a
+/// photograph of it, and the boot continues afterwards — the shell may
+/// still be useful over serial on a machine that has one.
+/// Puts the USB/PCI part of the boot log on the screen when no USB
+/// keyboard came up, and holds it there when the machine additionally has
+/// no legacy 8042 — i.e. when there is provably no way to type at all.
+///
+/// **The dump and the hold are gated separately, and that separation was
+/// learned from a bare-metal run.** Both used to require "no 8042", which
+/// is wrong for the machine this exists for: its board *does* answer at
+/// port 0x64 (the controller is there, nothing is plugged into it), so the
+/// probe said "you have PS/2", the dump never ran, and the only thing that
+/// reached the screen was the one-line red summary — the detail that says
+/// *which stage* failed stayed in a serial log nobody can read there.
+///
+/// So: the dump costs about fifteen lines and runs whenever the USB
+/// keyboard is missing, which is exactly when someone needs to read it.
+/// Thanks to `FramebufferConsole::new` no longer clearing the screen, the
+/// shell's output then scrolls up from underneath it rather than replacing
+/// it, so those lines stay readable without stopping the boot.
+///
+/// The 30 s hold still needs the stricter gate: it is for the case where
+/// the shell is unreachable anyway, and it must never fire in QEMU (where
+/// the 8042 always answers) or every test boot would pay for it.
+fn show_boot_log_if_no_keyboard() {
+    let usb_keyboards = crate::usb::keyboard_count();
+    let ps2 = hal::i8042::controller_present(&crate::hal::X86PortIo);
+    serial_println!("input: usb keyboards={} i8042_present={}", usb_keyboards, ps2);
+
+    if usb_keyboards > 0 {
+        return;
+    }
+
+    crate::kalert!("SIN teclado USB - log de arranque (USB/PCI):");
+    // Substring filters rather than log levels: see `klog::dump_to_screen`.
+    crate::klog::dump_to_screen(&["usb", "xhci", "pci", "input:", "PANIC", "FAILED", "failed"]);
+
+    if ps2 {
+        // A keyboard may still be reachable through the 8042; don't stop.
+        crate::kalert!("fin del log (hay 8042: se sigue arrancando)");
+        return;
+    }
+
+    crate::kalert!("fin del log - sin teclado alguno, 30 s antes del shell");
+
+    // Bounded exactly like the xHCI driver's own waits, and for the same
+    // reason: with interrupts masked a jiffies-based clocksource would
+    // never advance, so the spin count is what guarantees this terminates
+    // rather than becoming the hang it exists to diagnose.
+    let start = crate::time::ktime_get();
+    let mut spins: u64 = 0;
+    while crate::time::ktime_get().wrapping_sub(start) < 30_000_000_000 {
+        spins += 1;
+        if spins > 2_000_000_000 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
 }

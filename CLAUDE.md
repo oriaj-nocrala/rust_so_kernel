@@ -138,7 +138,7 @@ Testing section and `docs/drivers/roadmap.md`'s Phase 2 for more.
 |-------|------|---------|
 | `so2` | `/` (host) | Build script + QEMU launcher |
 | `kernel` | `kernel/` | Bare-metal kernel (`#![no_std]`, `x86_64-unknown-none`) |
-| `hal` | `hal/` | Host-testable hardware-access seams (`PortIo`/`PhysMem`) + pure driver logic (`cd hal && cargo test`) |
+| `hal` | `hal/` | Host-testable hardware-access seams (`PortIo`/`PhysMem`) + pure driver logic, including the xHCI/USB/HID logic behind the USB keyboard (`cd hal && cargo test`) |
 | `ext2` | `ext2/` | Host-testable ext2 filesystem core (`cd ext2 && cargo test` — known intermittent failure, see `docs/fs/ext2-test-flake.md`) |
 | `mm` | `mm/` | Host-testable buddy (physical) + slab (heap) allocators (`cd mm && cargo test`; the optional `slab-debug` feature adds a redzone + free-object quarantine, off by default so the default slot layout stays the reference one) |
 | `vfs` | `vfs/` | Host-testable VFS core: `Inode`/`Filesystem`/`FileHandle` traits, mount table + path resolution, and ramfs (`cd vfs && cargo test`) |
@@ -370,11 +370,11 @@ Register a new driver by:
 1. Creating `kernel/src/drivers/<name>.rs` implementing `FileHandle`
 2. Adding one entry to the `DEVICES` static slice in `drivers/mod.rs`
 
-Current devices: `/dev/null`, `/dev/zero`, `/dev/console` (serial), `/dev/fb` (framebuffer), `/dev/kbd` (non-blocking keyboard, char/ANSI stream), `/dev/input/event0` and `/dev/input/event1` (non-blocking, wire-compatible with real Linux evdev — each `read()` returns one real `struct input_event`, 24-byte-record layout shared via `drivers/evdev.rs`). `event0` is the keyboard (`EV_KEY` + a real `linux/input-event-codes.h` `KEY_*` code + press/release value, followed by an `EV_SYN`/`SYN_REPORT`, sourced from the PS/2 IRQ's raw scancode decode — see `drivers/dev_input_event.rs`; note the underlying ring buffer fills from every keypress since boot, so a game must drain the backlog at startup, see `doom-port/doomgeneric_constanos.c::DG_Init`). `event1` is the PS/2 mouse (`EV_REL` `REL_X`/`REL_Y` for relative motion, `EV_KEY` `BTN_LEFT`/`BTN_RIGHT`/`BTN_MIDDLE` for buttons — see `mouse.rs` for the 8042 aux-device enable sequence + 3-byte packet decode, and `drivers/dev_mouse_event.rs` for the evdev translation). Both back the DOOM port's input (keyboard + mouse-look). `/dev/input/*` lives under a one-level-deep devfs subdirectory (`fs/devfs.rs::InputDirInode`) — devfs is otherwise flat, so this is a hardcoded special case, not a general nested-device mechanism. `/dev/dsp` (`drivers/dev_dsp.rs`) is a write-only, fixed-format (48000 Hz stereo s16le) PCM sink backed by the AC97 PCI driver (`ac97.rs`) — see below.
+Current devices: `/dev/null`, `/dev/zero`, `/dev/console` (serial), `/dev/fb` (framebuffer), `/dev/kbd` (non-blocking keyboard, char/ANSI stream — fed by the PS/2 ISR *and* by the polled USB HID keyboard driver, see the USB section below: USB key presses are translated to Set-1 scancodes and enter through the same `keyboard::process_scancode`, so every device here behaves identically whichever keyboard is attached), `/dev/input/event0` and `/dev/input/event1` (non-blocking, wire-compatible with real Linux evdev — each `read()` returns one real `struct input_event`, 24-byte-record layout shared via `drivers/evdev.rs`). `event0` is the keyboard (`EV_KEY` + a real `linux/input-event-codes.h` `KEY_*` code + press/release value, followed by an `EV_SYN`/`SYN_REPORT`, sourced from the PS/2 IRQ's raw scancode decode — see `drivers/dev_input_event.rs`; note the underlying ring buffer fills from every keypress since boot, so a game must drain the backlog at startup, see `doom-port/doomgeneric_constanos.c::DG_Init`). `event1` is the PS/2 mouse (`EV_REL` `REL_X`/`REL_Y` for relative motion, `EV_KEY` `BTN_LEFT`/`BTN_RIGHT`/`BTN_MIDDLE` for buttons — see `mouse.rs` for the 8042 aux-device enable sequence + 3-byte packet decode, and `drivers/dev_mouse_event.rs` for the evdev translation). Both back the DOOM port's input (keyboard + mouse-look). `/dev/input/*` lives under a one-level-deep devfs subdirectory (`fs/devfs.rs::InputDirInode`) — devfs is otherwise flat, so this is a hardcoded special case, not a general nested-device mechanism. `/dev/dsp` (`drivers/dev_dsp.rs`) is a write-only, fixed-format (48000 Hz stereo s16le) PCM sink backed by the AC97 PCI driver (`ac97.rs`) — see below.
 
 **PCI + AC97 audio** (`pci.rs`, `ac97.rs`): this kernel's only PCI-aware code — `pci.rs` does raw 0xCF8/0xCFC config-space access and a bus-0 device scan (nothing else in this kernel enumerates PCI; every other driver targets a fixed legacy ISA port). `ac97.rs` finds the Intel 82801AA AC'97 codec (`-device AC97` in QEMU), does the cold-reset + PCM-out-stream-reset + mixer-unmute sequence, and runs a **polling**, not interrupt-driven, bus-master DMA ring: the IDT is a `spin::Once`, populated once as literally the first line of `boot()` before `memory::init_core` — wiring up a PCI IRQ whose vector is only known after enumeration doesn't fit that without either an early pre-memory PCI scan or a bigger IDT refactor, so `write_pcm()` instead polls the hardware's CIV register directly and blocks (spinning, no lock held across the spin, so the timer ISR/scheduler still preempts normally) until a buffer-descriptor slot frees. The 32-entry hardware BDL aliases only 8 real physical ring buffers (`entry[i].addr = slot_phys[i % 8]`) so the hardware's native mod-32 index wraparound still works correctly without needing all 32 to be distinct allocations. Fixed format only (48000 Hz stereo s16le, AC97's native non-VRA operating point) — no `ioctl` negotiation, matching the same "one client, one format, document it" simplification `/dev/input/event0`+`event1` already use.
 
-VFS mounts (`kernel/src/fs/mod.rs`): `/dev` (devfs), `/` (initramfs, embedded ELFs — a real two-level tree: root contains a real `bin` subdirectory, `/bin/<name>` is a genuine directory lookup, not a second mount aliasing the same flat namespace, see `fs::initramfs`), `/tmp` (ramfs, writable — the filesystem itself is `vfs::ramfs::RamFs`, host-testable; `kernel/src/fs/ramfs.rs` only supplies the `DirLockObserver` that wires its lock diagnostic into `/proc/kdebug`, see below), `/mnt` (ext2, read-write, best-effort — see the ext2 section below), `/proc` (procfs, read-only, synthetic — `/proc/meminfo` generated fresh on every `open()` from the live Buddy allocator stats; `/proc/self` and `/proc/<pid>/exe` are real symlinks, see `fs::procfs`). `ls /` also shows every other mount (`dev`, `tmp`, `mnt`, `proc`) as an entry — `fs::vfs::direct_children` (a thin delegate onto `vfs::mount::MountTable::direct_children`, see below) lets initramfs's root directory list them dynamically, same idea as a real Linux rootfs pre-creating empty `/proc`, `/dev`, etc. that mounts later overlay; actual traversal into them is still redirected by the mount table before ever reaching initramfs, so they only need to look like directories, not serve one.
+VFS mounts (`kernel/src/fs/mod.rs`): `/dev` (devfs), `/` (initramfs, embedded ELFs — a real two-level tree: root contains a real `bin` subdirectory, `/bin/<name>` is a genuine directory lookup, not a second mount aliasing the same flat namespace, see `fs::initramfs`), `/tmp` (ramfs, writable — the filesystem itself is `vfs::ramfs::RamFs`, host-testable; `kernel/src/fs/ramfs.rs` only supplies the `DirLockObserver` that wires its lock diagnostic into `/proc/kdebug`, see below), `/mnt` (ext2, read-write, best-effort — see the ext2 section below), `/proc` (procfs, read-only, synthetic — `/proc/meminfo` generated fresh on every `open()` from the live Buddy allocator stats; `/proc/self` and `/proc/<pid>/exe` are real symlinks, and `/proc/dmesg` is the kernel log ring — see `fs::procfs` and the kernel-log section below). `ls /` also shows every other mount (`dev`, `tmp`, `mnt`, `proc`) as an entry — `fs::vfs::direct_children` (a thin delegate onto `vfs::mount::MountTable::direct_children`, see below) lets initramfs's root directory list them dynamically, same idea as a real Linux rootfs pre-creating empty `/proc`, `/dev`, etc. that mounts later overlay; actual traversal into them is still redirected by the mount table before ever reaching initramfs, so they only need to look like directories, not serve one.
 
 **Storage stack seam** (`hal::block::BlockDevice`, `hal/src/block.rs`; `kernel::block::AtaBlockDevice`, `kernel/src/block/mod.rs`): `fs::ext2` no longer calls `block::ata::{read_sectors,write_sectors,present}` directly — it goes through `Ext2Fs::core.device: Box<dyn BlockDevice>` instead (`Ext2Core`, from the standalone `ext2` crate — see below), the same seam shape as `hal::PortIo`/`hal::PhysMem` (see `docs/drivers/architecture.md`'s storage-stack section), sector-granular (512 bytes) rather than filesystem-block-granular. `AtaBlockDevice` (zero-sized, wraps `block::ata`'s existing free functions) is what `fs::ext2::init()` mounts against at real boot; `hal::block::MemDisk` (`Vec<u8>`-backed, host-tested in `hal`) is what both the `ext2` crate's own host tests and the QEMU integration tests (`kernel/src/hw_tests.rs::ext2_memdisk_roundtrip` and `ext2_reclaim_orphans_clears_injected_disk_img_shape`) mount instead, exercising ext2's full read-write path with zero risk to the real `disk.img`. Explicitly a *partial* migration: `block::ata.rs` itself is still not seamed onto `PortIo` the way the six drivers in `docs/drivers/architecture.md`'s "Current status" are — only the layer above it (`fs::ext2`) moved.
 
@@ -385,6 +385,190 @@ No journal, so a crash mid-operation can still leak an allocated-but-unlinked bl
 **Critical ordering invariant in `reclaim_orphans`:** the reachability walk (`mark_reachable(ROOT_INO, ...)`) must run *before* the reserved-inode range (`1..first_ino`, which includes root's own inode 2) gets pre-marked "used" — `mark_reachable`'s own cycle guard treats an already-marked bit as "already visited, nothing more to do here." Pre-marking root first used to make the very first call return immediately without ever reading root's blocks or descending into a single child, silently treating the *entire* real directory tree as unreachable — the sweep then freed nearly every live block/inode on every fresh mount, and the next allocation handed out an already-live block to unrelated file data, corrupting whatever legitimately owned it. This is exactly what produced an `add_dir_entry` "range end index ... out of range" panic the first time this surfaced: root directory's own data block had been reused for a new file's content. Also guarded: the superblock's own block (at `first_data_block`, easy to mis-place one-off with "everything strictly before it") and sparse_super's backup superblock+BGDT copies in other block groups, both reserved unconditionally per group rather than replicating mke2fs's exact backup-placement rule (group 0, 1, and powers of 3/5/7) — reserving a slot that turns out not to have a backup costs nothing, since the real per-group bitmap never marks it used anyway.
 
 `unlink`/`rmdir` must persist the deleted inode's zeroed record (`write_inode`) *before* clearing its bitmap bit (`free_inode`) — `free_all_blocks` only updates the in-memory copy; skipping the write-back left a stale, pre-delete record (nonzero mode, dangling block pointers into blocks the bitmap already shows free) that a real `e2fsck` flags as a disconnected inode. `i_dtime` (deletion timestamp) is stamped with a real Unix epoch (`crate::time::now_unix_secs()`) — a raw boot-relative uptime value there is small enough to collide with a different on-disk use of that same field (ext3+ threads its in-progress orphan-inode list through `i_dtime` as a next-inode-number link), which `e2fsck` misdiagnoses as a corrupted orphan chain purely because the value looks too small to be a real calendar time.
+
+## USB Keyboard (`hal/src/{xhci,usb,hid}.rs`, `kernel/src/usb/`, `kernel/src/memory/mmio.rs`)
+
+Written because the physical AM4/Ryzen machine this kernel is brought up on
+has **no PS/2 port at all** — it booted to a shell nobody could type into,
+every input path in this kernel having gone through the 8042.
+
+**The design decision worth knowing:** a USB key press is translated into
+the PS/2 Set-1 scancode the same key would have produced and fed into the
+existing `keyboard::process_scancode`. Nothing downstream learns USB
+exists — `hal::keyboard::KeyDecoder`'s Shift/Ctrl/CapsLock state machine,
+the ANSI arrow sequences, `tty::feed_input`'s Ctrl-C handling, `/dev/kbd`
+and `/dev/input/event0`'s evdev records (whose `KEY_*` codes are themselves
+derived from Set-1, see `drivers/dev_input_event.rs`) all work unchanged
+and identically for both keyboards. One translation table
+(`hal::hid::usage_to_set1`) replaces a parallel copy of all of that, and a
+machine with both keyboards gets both merged into one stream with no
+arbitration, exactly where two PS/2 keyboards would merge.
+
+**Split across the usual seam.** `hal::xhci` (register/TRB/ring/context
+arithmetic), `hal::usb` (descriptor parsing + setup packets) and
+`hal::hid` (boot-report diffing + the Set-1 table) are pure and host-tested
+— 56 of `hal`'s 120 tests. `kernel/src/usb/xhci.rs` owns the MMIO window,
+DMA pages, doorbells and waiting. That line is drawn hard here because an
+xHCI bring-up failure is nearly unobservable (a wrong bit in a device
+context yields no fault, no log, just a Transfer Event that never arrives)
+and the target machine has no serial capture, so a mistake costs a reboot
+to find rather than a second.
+
+**Polled, not interrupt-driven**, for exactly `ac97.rs`'s reason (the IDT
+is a `spin::Once` filled before PCI enumeration exists): `usb::poll()` runs
+off the 100 Hz PIT tick in `timer_preempt_handler`, before the scheduler
+lock is taken. It `try_lock`s (a tick landing mid-enumeration skips its
+turn — the `tick_cursor_blink` strategy) and **returns** decoded scancodes
+rather than dispatching them, so the driver's lock is released before
+`process_scancode` runs — that path can take the scheduler lock to deliver
+SIGINT. A keyboard's interrupt endpoint has an 8 ms service interval, so a
+10 ms poll adds at most one interval.
+
+**`memory::mmio::map`** is new and exists for this driver: the first
+memory-BAR device here. It maps 4 KiB pages **uncached** (PWT|PCD) in a
+free higher-half PML4 slot, rather than reusing the bootloader's
+physical-memory window like ac97's DMA buffers do — that window is
+write-back cacheable, and a cached read of a status register can return a
+stale value. Picking an *unused* PML4 entry is what makes the mapping
+inherited by every later process (`OwnedPageTable::new_user` copies
+non-user kernel entries), which is what lets the timer ISR touch these
+registers under any address space. DMA buffers deliberately stay on the
+cacheable window — x86 DMA is cache-coherent. Measured, not assumed: QEMU's
+`qemu-xhci` BAR lands at `0xc0_0000_0000`, above the 4 GiB the bootloader
+window is only guaranteed to cover.
+
+**`pci.rs` gained a second discovery path** (`for_each_by_class`,
+`enable_mem_and_bus_master`): by class code (0x0C/0x03/0x30) rather than
+vendor/device ID, across all 256 buses rather than bus 0, assembling a
+64-bit memory BAR from BAR0+BAR1. All three differ from what ac97 needed,
+which is why `find_device` was left alone instead of loosened.
+
+**The event ring is read ownership-bit first, and that is load-bearing.**
+`next_event` reads dword 3 (which carries the cycle bit) *before* the
+payload dwords, because the controller writes the cycle bit last — that
+write is what hands the TRB over. Reading the payload first races the DMA
+write: dwords 0-2 get sampled before the controller writes them and dword 3
+after, producing an event whose type/slot/endpoint are fresh while its
+completion code and TRB pointer are still zero. Each torn read also
+*consumes* the ring slot, so the real event that follows is lost and its
+transfer times out a second later.
+
+This is the bug that made the driver fail on real hardware while passing in
+QEMU, where the device model writes the whole TRB atomically with respect to
+the guest and the window does not exist. It was invisible for three
+bare-metal cycles because every symptom was a plain `Timeout`; it only
+became findable once unmatched events were logged instead of silently
+dropped, and then showed as
+`slot 3 ep0 unknown-trb stage failed: Failed(0) ? (trb=0x0)` — completion
+code 0, which the specification never assigns, beside a null pointer. Note
+the asymmetry it fixed: `Dma::write_trb` already wrote the cycle bit last
+for the mirror-image reason, so the producer side was right and the consumer
+side was backwards.
+
+**Errors are matched by slot + endpoint, never by TRB pointer alone.** The
+original `control_transfer` recognised a Transfer Event only by matching the
+data or status TRB's address, so an error reported against the *Setup Stage*
+TRB (whose address was never recorded) fell through to the discard path and
+the genuine completion code was thrown away — every failure then read as a
+timeout. `handle_async_event` now logs (bounded) rather than dropping.
+
+**Recovery:** a `Stall` leaves the endpoint Halted and silently completing
+nothing, so `control_transfer` issues Reset Endpoint + Set TR Dequeue
+Pointer and retries once, logging both. The port reset likewise retries up
+to three times (`hub_port_reset` in Linux does the same), and Address Device
+once — every retry is logged, so a boot that only works because of one says
+so rather than looking like it always worked.
+
+**Deliberately out of scope:** hot-plug (ports are enumerated once at boot
+— enumeration waits milliseconds on hardware, which cannot happen in the
+timer ISR, and this kernel has no kernel-thread context to defer it to),
+external hubs (root-hub ports only; a hub needs the hub class driver plus
+route strings), and non-keyboard devices (addressed so they appear in the
+boot log, then left alone).
+
+**Testing it in QEMU:** both launchers attach `qemu-xhci` by default, so
+the bring-up path runs on every boot; `QEMU_USB_KBD=1` additionally
+attaches a `usb-kbd`. That flag is opt-in rather than default because QEMU
+routes monitor `sendkey` events to whichever keyboard it considers current
+— with it set, `scripts/qemu-debug.sh send "text"` arrives through xHCI
+instead of the 8042, which is exactly how the driver is tested end to end
+(`QEMU_DEBUG_NO_USB=1` omits the controller entirely). Verified: typing,
+backspace, arrow-key history recall, `usb_key_reports` in `/proc/kdebug`
+counting the reports, 12/12 clean boots under `boot-matrix.sh 4 3`, and
+the USB 2 port-reset branch via
+`-device qemu-xhci,id=xhci,p2=4,p3=0` (QEMU puts a high-speed keyboard on a
+USB 3 port otherwise).
+
+**The on-screen summary reports counts, not a verdict** — controllers up,
+ports, connected, addressed, other devices, setup errors, keyboards. The
+first bare-metal attempt produced nothing typeable with no way to tell
+whether the controller was missing, the ports were empty, or a keyboard had
+been addressed and then failed to deliver: three problems with three
+different next steps. (That attempt also showed nothing on screen at all —
+see the kernel-log section below for the screen-clear bug that ate it.)
+
+**`/proc/kdebug` carries `usb_keyboards` and `usb_key_reports`** — the
+counter that separates the two failure modes of a USB keyboard that types
+nothing: zero reports means the controller is not delivering transfers at
+all, nonzero means they arrive and the fault is in the decode or below.
+That distinction is otherwise unobservable on the serial-less target.
+
+## Kernel Log Ring + the No-Input Escape Hatch (`kernel/src/klog.rs`, `/proc/dmesg`)
+
+`klog` keeps every byte `serial_println!`/`serial_println_raw!` emits in a
+fixed 64 KiB BSS ring (a boot to the shell prompt measures ~14 KiB, so the
+whole boot plus a good deal of runtime fits). `cat /proc/dmesg` reads it
+back. **Lock-free on purpose** — one `fetch_add` reserves a byte range and
+the writer fills it — because `push` is reachable from the timer ISR, the
+page-fault handler, the allocators and the panic handler; interleaving
+between concurrent writers is the same trade-off `RawSerialWriter` already
+documents, and is worth far more than a log that can deadlock the machine
+it is debugging.
+
+**Why it exists, and what `/proc/dmesg` alone does not solve.** On the
+physical AM4/Ryzen machine there is no serial capture, so boot messages are
+readable only on screen — and they were being destroyed twice over. First,
+`FramebufferConsole::new()` cleared the entire screen the first time a
+process opened `/dev/fb`, which happens when PID 1's stdout is set up,
+*after* every driver has run: any `kalert!` the boot produced was wiped
+microseconds before anyone could read it. That is why the USB driver's
+on-screen status line was reported as never appearing on real hardware —
+it had been drawn and then erased, which is indistinguishable from a driver
+that said nothing. `FramebufferConsole::new` now skips that clear when the
+kernel has already written to the console (`KERNEL_WROTE`), so the shell's
+output scrolls up from the boot log instead of replacing it, and
+`draw_boot_screen` parks the console cursor below its own banner
+(`reserve_rows_at_top`) so notices don't overprint it.
+
+Second, and the reason a `dmesg` file is only half an answer: **reading it
+takes a shell, which takes a keyboard, which is the thing that was
+broken.** So `init::boot` also calls `show_boot_log_if_no_keyboard()`,
+which renders the USB/PCI-relevant log lines to the framebuffer and holds
+them for 30 s when the machine has no keyboard at all. The gate is
+deliberately narrow — no USB keyboard enumerated **and**
+`hal::i8042::controller_present` says the legacy 8042 does not answer — so
+it never fires in QEMU (where the 8042 always answers) and no test flow
+pays for it. `klog::dump_to_screen` filters by substring rather than by log
+level: a boot is ~300 lines and a screen holds ~80, and threading real
+levels through every existing call site is a far bigger change than this
+one diagnostic justifies.
+
+**`hal::i8042::controller_present` is read-only by construction.** The
+thorough probe (controller self-test `0xAA`, keyboard interface test
+`0xAB`) is what Linux does *during its own 8042 init*; issuing either here
+— after `init_hardware_interrupts` has set the keyboard up, possibly while
+it is in use — can leave the interfaces disabled on real hardware. A probe
+whose failure mode is "the keyboard that was working now isn't" is worse
+than no probe, so this one only reads the status port and treats the
+open-bus `0xFF` as "no controller". It therefore cannot distinguish "8042
+present but no keyboard attached"; that case needs the active commands.
+
+**Reproducing the target machine in QEMU:** `QEMU_DEBUG_NO_PS2=1`
+(`-machine pc,i8042=off`) removes the legacy controller, so with
+`QEMU_USB_KBD=1` the USB driver is the only possible input path — exactly
+the bring-up machine's shape. Verified: typing works in that configuration,
+`i8042_present=false` is reported, and with the USB keyboard also removed
+the no-input hold renders the filtered log and the red summary on screen.
 
 ## Time Subsystem (`kernel/src/time/`, `kernel/src/rtc.rs`)
 
