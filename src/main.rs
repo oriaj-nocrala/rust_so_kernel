@@ -50,6 +50,22 @@ fn main() {
     cmd.arg("-audiodev").arg(format!("{},id=snd0", audiodev));
     cmd.arg("-device").arg("AC97,audiodev=snd0");
 
+    // xHCI USB controller (kernel/src/usb/) — always present, so the USB
+    // driver's bring-up path runs on every `cargo run` instead of only on
+    // the physical machine it was written for.
+    //
+    // The USB keyboard behind it is opt-in (`QEMU_USB_KBD=1`) rather than
+    // default, because QEMU routes monitor `sendkey` events to whichever
+    // keyboard device it considers current: attaching a `usb-kbd`
+    // unconditionally would move every existing scripted-input flow
+    // (scripts/qemu-debug.sh's `send`, boot-matrix.sh) onto the USB path
+    // silently. With the flag set, that rerouting is exactly the point —
+    // it is how the driver gets tested end to end.
+    cmd.arg("-device").arg("qemu-xhci,id=xhci");
+    if std::env::var("QEMU_USB_KBD").is_ok() {
+        cmd.arg("-device").arg("usb-kbd,bus=xhci.0");
+    }
+
     let mut child = cmd.spawn().unwrap();
     child.wait().unwrap();
 }

@@ -42,6 +42,12 @@
 #                            and every QEMU default here does not
 #   QEMU_DEBUG_NO_DISK=1     omit the ext2 disk (no ATA on the target board)
 #   QEMU_DEBUG_NO_AC97=1     omit the AC97 codec (target board has HDA)
+#   QEMU_DEBUG_NO_USB=1      omit the xHCI USB controller
+#   QEMU_DEBUG_NO_PS2=1      omit the legacy 8042 (PS/2) controller — the
+#                            target board has none; combine with QEMU_USB_KBD=1
+#                            to make USB the only input path, as on metal
+#   QEMU_USB_KBD=1           attach a USB keyboard to it, and route `send`
+#                            through it instead of the PS/2 8042
 #   QEMU_DEBUG_EXTRA_ARGS    extra raw qemu args, word-split
 #
 #   scripts/qemu-debug.sh gdb ["cmd" "cmd" ...]      # batch gdb against a running instance
@@ -249,6 +255,29 @@ cmd_start() {
     )
     if [ -z "${QEMU_DEBUG_NO_AC97:-}" ]; then
         qemu_args+=(-audiodev "$audiodev" -device "AC97,audiodev=snd0")
+    fi
+    # xHCI controller (kernel/src/usb/) — present by default so the USB
+    # driver's bring-up runs on every boot; QEMU_DEBUG_NO_USB=1 omits it
+    # for a machine-shape sweep (see the NO_DISK/NO_AC97 knobs above).
+    #
+    # The keyboard behind it is opt-in: QEMU sends monitor `sendkey` events
+    # to whichever keyboard it considers current, so attaching a usb-kbd
+    # unconditionally would silently move `send`/`enter` below — and every
+    # script built on them — onto the USB path. QEMU_USB_KBD=1 makes that
+    # rerouting deliberate, which is how the USB driver is tested end to
+    # end: same `send "text"`, arriving through xHCI instead of the 8042.
+    # No legacy PS/2 controller — what a modern board with the 8042 fused
+    # out looks like, and the single most faithful knob for reproducing the
+    # USB-keyboard-only bring-up machine: with it set, the USB driver is the
+    # only possible source of input, exactly as on real hardware.
+    if [ -n "${QEMU_DEBUG_NO_PS2:-}" ]; then
+        qemu_args+=(-machine "pc,i8042=off")
+    fi
+    if [ -z "${QEMU_DEBUG_NO_USB:-}" ]; then
+        qemu_args+=(-device "qemu-xhci,id=xhci")
+        if [ -n "${QEMU_USB_KBD:-}" ]; then
+            qemu_args+=(-device "usb-kbd,bus=xhci.0")
+        fi
     fi
     if [ -f "$ext2_disk" ] && [ -z "${QEMU_DEBUG_NO_DISK:-}" ]; then
         # QEMU_DEBUG_DISK_IMG can point at a qcow2 overlay instead of the
