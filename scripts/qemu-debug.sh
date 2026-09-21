@@ -35,6 +35,15 @@
 #                                                    # confirm what SGR codes got emitted.
 #   scripts/qemu-debug.sh dlog [N]                  # tail -n N debug.log (-d int trace)
 #   scripts/qemu-debug.sh wait-for PATTERN [TIMEOUT_SECS]   # poll serial.log for a regex
+#
+# Real-hardware-shaped env overrides (see the block around `local mem=`):
+#   QEMU_DEBUG_MEM=8G        RAM size (default 512M) — sizes above 512 MiB
+#                            exercise physical addresses a real machine has
+#                            and every QEMU default here does not
+#   QEMU_DEBUG_NO_DISK=1     omit the ext2 disk (no ATA on the target board)
+#   QEMU_DEBUG_NO_AC97=1     omit the AC97 codec (target board has HDA)
+#   QEMU_DEBUG_EXTRA_ARGS    extra raw qemu args, word-split
+#
 #   scripts/qemu-debug.sh gdb ["cmd" "cmd" ...]      # batch gdb against a running instance
 #                                                    # (needs `start --gdb`/`--gdb-freeze` first)
 #                                                    # — see the GDB section below
@@ -203,6 +212,19 @@ cmd_start() {
     # output to a host .wav file for verification.
     local audiodev="${QEMU_AUDIODEV:-none,id=snd0}"
 
+    # ── Real-hardware-shaped overrides ──────────────────────────────
+    # This kernel is also brought up on a physical AM4/Ryzen machine that
+    # has none of QEMU's default legacy devices (no ATA/IDE, no AC97, no
+    # PS/2) and far more RAM than 512 MiB. Reproducing a real-hardware-only
+    # hang needs those same conditions here, where serial.log and gdb still
+    # work — hence these knobs rather than a hand-rolled qemu command line
+    # (which is exactly what this script exists to replace):
+    #   QEMU_DEBUG_MEM=32G        RAM size (default 512M)
+    #   QEMU_DEBUG_NO_DISK=1      omit the ext2 disk (machine has no ATA)
+    #   QEMU_DEBUG_NO_AC97=1      omit the AC97 codec (machine has HDA)
+    #   QEMU_DEBUG_EXTRA_ARGS=".." extra raw args, word-split (e.g. "-smp 8")
+    local mem="${QEMU_DEBUG_MEM:-512M}"
+
     local qemu_args=(
         -drive "if=pflash,format=raw,readonly=on,file=$ovmf_code"
         # file.locking=off on the VARS pflash and the UEFI boot image: both
@@ -218,16 +240,17 @@ cmd_start() {
         # so disabling QEMU's advisory lock here doesn't add real risk.
         -drive "if=pflash,format=raw,file=$ovmf_vars_src,file.locking=off"
         -drive "format=raw,file=$uefi_path,file.locking=off"
-        -m 512M
+        -m "$mem"
         -cpu max
         -serial "file:$SERIAL_LOG"
         -monitor "unix:$SOCK,server,nowait"
         -display none
         -d int,guest_errors -D "$DEBUG_LOG"
-        -audiodev "$audiodev"
-        -device "AC97,audiodev=snd0"
     )
-    if [ -f "$ext2_disk" ]; then
+    if [ -z "${QEMU_DEBUG_NO_AC97:-}" ]; then
+        qemu_args+=(-audiodev "$audiodev" -device "AC97,audiodev=snd0")
+    fi
+    if [ -f "$ext2_disk" ] && [ -z "${QEMU_DEBUG_NO_DISK:-}" ]; then
         # QEMU_DEBUG_DISK_IMG can point at a qcow2 overlay instead of the
         # real raw disk.img (see boot-matrix.sh: `qemu-img create -f qcow2
         # -b disk.img -F raw overlay.qcow2` — kilobytes instead of copying
@@ -240,6 +263,13 @@ cmd_start() {
             *.qcow2) ext2_fmt="qcow2" ;;
         esac
         qemu_args+=(-drive "file=$ext2_disk,format=$ext2_fmt,if=none,id=ext2disk" -device "ide-hd,drive=ext2disk,bus=ide.1")
+    fi
+
+    if [ -n "${QEMU_DEBUG_EXTRA_ARGS:-}" ]; then
+        # Deliberately word-split (unquoted): the point is to pass several
+        # raw qemu args from one env var.
+        # shellcheck disable=SC2206
+        qemu_args+=(${QEMU_DEBUG_EXTRA_ARGS})
     fi
 
     if [ "$enable_gdb" = 1 ]; then

@@ -33,6 +33,21 @@ scripts/qemu-debug.sh log 50                                   # tail serial.log
 scripts/qemu-debug.sh stop
 ```
 
+**Reproducing a real-hardware-only failure:** this kernel is also brought up
+on a physical AM4/Ryzen machine, where there is no serial capture at all —
+every observation has to be text drawn on the framebuffer and read off the
+screen by eye. Before iterating on that loop (edit → build → `dd` to USB →
+physical reboot → read screen), try to make QEMU look like the target
+machine: `QEMU_DEBUG_MEM=8G` (RAM size — the default here is 512M and *every*
+real machine has more), `QEMU_DEBUG_NO_DISK=1` (the board has NVMe+AHCI, no
+ATA/IDE), `QEMU_DEBUG_NO_AC97=1` (it has HDA), `QEMU_DEBUG_EXTRA_ARGS` for
+anything else. This is not hypothetical leverage: the 2026-09-21 bring-up
+blocker looked hardware-specific (TSC calibration against a real 3.7 GHz
+clock, no PS/2, USB-only keyboard) and was none of those — `-m 768M`
+reproduced it on the first try, which put serial.log, gdb and boot-matrix
+back in play. Sweep one variable at a time; the device knobs were clean and
+only memory mattered.
+
 **Measuring an intermittent boot failure:** `scripts/boot-matrix.sh N M` runs N QEMU
 instances in parallel, M boots each, classifies every boot (`OK`/`HANG`/`PANIC`/
 `DOUBLE_FAULT`) by grepping its own serial.log, and prints an aggregate. Isolation per
