@@ -21,9 +21,28 @@
 //
 //   The bitmap covers physical addresses 0..MAX_PHYS_ADDR (512 MiB).
 //   Addresses above this threshold are silently ignored by the bitmap
-//   (bitmap_set/clear/test become no-ops), falling back to correct but
-//   slower behavior.  In practice, QEMU+bootloader place all usable
-//   memory well below 512 MiB.
+//   (bitmap_set/clear/test become no-ops).  Correctness is preserved —
+//   the intrusive free list, not the bitmap, is the source of truth for
+//   what `allocate`/`deallocate` hand out — but two things are lost up
+//   there, and "slower" undersells both:
+//
+//     1. ALL coalescing.  `deallocate`'s merge loop stops the moment
+//        `is_free(buddy)` says false, which above the bound it always
+//        does.  Blocks fragment downward and never merge back.
+//     2. Double-free detection.  `bitmap_set`'s panic is the only check
+//        that exists, and it cannot fire above the bound.
+//
+//   This comment used to claim "in practice, QEMU+bootloader place all
+//   usable memory well below 512 MiB".  That is true of this kernel's
+//   own 512 MiB QEMU default and of nothing else: on the real AM4/Ryzen
+//   machine it is brought up on, *every* frame is above the bound, so
+//   the allocator never coalesces for the whole uptime.  The plausible
+//   consequence is a progressive large-allocation failure in a long
+//   session (the slab asks for order-20/1 MiB blocks) — reasoned from
+//   the code, NOT yet observed or measured.  Sizing the bitmap at boot
+//   from real RAM is the fix if it earns it; `kernel/src/memory/cow.rs`
+//   took exactly that route for a ceiling of the same shape that *was*
+//   a correctness bug.  Measure first.
 //
 //   Total bitmap size: ~32 KiB (computed at compile time).
 
