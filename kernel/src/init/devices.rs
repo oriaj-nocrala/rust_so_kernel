@@ -324,6 +324,20 @@ fn kill_current_user_process(reason: &str) -> ! {
             Some(proc) => {
                 proc.killed_by_signal = Some(crate::process::signal::SIGSEGV);
                 let parent = if proc.is_thread { None } else { proc.parent_pid };
+
+                // Say it on screen too, not just over serial. On hardware
+                // with no serial capture this line is the *only* thing that
+                // distinguishes "a process died" from "the machine hung" —
+                // both otherwise look like a screen that stopped changing
+                // under a still-blinking cursor. Never blocks; see
+                // `kernel_alert`.
+                crate::kalert!(
+                    "PID {} ({}) killed: {}",
+                    proc.pid.0,
+                    core::str::from_utf8(&proc.name).unwrap_or("<?>").trim_end_matches('\0'),
+                    reason,
+                );
+
                 (proc.pid.0, parent)
             }
             None => (0, None),

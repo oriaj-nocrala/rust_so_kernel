@@ -413,6 +413,180 @@ fn dispatch_csi(
     }
 }
 
+
+/// Render `buf` onto the console: the whole text path — control codes, ANSI
+/// escapes, scrolling and cursor bookkeeping — with both locks already held
+/// by the caller.
+///
+/// Split out of `FramebufferConsole::write` so the kernel's own
+/// [`kernel_alert`] can reach the same renderer without either duplicating
+/// the ANSI parser or taking the blocking `lock()`s that a `FileHandle`
+/// write can afford and a fault handler cannot.
+fn render_bytes(state: &mut FbState, fb: &mut Framebuffer, buf: &[u8]) {
+    if FB_RAW_DIRTY.load(Ordering::SeqCst) {
+        // Screen already belongs to (or was just handed back from) a
+        // raw-blit client — whatever the flag was tracking is stale.
+        CURSOR_DRAWN.store(false, Ordering::Relaxed);
+    } else {
+        undraw_cursor_locked(state, fb);
+    }
+
+    if FB_RAW_DIRTY.swap(false, Ordering::SeqCst) {
+        fb.clear(DEFAULT_BG);
+        state.col = 0;
+        state.row = 0;
+        state.fg = DEFAULT_FG;
+        state.bg = DEFAULT_BG;
+        state.ansi = AnsiState::Normal;
+    }
+
+    let (w, h) = fb.dimensions();
+    let cols = (w.saturating_sub(MARGIN_X)) / CHAR_W;
+    let rows = (h.saturating_sub(MARGIN_Y)) / CHAR_H;
+
+    for &byte in buf {
+        // Replace state.ansi with Normal, taking ownership of the old value.
+        // This avoids a borrow conflict when we need &mut state later.
+        let ansi = core::mem::replace(&mut state.ansi, AnsiState::Normal);
+        match ansi {
+            AnsiState::Normal => {
+                match byte {
+                    0x1B => {
+                        state.ansi = AnsiState::Escape;
+                    }
+                    b'\n' => {
+                        state.col = 0;
+                        state.row += 1;
+                        if state.row >= rows {
+                            fb.scroll_up(CHAR_H);
+                            state.row = rows - 1;
+                        }
+                    }
+                    b'\r' => {
+                        state.col = 0;
+                    }
+                    0x08 | 0x7f => {
+                        if state.col > 0 {
+                            state.col -= 1;
+                            let px = MARGIN_X + state.col * CHAR_W;
+                            let py = MARGIN_Y + state.row * CHAR_H;
+                            fb.draw_char(px, py, b' ', state.fg, state.bg, SCALE);
+                        }
+                    }
+                    b if b >= 0x20 && b < 0x7f => {
+                        let px = MARGIN_X + state.col * CHAR_W;
+                        let py = MARGIN_Y + state.row * CHAR_H;
+                        fb.draw_char(px, py, b, state.fg, state.bg, SCALE);
+                        state.col += 1;
+                        if state.col >= cols {
+                            state.col = 0;
+                            state.row += 1;
+                            if state.row >= rows {
+                                fb.scroll_up(CHAR_H);
+                                state.row = rows - 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            AnsiState::Escape => {
+                if byte == b'[' {
+                    state.ansi = AnsiState::Csi { buf: [0u8; 32], len: 0 };
+                }
+                // else: unrecognised escape — state.ansi stays Normal
+            }
+            AnsiState::Csi { mut buf, mut len } => {
+                if byte >= 0x40 && byte <= 0x7E {
+                    // Final byte — dispatch and return to Normal
+                    dispatch_csi(byte, &buf[..len], &mut *state, fb, cols, rows);
+                    // state.ansi already Normal from the replace above
+                } else if byte >= 0x20 && byte <= 0x3F {
+                    // Parameter or intermediate byte — accumulate
+                    if len < 32 {
+                        buf[len] = byte;
+                        len += 1;
+                    }
+                    state.ansi = AnsiState::Csi { buf, len };
+                }
+                // else: C0 control inside CSI — abort, stay Normal
+            }
+        }
+    }
+
+    // Show the cursor solid at its new position right away instead of
+    // waiting up to one full blink period — same feel as a real
+    // terminal, which keeps the cursor lit right after each keystroke
+    // and only starts blinking once input pauses.
+    let (x, y, w, h) = cursor_cell_rect(state);
+    fb.xor_rect(x, y, w, h);
+    CURSOR_DRAWN.store(true, Ordering::Relaxed);
+    CURSOR_TICKS.store(0, Ordering::Relaxed);
+}
+
+// ── Kernel-originated notices ────────────────────────────────────────────────
+
+/// Adapter letting `core::fmt` write straight through [`render_bytes`] with
+/// the locks already held — no intermediate buffer, and in particular no
+/// allocation, since the one caller runs inside a CPU exception handler.
+struct ConsoleWriter<'a> {
+    state: &'a mut FbState,
+    fb:    &'a mut Framebuffer,
+}
+
+impl core::fmt::Write for ConsoleWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        render_bytes(self.state, self.fb, s.as_bytes());
+        Ok(())
+    }
+}
+
+/// Announce a kernel-level event on the framebuffer console, in bright red,
+/// on a line of its own. Use [`kalert!`] rather than calling this directly.
+///
+/// Why this exists at all, when `serial_println!` already says everything:
+/// this kernel is also brought up on a physical machine with no serial
+/// capture, and there a killed process and a hard hang look *identical* —
+/// the screen simply stops changing while the PIT-driven cursor keeps
+/// blinking. Telling those two apart cost real time during the 2026-09-21
+/// bring-up, and nothing on screen distinguished them.
+///
+/// `try_lock`, never `lock`, on both locks. The caller is a fault handler,
+/// which can run while the interrupted process sits mid-`write` holding
+/// either one; blocking there would turn a process death into exactly the
+/// system-wide freeze this is meant to rule out. Same "skip this beat"
+/// strategy `tick_cursor_blink` uses, for the same reason — and the cost of
+/// skipping is only a line the serial log still has.
+///
+/// Deliberately does *not* mirror to serial: every caller already logs its
+/// own `serial_println!`, and duplicating it would just double the noise in
+/// the one place that was never the problem.
+pub fn kernel_alert(args: core::fmt::Arguments) {
+    use core::fmt::Write;
+
+    let Some(mut state) = FB_STATE.try_lock() else { return };
+    let Some(mut fb_guard) = FRAMEBUFFER.try_lock() else { return };
+    let Some(fb) = fb_guard.as_mut() else { return };
+
+    let mut w = ConsoleWriter { state: &mut state, fb };
+    // Reset the colour afterwards so the next writer — a shell prompt, some
+    // other process's output — is not left painted red.
+    let _ = w.write_str("\r\n\x1b[1;31m");
+    let _ = w.write_fmt(args);
+    let _ = w.write_str("\x1b[0m\r\n");
+}
+
+/// `serial_println!`'s visible counterpart: renders one bright-red notice on
+/// the framebuffer console. For events a user watching a screen with no
+/// serial attached must not miss — a process dying, above all. See
+/// [`kernel_alert`].
+#[macro_export]
+macro_rules! kalert {
+    ($($arg:tt)*) => {
+        $crate::drivers::framebuffer_console::kernel_alert(format_args!($($arg)*))
+    };
+}
+
 // ── Driver struct (ZST — all state is global) ─────────────────────────────────
 
 pub struct FramebufferConsole;
@@ -440,105 +614,7 @@ impl FileHandle for FramebufferConsole {
         let mut fb_guard = FRAMEBUFFER.lock();
         let Some(fb) = fb_guard.as_mut() else { return Ok(buf.len()); };
 
-        if FB_RAW_DIRTY.load(Ordering::SeqCst) {
-            // Screen already belongs to (or was just handed back from) a
-            // raw-blit client — whatever the flag was tracking is stale.
-            CURSOR_DRAWN.store(false, Ordering::Relaxed);
-        } else {
-            undraw_cursor_locked(&state, fb);
-        }
-
-        if FB_RAW_DIRTY.swap(false, Ordering::SeqCst) {
-            fb.clear(DEFAULT_BG);
-            state.col = 0;
-            state.row = 0;
-            state.fg = DEFAULT_FG;
-            state.bg = DEFAULT_BG;
-            state.ansi = AnsiState::Normal;
-        }
-
-        let (w, h) = fb.dimensions();
-        let cols = (w.saturating_sub(MARGIN_X)) / CHAR_W;
-        let rows = (h.saturating_sub(MARGIN_Y)) / CHAR_H;
-
-        for &byte in buf {
-            // Replace state.ansi with Normal, taking ownership of the old value.
-            // This avoids a borrow conflict when we need &mut state later.
-            let ansi = core::mem::replace(&mut state.ansi, AnsiState::Normal);
-            match ansi {
-                AnsiState::Normal => {
-                    match byte {
-                        0x1B => {
-                            state.ansi = AnsiState::Escape;
-                        }
-                        b'\n' => {
-                            state.col = 0;
-                            state.row += 1;
-                            if state.row >= rows {
-                                fb.scroll_up(CHAR_H);
-                                state.row = rows - 1;
-                            }
-                        }
-                        b'\r' => {
-                            state.col = 0;
-                        }
-                        0x08 | 0x7f => {
-                            if state.col > 0 {
-                                state.col -= 1;
-                                let px = MARGIN_X + state.col * CHAR_W;
-                                let py = MARGIN_Y + state.row * CHAR_H;
-                                fb.draw_char(px, py, b' ', state.fg, state.bg, SCALE);
-                            }
-                        }
-                        b if b >= 0x20 && b < 0x7f => {
-                            let px = MARGIN_X + state.col * CHAR_W;
-                            let py = MARGIN_Y + state.row * CHAR_H;
-                            fb.draw_char(px, py, b, state.fg, state.bg, SCALE);
-                            state.col += 1;
-                            if state.col >= cols {
-                                state.col = 0;
-                                state.row += 1;
-                                if state.row >= rows {
-                                    fb.scroll_up(CHAR_H);
-                                    state.row = rows - 1;
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                AnsiState::Escape => {
-                    if byte == b'[' {
-                        state.ansi = AnsiState::Csi { buf: [0u8; 32], len: 0 };
-                    }
-                    // else: unrecognised escape — state.ansi stays Normal
-                }
-                AnsiState::Csi { mut buf, mut len } => {
-                    if byte >= 0x40 && byte <= 0x7E {
-                        // Final byte — dispatch and return to Normal
-                        dispatch_csi(byte, &buf[..len], &mut *state, fb, cols, rows);
-                        // state.ansi already Normal from the replace above
-                    } else if byte >= 0x20 && byte <= 0x3F {
-                        // Parameter or intermediate byte — accumulate
-                        if len < 32 {
-                            buf[len] = byte;
-                            len += 1;
-                        }
-                        state.ansi = AnsiState::Csi { buf, len };
-                    }
-                    // else: C0 control inside CSI — abort, stay Normal
-                }
-            }
-        }
-
-        // Show the cursor solid at its new position right away instead of
-        // waiting up to one full blink period — same feel as a real
-        // terminal, which keeps the cursor lit right after each keystroke
-        // and only starts blinking once input pauses.
-        let (x, y, w, h) = cursor_cell_rect(&state);
-        fb.xor_rect(x, y, w, h);
-        CURSOR_DRAWN.store(true, Ordering::Relaxed);
-        CURSOR_TICKS.store(0, Ordering::Relaxed);
+        render_bytes(&mut state, fb, buf);
 
         Ok(buf.len())
     }
