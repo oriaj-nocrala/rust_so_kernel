@@ -10,3 +10,9 @@
 [submodule "quakegeneric"]
 	path = quakegeneric
 	url = https://github.com/erysdren/quakegeneric
+[submodule "ncurses"]
+	path = ncurses
+	url = https://github.com/mirror/ncurses.git
+[submodule "cmatrix"]
+	path = cmatrix
+	url = https://github.com/abishekvashok/cmatrix.git

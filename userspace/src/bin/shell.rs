@@ -62,7 +62,27 @@ extern "C" fn _start() -> ! {
             // comment and CLAUDE.md's Userspace Programs section). Listed
             // last: /tmp/bin (busybox applet symlinks) and /bin (initramfs)
             // should win on any name collision, same as before.
-            let envp: [&[u8]; 1] = [b"PATH=/tmp/bin:/bin:/mnt/bin\0"];
+            // HISTFILE on /mnt (ext2, disk.img) rather than /tmp (ramfs) —
+            // disk.img is the one mount that survives across `cargo run`
+            // invocations (see CLAUDE.md's ensure_ext2_disk_image), so
+            // command history actually persists across reboots instead of
+            // resetting every boot the way anything under /tmp would.
+            // TERM=linux matches this kernel's own framebuffer console
+            // (dispatch_csi in kernel/src/drivers/framebuffer_console.rs
+            // implements a "linux"-console-compatible subset of ANSI/SGR)
+            // and the terminfo entry actually shipped at
+            // /mnt/usr/share/terminfo/l/linux (scripts/build-terminfo.sh).
+            // Without this, any curses program (cmatrix, and anything
+            // else built against libncursesw.a later) inherits no $TERM
+            // at all and setupterm() fails with "Error opening terminal:
+            // unknown." — exported here so every program launched from
+            // ash gets it for free instead of needing `TERM=linux` typed
+            // by hand every time.
+            let envp: [&[u8]; 3] = [
+                b"PATH=/tmp/bin:/bin:/mnt/bin\0",
+                b"HISTFILE=/mnt/.ash_history\0",
+                b"TERM=linux\0",
+            ];
             syscall::exec_argv(b"/bin/busybox\0", &argv, &envp);
             // Only reached if exec failed.
             println!("init: exec /bin/busybox failed");

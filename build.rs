@@ -38,6 +38,7 @@ fn main() {
 
     let disk_image = ensure_ext2_disk_image();
     sync_disk_bin_dir(&disk_image);
+    sync_disk_terminfo_dir(&disk_image);
 
     // pass the disk image paths as env variables to the `main.rs`
     println!("cargo:rustc-env=UEFI_PATH={}", uefi_path.display());
@@ -91,6 +92,23 @@ fn ensure_ext2_disk_image() -> PathBuf {
             .status()
             .expect("Failed to spawn scripts/fetch-quake-shareware.sh");
         assert!(status.success(), "scripts/fetch-quake-shareware.sh failed");
+    }
+
+    // Terminfo database (~36K, scripts/build-terminfo.sh — see that
+    // script's header for what it compiles and why): unlike freedoom/quake
+    // this doesn't need a network fetch, just a native (host-side) build
+    // of the ncurses submodule's `tic` compiler, so it's cheap enough to
+    // run unconditionally rather than gating it on a rerun-if-changed like
+    // the two fetch scripts above.
+    println!("cargo:rerun-if-changed={}", manifest_dir.join("scripts/build-terminfo.sh").display());
+    if !seed_dir.join("usr/share/terminfo/l/linux").exists() {
+        println!("cargo:warning=terminfo database missing — building it from the ncurses submodule...");
+        let status = Command::new("bash")
+            .arg(manifest_dir.join("scripts/build-terminfo.sh"))
+            .current_dir(&manifest_dir)
+            .status()
+            .expect("Failed to spawn scripts/build-terminfo.sh");
+        assert!(status.success(), "scripts/build-terminfo.sh failed");
     }
 
     // 96MiB: freedoom1.wad (~29MB) + id1/pak0.pak (~18MB) alone are
@@ -302,6 +320,139 @@ fn sync_disk_bin_dir(disk_path: &std::path::Path) {
         "cargo:warning=synced {} userspace program(s) into disk.img:/bin ({})",
         entries.len(),
         entries.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>().join(", "),
+    );
+}
+
+/// Sync `disk-image-root/usr/share/terminfo/` (built by
+/// `scripts/build-terminfo.sh`, see its header comment) onto `disk.img`'s
+/// `/usr/share/terminfo`. Same reason `sync_disk_bin_dir` exists above:
+/// `disk.img` is create-once, so on a checkout that already has one this
+/// tree needs pushing in after the fact, same `debugfs -w` mechanism.
+///
+/// The one real difference from `sync_disk_bin_dir` is depth: terminfo's
+/// on-disk layout is `<first-letter>/<name>` two levels under
+/// `usr/share/terminfo`, so this walks `usr`, `usr/share`,
+/// `usr/share/terminfo`, and each first-letter subdirectory and creates
+/// only the ones genuinely missing — an unconditional `mkdir` on a
+/// directory that already exists hits the same e2fsprogs orphan-inode bug
+/// `sync_disk_bin_dir`'s doc comment describes for `/bin`, so every level
+/// gets the same existence probe that guard uses.
+fn sync_disk_terminfo_dir(disk_path: &std::path::Path) {
+    let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let terminfo_seed_dir = manifest_dir.join("disk-image-root/usr/share/terminfo");
+
+    if !terminfo_seed_dir.is_dir() || !disk_path.exists() {
+        return;
+    }
+
+    if Command::new("debugfs").arg("-V").output().is_err() {
+        // sync_disk_bin_dir already warns about debugfs being missing.
+        return;
+    }
+
+    let ext2_dir_exists = |path: &str| -> bool {
+        Command::new("debugfs")
+            .arg("-R").arg(format!("ls -l {path}"))
+            .arg(disk_path)
+            .output()
+            .map(|out| !out.stdout.is_empty())
+            .unwrap_or(false)
+    };
+
+    // First-letter subdirectories actually present on the host side
+    // (e.g. "a", "d", "l", "s", "v", "x" for the entry set
+    // scripts/build-terminfo.sh compiles), discovered rather than
+    // hardcoded so a different ENTRIES list there needs no change here.
+    let mut letter_dirs: Vec<(String, Vec<(String, PathBuf, u64)>)> = Vec::new();
+    let Ok(read_dir) = std::fs::read_dir(&terminfo_seed_dir) else { return; };
+    for entry in read_dir {
+        let entry = entry.expect("reading disk-image-root/usr/share/terminfo/ entry");
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let letter = entry.file_name().into_string()
+            .expect("non-UTF8 dirname in disk-image-root/usr/share/terminfo/");
+        let mut files = Vec::new();
+        for file_entry in std::fs::read_dir(entry.path()).expect("reading terminfo letter dir") {
+            let file_entry = file_entry.expect("reading terminfo letter dir entry");
+            if !file_entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let name = file_entry.file_name().into_string()
+                .expect("non-UTF8 filename in terminfo letter dir");
+            let size = file_entry.metadata().expect("stat terminfo entry").len();
+            files.push((name, file_entry.path(), size));
+        }
+        letter_dirs.push((letter, files));
+    }
+    if letter_dirs.is_empty() {
+        return;
+    }
+
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let script_path = out_dir.join("sync_disk_terminfo.debugfs");
+    let mut script = String::new();
+
+    for path in ["/usr", "/usr/share", "/usr/share/terminfo"] {
+        if !ext2_dir_exists(path) {
+            script.push_str(&format!("mkdir {path}\n"));
+        }
+    }
+    let mut total_files = 0usize;
+    for (letter, files) in &letter_dirs {
+        let dir_path = format!("/usr/share/terminfo/{letter}");
+        if !ext2_dir_exists(&dir_path) {
+            script.push_str(&format!("mkdir {dir_path}\n"));
+        }
+        script.push_str(&format!("cd {dir_path}\n"));
+        for (name, host_path, _) in files {
+            script.push_str(&format!("rm {name}\nwrite {} {name}\n", host_path.display()));
+            total_files += 1;
+        }
+    }
+    std::fs::write(&script_path, &script).expect("writing debugfs terminfo sync script");
+
+    Command::new("debugfs")
+        .arg("-w")
+        .arg("-f").arg(&script_path)
+        .arg(disk_path)
+        .output()
+        .expect("Failed to spawn debugfs");
+
+    // Verify the last-populated letter dir landed correctly (a full
+    // per-file check across every subdirectory isn't worth the extra
+    // debugfs round-trips this data doesn't get rewritten often); a
+    // missing/short file there means the whole script aborted partway.
+    if let Some((letter, files)) = letter_dirs.last() {
+        let relist = Command::new("debugfs")
+            .arg("-R").arg(format!("ls -l /usr/share/terminfo/{letter}"))
+            .arg(disk_path)
+            .output()
+            .expect("Failed to spawn debugfs for verification");
+        let relisting = String::from_utf8_lossy(&relist.stdout);
+        let missing: Vec<&str> = files.iter()
+            .filter(|(name, _, expected_size)| {
+                !relisting.lines().any(|line| {
+                    let mut fields = line.split_whitespace();
+                    let size_field = fields.nth(5);
+                    let name_field = line.trim_end().rsplit(char::is_whitespace).next();
+                    name_field == Some(name.as_str())
+                        && size_field == Some(expected_size.to_string().as_str())
+                })
+            })
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        if !missing.is_empty() {
+            panic!(
+                "sync_disk_terminfo_dir: failed to sync {:?} onto {}:/usr/share/terminfo/{} (debugfs `ls -l` follows)\n{}",
+                missing, disk_path.display(), letter, relisting,
+            );
+        }
+    }
+
+    println!(
+        "cargo:warning=synced {} terminfo entries into disk.img:/usr/share/terminfo ({} letter dirs)",
+        total_files, letter_dirs.len(),
     );
 }
 

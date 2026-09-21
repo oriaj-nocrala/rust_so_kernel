@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/sysinfo.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/utsname.h>
@@ -566,6 +567,80 @@ int sys_poll(struct pollfd *fds, nfds_t count, int timeout, int *num_events) {
 	if (ret < 0)
 		return (int)-ret;
 	*num_events = (int)ret;
+	return 0;
+}
+
+// select()/pselect() have no syscall of their own in this kernel — only
+// poll() (SYS_poll, above) does. Real Linux libc's don't need this: glibc
+// implements select() on top of the kernel's own separate select(2), but
+// this kernel never grew one (poll() covers the same ground and is what
+// epoll/pipe/socket code here already uses) — so mlibc's posix option
+// (options/posix/generic/sys-select.cpp) is bridged onto sys_poll instead
+// of left unimplemented. ncurses' input-with-timeout path (what drives
+// cmatrix's/curses's getch()-with-nodelay animation loop) calls select()
+// directly, not poll(), so this was a real gap, not a hypothetical one —
+// found via cmatrix flooding the console with "missing sysdep" errors.
+//
+// timeout/sigmask semantics: sigmask is ignored (this kernel has no
+// syscall to atomically swap the signal mask for the duration of a single
+// wait, and nothing in this port relies on that race-free guarantee —
+// see kill/sigprocmask's own scope). Negative/zero fds and NULL sets are
+// handled by simply never marking them ready, matching a real select()'s
+// behavior for an unwatched fd.
+int sys_pselect(int num_fds, fd_set *read_set, fd_set *write_set, fd_set *except_set,
+		const struct timespec *timeout, const sigset_t *, int *num_events) {
+	if (num_fds < 0 || num_fds > FD_SETSIZE)
+		return EINVAL;
+
+	struct pollfd fds[16];
+	if ((size_t)num_fds > sizeof(fds) / sizeof(fds[0]))
+		return EINVAL;
+
+	int n = 0;
+	for (int fd = 0; fd < num_fds; fd++) {
+		short events = 0;
+		if (read_set && __FD_ISSET(fd, read_set)) events |= POLLIN;
+		if (write_set && __FD_ISSET(fd, write_set)) events |= POLLOUT;
+		if (except_set && __FD_ISSET(fd, except_set)) events |= POLLPRI;
+		if (!events)
+			continue;
+		fds[n].fd = fd;
+		fds[n].events = events;
+		fds[n].revents = 0;
+		n++;
+	}
+
+	int timeout_ms = -1;
+	if (timeout)
+		timeout_ms = (int)(timeout->tv_sec * 1000 + timeout->tv_nsec / 1000000);
+
+	int nready = 0;
+	int err = sys_poll(fds, n, timeout_ms, &nready);
+	if (err)
+		return err;
+
+	if (read_set) __FD_ZERO(read_set);
+	if (write_set) __FD_ZERO(write_set);
+	if (except_set) __FD_ZERO(except_set);
+
+	int count = 0;
+	for (int i = 0; i < n; i++) {
+		if (!fds[i].revents)
+			continue;
+		if (read_set && (fds[i].revents & (POLLIN | POLLHUP | POLLERR))) {
+			__FD_SET(fds[i].fd, read_set);
+			count++;
+		}
+		if (write_set && (fds[i].revents & (POLLOUT | POLLERR))) {
+			__FD_SET(fds[i].fd, write_set);
+			count++;
+		}
+		if (except_set && (fds[i].revents & POLLPRI)) {
+			__FD_SET(fds[i].fd, except_set);
+			count++;
+		}
+	}
+	*num_events = count;
 	return 0;
 }
 

@@ -65,6 +65,28 @@ impl Framebuffer {
         }
     }
 
+    /// Invierte (XOR) los bytes de color de un rectángulo de píxeles.
+    /// Auto-inverso: aplicarlo dos veces sobre la misma región restaura los
+    /// píxeles originales sin necesidad de recordar qué había dibujado ahí
+    /// — así es como el cursor parpadeante se dibuja/borra sin llevar un
+    /// buffer de texto propio (este renderer es "immediate mode").
+    pub fn xor_rect(&mut self, x: usize, y: usize, w: usize, h: usize) {
+        let buffer = unsafe {
+            core::slice::from_raw_parts_mut(self.buffer.as_ptr(), self.height * self.stride * self.bytes_per_pixel)
+        };
+
+        for row in y..(y + h).min(self.height) {
+            for col in x..(x + w).min(self.width) {
+                let offset = (row * self.stride + col) * self.bytes_per_pixel;
+                if offset + self.bytes_per_pixel <= buffer.len() {
+                    buffer[offset] ^= 0xFF;
+                    buffer[offset + 1] ^= 0xFF;
+                    buffer[offset + 2] ^= 0xFF;
+                }
+            }
+        }
+    }
+
     /// Dibuja un carácter en las coordenadas especificadas
     pub fn draw_char(
         &mut self,

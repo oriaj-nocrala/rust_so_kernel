@@ -413,4 +413,125 @@ fn main() {
         assert!(status.success(), "scripts/build-quake.sh failed");
     }
     strip_elf(strip, &quake_elf);
+
+    // ── Build libtinfo+libncurses (scripts/build-libtinfo.sh) + smoke test ─
+    //
+    // Third slice of the ncurses port (see scripts/build-terminfo.sh for
+    // the terminfo database, and CLAUDE.md's session notes for the
+    // overall plan). Same "external build, only if missing" shape as
+    // BusyBox/doom/quake above — ncurses' own autotools build, not this
+    // build.rs's build_c_program closure. Wide-char build (see that
+    // script's header comment for why) — hence the 'w' suffix and the
+    // ncursesw/ include dir. tinfo_test.c then links against libtinfow.a
+    // directly (its own clang invocation, since it needs -I/-L flags
+    // build_c_program's DISK_C_PROGRAMS loop doesn't carry) and is staged
+    // to disk-image-root/bin/, not embedded.
+    let ncurses_lib = workspace_root.join("build-libtinfo/prefix/lib");
+    let ncurses_inc = workspace_root.join("build-libtinfo/prefix/include");
+    let libtinfow_a = ncurses_lib.join("libtinfow.a");
+    let libncursesw_a = ncurses_lib.join("libncursesw.a");
+    println!("cargo:rerun-if-changed={}", workspace_root.join("scripts/build-libtinfo.sh").display());
+    if !libtinfow_a.exists() || !libncursesw_a.exists() {
+        println!("cargo:warning=libtinfow.a/libncursesw.a missing — cross-compiling ncurses...");
+        let status = Command::new("bash")
+            .arg(workspace_root.join("scripts/build-libtinfo.sh"))
+            .current_dir(workspace_root)
+            .status()
+            .expect("Failed to spawn scripts/build-libtinfo.sh");
+        assert!(status.success(), "scripts/build-libtinfo.sh failed");
+    }
+
+    let build_ncurses_program = |src: &Path, dst: &Path, extra_libs: &[&Path]| {
+        let mut args: Vec<String> = vec![
+            "--target=x86_64-constanos-elf".into(),
+            "-ffreestanding".into(),
+            "-fno-stack-protector".into(),
+            "-fomit-frame-pointer".into(),
+            "-mno-red-zone".into(),
+            "-O2".into(),
+            "-static".into(),
+            "-nostdlib".into(),
+            "-isystem".into(), sysroot_inc.to_str().unwrap().into(),
+            "-I".into(), ncurses_inc.to_str().unwrap().into(),
+            "-I".into(), ncurses_inc.join("ncursesw").to_str().unwrap().into(),
+            crt1.to_str().unwrap().into(),
+            src.to_str().unwrap().into(),
+        ];
+        for lib in extra_libs {
+            args.push(lib.to_str().unwrap().into());
+        }
+        args.push(libc_a.to_str().unwrap().into());
+        args.push("-o".into());
+        args.push(dst.to_str().unwrap().into());
+
+        let status = Command::new("clang").args(&args).status()
+            .unwrap_or_else(|e| panic!("Failed to spawn clang for {}: {}", src.display(), e));
+        assert!(status.success(), "build failed for {}", src.display());
+    };
+
+    let tinfo_test_elf = disk_bin_dir.join("tinfo_test");
+    build_ncurses_program(&c_dir.join("tinfo_test.c"), &tinfo_test_elf, &[&libtinfow_a]);
+    strip_elf(strip, &tinfo_test_elf);
+    println!("cargo:warning=userspace(c, disk): tinfo_test.c -> disk-image-root/bin/tinfo_test");
+
+    // ── Build cmatrix (git submodule) against libncursesw ───────────────────
+    //
+    // The actual payoff of the ncurses port: cmatrix.c is upstream's own
+    // source, unmodified except for a hand-written config.h (the same kind
+    // of build-glue file scripts/build-busybox.sh's cc-wrapper.sh already
+    // is — not part of the program). scripts/write-cmatrix-config.sh
+    // generates it; see that script for exactly what's stubbed and why
+    // (mainly: no SIGWINCH/resizeterm, no Linux-console-font switching —
+    // neither exists in this kernel).
+    let cmatrix_src = workspace_root.join("cmatrix/cmatrix.c");
+    // Must be literally named config.h (cmatrix.c does `#include "config.h"`
+    // quoted) — kept in its own subdirectory so that -I directory contains
+    // nothing else and can't shadow anything real.
+    let cmatrix_config_h = workspace_root.join("build-libtinfo/cmatrix-config/config.h");
+    println!("cargo:rerun-if-changed={}", workspace_root.join("scripts/write-cmatrix-config.sh").display());
+    println!("cargo:rerun-if-changed={}", cmatrix_src.display());
+    {
+        let status = Command::new("bash")
+            .arg(workspace_root.join("scripts/write-cmatrix-config.sh"))
+            .arg(&cmatrix_config_h)
+            .status()
+            .expect("Failed to spawn scripts/write-cmatrix-config.sh");
+        assert!(status.success(), "scripts/write-cmatrix-config.sh failed");
+    }
+    let cmatrix_elf = disk_bin_dir.join("cmatrix");
+    {
+        let args: Vec<String> = vec![
+            "--target=x86_64-constanos-elf".into(),
+            "-ffreestanding".into(),
+            "-fno-stack-protector".into(),
+            "-fomit-frame-pointer".into(),
+            "-mno-red-zone".into(),
+            "-O2".into(),
+            "-static".into(),
+            "-nostdlib".into(),
+            "-isystem".into(), sysroot_inc.to_str().unwrap().into(),
+            "-I".into(), ncurses_inc.to_str().unwrap().into(),
+            "-I".into(), ncurses_inc.join("ncursesw").to_str().unwrap().into(),
+            // cmatrix.c does `#include "config.h"` (quoted, same-dir
+            // lookup first) — putting our generated one first on -I
+            // makes that resolve without touching the submodule checkout.
+            "-I".into(), cmatrix_config_h.parent().unwrap().to_str().unwrap().into(),
+            // cmatrix.c calls strcasecmp() without including strings.h —
+            // on a real Linux system it comes in transitively through
+            // some other header's own includes; force it in explicitly
+            // rather than patch the (unmodified) upstream source.
+            "-include".into(), "strings.h".into(),
+            crt1.to_str().unwrap().into(),
+            cmatrix_src.to_str().unwrap().into(),
+            libncursesw_a.to_str().unwrap().into(),
+            libtinfow_a.to_str().unwrap().into(),
+            libc_a.to_str().unwrap().into(),
+            "-o".into(), cmatrix_elf.to_str().unwrap().into(),
+        ];
+        let status = Command::new("clang").args(&args).status()
+            .expect("Failed to spawn clang for cmatrix");
+        assert!(status.success(), "cmatrix build failed");
+    }
+    strip_elf(strip, &cmatrix_elf);
+    println!("cargo:warning=userspace(c, disk): cmatrix.c -> disk-image-root/bin/cmatrix");
 }

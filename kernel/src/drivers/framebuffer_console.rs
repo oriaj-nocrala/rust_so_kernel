@@ -7,7 +7,7 @@
 
 use alloc::boxed::Box;
 use spin::Mutex;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::{
     framebuffer::{FRAMEBUFFER, Color, Framebuffer},
@@ -124,6 +124,68 @@ static FB_RAW_DIRTY: AtomicBool = AtomicBool::new(false);
 /// Called by `FBIO_BLIT`'s ioctl handler after every raw blit.
 pub fn mark_raw_dirty() {
     FB_RAW_DIRTY.store(true, Ordering::SeqCst);
+}
+
+// ── Blinking text cursor ──────────────────────────────────────────────────────
+//
+// Renders as an inverse-video block over the current cell, toggled by
+// `tick_cursor_blink()` (called from the 100 Hz PIT ISR). It never tracks
+// glyph content — `xor_rect` is self-inverting, so "drawn"/"not drawn" is
+// the only state that needs to survive between toggles. `CURSOR_DRAWN`
+// records which of those two states is currently on screen so a text write
+// landing on the cursor cell can undo it before drawing over it, and so the
+// ISR toggle and a concurrent write never fight over the same XOR parity.
+
+static CURSOR_DRAWN: AtomicBool = AtomicBool::new(false);
+static CURSOR_TICKS: AtomicU64 = AtomicU64::new(0);
+/// PIT runs at 100 Hz (`pit::init(100)`, see init/devices.rs); 50 ticks is
+/// a 500ms on/off period, the conventional terminal blink rate.
+const CURSOR_BLINK_TICKS: u64 = 50;
+
+fn cursor_cell_rect(state: &FbState) -> (usize, usize, usize, usize) {
+    let px = MARGIN_X + state.col * CHAR_W;
+    let py = MARGIN_Y + state.row * CHAR_H;
+    (px, py, CHAR_W, crate::framebuffer::GLYPH_H * SCALE)
+}
+
+/// If the cursor is currently rendered (inverted) at `state`'s position,
+/// un-invert it and clear the flag. Must be called with both `FB_STATE` and
+/// `FRAMEBUFFER` already locked by the caller.
+fn undraw_cursor_locked(state: &FbState, fb: &mut Framebuffer) {
+    if CURSOR_DRAWN.swap(false, Ordering::Relaxed) {
+        let (x, y, w, h) = cursor_cell_rect(state);
+        fb.xor_rect(x, y, w, h);
+    }
+}
+
+/// Called once per PIT tick from `timer_preempt_handler`. Runs with
+/// interrupts already disabled (ISR context), so it must never block: a
+/// `lock()` here could spin forever against a process that was preempted
+/// mid-write while holding the same lock. `try_lock` + "skip this beat" is
+/// the whole strategy — missing an occasional 10ms tick just delays the
+/// next blink phase slightly, which is invisible to a human.
+pub fn tick_cursor_blink() {
+    // A raw-blit client (DOOM/Quake) owns the screen; any cursor state
+    // from before it started pointed at pixels that are long gone, and
+    // inverting "the same" rectangle now would just corrupt its frame.
+    if FB_RAW_DIRTY.load(Ordering::SeqCst) {
+        CURSOR_DRAWN.store(false, Ordering::Relaxed);
+        return;
+    }
+
+    let ticks = CURSOR_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if ticks % CURSOR_BLINK_TICKS != 0 {
+        return;
+    }
+
+    let Some(state) = FB_STATE.try_lock() else { return; };
+    let Some(mut fb_guard) = FRAMEBUFFER.try_lock() else { return; };
+    let Some(fb) = fb_guard.as_mut() else { return; };
+
+    let (x, y, w, h) = cursor_cell_rect(&state);
+    fb.xor_rect(x, y, w, h);
+    let now_drawn = !CURSOR_DRAWN.load(Ordering::Relaxed);
+    CURSOR_DRAWN.store(now_drawn, Ordering::Relaxed);
 }
 
 // ── Serial mirror ──────────────────────────────────────────────────────────
@@ -378,6 +440,14 @@ impl FileHandle for FramebufferConsole {
         let mut fb_guard = FRAMEBUFFER.lock();
         let Some(fb) = fb_guard.as_mut() else { return Ok(buf.len()); };
 
+        if FB_RAW_DIRTY.load(Ordering::SeqCst) {
+            // Screen already belongs to (or was just handed back from) a
+            // raw-blit client — whatever the flag was tracking is stale.
+            CURSOR_DRAWN.store(false, Ordering::Relaxed);
+        } else {
+            undraw_cursor_locked(&state, fb);
+        }
+
         if FB_RAW_DIRTY.swap(false, Ordering::SeqCst) {
             fb.clear(DEFAULT_BG);
             state.col = 0;
@@ -460,6 +530,15 @@ impl FileHandle for FramebufferConsole {
                 }
             }
         }
+
+        // Show the cursor solid at its new position right away instead of
+        // waiting up to one full blink period — same feel as a real
+        // terminal, which keeps the cursor lit right after each keystroke
+        // and only starts blinking once input pauses.
+        let (x, y, w, h) = cursor_cell_rect(&state);
+        fb.xor_rect(x, y, w, h);
+        CURSOR_DRAWN.store(true, Ordering::Relaxed);
+        CURSOR_TICKS.store(0, Ordering::Relaxed);
 
         Ok(buf.len())
     }

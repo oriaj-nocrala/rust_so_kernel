@@ -156,6 +156,8 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> *const 
         PortWriteOnly::<u8>::new(0x20).write(0x20);
     }
 
+    crate::drivers::framebuffer_console::tick_cursor_blink();
+
     // ── 2. Advance jiffies counter ────────────────────────────────────
     // crate::time::clockevent::tick();
 
