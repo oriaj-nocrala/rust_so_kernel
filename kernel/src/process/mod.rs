@@ -541,9 +541,21 @@ impl Process {
         }
     }
 
+    /// Set the process's display name (Linux's `comm`) — what
+    /// `/proc/<pid>/stat` reports, and so what BusyBox `ps`/`top` show.
+    /// Truncated to 15 bytes plus a NUL, matching Linux's
+    /// `TASK_COMM_LEN`.
+    ///
+    /// Zeroes the rest of the field. That used to be unnecessary — every
+    /// name was set exactly once, onto a freshly zeroed `[0; 16]` — but
+    /// `sys_exec` now renames a live process, and readers stop at the
+    /// first NUL (`fs::procfs`'s `render_proc_stat`), so a shorter name
+    /// written over a longer one would otherwise leave the old tail
+    /// visible: "child" renamed to "ls" would read as "lsild".
     pub fn set_name(&mut self, name: &str) {
         let bytes = name.as_bytes();
         let len = core::cmp::min(bytes.len(), 15);
+        self.name = [0; 16];
         self.name[..len].copy_from_slice(&bytes[..len]);
     }
 

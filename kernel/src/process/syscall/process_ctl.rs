@@ -536,6 +536,19 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
         crate::ktrace!(crate::debug::SCHED, "exec: scheduler locked, swapping address space");
         match scheduler.running_mut() {
             Some(proc) => {
+                // Rename to the new image's basename, the way real
+                // `execve()` resets `comm`. Without it a process kept
+                // whatever it was called when it was created — and since
+                // the only way to reach `exec` is through `fork()`, which
+                // names every child "child", that meant *every* program
+                // this kernel ever ran showed up as "child" in `ps`, in
+                // `top`, in the scheduler's traces and in the on-screen
+                // kill notice. Taken from `resolved_path` before it is
+                // moved into `exe_name` just below (a borrow of
+                // `proc.exe_name` afterwards would collide with
+                // `set_name`'s `&mut self`).
+                let comm_at = resolved_path.rfind('/').map_or(0, |i| i + 1);
+                proc.set_name(&resolved_path[comm_at..]);
                 proc.exe_name = resolved_path;
                 crate::ktrace!(crate::debug::SCHED, "exec: dropping old AS");
                 // Replace address space with freshly loaded one. This drops
