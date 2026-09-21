@@ -26,6 +26,7 @@ pub mod block;
 pub mod hid;
 pub mod i8042;
 pub mod keyboard;
+pub mod memtype;
 pub mod mouse;
 pub mod pit;
 pub mod rtc;

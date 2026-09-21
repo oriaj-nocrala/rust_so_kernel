@@ -35,12 +35,73 @@ Empezó como un proyecto de aprendizaje ("SO2") para explorar desarrollo de sist
 - **`waitpid` con exit status real**: `WIFEXITED`/`WIFSIGNALED`/`WEXITSTATUS` reflejan el código de salida o la señal real del hijo, no un `exited(0)` fijo.
 - **IPC**: canales tipo socket (`socket`/`bind`/`connect`/`accept`/`sendmsg`/`recvmsg`) con `poll`/`epoll`.
 - **Tiempo**: TSC calibrado contra el PIT, hrtimer, `nanosleep`, `clock_gettime`. Reloj de pared real vía un driver de RTC CMOS propio (`kernel/src/rtc.rs`, puertos `0x70`/`0x71`) leído una vez al bootear — `CLOCK_REALTIME` ahora devuelve la hora real, no "boot = epoch".
-- **Consola con framebuffer** con soporte de escapes ANSI real (colores, posicionamiento de cursor, clear screen/line) — suficiente para que aplicaciones full-screen como `vi`/`less` dibujen bien. `ioctl` da termios real (`TCGETS`/`TCSETS`), tamaño de terminal real vía `TIOCGWINSZ` (calculado del framebuffer, no un 80×25 fijo), y control de grupo de terminal (`TIOCGPGRP`/`TIOCSPGRP`) — suficiente para job control real.
+- **Consola con framebuffer** con soporte de escapes ANSI real (colores, posicionamiento de cursor, clear screen/line) — suficiente para que aplicaciones full-screen como `vi`/`less` dibujen bien. `ioctl` da termios real (`TCGETS`/`TCSETS`), tamaño de terminal real vía `TIOCGWINSZ` (calculado del framebuffer, no un 80×25 fijo), y control de grupo de terminal (`TIOCGPGRP`/`TIOCSPGRP`) — suficiente para job control real. **Los rellenos van por scanline, no píxel a píxel** (`Framebuffer::fill_rect`): en la máquina física el framebuffer está detrás de PCIe y cada escritura suelta es una transacción de bus, así que un `ESC[J` (lo que emite `ash` al borrar un carácter — no borra una celda, redibuja la línea entera) costaba ~14.000 celdas × 64 píxeles y **congelaba la consola casi un segundo**. Medido A/B, mismo build salvo esa función: **534 ms → 1,3 ms, 410×**. Ver la sección de bare metal más abajo.
 - **mlibc portado a este kernel** (`mlibc-port/`, ver más abajo): permite compilar programas en C reales (`printf`, `malloc`, TLS, stdio con buffering) contra la ABI de syscalls propia. En el camino se encontró y parchó un bug real de mlibc *upstream* (no de este puerto): `sscanf`/`fscanf` cortaban de raíz en la primera conversión suprimida (`%*s`) — afecta a cualquier programa que use ese patrón, se descubrió porque rompía en silencio el parser de `/proc/<pid>/stat` de BusyBox `ps`/`top`. El parche vive en `scripts/setup-mlibc.sh` (se re-aplica solo, sobrevive a un reset del submódulo), no en el checkout.
 - **BusyBox real corriendo, con uso real**: BusyBox 1.36.1 (fuente oficial sin modificar, submódulo git) compila y corre contra el `sysroot/` propio. Ya no es solo `busybox echo hello`: `ash` (con job control real) es la shell interactiva de PID 1 en adelante, y hay ~60 applets reales — `vi` (editor full-screen), `grep`/`sed`/`awk`/`find`/`sort`/`diff`, `tar`/`gzip`/`gunzip`, `ps`/`top` (vía `/proc` real), `df` (vía `statvfs`), `du`, `chmod`, `id`/`hostname`, `md5sum`, `od`/`hexdump`, `less`/`more`. Al bootear, PID 1 corre `busybox --install -s /tmp/bin` de verdad — `symlink()` real por cada applet, la misma mecánica que usa una instalación real de Linux (un binario multicall + symlinks reales + dispatch por `argv[0]`), no algo calculado por el kernel.
 - **🎮 DOOM corre y se juega de verdad, con mouse-look y sonido**: [doomgeneric](https://github.com/ozkl/doomgeneric) (submódulo git) + un puerto propio (`doom-port/doomgeneric_constanos.c` + `doomgeneric_sound_constanos.c`) sobre las primitivas del kernel — un ioctl `FBIO_BLIT` en `/dev/fb` (el juego manda su propio buffer offscreen, el kernel lo escala y bliteá directo al framebuffer real), `/dev/input/event0`+`/dev/input/event1` wire-compatible con el evdev real de Linux (`event1` es un driver PS/2 mouse real: IRQ12, secuencia de habilitación del controlador 8042, decodificación de paquetes de 3 bytes — mouse-look de verdad: girar con X, avanzar/retroceder con Y, disparar con el botón izquierdo), y `/dev/dsp` sobre un **driver PCI AC97 real** (`kernel/src/ac97.rs` + `kernel/src/pci.rs`, el primer código PCI de este kernel — enumeración de config-space desde cero, DMA bus-mastering por buffer-descriptor-list, todo por *polling* en vez de IRQ ya que el IDT es un `Once` poblado antes de que exista memoria dinámica). El puerto de sonido decodifica los lumps DMX de los efectos, los mezcla (hasta 16 canales, resample 16.16 de punto fijo) y escribe PCM de 48kHz estéreo real — verificado capturando la salida real con el backend `wav` de QEMU e inspeccionando el `.wav` resultante (picos de -3dB, no silencio). Sin música (este fork de doomgeneric no trae ningún sintetizador MIDI/OPL, algo aparte del driver de audio en sí). El IWAD (Freedoom, licencia libre) se lee desde `/mnt/freedoom1.wad` (ext2). Escribir "doom" desde `ash` — probado de punta a punta: pantalla de título, menús, partida real, movimiento, giro, disparo con mouse y efectos de sonido reales. En el camino aparecieron y se arreglaron 3 bugs reales y preexistentes del kernel: `ext2` solo soportaba bloques directos + indirectos simples (tope ~268KB por archivo, ahora soporta doblemente indirectos), un `read()` escribiendo en un buffer de usuario recién `malloc`-eado (nunca tocado en modo usuario) paniqueaba el kernel por tratar todo fault en modo kernel como bug irrecuperable, y `lseek()` era un stub completo que siempre devolvía `ESPIPE` desde una época en que no existían archivos reales. La causa raíz real de los síntomas "el WAD se vacía" terminó siendo un mismatch de ABI: `SEEK_SET` valía `3` en un header de mlibc copiado de un puerto no-Linux, en vez del `0` que esta ABI espera — una vez arreglado, el WAD se sirve directo desde ext2 sin necesidad de un device kernel-embedded como workaround.
 - **🎮 Quake también corre y se juega de verdad**: [quakegeneric](https://github.com/erysdren/quakegeneric) (submódulo git, un puerto minimalista al estilo doomgeneric del código GPL de WinQuake de id Software) + un puerto propio (`quake-port/quakegeneric_constanos.c`) sobre las mismas primitivas del kernel que DOOM: `FBIO_BLIT` en `/dev/fb` (acá el motor entrega un buffer paletizado de 8bpp a 320x240, así que el puerto hace la conversión índice→RGB él mismo antes de blitear) y `/dev/input/event0`+`event1` (mismo evdev real, pero acá el motor los pide — `QG_GetKey`/`QG_GetMouseMove` — en vez de que el puerto empuje eventos como hace DOOM). El propio README de quakegeneric dice que "solo compila para 32 bits" — antes de meterle tiempo real, lo clonamos y lo compilamos con `-m64` en el host: compila limpio, con dos warnings inofensivos nada más (ningún puntero real truncado) — la advertencia del upstream resultó ser más conservadora de lo necesario para este caso. El shareware `id1/pak0.pak` (licencia de redistribución libre de id Software, misma lógica que el WAD shareware de Doom) se baja de un espejo en archive.org y se siembra en `disk.img` (ahora 96MB, no 48MB, para entrar junto con el WAD de Freedoom). En el camino apareció un gap real de este kernel: el motor de Quake (C de 1996, nunca escrito contra una pila chica) desbordaba la pila de usuario fija de 64KB que todo proceso recibe. La solución real es una **pila que crece sola** (`VmaKind::GrowableStack` — arranca en 64KB y el page fault handler la extiende hacia abajo bajo demanda, hasta un tope de 8MB tipo `RLIMIT_STACK`), no adivinar cuánta pila va a necesitar cada programa de antemano. En el camino de diagnosticar esto se encontró, por separado, un bug real y preexistente: `busybox --install` cuelga o hace double-fault en su propio `fork()` más o menos 1 de cada 3-4 boots — reproducible tal cual en el código sin tocar (sin Quake, sin cambios de pila), así que no tiene nada que ver con el tamaño de la pila (un diagnóstico intermedio culpó al tamaño de la pila; estaba mal). Sigue sin diagnosticar del todo. **Con sonido real**: `quake-port/quakegeneric_sound_constanos.c` reemplaza el backend silencioso `snd_null.c` de upstream, reimplementando la API `S_*` del motor directo sobre `/dev/dsp`/`ac97.rs` (mismo driver que usa el sonido de DOOM) — decodifica los WAV de `pak0.pak` con un parser RIFF/WAVE propio (el shareware es 8-bit mono PCM nada más, verificado contra el pak), resampleado a 48000 Hz estéreo con la misma técnica de punto fijo 16.16 que ya usaba el puerto de sonido de DOOM, mezclando hasta 32 canales. Hubo que agrandar dos límites de memoria propios de Quake una vez que empezó a cachear WAVs de verdad (el heap fijo de 8MB de `quakegeneric.c`, parcheado a 64MB vía el mismo mecanismo de parche-al-submódulo que usa mlibc; y la zona separada de `Z_Malloc`, mucho más chica —48KB—, agrandada con `-zone 8192`), y se encontró y arregló un bug real de lectura fuera de rango en el parser WAV (un chunk no reconocido con tamaño corrupto mandaba el cursor de parseo a memoria ajena). Verificado con captura de audio real vía QEMU (`QEMU_AUDIODEV=wav,...` + `ffmpeg -af volumedetect`: señal real, no silencio). Escribir "quake" desde `ash` — probado de punta a punta: demo de la pantalla de título, menú principal navegable, partida real jugándose sola en el demo, HUD completo, sonido real.
 - **Salida limpia de clientes de framebuffer crudo**: `FBIO_BLIT` (usado por DOOM y Quake) escribe píxeles directo al framebuffer sin pasar por el tracking de cursor/ANSI de la consola de texto — al salir, el siguiente `write()` de texto (el prompt de la shell) detecta el framebuffer "sucio" y limpia la pantalla antes de dibujar, en vez de quedar el último frame del juego debajo del texto nuevo.
+
+### 🖥️ Corriendo en hardware real (no solo QEMU)
+
+El kernel arranca y se usa en una **máquina física AM4/Ryzen 5900X**, no solo en
+QEMU. Ese cambio de escenario rompió cosas que en QEMU eran invisibles, y arreglarlas
+obligó a construir instrumentos nuevos — porque esa máquina **no tiene captura de
+serial**: la única salida es lo que se dibuje en la pantalla, y se lee sacándole una
+foto.
+
+- **Teclado USB vía un driver xHCI propio** (`hal/src/{xhci,usb,hid}.rs` +
+  `kernel/src/usb/`): la máquina objetivo **no tiene puerto PS/2**, así que booteaba
+  a un shell donde nadie podía escribir. Una tecla USB se traduce al scancode Set-1
+  que habría producido esa misma tecla en un teclado PS/2 y entra por el
+  `process_scancode` que ya existía — nada río abajo se entera de que existe USB, así
+  que el decodificador de Shift/Ctrl/CapsLock, las secuencias ANSI de las flechas,
+  `/dev/kbd` y los eventos evdev de `/dev/input/event0` funcionan idénticos con
+  cualquiera de los dos teclados. Polled desde el tick del PIT (el IDT es un `Once`
+  poblado antes de que exista enumeración PCI, mismo motivo que el AC97). Encontró un
+  bug real que pasaba en metal y no en QEMU: el event ring hay que leerlo **por el bit
+  de ciclo primero**, porque el controlador escribe ese bit al final — leer el payload
+  antes carrerea con la escritura de DMA y produce eventos a medio escribir (QEMU
+  escribe el TRB entero de forma atómica respecto al guest, así que la ventana no
+  existe ahí).
+- **`/proc/dmesg` + un escape hatch sin teclado**: `klog` guarda en un ring de 64KB
+  todo lo que emite `serial_println!`, y `cat /proc/dmesg` lo lee. Pero leerlo exige
+  un shell, que exige un teclado, que era justo lo roto — así que si la máquina no
+  tiene **ningún** teclado, el boot dibuja el log en la pantalla y lo sostiene 30
+  segundos. En el camino se encontró la razón por la que los diagnósticos del driver
+  USB "nunca aparecían" en metal: la consola limpiaba la pantalla entera la primera
+  vez que un proceso abría `/dev/fb` (o sea, después de que hubieran corrido todos los
+  drivers), borrando todo lo que el kernel había dibujado microsegundos antes de que
+  nadie pudiera leerlo — indistinguible de un driver que no dijo nada.
+- **`kalert!`**: avisos del kernel en rojo sobre el framebuffer. En esa máquina un
+  proceso muerto y un cuelgue duro se ven **idénticos** (la pantalla deja de cambiar y
+  el cursor sigue parpadeando), y distinguirlos costó tiempo real. Ahora toda muerte
+  por fault se anuncia en pantalla.
+- **`/proc/fbinfo`**: el panel de instrumentos de la consola. Geometría real
+  (`stride` no es `width`), dirección física, los bits PAT/PCD/PWT que la PTE viva
+  selecciona, el `IA32_PAT` entero y qué MTRR cubre el framebuffer (decodificado por
+  `hal::memtype`, con tests en el host), más el coste medido en ciclos TSC de cada
+  primitiva de dibujo — con **min y max**, porque los deltas son reloj de pared y una
+  preempción dentro de una operación medida le carga el tiempo de otro proceso. Y una
+  línea `instrument_overhead` que mide en vivo lo que cuesta una medición vacía (74
+  ciclos en QEMU), para que nadie confunda una operación barata con una cuyo coste
+  *es* el instrumento.
+
+  Ese instrumento después **decidió** qué valía la pena tocar y qué no, en vez de
+  adivinar: el read-modify-write del cursor sobre VRAM es el 4 % del tiempo y el
+  mirror a serial el 0,9 % — los dos quedaron como estaban, pese a estar los dos en
+  la lista de sospechosos — mientras que **`scroll_up` es el ~83 %**, a ~1,06 ms por
+  línea scrolleada (lee el framebuffer entero de vuelta, y una lectura de VRAM es
+  *non-posted*: el CPU se para hasta que el dato vuelve por el bus). Ese sigue sin
+  arreglar: no tiene arreglo local, necesita write-combining o un shadow buffer en
+  RAM. Registro completo en `docs/fb/console-perf.md`.
+- **Reproducir bugs de metal en QEMU**: `QEMU_DEBUG_MEM`, `QEMU_DEBUG_NO_PS2`,
+  `QEMU_USB_KBD`, `QEMU_DEBUG_NO_DISK`... Vale la pena de verdad: el bloqueante de
+  bring-up del 2026-09-21 parecía puro hardware (calibración de TSC contra un reloj
+  real de 3,7 GHz, sin PS/2, teclado solo USB) y no era nada de eso — `-m 768M` lo
+  reprodujo al primer intento. Era una tabla de refcounts de COW con techo fijo de
+  512 MiB: por encima de ese límite `fork()` no fallaba, fallaba **mal** (dos procesos
+  escribiendo el mismo frame físico), y en esa máquina toda la RAM está por encima.
 
 ### Programas de usuario incluidos
 
@@ -79,6 +140,7 @@ Empezó como un proyecto de aprendizaje ("SO2") para explorar desarrollo de sist
 │   │   ├── ipc/          # Canales tipo socket
 │   │   ├── block/        # Driver ATA PIO (canal secundario IDE)
 │   │   ├── drivers/      # /dev/null, /dev/zero, /dev/console, /dev/fb, /dev/kbd, /dev/input/event0+1 (evdev: teclado+mouse), /dev/dsp (AC97)
+│   │   ├── usb/          # Driver xHCI + teclado USB (traduce a scancodes Set-1)
 │   │   └── time/         # TSC, hrtimer, clocksource
 │   └── embedded/         # ELFs de userspace embebidos vía include_bytes!
 ├── userspace/            # Programas de usuario en Rust (workspace Cargo separado)
@@ -91,6 +153,8 @@ Empezó como un proyecto de aprendizaje ("SO2") para explorar desarrollo de sist
 ├── mlibc-port/           # Puerto propio de mlibc a este kernel (sysdeps "constanos")
 ├── busybox/              # Submódulo git: BusyBox oficial (git.busybox.net), pineado en 1_36_1
 ├── busybox-config/        # .config mínimo versionado para BusyBox
+├── hal/ ext2/ mm/ vfs/ diag/ sched/ usock/  # Crates host-testables (cargo test sin QEMU)
+├── docs/fb/console-perf.md   # Medición de la consola de framebuffer en metal
 ├── scripts/setup-mlibc.sh    # Reconstruye el sysroot de mlibc automáticamente
 ├── scripts/build-busybox.sh  # Compila BusyBox contra el sysroot automáticamente
 ├── scripts/build-doom.sh     # Compila doomgeneric + el puerto propio contra el sysroot
@@ -131,6 +195,7 @@ Lo que falta o está a medias, mirando el propio código:
 - ⏳ **Un solo core real**: la infraestructura para SMP existe (arrays por-CPU, `MAX_CPUS=8`) pero `cpu_id()` siempre devuelve 0. Todo el modelo de concurrencia actual (`cli`/`sti` + `spin::Mutex`) asume esto — el día que haya un segundo core de verdad, cada sitio que usa `cli` como si fuera exclusión mutua (no solo el propio lock) necesita auditoría, no es un cambio aislado.
 - ✅ **FPU/SSE guardado en los context switches, arreglado**: `Process::fpu_state` (imagen FXSAVE de 512 bytes) ahora se guarda/restaura de verdad (`fxsave`/`fxrstor`) en cada punto de cambio de contexto — antes `TrapFrame` solo tenía registros de propósito general, así que una preempción en medio de una computación de punto flotante corrompía silenciosamente `xmm0`-`xmm15`. `fork()` copia los registros *en vivo* del padre (semántica real de `fork()`); `clone()` (threads) arranca con el estado default; `exec()` lo resetea, igual que hace un `execve()` real. Verificado con `fpu_test`: carga un patrón de 128 bits en `xmm0` vía asm inline, gira en un loop entero puro el tiempo suficiente para atravesar cientos de preempciones reales (confirmado con un contador nuevo, `switches_total` en `/proc/kdebug`, no solo tiempo transcurrido), y chequea que sobrevivió intacto. Esto era el bloqueante real para portar algo como Quake (motor 100% en punto flotante) — ya no lo es.
 - ✅ **ext2 con escritura real, arreglado**: `/mnt` ahora soporta `create`/`mkdir`/`unlink`/`rmdir`/`rename`/`symlink`/`chmod` de verdad (allocation real de bloques/inodos, ver más arriba) — ya no hace falta pasar por `/tmp` (ramfs, sin persistencia entre reboots) para tener escritura real.
+- ⏳ **`scroll_up` de la consola lee el framebuffer entero**: medido, es el ~83 % del tiempo de consola (~1,06 ms por línea, y eso en QEMU — en metal la mitad de lectura es *non-posted* y será peor). No tiene arreglo local: necesita write-combining (reprogramar `IA32_PAT`, que de fábrica **no trae ninguna entrada WC**) o un shadow buffer en RAM. Ver `docs/fb/console-perf.md`.
 - ⏳ **`mmap` solo anónimo**: no hay mmap de archivos/devices (`fd` tiene que ser `-1`). Bloquea, por ejemplo, un framebuffer mapeable directamente en vez de escrito por syscall.
 - ✅ **Leak de stack por hilo, arreglado en su mayor parte**: el `mmap()` de 2MiB que mlibc arma para la pila de cada `pthread_create` nunca se liberaba — es un gap de mlibc *upstream* (`pthread_exit`/`thread_join` tienen TODOs/FIXMEs propios admitiéndolo), no específico de este puerto. El kernel ahora lo libera solo al morir el hilo (mismo patrón de liberación diferida que `kernel_stack`, evitando el mismo peligro de liberar la pila mientras el hilo todavía corre sobre ella). Con `meminfo`: bajó de ~8.9MB a ~2.7MB perdidos por corrida de `pthread_test` — probablemente el TCB en sí (`thread_join`'s FIXME: "destroy tcb here, currently we leak it"), sin investigar todavía.
 

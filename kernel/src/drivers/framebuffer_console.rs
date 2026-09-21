@@ -207,6 +207,7 @@ static STDOUT_AT_LINE_START: AtomicBool = AtomicBool::new(true);
 
 fn mirror_to_serial(buf: &[u8]) {
     use x86_64::instructions::port::Port;
+    let t0 = crate::cpu::tsc::read();
     let mut port = Port::<u8>::new(0x3F8);
     for &byte in buf {
         if STDOUT_AT_LINE_START.load(Ordering::Relaxed) {
@@ -220,6 +221,12 @@ fn mirror_to_serial(buf: &[u8]) {
             STDOUT_AT_LINE_START.store(true, Ordering::Relaxed);
         }
     }
+    // Counted because on the target machine nothing is listening at the
+    // other end: this is one I/O port write per byte of user output, on
+    // the hot path, for a log nobody can read there. Whether that is worth
+    // a condition is a question for the measurement, not for a guess —
+    // see `/proc/fbinfo`'s `fb_serial_mirror`.
+    crate::debug::FB_SERIAL_MIRROR.record(buf.len() as u64, crate::cpu::tsc::read().wrapping_sub(t0));
 }
 
 // ── Parse CSI parameter string ────────────────────────────────────────────────
@@ -306,12 +313,47 @@ fn apply_sgr(params: &[u32], state: &mut FbState) {
 /// cases (0 and 1), which need to blank a range of whole rows plus one
 /// partial row, the same way `ESC[K` already blanks a range within a
 /// single row.
+///
+/// One `fill_rect` for the whole span, not one `draw_char(b' ')` per cell.
+/// That rewrite is the fix for the symptom this whole line of work started
+/// from: on the physical machine, `ash` redrawing its line after a
+/// backspace emits `ESC[J`, which from a prompt a quarter of the way down
+/// a 1920x1080 screen used to mean ~22,000 cells x 64 pixels ~= 1.4
+/// million individual writes to an uncacheable PCIe aperture — about a
+/// second of frozen console, and imperceptible in QEMU because there the
+/// framebuffer is host RAM. See `Framebuffer::fill_rect`.
+///
+/// Blanks the full `CHAR_H` cell height, including the `LINE_GAP` row that
+/// `draw_char` never touches — the old per-cell version left that row
+/// holding whatever was there, which after a scroll or a raw blit was not
+/// necessarily background.
 fn clear_row_from(fb: &mut Framebuffer, state: &FbState, row: usize, start_col: usize, end_col: usize) {
-    for c in start_col..end_col {
-        let px = MARGIN_X + c * CHAR_W;
-        let py = MARGIN_Y + row * CHAR_H;
-        fb.draw_char(px, py, b' ', DEFAULT_FG, state.bg, SCALE);
+    if end_col <= start_col {
+        return;
     }
+    fb.fill_rect(
+        MARGIN_X + start_col * CHAR_W,
+        MARGIN_Y + row * CHAR_H,
+        (end_col - start_col) * CHAR_W,
+        CHAR_H,
+        state.bg,
+    );
+}
+
+/// Blank whole rows `[row0, row1)` across all `cols` columns — one
+/// `fill_rect` for the entire block rather than one per row, which is what
+/// turns `ESC[J`'s "and everything below" into a single operation.
+fn clear_rows(fb: &mut Framebuffer, state: &FbState, row0: usize, row1: usize, cols: usize) {
+    if row1 <= row0 || cols == 0 {
+        return;
+    }
+    fb.fill_rect(
+        MARGIN_X,
+        MARGIN_Y + row0 * CHAR_H,
+        cols * CHAR_W,
+        (row1 - row0) * CHAR_H,
+        state.bg,
+    );
 }
 
 // ── CSI dispatcher ────────────────────────────────────────────────────────────
@@ -370,14 +412,10 @@ fn dispatch_csi(
             match params[0] {
                 0 => {
                     clear_row_from(fb, state, state.row, state.col, cols);
-                    for r in (state.row + 1)..rows {
-                        clear_row_from(fb, state, r, 0, cols);
-                    }
+                    clear_rows(fb, state, state.row + 1, rows, cols);
                 }
                 1 => {
-                    for r in 0..state.row {
-                        clear_row_from(fb, state, r, 0, cols);
-                    }
+                    clear_rows(fb, state, 0, state.row, cols);
                     clear_row_from(fb, state, state.row, 0, state.col + 1);
                 }
                 2 | 3 => {
@@ -389,28 +427,13 @@ fn dispatch_csi(
             }
         }
         b'K' => {
+            // Same one-`fill_rect`-per-span treatment as `ESC[J` above;
+            // `vi` emits an `ESC[K` per line it repaints, so this is the
+            // hot one in a full-screen editor rather than the dramatic one.
             match params[0] {
-                0 => {
-                    for c in state.col..cols {
-                        let px = MARGIN_X + c * CHAR_W;
-                        let py = MARGIN_Y + state.row * CHAR_H;
-                        fb.draw_char(px, py, b' ', DEFAULT_FG, state.bg, SCALE);
-                    }
-                }
-                1 => {
-                    for c in 0..=state.col {
-                        let px = MARGIN_X + c * CHAR_W;
-                        let py = MARGIN_Y + state.row * CHAR_H;
-                        fb.draw_char(px, py, b' ', DEFAULT_FG, state.bg, SCALE);
-                    }
-                }
-                2 => {
-                    for c in 0..cols {
-                        let px = MARGIN_X + c * CHAR_W;
-                        let py = MARGIN_Y + state.row * CHAR_H;
-                        fb.draw_char(px, py, b' ', DEFAULT_FG, state.bg, SCALE);
-                    }
-                }
+                0 => clear_row_from(fb, state, state.row, state.col, cols),
+                1 => clear_row_from(fb, state, state.row, 0, state.col + 1),
+                2 => clear_row_from(fb, state, state.row, 0, cols),
                 _ => {}
             }
         }
@@ -428,6 +451,7 @@ fn dispatch_csi(
 /// the ANSI parser or taking the blocking `lock()`s that a `FileHandle`
 /// write can afford and a fault handler cannot.
 fn render_bytes(state: &mut FbState, fb: &mut Framebuffer, buf: &[u8]) {
+    let t0 = crate::cpu::tsc::read();
     if FB_RAW_DIRTY.load(Ordering::SeqCst) {
         // Screen already belongs to (or was just handed back from) a
         // raw-blit client — whatever the flag was tracking is stale.
@@ -527,6 +551,12 @@ fn render_bytes(state: &mut FbState, fb: &mut Framebuffer, buf: &[u8]) {
     fb.xor_rect(x, y, w, h);
     CURSOR_DRAWN.store(true, Ordering::Relaxed);
     CURSOR_TICKS.store(0, Ordering::Relaxed);
+
+    // `bytes` here is the *input* byte count, not framebuffer bytes — the
+    // rate `/proc/fbinfo` derives from it is "console throughput in bytes
+    // of text per second", which is the figure a human comparing a
+    // before/after actually wants, not a memory bandwidth.
+    crate::debug::FB_RENDER.record(buf.len() as u64, crate::cpu::tsc::read().wrapping_sub(t0));
 }
 
 // ── Kernel-originated notices ────────────────────────────────────────────────

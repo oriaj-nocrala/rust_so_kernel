@@ -128,7 +128,12 @@ passes below. The fourth,
 `unix_socket_handle_roundtrip`, covers the AF_UNIX adapter (`kernel/src/ipc/unix.rs`) — the
 half of the socket stack the `usock` crate's host tests cannot reach: `UnixSocketHandle` as a
 real `FileHandle`, `socket_id()` reporting through a `Box<dyn FileHandle>`, and reference
-counting living in `Drop` rather than `close()`; see the AF_UNIX section below. See
+counting living in `Drop` rather than `close()`; see the AF_UNIX section below. The fifth,
+`framebuffer_primitives_touch_exactly_their_own_pixels`, asserts `fill_rect`/`draw_char`/
+`scroll_up` against a RAM-backed `Framebuffer` (the same technique `MemDisk` gives ext2) with
+a **`stride` deliberately larger than `width`** and the buffer pre-filled with `0xAA`, so the
+padding columns a naive `row * width` would corrupt are checked and "untouched" is something
+the test can actually assert — see the framebuffer console section below. See
 `docs/drivers/architecture.md`'s
 Testing section and `docs/drivers/roadmap.md`'s Phase 2 for more.
 
@@ -138,11 +143,11 @@ Testing section and `docs/drivers/roadmap.md`'s Phase 2 for more.
 |-------|------|---------|
 | `so2` | `/` (host) | Build script + QEMU launcher |
 | `kernel` | `kernel/` | Bare-metal kernel (`#![no_std]`, `x86_64-unknown-none`) |
-| `hal` | `hal/` | Host-testable hardware-access seams (`PortIo`/`PhysMem`) + pure driver logic, including the xHCI/USB/HID logic behind the USB keyboard (`cd hal && cargo test`) |
+| `hal` | `hal/` | Host-testable hardware-access seams (`PortIo`/`PhysMem`) + pure driver logic, including the xHCI/USB/HID logic behind the USB keyboard and the MTRR/PAT memory-type decoding behind `/proc/fbinfo` (`cd hal && cargo test`) |
 | `ext2` | `ext2/` | Host-testable ext2 filesystem core (`cd ext2 && cargo test` — known intermittent failure, see `docs/fs/ext2-test-flake.md`) |
 | `mm` | `mm/` | Host-testable buddy (physical) + slab (heap) allocators (`cd mm && cargo test`; the optional `slab-debug` feature adds a redzone + free-object quarantine, off by default so the default slot layout stays the reference one) |
 | `vfs` | `vfs/` | Host-testable VFS core: `Inode`/`Filesystem`/`FileHandle` traits, mount table + path resolution, and ramfs (`cd vfs && cargo test`) |
-| `diag` | `diag/` | Host-testable always-on diagnostic instruments (`LockDiag`, `DirLockDiag`, `TfRewindDiag`, `IfViolationDiag`) extracted out of `kernel/src/debug.rs` (`cd diag && cargo test`) |
+| `diag` | `diag/` | Host-testable always-on diagnostic instruments (`LockDiag`, `DirLockDiag`, `TfRewindDiag`, `IfViolationDiag`, `OpStat`) extracted out of `kernel/src/debug.rs` (`cd diag && cargo test`) |
 | `usock` | `usock/` | Host-testable AF_UNIX socket core: socket state machines, stream/datagram queues, backlog, `sockaddr_un` parsing, the abstract namespace and `SCM_RIGHTS`, generic over the passed-descriptor type (`cd usock && cargo test`) |
 | `sched` | `sched/` | Host-testable scheduler core: priority run queues, wait queue, decay-on-preemption, aging, quantum arithmetic, and an invariant checker + property tests, generic over the scheduled entity (`cd sched && cargo test`) |
 | `qemu-test-runner` | `qemu-test-runner/` | Host-side driver for the QEMU integration tests (`scripts/run-kernel-tests.sh`) |
@@ -366,6 +371,46 @@ Drivers implement `FileHandle` (trait in `process/file.rs`): `read`, `write`, `c
 
 **Kernel-originated on-screen notices** (`drivers/framebuffer_console.rs`): `crate::kalert!("...", args)` renders one bright-red line through the console's normal text path (ANSI parser, scrolling, cursor bookkeeping — `render_bytes`, split out of `FramebufferConsole::write` so there is one renderer, not two). It exists for the real-hardware bring-up case, where there is no serial capture at all: on that machine a killed process and a hard hang look *identical* — the screen simply stops changing while the PIT-driven cursor keeps blinking — and telling those apart cost real time on 2026-09-21. The one caller is `init::devices::kill_current_user_process`, so every fault-induced death (divide-by-zero, invalid opcode, GPF, unhandled page fault) is announced on screen; a normal `exit()` is not. It takes **`try_lock` on both `FB_STATE` and `FRAMEBUFFER`, never `lock`** — the caller is a fault handler that can run while the interrupted process sits mid-`write` holding either one, and blocking there would turn a process death into exactly the freeze it exists to rule out (same "skip this beat" strategy as `tick_cursor_blink`). It writes no `core::fmt` into a heap buffer either — `ConsoleWriter` formats straight through `render_bytes`. Deliberately does not mirror to serial: every caller already has its own `serial_println!`.
 
+**Framebuffer console performance, and the instrument that measures it**
+(`kernel/src/framebuffer.rs`, `/proc/fbinfo`, `hal::memtype`, `diag::OpStat`;
+full record in `docs/fb/console-perf.md`): the console is imperceptibly fast in
+QEMU, where the framebuffer is host RAM, and was a second per screen-clear on
+the physical AM4 machine, where it lives across PCIe — `ash` redraws its whole
+line after a backspace and emits `ESC[J`, which used to mean ~14,000 cells x 64
+pixels of individual bounds-checked stores. `Framebuffer::fill_rect` replaced
+that with one contiguous byte range per scanline (`memset` for black,
+a repeated pre-built pixel pattern otherwise) and `clear`/`clear_row_from`/
+`clear_rows`/`ESC[J`/`ESC[K` all route through it. **Measured A/B, same build
+but for that one function: 1,975,481,800 cycles (534 ms) → 4,811,369 (1.3 ms),
+410x** — in QEMU, which is exactly the environment that hid the problem, so the
+magnitude on the target machine still has to come from the target machine.
+
+`cat /proc/fbinfo` is how it does: real geometry (`stride` is not `width`),
+physical address, the PTE's own PAT/PCD/PWT bits, `IA32_PAT`, and whichever
+MTRR covers the aperture — decoded by `hal::memtype` (pure, host-tested), read
+by `kernel/src/memory/memtype.rs` (`rdmsr` + `OwnedPageTable::translate_with_flags`).
+It deliberately reports the MTRR and PAT types **separately** rather than
+combining them into one verdict: the SDM's MTRR x PAT table is the one thing
+here that is easy to get wrong from memory, and the ground truth is the
+measured `MB/s` beside it, which needs no table. Every primitive carries a
+`diag::OpStat` (calls/bytes/cycles/**min**/**max**), plus an
+`instrument_overhead` line measuring an empty measurement live — 74 cycles in
+QEMU, so nothing below it is instrument artifact. `min`/`max` exist because the
+deltas are wall-clock and the console does not run with interrupts off: a
+preemption inside a measured call charges it for another process's time
+(`draw_char` averages ~115k cycles idle and ~1.5M under load, for identical
+work), and showing the spread is what keeps the mean from silently lying.
+
+What the instrument then *decided*, rather than what seemed plausible: the
+cursor's `xor_rect` read-modify-write is 4% of console time and the serial
+mirror 0.9% — both left alone despite both being on the original suspect list
+— while **`scroll_up` is ~83%**, at a measured ~1.06 ms per scrolled line
+(it reads the entire framebuffer back, and a VRAM read is non-posted). That one
+has no local fix: it needs either write-combining (`/proc/fbinfo` already
+reports the two facts that decide it — the reset PAT has *no* WC entry at all,
+so `IA32_PAT` must be reprogrammed first, and QEMU's own aperture MTRR is UC)
+or a RAM shadow buffer. Neither is done; see `docs/fb/console-perf.md`.
+
 Register a new driver by:
 1. Creating `kernel/src/drivers/<name>.rs` implementing `FileHandle`
 2. Adding one entry to the `DEVICES` static slice in `drivers/mod.rs`
@@ -374,7 +419,7 @@ Current devices: `/dev/null`, `/dev/zero`, `/dev/console` (serial), `/dev/fb` (f
 
 **PCI + AC97 audio** (`pci.rs`, `ac97.rs`): this kernel's only PCI-aware code — `pci.rs` does raw 0xCF8/0xCFC config-space access and a bus-0 device scan (nothing else in this kernel enumerates PCI; every other driver targets a fixed legacy ISA port). `ac97.rs` finds the Intel 82801AA AC'97 codec (`-device AC97` in QEMU), does the cold-reset + PCM-out-stream-reset + mixer-unmute sequence, and runs a **polling**, not interrupt-driven, bus-master DMA ring: the IDT is a `spin::Once`, populated once as literally the first line of `boot()` before `memory::init_core` — wiring up a PCI IRQ whose vector is only known after enumeration doesn't fit that without either an early pre-memory PCI scan or a bigger IDT refactor, so `write_pcm()` instead polls the hardware's CIV register directly and blocks (spinning, no lock held across the spin, so the timer ISR/scheduler still preempts normally) until a buffer-descriptor slot frees. The 32-entry hardware BDL aliases only 8 real physical ring buffers (`entry[i].addr = slot_phys[i % 8]`) so the hardware's native mod-32 index wraparound still works correctly without needing all 32 to be distinct allocations. Fixed format only (48000 Hz stereo s16le, AC97's native non-VRA operating point) — no `ioctl` negotiation, matching the same "one client, one format, document it" simplification `/dev/input/event0`+`event1` already use.
 
-VFS mounts (`kernel/src/fs/mod.rs`): `/dev` (devfs), `/` (initramfs, embedded ELFs — a real two-level tree: root contains a real `bin` subdirectory, `/bin/<name>` is a genuine directory lookup, not a second mount aliasing the same flat namespace, see `fs::initramfs`), `/tmp` (ramfs, writable — the filesystem itself is `vfs::ramfs::RamFs`, host-testable; `kernel/src/fs/ramfs.rs` only supplies the `DirLockObserver` that wires its lock diagnostic into `/proc/kdebug`, see below), `/mnt` (ext2, read-write, best-effort — see the ext2 section below), `/proc` (procfs, read-only, synthetic — `/proc/meminfo` generated fresh on every `open()` from the live Buddy allocator stats; `/proc/self` and `/proc/<pid>/exe` are real symlinks, and `/proc/dmesg` is the kernel log ring — see `fs::procfs` and the kernel-log section below). `ls /` also shows every other mount (`dev`, `tmp`, `mnt`, `proc`) as an entry — `fs::vfs::direct_children` (a thin delegate onto `vfs::mount::MountTable::direct_children`, see below) lets initramfs's root directory list them dynamically, same idea as a real Linux rootfs pre-creating empty `/proc`, `/dev`, etc. that mounts later overlay; actual traversal into them is still redirected by the mount table before ever reaching initramfs, so they only need to look like directories, not serve one.
+VFS mounts (`kernel/src/fs/mod.rs`): `/dev` (devfs), `/` (initramfs, embedded ELFs — a real two-level tree: root contains a real `bin` subdirectory, `/bin/<name>` is a genuine directory lookup, not a second mount aliasing the same flat namespace, see `fs::initramfs`), `/tmp` (ramfs, writable — the filesystem itself is `vfs::ramfs::RamFs`, host-testable; `kernel/src/fs/ramfs.rs` only supplies the `DirLockObserver` that wires its lock diagnostic into `/proc/kdebug`, see below), `/mnt` (ext2, read-write, best-effort — see the ext2 section below), `/proc` (procfs, read-only, synthetic — `/proc/meminfo` generated fresh on every `open()` from the live Buddy allocator stats; `/proc/self` and `/proc/<pid>/exe` are real symlinks, `/proc/dmesg` is the kernel log ring, and `/proc/fbinfo` is the framebuffer console's instrument panel — see `fs::procfs`, the kernel-log section below, and the framebuffer-performance note above). `ls /` also shows every other mount (`dev`, `tmp`, `mnt`, `proc`) as an entry — `fs::vfs::direct_children` (a thin delegate onto `vfs::mount::MountTable::direct_children`, see below) lets initramfs's root directory list them dynamically, same idea as a real Linux rootfs pre-creating empty `/proc`, `/dev`, etc. that mounts later overlay; actual traversal into them is still redirected by the mount table before ever reaching initramfs, so they only need to look like directories, not serve one.
 
 **Storage stack seam** (`hal::block::BlockDevice`, `hal/src/block.rs`; `kernel::block::AtaBlockDevice`, `kernel/src/block/mod.rs`): `fs::ext2` no longer calls `block::ata::{read_sectors,write_sectors,present}` directly — it goes through `Ext2Fs::core.device: Box<dyn BlockDevice>` instead (`Ext2Core`, from the standalone `ext2` crate — see below), the same seam shape as `hal::PortIo`/`hal::PhysMem` (see `docs/drivers/architecture.md`'s storage-stack section), sector-granular (512 bytes) rather than filesystem-block-granular. `AtaBlockDevice` (zero-sized, wraps `block::ata`'s existing free functions) is what `fs::ext2::init()` mounts against at real boot; `hal::block::MemDisk` (`Vec<u8>`-backed, host-tested in `hal`) is what both the `ext2` crate's own host tests and the QEMU integration tests (`kernel/src/hw_tests.rs::ext2_memdisk_roundtrip` and `ext2_reclaim_orphans_clears_injected_disk_img_shape`) mount instead, exercising ext2's full read-write path with zero risk to the real `disk.img`. Explicitly a *partial* migration: `block::ata.rs` itself is still not seamed onto `PortIo` the way the six drivers in `docs/drivers/architecture.md`'s "Current status" are — only the layer above it (`fs::ext2`) moved.
 

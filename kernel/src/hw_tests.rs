@@ -374,3 +374,112 @@ fn unix_socket_handle_roundtrip() {
         "both sockets must be released once every handle is dropped"
     );
 }
+
+/// Case 5: the framebuffer's drawing primitives, against a RAM-backed
+/// `Framebuffer` — the same technique `ext2_memdisk_roundtrip` uses with
+/// `MemDisk`, applied to the one other driver whose output is a byte
+/// buffer somebody can read back and assert on.
+///
+/// It exists because `fill_rect` and `draw_char`'s fast path replaced
+/// straightforward per-pixel loops with span-at-a-time writes composed out
+/// of a pattern buffer (see `Framebuffer::fill_rect`), and the failure
+/// mode of getting that arithmetic wrong is invisible in the place it
+/// matters: on the target machine the screen is the only output there is,
+/// a `stride > width` framebuffer smears every row by a few pixels, and
+/// finding that out costs a `dd` to a pendrive and a reboot. `stride` is
+/// deliberately larger than `width` here — the padding columns are exactly
+/// what a naive `row * width` would corrupt — and the buffer starts filled
+/// with `0xAA` so "untouched" is a thing the test can actually assert,
+/// rather than being indistinguishable from "written with zeros".
+#[test_case]
+fn framebuffer_primitives_touch_exactly_their_own_pixels() {
+    use alloc::boxed::Box;
+    use alloc::vec;
+    use crate::framebuffer::{Color, Framebuffer, GLYPH_H, GLYPH_W};
+
+    const W: usize = 32;
+    const H: usize = 16;
+    const STRIDE: usize = 40; // deliberately > W
+    const BPP: usize = 4;
+
+    let buf: &'static mut [u8] = Box::leak(vec![0xAAu8; H * STRIDE * BPP].into_boxed_slice());
+    let base = buf.as_ptr() as usize;
+    let mut fb = Framebuffer::new(buf, W, H, STRIDE, BPP);
+
+    // Read a pixel back out of the same memory the framebuffer writes to.
+    let px = |x: usize, y: usize| -> [u8; 4] {
+        let off = (y * STRIDE + x) * BPP;
+        // SAFETY: `base` is the leaked buffer, alive for the rest of the
+        // boot, and `off + 4` is inside `H * STRIDE * BPP` for every
+        // coordinate used below.
+        let p = (base + off) as *const u8;
+        unsafe { [*p, *p.add(1), *p.add(2), *p.add(3)] }
+    };
+
+    // ── A coloured rectangle: the pattern path ───────────────────────
+    let c = Color::rgb(0x11, 0x22, 0x33);
+    fb.fill_rect(2, 3, 5, 4, c);
+    assert_eq!(px(2, 3), [0x33, 0x22, 0x11, 0x00], "pixels are written B,G,R");
+    assert_eq!(px(6, 6), [0x33, 0x22, 0x11, 0x00], "bottom-right corner is inclusive of w-1/h-1");
+    assert_eq!(px(7, 6), [0xAA; 4], "one column past the rectangle must be untouched");
+    assert_eq!(px(2, 7), [0xAA; 4], "one row past the rectangle must be untouched");
+    assert_eq!(px(1, 3), [0xAA; 4], "one column before the rectangle must be untouched");
+
+    // The padding columns between `width` and `stride` are what a
+    // `row * width` slip would silently eat.
+    for y in 0..H {
+        for x in W..STRIDE {
+            assert_eq!(px(x, y), [0xAA; 4], "stride padding at ({x},{y}) must never be written");
+        }
+    }
+
+    // ── Black: the memset path, which also clears the 4th byte ───────
+    fb.fill_rect(2, 3, 5, 4, Color::rgb(0, 0, 0));
+    assert_eq!(px(3, 4), [0, 0, 0, 0], "a black fill zeroes the whole pixel");
+    assert_eq!(px(7, 4), [0xAA; 4], "the black path respects the same bounds");
+
+    // ── Clamping: a rectangle running off every edge ─────────────────
+    // `ESC[J` on the bottom row passes exactly this shape. It must clip,
+    // not panic and not write past the last scanline.
+    fb.fill_rect(W - 2, H - 2, 999, 999, Color::rgb(0, 0, 0));
+    assert_eq!(px(W - 1, H - 1), [0, 0, 0, 0]);
+    assert_eq!(px(W, H - 1), [0xAA; 4], "clipping stops at `width`, not `stride`");
+    fb.fill_rect(W + 10, H + 10, 4, 4, c); // entirely off-screen: a no-op
+
+    // ── A glyph: fast path (cell fully on screen) ────────────────────
+    let fg = Color::rgb(0xFF, 0xFF, 0xFF);
+    let bg = Color::rgb(0x01, 0x02, 0x03);
+    fb.draw_char(8, 8, b'A', fg, bg, 1);
+
+    let glyph = font8x8::legacy::BASIC_LEGACY[b'A' as usize];
+    let mut lit = 0usize;
+    for row in 0..GLYPH_H {
+        for col in 0..GLYPH_W {
+            let set = (glyph[row] >> col) & 1 != 0;
+            let got = px(8 + col, 8 + row);
+            if set {
+                lit += 1;
+                assert_eq!(got, [0xFF, 0xFF, 0xFF, 0x00], "lit pixel at ({col},{row}) of 'A'");
+            } else {
+                assert_eq!(got, [0x03, 0x02, 0x01, 0x00], "background pixel at ({col},{row}) of 'A'");
+            }
+        }
+    }
+    assert!(lit > 0, "the glyph for 'A' must have some lit pixels — wrong font indexing otherwise");
+    assert_eq!(px(8 + GLYPH_W, 8), [0xAA; 4], "a glyph must not bleed into the next cell");
+
+    // ── A glyph half off the right edge: slow, clipped path ──────────
+    fb.draw_char(W - 3, 0, b'B', fg, bg, 1);
+    assert_ne!(px(W - 3, 0), [0xAA; 4], "the on-screen part of a clipped glyph is drawn");
+    for y in 0..GLYPH_H {
+        assert_eq!(px(W, y), [0xAA; 4], "a clipped glyph must not spill into stride padding");
+    }
+
+    // ── scroll_up ────────────────────────────────────────────────────
+    fb.fill_rect(0, 0, W, H, Color::rgb(0, 0, 0));
+    fb.fill_rect(0, 4, W, 1, c); // one marker scanline
+    fb.scroll_up(4);
+    assert_eq!(px(0, 0), [0x33, 0x22, 0x11, 0x00], "the marker row moved up by exactly 4 scanlines");
+    assert_eq!(px(0, 1), [0, 0, 0, 0]);
+    assert_eq!(px(0, H - 1), [0, 0, 0, 0], "the vacated rows are cleared, not left stale");
+}

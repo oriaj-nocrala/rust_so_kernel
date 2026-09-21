@@ -79,7 +79,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 // `RewindEvent` and `tf_record()` below reproduces that exact line. The two
 // allocation-free `print_panic_line` methods are gone the same way —
 // `print_panic_snapshot` formats and prints from plain accessors instead.
-pub use diag::{DirLockDiag, IfViolationDiag, LockDiag, RewindEvent, TfRewindDiag};
+pub use diag::{DirLockDiag, IfViolationDiag, LockDiag, OpStat, RewindEvent, TfRewindDiag};
 
 /// Diagnostics for the scheduler's per-CPU lock — see `scheduler::
 /// local_scheduler()`, which is the only thing that acquires it.
@@ -240,6 +240,66 @@ pub fn inc_usb_key_reports() { USB_KEY_REPORTS.fetch_add(1, Ordering::Relaxed); 
 pub fn add_orphans_reclaimed(blocks: u64, inodes: u64) {
     ORPHAN_BLOCKS_RECLAIMED.fetch_add(blocks, Ordering::Relaxed);
     ORPHAN_INODES_RECLAIMED.fetch_add(inodes, Ordering::Relaxed);
+}
+
+// ── Framebuffer console cost counters ────────────────────────────────────────
+//
+// Always on, same argument as `switches_total`: three relaxed `fetch_add`s
+// and one `rdtsc` per operation is nothing beside the work being measured
+// (a single `draw_char` writes 64 pixels; on the machine these exist for,
+// that is 64 separate bus transactions).
+//
+// They exist because the console is imperceptibly fast in QEMU, where the
+// framebuffer is host RAM, and takes about a second to clear the screen on
+// the physical AM4 machine, where it lives across PCIe — and that machine
+// has no serial capture, so the only way "it feels slow" becomes a number
+// is for the kernel to count its own cost and render it somewhere
+// `cat`-able. See `/proc/fbinfo`, and `diag::OpStat` for the shape of each
+// line.
+//
+// Rendered into `/proc/fbinfo` rather than `/proc/kdebug` so that one file
+// carries the whole picture — geometry, memory type and cost together,
+// since on that machine the report is read by photographing the screen and
+// a second file means a second photograph.
+
+/// `Framebuffer::fill_rect` — scanline rectangle fills. `ESC[J`'s
+/// clear-to-end-of-screen, `clear()`, and every glyph cell's background
+/// all land here.
+pub static FB_FILL_RECT: OpStat = OpStat::new();
+/// `Framebuffer::draw_char` — one glyph, composed a pixel row at a time.
+pub static FB_DRAW_CHAR: OpStat = OpStat::new();
+/// `Framebuffer::scroll_up` — reads the whole framebuffer back. The one
+/// operation here that is dominated by VRAM *reads*, which are
+/// non-posted: the CPU stalls until the data returns, unlike a write.
+pub static FB_SCROLL: OpStat = OpStat::new();
+/// `Framebuffer::xor_rect` — the blinking cursor, read-modify-write over
+/// one cell, from the PIT ISR at 100 Hz plus once per console write.
+pub static FB_CURSOR: OpStat = OpStat::new();
+/// `Framebuffer::blit_scaled` — `FBIO_BLIT`, i.e. DOOM/Quake frames.
+pub static FB_BLIT: OpStat = OpStat::new();
+/// `framebuffer_console::render_bytes` — the whole text path for one
+/// write, everything above included. `bytes` is the input byte count, not
+/// framebuffer bytes, so its rate is not a memory bandwidth.
+pub static FB_RENDER: OpStat = OpStat::new();
+/// `framebuffer_console::mirror_to_serial` — one port write per byte of
+/// user output, on the hot path, to a UART nothing is listening to on the
+/// target machine.
+pub static FB_SERIAL_MIRROR: OpStat = OpStat::new();
+
+/// Render every framebuffer cost counter, for `/proc/fbinfo`.
+pub fn render_fb_report() -> alloc::string::String {
+    use alloc::string::String;
+
+    let hz = crate::cpu::tsc::freq_hz();
+    let mut out = String::new();
+    out.push_str(&FB_FILL_RECT.render("fb_fill_rect", hz));
+    out.push_str(&FB_DRAW_CHAR.render("fb_draw_char", hz));
+    out.push_str(&FB_SCROLL.render("fb_scroll_up", hz));
+    out.push_str(&FB_CURSOR.render("fb_cursor_xor", hz));
+    out.push_str(&FB_BLIT.render("fb_blit_scaled", hz));
+    out.push_str(&FB_RENDER.render("fb_render_bytes", hz));
+    out.push_str(&FB_SERIAL_MIRROR.render("fb_serial_mirror", hz));
+    out
 }
 
 /// Render the current state for `/proc/kdebug`: enabled subsystems (by

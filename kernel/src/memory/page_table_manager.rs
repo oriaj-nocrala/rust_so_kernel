@@ -243,6 +243,42 @@ impl OwnedPageTable {
         mapper.translate_page(page).ok()
     }
 
+    /// Look up both the physical frame and the *flags* of an
+    /// already-mapped page — `translate_page`'s sibling, for callers that
+    /// need the caching bits (PAT/PCD/PWT) and not just the address.
+    ///
+    /// Added for `memory::memtype`, which reports what memory type the
+    /// framebuffer mapping actually has: the bootloader's own choice of
+    /// those bits is one of the two inputs, and reading them out of the
+    /// live table beats assuming what the bootloader did.
+    pub unsafe fn translate_with_flags(
+        &self,
+        page: Page<Size4KiB>,
+    ) -> Option<(PhysFrame, PageTableFlags)> {
+        use x86_64::structures::paging::mapper::{MappedFrame, TranslateResult};
+        use x86_64::structures::paging::Translate;
+
+        let mapper = self.create_mapper();
+        match mapper.translate(page.start_address()) {
+            TranslateResult::Mapped { frame: MappedFrame::Size4KiB(f), flags, .. } => {
+                Some((f, flags))
+            }
+            // A huge-page mapping still has a first frame and real flags;
+            // the framebuffer is mapped 4 KiB-granular by `bootloader`,
+            // but reporting "unmapped" for a 2 MiB mapping would be a
+            // lie the caller cannot distinguish from a real hole.
+            TranslateResult::Mapped { frame: MappedFrame::Size2MiB(f), flags, .. } => Some((
+                PhysFrame::containing_address(f.start_address() + (page.start_address().as_u64() & 0x1F_FFFF)),
+                flags,
+            )),
+            TranslateResult::Mapped { frame: MappedFrame::Size1GiB(f), flags, .. } => Some((
+                PhysFrame::containing_address(f.start_address() + (page.start_address().as_u64() & 0x3FFF_FFFF)),
+                flags,
+            )),
+            _ => None,
+        }
+    }
+
     /// Map one user page.  Allocates data + intermediate frames from Buddy.
     /// Sets the frame's COW refcount to 1 (single owner).
     pub unsafe fn map_user_page(

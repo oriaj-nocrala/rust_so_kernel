@@ -127,6 +127,133 @@ fn render_proc_stat(pid: usize, snap: &crate::process::scheduler::ProcStatSnapsh
     )
 }
 
+/// Renders `/proc/fbinfo` — the framebuffer console's instrument panel:
+/// real geometry, the memory type its mapping actually has, and the cost
+/// of every drawing primitive since boot.
+///
+/// WHY THIS FILE EXISTS. The console is imperceptibly fast in QEMU, where
+/// the framebuffer is host RAM, and was measured at roughly a second to
+/// clear the screen on the physical AM4 machine, where it lives across
+/// PCIe. Nothing about that gap was observable from inside the kernel:
+/// the resolution was assumed (a comment in `framebuffer.rs` said "1280 x
+/// 800 en qemu"), the memory type was assumed, and "slow" was a feeling.
+/// On a machine with no serial capture, the only way any of it becomes a
+/// number is a file somebody can `cat` and photograph.
+///
+/// The memory type is reported as its two raw inputs — what the MTRRs say
+/// about the physical range, and which PAT entry the page's own bits
+/// select — rather than as a single combined verdict, because the
+/// MTRR x PAT combination table is exactly the thing that is easy to get
+/// wrong from memory. The ground truth is the measured `MB/s` below it,
+/// which needs no table at all.
+fn render_fbinfo() -> String {
+    use crate::framebuffer::FRAMEBUFFER;
+
+    let mut out = String::new();
+
+    let geometry = {
+        let guard = FRAMEBUFFER.lock();
+        guard.as_ref().map(|fb| {
+            let (w, h) = fb.dimensions();
+            (w, h, fb.stride(), fb.bytes_per_pixel(), fb.virt_addr(), fb.byte_len())
+        })
+    };
+
+    let Some((w, h, stride, bpp, virt, len)) = geometry else {
+        out.push_str("framebuffer: none (headless boot)\n");
+        out.push_str(&crate::debug::render_fb_report());
+        return out;
+    };
+
+    let (cols, rows) = crate::drivers::framebuffer_console::text_dimensions();
+    out.push_str(&format!(
+        "width: {}\nheight: {}\nstride: {} px\nbytes_per_pixel: {}\n\
+         size: {} bytes ({} KiB)\ntext_grid: {}x{} cells ({}x{} px each)\n\
+         virt: {:#x}\n",
+        w, h, stride, bpp, len, len / 1024, cols, rows,
+        crate::framebuffer::GLYPH_W, crate::framebuffer::GLYPH_H + 1, virt,
+    ));
+
+    let r = crate::memory::memtype::report_for(x86_64::VirtAddr::new(virt));
+    match r.phys {
+        Some(p) => out.push_str(&format!("phys: {:#x}\n", p)),
+        None => out.push_str("phys: <not mapped?>\n"),
+    }
+    out.push_str(&format!(
+        "pte_cache_bits: PAT={} PCD={} PWT={} -> pat_index={}\n",
+        r.pat_bit as u8, r.pcd as u8, r.pwt as u8, r.pat_index,
+    ));
+    out.push_str(&format!(
+        "pat_msr: {:#018x} (entry {} = {}, WC entry present: {})\n",
+        r.pat_msr,
+        r.pat_index,
+        r.pat_type.map(|t| t.name()).unwrap_or("?"),
+        r.pat_has_wc,
+    ));
+    out.push_str(&format!(
+        "mtrrcap: {:#x} (variable={} wc_supported={}) def_type: {:#x}\n",
+        r.mtrrcap, r.range_count, r.mtrr_wc_supported, r.def_type,
+    ));
+    out.push_str(&match r.mtrr {
+        None => String::from("mtrr_type: <no physical address>\n"),
+        Some(hal::memtype::MtrrResolution::Disabled) => {
+            String::from("mtrr_type: UC (MTRRs disabled)\n")
+        }
+        Some(hal::memtype::MtrrResolution::Default(t)) => {
+            format!("mtrr_type: {} (no range covers it; default type)\n", t.name())
+        }
+        Some(hal::memtype::MtrrResolution::Matched(t)) => {
+            format!("mtrr_type: {}\n", t.name())
+        }
+        Some(hal::memtype::MtrrResolution::Overlapping { resolved, conflicting }) => format!(
+            "mtrr_type: {} (overlapping ranges{})\n",
+            resolved.name(),
+            if conflicting { ", UNDEFINED combination" } else { "" },
+        ),
+    });
+    out.push_str(&format!("max_phys_addr_bits: {}\n", r.max_phys_addr_bits));
+    for (i, e) in r.ranges.iter().enumerate().take(r.range_count) {
+        if let Some((base, mask, t)) = e {
+            out.push_str(&format!(
+                "  mtrr[{}]: base={:#x} mask={:#x} type={}\n",
+                i, base, mask, t.name(),
+            ));
+        }
+    }
+
+    out.push('\n');
+    out.push_str(&format!("tsc_hz: {}\n", crate::cpu::tsc::freq_hz()));
+    out.push_str(&format!(
+        "instrument_overhead: {} cycles (min of 64 back-to-back TSC reads)\n",
+        tsc_pair_cost(),
+    ));
+    out.push_str(&crate::debug::render_fb_report());
+    out
+}
+
+/// The noise floor of every `cycles` figure below it: what a measurement
+/// costs when the thing being measured does nothing at all.
+///
+/// Measured here, live, rather than assumed, because it is not a constant
+/// — `cpu::tsc::read` fences before `rdtsc`, and under QEMU's TCG that is
+/// a translation-block break rather than a couple of cycles. Without this
+/// line a reader has no way to tell an operation that is genuinely cheap
+/// from one whose cost is the instrument, which is the exact trap this
+/// kernel has a rule about (`measure-the-instrument-first`): a counter
+/// nobody can calibrate is worse than no counter.
+///
+/// `min` of 64, not the mean: the cheapest pair is the one that was not
+/// interrupted.
+fn tsc_pair_cost() -> u64 {
+    let mut best = u64::MAX;
+    for _ in 0..64 {
+        let a = crate::cpu::tsc::read();
+        let b = crate::cpu::tsc::read();
+        best = best.min(b.wrapping_sub(a));
+    }
+    best
+}
+
 // ── Directory inode ──────────────────────────────────────────────────────────
 
 struct ProcDirInode;
@@ -147,6 +274,7 @@ impl Inode for ProcDirInode {
             "meminfo" => Ok(Arc::new(MeminfoInode)),
             "kdebug" => Ok(Arc::new(KdebugInode)),
             "acpi" => Ok(Arc::new(AcpiInode)),
+            "fbinfo" => Ok(Arc::new(FbInfoInode)),
             "dmesg" => Ok(Arc::new(DmesgInode)),
             "self" => Ok(Arc::new(SelfInode)),
             _ => {
@@ -169,13 +297,14 @@ impl Inode for ProcDirInode {
             4 => Ok(Some(DirEntry::new(203, FileType::Regular, b"kdebug"))),
             5 => Ok(Some(DirEntry::new(204, FileType::Regular, b"acpi"))),
             6 => Ok(Some(DirEntry::new(205, FileType::Regular, b"dmesg"))),
+            7 => Ok(Some(DirEntry::new(206, FileType::Regular, b"fbinfo"))),
             n => {
                 // Live pids, appended after the always-present entries above
                 // — this is what makes `ls /proc` / BusyBox `ps`'s
                 // `opendir("/proc")` scan see every process (previously
                 // direct lookup like `cat /proc/3/exe` worked but nothing
                 // enumerated them, see this module's top doc comment).
-                let idx = (n - 7) as usize;
+                let idx = (n - 8) as usize;
                 let pids = crate::process::scheduler::all_pids();
                 let Some(&pid) = pids.get(idx) else { return Ok(None); };
                 let name = format!("{}", pid);
@@ -274,6 +403,29 @@ impl Inode for AcpiInode {
             return Err(Errno::EROFS);
         }
         Ok(Box::new(ProcFile { data: render_acpi().into_bytes(), offset: 0 }))
+    }
+}
+
+// ── fbinfo file inode ────────────────────────────────────────────────────────
+//
+// Framebuffer geometry, memory type and per-operation cost counters —
+// regenerated fresh on every open(), same convention as
+// `/proc/meminfo`/`/proc/kdebug`. See `render_fbinfo` for why it is its
+// own file rather than more lines in `/proc/kdebug`.
+struct FbInfoInode;
+
+impl Inode for FbInfoInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
+    fn stat(&self) -> Stat {
+        Stat::regular(206, render_fbinfo().len() as i64)
+    }
+
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+        if flags.is_write() {
+            return Err(Errno::EROFS);
+        }
+        Ok(Box::new(ProcFile { data: render_fbinfo().into_bytes(), offset: 0 }))
     }
 }
 
