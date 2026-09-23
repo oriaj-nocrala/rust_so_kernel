@@ -58,6 +58,12 @@ impl fmt::Write for Serial {
     }
 }
 
+/// Whether the locked writer is held right now — for the panic handler,
+/// which must not call anything that could log through it if so.
+pub fn is_locked() -> bool {
+    SERIAL.is_locked()
+}
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;

@@ -369,6 +369,11 @@ fn load_raw_process(
 
 fn idle_task() -> ! {
     loop {
+        // Copies the kernel log to the USB stick every few seconds, when
+        // nothing else wants the CPU — see `block::logpart` for why here
+        // and not in the timer ISR. Two atomic loads when there is nothing
+        // to do.
+        crate::block::logpart::periodic();
         unsafe { core::arch::asm!("hlt"); }
     }
 }

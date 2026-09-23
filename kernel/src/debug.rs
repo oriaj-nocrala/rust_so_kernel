@@ -230,6 +230,14 @@ static SWITCHES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// read there.
 static USB_KEY_REPORTS: AtomicU64 = AtomicU64::new(0);
 
+/// USB keyboard scancodes decoded off the event ring but dropped because
+/// the driver's pending buffer was full (`usb::xhci::PENDING_KEYS`). Should
+/// stay zero: the ring is drained by whoever holds the controller lock —
+/// the timer's `usb::poll`, or a USB disk transfer spinning for its own
+/// completion — and only `poll` hands keys on. Nonzero means the lock was
+/// held for a long stretch of typing, e.g. during a slow disk read.
+static USB_KEYS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
 pub fn inc_forks()         { FORKS_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_execs()         { EXECS_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_reaps()         { REAPS_TOTAL.fetch_add(1, Ordering::Relaxed); }
@@ -237,6 +245,7 @@ pub fn inc_cow_resolved()  { COW_FAULTS_RESOLVED.fetch_add(1, Ordering::Relaxed)
 pub fn inc_cow_failed()    { COW_FAULTS_FAILED.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_switches()      { SWITCHES_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_usb_key_reports() { USB_KEY_REPORTS.fetch_add(1, Ordering::Relaxed); }
+pub fn add_usb_keys_dropped(n: u64) { USB_KEYS_DROPPED.fetch_add(n, Ordering::Relaxed); }
 pub fn add_orphans_reclaimed(blocks: u64, inodes: u64) {
     ORPHAN_BLOCKS_RECLAIMED.fetch_add(blocks, Ordering::Relaxed);
     ORPHAN_INODES_RECLAIMED.fetch_add(inodes, Ordering::Relaxed);
@@ -333,6 +342,7 @@ pub fn render_report() -> alloc::string::String {
          cow_tracked_frames: {} ({} MiB of RAM)\n\
          usb_keyboards: {}\n\
          usb_key_reports: {}\n\
+         usb_keys_dropped: {}\n\
          {}{}{}{}",
         mask, enabled,
         FORKS_TOTAL.load(Ordering::Relaxed),
@@ -347,6 +357,7 @@ pub fn render_report() -> alloc::string::String {
         (crate::memory::cow::tracked_frames() * 4096) / (1024 * 1024),
         crate::usb::keyboard_count(),
         USB_KEY_REPORTS.load(Ordering::Relaxed),
+        USB_KEYS_DROPPED.load(Ordering::Relaxed),
         SCHEDULER_LOCK.render("scheduler"),
         RAMFS_ENTRIES_LOCK.render("ramfs_entries_lock"),
         TF_REWIND.render(),

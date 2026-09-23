@@ -96,7 +96,7 @@ so addresses actually resolve to real function names instead of bare hex.
 ### QEMU integration tests
 
 Real hardware-path behavior (drivers that need actual QEMU devices, not just host-testable
-pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 64 tests, <1s, no QEMU) is
+pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 198 tests, <1s, no QEMU) is
 asserted by a `#![feature(custom_test_frameworks)]` harness that boots the real kernel in
 QEMU and reports PASS/FAIL as a process exit code:
 
@@ -255,7 +255,8 @@ Implemented syscalls (Linux-compatible numbers — see `SyscallNumber` enum for 
 | 218 | `set_tid_address` | Stub for TLS/thread bookkeeping |
 | 228 | `clock_gettime` | `CLOCK_REALTIME` is a real wall-clock reading (CMOS RTC read once at boot, see Time Subsystem below, plus uptime since); `CLOCK_MONOTONIC`/`CLOCK_BOOTTIME` are uptime, unaffected by wall-clock |
 | 400/401/402 | `uptime_ms`/`uptime_sec`/`meminfo_kb` | Custom, above the Linux syscall range — debug/introspection only |
-| 403 | `kdebug_ctl` | Get/set `kernel::debug`'s runtime tracing mask (get: `cmd=0`; set: `cmd=1`, subsystem name + on/off) — backs the `kdebug` userspace program |
+| 162 | `sync` | No write-back cache exists to flush (ext2 writes are synchronous), so this copies the kernel log ring to the USB stick's `constanos-log` partition — see the kernel-log-on-the-stick section. Reports failure, unlike Linux: `ENODEV` (no log partition), `EBUSY`, `EIO`. `kdebug sync` calls it |
+| 403 | `kdebug_ctl` | Get/set `kernel::debug`'s runtime tracing mask (get: `cmd=0`; set: `cmd=1`, subsystem name + on/off) — backs the `kdebug` userspace program. `cmd=2` panics the kernel on purpose (`kdebug panic`, Linux's sysrq-c) to exercise the panic path on demand |
 | 404 | `statvfs` | Custom (real `statvfs(2)` has no fixed Linux syscall number of its own — glibc/mlibc implement it over `statfs`, which this port doesn't wire). One physical-memory pool backs every mount, so every path reports the same Buddy-allocator-derived total/free block counts — enough for `df` to run and show live numbers, not a real per-mount breakdown |
 
 Helpers `with_current_process` and `with_scheduler` guarantee `cli` before lock and `sti` after lock is dropped to prevent deadlocks with the timer ISR. `sys_close`/`sys_dup2` deliberately avoid `with_current_process` (see their doc comments) — closing a handle can run a `Drop` impl that needs a fresh `SCHEDULER` lock, which would self-deadlock if the outer helper were still holding it.
@@ -388,7 +389,7 @@ magnitude on the target machine still has to come from the target machine.
 `cat /proc/fbinfo` is how it does: real geometry (`stride` is not `width`),
 physical address, the PTE's own PAT/PCD/PWT bits, `IA32_PAT`, and whichever
 MTRR covers the aperture — decoded by `hal::memtype` (pure, host-tested), read
-by `kernel/src/memory/memtype.rs` (`rdmsr` + `OwnedPageTable::translate_with_flags`).
+by `kernel/src/memory/memtype.rs` (`rdmsr` + `memtype::leaf_for`, a raw page-table walk: `x86_64::PageTableFlags` drops bit 12, a large page's PAT bit).
 It deliberately reports the MTRR and PAT types **separately** rather than
 combining them into one verdict: the SDM's MTRR x PAT table is the one thing
 here that is easy to get wrong from memory, and the ground truth is the
@@ -452,7 +453,7 @@ arbitration, exactly where two PS/2 keyboards would merge.
 **Split across the usual seam.** `hal::xhci` (register/TRB/ring/context
 arithmetic), `hal::usb` (descriptor parsing + setup packets) and
 `hal::hid` (boot-report diffing + the Set-1 table) are pure and host-tested
-— 56 of `hal`'s 120 tests. `kernel/src/usb/xhci.rs` owns the MMIO window,
+— most of `hal`'s 198 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
 DMA pages, doorbells and waiting. That line is drawn hard here because an
 xHCI bring-up failure is nearly unobservable (a wrong bit in a device
 context yields no fault, no log, just a Transfer Event that never arrives)
@@ -558,6 +559,111 @@ nothing: zero reports means the controller is not delivering transfers at
 all, nonzero means they arrive and the fault is in the decode or below.
 That distinction is otherwise unobservable on the serial-less target.
 
+## USB Mass Storage: `/mnt` from the boot pendrive (`hal/src/{msc,gpt}.rs`, `kernel/src/usb/xhci/msc.rs`, `kernel/src/block/usb.rs`)
+
+The target machine has no IDE, so `block::ata` finds nothing there and
+`/mnt` (doom, quake, the C tests on `$PATH`) used to be absent on metal.
+The pendrive it boots from carries an ext2 partition named
+`constanos-data`; this reads it. Plan and history:
+`docs/storage/usb-msc-plan.md`.
+
+**Layers.** `hal::msc` (CBW/CSW, SCSI CDBs, INQUIRY/READ CAPACITY/sense
+decoding — CBW fields little-endian, CDB fields big-endian, each tested),
+`hal::usb::find_mass_storage` (class 08/06/50 at alt 0, SuperSpeed
+companion `bMaxBurst` attached to the right endpoint), `hal::gpt` (both
+CRCs checked, bad primary falls back to the backup, backup must claim the
+LBA it was read from; lookup by partition name, else the *only*
+Linux-filesystem partition) and `hal::block::Partition` (offset + refuses,
+never clamps, a request outside its window) are pure and host-tested,
+including against `sfdisk` output and the real stick's own GPT regions
+(`hal/fixtures/`). `kernel/src/usb/xhci/msc.rs` is the hardware half —
+a child module of `xhci` so it can use the private rings and
+`service_events`.
+
+**One reader of the event ring** (`Xhci::service_events`). Before this, the
+keyboard poll and every waiter each read the ring and treated what they
+found as theirs or noise: a keyboard report arriving during another
+device's enumeration was dropped *with its only outstanding transfer*, so
+the keyboard went silent for good, and a disk completion would have been
+eaten by the timer's poll. Now routing lives in one place — keyboard events
+are decoded into a pending buffer and re-armed whoever is draining; the
+caller gets its own event; the rest is logged. `usb_keys_dropped` in
+`/proc/kdebug` should stay 0.
+
+**Every transfer runs with interrupts off and `CONTROLLERS` held**
+(`usb::storage_read`/`storage_write`, one ≤64 KiB transfer at a time,
+released between them). The lock makes the transfer the ring's sole
+reader; IF=0 makes the holder unpreemptible, so no other reader can ever
+spin on a preempted holder. Cost: ~1 ms of interrupt latency per 64 KiB.
+
+**Mounted read-only** (`fs::ext2::init_read_only`): no repair passes, every
+mutation goes through `write_lock()` which returns `EROFS`, and a write
+`open()` fails with `EROFS` like Linux. `Partition` refuses writes too, as
+a second guard. Writing is step 6 of the plan — the stick is also the boot
+key and there is no journal.
+
+**Bring-up recovery** follows BOT, not hope: STALL in data/status → clear
+halt on both sides (Reset Endpoint or Stop Endpoint chosen from the
+endpoint's real state in the output context, then Set TR Dequeue, then
+CLEAR_FEATURE); bad CSW or Phase Error → Reset Recovery; UNIT ATTENTION /
+becoming-ready → retried. QEMU never exercises any of it.
+
+**Testing in QEMU:** `QEMU_USB_STORAGE=<img>` attaches a `usb-storage`
+stick. Combine with `QEMU_DEBUG_NO_DISK=1` so ATA can't mount first
+(`fs::ext2::init` tries USB first, ATA second). Verified: SuperSpeed and
+USB 2 ports (`-device qemu-xhci,p2=4,p3=0`), `-m 8G` (DMA above 4 GiB),
+md5 of the WAD/pak identical to the host, `doom` running from a copy of
+the real stick's GPT + data partition. Deploying: copy only the UEFI
+image's FAT partition (sector 34, 34816 sectors) to
+`/dev/disk/by-partlabel/boot` — never `dd` the whole image to the device,
+which replaces the GPT and drops `constanos-data` — then
+`scripts/sync-usb-data.sh`.
+
+## Kernel Log on the USB Stick (`kernel/src/block/logpart.rs`, `hal/src/logpart.rs`, `scripts/usb-log.sh`)
+
+The target machine has no serial capture, and until this every result
+there had to be photographed off the screen. Now the kernel copies the
+`klog` ring onto a third, **raw** GPT partition of the boot pendrive,
+`constanos-log` (no filesystem: a torn write spoils at most the log, never
+`constanos-data` or `boot`), and `scripts/usb-log.sh read`, run on the
+machine's own Linux after a reboot, prints it. `list` shows every boot kept.
+
+- **When:** every 5 s from the **idle task** if the ring grew (idle, not
+  the timer ISR: a failing transfer logs through `serial_println!`, whose
+  `SERIAL` lock the interrupted code may hold — cost: a process spinning at
+  100% CPU starves the periodic flush); on `sync(2)` (`kdebug sync`); and
+  from the **panic handler** after the panic screen is drawn, `try_lock`
+  everywhere and skipped if `SERIAL` is held. Three consecutive periodic
+  failures disable periodic flushing (a dead stick would otherwise cost a
+  5 s IF=0 timeout every period).
+- **Format** (`hal::logpart`, host-tested): sector 0 is a marker only the
+  host writes; then up to 16 slots of 128 KiB, **one per boot**, reused
+  oldest-first, so a second boot doesn't overwrite the one you wanted. The
+  ring is stored raw with `write_pos` in the slot header, which makes
+  flushes incremental (only the sectors the ring touched). A boot claims its
+  slot with an empty header before any data lands.
+- **Guards against writing the wrong sectors:** exact name lookup (no
+  fallback, unlike the data partition), the host's marker must be in sector
+  0, and every write goes through `hal::block::Partition`, which refuses
+  out-of-window requests. The partition's type is Linux *reserved*, so it
+  never makes the data partition's "only Linux filesystem" fallback
+  ambiguous.
+- **User output is in the log** because `FramebufferConsole`'s serial
+  mirror now also pushes to `klog` (it used to go straight to port 0x3F8,
+  so `[fb]` lines were on COM1 but in neither `/proc/dmesg` nor the stick).
+- **Setup (once, on the host):** `scripts/usb-log.sh mkpart /dev/sdX`
+  (backs up the GPT with `sfdisk --dump`, then `sfdisk --append` of 64 MiB —
+  existing partitions untouched; asks for `yes`), then
+  `scripts/usb-log.sh init`. **QEMU:** `scripts/usb-log.sh mkimage
+  <out.img>` builds a stick with the real shape (disk.img as the data
+  partition), then `QEMU_USB_STORAGE=<out.img> QEMU_DEBUG_NO_DISK=1` and
+  `scripts/usb-log.sh read --image <out.img>`. Verified in QEMU: periodic,
+  sync and panic flushes; the on-disk log byte-identical to serial.log;
+  boot #N landing in slot N-1; an unformatted partition left untouched; and
+  every sector outside the log partition (both GPTs, `boot`, data) hashing
+  the same before and after a boot. Works on metal too: four Ryzen boots
+  so far, with periodic, sync and panic flushes all read back.
+
 ## Kernel Log Ring + the No-Input Escape Hatch (`kernel/src/klog.rs`, `/proc/dmesg`)
 
 `klog` keeps every byte `serial_println!`/`serial_println_raw!` emits in a
@@ -625,7 +731,7 @@ Monotonic time (`time::clocksource`, TSC-backed when available, jiffies fallback
 
 **Permission bits** (`fs::types::Stat`): no real per-inode permission model — `regular()` (initramfs/ext2/procfs) hardcodes `0o444`, `regular_writable()` (ramfs only) hardcodes `0o644`. Added because BusyBox `vi`'s readonly check is `access(fn, W_OK) < 0 || !(st_mode & (S_IWUSR|...))` — fixing `access()` alone wasn't enough; every regular file reported zero write bits regardless of which filesystem it actually lived on, so `vi` opened `/tmp/*` files `[Readonly]` too.
 
-The `FileDescriptorTable` per process holds up to 16 open files. FD 0 (stdin) is pre-opened to `/dev/console` (serial — real reads still come from the shared keyboard/UART ring buffer regardless of the handle here); FDs 1/2 (stdout/stderr) are both pre-opened to `/dev/fb` so user-process output and errors are visible on the actual screen, not just in `serial.log` — `FramebufferConsole::write` mirrors every byte it renders out over COM1 too (`[fb] ` prefix), so headless/serial-log debugging still sees everything.
+The `FileDescriptorTable` per process holds up to 16 open files. FD 0 (stdin) is pre-opened to `/dev/console` (serial — real reads still come from the shared keyboard/UART ring buffer regardless of the handle here); FDs 1/2 (stdout/stderr) are both pre-opened to `/dev/fb` so user-process output and errors are visible on the actual screen, not just in `serial.log` — `FramebufferConsole::write` mirrors every byte it renders out over COM1 too (`[fb] ` prefix), so headless/serial-log debugging still sees everything — and into `klog`, so `/proc/dmesg` and the USB log partition carry it as well.
 
 ## Userspace Programs (`kernel/src/process/user_programs.rs`)
 

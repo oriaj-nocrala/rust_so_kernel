@@ -21,6 +21,9 @@ pub const DESC_DEVICE: u8 = 0x01;
 pub const DESC_CONFIGURATION: u8 = 0x02;
 pub const DESC_INTERFACE: u8 = 0x04;
 pub const DESC_ENDPOINT: u8 = 0x05;
+/// SuperSpeed Endpoint Companion (USB 3.2 §9.6.7) — follows each endpoint
+/// descriptor of a USB 3 device and carries `bMaxBurst`.
+pub const DESC_SS_ENDPOINT_COMPANION: u8 = 0x30;
 
 /// USB class/subclass/protocol triple identifying a boot-protocol keyboard
 /// (USB HID 1.11 §4.3 + Appendix B: "Boot Interface Subclass").
@@ -29,6 +32,7 @@ pub const SUBCLASS_BOOT: u8 = 0x01;
 pub const PROTOCOL_KEYBOARD: u8 = 0x01;
 
 /// Endpoint transfer types (`bmAttributes & 0x03`).
+pub const XFER_BULK: u8 = 0x02;
 pub const XFER_INTERRUPT: u8 = 0x03;
 
 // ── Device descriptor ────────────────────────────────────────────────────────
@@ -193,6 +197,138 @@ pub fn find_boot_keyboard(config: &[u8]) -> Option<BootKeyboardInterface> {
     None
 }
 
+/// One bulk endpoint of a mass-storage interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BulkEndpoint {
+    /// `bEndpointAddress`, direction bit included.
+    pub address: u8,
+    pub max_packet: u16,
+    /// `bMaxBurst` from the SuperSpeed companion descriptor (0 = one
+    /// packet per burst). Zero when the device sent no companion, which is
+    /// every USB 2 device.
+    pub max_burst: u8,
+}
+
+impl BulkEndpoint {
+    /// Endpoint number without the direction bit (1..=15).
+    pub fn number(&self) -> u8 {
+        self.address & 0x0F
+    }
+}
+
+/// A Bulk-Only Transport mass-storage interface and its two bulk
+/// endpoints (USB MSC BOT 1.0 §4.3: exactly one bulk IN and one bulk OUT).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MassStorageInterface {
+    pub config_value: u8,
+    pub interface: u8,
+    pub bulk_in: BulkEndpoint,
+    pub bulk_out: BulkEndpoint,
+}
+
+/// Walks a configuration blob for a SCSI / Bulk-Only mass-storage
+/// interface (class 0x08, subclass 0x06, protocol 0x50) at alternate
+/// setting 0, and returns it once both of its bulk endpoints have been
+/// seen.
+///
+/// Same three guards as [`find_boot_keyboard`]. One addition: a USB 3
+/// device follows every endpoint descriptor with a SuperSpeed Endpoint
+/// Companion, whose `bMaxBurst` belongs to the endpoint *just before it* —
+/// so the walk remembers which endpoint it last recorded and patches that
+/// one, never a guess.
+pub fn find_mass_storage(config: &[u8]) -> Option<MassStorageInterface> {
+    use crate::msc::{CLASS_MASS_STORAGE, PROTOCOL_BULK_ONLY, SUBCLASS_SCSI};
+
+    let config_value = config_value(config)?;
+    let mut pos = 0usize;
+    let mut current_if: Option<u8> = None;
+    let mut bulk_in: Option<BulkEndpoint> = None;
+    let mut bulk_out: Option<BulkEndpoint> = None;
+    // Which endpoint a following companion descriptor describes:
+    // Some(true) = the IN one, Some(false) = the OUT one.
+    let mut last_ep_in: Option<bool> = None;
+
+    while pos + 2 <= config.len() {
+        let len = config[pos] as usize;
+        let ty = config[pos + 1];
+        if len < 2 || pos + len > config.len() {
+            break;
+        }
+        let desc = &config[pos..pos + len];
+
+        match ty {
+            DESC_INTERFACE if len >= 9 => {
+                // A new interface ends the previous one. If that one was
+                // complete it would already have been returned below.
+                bulk_in = None;
+                bulk_out = None;
+                last_ep_in = None;
+                current_if = if desc[3] == 0
+                    && desc[5] == CLASS_MASS_STORAGE
+                    && desc[6] == SUBCLASS_SCSI
+                    && desc[7] == PROTOCOL_BULK_ONLY
+                {
+                    Some(desc[2])
+                } else {
+                    None
+                };
+            }
+            DESC_ENDPOINT if len >= 7 => {
+                last_ep_in = None;
+                if current_if.is_some() && desc[3] & 0x03 == XFER_BULK {
+                    let ep = BulkEndpoint {
+                        address: desc[2],
+                        max_packet: u16::from_le_bytes([desc[4], desc[5]]) & 0x07FF,
+                        max_burst: 0,
+                    };
+                    if ep.address & 0x80 != 0 {
+                        if bulk_in.is_none() {
+                            bulk_in = Some(ep);
+                            last_ep_in = Some(true);
+                        }
+                    } else if bulk_out.is_none() {
+                        bulk_out = Some(ep);
+                        last_ep_in = Some(false);
+                    }
+                }
+            }
+            DESC_SS_ENDPOINT_COMPANION if len >= 6 => {
+                let burst = desc[2].min(15);
+                match last_ep_in {
+                    Some(true) => {
+                        if let Some(ep) = bulk_in.as_mut() {
+                            ep.max_burst = burst;
+                        }
+                    }
+                    Some(false) => {
+                        if let Some(ep) = bulk_out.as_mut() {
+                            ep.max_burst = burst;
+                        }
+                    }
+                    None => {}
+                }
+                last_ep_in = None;
+            }
+            _ => {}
+        }
+
+        pos += len;
+
+        // Returned only once the interface is complete *and* any companion
+        // right after the last endpoint has been consumed — returning at
+        // the second endpoint would drop its bMaxBurst.
+        if let (Some(interface), Some(i), Some(o)) = (current_if, bulk_in, bulk_out) {
+            let next_is_companion =
+                pos + 2 <= config.len() && config[pos + 1] == DESC_SS_ENDPOINT_COMPANION;
+            if !next_is_companion {
+                return Some(MassStorageInterface { config_value, interface, bulk_in: i, bulk_out: o });
+            }
+        }
+    }
+
+    None
+}
+
 // ── Control-transfer setup packets (USB 2.0 §9.3) ────────────────────────────
 
 /// An 8-byte `SETUP` packet, built field by field. The xHCI Setup Stage
@@ -207,7 +343,10 @@ pub struct SetupPacket {
     pub length: u16,
 }
 
+pub const REQ_CLEAR_FEATURE: u8 = 0x01;
 pub const REQ_GET_DESCRIPTOR: u8 = 0x06;
+/// Feature selector ENDPOINT_HALT (USB 2.0 §9.4, table 9-6).
+pub const FEATURE_ENDPOINT_HALT: u16 = 0;
 pub const REQ_SET_CONFIGURATION: u8 = 0x09;
 /// HID class requests (HID 1.11 §7.2).
 pub const REQ_HID_SET_IDLE: u8 = 0x0A;
@@ -257,6 +396,42 @@ impl SetupPacket {
             value: 0,
             index: interface as u16,
             length: 0,
+        }
+    }
+
+    /// `CLEAR_FEATURE(ENDPOINT_HALT)` on one endpoint — the device-side
+    /// half of un-halting a bulk endpoint. The xHCI's Reset Endpoint only
+    /// clears the *controller's* view; without this the device keeps
+    /// stalling (and resets its data toggle only when told to).
+    pub fn clear_endpoint_halt(ep_address: u8) -> Self {
+        SetupPacket {
+            request_type: 0x02, // host-to-device, standard, endpoint
+            request: REQ_CLEAR_FEATURE,
+            value: FEATURE_ENDPOINT_HALT,
+            index: ep_address as u16,
+            length: 0,
+        }
+    }
+
+    /// Bulk-Only Mass Storage Reset (BOT §3.1).
+    pub fn bulk_only_reset(interface: u8) -> Self {
+        SetupPacket {
+            request_type: 0x21, // host-to-device, class, interface
+            request: crate::msc::REQUEST_BOMS_RESET,
+            value: 0,
+            index: interface as u16,
+            length: 0,
+        }
+    }
+
+    /// Get Max LUN (BOT §3.2): one byte back, the highest LUN number.
+    pub fn get_max_lun(interface: u8) -> Self {
+        SetupPacket {
+            request_type: 0xA1, // device-to-host, class, interface
+            request: crate::msc::REQUEST_GET_MAX_LUN,
+            value: 0,
+            index: interface as u16,
+            length: 1,
         }
     }
 
@@ -431,5 +606,114 @@ mod tests {
         // SET_IDLE(0) on interface 1: 21 0A 00 00 01 00 00 00
         let s = SetupPacket::set_idle(1);
         assert_eq!(s.to_bytes(), [0x21, 0x0A, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]);
+    }
+
+    // ── Mass storage ────────────────────────────────────────────────────
+
+    /// A USB 2 pendrive: one BOT interface, bulk IN then bulk OUT.
+    #[test]
+    fn finds_a_usb2_mass_storage_interface() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&config_header(32, 1));
+        blob.extend_from_slice(&interface_desc(0, 0, 0x08, 0x06, 0x50));
+        blob.extend_from_slice(&endpoint_desc(0x81, XFER_BULK, 512, 0));
+        blob.extend_from_slice(&endpoint_desc(0x02, XFER_BULK, 512, 0));
+        let m = find_mass_storage(&blob).unwrap();
+        assert_eq!(m.config_value, 1);
+        assert_eq!(m.interface, 0);
+        assert_eq!(m.bulk_in, BulkEndpoint { address: 0x81, max_packet: 512, max_burst: 0 });
+        assert_eq!(m.bulk_out, BulkEndpoint { address: 0x02, max_packet: 512, max_burst: 0 });
+        assert_eq!(m.bulk_in.number(), 1);
+        assert_eq!(m.bulk_out.number(), 2);
+        assert!(find_boot_keyboard(&blob).is_none());
+    }
+
+    fn companion(max_burst: u8) -> [u8; 6] {
+        [6, DESC_SS_ENDPOINT_COMPANION, max_burst, 0, 0, 0]
+    }
+
+    /// A USB 3 stick (the SanDisk shape): each endpoint followed by its
+    /// companion, and the *last* companion must still be attributed —
+    /// returning as soon as the second endpoint is seen would lose it.
+    #[test]
+    fn usb3_companions_attach_to_the_right_endpoint() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&config_header(44, 1));
+        blob.extend_from_slice(&interface_desc(0, 0, 0x08, 0x06, 0x50));
+        blob.extend_from_slice(&endpoint_desc(0x81, XFER_BULK, 1024, 0));
+        blob.extend_from_slice(&companion(15));
+        blob.extend_from_slice(&endpoint_desc(0x02, XFER_BULK, 1024, 0));
+        blob.extend_from_slice(&companion(3));
+        let m = find_mass_storage(&blob).unwrap();
+        assert_eq!((m.bulk_in.max_packet, m.bulk_in.max_burst), (1024, 15));
+        assert_eq!((m.bulk_out.max_packet, m.bulk_out.max_burst), (1024, 3));
+    }
+
+    /// UAS sticks offer BOT at alt 0 and UAS (protocol 0x62) at alt 1. The
+    /// UAS alternate has four bulk endpoints; none of them may leak into
+    /// the BOT result, and a UAS-only interface must not match at all.
+    #[test]
+    fn uas_alternate_is_ignored() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&config_header(80, 1));
+        blob.extend_from_slice(&interface_desc(0, 1, 0x08, 0x06, 0x62));
+        blob.extend_from_slice(&endpoint_desc(0x83, XFER_BULK, 512, 0));
+        blob.extend_from_slice(&endpoint_desc(0x04, XFER_BULK, 512, 0));
+        blob.extend_from_slice(&interface_desc(0, 0, 0x08, 0x06, 0x50));
+        blob.extend_from_slice(&endpoint_desc(0x81, XFER_BULK, 512, 0));
+        blob.extend_from_slice(&endpoint_desc(0x02, XFER_BULK, 512, 0));
+        let m = find_mass_storage(&blob).unwrap();
+        assert_eq!((m.bulk_in.address, m.bulk_out.address), (0x81, 0x02));
+
+        let uas_only = &blob[..9 + 9 + 7 + 7];
+        assert!(find_mass_storage(uas_only).is_none());
+    }
+
+    #[test]
+    fn mass_storage_needs_both_endpoints_of_one_interface() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&config_header(48, 1));
+        blob.extend_from_slice(&interface_desc(0, 0, 0x08, 0x06, 0x50));
+        blob.extend_from_slice(&endpoint_desc(0x81, XFER_BULK, 512, 0));
+        // interrupt endpoint doesn't count as the OUT half
+        blob.extend_from_slice(&endpoint_desc(0x02, XFER_INTERRUPT, 64, 1));
+        // the OUT endpoint of a *different* interface doesn't either
+        blob.extend_from_slice(&interface_desc(1, 0, 0xFF, 0, 0));
+        blob.extend_from_slice(&endpoint_desc(0x03, XFER_BULK, 512, 0));
+        assert!(find_mass_storage(&blob).is_none());
+    }
+
+    #[test]
+    fn mass_storage_walk_survives_malformed_lengths() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&config_header(40, 1));
+        blob.extend_from_slice(&interface_desc(0, 0, 0x08, 0x06, 0x50));
+        blob.extend_from_slice(&[0u8, DESC_ENDPOINT, 0x81]);
+        assert!(find_mass_storage(&blob).is_none());
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&config_header(40, 1));
+        blob.extend_from_slice(&interface_desc(0, 0, 0x08, 0x06, 0x50));
+        blob.extend_from_slice(&endpoint_desc(0x81, XFER_BULK, 512, 0));
+        blob.extend_from_slice(&[250u8, DESC_ENDPOINT, 0x02, XFER_BULK]);
+        assert!(find_mass_storage(&blob).is_none());
+    }
+
+    #[test]
+    fn mass_storage_setup_packets() {
+        // Bulk-Only Mass Storage Reset, interface 0: 21 FF 00 00 00 00 00 00
+        assert_eq!(
+            SetupPacket::bulk_only_reset(0).to_bytes(),
+            [0x21, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+        // Get Max LUN, interface 0: A1 FE 00 00 00 00 01 00
+        let s = SetupPacket::get_max_lun(0);
+        assert_eq!(s.to_bytes(), [0xA1, 0xFE, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00]);
+        assert!(s.is_in());
+        // CLEAR_FEATURE(ENDPOINT_HALT) on EP 0x81: 02 01 00 00 81 00 00 00
+        assert_eq!(
+            SetupPacket::clear_endpoint_halt(0x81).to_bytes(),
+            [0x02, 0x01, 0x00, 0x00, 0x81, 0x00, 0x00, 0x00]
+        );
     }
 }

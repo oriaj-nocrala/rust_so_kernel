@@ -124,6 +124,12 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     crate::fs::init();
     serial_println!("VFS: initramfs @ /bin, devfs @ /dev");
 
+    // ── Kernel log → USB stick ─────────────────────────────────────
+    // Claims the pendrive's raw `constanos-log` partition, if it has one;
+    // from here on the idle task, `sync(2)` and the panic handler copy the
+    // log ring there. See `block::logpart`.
+    crate::block::logpart::init();
+
     // ── TSS + GDT ──────────────────────────────────────────────────
     serial_println!("Step 9: Initializing TSS and GDT");
     process::tss::init();

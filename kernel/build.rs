@@ -75,6 +75,7 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "ext2_robust_test",
     "fpu_test",
     "socket_test",
+    "fbbench",
 ];
 
 /// Not built here at all — see the busybox.elf handling below, which

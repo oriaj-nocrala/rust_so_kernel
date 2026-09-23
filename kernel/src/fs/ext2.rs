@@ -129,6 +129,8 @@
 //     file's wrapper, since `ext2` has no clock of its own.
 
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use spin::{Mutex, Once};
 
 use crate::block::BlockDevice;
@@ -219,16 +221,72 @@ static EXT2: Once<Ext2Fs> = Once::new();
 /// don't take it.
 static EXT2_LOCK: Mutex<()> = Mutex::new(());
 
-/// Mount the ext2 filesystem from the real ATA disk (`crate::block::
-/// AtaBlockDevice`). Call once, before the VFS mounts `/mnt`. Returns `Err`
+/// Set when `/mnt` was mounted read-only (`init_read_only`). Every
+/// mutating path takes [`write_lock`] instead of `EXT2_LOCK` directly, so
+/// this one flag turns them all into `EROFS` — there is no mutation that
+/// can forget to check it.
+static READ_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// The lock every mutating operation takes, or `EROFS` on a read-only
+/// mount.
+fn write_lock() -> Result<spin::MutexGuard<'static, ()>, Errno> {
+    if READ_ONLY.load(Ordering::Relaxed) {
+        return Err(Errno::EROFS);
+    }
+    Ok(EXT2_LOCK.lock())
+}
+
+/// Whether `/mnt` is mounted read-only.
+pub fn is_read_only() -> bool {
+    READ_ONLY.load(Ordering::Relaxed)
+}
+
+/// Mount the ext2 filesystem: the USB boot pendrive's data partition if
+/// there is one (read-only, see `init_read_only`), else the real ATA disk
+/// (`crate::block::AtaBlockDevice`). Call once, before the VFS mounts
+/// `/mnt`. Returns `Err`
 /// (not panics) on any problem — a missing or unreadable disk shouldn't
 /// take down boot, just leave `/mnt` unmounted.
 pub fn init() -> Result<(), &'static str> {
+    // The boot pendrive first: on the target machine it is the only disk
+    // there is (no IDE), and in QEMU it is only present when asked for
+    // (`QEMU_USB_STORAGE`), so the ATA path below still serves every
+    // ordinary QEMU boot unchanged.
+    if crate::usb::storage().is_some() {
+        match crate::block::usb::data_partition() {
+            Ok(part) => match init_read_only(Box::new(part)) {
+                Ok(()) => {
+                    crate::kalert!("ext2: /mnt montado desde el pendrive USB (solo lectura)");
+                    return Ok(());
+                }
+                Err(e) => crate::kalert!("ext2: pendrive USB sin montar: {}", e),
+            },
+            Err(e) => crate::kalert!("ext2: pendrive USB sin montar: {}", e),
+        }
+    }
+
     let device: Box<dyn BlockDevice> = Box::new(crate::block::AtaBlockDevice);
     if !device.present() {
         return Err("no disk on the secondary IDE channel");
     }
     mount_and_repair(device)
+}
+
+/// Mounts ext2 **read-only** from an arbitrary device — the USB pendrive's
+/// data partition. Skips the mount-time repair passes, which write, and
+/// marks the mount read-only so every mutation fails with `EROFS` instead
+/// of reaching the disk.
+///
+/// Read-only first because there is no journal and the stick is also the
+/// boot key: a hang in the middle of `reclaim_orphans` on a new, barely
+/// exercised transport would leave the only copy of the filesystem
+/// inconsistent. Writing comes once reading is boring — see
+/// `docs/storage/usb-msc-plan.md`, step 6.
+pub fn init_read_only(device: Box<dyn BlockDevice>) -> Result<(), &'static str> {
+    let fs = Ext2Fs::mount(device)?;
+    READ_ONLY.store(true, Ordering::Relaxed);
+    EXT2.call_once(|| fs);
+    Ok(())
 }
 
 /// Alternate entry point used only by the QEMU integration test
@@ -613,9 +671,16 @@ impl Inode for Ext2Inode {
             }
             Ok(Box::new(Ext2DirHandle { ino: self.ino, snapshot, offset: 0 }))
         } else {
+            // Refused at open, as Linux does on a read-only mount, rather
+            // than handing out a handle whose every write fails —
+            // `access(W_OK)` probes writability by opening `O_WRONLY`, so
+            // this is also what makes `vi` say `[Readonly]` truthfully.
+            if flags.is_write() && is_read_only() {
+                return Err(Errno::EROFS);
+            }
             let mut raw = self.raw.clone();
             if flags.is_write() && flags.0 & OpenFlags::TRUNC.0 != 0 {
-                let _guard = EXT2_LOCK.lock();
+                let _guard = write_lock()?;
                 fs().truncate_to_zero(self.ino, &mut raw)?;
             }
             let start_offset = if flags.0 & OpenFlags::APPEND.0 != 0 {
@@ -659,7 +724,7 @@ impl Inode for Ext2Inode {
         if !self.raw.is_dir() {
             return Err(Errno::ENOTDIR);
         }
-        let _guard = EXT2_LOCK.lock();
+        let _guard = write_lock()?;
         if let Ok(existing) = self.lookup(name) {
             if existing.file_type() == FileType::Directory {
                 return Err(Errno::EISDIR);
@@ -686,7 +751,7 @@ impl Inode for Ext2Inode {
         if !self.raw.is_dir() {
             return Err(Errno::ENOTDIR);
         }
-        let _guard = EXT2_LOCK.lock();
+        let _guard = write_lock()?;
         if self.lookup(name).is_ok() {
             return Err(Errno::EEXIST);
         }
@@ -731,7 +796,7 @@ impl Inode for Ext2Inode {
         if !self.raw.is_dir() {
             return Err(Errno::ENOTDIR);
         }
-        let _guard = EXT2_LOCK.lock();
+        let _guard = write_lock()?;
         let child = self.lookup(name)?;
         if child.file_type() == FileType::Directory {
             return Err(Errno::EISDIR);
@@ -768,7 +833,7 @@ impl Inode for Ext2Inode {
         if !self.raw.is_dir() {
             return Err(Errno::ENOTDIR);
         }
-        let _guard = EXT2_LOCK.lock();
+        let _guard = write_lock()?;
         let child = self.lookup(name)?;
         if child.file_type() != FileType::Directory {
             return Err(Errno::ENOTDIR);
@@ -802,7 +867,7 @@ impl Inode for Ext2Inode {
         if !self.raw.is_dir() {
             return Err(Errno::ENOTDIR);
         }
-        let _guard = EXT2_LOCK.lock();
+        let _guard = write_lock()?;
         let child = self.lookup(name)?;
         let f = fs();
         let dir_raw = self.raw.clone();
@@ -819,7 +884,7 @@ impl Inode for Ext2Inode {
         if !self.raw.is_dir() {
             return Err(Errno::ENOTDIR);
         }
-        let _guard = EXT2_LOCK.lock();
+        let _guard = write_lock()?;
         if self.lookup(name).is_ok() {
             return Err(Errno::EEXIST);
         }
@@ -856,7 +921,7 @@ impl Inode for Ext2Inode {
         if !self.raw.is_dir() {
             return Err(Errno::ENOTDIR);
         }
-        let _guard = EXT2_LOCK.lock();
+        let _guard = write_lock()?;
         if self.lookup(name).is_ok() {
             return Err(Errno::EEXIST);
         }
@@ -899,7 +964,7 @@ impl Inode for Ext2Inode {
     }
 
     fn chmod(&self, mode: u32) -> Result<(), Errno> {
-        let _guard = EXT2_LOCK.lock();
+        let _guard = write_lock()?;
         let f = fs();
         let mut raw = f.read_inode(self.ino)?; // fresh, not `self.raw` — don't clobber a concurrent write's size/blocks
         let new_mode = (raw.i_mode() & 0xF000) | (mode as u16 & 0o7777);
@@ -935,7 +1000,7 @@ impl FileHandle for Ext2FileHandle {
     }
 
     fn write(&mut self, buf: &[u8]) -> FileResult<usize> {
-        let _guard = EXT2_LOCK.lock();
+        let _guard = write_lock().map_err(|_| FileError::IOError)?;
         let mut raw = self.raw.lock();
         let mut offset = self.offset.lock();
         match fs().write_file_range(self.ino, &mut raw, *offset, buf) {
@@ -966,7 +1031,7 @@ impl FileHandle for Ext2FileHandle {
     }
 
     fn chmod(&mut self, mode: u32) -> FileResult<()> {
-        let _guard = EXT2_LOCK.lock();
+        let _guard = write_lock().map_err(|_| FileError::IOError)?;
         let mut raw = self.raw.lock();
         let new_mode = (raw.i_mode() & 0xF000) | (mode as u16 & 0o7777);
         raw.set_i_mode(new_mode);

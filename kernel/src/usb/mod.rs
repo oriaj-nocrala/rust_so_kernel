@@ -32,9 +32,14 @@
 // * **Hubs.** Only devices on root-hub ports are found. A keyboard behind
 //   an external hub needs the hub class driver plus route-string handling
 //   in the slot context, which is a second project.
-// * **Mice, storage, anything else.** A device that is not a HID
-//   boot-protocol keyboard is addressed (so it is visible in the boot log)
-//   and then left alone. `/dev/input/event1` remains the PS/2 mouse.
+// * **Mice, anything else.** A device that is neither a HID boot-protocol
+//   keyboard nor Bulk-Only mass storage is addressed (so it is visible in
+//   the boot log) and then left alone. `/dev/input/event1` remains the
+//   PS/2 mouse.
+//
+// Mass storage (the boot pendrive, see `xhci/msc.rs`) is the second device
+// class; `storage()` / `storage_read()` / `storage_write()` below are what
+// `block::UsbBlockDevice` sits on.
 // * **Interrupts.** Polled off the 100 Hz timer, for the reason `ac97.rs`
 //   polls: the IDT is a `spin::Once` populated before PCI enumeration
 //   exists. See `xhci.rs`'s header.
@@ -61,6 +66,20 @@ static CONTROLLERS: Mutex<[Option<xhci::Xhci>; MAX_CONTROLLERS]> =
 /// Number of HID boot keyboards found at boot — read by the boot summary
 /// and by `/proc`-style introspection.
 static KEYBOARDS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// A mass-storage device that finished bring-up: which controller, which
+/// slot, and its size in 512-byte sectors.
+#[derive(Debug, Clone, Copy)]
+pub struct Storage {
+    ctrl: usize,
+    slot: u8,
+    pub sectors: u64,
+}
+
+/// The first mass-storage device found at boot. Only one: the pendrive
+/// this kernel boots from. A second stick is enumerated and logged but not
+/// offered to the block layer.
+static STORAGE: spin::Once<Storage> = spin::Once::new();
 
 pub struct UsbDriver;
 
@@ -125,6 +144,15 @@ impl Driver for UsbDriver {
                 match xhci::Xhci::init(*bar) {
                     Ok(mut ctrl) => {
                         scan.add(&ctrl.enumerate_ports());
+                        for (slot, sectors) in ctrl.storage_devices() {
+                            if STORAGE.get().is_none() {
+                                STORAGE.call_once(|| Storage { ctrl: live, slot, sectors });
+                            } else {
+                                crate::serial_println!(
+                                    "usb-storage: ignoring second device (ctrl {} slot {})", live, slot
+                                );
+                            }
+                        }
                         slots[live] = Some(ctrl);
                         live += 1;
                     }
@@ -139,9 +167,9 @@ impl Driver for UsbDriver {
         KEYBOARDS.store(scan.keyboards, core::sync::atomic::Ordering::Relaxed);
         crate::serial_println!(
             "usb: {} controller(s) up ({} failed), {} port(s), {} connected, \
-             {} addressed, {} setup error(s), {} keyboard(s)",
+             {} addressed, {} setup error(s), {} keyboard(s), {} storage",
             live, init_failures, scan.ports, scan.connected, scan.addressed,
-            scan.failed, scan.keyboards,
+            scan.failed, scan.keyboards, scan.storage,
         );
 
         // On the actual screen, not just to serial. This driver exists for
@@ -156,13 +184,13 @@ impl Driver for UsbDriver {
         // them in one line.
         if scan.keyboards > 0 {
             crate::kalert!(
-                "usb: {} teclado(s) USB OK  [{} ctrl, {} puertos, {} conectados]",
-                scan.keyboards, live, scan.ports, scan.connected
+                "usb: {} teclado(s) USB OK, {} almacenamiento  [{} ctrl, {} puertos, {} conectados]",
+                scan.keyboards, scan.storage, live, scan.ports, scan.connected
             );
         } else if live > 0 {
             crate::kalert!(
-                "usb: SIN teclado  [{} ctrl, {} puertos, {} conectados, {} direccionados, {} otros, {} errores]",
-                live, scan.ports, scan.connected, scan.addressed, scan.other_devices, scan.failed
+                "usb: SIN teclado  [{} ctrl, {} puertos, {} conectados, {} direccionados, {} almac., {} otros, {} errores]",
+                live, scan.ports, scan.connected, scan.addressed, scan.storage, scan.other_devices, scan.failed
             );
         } else if n > 0 {
             crate::kalert!("usb: {} controlador(es) xHCI hallados, ninguno arranco", n);
@@ -206,10 +234,7 @@ pub fn poll() {
             return;
         };
         for ctrl in slots.iter_mut().flatten() {
-            if count >= MAX_SCANCODES_PER_POLL {
-                break;
-            }
-            count += ctrl.poll(&mut scancodes[count..], MAX_SCANCODES_PER_POLL - count);
+            count += ctrl.poll(&mut scancodes[count..]);
         }
     }
 
@@ -227,4 +252,86 @@ pub fn poll() {
     // `init::devices::keyboard_interrupt_handler`.
     crate::process::syscall::stdin_wakeup();
     crate::process::syscall::poll_wakeup_for_fd0();
+}
+
+/// The boot-time mass-storage device, if one was found.
+pub fn storage() -> Option<Storage> {
+    STORAGE.get().copied()
+}
+
+/// Reads `count` sectors at `lba` from the storage device into `buf`,
+/// split into bounce-buffer-sized transfers.
+///
+/// **Each transfer runs with interrupts disabled and the `CONTROLLERS`
+/// lock held**, released between transfers. Both halves matter:
+///
+/// * The lock makes this the ring's only reader for the transfer's whole
+///   duration (see `Xhci::service_events`), so the timer's `poll` cannot
+///   consume the disk's completion.
+/// * Interrupts off means the lock holder can never be preempted. Without
+///   it, a process preempted mid-read would leave the lock held while the
+///   next process to read the disk spins on it — forever, if that one
+///   spins with interrupts off. With it, the only other party ever to
+///   touch the lock is the timer ISR, and that only `try_lock`s.
+///
+/// The cost is one transfer's worth of interrupt latency — about a
+/// millisecond for 64 KiB on USB 2, the PIT tick it delays simply fires
+/// late — bounded by `msc::BULK_TIMEOUT_MS` in the failure case. Keystrokes
+/// typed meanwhile are decoded by this very transfer's event draining and
+/// handed out by the next `poll`.
+pub fn storage_read(dev: &Storage, lba: u32, count: usize, buf: &mut [u8]) -> Result<(), xhci::MscError> {
+    let mut done = 0usize;
+    while done < count {
+        let n = (count - done).min(xhci::MAX_SECTORS);
+        let at = lba + done as u32;
+        let chunk = &mut buf[done * 512..(done + n) * 512];
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut slots = CONTROLLERS.lock();
+            match slots[dev.ctrl].as_mut() {
+                Some(ctrl) => ctrl.storage_read(dev.slot, at, n, chunk),
+                None => Err(xhci::MscError::NotStorage),
+            }
+        })?;
+        done += n;
+    }
+    Ok(())
+}
+
+/// Write counterpart of [`storage_read`], same locking.
+pub fn storage_write(dev: &Storage, lba: u32, count: usize, buf: &[u8]) -> Result<(), xhci::MscError> {
+    let mut done = 0usize;
+    while done < count {
+        let n = (count - done).min(xhci::MAX_SECTORS);
+        let at = lba + done as u32;
+        let chunk = &buf[done * 512..(done + n) * 512];
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut slots = CONTROLLERS.lock();
+            match slots[dev.ctrl].as_mut() {
+                Some(ctrl) => ctrl.storage_write(dev.slot, at, n, chunk),
+                None => Err(xhci::MscError::NotStorage),
+            }
+        })?;
+        done += n;
+    }
+    Ok(())
+}
+
+/// One write of at most [`xhci::MAX_SECTORS`] sectors that gives up
+/// instead of waiting for the controller lock — `None` if it is held.
+///
+/// For the panic handler only (`block::logpart`): a panic can fire in the
+/// middle of a transfer, with `CONTROLLERS` held by the code that just
+/// died, and a blocking `lock()` there would turn the panic into a silent
+/// hang before the panic screen is even drawn.
+pub fn try_storage_write(dev: &Storage, lba: u32, count: usize, buf: &[u8]) -> Option<Result<(), xhci::MscError>> {
+    if count > xhci::MAX_SECTORS {
+        return Some(Err(xhci::MscError::OutOfRange));
+    }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut slots = CONTROLLERS.try_lock()?;
+        Some(match slots[dev.ctrl].as_mut() {
+            Some(ctrl) => ctrl.storage_write(dev.slot, lba, count, buf),
+            None => Err(xhci::MscError::NotStorage),
+        })
+    })
 }

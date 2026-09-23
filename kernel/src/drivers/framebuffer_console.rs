@@ -202,22 +202,33 @@ pub fn tick_cursor_blink() {
 // SerialConsole::write — no shared lock, so no deadlock risk against the
 // FB_STATE/FRAMEBUFFER locks already held by the caller), tagged with a
 // `[fb] ` prefix at the start of each line so it's greppable/distinguishable
-// from the kernel's own `serial_println!` diagnostics in the same log.
+// from the kernel's own `serial_println!` diagnostics in the same log. The
+// mirror also feeds `klog`, so `/proc/dmesg` and the USB log partition carry
+// user output too.
 static STDOUT_AT_LINE_START: AtomicBool = AtomicBool::new(true);
 
 fn mirror_to_serial(buf: &[u8]) {
     use x86_64::instructions::port::Port;
     let t0 = crate::cpu::tsc::read();
     let mut port = Port::<u8>::new(0x3F8);
-    for &byte in buf {
+    // The same bytes go into the kernel log ring, one `push` per line
+    // rather than per byte. Without this, user output reached COM1 but not
+    // `klog` — so not `/proc/dmesg`, and not the USB log partition
+    // (`block::logpart`), which on the serial-less target is the only place
+    // a program's output can be read back from.
+    for line in buf.split_inclusive(|&b| b == b'\n') {
         if STDOUT_AT_LINE_START.load(Ordering::Relaxed) {
             for &b in b"[fb] " {
                 unsafe { port.write(b); }
             }
+            crate::klog::push(b"[fb] ");
             STDOUT_AT_LINE_START.store(false, Ordering::Relaxed);
         }
-        unsafe { port.write(byte); }
-        if byte == b'\n' {
+        for &byte in line {
+            unsafe { port.write(byte); }
+        }
+        crate::klog::push(line);
+        if line.last() == Some(&b'\n') {
             STDOUT_AT_LINE_START.store(true, Ordering::Relaxed);
         }
     }

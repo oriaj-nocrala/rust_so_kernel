@@ -133,6 +133,22 @@ leerlo hace falta una de dos cosas, las dos grandes:
 Ninguna de las dos se hizo aquí, por la disciplina de la propia línea: una
 a la vez, cada una medida por separado contra el paso 0.
 
+**Siguiente paso:** las dos juntas, en fases medidas por separado —
+`docs/fb/wc-shadow-plan.md`.
+
+## La medición en metal (2026-09-23)
+
+`fbbench` (`userspace/c/fbbench.c`) en la Ryzen, kernel `dev`, 1920x1080:
+**un `scroll_up` cuesta 2,18 s** (8 076 M ciclos, frente a 3,7 M en QEMU,
+unas 2 000 veces más). `seq 1 400` tarda 875 s. Las escrituras van a 391
+MB/s (`fill_rect`), pero leer la VRAM va a ~4 MB/s. La predicción de
+arriba («en metal la mitad de lectura será mucho peor») se quedó corta
+por tres órdenes de magnitud. La apertura está por encima de 4 GiB, es UC
+por el tipo MTRR por defecto y no tiene alias en el physmap.
+
+Consecuencia: el shadow buffer pasa por delante del WC. Tablas completas y
+plan en `docs/fb/wc-shadow-plan.md`.
+
 ## Verificación de este cambio
 
 * `cd hal && cargo test` — 142 (125 antes + 17 de `memtype`).

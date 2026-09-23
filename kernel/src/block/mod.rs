@@ -15,6 +15,8 @@
 // file only adds the `BlockDevice` seam *above* it, unchanged underneath.
 
 pub mod ata;
+pub mod logpart;
+pub mod usb;
 
 pub use hal::block::{BlockDevice, SECTOR_SIZE};
 

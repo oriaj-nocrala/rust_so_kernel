@@ -48,6 +48,9 @@
 #                            to make USB the only input path, as on metal
 #   QEMU_USB_KBD=1           attach a USB keyboard to it, and route `send`
 #                            through it instead of the PS/2 8042
+#   QEMU_USB_STORAGE=<img>   attach <img> (raw, or .qcow2) as a USB mass-storage stick —
+#                            the boot pendrive's shape; pass a scratch copy,
+#                            the kernel mounts it read-write eventually
 #   QEMU_DEBUG_EXTRA_ARGS    extra raw qemu args, word-split
 #
 #   scripts/qemu-debug.sh gdb ["cmd" "cmd" ...]      # batch gdb against a running instance
@@ -277,6 +280,12 @@ cmd_start() {
         qemu_args+=(-device "qemu-xhci,id=xhci")
         if [ -n "${QEMU_USB_KBD:-}" ]; then
             qemu_args+=(-device "usb-kbd,bus=xhci.0")
+        fi
+        if [ -n "${QEMU_USB_STORAGE:-}" ]; then
+            local stick_fmt="raw"
+            case "$QEMU_USB_STORAGE" in *.qcow2) stick_fmt="qcow2" ;; esac
+            qemu_args+=(-drive "if=none,id=usbstick,format=${stick_fmt},file=${QEMU_USB_STORAGE}")
+            qemu_args+=(-device "usb-storage,bus=xhci.0,drive=usbstick")
         fi
     fi
     if [ -f "$ext2_disk" ] && [ -z "${QEMU_DEBUG_NO_DISK:-}" ]; then

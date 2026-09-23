@@ -30,6 +30,9 @@ use x86_64::PhysAddr;
 
 use crate::allocator::phys_alloc;
 
+mod msc;
+pub use msc::{MAX_SECTORS, MscError};
+
 /// TRBs per ring segment: one 4 KiB page at 16 bytes each. A ring segment
 /// may not cross a 64 KiB boundary (xHCI §4.11.5.1); a single page-aligned
 /// page never does.
@@ -52,6 +55,13 @@ const MAX_CONFIG_BYTES: u16 = 512;
 /// for every control transfer.
 const EP0_DCI: u8 = 1;
 
+/// Scancodes decoded off the event ring but not yet collected by `poll`.
+/// Keyboard reports are now decoded by whoever happens to be draining the
+/// ring — including a disk read spinning for its own completion while the
+/// timer ISR is locked out — so they need somewhere to wait. 256 bytes is
+/// dozens of reports; a keyboard cannot fill it inside one disk transfer.
+const PENDING_KEYS: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XhciError {
     /// A register never reached the expected state inside its timeout.
@@ -67,7 +77,10 @@ pub enum XhciError {
 type Result<T> = core::result::Result<T, XhciError>;
 
 /// Short name for an error, completion codes included (xHCI §6.4.5,
-/// table 6-90). A bare `Failed(4)` read off a photographed screen means
+/// table 6-90; the same numbering as Linux's `COMP_*` constants). Codes
+/// 18 and up were once shifted by one here — 19 read as "BandwidthOverrun"
+/// when it is Context State Error — which would have mislabelled exactly
+/// the error endpoint recovery produces. A bare `Failed(4)` read off a photographed screen means
 /// nothing; `Failed(4) XactErr` says the device did not answer on the wire,
 /// which is a different problem from `Failed(17) ParamErr` (a malformed
 /// context this driver built).
@@ -87,15 +100,22 @@ fn describe(e: XhciError) -> &'static str {
             9 => "NoSlots",
             11 => "SlotNotEnabled",
             12 => "EpNotEnabled",
+            13 => "ShortPacket",
+            14 => "RingUnderrun",
+            15 => "RingOverrun",
             17 => "ParamErr",
-            19 => "BandwidthOverrun",
-            20 => "ContextStateErr",
-            21 => "NoPingResponse",
-            22 => "EventRingFull",
-            23 => "IncompatibleDevice",
-            25 => "CmdRingStopped",
-            26 => "CmdAborted",
-            30 => "MaxExitLatencyTooLarge",
+            18 => "BandwidthOverrun",
+            19 => "ContextStateErr",
+            20 => "NoPingResponse",
+            21 => "EventRingFull",
+            22 => "IncompatibleDevice",
+            23 => "MissedService",
+            24 => "CmdRingStopped",
+            25 => "CmdAborted",
+            26 => "Stopped",
+            27 => "StoppedLenInvalid",
+            28 => "StoppedShortPacket",
+            29 => "MaxExitLatencyTooLarge",
             _ => "?",
         },
     }
@@ -122,6 +142,8 @@ pub struct PortScan {
     pub failed: usize,
     /// HID boot keyboards now being polled.
     pub keyboards: usize,
+    /// Mass-storage devices that finished SCSI bring-up.
+    pub storage: usize,
 }
 
 /// Which stage of bringing one port's device up was reached, and how it
@@ -146,6 +168,7 @@ pub struct PortOutcome {
     pub error: Option<XhciError>,
     pub addressed: bool,
     pub keyboard: bool,
+    pub storage: bool,
     /// `idVendor`/`idProduct`, once the device descriptor has been read.
     /// Zero before that. Reported per port because the port *number* alone
     /// does not say which physical device is which — matching a failing
@@ -167,6 +190,7 @@ impl PortOutcome {
             error: None,
             addressed: false,
             keyboard: false,
+            storage: false,
             vendor: 0,
             product: 0,
         }
@@ -181,6 +205,7 @@ impl PortScan {
         self.other_devices += other.other_devices;
         self.failed += other.failed;
         self.keyboards += other.keyboards;
+        self.storage += other.storage;
     }
 }
 
@@ -303,6 +328,14 @@ impl Ring {
 
 // ── Per-device state ─────────────────────────────────────────────────────────
 
+/// What `configure_device` made of a device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceKind {
+    Keyboard,
+    Storage,
+    Other,
+}
+
 /// A HID boot keyboard this driver is actively polling.
 struct Keyboard {
     /// Device Context Index of its interrupt IN endpoint.
@@ -326,6 +359,7 @@ struct Device {
     /// Scratch page for control-transfer data stages.
     buf: Dma,
     keyboard: Option<Keyboard>,
+    storage: Option<msc::MassStorage>,
 }
 
 // ── The controller ───────────────────────────────────────────────────────────
@@ -352,6 +386,10 @@ pub struct Xhci {
     /// How many unexpected events have been logged — see
     /// `handle_async_event`.
     async_events_logged: u32,
+
+    /// Decoded keyboard scancodes awaiting `poll` — see [`PENDING_KEYS`].
+    pending_keys: [u8; PENDING_KEYS],
+    pending_len: usize,
 }
 
 // SAFETY: the raw pointers are a fixed MMIO window and permanently-owned
@@ -467,6 +505,8 @@ impl Xhci {
             _erst: Dma::alloc()?,
             devices: [const { None }; MAX_SLOTS as usize],
             async_events_logged: 0,
+            pending_keys: [0; PENDING_KEYS],
+            pending_len: 0,
         };
 
         ctrl.reset()?;
@@ -754,16 +794,15 @@ impl Xhci {
         let limit_ns = timeout_ms * 1_000_000;
         let mut spins: u64 = 0;
         loop {
-            while let Some(trb) = self.next_event() {
-                if trb.trb_type() == x::TRB_COMMAND_COMPLETION_EVENT && trb.pointer() == cmd_trb_phys
-                {
-                    return if trb.completion_code() == x::COMP_SUCCESS {
-                        Ok(trb)
-                    } else {
-                        Err(XhciError::Failed(trb.completion_code()))
-                    };
-                }
-                self.handle_async_event(trb);
+            let mine = |t: &Trb| {
+                t.trb_type() == x::TRB_COMMAND_COMPLETION_EVENT && t.pointer() == cmd_trb_phys
+            };
+            if let Some(trb) = self.service_events(&mine) {
+                return if trb.completion_code() == x::COMP_SUCCESS {
+                    Ok(trb)
+                } else {
+                    Err(XhciError::Failed(trb.completion_code()))
+                };
             }
             if self.op_read(x::OP_USBSTS) & (x::USBSTS_HCE | x::USBSTS_HSE) != 0 {
                 crate::serial_println!("xhci: host controller error while waiting for a command");
@@ -778,6 +817,90 @@ impl Xhci {
             }
             core::hint::spin_loop();
         }
+    }
+
+    /// **The only reader of the event ring.** Drains it, routing every
+    /// event to where it belongs, and returns the first one `want` accepts
+    /// — leaving everything after it on the ring for the next call.
+    ///
+    /// Why one reader: the ring is shared by every command and every
+    /// endpoint on the controller. Before mass storage there were two
+    /// readers — `poll` for the keyboard, and each waiter for its own
+    /// completion — and each treated whatever it found as its own or as
+    /// noise. A keyboard report that arrived while enumeration was waiting
+    /// on another device's control transfer was logged and dropped, and
+    /// with it the keyboard's only outstanding transfer: nothing re-armed
+    /// it and the keyboard went silent for good. A disk read spinning for
+    /// its completion would have done the same to every keystroke typed
+    /// during it — and, in the other direction, `poll` would have swallowed
+    /// the disk's completion, which then times out a second later disguised
+    /// as a plain `Timeout`, the failure shape that cost three bare-metal
+    /// cycles on the keyboard driver.
+    ///
+    /// So routing lives here, once: keyboard transfer events are decoded
+    /// into `pending_keys` and re-armed no matter who is draining; the
+    /// caller's own event comes back to it; anything else is logged. The
+    /// caller always holds the `CONTROLLERS` lock, which is what makes
+    /// "whoever is draining" a single party at any instant.
+    ///
+    /// Bounded to one ring's worth of events per call, so a controller
+    /// flooding events cannot pin the timer ISR.
+    fn service_events(&mut self, want: &dyn Fn(&Trb) -> bool) -> Option<Trb> {
+        for _ in 0..RING_TRBS {
+            let trb = self.next_event()?;
+            if self.handle_keyboard_event(&trb) {
+                continue;
+            }
+            if want(&trb) {
+                return Some(trb);
+            }
+            self.handle_async_event(trb);
+        }
+        None
+    }
+
+    /// Consumes a Transfer Event if it belongs to a keyboard's interrupt
+    /// endpoint: decodes the report into `pending_keys` and re-arms the
+    /// transfer. Returns whether it was a keyboard event.
+    fn handle_keyboard_event(&mut self, trb: &Trb) -> bool {
+        if trb.trb_type() != x::TRB_TRANSFER_EVENT {
+            return false;
+        }
+        let slot = trb.slot_id();
+        if slot == 0 || slot as usize > self.devices.len() {
+            return false;
+        }
+        let mut report = [0u8; 8];
+        let report_len = {
+            let Some(kb) = self.devices[slot as usize - 1].as_mut().and_then(|d| d.keyboard.as_mut()) else {
+                return false;
+            };
+            if kb.dci != trb.endpoint_id() {
+                return false;
+            }
+            kb.report.read_bytes(0, &mut report);
+            kb.report_len
+        };
+
+        let code = trb.completion_code();
+        if code == x::COMP_SUCCESS || code == x::COMP_SHORT_PACKET {
+            let valid = (report_len as u32).saturating_sub(trb.transfer_length()) as usize;
+            let mut decoded = [0u8; 2 * hal::hid::MAX_EVENTS];
+            let n = self.decode_report(slot, &report[..valid.min(report.len())], &mut decoded);
+            let room = PENDING_KEYS - self.pending_len;
+            let take = n.min(room);
+            self.pending_keys[self.pending_len..self.pending_len + take].copy_from_slice(&decoded[..take]);
+            self.pending_len += take;
+            if take < n {
+                crate::debug::add_usb_keys_dropped((n - take) as u64);
+            }
+        }
+
+        // Re-arm regardless of completion code: a stalled endpoint would
+        // need a Reset Endpoint command this driver doesn't issue, but a
+        // transient error must not silently end input.
+        let _ = self.queue_keyboard_report(slot);
+        true
     }
 
     /// Events that arrive while waiting for something else — port-status
@@ -836,7 +959,7 @@ impl Xhci {
             crate::debug::USB,
                     "xhci: p{} spd={} slot={} [{:04x}:{:04x}] {} OK{}",
                     out.port, out.speed, out.slot, out.vendor, out.product, out.stage,
-                    if out.keyboard { " KBD" } else { "" },
+                    if out.keyboard { " KBD" } else if out.storage { " STORAGE" } else { "" },
                 ),
                 Some(e) => crate::serial_println!(
                     "xhci: p{} spd={} slot={} [{:04x}:{:04x}] sc={:#x} FAIL at {} ({:?} {})",
@@ -850,6 +973,8 @@ impl Xhci {
             }
             if out.keyboard {
                 scan.keyboards += 1;
+            } else if out.storage {
+                scan.storage += 1;
             } else if out.error.is_none() {
                 scan.other_devices += 1;
             }
@@ -957,8 +1082,9 @@ impl Xhci {
         out.addressed = true;
 
         match self.configure_device(slot, &mut out) {
-            Ok(is_keyboard) => {
-                out.keyboard = is_keyboard;
+            Ok(kind) => {
+                out.keyboard = kind == DeviceKind::Keyboard;
+                out.storage = kind == DeviceKind::Storage;
                 out.stage = "done";
             }
             Err(e) => out.error = Some(e),
@@ -1028,6 +1154,7 @@ impl Xhci {
             ep0,
             buf,
             keyboard: None,
+            storage: None,
         });
         Ok(())
     }
@@ -1045,17 +1172,17 @@ impl Xhci {
 
     // ── Device configuration ────────────────────────────────────────────
 
-    /// Reads the descriptors of an addressed device and, if it is a HID
-    /// boot keyboard, configures its interrupt endpoint and starts polling
-    /// it. Returns whether it was a keyboard.
-    fn configure_device(&mut self, slot: u8, out: &mut PortOutcome) -> Result<bool> {
+    /// Reads the descriptors of an addressed device and sets up the ones
+    /// this driver has a use for: a HID boot keyboard (interrupt endpoint,
+    /// polled) or a Bulk-Only mass-storage device (see `msc.rs`).
+    fn configure_device(&mut self, slot: u8, out: &mut PortOutcome) -> Result<DeviceKind> {
         out.stage = "desc8";
         // 1. First eight bytes of the device descriptor, for the real
         //    control max packet size.
         let mut header = [0u8; 8];
         let n = self.control_in(slot, SetupPacket::get_descriptor(usb::DESC_DEVICE, 0, 8), &mut header)?;
         let Some(desc) = usb::parse_device_descriptor(&header[..n]) else {
-            return Ok(false);
+            return Ok(DeviceKind::Other);
         };
 
         let speed = self.device(slot)?.speed;
@@ -1096,7 +1223,7 @@ impl Xhci {
             &mut cfg_header,
         )?;
         let Some(total) = usb::config_total_length(&cfg_header[..n]) else {
-            return Ok(false);
+            return Ok(DeviceKind::Other);
         };
         let total = total.min(MAX_CONFIG_BYTES);
 
@@ -1109,8 +1236,21 @@ impl Xhci {
         )?;
 
         let Some(kb) = usb::find_boot_keyboard(&config[..n]) else {
-            crate::ktrace!(crate::debug::USB, "xhci: slot {} is not a boot keyboard", slot);
-            return Ok(false);
+            if let Some(ms) = usb::find_mass_storage(&config[..n]) {
+                out.stage = "msc";
+                return match self.configure_storage(slot, &ms) {
+                    Ok(()) => Ok(DeviceKind::Storage),
+                    Err(e) => {
+                        crate::serial_println!("usb-storage: slot {} bring-up failed: {:?}", slot, e);
+                        Err(match e {
+                            MscError::Xhci(x) => x,
+                            _ => XhciError::Unusable,
+                        })
+                    }
+                };
+            }
+            crate::ktrace!(crate::debug::USB, "xhci: slot {} is neither a boot keyboard nor storage", slot);
+            return Ok(DeviceKind::Other);
         };
         crate::serial_println!(
             "xhci: slot {} boot keyboard on interface {} ep {:#04x} ({} bytes, bInterval={})",
@@ -1138,7 +1278,7 @@ impl Xhci {
         let _ = self.control_out(slot, SetupPacket::set_idle(kb.interface));
 
         self.queue_keyboard_report(slot)?;
-        Ok(true)
+        Ok(DeviceKind::Keyboard)
     }
 
     fn device(&mut self, slot: u8) -> Result<&mut Device> {
@@ -1362,12 +1502,11 @@ impl Xhci {
         let mut residual = 0u32;
         let start = crate::time::ktime_get();
         let mut spins: u64 = 0;
+        let mine = |t: &Trb| {
+            t.trb_type() == x::TRB_TRANSFER_EVENT && t.slot_id() == slot && t.endpoint_id() == EP0_DCI
+        };
         loop {
-            while let Some(trb) = self.next_event() {
-                if trb.trb_type() != x::TRB_TRANSFER_EVENT {
-                    self.handle_async_event(trb);
-                    continue;
-                }
+            while let Some(trb) = self.service_events(&mine) {
                 // **Any** event for this slot's EP0 belongs to this
                 // transfer — matching on the TRB pointer alone was a real
                 // bug, and an expensive one: an error reported against the
@@ -1378,11 +1517,6 @@ impl Xhci {
                 // in the first instrumented bare-metal run read as
                 // `Timeout` for exactly that reason, which said nothing
                 // about what the hardware had actually objected to.
-                if trb.slot_id() != slot || trb.endpoint_id() != EP0_DCI {
-                    self.handle_async_event(trb);
-                    continue;
-                }
-
                 let code = trb.completion_code();
                 let ptr = trb.pointer();
                 if code != x::COMP_SUCCESS && code != x::COMP_SHORT_PACKET {
@@ -1425,77 +1559,27 @@ impl Xhci {
 
     // ── Runtime polling ─────────────────────────────────────────────────
 
-    /// Drains the event ring, decoding any keyboard reports into
-    /// `scancodes` (the PS/2 Set-1 bytes to feed
-    /// `keyboard::process_scancode`) and returning how many were produced.
+    /// Drains the event ring and hands out the keyboard scancodes decoded
+    /// since the last call (the PS/2 Set-1 bytes to feed
+    /// `keyboard::process_scancode`), returning how many were written.
     ///
     /// Called from the timer ISR, so it does no allocation, takes no other
-    /// lock, and never waits: work that cannot be finished now is simply
-    /// left for the next tick. The decoded scancodes are *returned* rather
-    /// than dispatched here so the caller can drop this driver's lock
-    /// before feeding them into the keyboard pipeline — which itself takes
-    /// the scheduler lock (`tty::feed_input` can deliver SIGINT).
-    pub fn poll(&mut self, scancodes: &mut [u8], limit: usize) -> usize {
-        let mut produced = 0usize;
-        let mut events = 0usize;
-
-        loop {
-            // Stop *before* dequeuing when the output buffer could not
-            // hold another key transition (two bytes worst case): an event
-            // taken off the ring is gone, so leaving it there is what
-            // makes the overflow a deferral to the next tick rather than a
-            // dropped keystroke.
-            if produced + 2 > limit.min(scancodes.len()) {
-                break;
-            }
-            let Some(trb) = self.next_event() else { break };
-            events += 1;
-            if events > RING_TRBS {
-                break; // one segment's worth per tick, no more
-            }
-            if trb.trb_type() != x::TRB_TRANSFER_EVENT {
-                continue;
-            }
-            let slot = trb.slot_id();
-            let code = trb.completion_code();
-            if slot == 0 || slot as usize > self.devices.len() {
-                continue;
-            }
-
-            let mut report = [0u8; 8];
-            let (matched, report_len) = {
-                let Some(dev) = self.devices[slot as usize - 1].as_mut() else {
-                    continue;
-                };
-                let Some(kb) = dev.keyboard.as_mut() else {
-                    continue;
-                };
-                if kb.dci != trb.endpoint_id() {
-                    continue;
-                }
-                kb.report.read_bytes(0, &mut report);
-                (true, kb.report_len)
-            };
-            if !matched {
-                continue;
-            }
-
-            if code == x::COMP_SUCCESS || code == x::COMP_SHORT_PACKET {
-                let valid = (report_len as u32).saturating_sub(trb.transfer_length()) as usize;
-                produced += self.decode_report(slot, &report[..valid.min(report.len())], &mut scancodes[produced..], limit - produced);
-            }
-
-            // Re-arm regardless of completion code: a stalled endpoint
-            // would need a Reset Endpoint command this driver doesn't
-            // issue, but a transient error must not silently end input.
-            let _ = self.queue_keyboard_report(slot);
-        }
-
-        produced
+    /// lock, and never waits. The scancodes are *returned* rather than
+    /// dispatched here so the caller can drop this driver's lock before
+    /// feeding them into the keyboard pipeline — which itself takes the
+    /// scheduler lock (`tty::feed_input` can deliver SIGINT). Whatever does
+    /// not fit in `scancodes` stays pending for the next tick.
+    pub fn poll(&mut self, scancodes: &mut [u8]) -> usize {
+        let _ = self.service_events(&|_| false);
+        let n = self.pending_len.min(scancodes.len());
+        scancodes[..n].copy_from_slice(&self.pending_keys[..n]);
+        self.pending_keys.copy_within(n..self.pending_len, 0);
+        self.pending_len -= n;
+        n
     }
 
     /// Turns one boot report into Set-1 scancodes.
-    fn decode_report(&mut self, slot: u8, report: &[u8], out: &mut [u8], limit: usize) -> usize {
+    fn decode_report(&mut self, slot: u8, report: &[u8], out: &mut [u8]) -> usize {
         let Some(dev) = self.devices[slot as usize - 1].as_mut() else {
             return 0;
         };
@@ -1513,7 +1597,7 @@ impl Xhci {
             };
             // Two bytes worst case (the 0xE0 prefix plus the code), so
             // stop while both still fit.
-            if written + 2 > limit.min(out.len()) {
+            if written + 2 > out.len() {
                 break;
             }
             if code.extended {

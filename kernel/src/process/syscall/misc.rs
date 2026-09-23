@@ -31,7 +31,8 @@ pub(super) fn sys_meminfo_kb() -> SyscallResult {
 /// `cmd`: 0 = get current mask (other args ignored). 1 = set: resolve
 /// `name` (a NUL-terminated string, e.g. "mm") to its subsystem bit and
 /// set or clear it in the mask depending on `enable`; returns the *new*
-/// mask, or `EINVAL` if `name` doesn't match a known subsystem.
+/// mask, or `EINVAL` if `name` doesn't match a known subsystem. 2 = panic
+/// the kernel on purpose (never returns).
 pub(super) fn sys_kdebug_ctl(cmd: u64, name_ptr: u64, enable: u64) -> SyscallResult {
     match cmd {
         0 => crate::debug::get_mask() as SyscallResult,
@@ -60,10 +61,38 @@ pub(super) fn sys_kdebug_ctl(cmd: u64, name_ptr: u64, enable: u64) -> SyscallRes
             crate::debug::set_mask(mask);
             mask as SyscallResult
         }
+        // A deliberate kernel panic — Linux's `echo c > /proc/sysrq-trigger`.
+        // Exists to exercise the panic path end to end on demand, above all
+        // the panic handler's flush of the log to the USB stick
+        // (`block::logpart::on_panic`), which is otherwise only reached by
+        // a real bug. `kdebug panic`.
+        2 => panic!("kdebug panic: deliberate panic requested from userspace"),
         _ => errno::EINVAL,
     }
 }
 
+
+/// sys_sync (Linux #162) — this kernel has no write-back cache to flush
+/// (ext2 writes are synchronous), so what `sync` does here is the one
+/// thing that *is* buffered: copy the kernel log ring to the USB stick's
+/// `constanos-log` partition (`block::logpart`), the "write it now" before
+/// rebooting the machine to read it.
+///
+/// Unlike Linux's `sync`, which cannot fail, this reports what happened —
+/// `kdebug sync` prints it: `ENODEV` when there is no log partition in
+/// use, `EBUSY` if a flush is already running, `EIO` if the write failed.
+pub(super) fn sys_sync() -> SyscallResult {
+    use crate::block::logpart::{flush, FlushError};
+    match flush(hal::logpart::Reason::Sync) {
+        Ok(_) => 0,
+        Err(FlushError::NoPartition) => errno::ENODEV,
+        Err(FlushError::Busy) => errno::EBUSY,
+        Err(FlushError::Io(e)) => {
+            crate::serial_println!("klog-disk: sync failed: {}", e);
+            errno::EIO
+        }
+    }
+}
 
 /// sys_uptime_sec (custom #202) — seconds elapsed since kernel boot.
 ///

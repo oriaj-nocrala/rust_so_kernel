@@ -180,9 +180,12 @@ fn render_fbinfo() -> String {
         None => out.push_str("phys: <not mapped?>\n"),
     }
     out.push_str(&format!(
-        "pte_cache_bits: PAT={} PCD={} PWT={} -> pat_index={}\n",
-        r.pat_bit as u8, r.pcd as u8, r.pwt as u8, r.pat_index,
+        "pte_cache_bits: {} page, PAT={} PCD={} PWT={} -> pat_index={}\n",
+        r.page_size.unwrap_or("?"), r.pat_bit as u8, r.pcd as u8, r.pwt as u8, r.pat_index,
     ));
+    if let Some(p) = r.phys {
+        out.push_str(&render_physmap_alias(p, len as u64, r.pat_msr));
+    }
     out.push_str(&format!(
         "pat_msr: {:#018x} (entry {} = {}, WC entry present: {})\n",
         r.pat_msr,
@@ -228,6 +231,38 @@ fn render_fbinfo() -> String {
         tsc_pair_cost(),
     ));
     out.push_str(&crate::debug::render_fb_report());
+    out
+}
+
+/// Whether the bootloader's physical-memory window also maps the
+/// framebuffer aperture, and with which caching bits: one line for the
+/// aperture's first byte and one for its last.
+///
+/// Phase 2 of `docs/fb/wc-shadow-plan.md` maps the framebuffer WC. If the
+/// same frames are also mapped WB here, the two mappings disagree on the
+/// memory type, which the SDM leaves undefined. Whether that alias exists
+/// depends on how far the bootloader's window reaches, which on the target
+/// machine is not known yet, so it is read here rather than assumed. Two
+/// ends because the aperture can straddle the end of the window.
+fn render_physmap_alias(fb_phys: u64, len: u64, pat_msr: u64) -> String {
+    let offset = crate::memory::physical_memory_offset().as_u64();
+    let mut out = String::new();
+    for (label, phys) in [("first", fb_phys), ("last", fb_phys + len.saturating_sub(1))] {
+        let virt = x86_64::VirtAddr::new(offset + phys);
+        out.push_str(&match crate::memory::memtype::leaf_for(virt) {
+            None => format!("physmap_alias_{}: {:#x} not mapped\n", label, virt.as_u64()),
+            Some(l) => {
+                let (pat, pcd, pwt) = l.cache_bits();
+                let idx = hal::memtype::pat_index(pat, pcd, pwt);
+                format!(
+                    "physmap_alias_{}: {:#x} -> {:#x}, {} page, PAT={} PCD={} PWT={} -> pat_index={} ({})\n",
+                    label, virt.as_u64(), l.phys, l.size_name(),
+                    pat as u8, pcd as u8, pwt as u8, idx,
+                    hal::memtype::pat_entry(pat_msr, idx).map(|t| t.name()).unwrap_or("?"),
+                )
+            }
+        });
+    }
     out
 }
 

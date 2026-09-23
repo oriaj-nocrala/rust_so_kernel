@@ -13,6 +13,7 @@
 #include <string.h>
 
 #define SYS_KDEBUG_CTL 403
+#define SYS_SYNC 162
 
 static long raw_syscall(long nr, long a1, long a2, long a3) {
     long ret;
@@ -28,6 +29,21 @@ static long raw_syscall(long nr, long a1, long a2, long a3) {
 static void usage(void) {
     printf("usage: kdebug                    show current mask\n");
     printf("       kdebug <subsystem> <on|off>  (mm, sched, fs, proc)\n");
+    printf("       kdebug sync               copy the kernel log to the USB stick\n");
+    printf("       kdebug panic              panic the kernel on purpose (tests the panic path)\n");
+}
+
+// sync(2) — in this kernel, the flush of the log ring to the pendrive's
+// `constanos-log` partition (kernel/src/block/logpart.rs). Unlike Linux's
+// it reports failure, and says why, so the result is worth printing.
+static int do_sync(void) {
+    long r = raw_syscall(SYS_SYNC, 0, 0, 0);
+    switch (r) {
+    case 0:   printf("kdebug: log written to the USB stick\n"); return 0;
+    case -19: printf("kdebug: no log partition in use (see /proc/dmesg: klog-disk)\n"); return 1;
+    case -16: printf("kdebug: a flush is already running\n"); return 1;
+    default:  printf("kdebug: log flush failed (%ld)\n", r); return 1;
+    }
 }
 
 int main(int argc, char **argv) {
@@ -36,6 +52,15 @@ int main(int argc, char **argv) {
         printf("kdebug: mask=0x%lx\n", mask);
         usage();
         return 0;
+    }
+
+    if (argc == 2 && strcmp(argv[1], "sync") == 0) {
+        return do_sync();
+    }
+    if (argc == 2 && strcmp(argv[1], "panic") == 0) {
+        raw_syscall(SYS_KDEBUG_CTL, 2, 0, 0);
+        printf("kdebug: still alive?\n");
+        return 1;
     }
 
     if (argc != 3) {

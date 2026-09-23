@@ -275,6 +275,7 @@ pub enum SyscallNumber {
     Kill = 62,
     Setpgid = 109,
     Setsid = 112,
+    Sync = 162,
     Getpgid = 121,
     ArchPrctl = 158,
     Futex = 202,
@@ -356,6 +357,7 @@ impl SyscallNumber {
             112 => Some(Self::Setsid),
             121 => Some(Self::Getpgid),
             158 => Some(Self::ArchPrctl),
+            162 => Some(Self::Sync),
             202 => Some(Self::Futex),
             213 => Some(Self::EpollCreate),
             217 => Some(Self::GetDents64),
@@ -391,6 +393,7 @@ pub mod errno {
     pub const EACCES: i64 = -13;
     pub const EFAULT: i64 = -14;
     pub const ENOTBLK: i64 = -15;
+    pub const ENODEV: i64 = -19;
     pub const EBUSY: i64 = -16;
     pub const EEXIST: i64 = -17;
     pub const ENOTDIR: i64 = -20;
@@ -586,5 +589,6 @@ pub fn syscall_handler(
         SyscallNumber::MemInfoKb => misc::sys_meminfo_kb(),
         SyscallNumber::KdebugCtl => misc::sys_kdebug_ctl(arg1, arg2, arg3),
         SyscallNumber::Statvfs => fs::sys_statvfs(arg1 as usize, arg2 as usize),
+        SyscallNumber::Sync => misc::sys_sync(),
     }
 }

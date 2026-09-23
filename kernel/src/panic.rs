@@ -43,6 +43,7 @@ fn panic(info: &PanicInfo) -> ! {
         Some(guard) => guard,
         None => {
             crate::serial_println_raw!("  (framebuffer locked — skipping panic screen)");
+            crate::block::logpart::on_panic();
             loop { unsafe { core::arch::asm!("hlt"); } }
         }
     };
@@ -74,6 +75,13 @@ fn panic(info: &PanicInfo) -> ! {
         let _ = writeln!(writer, "Press any key to reboot (jk, reinicia manualmente)");
         
     }
+    drop(fb_lock);
+
+    // Last: copy the log (this panic's report included) to the USB stick.
+    // After the panic screen, because a USB transfer can take seconds to
+    // time out and the screen must not wait on it. Best-effort, never
+    // blocks — see `block::logpart::on_panic`.
+    crate::block::logpart::on_panic();
     
     loop {
         unsafe { core::arch::asm!("hlt"); }

@@ -87,6 +87,29 @@ pub fn pat_index(pat: bool, pcd: bool, pwt: bool) -> u8 {
     ((pat as u8) << 2) | ((pcd as u8) << 1) | (pwt as u8)
 }
 
+/// The caching bits of a *leaf* paging-structure entry, as
+/// `(pat, pcd, pwt)`, from the raw 64-bit entry.
+///
+/// `large` is true for a leaf that maps a 2 MiB or 1 GiB page (a PDE or
+/// PDPTE with PS set). The PAT bit moves with the page size: bit 7 in a
+/// 4 KiB PTE, bit 12 in a large-page entry, because bit 7 is PS there.
+/// PCD (bit 4) and PWT (bit 3) are in the same place at every level.
+///
+/// Takes the raw entry rather than `x86_64::PageTableFlags` because that
+/// type builds with `from_bits_truncate` and has no bit 12. A large page's
+/// PAT bit is dropped before the caller sees it, and bit 7 reads as set,
+/// since it is PS. Reading the PAT bit from bit 7 through that type
+/// reports PAT=1 for every large page. `/proc/fbinfo` got it wrong in
+/// exactly that way until this existed.
+pub fn leaf_cache_bits(entry: u64, large: bool) -> (bool, bool, bool) {
+    let pat_bit = if large { 12 } else { 7 };
+    (
+        entry & (1 << pat_bit) != 0,
+        entry & (1 << 4) != 0,
+        entry & (1 << 3) != 0,
+    )
+}
+
 /// Decode one of `IA32_PAT`'s eight entries.
 ///
 /// Returns `None` for an index above 7 rather than wrapping — an
@@ -283,6 +306,29 @@ pub fn mtrr_wc_supported(mtrrcap: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_4k_pte_keeps_its_pat_bit_in_bit_7() {
+        // PRESENT | PWT | PAT(7)
+        assert_eq!(leaf_cache_bits(0x1 | 0x8 | 0x80, false), (true, false, true));
+        // Bit 12 means nothing in a 4 KiB PTE: it is an address bit.
+        assert_eq!(leaf_cache_bits(0x1 | 0x1000, false), (false, false, false));
+    }
+
+    #[test]
+    fn a_large_page_keeps_its_pat_bit_in_bit_12_and_bit_7_is_ps() {
+        // PRESENT | PS(7): PS set, PAT clear. The wrong reading says PAT=1.
+        assert_eq!(leaf_cache_bits(0x1 | 0x80, true), (false, false, false));
+        // PRESENT | PCD | PS | PAT(12)
+        assert_eq!(leaf_cache_bits(0x1 | 0x10 | 0x80 | 0x1000, true), (true, true, false));
+    }
+
+    #[test]
+    fn pcd_and_pwt_do_not_move_with_page_size() {
+        for large in [false, true] {
+            assert_eq!(leaf_cache_bits(0x18, large), (false, true, true));
+        }
+    }
 
     #[test]
     fn memtype_raw_encodings_round_trip_to_their_names() {

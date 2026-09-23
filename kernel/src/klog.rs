@@ -114,6 +114,21 @@ fn copy_range(start: usize, end: usize, out: &mut [u8]) -> usize {
     n
 }
 
+/// Copies the ring's raw array — by array index, not by log position —
+/// starting at `offset`. This is what `block::logpart` writes to disk: the
+/// ring as it sits in memory, sector for sector, so a flush only has to
+/// rewrite the sectors that changed (see `hal::logpart`). Anything past
+/// the end of the array is left untouched rather than panicking — the
+/// panic handler is one of the callers.
+pub fn copy_raw(offset: usize, out: &mut [u8]) {
+    let n = out.len().min(CAPACITY.saturating_sub(offset));
+    let buf = BUF.0.get() as *const u8;
+    for (i, slot) in out[..n].iter_mut().enumerate() {
+        // SAFETY: `offset + i < CAPACITY` by the clamp above.
+        *slot = unsafe { core::ptr::read_volatile(buf.add(offset + i)) };
+    }
+}
+
 /// How many bytes the ring currently holds.
 pub fn len() -> usize {
     mark().min(CAPACITY)

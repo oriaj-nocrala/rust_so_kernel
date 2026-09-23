@@ -164,6 +164,66 @@ impl BlockDevice for MemDisk {
     }
 }
 
+/// A window onto part of another `BlockDevice` — one partition of a disk.
+///
+/// Adds the partition's first LBA to every request and **refuses** any
+/// request that would leave the window, rather than clamping it: a sector
+/// past the end of the ext2 partition is some other partition's data (on
+/// the boot stick, nothing — but on another disk, anything), and a
+/// filesystem bug that asks for it must surface as an I/O error, never as
+/// a read of the neighbour or, worse, a write to it.
+///
+/// `read_only` refuses writes at the device level too. `fs::ext2`'s own
+/// read-only mount already never issues one; this is the second guard,
+/// independent of that code being right.
+pub struct Partition {
+    inner: alloc::boxed::Box<dyn BlockDevice>,
+    first_lba: u32,
+    sectors: u32,
+    read_only: bool,
+}
+
+impl Partition {
+    /// `None` if the window does not fit in 32-bit LBAs.
+    pub fn new(inner: alloc::boxed::Box<dyn BlockDevice>, first_lba: u32, sectors: u32, read_only: bool) -> Option<Self> {
+        first_lba.checked_add(sectors)?;
+        Some(Partition { inner, first_lba, sectors, read_only })
+    }
+
+    pub fn sectors(&self) -> u32 {
+        self.sectors
+    }
+
+    /// The absolute LBA for a request of `count` sectors at `lba`, or an
+    /// error if any of it falls outside the partition.
+    fn translate(&self, lba: u32, count: u8) -> Result<u32, &'static str> {
+        let n = if count == 0 { 256 } else { count as u32 };
+        match lba.checked_add(n) {
+            Some(end) if end <= self.sectors => Ok(self.first_lba + lba),
+            _ => Err("partition: request outside the partition"),
+        }
+    }
+}
+
+impl BlockDevice for Partition {
+    fn present(&self) -> bool {
+        self.inner.present()
+    }
+
+    fn read_sectors(&self, lba: u32, count: u8, buf: &mut [u8]) -> Result<(), &'static str> {
+        let abs = self.translate(lba, count)?;
+        self.inner.read_sectors(abs, count, buf)
+    }
+
+    fn write_sectors(&self, lba: u32, count: u8, buf: &[u8]) -> Result<(), &'static str> {
+        if self.read_only {
+            return Err("partition: read-only");
+        }
+        let abs = self.translate(lba, count)?;
+        self.inner.write_sectors(abs, count, buf)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +299,62 @@ mod tests {
         let snap = disk.snapshot();
         assert_eq!(&snap[..SECTOR_SIZE], &pattern[..]);
         assert!(snap[SECTOR_SIZE..].iter().all(|&b| b == 0));
+    }
+
+    // ── Partition ───────────────────────────────────────────────────────
+
+    /// A 16-sector disk whose every sector is filled with its own number.
+    fn numbered_disk() -> alloc::boxed::Box<MemDisk> {
+        let mut img = alloc::vec![0u8; 16 * SECTOR_SIZE];
+        for (i, sector) in img.chunks_mut(SECTOR_SIZE).enumerate() {
+            sector.fill(i as u8);
+        }
+        alloc::boxed::Box::new(MemDisk::from_vec(img))
+    }
+
+    #[test]
+    fn partition_offsets_reads() {
+        let p = Partition::new(numbered_disk(), 4, 8, true).unwrap();
+        let mut buf = alloc::vec![0u8; 2 * SECTOR_SIZE];
+        p.read_sectors(0, 2, &mut buf).unwrap();
+        assert!(buf[..SECTOR_SIZE].iter().all(|&b| b == 4));
+        assert!(buf[SECTOR_SIZE..].iter().all(|&b| b == 5));
+        p.read_sectors(6, 2, &mut buf).unwrap(); // last two sectors: 10, 11
+        assert!(buf[SECTOR_SIZE..].iter().all(|&b| b == 11));
+    }
+
+    /// One sector past the end is the neighbour's data — must be refused,
+    /// not clamped, including via `count == 0` (= 256) and via LBA
+    /// overflow.
+    #[test]
+    fn partition_refuses_to_leave_its_window() {
+        let p = Partition::new(numbered_disk(), 4, 8, false).unwrap();
+        let mut buf = alloc::vec![0u8; 256 * SECTOR_SIZE];
+        assert!(p.read_sectors(7, 2, &mut buf).is_err());
+        assert!(p.read_sectors(8, 1, &mut buf).is_err());
+        assert!(p.read_sectors(0, 0, &mut buf).is_err());
+        assert!(p.read_sectors(u32::MAX, 1, &mut buf).is_err());
+        assert!(p.write_sectors(7, 2, &buf).is_err());
+    }
+
+    #[test]
+    fn partition_write_lands_in_the_window_or_is_refused_when_read_only() {
+        let ro = Partition::new(numbered_disk(), 4, 8, true).unwrap();
+        assert_eq!(ro.write_sectors(0, 1, &[0xEE; SECTOR_SIZE]), Err("partition: read-only"));
+
+        let disk = numbered_disk();
+        let raw: *const MemDisk = &*disk;
+        let rw = Partition::new(disk, 4, 8, false).unwrap();
+        rw.write_sectors(1, 1, &[0xEE; SECTOR_SIZE]).unwrap();
+        // SAFETY: `rw` owns the box and is still alive; this only reads.
+        let snap = unsafe { (*raw).snapshot() };
+        assert!(snap[5 * SECTOR_SIZE..6 * SECTOR_SIZE].iter().all(|&b| b == 0xEE));
+        assert!(snap[4 * SECTOR_SIZE..5 * SECTOR_SIZE].iter().all(|&b| b == 4));
+        assert!(snap[6 * SECTOR_SIZE..7 * SECTOR_SIZE].iter().all(|&b| b == 6));
+    }
+
+    #[test]
+    fn partition_window_must_fit_32_bit_lbas() {
+        assert!(Partition::new(numbered_disk(), u32::MAX, 2, true).is_none());
     }
 }

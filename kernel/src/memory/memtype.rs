@@ -15,7 +15,7 @@
 // firmware, not something to assume from the code. See `/proc/fbinfo`,
 // which is how it gets read on a machine with no serial capture.
 
-use x86_64::structures::paging::{Page, Size4KiB};
+use x86_64::registers::control::Cr3;
 use x86_64::VirtAddr;
 
 use hal::memtype::{MemType, MtrrDefType, MtrrResolution, VariableMtrr};
@@ -31,10 +31,79 @@ const IA32_PAT: u32 = 0x277;
 /// actually bounds the walk).
 const MAX_VARIABLE_MTRRS: usize = 16;
 
+/// One leaf of the live kernel page table: the entry itself, raw, and
+/// the size of the page it maps.
+#[derive(Clone, Copy)]
+pub struct Leaf {
+    pub phys: u64,
+    /// The raw 64-bit entry, every bit kept. `x86_64::PageTableFlags`
+    /// drops bit 12, which is a large page's PAT bit.
+    pub entry: u64,
+    pub page_size: u64,
+}
+
+impl Leaf {
+    pub fn size_name(&self) -> &'static str {
+        match self.page_size {
+            0x1000 => "4K",
+            0x20_0000 => "2M",
+            _ => "1G",
+        }
+    }
+
+    /// `(pat, pcd, pwt)`, with the PAT bit read from where this page
+    /// size keeps it. See `hal::memtype::leaf_cache_bits`.
+    pub fn cache_bits(&self) -> (bool, bool, bool) {
+        hal::memtype::leaf_cache_bits(self.entry, self.page_size != 0x1000)
+    }
+}
+
+/// Walk the live page table (CR3) down to the leaf that maps `virt`.
+///
+/// Written by hand rather than through `OffsetPageTable::translate`
+/// because that API hands back `PageTableFlags`, which has lost a large
+/// page's PAT bit by the time the caller sees it. The walk reads the
+/// tables through the bootloader's physical-memory window, the same way
+/// every mapper in this kernel does.
+pub fn leaf_for(virt: VirtAddr) -> Option<Leaf> {
+    const PRESENT: u64 = 1;
+    const PS: u64 = 1 << 7;
+    const ADDR: u64 = 0x000F_FFFF_FFFF_F000;
+
+    let offset = super::physical_memory_offset().as_u64();
+    let v = virt.as_u64();
+    let (pml4, _) = Cr3::read();
+    let mut table = pml4.start_address().as_u64();
+
+    // (index shift, page size mapped by a leaf at this level)
+    for (shift, size) in [(39u32, 0u64), (30, 1 << 30), (21, 1 << 21), (12, 1 << 12)] {
+        let idx = (v >> shift) & 0x1FF;
+        // SAFETY: `table` is the physical address of a paging structure
+        // taken from CR3 or from a present non-leaf entry above it, and the
+        // physical window maps all of RAM. Read-only.
+        let entry = unsafe { core::ptr::read_volatile((offset + table + idx * 8) as *const u64) };
+        if entry & PRESENT == 0 {
+            return None;
+        }
+        let leaf = shift == 12 || (size != 0 && entry & PS != 0);
+        if leaf {
+            // A large page's address field starts above its own PAT bit
+            // (bit 12), so mask to the page size, not just to 4 KiB.
+            let base = entry & ADDR & !(size - 1);
+            return Some(Leaf { phys: base + (v & (size - 1)), entry, page_size: size });
+        }
+        table = entry & ADDR;
+    }
+    None
+}
+
 /// Everything `/proc/fbinfo` needs to say about one mapping's memory type.
 pub struct MemTypeReport {
     pub phys: Option<u64>,
-    /// PTE bits that select the PAT entry, as read from the live mapping.
+    /// Page size of the live mapping, or `None` if it is not mapped.
+    pub page_size: Option<&'static str>,
+    /// Leaf-entry bits that select the PAT entry, as read from the live
+    /// mapping, with the PAT bit taken from where that page size keeps it.
     pub pat_bit: bool,
     pub pcd: bool,
     pub pwt: bool,
@@ -81,25 +150,9 @@ fn max_phys_addr_bits() -> u8 {
 /// `virt`: its physical address and caching bits, the PAT, and whatever
 /// MTRR covers the physical page.
 pub fn report_for(virt: VirtAddr) -> MemTypeReport {
-    let page = Page::<Size4KiB>::containing_address(virt);
-    let table = super::page_table_manager::OwnedPageTable::from_current();
-    // SAFETY: reads the live kernel page table through the bootloader's
-    // physical window, exactly as every other caller of this method does.
-    let mapping = unsafe { table.translate_with_flags(page) };
-
-    let (phys, flags) = match mapping {
-        Some((frame, flags)) => (
-            Some(frame.start_address().as_u64() + (virt.as_u64() & 0xFFF)),
-            flags.bits(),
-        ),
-        None => (None, 0),
-    };
-
-    // 4 KiB PTE: bit 7 is PAT (where a large page keeps PS), bit 4 PCD,
-    // bit 3 PWT.
-    let pat_bit = flags & (1 << 7) != 0;
-    let pcd = flags & (1 << 4) != 0;
-    let pwt = flags & (1 << 3) != 0;
+    let leaf = leaf_for(virt);
+    let phys = leaf.map(|l| l.phys);
+    let (pat_bit, pcd, pwt) = leaf.map(|l| l.cache_bits()).unwrap_or((false, false, false));
 
     let pat_msr = rdmsr(IA32_PAT);
     let pat_index = hal::memtype::pat_index(pat_bit, pcd, pwt);
@@ -123,6 +176,7 @@ pub fn report_for(virt: VirtAddr) -> MemTypeReport {
 
     MemTypeReport {
         phys,
+        page_size: leaf.map(|l| l.size_name()),
         pat_bit,
         pcd,
         pwt,

@@ -239,6 +239,7 @@ pub const TRB_ADDRESS_DEVICE: u32 = 11;
 pub const TRB_CONFIGURE_ENDPOINT: u32 = 12;
 pub const TRB_EVALUATE_CONTEXT: u32 = 13;
 pub const TRB_RESET_ENDPOINT: u32 = 14;
+pub const TRB_STOP_ENDPOINT: u32 = 15;
 pub const TRB_SET_TR_DEQUEUE: u32 = 16;
 pub const TRB_NO_OP_COMMAND: u32 = 23;
 pub const TRB_TRANSFER_EVENT: u32 = 32;
@@ -247,7 +248,16 @@ pub const TRB_PORT_STATUS_CHANGE_EVENT: u32 = 34;
 
 /// Completion codes (§6.4.5) worth naming.
 pub const COMP_SUCCESS: u8 = 1;
+pub const COMP_STALL: u8 = 6;
 pub const COMP_SHORT_PACKET: u8 = 13;
+pub const COMP_CONTEXT_STATE_ERROR: u8 = 19;
+pub const COMP_STOPPED: u8 = 26;
+
+/// Endpoint State, bits 2:0 of an Endpoint Context's dword 0 (§6.2.3,
+/// table 6-8) — read back from the controller's *output* device context.
+pub const EP_STATE_RUNNING: u32 = 1;
+pub const EP_STATE_HALTED: u32 = 2;
+pub const EP_STATE_STOPPED: u32 = 3;
 
 const TRB_CYCLE: u32 = 1 << 0;
 const TRB_TOGGLE_CYCLE: u32 = 1 << 1;
@@ -354,6 +364,17 @@ impl Trb {
     /// every later transfer to that device.
     pub fn reset_endpoint(slot: u8, dci: u8, cycle: bool) -> Self {
         let mut t = Self::typed(TRB_RESET_ENDPOINT, cycle);
+        t.0[3] |= ((dci as u32) << 16) | ((slot as u32) << 24);
+        t
+    }
+
+    /// Stop Endpoint (§4.6.9) — halts a *running* endpoint so its dequeue
+    /// pointer can be moved. The recovery for a transfer that timed out
+    /// without the endpoint halting: its TRB is still owned by the
+    /// controller, and Set TR Dequeue Pointer is refused (Context State
+    /// Error) on an endpoint that is still running.
+    pub fn stop_endpoint(slot: u8, dci: u8, cycle: bool) -> Self {
+        let mut t = Self::typed(TRB_STOP_ENDPOINT, cycle);
         t.0[3] |= ((dci as u32) << 16) | ((slot as u32) << 24);
         t
     }
@@ -568,7 +589,9 @@ pub fn build_slot_context(ctx: &mut [u32], speed: u8, root_port: u8, context_ent
 }
 
 /// Endpoint types (§6.2.3, table 6-9).
+pub const EP_TYPE_BULK_OUT: u32 = 2;
 pub const EP_TYPE_CONTROL: u32 = 4;
+pub const EP_TYPE_BULK_IN: u32 = 6;
 pub const EP_TYPE_INTERRUPT_IN: u32 = 7;
 
 /// Writes an Endpoint Context.
@@ -599,6 +622,25 @@ pub fn build_endpoint_context(
     ctx[5] = 0;
     ctx[6] = 0;
     ctx[7] = 0;
+}
+
+/// Writes a bulk Endpoint Context (§6.2.3): no interval, streams off,
+/// and the SuperSpeed companion's `bMaxBurst` in Max Burst Size (dword 1,
+/// bits 15:8) — zero for a USB 2 device, which is also correct there.
+///
+/// Average TRB Length 3 KiB is §4.14.1.1's own suggested starting value
+/// for bulk endpoints; the controller only uses it for bandwidth
+/// estimation, and zero is not allowed.
+pub fn build_bulk_endpoint_context(
+    ctx: &mut [u32],
+    is_in: bool,
+    max_packet: u16,
+    max_burst: u8,
+    ring_phys: u64,
+) {
+    let ep_type = if is_in { EP_TYPE_BULK_IN } else { EP_TYPE_BULK_OUT };
+    build_endpoint_context(ctx, ep_type, max_packet, 0, ring_phys, 3072);
+    ctx[1] |= (max_burst as u32 & 0xFF) << 8;
 }
 
 /// The doorbell value for an endpoint: DB Target = DCI, stream 0.
@@ -931,5 +973,35 @@ mod tests {
         assert_eq!((ctx[0] >> 16) & 0xFF, 6, "interval");
         assert_eq!((ctx[1] >> 3) & 0x7, EP_TYPE_INTERRUPT_IN);
         assert_eq!((ctx[4] >> 16) & 0xFFFF, 8, "max ESIT payload");
+    }
+
+    #[test]
+    fn bulk_endpoint_context_fields() {
+        let mut ctx = [0xFFFF_FFFFu32; 8];
+        build_bulk_endpoint_context(&mut ctx, true, 1024, 15, 0x1234_5000);
+        assert_eq!(ctx[0], 0, "no interval, no streams, no mult");
+        assert_eq!((ctx[1] >> 16) & 0xFFFF, 1024, "max packet");
+        assert_eq!((ctx[1] >> 8) & 0xFF, 15, "max burst");
+        assert_eq!((ctx[1] >> 3) & 0x7, EP_TYPE_BULK_IN);
+        assert_eq!((ctx[1] >> 1) & 0x3, 3, "CErr");
+        assert_eq!(ctx[2], 0x1234_5001, "dequeue pointer with DCS=1");
+        assert_eq!(ctx[3], 0);
+        assert_eq!(ctx[4], 3072, "avg TRB length, and no ESIT payload for bulk");
+
+        build_bulk_endpoint_context(&mut ctx, false, 512, 0, 0x1_0000_2000);
+        assert_eq!((ctx[1] >> 3) & 0x7, EP_TYPE_BULK_OUT);
+        assert_eq!((ctx[1] >> 8) & 0xFF, 0);
+        assert_eq!(ctx[3], 1, "high half of a >4 GiB ring address");
+    }
+
+    #[test]
+    fn stop_endpoint_trb_fields() {
+        let t = Trb::stop_endpoint(3, 5, true);
+        assert_eq!(t.trb_type(), TRB_STOP_ENDPOINT);
+        assert!(t.cycle());
+        assert_eq!((t.0[3] >> 24) & 0xFF, 3, "slot");
+        assert_eq!((t.0[3] >> 16) & 0x1F, 5, "endpoint id");
+        assert_eq!(t.0[3] & (1 << 23), 0, "suspend bit clear");
+        assert_eq!((t.0[0], t.0[1], t.0[2]), (0, 0, 0));
     }
 }
