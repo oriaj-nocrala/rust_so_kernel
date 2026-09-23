@@ -136,6 +136,134 @@ pub fn pat_has_wc(pat_msr: u64) -> bool {
     (0..8).any(|i| pat_entry(pat_msr, i) == Some(MemType::Wc))
 }
 
+/// The PAT entry this kernel reprograms to WC: `PAT=0, PCD=0, PWT=1`.
+///
+/// Index 1 because it is the one Linux uses, and because it is selected
+/// without the PAT bit — which lives in bit 7 of a 4 KiB PTE but bit 12 of
+/// a large-page entry — so the same two flag bits (`WRITE_THROUGH`, no
+/// `NO_CACHE`) mean WC at every page size. The price: after
+/// `program_pat`, **any mapping with `PWT` set and `PCD` clear is WC, not
+/// WT.** Nothing in this kernel maps that way (`memory::mmio` sets both,
+/// index 3), and `program_pat` refuses to run if a live entry already
+/// does — see `find_pat_index_user`.
+pub const PAT_WC_INDEX: u8 = 1;
+
+/// `pat_msr` with entry `index` replaced by `ty`, the other seven left
+/// exactly as they were.
+///
+/// `None` for an index above 7 or a reserved type: `wrmsr` of a reserved
+/// encoding into `IA32_PAT` is a #GP, and on a machine with no serial
+/// capture a #GP this early in boot is a black screen.
+///
+/// Only the one entry changes, rather than writing Linux's whole layout
+/// (`WB WC UC- UC WB WP UC- WT`): entries 5 and 7 would also move there
+/// (WT→WP, UC→WT), and nothing here needs them, so rewriting them would
+/// only add a way for an existing `PAT=1` mapping to change type.
+pub fn pat_with_entry(pat_msr: u64, index: u8, ty: MemType) -> Option<u64> {
+    if index > 7 {
+        return None;
+    }
+    let raw = match ty {
+        MemType::Uc => 0u64,
+        MemType::Wc => 1,
+        MemType::Wt => 4,
+        MemType::Wp => 5,
+        MemType::Wb => 6,
+        MemType::UcMinus => 7,
+        MemType::Reserved(_) => return None,
+    };
+    let shift = index as u64 * 8;
+    Some((pat_msr & !(0xFF << shift)) | (raw << shift))
+}
+
+/// A paging-structure entry that selects a given PAT index — the reason
+/// `program_pat` declines to change that entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PatIndexUser {
+    /// Canonical virtual address of the first byte the entry covers. For
+    /// `level == 5` (CR3 itself) this is 0.
+    pub virt: u64,
+    /// 1 = PT (4 KiB leaf), 2 = PD, 3 = PDPT, 4 = PML4, 5 = CR3.
+    pub level: u8,
+    /// The raw entry (or CR3 value).
+    pub entry: u64,
+    /// Whether the entry maps a page (as opposed to pointing at a table).
+    pub leaf: bool,
+}
+
+/// Walk a 4-level page table and return the first entry — leaf *or not* —
+/// whose caching bits select PAT entry `index`.
+///
+/// Non-leaf entries matter too: the processor reads the next-level table
+/// with the memory type its parent's `PCD`/`PWT` select (PAT bit taken as
+/// 0), and CR3's own `PCD`/`PWT` do the same for the PML4. Changing the
+/// meaning of an index those use would change how page tables are cached,
+/// which is worse than changing a data mapping.
+///
+/// `cr3` is the raw register. `read(phys)` returns the `u64` at a
+/// physical address — the kernel reads through its physical-memory
+/// window, host tests through a map. Pure otherwise: no allocation, and
+/// the recursion depth is the paging depth, so a malformed table cannot
+/// make it unbounded (a table that points back at an ancestor is only
+/// walked again at a lower level, at most four deep).
+pub fn find_pat_index_user(
+    cr3: u64,
+    index: u8,
+    read: &mut dyn FnMut(u64) -> u64,
+) -> Option<PatIndexUser> {
+    // CR3: PWT bit 3, PCD bit 4 — same positions as in an entry.
+    if nonleaf_pat_index(cr3) == index {
+        return Some(PatIndexUser { virt: 0, level: 5, entry: cr3, leaf: false });
+    }
+    walk_table(cr3 & ADDR_MASK, 4, 0, index, read)
+}
+
+const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+fn nonleaf_pat_index(entry: u64) -> u8 {
+    pat_index(false, entry & (1 << 4) != 0, entry & (1 << 3) != 0)
+}
+
+fn walk_table(
+    table: u64,
+    level: u8,
+    virt_base: u64,
+    index: u8,
+    read: &mut dyn FnMut(u64) -> u64,
+) -> Option<PatIndexUser> {
+    let shift = 12 + 9 * (level as u64 - 1);
+    for i in 0..512u64 {
+        let entry = read(table + i * 8);
+        if entry & 1 == 0 {
+            continue;
+        }
+        let virt = canonical(virt_base | (i << shift));
+        // PS (bit 7) makes a PDPTE/PDE a leaf; in a PML4E it is reserved
+        // and in a PTE it is the PAT bit, so it only counts at 2 and 3.
+        let leaf = level == 1 || ((level == 2 || level == 3) && entry & (1 << 7) != 0);
+        let selected = if leaf {
+            let (pat, pcd, pwt) = leaf_cache_bits(entry, level != 1);
+            pat_index(pat, pcd, pwt)
+        } else {
+            nonleaf_pat_index(entry)
+        };
+        if selected == index {
+            return Some(PatIndexUser { virt, level, entry, leaf });
+        }
+        if !leaf {
+            if let Some(hit) = walk_table(entry & ADDR_MASK, level - 1, virt, index, read) {
+                return Some(hit);
+            }
+        }
+    }
+    None
+}
+
+/// Sign-extend bit 47, as a 4-level virtual address must be.
+fn canonical(v: u64) -> u64 {
+    if v & (1 << 47) != 0 { v | 0xFFFF_0000_0000_0000 } else { v & 0x0000_FFFF_FFFF_FFFF }
+}
+
 // ── MTRRs ────────────────────────────────────────────────────────────────
 
 /// One variable-range MTRR, as the raw `IA32_MTRR_PHYSBASE_n` /
@@ -380,6 +508,170 @@ mod tests {
         let linux_like = (PAT_RESET_VALUE & !0xFF00) | (0x01 << 8);
         assert!(pat_has_wc(linux_like));
         assert_eq!(pat_entry(linux_like, 1), Some(MemType::Wc));
+    }
+
+    #[test]
+    fn wc_at_index_1_changes_that_entry_and_leaves_the_other_seven() {
+        let p = pat_with_entry(PAT_RESET_VALUE, PAT_WC_INDEX, MemType::Wc).unwrap();
+        // WB WC UC- UC WB WT UC- UC — the reset layout with entry 1 as WC.
+        assert_eq!(p, 0x0007_0406_0007_0106);
+        assert_eq!(pat_entry(p, 1), Some(MemType::Wc));
+        for i in [0u8, 2, 3, 4, 5, 6, 7] {
+            assert_eq!(pat_entry(p, i), pat_entry(PAT_RESET_VALUE, i), "entry {}", i);
+        }
+        assert!(pat_has_wc(p));
+    }
+
+    #[test]
+    fn pat_with_entry_round_trips_every_real_type_at_every_index() {
+        let types = [MemType::Uc, MemType::Wc, MemType::Wt, MemType::Wp, MemType::Wb, MemType::UcMinus];
+        for i in 0..8u8 {
+            for t in types {
+                let p = pat_with_entry(PAT_RESET_VALUE, i, t).unwrap();
+                assert_eq!(pat_entry(p, i), Some(t));
+            }
+        }
+    }
+
+    #[test]
+    fn pat_with_entry_refuses_reserved_types_and_out_of_range_indices() {
+        assert_eq!(pat_with_entry(PAT_RESET_VALUE, 1, MemType::Reserved(2)), None);
+        assert_eq!(pat_with_entry(PAT_RESET_VALUE, 1, MemType::Reserved(3)), None);
+        assert_eq!(pat_with_entry(PAT_RESET_VALUE, 8, MemType::Wc), None);
+    }
+
+    // ── find_pat_index_user ──────────────────────────────────────────
+
+    use alloc::collections::BTreeMap;
+
+    const P: u64 = 1; // present
+    const PWT: u64 = 1 << 3;
+    const PCD: u64 = 1 << 4;
+    const PS: u64 = 1 << 7;
+
+    /// Fake physical memory holding page tables; absent words read 0.
+    struct Mem(BTreeMap<u64, u64>);
+    impl Mem {
+        fn new() -> Self { Mem(BTreeMap::new()) }
+        fn set(&mut self, table: u64, idx: u64, entry: u64) { self.0.insert(table + idx * 8, entry); }
+        fn find(&self, cr3: u64, index: u8) -> Option<PatIndexUser> {
+            find_pat_index_user(cr3, index, &mut |a| *self.0.get(&a).unwrap_or(&0))
+        }
+    }
+
+    const PML4: u64 = 0x1000;
+    const PDPT: u64 = 0x2000;
+    const PD: u64 = 0x3000;
+    const PT: u64 = 0x4000;
+
+    /// A higher-half chain PML4[511] → PDPT[1] → PD[2] → PT, all
+    /// plain (index 0) and each PT entry a WB 4 KiB page.
+    fn chain() -> Mem {
+        let mut m = Mem::new();
+        m.set(PML4, 511, PDPT | P);
+        m.set(PDPT, 1, PD | P);
+        m.set(PD, 2, PT | P);
+        for i in 0..4 {
+            m.set(PT, i, 0x10_0000 + i * 0x1000 | P);
+        }
+        m
+    }
+
+    #[test]
+    fn a_plain_table_has_no_user_of_index_1() {
+        assert_eq!(chain().find(PML4, 1), None);
+    }
+
+    #[test]
+    fn a_4k_leaf_with_pwt_only_is_found_with_its_canonical_address() {
+        let mut m = chain();
+        m.set(PT, 3, 0x20_0000 | P | PWT);
+        let hit = m.find(PML4, 1).unwrap();
+        assert_eq!(hit.level, 1);
+        assert!(hit.leaf);
+        let expect = 0xFFFF_0000_0000_0000 | (511 << 39) | (1 << 30) | (2 << 21) | (3 << 12);
+        assert_eq!(hit.virt, expect);
+    }
+
+    #[test]
+    fn a_4k_leaf_with_pwt_and_its_pat_bit_selects_index_5_not_1() {
+        let mut m = chain();
+        m.set(PT, 3, 0x20_0000 | P | PWT | (1 << 7));
+        assert_eq!(m.find(PML4, 1), None);
+        assert_eq!(m.find(PML4, 5).map(|h| h.level), Some(1));
+    }
+
+    #[test]
+    fn pwt_and_pcd_together_is_index_3_the_mmio_mapping_and_not_a_conflict() {
+        let mut m = chain();
+        m.set(PT, 0, 0x20_0000 | P | PWT | PCD);
+        assert_eq!(m.find(PML4, 1), None);
+        assert_eq!(m.find(PML4, 3).map(|h| h.level), Some(1));
+    }
+
+    #[test]
+    fn a_2m_leaf_reads_its_pat_bit_from_bit_12_and_ps_is_not_mistaken_for_it() {
+        let mut m = chain();
+        m.set(PD, 7, 0x4000_0000 | P | PS | PWT);
+        assert_eq!(m.find(PML4, 1).map(|h| (h.level, h.leaf)), Some((2, true)));
+
+        let mut m = chain();
+        m.set(PD, 7, 0x4000_0000 | P | PS | PWT | (1 << 12));
+        assert_eq!(m.find(PML4, 1), None, "PAT bit 12 set: index 5");
+        assert_eq!(m.find(PML4, 5).map(|h| h.level), Some(2));
+    }
+
+    #[test]
+    fn a_1g_leaf_is_a_leaf_and_is_not_descended_into() {
+        let mut m = chain();
+        // Points at PT's frame: descending into it would find the PWT
+        // entry planted there. A leaf must not be walked as a table.
+        m.set(PDPT, 5, PT | P | PS);
+        m.set(PT, 9, 0x30_0000 | P | PWT);
+        m.set(PD, 2, 0); // PT is no longer reachable as a table
+        assert_eq!(m.find(PML4, 1), None);
+    }
+
+    #[test]
+    fn a_non_leaf_entry_with_pwt_only_is_found_because_it_types_the_table_below() {
+        let mut m = chain();
+        m.set(PDPT, 1, PD | P | PWT);
+        let hit = m.find(PML4, 1).unwrap();
+        assert_eq!((hit.level, hit.leaf), (3, false));
+    }
+
+    #[test]
+    fn bit_7_of_a_pml4_entry_is_not_ps_so_the_walk_still_descends() {
+        // In a PML4E bit 7 is reserved, not PS. Reading it as PS would
+        // treat the entry as a 512 GiB leaf and never see the PWT-only
+        // page underneath.
+        let mut m = chain();
+        m.set(PML4, 511, PDPT | P | (1 << 7));
+        m.set(PT, 3, 0x20_0000 | P | PWT);
+        assert_eq!(m.find(PML4, 1).map(|h| h.level), Some(1));
+    }
+
+    #[test]
+    fn cr3_with_pwt_only_is_reported_as_level_5() {
+        let m = chain();
+        assert_eq!(m.find(PML4 | PWT, 1).map(|h| h.level), Some(5));
+    }
+
+    #[test]
+    fn non_present_entries_are_ignored_whatever_their_bits() {
+        let mut m = chain();
+        m.set(PT, 10, 0x20_0000 | PWT); // not present
+        assert_eq!(m.find(PML4, 1), None);
+    }
+
+    #[test]
+    fn a_lower_half_address_stays_lower_half() {
+        let mut m = Mem::new();
+        m.set(PML4, 0, PDPT | P);
+        m.set(PDPT, 0, PD | P);
+        m.set(PD, 0, PT | P);
+        m.set(PT, 1, 0x5000 | P | PWT);
+        assert_eq!(m.find(PML4, 1).map(|h| h.virt), Some(0x1000));
     }
 
     fn mtrr(base: u64, ty: u8, size: u64, valid: bool) -> VariableMtrr {

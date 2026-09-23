@@ -52,6 +52,13 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
 
     memory::test_allocators();
 
+    // ── PAT: make entry 1 write-combining ──────────────────────────
+    // Before anything can map `PWT`-only and before the first process
+    // (every address space is cloned from the kernel's, so checking this
+    // one table covers them all). No mapping changes type here; phase 3
+    // of `docs/fb/wc-shadow-plan.md` is what points the framebuffer at it.
+    serial_println!("PAT: {}", crate::memory::memtype::program_pat());
+
     // ── Framebuffer RAM shadow ─────────────────────────────────────
     // Needs the heap, so not before `init_core`; before the boot screen so
     // that is drawn through the shadow too. Best-effort: on failure the

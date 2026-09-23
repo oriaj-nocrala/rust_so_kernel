@@ -202,6 +202,10 @@ fn render_fbinfo() -> String {
         r.pat_type.map(|t| t.name()).unwrap_or("?"),
         r.pat_has_wc,
     ));
+    out.push_str(&match crate::memory::memtype::pat_program_status() {
+        Some(p) => format!("pat_program: {}\n", p),
+        None => String::from("pat_program: not run\n"),
+    });
     out.push_str(&format!(
         "mtrrcap: {:#x} (variable={} wc_supported={}) def_type: {:#x}\n",
         r.mtrrcap, r.range_count, r.mtrr_wc_supported, r.def_type,

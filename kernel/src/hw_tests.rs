@@ -599,3 +599,35 @@ fn framebuffer_shadow_mode_flushes_exactly_what_changed() {
     let other: &'static mut [u8] = Box::leak(vec![0u8; LEN].into_boxed_slice());
     assert!(!fb.attach_shadow(other), "attach_shadow must not replace an attached shadow");
 }
+
+/// Phase 2 of `docs/fb/wc-shadow-plan.md`: `program_pat` (run by
+/// `boot_for_tests`, as by the real boot) made PAT entry 1 WC, left the
+/// other seven entries exactly as they were, and the live `IA32_PAT` —
+/// read here, not from the recorded status — says so. QEMU's reset PAT
+/// has no WC entry and no mapping uses index 1, so anything other than
+/// `Programmed` means the scan or the write misbehaved.
+#[test_case]
+fn pat_entry_1_is_wc_and_nothing_else_moved() {
+    use crate::memory::memtype::{pat_program_status, PatProgram};
+    use hal::memtype::{pat_entry, MemType, PAT_WC_INDEX};
+
+    let (before, after) = match pat_program_status() {
+        Some(PatProgram::Programmed { before, after }) => (before, after),
+        Some(other) => panic!("program_pat did not program: {}", other),
+        None => panic!("program_pat never ran in boot_for_tests"),
+    };
+    // SAFETY: IA32_PAT is architectural; reading it has no side effects.
+    let live = unsafe { x86_64::registers::model_specific::Msr::new(0x277).read() };
+    assert_eq!(live, after, "live IA32_PAT differs from what program_pat reported");
+    assert_eq!(pat_entry(live, PAT_WC_INDEX), Some(MemType::Wc));
+    for i in (0..8u8).filter(|&i| i != PAT_WC_INDEX) {
+        assert_eq!(pat_entry(live, i), pat_entry(before, i), "PAT entry {} changed", i);
+    }
+    assert!(!hal::memtype::pat_has_wc(before), "QEMU's reset PAT should have no WC entry");
+
+    // A second call reports what is there instead of rewriting it.
+    match crate::memory::memtype::program_pat() {
+        PatProgram::AlreadyWc { pat } => assert_eq!(pat, live),
+        other => panic!("second program_pat: {}", other),
+    }
+}

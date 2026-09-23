@@ -57,6 +57,10 @@ pub fn boot_for_tests(boot_info: &'static mut BootInfo) {
         crate::memory::cow::init_zero_frame();
     }
 
+    // Same step as the real boot's, right after the allocators — see
+    // `hw_tests.rs`'s `pat_entry_1_is_wc_and_nothing_else_moved`.
+    crate::serial_println!("PAT: {}", crate::memory::memtype::program_pat());
+
     // Same driver, same registry call, as the real boot's ACPI step
     // (`init/mod.rs`) — see `hw_tests.rs`'s `acpi_selftest_passes`, the
     // consumer. A future APIC test would add its own driver to this same

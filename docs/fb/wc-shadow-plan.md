@@ -2,7 +2,8 @@
 
 > **Estado (2026-09-23):** fases 0 y 1 **hechas y medidas en la Ryzen**.
 > El shadow bajó S de 875 s a 8,2 s y A1 a 0,32 s (resultados abajo, en
-> la fase 1). Siguen las fases 2-3 (PAT + mapeo WC). Las fases 2-3 (PAT + mapeo WC) van después.
+> la fase 1). La fase 2 (PAT) está **hecha y verificada en metal**
+> (arranque #6). Sigue la fase 3 (mapeo WC).
 > El orden cambió respecto a la primera versión de este plan: la medición
 > en metal dijo que el shadow va primero (ver «Por qué este orden»).
 >
@@ -234,10 +235,41 @@ fila a fila (solo el ancho visible, nunca el relleno de `stride`).
 
 ## Fase 2: reprogramar `IA32_PAT` (sin cambio visible)
 
-* `hal::memtype::pat_with_entry(pat_msr, index, MemType) -> u64`, pura y
-  con tests: la entrada 1 del reset pasa a WC, las otras siete no cambian,
-  el resultado es el layout de Linux (`WB WC UC- UC WB WP UC- WT`) y se
-  rechazan los tipos reservados (2, 3).
+**Progreso (2026-09-23): hecha, verificada en QEMU y en metal.** Ryzen,
+arranque #6 (16:52), leído del pendrive: `PAT: programmed, entry 1 = WC
+(0x0007040600070406 -> 0x0007040600070106)`, `/proc/fbinfo` con
+`WC entry present: true`, la PTE del framebuffer sigue en el índice 0,
+el physmap sigue sin cubrir la apertura y el shell arranca. La secuencia
+con `CR0.CD` no congeló la máquina.
+
+* `hal::memtype::pat_with_entry` + `PAT_WC_INDEX` y
+  `hal::memtype::find_pat_index_user` (el recorrido de tablas, genérico
+  sobre una función `read(phys)`): 14 tests de host nuevos (219 en total)
+  y tres sabotajes, los tres detectados (ignorar las entradas no hoja,
+  leer el bit PAT de una hoja grande en el bit 7, tomar el bit 7 de una
+  PML4E como PS). El tercero sobrevivió a la primera versión del test,
+  que no dependía de descender; se reescribió.
+* `memory::memtype::program_pat()`, llamado en `init::boot` justo tras
+  `test_allocators` (y en `boot_for_tests`). Deja el resultado en un
+  `spin::Once` que `/proc/fbinfo` imprime como `pat_program:`, y el log
+  de arranque lleva `PAT: ...` con el valor antes y después.
+* QEMU: `PAT: programmed, entry 1 = WC (0x0007040600070406 ->
+  0x0007040600070106)`, `pat_has_wc: true`, la PTE del framebuffer sigue
+  en el índice 0. Test `pat_entry_1_is_wc_and_nothing_else_moved`, que lee
+  el MSR vivo; sabotaje (escribir otro valor) detectado, y el camino
+  `WRITE MISMATCH` lo reporta. `run-kernel-tests.sh` PASS, `boot-matrix.sh
+  4 3` 12/12 y `QEMU_DEBUG_MEM=8G boot-matrix.sh 4 2` 8/8.
+* **Corrección al plan:** la versión anterior pedía a la vez «las otras
+  siete entradas no cambian» y «el layout de Linux (`WB WC UC- UC WB WP UC-
+  WT`)», que son incompatibles: el de Linux también cambia las entradas 5
+  y 7. Se cambia **solo la entrada 1**; el resultado es `WB WC UC- UC WB
+  WT UC- UC`. Así ninguna entrada que alguien pudiera usar cambia de tipo.
+
+Diseño original:
+
+* `hal::memtype::pat_with_entry(pat_msr, index, MemType)`, pura y
+  con tests: la entrada 1 del reset pasa a WC, las otras siete no cambian
+  y se rechazan los tipos reservados (2, 3).
 * `memory::memtype::program_pat()`, con la secuencia del SDM §11.12.4 e
   IF=0 de punta a punta: `CR0.CD=1, NW=0` → `wbinvd` → vaciar TLB incluidas
   las globales (conmutar `CR4.PGE`) → `wrmsr` → `wbinvd` → vaciar TLB →
@@ -245,8 +277,11 @@ fila a fila (solo el ancho visible, nunca el relleno de `stride`).
 * **Índice 1 (PWT=1, PCD=0, PAT=0)**: está libre (`mmio.rs` usa PWT|PCD, el
   índice 3) y no depende de dónde esté el bit PAT, que cambia con el tamaño
   de página. Antes de reprogramar, un recorrido de las tablas del kernel
-  **busca entradas con PWT=1 y PCD=0; si encuentra alguna no reprograma**
-  y lo deja en el log.
+  **busca entradas que seleccionen el índice 1; si encuentra alguna no
+  reprograma** y lo deja en el log. Se miran también las entradas no hoja
+  y el propio CR3: su PCD/PWT decide con qué tipo se lee la tabla de
+  debajo. Una hoja con PWT=1, PCD=0 y el bit PAT puesto es el índice 5,
+  que no cambia, y no bloquea.
 * Verificación: `pat_has_wc: true` en `/proc/fbinfo`, `boot-matrix`
   limpio, tests en verde y un arranque en metal hasta el shell. No se
   espera ningún cambio de rendimiento; si aparece, desconfiar del

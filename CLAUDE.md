@@ -96,7 +96,7 @@ so addresses actually resolve to real function names instead of bare hex.
 ### QEMU integration tests
 
 Real hardware-path behavior (drivers that need actual QEMU devices, not just host-testable
-pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 198 tests, <1s, no QEMU) is
+pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 219 tests, <1s, no QEMU) is
 asserted by a `#![feature(custom_test_frameworks)]` harness that boots the real kernel in
 QEMU and reports PASS/FAIL as a process exit code:
 
@@ -436,8 +436,14 @@ QEMU (TLB-slot collisions; see the constant's comment), and
 instead of panicking. In QEMU the shadow is slightly *slower* (VRAM is host
 RAM there, so it only adds a copy). **On the Ryzen it took `seq 1 400` from
 875 s to 8.2 s** (one 400-line `write()`: 0.32 s); what remains is
-`fb_flush` writing UC VRAM at 412 MB/s, ~98% of the time. WC (PAT)
-is phases 2-3 of the same plan, not done.
+`fb_flush` writing UC VRAM at 412 MB/s, ~98% of the time. Phase 2 (PAT) is done and verified on the Ryzen: `memory::memtype::program_pat()`
+(in `init::boot` right after `test_allocators`) makes PAT entry 1 —
+`PWT` set, `PCD` clear, at any page size — **WC**, changing only that entry
+(`WB WC UC- UC WB WT UC- UC`), after walking the live page table (tables,
+leaves and CR3) to prove nothing selects index 1 yet; the outcome is
+`pat_program:` in `/proc/fbinfo`. **So any new mapping with
+`WRITE_THROUGH` but not `NO_CACHE` is write-combining, not write-through.**
+Phase 3 (mapping the framebuffer through index 1) is not done.
 
 Register a new driver by:
 1. Creating `kernel/src/drivers/<name>.rs` implementing `FileHandle`
@@ -480,7 +486,7 @@ arbitration, exactly where two PS/2 keyboards would merge.
 **Split across the usual seam.** `hal::xhci` (register/TRB/ring/context
 arithmetic), `hal::usb` (descriptor parsing + setup packets) and
 `hal::hid` (boot-report diffing + the Set-1 table) are pure and host-tested
-— most of `hal`'s 198 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
+— most of `hal`'s 219 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
 DMA pages, doorbells and waiting. That line is drawn hard here because an
 xHCI bring-up failure is nearly unobservable (a wrong bit in a device
 context yields no fault, no log, just a Transfer Event that never arrives)

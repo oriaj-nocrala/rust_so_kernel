@@ -193,3 +193,160 @@ pub fn report_for(virt: VirtAddr) -> MemTypeReport {
         range_count: count,
     }
 }
+
+// ── Reprogramming the PAT (phase 2 of docs/fb/wc-shadow-plan.md) ────────
+
+/// What `program_pat` did, kept for `/proc/fbinfo` — on the serial-less
+/// target that file is the only place the outcome can be read.
+#[derive(Clone, Copy)]
+pub enum PatProgram {
+    /// `IA32_PAT` rewritten and read back equal to `after`.
+    Programmed { before: u64, after: u64 },
+    /// Entry `PAT_WC_INDEX` was already WC (firmware or an earlier call).
+    AlreadyWc { pat: u64 },
+    /// `CPUID.01H:EDX[16]` says there is no PAT.
+    Unsupported,
+    /// A live paging-structure entry selects `PAT_WC_INDEX`; changing its
+    /// meaning would silently retype that mapping, so nothing was written.
+    Blocked { user: hal::memtype::PatIndexUser, pat: u64 },
+    /// `wrmsr` went through but the read-back differs.
+    Mismatch { wrote: u64, read: u64 },
+}
+
+impl core::fmt::Display for PatProgram {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            PatProgram::Programmed { before, after } => {
+                write!(f, "programmed, entry 1 = WC ({:#018x} -> {:#018x})", before, after)
+            }
+            PatProgram::AlreadyWc { pat } => write!(f, "entry 1 already WC ({:#018x})", pat),
+            PatProgram::Unsupported => write!(f, "not programmed: CPU has no PAT"),
+            PatProgram::Blocked { user, pat } => write!(
+                f,
+                "not programmed: level-{} {} entry {:#x} at virt {:#x} already selects index 1 ({:#018x} kept)",
+                user.level,
+                if user.leaf { "leaf" } else { "table" },
+                user.entry,
+                user.virt,
+                pat,
+            ),
+            PatProgram::Mismatch { wrote, read } => {
+                write!(f, "WRITE MISMATCH: wrote {:#018x}, read back {:#018x}", wrote, read)
+            }
+        }
+    }
+}
+
+static PAT_PROGRAM: spin::Once<PatProgram> = spin::Once::new();
+
+/// The outcome of the boot-time `program_pat`, if it has run.
+pub fn pat_program_status() -> Option<PatProgram> {
+    PAT_PROGRAM.get().copied()
+}
+
+fn cpu_has_pat() -> bool {
+    // `cpuid` leaf 1 exists on every x86-64 processor.
+    core::arch::x86_64::__cpuid(1).edx & (1 << 16) != 0
+}
+
+/// Make PAT entry `hal::memtype::PAT_WC_INDEX` (1: `PWT` without `PCD`)
+/// write-combining, leaving the other seven entries alone.
+///
+/// No mapping changes type here: nothing is mapped with index 1, which is
+/// checked first by walking the live kernel page table (leaves *and*
+/// tables, and CR3) — if anything is, the MSR is left as it was and the
+/// reason is recorded. Phase 3 is what points the framebuffer at index 1.
+///
+/// Must run before any process exists (every address space is cloned from
+/// the kernel's, so the walk covers them all) and before any later code
+/// could map `PWT`-only. Call it once per CPU: the SDM requires the PAT to
+/// be identical on all of them, so APs will need it too when SMP exists.
+///
+/// The sequence is the SDM's (vol. 3A §11.11.8, which §11.12.4 points to
+/// for the PAT): caches off in no-fill mode, write back and invalidate,
+/// flush the TLB including global entries, write, flush both again, caches
+/// back on. With interrupts off from the first `CR0` write to the last: a
+/// tick taken with `CR0.CD=1` runs its whole handler uncached, and a hang
+/// here would leave no trace at all on a machine with no serial.
+pub fn program_pat() -> PatProgram {
+    let r = program_pat_inner();
+    PAT_PROGRAM.call_once(|| r);
+    r
+}
+
+fn program_pat_inner() -> PatProgram {
+    use hal::memtype::{MemType, PAT_WC_INDEX};
+
+    if !cpu_has_pat() {
+        return PatProgram::Unsupported;
+    }
+    let before = rdmsr(IA32_PAT);
+    if hal::memtype::pat_entry(before, PAT_WC_INDEX) == Some(MemType::Wc) {
+        return PatProgram::AlreadyWc { pat: before };
+    }
+
+    let offset = super::physical_memory_offset().as_u64();
+    let cr3 = x86_64::registers::control::Cr3::read_raw();
+    let cr3_raw = cr3.0.start_address().as_u64() | cr3.1 as u64;
+    let mut read = |phys: u64| -> u64 {
+        // SAFETY: `phys` is a paging-structure entry address derived from
+        // CR3 or a present non-leaf entry, and the bootloader's physical
+        // window maps all of RAM. Read-only.
+        unsafe { core::ptr::read_volatile((offset + phys) as *const u64) }
+    };
+    if let Some(user) = hal::memtype::find_pat_index_user(cr3_raw, PAT_WC_INDEX, &mut read) {
+        return PatProgram::Blocked { user, pat: before };
+    }
+
+    let after = hal::memtype::pat_with_entry(before, PAT_WC_INDEX, MemType::Wc)
+        .expect("PAT_WC_INDEX is in range and WC is not reserved");
+    // SAFETY: `after` differs from the live PAT only in an entry nothing
+    // maps with (checked above), and holds no reserved encoding.
+    unsafe { write_pat_sdm_sequence(after) };
+
+    let read_back = rdmsr(IA32_PAT);
+    if read_back != after {
+        return PatProgram::Mismatch { wrote: after, read: read_back };
+    }
+    PatProgram::Programmed { before, after }
+}
+
+/// # Safety
+/// `value` must be a valid `IA32_PAT` value (no reserved encodings) and
+/// must not change the type of any entry a live mapping uses.
+unsafe fn write_pat_sdm_sequence(value: u64) {
+    use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
+    use x86_64::instructions::tlb;
+
+    #[inline(always)]
+    unsafe fn wbinvd() {
+        unsafe { core::arch::asm!("wbinvd", options(nostack, preserves_flags)) };
+    }
+
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        let cr0 = Cr0::read();
+        let cr4 = Cr4::read();
+        let pge = cr4.contains(Cr4Flags::PAGE_GLOBAL);
+
+        // No-fill cache mode: CD=1, NW=0.
+        Cr0::write((cr0 | Cr0Flags::CACHE_DISABLE) - Cr0Flags::NOT_WRITE_THROUGH);
+        wbinvd();
+        // Flush the TLB, global entries included: clearing PGE does that
+        // by itself; without PGE a CR3 reload is enough.
+        if pge {
+            Cr4::write(cr4 - Cr4Flags::PAGE_GLOBAL);
+        } else {
+            tlb::flush_all();
+        }
+
+        x86_64::registers::model_specific::Msr::new(IA32_PAT).write(value);
+
+        wbinvd();
+        // PGE is still clear here, so a CR3 reload flushes everything.
+        tlb::flush_all();
+        Cr0::write(cr0);
+        if pge {
+            Cr4::write(cr4);
+        }
+    });
+}
