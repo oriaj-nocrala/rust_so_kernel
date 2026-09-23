@@ -40,6 +40,11 @@ pub struct Leaf {
     /// drops bit 12, which is a large page's PAT bit.
     pub entry: u64,
     pub page_size: u64,
+    /// Physical address of the entry itself, for `set_pat_index_range`
+    /// to rewrite it in place.
+    pub entry_phys: u64,
+    /// Virtual address of the first byte the leaf maps.
+    pub virt_base: u64,
 }
 
 impl Leaf {
@@ -90,7 +95,13 @@ pub fn leaf_for(virt: VirtAddr) -> Option<Leaf> {
             // A large page's address field starts above its own PAT bit
             // (bit 12), so mask to the page size, not just to 4 KiB.
             let base = entry & ADDR & !(size - 1);
-            return Some(Leaf { phys: base + (v & (size - 1)), entry, page_size: size });
+            return Some(Leaf {
+                phys: base + (v & (size - 1)),
+                entry,
+                page_size: size,
+                entry_phys: table + idx * 8,
+                virt_base: v & !(size - 1),
+            });
         }
         table = entry & ADDR;
     }
@@ -349,4 +360,108 @@ unsafe fn write_pat_sdm_sequence(value: u64) {
             Cr4::write(cr4);
         }
     });
+}
+
+// ── Retyping a mapping (phase 3 of docs/fb/wc-shadow-plan.md) ───────────
+
+/// What `set_pat_index_range` changed.
+#[derive(Clone, Copy)]
+pub struct Retyped {
+    pub pages_4k: usize,
+    pub pages_large: usize,
+    /// PAT index the first leaf selected before the change.
+    pub old_index: u8,
+}
+
+/// Why `set_pat_index_range` changed nothing.
+#[derive(Clone, Copy, Debug)]
+pub enum RetypeError {
+    /// Some page of the range has no mapping.
+    NotMapped { virt: u64 },
+    /// A 2 MiB/1 GiB leaf maps memory outside the range too: retyping it
+    /// would retype that memory as well.
+    LargeLeafOutside { virt: u64, page_size: u64 },
+    BadIndex,
+}
+
+impl core::fmt::Display for RetypeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            RetypeError::NotMapped { virt } => write!(f, "{:#x} not mapped", virt),
+            RetypeError::LargeLeafOutside { virt, page_size } => write!(
+                f,
+                "{:#x} is inside a {} KiB page that extends past the range",
+                virt,
+                page_size / 1024,
+            ),
+            RetypeError::BadIndex => write!(f, "PAT index out of range"),
+        }
+    }
+}
+
+/// Point every leaf that maps `[virt, virt + len)` at PAT entry `index`,
+/// in the live kernel page table, and invalidate those TLB entries.
+///
+/// All or nothing: the whole range is checked first (every page mapped,
+/// no large leaf reaching outside it), and only then written, so a range
+/// that fails leaves every entry as it was. The range is rounded out to
+/// whole 4 KiB pages.
+///
+/// Only the leaves change, never the tables above them, and the kernel's
+/// lower-level tables are shared by every address space
+/// (`OwnedPageTable::new_user` copies the upper entries, not the tables),
+/// so a process created later sees the new type too; one that already
+/// exists does as well, for the same reason. Single CPU: there is no
+/// other TLB to shoot down.
+///
+/// Ends with `wbinvd`. Moving *to* a non-cacheable type while a line of
+/// the range sits in a cache would leave that line to be written back
+/// later over whatever the new mapping wrote; the aperture this exists
+/// for was UC and has no cached lines, but the function should not rely
+/// on what its caller used to be.
+pub fn set_pat_index_range(virt: u64, len: u64, index: u8) -> Result<Retyped, RetypeError> {
+    if index > 7 {
+        return Err(RetypeError::BadIndex);
+    }
+    let start = virt & !0xFFF;
+    let end = (virt + len + 0xFFF) & !0xFFF;
+
+    // Pass 1: check, change nothing.
+    let mut v = start;
+    let mut out = Retyped { pages_4k: 0, pages_large: 0, old_index: 0 };
+    while v < end {
+        let leaf = leaf_for(VirtAddr::new(v)).ok_or(RetypeError::NotMapped { virt: v })?;
+        if leaf.page_size != 0x1000
+            && (leaf.virt_base < start || leaf.virt_base + leaf.page_size > end)
+        {
+            return Err(RetypeError::LargeLeafOutside { virt: v, page_size: leaf.page_size });
+        }
+        if v == start {
+            let (pat, pcd, pwt) = leaf.cache_bits();
+            out.old_index = hal::memtype::pat_index(pat, pcd, pwt);
+        }
+        if leaf.page_size == 0x1000 { out.pages_4k += 1 } else { out.pages_large += 1 }
+        v = leaf.virt_base + leaf.page_size;
+    }
+
+    // Pass 2: rewrite each leaf and drop its TLB entry.
+    let offset = super::physical_memory_offset().as_u64();
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut v = start;
+        while v < end {
+            let leaf = leaf_for(VirtAddr::new(v)).expect("checked in pass 1");
+            let new = hal::memtype::with_pat_index(leaf.entry, leaf.page_size != 0x1000, index)
+                .expect("index checked above");
+            // SAFETY: `entry_phys` is the live leaf entry `leaf_for` just
+            // walked to, reached through the physical window; only its
+            // caching bits change, so it maps the same frame as before.
+            unsafe { core::ptr::write_volatile((offset + leaf.entry_phys) as *mut u64, new) };
+            x86_64::instructions::tlb::flush(VirtAddr::new(leaf.virt_base));
+            v = leaf.virt_base + leaf.page_size;
+        }
+        // SAFETY: `wbinvd` writes back and invalidates caches; no memory
+        // is changed from the program's point of view.
+        unsafe { core::arch::asm!("wbinvd", options(nostack, preserves_flags)) };
+    });
+    Ok(out)
 }

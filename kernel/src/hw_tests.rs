@@ -631,3 +631,72 @@ fn pat_entry_1_is_wc_and_nothing_else_moved() {
         other => panic!("second program_pat: {}", other),
     }
 }
+
+/// Phase 3 of `docs/fb/wc-shadow-plan.md`: `set_pat_index_range`, the
+/// page-table half of mapping the framebuffer WC, against real page
+/// tables. (The test boot has no framebuffer console, so the aperture
+/// itself is not retyped here; the real boot logs `framebuffer: ...` and
+/// `/proc/fbinfo` shows `fb_wc:`.)
+///
+/// (1) a 4 KiB mapping ends up selecting PAT index 1, which is WC, keeps
+/// its frame, and still reads back what is written through it; (2) a
+/// page inside one of the physical window's large leaves is refused,
+/// because retyping the leaf would retype its neighbours too; (3) a range
+/// whose second page is unmapped is refused *before* the first page is
+/// touched — all or nothing.
+#[test_case]
+fn set_pat_index_range_retypes_4k_leaves_and_refuses_the_rest() {
+    use crate::memory::memtype::{leaf_for, set_pat_index_range, RetypeError};
+    use hal::memtype::{pat_entry, pat_index, MemType, PAT_WC_INDEX};
+    use x86_64::VirtAddr;
+
+    let index_of = |v: u64| {
+        let l = leaf_for(VirtAddr::new(v)).expect("mapped");
+        let (p, c, w) = l.cache_bits();
+        (pat_index(p, c, w), l.phys)
+    };
+
+    // A fresh frame nobody else uses, mapped once more through
+    // `mmio::map` (4 KiB, PWT|PCD: index 3).
+    let frame = unsafe { crate::allocator::phys_alloc(12) }.expect("a frame");
+    let virt = unsafe { crate::memory::mmio::map(frame, 4096) }.expect("mmio mapping").as_u64();
+    let (before, phys) = index_of(virt);
+    assert_eq!(before, 3, "mmio::map is PWT|PCD");
+    assert_eq!(phys, frame.as_u64());
+
+    // (3) first, while the page is still index 3: page 2 is unmapped.
+    match set_pat_index_range(virt, 2 * 4096, PAT_WC_INDEX) {
+        Err(RetypeError::NotMapped { virt: v }) => assert_eq!(v, virt + 4096),
+        Err(e) => panic!("expected NotMapped, got: {}", e),
+        Ok(_) => panic!("a range with an unmapped page was accepted"),
+    }
+    assert_eq!(index_of(virt).0, 3, "a refused range changed its first page");
+
+    // (1)
+    let r = set_pat_index_range(virt, 4096, PAT_WC_INDEX).expect("retype a 4K leaf");
+    assert_eq!((r.pages_4k, r.pages_large, r.old_index), (1, 0, 3));
+    let (after, phys_after) = index_of(virt);
+    assert_eq!(after, PAT_WC_INDEX);
+    assert_eq!(phys_after, frame.as_u64(), "retyping moved the frame");
+    // SAFETY: IA32_PAT is architectural; reading it has no side effects.
+    let pat = unsafe { x86_64::registers::model_specific::Msr::new(0x277).read() };
+    assert_eq!(pat_entry(pat, after), Some(MemType::Wc));
+    let p = virt as *mut u64;
+    unsafe {
+        core::ptr::write_volatile(p, 0x5743_5f4f_4b21_0001);
+        core::arch::asm!("sfence", options(nostack, preserves_flags));
+        assert_eq!(core::ptr::read_volatile(p), 0x5743_5f4f_4b21_0001);
+    }
+
+    // (2) the physical window maps with large pages.
+    let window = crate::memory::physical_memory_offset().as_u64() + frame.as_u64();
+    let leaf = leaf_for(VirtAddr::new(window)).expect("physical window maps RAM");
+    assert_ne!(leaf.page_size, 0x1000, "expected the physical window to use large pages");
+    let entry_before = leaf.entry;
+    match set_pat_index_range(window, 4096, PAT_WC_INDEX) {
+        Err(RetypeError::LargeLeafOutside { .. }) => {}
+        Err(e) => panic!("expected LargeLeafOutside, got: {}", e),
+        Ok(_) => panic!("retyped a large leaf for a 4K range"),
+    }
+    assert_eq!(leaf_for(VirtAddr::new(window)).unwrap().entry, entry_before);
+}

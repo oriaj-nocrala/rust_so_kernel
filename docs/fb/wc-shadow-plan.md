@@ -3,7 +3,8 @@
 > **Estado (2026-09-23):** fases 0 y 1 **hechas y medidas en la Ryzen**.
 > El shadow bajó S de 875 s a 8,2 s y A1 a 0,32 s (resultados abajo, en
 > la fase 1). La fase 2 (PAT) está **hecha y verificada en metal**
-> (arranque #6). Sigue la fase 3 (mapeo WC).
+> (arranque #6). La fase 3 (mapeo WC) está hecha y medida en metal
+> (arranque #7): `fb_flush` de 412 a ~5 600 MB/s, S de 8,18 s a 0,75 s.
 > El orden cambió respecto a la primera versión de este plan: la medición
 > en metal dijo que el shadow va primero (ver «Por qué este orden»).
 >
@@ -291,6 +292,39 @@ Diseño original:
 
 ## Fase 3: mapear el framebuffer como WC
 
+**Progreso (2026-09-23): hecha y medida en metal** (arranque #7, tabla
+completa en `console-perf.md`): `fb_flush` 412 → 5 486-6 038 MB/s
+(~13,5x; la predicción era «GB/s»), S 8,18 → 0,754 s, A 8,30 → 0,862 s,
+B 68 → 35 ms, C 1,26 → 0,818 s. `draw_char` y `scroll_up` sin cambio,
+como se predijo.
+
+* `hal::memtype::with_pat_index` (reescribe los bits de caché de una hoja
+  sin tocar PS ni el resto), 3 tests de host (222 en total).
+* `memory::memtype::set_pat_index_range`: todo o nada. Una primera pasada
+  comprueba que cada página del rango esté mapeada y que ninguna hoja
+  grande se salga del rango; solo entonces reescribe cada hoja, hace
+  `invlpg` y termina con un `wbinvd`. `leaf_for` devuelve ahora también
+  la dirección física de la entrada.
+* `framebuffer::map_write_combining()`, llamado en `init::boot` justo tras
+  `program_pat`. Solo actúa si el PAT tiene WC en el índice 1. Su
+  resultado sale en el log (`framebuffer: write-combining (...)`) y como
+  `fb_wc:` en `/proc/fbinfo`.
+* `sfence` al final de `flush()` (dentro de la medición de `fb_flush`) y
+  en `touched()` en modo directo.
+* QEMU: `framebuffer: write-combining (1000 x 4K + 0 large pages, PAT
+  index 0 -> 1)`, `pte_cache_bits: ... PWT=1 -> pat_index=1`, pantalla
+  correcta por captura tras `fbbench` entero. Test
+  `set_pat_index_range_retypes_4k_leaves_and_refuses_the_rest`: una hoja
+  de 4K pasa al índice 1 sin cambiar de marco; una página dentro de una
+  hoja grande del physmap se rechaza; un rango con una página sin mapear
+  se rechaza sin tocar la primera. Sabotaje (quitar el rechazo de hojas
+  grandes) detectado. `run-kernel-tests.sh` PASS (8/8), `boot-matrix.sh
+  4 3` 12/12 y con 8G 8/8.
+* **QEMU no mide esto:** `fb_flush` da ~2 200 MB/s, igual que en la fase 1
+  (2 100), y S 1,24 s frente a 1,28 s. QEMU no modela WC.
+
+Diseño original:
+
 * Recorrer `virt_addr()..+byte_len()` (páginas de 4K en ambas máquinas,
   pero el código acepta hojas grandes): PWT=1, PCD=0, bit PAT sin tocar y
   `invlpg`. Corre en el arranque, antes de que exista ningún proceso, y
@@ -347,6 +381,8 @@ Diseño original:
    1,26 s (no cumplido, falta `blit_scaled`, fase 4).**
 3. Fases 2-3: `pat_has_wc: true`, PTE del framebuffer en WC y `fb_flush`
    más rápido en metal, con número.
+   **Cumplido:** arranques #6 y #7, `fb_flush` 412 → ~5 600 MB/s. Con
+   eso C baja a 0,82 s y también cumple el criterio 2.
 4. En todas: `boot-matrix.sh 4 3` limpio, `run-kernel-tests.sh` PASS, tests
    de `hal` en verde, y `console-perf.md` actualizado con los números
    antes/después, incluidos los que no mejoraron.

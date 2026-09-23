@@ -96,7 +96,7 @@ so addresses actually resolve to real function names instead of bare hex.
 ### QEMU integration tests
 
 Real hardware-path behavior (drivers that need actual QEMU devices, not just host-testable
-pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 219 tests, <1s, no QEMU) is
+pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 222 tests, <1s, no QEMU) is
 asserted by a `#![feature(custom_test_frameworks)]` harness that boots the real kernel in
 QEMU and reports PASS/FAIL as a process exit code:
 
@@ -443,7 +443,12 @@ RAM there, so it only adds a copy). **On the Ryzen it took `seq 1 400` from
 leaves and CR3) to prove nothing selects index 1 yet; the outcome is
 `pat_program:` in `/proc/fbinfo`. **So any new mapping with
 `WRITE_THROUGH` but not `NO_CACHE` is write-combining, not write-through.**
-Phase 3 (mapping the framebuffer through index 1) is not done.
+Phase 3 is done too, and measured on the Ryzen: `fb_flush` 412 → ~5,600 MB/s, `seq 1 400` 8.2 s → 0.75 s (QEMU does not model WC and shows no change):
+`framebuffer::map_write_combining()`, right after `program_pat`, points
+the aperture's leaves at index 1 through `memtype::set_pat_index_range`
+(all-or-nothing; refuses a large leaf that reaches outside the range),
+reported as `fb_wc:` in `/proc/fbinfo`; `flush` and direct-mode
+primitives end with `sfence`, since WC stores are weakly ordered.
 
 Register a new driver by:
 1. Creating `kernel/src/drivers/<name>.rs` implementing `FileHandle`
@@ -486,7 +491,7 @@ arbitration, exactly where two PS/2 keyboards would merge.
 **Split across the usual seam.** `hal::xhci` (register/TRB/ring/context
 arithmetic), `hal::usb` (descriptor parsing + setup packets) and
 `hal::hid` (boot-report diffing + the Set-1 table) are pure and host-tested
-— most of `hal`'s 219 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
+— most of `hal`'s 222 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
 DMA pages, doorbells and waiting. That line is drawn hard here because an
 xHCI bring-up failure is nearly unobservable (a wrong bit in a device
 context yields no fault, no log, just a Transfer Event that never arrives)

@@ -59,6 +59,11 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     // of `docs/fb/wc-shadow-plan.md` is what points the framebuffer at it.
     serial_println!("PAT: {}", crate::memory::memtype::program_pat());
 
+    // ── Framebuffer: write-combining ───────────────────────────────
+    // Points the aperture at the PAT entry just made WC. Phase 3 of the
+    // same plan; declines, and says why, if the PAT step did not happen.
+    serial_println!("framebuffer: {}", crate::framebuffer::map_write_combining());
+
     // ── Framebuffer RAM shadow ─────────────────────────────────────
     // Needs the heap, so not before `init_core`; before the boot screen so
     // that is drawn through the shadow too. Best-effort: on failure the

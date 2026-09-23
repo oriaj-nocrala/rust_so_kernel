@@ -176,6 +176,27 @@ pub fn pat_with_entry(pat_msr: u64, index: u8, ty: MemType) -> Option<u64> {
     Some((pat_msr & !(0xFF << shift)) | (raw << shift))
 }
 
+/// `entry` (a raw leaf) with its caching bits rewritten to select PAT
+/// entry `index`, every other bit untouched.
+///
+/// `large` as in `leaf_cache_bits`: the PAT bit is bit 12 of a 2 MiB or
+/// 1 GiB leaf and bit 7 of a 4 KiB one. In a large leaf bit 7 is PS, so
+/// clearing "the PAT bit" there without knowing the page size would turn
+/// the leaf into a pointer to a page table. `None` for an index above 7.
+pub fn with_pat_index(entry: u64, large: bool, index: u8) -> Option<u64> {
+    if index > 7 {
+        return None;
+    }
+    let pat_bit = if large { 12 } else { 7 };
+    let cleared = entry & !((1 << pat_bit) | (1 << 4) | (1 << 3));
+    Some(
+        cleared
+            | (((index as u64 >> 2) & 1) << pat_bit)
+            | (((index as u64 >> 1) & 1) << 4)
+            | ((index as u64 & 1) << 3),
+    )
+}
+
 /// A paging-structure entry that selects a given PAT index — the reason
 /// `program_pat` declines to change that entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -538,6 +559,36 @@ mod tests {
         assert_eq!(pat_with_entry(PAT_RESET_VALUE, 1, MemType::Reserved(2)), None);
         assert_eq!(pat_with_entry(PAT_RESET_VALUE, 1, MemType::Reserved(3)), None);
         assert_eq!(pat_with_entry(PAT_RESET_VALUE, 8, MemType::Wc), None);
+    }
+
+    #[test]
+    fn with_pat_index_round_trips_through_leaf_cache_bits_at_both_page_sizes() {
+        // Present, writable, NX, an address, and — for the large leaf —
+        // PS: every one must survive.
+        let base_4k = 0x8000_0000_7C00_0003u64;
+        let base_2m = 0x8000_0000_7C00_0083u64;
+        for index in 0..8u8 {
+            for (entry, large) in [(base_4k, false), (base_2m, true)] {
+                let e = with_pat_index(entry | PWT | PCD | (1 << 7) | (1 << 12), large, index).unwrap();
+                let (pat, pcd, pwt) = leaf_cache_bits(e, large);
+                assert_eq!(pat_index(pat, pcd, pwt), index, "index {} large {}", index, large);
+                let caching = if large { (1 << 12) | PCD | PWT } else { (1 << 7) | PCD | PWT };
+                assert_eq!(e & !caching, (entry | (1 << 7) | (1 << 12)) & !caching);
+            }
+        }
+    }
+
+    #[test]
+    fn with_pat_index_keeps_ps_on_a_large_leaf() {
+        let e = with_pat_index(0x4000_0000 | P | PS, true, 0).unwrap();
+        assert!(e & PS != 0, "clearing the PAT bit of a 2M leaf must not clear PS");
+        assert_eq!(with_pat_index(0, false, 8), None);
+    }
+
+    #[test]
+    fn with_pat_index_1_on_the_framebuffers_4k_pte_is_pwt_only() {
+        let e = with_pat_index(0x7C_0000_0000 | P | 2, false, PAT_WC_INDEX).unwrap();
+        assert_eq!(e, 0x7C_0000_0000 | P | 2 | PWT);
     }
 
     // ── find_pat_index_user ──────────────────────────────────────────

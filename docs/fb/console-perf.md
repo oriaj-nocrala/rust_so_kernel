@@ -172,6 +172,35 @@ C no llegó al «< 1 s» previsto: el volcado cumplió (16 ms por frame), pero
 píxel en perfil `dev` (fase 4 del plan). Siguiente palanca: el WC (fases
 2-3), que ataca directamente esos 412 MB/s.
 
+## Write-combining en metal (2026-09-23, arranque #7)
+
+Fases 2-3 de `wc-shadow-plan.md`: entrada 1 del PAT en WC y las PTEs de la
+apertura apuntando a ella (`pte_cache_bits: ... PWT=1 -> pat_index=1`,
+MTRR UC). Mismo perfil `dev`, mismo `fbbench`, comparado con el arranque #4
+(solo shadow):
+
+| carga | shadow (UC) | shadow + WC | |
+|---|---|---|---|
+| S `seq 1 400` | 8,18 s | **0,754 s** | 10,8x |
+| A 400 x 80 | 8,30 s | **0,862 s** | 9,6x |
+| A1 un `write()` | 0,32 s | 0,302 s | sin cambio apreciable |
+| B backspace | 68 ms | **35 ms** | 1,9x |
+| C 30 blits | 1,26 s | **0,818 s** | 1,5x |
+| `fb_flush` | 412 MB/s | **5 486-6 038 MB/s** | ~13,5x |
+
+* Un volcado de pantalla completa (8,3 MB) pasa de 75 M ciclos (20 ms) a
+  5,4 M (1,5 ms). Es lo que cuesta cada línea nueva con la pantalla llena.
+* Lo que no tocaba la VRAM no cambió, como se esperaba: `draw_char` ~9 k
+  ciclos, `scroll_up` en RAM 1,28 M. A1 apenas se mueve porque hacía un
+  solo volcado.
+* **Qué domina ahora.** En S, `fb_flush` sigue siendo el 80 % (2 237 de
+  ~2 790 M ciclos) y `render_bytes` (casi todo `scroll_up` en RAM) el
+  19 %. En C, `blit_scaled` en RAM es el 96 %: 96,7 M ciclos (26 ms) por
+  frame, sin cambio. C cumple ya el «< 1 s» del plan, pero por el volcado;
+  `blit_scaled` píxel a píxel sigue siendo la entrada de la fase 4.
+
+De 875 s (línea base) a 0,75 s para `seq 1 400`: unas 1 160 veces.
+
 ## Verificación de este cambio
 
 * `cd hal && cargo test` — 142 (125 antes + 17 de `memtype`).

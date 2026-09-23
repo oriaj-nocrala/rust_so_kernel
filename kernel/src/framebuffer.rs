@@ -94,6 +94,8 @@ impl Framebuffer {
     /// the primitive already wrote VRAM directly.
     fn touched(&mut self, x: usize, y: usize, w: usize, h: usize) {
         if self.shadow.is_none() {
+            // Direct mode: the primitive just wrote VRAM, which may be WC.
+            sfence();
             return;
         }
         self.dirty.mark(x, y, w, h);
@@ -142,6 +144,11 @@ impl Framebuffer {
                 );
             }
         }
+        // With the aperture WC the stores above may still sit in the
+        // write-combining buffers; draining them here makes `fb_flush`
+        // measure the data leaving the CPU, not just the stores retiring,
+        // and puts the frame on screen before the caller moves on.
+        sfence();
         crate::debug::FB_FLUSH.record(
             (r.height() * span) as u64,
             crate::cpu::tsc::read().wrapping_sub(t0),
@@ -528,6 +535,16 @@ impl Color {
     }
 }
 
+/// Drain the write-combining buffers. WC stores are weakly ordered and
+/// may be held back until a buffer fills; everything that writes VRAM ends
+/// with one of these. A no-op cost on a UC or WB mapping.
+#[inline(always)]
+fn sfence() {
+    // SAFETY: `sfence` only orders stores; valid on every x86-64 CPU and
+    // independent of CR0/CR4's SSE enables.
+    unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) };
+}
+
 // Global framebuffer
 pub static FRAMEBUFFER: Mutex<Option<Framebuffer>> = Mutex::new(None);
 
@@ -587,4 +604,83 @@ pub fn attach_shadow() -> bool {
     // Called once, at boot, before anything else can attach one: the
     // `false` arm (and the leak it would imply) is unreachable in practice.
     FRAMEBUFFER.lock().as_mut().is_some_and(|fb| fb.attach_shadow(shadow))
+}
+/// What `map_write_combining` did, for the boot log and `/proc/fbinfo`.
+#[derive(Clone, Copy)]
+pub enum WcStatus {
+    Mapped(crate::memory::memtype::Retyped),
+    /// PAT entry `PAT_WC_INDEX` is not WC (see `pat_program:`), so pointing
+    /// the aperture at it would not make it WC.
+    PatNotWc,
+    Failed(crate::memory::memtype::RetypeError),
+    NoFramebuffer,
+}
+
+impl core::fmt::Display for WcStatus {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            WcStatus::Mapped(r) => write!(
+                f,
+                "write-combining ({} x 4K + {} large pages, PAT index {} -> {})",
+                r.pages_4k,
+                r.pages_large,
+                r.old_index,
+                hal::memtype::PAT_WC_INDEX,
+            ),
+            WcStatus::PatNotWc => write!(f, "not WC: the PAT has no WC entry at index 1"),
+            WcStatus::Failed(e) => write!(f, "not WC: {}", e),
+            WcStatus::NoFramebuffer => write!(f, "not WC: no framebuffer"),
+        }
+    }
+}
+
+static WC_STATUS: spin::Once<WcStatus> = spin::Once::new();
+
+/// The outcome of the boot-time `map_write_combining`, if it has run.
+pub fn wc_status() -> Option<WcStatus> {
+    WC_STATUS.get().copied()
+}
+
+/// Map the aperture write-combining: point its page-table leaves at PAT
+/// entry `hal::memtype::PAT_WC_INDEX`, which `memtype::program_pat` made
+/// WC. Phase 3 of `docs/fb/wc-shadow-plan.md`.
+///
+/// WHY: with the shadow attached, `flush` is the only VRAM writer and is
+/// ~98% of the console's time on the Ryzen, writing UC at 412 MB/s — one
+/// bus transaction per store. WC merges them into bursts. On that machine
+/// no MTRR covers the aperture (default type UC), and MTRR UC + PAT WC is
+/// WC; the bootloader's physical window does not map it, so there is no
+/// second, differently-typed alias. In QEMU there is one (WB PAT, but UC
+/// MTRR, so effectively UC), which the SDM tolerates.
+///
+/// Reads of a WC mapping are uncached and slow, which is why this only
+/// pays off with the shadow: nothing reads VRAM then. Without a shadow it
+/// is still applied — direct mode's writes get the same win, and it only
+/// reads VRAM in `scroll_up`/`xor_rect`, which were UC reads already.
+pub fn map_write_combining() -> WcStatus {
+    let status = map_write_combining_inner();
+    WC_STATUS.call_once(|| status);
+    status
+}
+
+fn map_write_combining_inner() -> WcStatus {
+    use crate::memory::memtype::PatProgram;
+    match crate::memory::memtype::pat_program_status() {
+        Some(PatProgram::Programmed { .. }) | Some(PatProgram::AlreadyWc { .. }) => {}
+        _ => return WcStatus::PatNotWc,
+    }
+    let Some((virt, len)) = FRAMEBUFFER.lock().as_ref().map(|fb| (fb.virt_addr(), fb.byte_len()))
+    else {
+        return WcStatus::NoFramebuffer;
+    };
+    // Nothing draws while this runs (boot, one CPU, interrupts off inside),
+    // so the lock need not be held across the retype.
+    match crate::memory::memtype::set_pat_index_range(
+        virt,
+        len as u64,
+        hal::memtype::PAT_WC_INDEX,
+    ) {
+        Ok(r) => WcStatus::Mapped(r),
+        Err(e) => WcStatus::Failed(e),
+    }
 }
