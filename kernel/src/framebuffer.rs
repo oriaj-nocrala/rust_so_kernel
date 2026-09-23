@@ -479,7 +479,9 @@ impl Framebuffer {
     /// game) that draw into their own small offscreen buffer instead of
     /// going through the text console's char/ANSI layer.
     pub fn blit_scaled(&mut self, src: &[u32], src_w: usize, src_h: usize) {
-        if src_w == 0 || src_h == 0 || src.len() < src_w * src_h {
+        // A pixel narrower than 3 bytes (16 bpp) has no B, G, R layout to
+        // write; no firmware this kernel boots on hands one out.
+        if src_w == 0 || src_h == 0 || src.len() < src_w * src_h || self.bytes_per_pixel < 3 {
             return;
         }
         let t0 = crate::cpu::tsc::read();
@@ -489,36 +491,82 @@ impl Framebuffer {
         let off_x = (self.width.saturating_sub(dst_w)) / 2;
         let off_y = (self.height.saturating_sub(dst_h)) / 2;
 
+        // Clip to the visible area: a source larger than the screen
+        // (scale forced to 1) is cut at `width`/`height`, never written
+        // into `stride` padding or past the last scanline.
+        let vis_w = core::cmp::min(dst_w, self.width.saturating_sub(off_x));
+        let vis_h = core::cmp::min(dst_h, self.height.saturating_sub(off_y));
+        let bpp = self.bytes_per_pixel;
+        let row_bytes = self.stride * bpp;
+        let span = vis_w * bpp;
         let buffer = self.draw_buffer();
 
+        // One destination scanline per source row, then `scale - 1`
+        // copies of it. The per-pixel version this replaced did
+        // `scale * scale` bounds-checked 3-byte stores for every source
+        // pixel: 96.7 M cycles (26 ms) per 320x200 frame on the Ryzen even
+        // into RAM, 96% of `fbbench` C and most of DOOM's frame budget.
+        // Here each destination pixel is written once, as one 32-bit
+        // store, and the replicated rows are a `memcpy`.
         for sy in 0..src_h {
-            let src_row = sy * src_w;
-            for sx in 0..src_w {
-                let p = src[src_row + sx];
-                let r = ((p >> 16) & 0xFF) as u8;
-                let g = ((p >> 8) & 0xFF) as u8;
-                let b = (p & 0xFF) as u8;
-                for oy in 0..scale {
-                    let dy = off_y + sy * scale + oy;
-                    let row_off = dy * self.stride * self.bytes_per_pixel;
-                    for ox in 0..scale {
-                        let dx = off_x + sx * scale + ox;
-                        let offset = row_off + dx * self.bytes_per_pixel;
-                        if offset + self.bytes_per_pixel <= buffer.len() {
-                            buffer[offset] = b;
-                            buffer[offset + 1] = g;
-                            buffer[offset + 2] = r;
-                        }
+            let first = off_y + sy * scale;
+            if first >= off_y + vis_h {
+                break;
+            }
+            let row = &mut buffer[first * row_bytes + off_x * bpp..][..span];
+            let src_row = &src[sy * src_w..(sy + 1) * src_w];
+            // Plain `while` loops over a raw pointer: this kernel runs the
+            // `dev` profile (opt-level 0), where an iterator chain costs a
+            // few calls per pixel. The slice above already bounds-checked
+            // the whole row once.
+            let dst = row.as_mut_ptr();
+            let mut i = 0; // destination pixel within the row
+            let mut sx = 0;
+            if bpp == 4 && dst as usize % 4 == 0 {
+                // The real case: VRAM is page-aligned and the shadow's
+                // `SHADOW_SKEW` is a multiple of 4. A plain aligned store;
+                // `write_unaligned` at opt-level 0 is a call into
+                // `copy_nonoverlapping` and its runtime UB checks per pixel.
+                let d = dst as *mut u32;
+                while sx < src_w && i < vis_w {
+                    // Little-endian 0x00RRGGBB is exactly B, G, R, 0.
+                    let px = src_row[sx] & 0x00FF_FFFF;
+                    let end = core::cmp::min(i + scale, vis_w);
+                    while i < end {
+                        // SAFETY: `i < vis_w`, so the store is inside
+                        // `row`, and `d` is 4-aligned (checked above).
+                        unsafe { *d.add(i) = px };
+                        i += 1;
                     }
+                    sx += 1;
                 }
+            } else {
+                while sx < src_w && i < vis_w {
+                    let bytes = (src_row[sx] & 0x00FF_FFFF).to_le_bytes();
+                    let end = core::cmp::min(i + scale, vis_w);
+                    while i < end {
+                        // SAFETY: `i < vis_w` and `bpp >= 3`, so the three
+                        // bytes are inside `row`.
+                        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(i * bpp), 3) };
+                        i += 1;
+                    }
+                    sx += 1;
+                }
+            }
+            let last = core::cmp::min(first + scale, off_y + vis_h);
+            for dy in first + 1..last {
+                buffer.copy_within(
+                    first * row_bytes + off_x * bpp..first * row_bytes + off_x * bpp + span,
+                    dy * row_bytes + off_x * bpp,
+                );
             }
         }
 
         crate::debug::FB_BLIT.record(
-            (dst_w * dst_h * self.bytes_per_pixel) as u64,
+            (vis_w * vis_h * self.bytes_per_pixel) as u64,
             crate::cpu::tsc::read().wrapping_sub(t0),
         );
-        self.touched(off_x, off_y, dst_w, dst_h);
+        self.touched(off_x, off_y, vis_w, vis_h);
     }
 }
 

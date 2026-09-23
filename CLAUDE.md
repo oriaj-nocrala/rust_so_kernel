@@ -448,7 +448,13 @@ Phase 3 is done too, and measured on the Ryzen: `fb_flush` 412 → ~5,600 MB/s, 
 the aperture's leaves at index 1 through `memtype::set_pat_index_range`
 (all-or-nothing; refuses a large leaf that reaches outside the range),
 reported as `fb_wc:` in `/proc/fbinfo`; `flush` and direct-mode
-primitives end with `sfence`, since WC stores are weakly ordered.
+primitives end with `sfence`, since WC stores are weakly ordered. Phase 4 did only what the numbers asked for: `blit_scaled` builds one
+destination scanline per source row with aligned 32-bit stores and
+replicates it with `memcpy` — 26 ms → 5.2 ms per DOOM frame on the Ryzen.
+At `opt-level 0` with `build-std`, `write_unaligned` is a call into
+`copy_nonoverlapping` with runtime UB checks, which cost most of that win
+until it was replaced by a plain aligned store; per-pixel hot loops here
+need that care.
 
 Register a new driver by:
 1. Creating `kernel/src/drivers/<name>.rs` implementing `FileHandle`

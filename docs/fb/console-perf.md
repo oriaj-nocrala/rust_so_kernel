@@ -201,6 +201,32 @@ MTRR UC). Mismo perfil `dev`, mismo `fbbench`, comparado con el arranque #4
 
 De 875 s (línea base) a 0,75 s para `seq 1 400`: unas 1 160 veces.
 
+## `blit_scaled` por filas (2026-09-23, arranque #8)
+
+Fase 4 de `wc-shadow-plan.md`, la única entrada que pedían los números.
+`blit_scaled` compone una fila de destino por fila de origen (un store de
+32 bits por píxel) y la replica con `memcpy`, en vez de `scale * scale`
+stores de 3 bytes con comprobación de límites por píxel de origen.
+
+| | arranque #7 | arranque #8 | |
+|---|---|---|---|
+| `fb_blit_scaled` por frame 320x200 → 1600x1000 | 96,7 M ciclos (26 ms) | **19,3 M (5,2 ms)** | 5,0x |
+| C (30 frames) | 818 ms | **191 ms** | 4,3x |
+| S / A / A1 / B | 754 / 862 / 302 / 35 ms | 754 / 864 / 304 / 35 ms | sin cambio (no hacen blits) |
+
+* Un frame de DOOM cuesta ahora ~6,3 ms de kernel (5,2 de blit + 1,1 de
+  volcado WC), frente a ~27 ms antes: cabe de sobra en los 28 ms de un
+  tic a 35 fps.
+* **Lo que decidió la ganancia:** el perfil `dev` es `opt-level 0` y
+  `build-std` compila `core` con comprobaciones de UB activas. La primera
+  versión usaba `write_unaligned`, que así es una llamada a
+  `copy_nonoverlapping` con sus comprobaciones por píxel, y en QEMU solo
+  ganaba 1,7x. Con un store alineado directo (la fila está alineada a 4 en
+  la VRAM y en el shadow) ganaba 7,9x en QEMU; en metal ha salido 5x.
+* C: ahora `blit_scaled` es el 82 % (579 de ~705 M ciclos) y el volcado el
+  18 %. S sigue dominado por el volcado (80 %), es decir por escribir
+  8,3 MB en la VRAM a ~5,5 GB/s en cada línea nueva.
+
 ## Verificación de este cambio
 
 * `cd hal && cargo test` — 142 (125 antes + 17 de `memtype`).

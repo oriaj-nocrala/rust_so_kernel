@@ -5,6 +5,8 @@
 > la fase 1). La fase 2 (PAT) está **hecha y verificada en metal**
 > (arranque #6). La fase 3 (mapeo WC) está hecha y medida en metal
 > (arranque #7): `fb_flush` de 412 a ~5 600 MB/s, S de 8,18 s a 0,75 s.
+> Fase 4: solo `blit_scaled` por filas (arranque #8), C de 0,82 s a
+> 0,19 s. El plan queda cerrado.
 > El orden cambió respecto a la primera versión de este plan: la medición
 > en metal dijo que el shadow va primero (ver «Por qué este orden»).
 >
@@ -342,6 +344,17 @@ Diseño original:
   con el shadow puesto, así que no deberían cambiar.
 
 ## Fase 4, solo si los números la piden
+
+**Hecho (2026-09-23): solo `blit_scaled`**, medido en metal (arranque
+#8): 96,7 M → 19,3 M ciclos por frame, C 818 → 191 ms. Detalle en
+`console-perf.md`. Las otras entradas se descartaron con los números del
+arranque #7: el volcado por columnas no hace falta porque `fb_flush` es el
+7 % de B; el volcado diferido al tick añadiría hasta 10 ms de latencia de
+eco para acelerar sobre todo un benchmark (S), y cada línea nueva ya
+cuesta ~1,5 ms; `movntdq` sobre una apertura que ya es WC tiene poco que
+ganar y no hay número que lo pida.
+
+Lista original:
 
 * Volcado por columnas o por bitset de filas, si `fb_flush` domina B.
 * Volcado diferido al tick del timer (añade hasta 10 ms de latencia de

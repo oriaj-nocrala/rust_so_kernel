@@ -482,6 +482,51 @@ fn framebuffer_primitives_touch_exactly_their_own_pixels() {
     assert_eq!(px(0, 0), [0x33, 0x22, 0x11, 0x00], "the marker row moved up by exactly 4 scanlines");
     assert_eq!(px(0, 1), [0, 0, 0, 0]);
     assert_eq!(px(0, H - 1), [0, 0, 0, 0], "the vacated rows are cleared, not left stale");
+
+    // ── blit_scaled: every destination pixel, and nothing else ───────
+    // 3x2 source into 32x16: scale = min(32/3, 16/2) = 8, so 24x16 at
+    // x offset 4. Checked pixel by pixel against the source, because the
+    // row-replication path writes one scanline and copies it.
+    // `scroll_up` above moved and cleared whole rows, padding included, so
+    // "untouched padding" here means "the same as before the blit".
+    let padding = || {
+        let mut v = alloc::vec::Vec::new();
+        for y in 0..H {
+            for x in W..STRIDE {
+                v.push(px(x, y));
+            }
+        }
+        v
+    };
+    fb.fill_rect(0, 0, W, H, Color::rgb(0, 0, 0));
+    let pad_before = padding();
+    let src: [u32; 6] = [0x00_11_22_33, 0x00_44_55_66, 0x00_77_88_99, 0x00_AA_BB_CC, 0x00_DD_EE_F0, 0xFF_01_02_03];
+    fb.blit_scaled(&src, 3, 2);
+    for y in 0..H {
+        for x in 0..W {
+            let got = px(x, y);
+            if (4..28).contains(&x) {
+                let p = src[(y / 8) * 3 + (x - 4) / 8];
+                let want = [p as u8, (p >> 8) as u8, (p >> 16) as u8, 0];
+                assert_eq!(got, want, "blit pixel ({x},{y}) differs from its source pixel (the source's top byte must be dropped)");
+            } else {
+                assert_eq!(got, [0, 0, 0, 0], "letterbox pixel ({x},{y}) must be untouched");
+            }
+        }
+    }
+    assert!(padding() == pad_before, "blit wrote stride padding");
+
+    // A source wider than the screen: scale 1, clipped at `width`, never
+    // into the padding.
+    let wide: [u32; 2 * (STRIDE + 8)] = [0x00_12_34_56; 2 * (STRIDE + 8)];
+    fb.fill_rect(0, 0, W, H, Color::rgb(0, 0, 0));
+    fb.blit_scaled(&wide, STRIDE + 8, 2);
+    // Still centred vertically: rows (16 - 2) / 2 = 7 and 8.
+    assert_eq!(px(0, 7), [0x56, 0x34, 0x12, 0], "a clipped blit still draws what fits");
+    assert_eq!(px(W - 1, 8), [0x56, 0x34, 0x12, 0]);
+    assert_eq!(px(0, 6), [0, 0, 0, 0], "only the source's rows are drawn");
+    assert_eq!(px(0, 9), [0, 0, 0, 0], "only the source's rows are drawn");
+    assert!(padding() == pad_before, "a clipped blit wrote stride padding");
 }
 
 /// The same primitives in shadow mode (`Framebuffer::attach_shadow`,
