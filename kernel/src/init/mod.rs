@@ -39,6 +39,8 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     );
 
     init_global_framebuffer(framebuffer);
+    // Console font size from the screen height; before any text is drawn.
+    crate::drivers::framebuffer_console::init_font();
 
     // ── Memory subsystem ───────────────────────────────────────────
     let phys_mem_offset = VirtAddr::new(

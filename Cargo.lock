@@ -315,6 +315,7 @@ dependencies = [
  "hal",
  "lazy_static",
  "mm",
+ "noto-sans-mono-bitmap",
  "sched",
  "spin 0.10.0",
  "usock",
@@ -397,6 +398,12 @@ version = "0.1.0"
 dependencies = [
  "x86_64",
 ]
+
+[[package]]
+name = "noto-sans-mono-bitmap"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a27daf9557165efe1d09b52f97393bf6283cadb0a76fbe64a1061e15553a994a"
 
 [[package]]
 name = "once_cell"

@@ -83,8 +83,8 @@ La versión anterior ponía el WC primero. Los números dicen otra cosa:
 
 ## Fase 1: shadow buffer en RAM (hecha y medida en metal)
 
-**Progreso:** implementado y verificado en QEMU (2026-09-23). Falta
-desplegar y medir `fbbench` en la Ryzen (último punto).
+**Progreso:** implementado, verificado en QEMU y medido en la Ryzen
+(2026-09-23, arranque #4; resultados más abajo).
 
 * `hal::fbdirty::DirtyRect`, 7 tests de host.
 * `Framebuffer` en modo shadow, `FB_FLUSH` (`fb_flush` en `/proc/fbinfo`
@@ -391,7 +391,8 @@ Lista original:
 2. Fase 1: S y A bajan en metal unas 100 veces (de 875 s a ~10 s), C baja
    de 37 s a menos de 1 s, y ninguna pantalla se queda sin actualizar
    (clientes raros comprobados a ojo). **Medido: S/A 107x (cumplido); C
-   1,26 s (no cumplido, falta `blit_scaled`, fase 4).**
+   1,26 s tras la fase 1, 0,82 s tras la 3 y 0,19 s tras la 4
+   (cumplido).**
 3. Fases 2-3: `pat_has_wc: true`, PTE del framebuffer en WC y `fb_flush`
    más rápido en metal, con número.
    **Cumplido:** arranques #6 y #7, `fb_flush` 412 → ~5 600 MB/s. Con

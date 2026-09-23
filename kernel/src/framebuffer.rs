@@ -305,6 +305,73 @@ impl Framebuffer {
     }
 
     /// Dibuja un carácter en las coordenadas especificadas
+    /// Draw one antialiased glyph cell: `raster[row][col]` is coverage
+    /// (0 = background, 255 = foreground), blended linearly between `bg`
+    /// and `fg`. The cell is `cell_w` x `cell_h` pixels; anything the
+    /// raster does not cover is background. Clipped to the screen.
+    ///
+    /// This is the console's text path (Noto Sans Mono, via
+    /// `noto-sans-mono-bitmap`); `draw_char` stays for the 8x8 bitmap font
+    /// the boot banner and the panic screen use. Same shape as
+    /// `blit_scaled`: at opt-level 0 a plain aligned 32-bit store per
+    /// pixel is what keeps this cheap, so that is the path for the real
+    /// framebuffers (4 bytes per pixel, rows 4-aligned).
+    pub fn draw_glyph(
+        &mut self,
+        x: usize,
+        y: usize,
+        cell_w: usize,
+        cell_h: usize,
+        raster: &[&[u8]],
+        fg: Color,
+        bg: Color,
+    ) {
+        if x >= self.width || y >= self.height || self.bytes_per_pixel < 3 {
+            return;
+        }
+        let t0 = crate::cpu::tsc::read();
+        let w = core::cmp::min(cell_w, self.width - x);
+        let h = core::cmp::min(cell_h, self.height - y);
+        let bpp = self.bytes_per_pixel;
+        let row_bytes = self.stride * bpp;
+        let fg_px = fg.packed();
+        let bg_px = bg.packed();
+        let buffer = self.draw_buffer();
+
+        let mut ry = 0;
+        while ry < h {
+            let row = &mut buffer[(y + ry) * row_bytes + x * bpp..][..w * bpp];
+            let cov: &[u8] = if ry < raster.len() { raster[ry] } else { &[] };
+            let dst = row.as_mut_ptr();
+            let aligned = bpp == 4 && dst as usize % 4 == 0;
+            let mut rx = 0;
+            while rx < w {
+                let a = if rx < cov.len() { cov[rx] } else { 0 };
+                let px = match a {
+                    0 => bg_px,
+                    255 => fg_px,
+                    _ => blend(fg, bg, a),
+                };
+                // SAFETY: `rx < w`, so the pixel is inside `row`.
+                unsafe {
+                    if aligned {
+                        *(dst as *mut u32).add(rx) = px;
+                    } else {
+                        core::ptr::copy_nonoverlapping(px.to_le_bytes().as_ptr(), dst.add(rx * bpp), 3);
+                    }
+                }
+                rx += 1;
+            }
+            ry += 1;
+        }
+
+        crate::debug::FB_DRAW_CHAR.record(
+            (w * h * bpp) as u64,
+            crate::cpu::tsc::read().wrapping_sub(t0),
+        );
+        self.touched(x, y, w, h);
+    }
+
     pub fn draw_char(
         &mut self,
         x: usize,
@@ -581,6 +648,24 @@ impl Color {
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
+
+    /// The pixel as one little-endian `u32`: bytes B, G, R, 0 — the
+    /// layout every primitive here writes.
+    pub const fn packed(self) -> u32 {
+        (self.r as u32) << 16 | (self.g as u32) << 8 | self.b as u32
+    }
+}
+
+/// `bg` moved `a / 255` of the way towards `fg`, per channel, packed.
+/// Linear in sRGB rather than in light: gamma-correct blending would need
+/// a table per channel, and at a glyph's size the difference is a hair of
+/// stroke weight.
+fn blend(fg: Color, bg: Color, a: u8) -> u32 {
+    let mix = |f: u8, b: u8| -> u32 {
+        let (f, b, a) = (f as u32, b as u32, a as u32);
+        (f * a + b * (255 - a) + 127) / 255
+    };
+    mix(fg.r, bg.r) << 16 | mix(fg.g, bg.g) << 8 | mix(fg.b, bg.b)
 }
 
 /// Drain the write-combining buffers. WC stores are weakly ordered and

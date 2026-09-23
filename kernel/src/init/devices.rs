@@ -375,10 +375,13 @@ extern "x86-interrupt" fn timer_handler(_sf: &mut ExceptionStackFrame) {
 /// Draw the initial boot screen (after allocators are ready).
 pub fn draw_boot_screen() {
     let mut fb = framebuffer::FRAMEBUFFER.lock();
+    let mut bottom = 0;
     if let Some(fb) = fb.as_mut() {
         fb.clear(Color::rgb(0, 0, 0));
-        fb.draw_text(10, 10, "ConstanOS v0.1", Color::rgb(0, 200, 255), Color::rgb(0, 0, 0), 2);
-        fb.draw_text(10, 770, "Allocator: Ready", Color::rgb(0, 255, 0), Color::rgb(0, 0, 0), 2);
+        let h = crate::drivers::framebuffer_console::draw_banner(
+            fb, 12, 8, "ConstanOS v0.1", Color::rgb(0x61, 0xAF, 0xEF),
+        );
+        bottom = 8 + h;
     }
     drop(fb);
     // This banner is drawn straight to the framebuffer, not through the
@@ -386,7 +389,7 @@ pub fn draw_boot_screen() {
     // kernel notice would land on top of it. Park the cursor below the
     // banner instead — it made the first `kalert!` line genuinely hard to
     // read on the one screen that matters.
-    crate::drivers::framebuffer_console::reserve_rows_at_top(2);
+    crate::drivers::framebuffer_console::reserve_pixels_at_top(bottom + 8);
 }
 
 /// PIC + PIT + load IDT.

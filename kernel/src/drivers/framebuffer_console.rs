@@ -20,41 +20,125 @@ use crate::{
 const MARGIN_X: usize = 4;
 const MARGIN_Y: usize = 4;
 
-/// Every `draw_char`/`draw_text` call in this file uses this scale — one
-/// constant instead of a literal `1` repeated at each call site, so
-/// `CHAR_W`/`CHAR_H` (and every cols/rows computation derived from them)
-/// can never drift out of sync with what's actually drawn.
-const SCALE: usize = 1;
-const LINE_GAP: usize = 1; // extra px of line spacing below each glyph row
+// ── Font ──────────────────────────────────────────────────────────────────────
+//
+// Noto Sans Mono, pre-rasterised with antialiasing (`noto-sans-mono-bitmap`,
+// no_std, no alloc — the crate `bootloader` itself logs with). It replaced
+// the 8x8 bitmap font at scale 1, which at 1920x1080 made a 240x120 grid of
+// 8-pixel glyphs: hard to read on the physical machine. The size is picked
+// once from the screen height (`init_font`) so a line stays around the same
+// physical size on any screen; the 8x8 font stays for the boot banner and
+// the panic screen, which draw with `Framebuffer::draw_text` directly.
 
-const CHAR_W: usize = crate::framebuffer::GLYPH_W * SCALE;
-const CHAR_H: usize = crate::framebuffer::GLYPH_H * SCALE + LINE_GAP;
+use noto_sans_mono_bitmap::{get_raster, get_raster_width, FontWeight, RasterHeight};
 
-const DEFAULT_FG: Color = Color::rgb(220, 220, 220);
+#[derive(Clone, Copy)]
+struct FontMetrics {
+    size: RasterHeight,
+    /// Cell width and height in pixels. The raster height already includes
+    /// the font's line spacing, so no extra gap is added.
+    w: usize,
+    h: usize,
+}
+
+const fn metrics(size: RasterHeight) -> FontMetrics {
+    FontMetrics {
+        size,
+        w: get_raster_width(FontWeight::Regular, size),
+        h: size.val(),
+    }
+}
+
+/// Before `init_font` (nothing draws text that early) and on a headless
+/// boot.
+const DEFAULT_FONT: FontMetrics = metrics(RasterHeight::Size16);
+
+static FONT: spin::Once<FontMetrics> = spin::Once::new();
+
+fn font() -> FontMetrics {
+    FONT.get().copied().unwrap_or(DEFAULT_FONT)
+}
+
+fn char_w() -> usize {
+    font().w
+}
+
+fn char_h() -> usize {
+    font().h
+}
+
+/// Rows of text for the screen height, about 44-54 lines: 16 px up to 720
+/// lines, 20 px to 1000, 24 px to 1400 (1920x1080 gets 147x44 cells of
+/// 13x24), 32 px above.
+fn pick_font(height: usize) -> RasterHeight {
+    match height {
+        0..=719 => RasterHeight::Size16,
+        720..=999 => RasterHeight::Size20,
+        1000..=1399 => RasterHeight::Size24,
+        _ => RasterHeight::Size32,
+    }
+}
+
+/// Choose the console font for the global framebuffer's size. Called once
+/// from `init::boot`, right after the framebuffer is registered and before
+/// anything writes text.
+pub fn init_font() {
+    let height = FRAMEBUFFER.lock().as_ref().map(|fb| fb.dimensions().1);
+    if let Some(h) = height {
+        FONT.call_once(|| metrics(pick_font(h)));
+    }
+}
+
+/// Draw `text` in the bold 32 px face straight onto `fb`, outside the
+/// console grid — the boot banner. Returns the height drawn, so the caller
+/// can reserve the rows it covers.
+pub fn draw_banner(fb: &mut Framebuffer, x: usize, y: usize, text: &str, fg: Color) -> usize {
+    let size = RasterHeight::Size32;
+    let w = get_raster_width(FontWeight::Bold, size);
+    for (i, c) in text.chars().enumerate() {
+        if let Some(glyph) = get_raster(c, FontWeight::Bold, size) {
+            fb.draw_glyph(x + i * w, y, w, size.val(), glyph.raster(), fg, DEFAULT_BG);
+        }
+    }
+    size.val()
+}
+
+/// Cell size in pixels, for `/proc/fbinfo`.
+pub fn cell_size() -> (usize, usize) {
+    (char_w(), char_h())
+}
+
+// Soft white on black rather than VGA's grey: easier on the eyes at this
+// size without looking washed out.
+const DEFAULT_FG: Color = Color::rgb(0xD8, 0xDB, 0xE0);
 const DEFAULT_BG: Color = Color::rgb(0, 0, 0);
 
 // ── ANSI color palette ────────────────────────────────────────────────────────
+//
+// Tuned for a black background (close to Atom's One Dark). The old one was
+// the VGA text-mode palette, whose blue is (0, 0, 170): nearly invisible on
+// black, and it is the colour `ls --color` gives every directory.
 
 const ANSI_COLORS: [Color; 8] = [
-    Color::rgb(0,   0,   0  ), // 0: black
-    Color::rgb(170, 0,   0  ), // 1: red
-    Color::rgb(0,   170, 0  ), // 2: green
-    Color::rgb(170, 85,  0  ), // 3: yellow (dark)
-    Color::rgb(0,   0,   170), // 4: blue
-    Color::rgb(170, 0,   170), // 5: magenta
-    Color::rgb(0,   170, 170), // 6: cyan
-    Color::rgb(170, 170, 170), // 7: white (light gray)
+    Color::rgb(0x3F, 0x44, 0x4E), // 0: black (a dark grey, so it still shows)
+    Color::rgb(0xE0, 0x6C, 0x75), // 1: red
+    Color::rgb(0x98, 0xC3, 0x79), // 2: green
+    Color::rgb(0xE5, 0xC0, 0x7B), // 3: yellow
+    Color::rgb(0x61, 0xAF, 0xEF), // 4: blue
+    Color::rgb(0xC6, 0x78, 0xDD), // 5: magenta
+    Color::rgb(0x56, 0xB6, 0xC2), // 6: cyan
+    Color::rgb(0xD8, 0xDB, 0xE0), // 7: white
 ];
 
 const ANSI_BRIGHT: [Color; 8] = [
-    Color::rgb(85,  85,  85 ), // 0: bright black (dark gray)
-    Color::rgb(255, 85,  85 ), // 1: bright red
-    Color::rgb(85,  255, 85 ), // 2: bright green
-    Color::rgb(255, 255, 85 ), // 3: bright yellow
-    Color::rgb(85,  85,  255), // 4: bright blue
-    Color::rgb(255, 85,  255), // 5: bright magenta
-    Color::rgb(85,  255, 255), // 6: bright cyan
-    Color::rgb(255, 255, 255), // 7: bright white
+    Color::rgb(0x7F, 0x84, 0x8E), // 0: bright black (grey)
+    Color::rgb(0xFF, 0x7A, 0x85), // 1: bright red
+    Color::rgb(0xB5, 0xE8, 0x90), // 2: bright green
+    Color::rgb(0xFF, 0xD6, 0x8A), // 3: bright yellow
+    Color::rgb(0x8C, 0xC8, 0xFF), // 4: bright blue
+    Color::rgb(0xDD, 0x9C, 0xF5), // 5: bright magenta
+    Color::rgb(0x7F, 0xD8, 0xE3), // 6: bright cyan
+    Color::rgb(0xFF, 0xFF, 0xFF), // 7: bright white
 ];
 
 fn ansi_color(idx: u8, bright: bool) -> Color {
@@ -98,6 +182,11 @@ struct FbState {
     row:  usize,
     fg:   Color,
     bg:   Color,
+    /// SGR 1: drawn with the bold weight of the font.
+    bold: bool,
+    /// SGR 7: foreground and background swapped (`less`'s and `vi`'s
+    /// status lines, selections).
+    reverse: bool,
     ansi: AnsiState,
 }
 
@@ -106,8 +195,23 @@ static FB_STATE: Mutex<FbState> = Mutex::new(FbState {
     row: 0,
     fg: DEFAULT_FG,
     bg: DEFAULT_BG,
+    bold: false,
+    reverse: false,
     ansi: AnsiState::Normal,
 });
+
+/// Draw one character cell at pixel `(px, py)` in the current attributes.
+/// A byte the font has no glyph for (anything outside printable ASCII
+/// reaches here only as such) is drawn as `?`.
+fn draw_cell(fb: &mut Framebuffer, px: usize, py: usize, byte: u8, state: &FbState) {
+    let f = font();
+    let (fg, bg) = if state.reverse { (state.bg, state.fg) } else { (state.fg, state.bg) };
+    let weight = if state.bold { FontWeight::Bold } else { FontWeight::Regular };
+    match get_raster(byte as char, weight, f.size).or_else(|| get_raster('?', weight, f.size)) {
+        Some(glyph) => fb.draw_glyph(px, py, f.w, f.h, glyph.raster(), fg, bg),
+        None => fb.fill_rect(px, py, f.w, f.h, bg),
+    }
+}
 static FB_CLEARED: AtomicBool = AtomicBool::new(false);
 
 /// Set by [`kernel_alert`] / [`kernel_print`] — i.e. whenever the kernel
@@ -148,9 +252,9 @@ static CURSOR_TICKS: AtomicU64 = AtomicU64::new(0);
 const CURSOR_BLINK_TICKS: u64 = 50;
 
 fn cursor_cell_rect(state: &FbState) -> (usize, usize, usize, usize) {
-    let px = MARGIN_X + state.col * CHAR_W;
-    let py = MARGIN_Y + state.row * CHAR_H;
-    (px, py, CHAR_W, crate::framebuffer::GLYPH_H * SCALE)
+    let px = MARGIN_X + state.col * char_w();
+    let py = MARGIN_Y + state.row * char_h();
+    (px, py, char_w(), char_h())
 }
 
 /// If the cursor is currently rendered (inverted) at `state`'s position,
@@ -279,8 +383,14 @@ fn apply_sgr(params: &[u32], state: &mut FbState) {
             0 => {
                 state.fg = DEFAULT_FG;
                 state.bg = DEFAULT_BG;
+                state.bold = false;
+                state.reverse = false;
             }
-            1..=29 => {}  // bold, italic, underline etc — ignore
+            1 => state.bold = true,
+            7 => state.reverse = true,
+            22 => state.bold = false,
+            27 => state.reverse = false,
+            2..=29 => {}  // dim, italic, underline, blink... — ignored
             30..=37 => state.fg = ansi_color((params[i] - 30) as u8, false),
             38 => {
                 if i + 2 < params.len() && params[i + 1] == 5 {
@@ -334,7 +444,7 @@ fn apply_sgr(params: &[u32], state: &mut FbState) {
 /// second of frozen console, and imperceptible in QEMU because there the
 /// framebuffer is host RAM. See `Framebuffer::fill_rect`.
 ///
-/// Blanks the full `CHAR_H` cell height, including the `LINE_GAP` row that
+/// Blanks the full cell height, including the line-spacing rows that
 /// `draw_char` never touches — the old per-cell version left that row
 /// holding whatever was there, which after a scroll or a raw blit was not
 /// necessarily background.
@@ -343,10 +453,10 @@ fn clear_row_from(fb: &mut Framebuffer, state: &FbState, row: usize, start_col: 
         return;
     }
     fb.fill_rect(
-        MARGIN_X + start_col * CHAR_W,
-        MARGIN_Y + row * CHAR_H,
-        (end_col - start_col) * CHAR_W,
-        CHAR_H,
+        MARGIN_X + start_col * char_w(),
+        MARGIN_Y + row * char_h(),
+        (end_col - start_col) * char_w(),
+        char_h(),
         state.bg,
     );
 }
@@ -360,9 +470,9 @@ fn clear_rows(fb: &mut Framebuffer, state: &FbState, row0: usize, row1: usize, c
     }
     fb.fill_rect(
         MARGIN_X,
-        MARGIN_Y + row0 * CHAR_H,
-        cols * CHAR_W,
-        (row1 - row0) * CHAR_H,
+        MARGIN_Y + row0 * char_h(),
+        cols * char_w(),
+        (row1 - row0) * char_h(),
         state.bg,
     );
 }
@@ -491,12 +601,14 @@ fn render_bytes_inner(state: &mut FbState, fb: &mut Framebuffer, buf: &[u8]) {
         state.row = 0;
         state.fg = DEFAULT_FG;
         state.bg = DEFAULT_BG;
+        state.bold = false;
+        state.reverse = false;
         state.ansi = AnsiState::Normal;
     }
 
     let (w, h) = fb.dimensions();
-    let cols = (w.saturating_sub(MARGIN_X)) / CHAR_W;
-    let rows = (h.saturating_sub(MARGIN_Y)) / CHAR_H;
+    let cols = (w.saturating_sub(MARGIN_X)) / char_w();
+    let rows = (h.saturating_sub(MARGIN_Y)) / char_h();
 
     for &byte in buf {
         // Replace state.ansi with Normal, taking ownership of the old value.
@@ -512,7 +624,7 @@ fn render_bytes_inner(state: &mut FbState, fb: &mut Framebuffer, buf: &[u8]) {
                         state.col = 0;
                         state.row += 1;
                         if state.row >= rows {
-                            fb.scroll_up(CHAR_H);
+                            fb.scroll_up(char_h());
                             state.row = rows - 1;
                         }
                     }
@@ -522,21 +634,21 @@ fn render_bytes_inner(state: &mut FbState, fb: &mut Framebuffer, buf: &[u8]) {
                     0x08 | 0x7f => {
                         if state.col > 0 {
                             state.col -= 1;
-                            let px = MARGIN_X + state.col * CHAR_W;
-                            let py = MARGIN_Y + state.row * CHAR_H;
-                            fb.draw_char(px, py, b' ', state.fg, state.bg, SCALE);
+                            let px = MARGIN_X + state.col * char_w();
+                            let py = MARGIN_Y + state.row * char_h();
+                            draw_cell(fb, px, py, b' ', state);
                         }
                     }
                     b if b >= 0x20 && b < 0x7f => {
-                        let px = MARGIN_X + state.col * CHAR_W;
-                        let py = MARGIN_Y + state.row * CHAR_H;
-                        fb.draw_char(px, py, b, state.fg, state.bg, SCALE);
+                        let px = MARGIN_X + state.col * char_w();
+                        let py = MARGIN_Y + state.row * char_h();
+                        draw_cell(fb, px, py, b, state);
                         state.col += 1;
                         if state.col >= cols {
                             state.col = 0;
                             state.row += 1;
                             if state.row >= rows {
-                                fb.scroll_up(CHAR_H);
+                                fb.scroll_up(char_h());
                                 state.row = rows - 1;
                             }
                         }
@@ -683,10 +795,11 @@ pub fn kernel_write_bytes(buf: &[u8]) {
     KERNEL_WROTE.store(true, Ordering::SeqCst);
 }
 
-/// Moves the console's cursor down to `rows`, so text drawn directly onto
+/// Moves the console's cursor below the top `px` pixel rows, so text drawn directly onto
 /// the framebuffer above it (the boot banner) is not overprinted. Only ever
 /// moves the cursor forward.
-pub fn reserve_rows_at_top(rows: usize) {
+pub fn reserve_pixels_at_top(px: usize) {
+    let rows = px.saturating_sub(MARGIN_Y).div_ceil(char_h());
     let Some(mut state) = FB_STATE.try_lock() else { return };
     if state.row < rows {
         state.row = rows;
@@ -784,8 +897,8 @@ pub fn text_dimensions() -> (usize, usize) {
     let fb_guard = FRAMEBUFFER.lock();
     let Some(fb) = fb_guard.as_ref() else { return (80, 25); };
     let (w, h) = fb.dimensions();
-    let cols = (w.saturating_sub(MARGIN_X)) / CHAR_W;
-    let rows = (h.saturating_sub(MARGIN_Y)) / CHAR_H;
+    let cols = (w.saturating_sub(MARGIN_X)) / char_w();
+    let rows = (h.saturating_sub(MARGIN_Y)) / char_h();
     (cols.max(1), rows.max(1))
 }
 

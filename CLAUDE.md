@@ -456,6 +456,19 @@ At `opt-level 0` with `build-std`, `write_unaligned` is a call into
 until it was replaced by a plain aligned store; per-pixel hot loops here
 need that care.
 
+**Console font and colours** (`drivers/framebuffer_console.rs`): text is
+Noto Sans Mono, pre-rasterised with antialiasing by the `noto-sans-mono-bitmap`
+crate (no_std, no alloc; regular + bold, 16/20/24/32 px, basic Latin only),
+drawn by `Framebuffer::draw_glyph` (coverage blended fg-over-bg, aligned 32-bit
+stores). The size is picked once from the screen height by `init_font`, called
+in `init::boot` right after the framebuffer is registered: 1920x1080 gets
+24 px (13x24 cells, 147x44), QEMU's 1280x800 gets 20 px. SGR 1/22 (bold) and
+7/27 (reverse) are honoured; the palette is tuned for black (One Dark-like)
+because VGA's blue `(0,0,170)` — what `ls --color` gives directories — was
+unreadable on it. The 8x8 `font8x8` path (`draw_char`/`draw_text`) remains
+only for the panic screen. `/proc/fbinfo`'s `text_grid` reports the live cell
+size.
+
 Register a new driver by:
 1. Creating `kernel/src/drivers/<name>.rs` implementing `FileHandle`
 2. Adding one entry to the `DEVICES` static slice in `drivers/mod.rs`

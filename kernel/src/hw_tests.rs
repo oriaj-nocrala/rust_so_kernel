@@ -375,6 +375,17 @@ fn unix_socket_handle_roundtrip() {
     );
 }
 
+/// Every stride-padding pixel of the 32x16 (stride 40) test framebuffer.
+fn padding_now(px: &dyn Fn(usize, usize) -> [u8; 4]) -> alloc::vec::Vec<[u8; 4]> {
+    let mut v = alloc::vec::Vec::new();
+    for y in 0..16 {
+        for x in 32..40 {
+            v.push(px(x, y));
+        }
+    }
+    v
+}
+
 /// Case 5: the framebuffer's drawing primitives, against a RAM-backed
 /// `Framebuffer` — the same technique `ext2_memdisk_roundtrip` uses with
 /// `MemDisk`, applied to the one other driver whose output is a byte
@@ -482,6 +493,28 @@ fn framebuffer_primitives_touch_exactly_their_own_pixels() {
     assert_eq!(px(0, 0), [0x33, 0x22, 0x11, 0x00], "the marker row moved up by exactly 4 scanlines");
     assert_eq!(px(0, 1), [0, 0, 0, 0]);
     assert_eq!(px(0, H - 1), [0, 0, 0, 0], "the vacated rows are cleared, not left stale");
+
+    // ── draw_glyph: coverage blends fg over bg, the rest of the cell is bg
+    fb.fill_rect(0, 0, W, H, Color::rgb(0, 0, 0));
+    let r0: &[u8] = &[0, 255, 128];
+    let r1: &[u8] = &[255];
+    let raster: [&[u8]; 2] = [r0, r1];
+    let fg = Color::rgb(200, 100, 0);
+    let bg = Color::rgb(0, 0, 100);
+    fb.draw_glyph(3, 2, 4, 3, &raster, fg, bg);
+    assert_eq!(px(3, 2), [100, 0, 0, 0], "coverage 0 is the background");
+    assert_eq!(px(4, 2), [0, 100, 200, 0], "coverage 255 is the foreground");
+    assert_eq!(px(5, 2), [50, 50, 100, 0], "coverage 128 is the rounded midpoint");
+    assert_eq!(px(6, 2), [100, 0, 0, 0], "past the raster row: background");
+    assert_eq!(px(3, 3), [0, 100, 200, 0]);
+    assert_eq!(px(3, 4), [100, 0, 0, 0], "past the raster's last row: background");
+    assert_eq!(px(7, 2), [0, 0, 0, 0], "the cell is 4 wide and no wider");
+    assert_eq!(px(3, 5), [0, 0, 0, 0], "the cell is 3 tall and no taller");
+    // Half off the right edge: clipped, padding untouched.
+    let pad_glyph = padding_now(&px);
+    fb.draw_glyph(W - 2, 0, 4, 3, &raster, fg, bg);
+    assert_eq!(px(W - 1, 0), [0, 100, 200, 0]);
+    assert!(padding_now(&px) == pad_glyph, "a clipped glyph wrote stride padding");
 
     // ── blit_scaled: every destination pixel, and nothing else ───────
     // 3x2 source into 32x16: scale = min(32/3, 16/2) = 8, so 24x16 at

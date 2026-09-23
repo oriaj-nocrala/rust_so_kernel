@@ -167,12 +167,13 @@ fn render_fbinfo() -> String {
     };
 
     let (cols, rows) = crate::drivers::framebuffer_console::text_dimensions();
+    let (cell_w, cell_h) = crate::drivers::framebuffer_console::cell_size();
     out.push_str(&format!(
         "width: {}\nheight: {}\nstride: {} px\nbytes_per_pixel: {}\n\
          size: {} bytes ({} KiB)\ntext_grid: {}x{} cells ({}x{} px each)\n\
          virt: {:#x}\n",
         w, h, stride, bpp, len, len / 1024, cols, rows,
-        crate::framebuffer::GLYPH_W, crate::framebuffer::GLYPH_H + 1, virt,
+        cell_w, cell_h, virt,
     ));
     // Direct mode is the fallback when the shadow's allocation failed at
     // boot; every cost below means something different in each mode (with
