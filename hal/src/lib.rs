@@ -23,6 +23,7 @@ extern crate alloc;
 pub mod acpi;
 pub mod ac97;
 pub mod block;
+pub mod fbdirty;
 pub mod gpt;
 pub mod hid;
 pub mod i8042;

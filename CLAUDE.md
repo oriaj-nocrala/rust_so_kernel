@@ -133,7 +133,11 @@ counting living in `Drop` rather than `close()`; see the AF_UNIX section below. 
 `scroll_up` against a RAM-backed `Framebuffer` (the same technique `MemDisk` gives ext2) with
 a **`stride` deliberately larger than `width`** and the buffer pre-filled with `0xAA`, so the
 padding columns a naive `row * width` would corrupt are checked and "untouched" is something
-the test can actually assert — see the framebuffer console section below. See
+the test can actually assert — see the framebuffer console section below. The sixth,
+`framebuffer_shadow_mode_flushes_exactly_what_changed`, repeats that in RAM-shadow mode
+with a second buffer standing in for VRAM: nothing reaches "VRAM" inside a batch, the
+outermost `end_batch` leaves it identical to the shadow, padding is never written, an
+unbatched primitive flushes itself, and a flush copies only its own rectangle. See
 `docs/drivers/architecture.md`'s
 Testing section and `docs/drivers/roadmap.md`'s Phase 2 for more.
 
@@ -176,7 +180,7 @@ Kernel crate config in `kernel/.cargo/config.toml` enables `-Z build-std` to reb
 
 ## Memory Subsystem (`kernel/src/memory/`, `kernel/src/allocator/`)
 
-**Both allocators live in the standalone `mm` crate** (`mm/src/buddy.rs`, `mm/src/slab.rs`; `cd mm && cargo test` — 32 host tests, no QEMU), extracted out of `kernel/src/allocator/{buddy_allocator,slab}.rs` following the exact precedent the `ext2` crate extraction set (`docs/fs/ext2-extraction-plan.md`; see `mm`'s own crate doc comment for the full rationale). `kernel/src/allocator/mod.rs` is now a thin adapter, the same shape `kernel/src/fs/ext2.rs` became after its extraction: it owns the global state (`BUDDY`, `SLAB_ALLOCATOR`, the `#[global_allocator]` registration) and the two seams `mm` needed in place of calling straight into `crate::memory`/`crate::serial_println_raw!`. `mm` is `no_std` with **no `alloc` dependency at all** (unlike `hal`/`ext2`, which both link `alloc`) — the slab allocator *is* the kernel's global allocator, so any internal allocation there would recurse into itself before the first `Vec`/`Box`/`String` ever completed; both allocators stay built entirely out of fixed-size arrays and intrusive linked lists for exactly this reason, unchanged from before the extraction.
+**Both allocators live in the standalone `mm` crate** (`mm/src/buddy.rs`, `mm/src/slab.rs`; `cd mm && cargo test` — 34 unit tests plus a few integration tests, no QEMU), extracted out of `kernel/src/allocator/{buddy_allocator,slab}.rs` following the exact precedent the `ext2` crate extraction set (`docs/fs/ext2-extraction-plan.md`; see `mm`'s own crate doc comment for the full rationale). `kernel/src/allocator/mod.rs` is now a thin adapter, the same shape `kernel/src/fs/ext2.rs` became after its extraction: it owns the global state (`BUDDY`, `SLAB_ALLOCATOR`, the `#[global_allocator]` registration) and the two seams `mm` needed in place of calling straight into `crate::memory`/`crate::serial_println_raw!`. `mm` is `no_std` with **no `alloc` dependency at all** (unlike `hal`/`ext2`, which both link `alloc`) — the slab allocator *is* the kernel's global allocator, so any internal allocation there would recurse into itself before the first `Vec`/`Box`/`String` ever completed; both allocators stay built entirely out of fixed-size arrays and intrusive linked lists for exactly this reason, unchanged from before the extraction.
 
 - **`mm::PhysMap`** (implemented kernel-side by `KernelPhysMap`, wrapping `physical_memory_offset()`) replaces the direct `crate::memory::physical_memory_offset()` calls — same shape as `hal::PhysMem`.
 - **Logging moved to the adapter.** `mm` can't call `crate::serial_println_raw!`, so recoverable conditions come back as data instead: `mm::buddy::PhantomEvent` (a stale/"phantom" bitmap entry found while coalescing on `deallocate` — bitmap said a buddy block was free but the intrusive free list didn't actually contain it) and `mm::slab::AllocEvent`/`DeallocEvent` (large-object alloc/dealloc, cache expansion). `kernel/src/allocator/mod.rs` matches on these and reproduces the exact pre-extraction `serial_println_raw!` text — verified byte-for-byte against the QEMU integration tests' serial output, not just read by eye. The one genuinely unrecoverable condition, a double-free caught by the bitmap, used to print then `loop { hlt }`; `kernel/src/panic.rs`'s handler is verified to touch neither `BUDDY` nor the heap, so `mm` just `panic!`s there now, the same way `ext2` panics/returns `Ext2Error` for its own hard errors.
@@ -410,7 +414,30 @@ mirror 0.9% — both left alone despite both being on the original suspect list
 has no local fix: it needs either write-combining (`/proc/fbinfo` already
 reports the two facts that decide it — the reset PAT has *no* WC entry at all,
 so `IA32_PAT` must be reprogrammed first, and QEMU's own aperture MTRR is UC)
-or a RAM shadow buffer. Neither is done; see `docs/fb/console-perf.md`.
+or a RAM shadow buffer. **The shadow is now done** (phase 1 of
+`docs/fb/wc-shadow-plan.md`, measured on metal first: there a scroll took
+2.18 s, 99.9% of the console's time, reading VRAM back at ~4 MB/s).
+`framebuffer::attach_shadow()` (in `init::boot`, right after
+`test_allocators`) gives the `Framebuffer` a WB-RAM copy of the aperture;
+every primitive draws there and marks a `hal::fbdirty::DirtyRect`, and
+`Framebuffer::flush` is then the **only** code that touches VRAM, write-only,
+measured as `fb_flush`. Correct by default: outside a batch each primitive
+flushes its own rectangle, so callers that never heard of the shadow
+(`panic.rs`, `draw_boot_screen`, `FBIO_BLIT`, the cursor ISR) need no change;
+`render_bytes` wraps each write in `begin_batch`/`end_batch` (nesting) so a
+400-line write is 400 RAM `memmove`s and one flush. **Any new code that
+writes VRAM without going through `Framebuffer`'s primitives desyncs the
+shadow.** Best-effort: if the allocation fails the console stays in direct
+mode, and `/proc/fbinfo` says which mode is live (`shadow:`). Two things
+found on the way: the shadow starts `SHADOW_SKEW` bytes into its allocation
+because a same-aligned shadow and aperture made `fb_flush` 8.6x slower in
+QEMU (TLB-slot collisions; see the constant's comment), and
+`mm::buddy::allocate` now returns `None` for an order above `MAX_ORDER`
+instead of panicking. In QEMU the shadow is slightly *slower* (VRAM is host
+RAM there, so it only adds a copy). **On the Ryzen it took `seq 1 400` from
+875 s to 8.2 s** (one 400-line `write()`: 0.32 s); what remains is
+`fb_flush` writing UC VRAM at 412 MB/s, ~98% of the time. WC (PAT)
+is phases 2-3 of the same plan, not done.
 
 Register a new driver by:
 1. Creating `kernel/src/drivers/<name>.rs` implementing `FileHandle`

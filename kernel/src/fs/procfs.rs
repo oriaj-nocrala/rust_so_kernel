@@ -155,11 +155,12 @@ fn render_fbinfo() -> String {
         let guard = FRAMEBUFFER.lock();
         guard.as_ref().map(|fb| {
             let (w, h) = fb.dimensions();
-            (w, h, fb.stride(), fb.bytes_per_pixel(), fb.virt_addr(), fb.byte_len())
+            (w, h, fb.stride(), fb.bytes_per_pixel(), fb.virt_addr(), fb.byte_len(),
+             fb.has_shadow())
         })
     };
 
-    let Some((w, h, stride, bpp, virt, len)) = geometry else {
+    let Some((w, h, stride, bpp, virt, len, shadow)) = geometry else {
         out.push_str("framebuffer: none (headless boot)\n");
         out.push_str(&crate::debug::render_fb_report());
         return out;
@@ -173,6 +174,14 @@ fn render_fbinfo() -> String {
         w, h, stride, bpp, len, len / 1024, cols, rows,
         crate::framebuffer::GLYPH_W, crate::framebuffer::GLYPH_H + 1, virt,
     ));
+    // Direct mode is the fallback when the shadow's allocation failed at
+    // boot; every cost below means something different in each mode (with
+    // a shadow only `fb_flush` touches VRAM), so say which one this is.
+    if shadow {
+        out.push_str(&format!("shadow: attached ({} KiB)\n", len / 1024));
+    } else {
+        out.push_str("shadow: none (drawing straight to VRAM)\n");
+    }
 
     let r = crate::memory::memtype::report_for(x86_64::VirtAddr::new(virt));
     match r.phys {

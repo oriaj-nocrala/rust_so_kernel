@@ -52,6 +52,18 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
 
     memory::test_allocators();
 
+    // ── Framebuffer RAM shadow ─────────────────────────────────────
+    // Needs the heap, so not before `init_core`; before the boot screen so
+    // that is drawn through the shadow too. Best-effort: on failure the
+    // console stays in direct-to-VRAM mode, correct but slow on real
+    // hardware (a scroll there reads VRAM back at ~4 MB/s). See
+    // `docs/fb/wc-shadow-plan.md`, phase 1.
+    if crate::framebuffer::attach_shadow() {
+        serial_println!("framebuffer: RAM shadow attached");
+    } else {
+        serial_println!("framebuffer: no RAM shadow, drawing straight to VRAM");
+    }
+
     // ── ACPI tables ────────────────────────────────────────────────
     // Best-effort, parse-only (bounded, never hangs boot) — see
     // `acpi::AcpiDriver`. Does NOT touch the existing 8259 PIC/IDT

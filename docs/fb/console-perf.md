@@ -149,6 +149,29 @@ por el tipo MTRR por defecto y no tiene alias en el physmap.
 Consecuencia: el shadow buffer pasa por delante del WC. Tablas completas y
 plan en `docs/fb/wc-shadow-plan.md`.
 
+## Shadow buffer en metal (2026-09-23, arranque #4)
+
+Mismo `fbbench`, mismo perfil `dev`, misma Ryzen; solo cambia la fase 1
+de `docs/fb/wc-shadow-plan.md` (`shadow: attached (8640 KiB)`):
+
+| carga | antes | shadow | factor |
+|---|---|---|---|
+| S `seq 1 400` | 875 s | **8,18 s** | 107x |
+| A 400 x 80 | 874 s | **8,30 s** | 105x |
+| A1 un `write()` | 872 s | **0,32 s** | 2 700x |
+| B backspace | 2,3 s | **68 ms** | 34x |
+| C 30 blits | 37 s | **1,26 s** | 29x |
+
+Todo lo que ahora cuesta es **escribir** la VRAM: `fb_flush` a 412 MB/s,
+la misma tasa que el `memset` de `fill_rect` antes (391), en UC. En S el
+volcado es el 98 % del tiempo (29 694 de ~30 300 M ciclos). Lo que antes
+tocaba la VRAM y ahora va a RAM: `scroll_up` de 2,18 s a 0,35 ms,
+`draw_char` de 18 k a 9 k ciclos y el cursor de 1,1 M a 4,4 k ciclos.
+C no llegó al «< 1 s» previsto: el volcado cumplió (16 ms por frame), pero
+`blit_scaled` en RAM sigue costando 26 ms por frame porque escribe píxel a
+píxel en perfil `dev` (fase 4 del plan). Siguiente palanca: el WC (fases
+2-3), que ataca directamente esos 412 MB/s.
+
 ## Verificación de este cambio
 
 * `cd hal && cargo test` — 142 (125 antes + 17 de `memtype`).

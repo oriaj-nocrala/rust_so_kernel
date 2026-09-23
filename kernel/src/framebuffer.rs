@@ -10,11 +10,26 @@ pub const GLYPH_W: usize = u8::BITS as usize;
 pub const GLYPH_H: usize = BASIC_LEGACY[0].len();
 
 pub struct Framebuffer {
+    /// The VRAM mapping.
     buffer: NonNull<u8>,
     width: usize,
     height: usize,
     stride: usize,
     bytes_per_pixel: usize,
+    /// RAM copy of the whole aperture, same layout (`stride` included),
+    /// once `attach_shadow` has run. While it exists every primitive
+    /// draws here and VRAM is only ever *written*, by `flush`.
+    ///
+    /// WHY: on the physical AM4 machine reading VRAM runs at ~4 MB/s, so
+    /// one `scroll_up`, which reads the screen back, measured 2.18 s,
+    /// against 391 MB/s for writes. See `docs/fb/wc-shadow-plan.md`.
+    shadow: Option<NonNull<u8>>,
+    /// What of `shadow` VRAM has not seen yet.
+    dirty: hal::fbdirty::DirtyRect,
+    /// Nesting depth of `begin_batch`. At 0 every primitive flushes its
+    /// own rectangle before returning, so a caller that has never heard
+    /// of the shadow still leaves the screen up to date.
+    batch_depth: u32,
 }
 
 // SAFETY: El framebuffer es solo memoria de video, podemos compartirlo
@@ -35,7 +50,102 @@ impl Framebuffer {
             height,
             stride,
             bytes_per_pixel,
+            shadow: None,
+            dirty: hal::fbdirty::DirtyRect::new(width, height),
+            batch_depth: 0,
         }
+    }
+
+    /// Switch to shadow mode, drawing into `shadow` from now on.
+    ///
+    /// `shadow` must be at least `byte_len()` bytes and all zero. VRAM's
+    /// visible area is then cleared to match: black on both sides, with
+    /// no VRAM read. Copying VRAM into the shadow instead would preserve
+    /// whatever the firmware and bootloader left on screen, but that read
+    /// alone is 2.2 s on the target machine, and `draw_boot_screen`
+    /// clears the screen right after this anyway.
+    ///
+    /// Returns false, and changes nothing, if `shadow` is too small.
+    pub fn attach_shadow(&mut self, shadow: &'static mut [u8]) -> bool {
+        if shadow.len() < self.byte_len() || self.shadow.is_some() {
+            return false;
+        }
+        self.shadow = NonNull::new(shadow.as_mut_ptr());
+        self.dirty.mark_all();
+        self.flush();
+        true
+    }
+
+    pub fn has_shadow(&self) -> bool {
+        self.shadow.is_some()
+    }
+
+    /// Where primitives draw: the shadow when there is one, else VRAM.
+    fn draw_buffer(&mut self) -> &'static mut [u8] {
+        let base = self.shadow.unwrap_or(self.buffer);
+        // SAFETY: both the VRAM mapping and the shadow span `byte_len()`
+        // bytes and live for the rest of the boot; `&mut self` is the
+        // only way to reach either.
+        unsafe { core::slice::from_raw_parts_mut(base.as_ptr(), self.byte_len()) }
+    }
+
+    /// Record that a primitive changed `[x, x+w) x [y, y+h)`, and outside
+    /// a batch copy it to VRAM right away. Nothing to do without a shadow:
+    /// the primitive already wrote VRAM directly.
+    fn touched(&mut self, x: usize, y: usize, w: usize, h: usize) {
+        if self.shadow.is_none() {
+            return;
+        }
+        self.dirty.mark(x, y, w, h);
+        if self.batch_depth == 0 {
+            self.flush();
+        }
+    }
+
+    /// Defer every primitive's VRAM copy until the matching `end_batch`.
+    /// Nests. The console wraps each `write()` in one, so 400 lines that
+    /// scroll 400 times cost 400 `memmove`s in RAM and one flush.
+    pub fn begin_batch(&mut self) {
+        self.batch_depth += 1;
+    }
+
+    /// Close a batch; the outermost one flushes.
+    pub fn end_batch(&mut self) {
+        self.batch_depth = self.batch_depth.saturating_sub(1);
+        if self.batch_depth == 0 {
+            self.flush();
+        }
+    }
+
+    /// Copy the dirty rectangle from the shadow to VRAM, one contiguous
+    /// span per scanline. Only the visible width is copied: `stride`
+    /// padding is never written, same as every primitive. This is the
+    /// only place VRAM is touched in shadow mode, so `fb_flush`'s MB/s in
+    /// `/proc/fbinfo` is the real write bandwidth to the aperture.
+    pub fn flush(&mut self) {
+        let Some(shadow) = self.shadow else { return };
+        let Some(r) = self.dirty.take() else { return };
+        let t0 = crate::cpu::tsc::read();
+        let bpp = self.bytes_per_pixel;
+        let row_bytes = self.stride * bpp;
+        let span = r.width() * bpp;
+        for row in r.y0..r.y1 {
+            let off = row * row_bytes + r.x0 * bpp;
+            // SAFETY: `DirtyRect` clips to `width` x `height`, so
+            // `off + span` stays inside `byte_len()` in both buffers,
+            // and the shadow never overlaps the VRAM mapping.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    shadow.as_ptr().add(off),
+                    self.buffer.as_ptr().add(off),
+                    span,
+                );
+            }
+        }
+        crate::debug::FB_FLUSH.record(
+            (r.height() * span) as u64,
+            crate::cpu::tsc::read().wrapping_sub(t0),
+        );
     }
 
     /// Limpia toda la pantalla con el color especificado
@@ -88,21 +198,17 @@ impl Framebuffer {
 
         // Unusual pixel widths fall back to the original per-pixel path
         // rather than this function silently composing a wrong pattern.
+        let buffer = self.draw_buffer();
+
         if bpp < 3 || bpp > 4 {
-            let buffer = unsafe {
-                core::slice::from_raw_parts_mut(self.buffer.as_ptr(), self.height * row_bytes)
-            };
             for row in y0..y1 {
                 for col in x0..x1 {
                     self.draw_pixel(buffer, col, row, color);
                 }
             }
+            self.touched(x0, y0, x1 - x0, y1 - y0);
             return;
         }
-
-        let buffer = unsafe {
-            core::slice::from_raw_parts_mut(self.buffer.as_ptr(), self.height * row_bytes)
-        };
 
         if color.r == 0 && color.g == 0 && color.b == 0 {
             for row in y0..y1 {
@@ -142,6 +248,7 @@ impl Framebuffer {
             ((y1 - y0) * span) as u64,
             crate::cpu::tsc::read().wrapping_sub(t0),
         );
+        self.touched(x0, y0, x1 - x0, y1 - y0);
     }
 
     fn draw_pixel(&self, buffer: &mut [u8], x: usize, y: usize, color: Color) {
@@ -171,9 +278,7 @@ impl Framebuffer {
     /// leave alone; the counter is here so that stops being an assumption.
     pub fn xor_rect(&mut self, x: usize, y: usize, w: usize, h: usize) {
         let t0 = crate::cpu::tsc::read();
-        let buffer = unsafe {
-            core::slice::from_raw_parts_mut(self.buffer.as_ptr(), self.height * self.stride * self.bytes_per_pixel)
-        };
+        let buffer = self.draw_buffer();
 
         let mut touched = 0u64;
         for row in y..(y + h).min(self.height) {
@@ -189,6 +294,7 @@ impl Framebuffer {
         }
 
         crate::debug::FB_CURSOR.record(touched, crate::cpu::tsc::read().wrapping_sub(t0));
+        self.touched(x, y, w, h);
     }
 
     /// Dibuja un carácter en las coordenadas especificadas
@@ -201,9 +307,7 @@ impl Framebuffer {
         bg_color: Color,
         scale: usize,
     ) {
-        let buffer = unsafe {
-            core::slice::from_raw_parts_mut(self.buffer.as_ptr(), self.height * self.stride * self.bytes_per_pixel)
-        };
+        let buffer = self.draw_buffer();
 
         let glyph: [u8; 8] = BASIC_LEGACY[ascii as usize];
 
@@ -255,6 +359,7 @@ impl Framebuffer {
                 (cell_h * span) as u64,
                 crate::cpu::tsc::read().wrapping_sub(t0),
             );
+            self.touched(x, y, cell_w, cell_h);
             return;
         }
 
@@ -276,6 +381,7 @@ impl Framebuffer {
             }
         }
         crate::debug::FB_DRAW_CHAR.record(0, crate::cpu::tsc::read().wrapping_sub(t0));
+        self.touched(x, y, cell_w, cell_h);
     }
 
     /// Dibuja texto en las coordenadas especificadas
@@ -303,9 +409,7 @@ impl Framebuffer {
         let total = self.height * row_bytes;
         let skip = line_height * row_bytes;
         if skip >= total { return; }
-        let buffer = unsafe {
-            core::slice::from_raw_parts_mut(self.buffer.as_ptr(), total)
-        };
+        let buffer = self.draw_buffer();
         let t0 = crate::cpu::tsc::read();
         buffer.copy_within(skip..total, 0);
         // `fill`, not a per-byte loop: one `memset` instead of `skip`
@@ -315,10 +419,20 @@ impl Framebuffer {
         // framebuffer, which is what makes it the most expensive thing the
         // console does on real hardware and why `/proc/fbinfo` reports it
         // separately from the fills.
+        //
+        // In shadow mode all of this is RAM, and what reaches VRAM is the
+        // one write-only flush of the whole screen, now or at the end of
+        // the batch.
         crate::debug::FB_SCROLL.record(
             ((total - skip) * 2 + skip) as u64,
             crate::cpu::tsc::read().wrapping_sub(t0),
         );
+        if self.shadow.is_some() {
+            self.dirty.mark_all();
+            if self.batch_depth == 0 {
+                self.flush();
+            }
+        }
     }
 
     /// Obtiene las dimensiones del framebuffer
@@ -368,9 +482,7 @@ impl Framebuffer {
         let off_x = (self.width.saturating_sub(dst_w)) / 2;
         let off_y = (self.height.saturating_sub(dst_h)) / 2;
 
-        let buffer = unsafe {
-            core::slice::from_raw_parts_mut(self.buffer.as_ptr(), self.height * self.stride * self.bytes_per_pixel)
-        };
+        let buffer = self.draw_buffer();
 
         for sy in 0..src_h {
             let src_row = sy * src_w;
@@ -399,6 +511,7 @@ impl Framebuffer {
             (dst_w * dst_h * self.bytes_per_pixel) as u64,
             crate::cpu::tsc::read().wrapping_sub(t0),
         );
+        self.touched(off_x, off_y, dst_w, dst_h);
     }
 }
 
@@ -421,4 +534,57 @@ pub static FRAMEBUFFER: Mutex<Option<Framebuffer>> = Mutex::new(None);
 // Helper para inicializar
 pub fn init_global_framebuffer(framebuffer: Framebuffer) {
     *FRAMEBUFFER.lock() = Some(framebuffer);
+}
+
+/// How far into its allocation the shadow starts: 2.5 pages plus one
+/// cache line, so shadow byte `i` and VRAM byte `i` never share a page
+/// index or the low 12 address bits.
+///
+/// WHY, measured: the large-object allocator hands back a block aligned to
+/// its own size (4 MiB in QEMU), and the aperture's mapping is aligned
+/// too, so without a skew `flush`'s source and destination for the same
+/// offset sat at the same position within their pages *and* at page
+/// numbers equal modulo any power-of-two table. QEMU's software TLB is
+/// exactly such a table (direct-mapped by page number), and every
+/// `movsq` of the copy then evicted the other side's entry: `fb_flush`
+/// ran at 248 MB/s, 17x slower per byte than a direct-mode `scroll_up`
+/// doing a VRAM-to-VRAM `memmove` of the same size. With this skew:
+/// 2 100 MB/s, same build, same `fbbench`. Real CPUs have the analogous
+/// hazard in 4K aliasing (a load whose low 12 bits match an in-flight
+/// store's is held back as if it depended on it), which is why the skew
+/// is not a whole number of pages.
+const SHADOW_SKEW: usize = 0x2840;
+
+/// Give the global framebuffer its RAM shadow. Needs the heap, so it runs
+/// after `memory::init_core`; the framebuffer itself is registered before
+/// that and works without one.
+///
+/// Best-effort: if the allocation fails (8.6 MB at 1920x1080 with a
+/// 2048-px stride), the console stays in direct mode, slow on real
+/// hardware but correct. `alloc_zeroed` rather than `vec!` because a
+/// failed `vec!` is a panic, not a `None`.
+///
+/// The allocation runs with `FRAMEBUFFER` *released*: a panic inside the
+/// allocator would otherwise find the lock held and skip the panic screen
+/// (`panic.rs` only `try_lock`s it), which is exactly what a fault-injected
+/// oversized request showed while this was being written.
+pub fn attach_shadow() -> bool {
+    let Some(len) = FRAMEBUFFER.lock().as_ref().map(|fb| fb.byte_len()) else {
+        return false;
+    };
+    let Ok(layout) = core::alloc::Layout::from_size_align(len + SHADOW_SKEW, 4096) else {
+        return false;
+    };
+    // SAFETY: `layout` has a nonzero size (a framebuffer has pixels). The
+    // allocation is never freed: the shadow lives as long as the screen.
+    let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        return false;
+    }
+    // SAFETY: `ptr` is a fresh, zeroed allocation of `len + SHADOW_SKEW`
+    // bytes nobody else references, so the skewed `len` bytes are inside it.
+    let shadow = unsafe { core::slice::from_raw_parts_mut(ptr.add(SHADOW_SKEW), len) };
+    // Called once, at boot, before anything else can attach one: the
+    // `false` arm (and the leak it would imply) is unreachable in practice.
+    FRAMEBUFFER.lock().as_mut().is_some_and(|fb| fb.attach_shadow(shadow))
 }

@@ -294,6 +294,12 @@ pub static FB_RENDER: OpStat = OpStat::new();
 /// user output, on the hot path, to a UART nothing is listening to on the
 /// target machine.
 pub static FB_SERIAL_MIRROR: OpStat = OpStat::new();
+/// `Framebuffer::flush` — shadow → VRAM copy of the dirty rectangle. In
+/// shadow mode this is the only thing that touches VRAM, and it only
+/// writes, so its MB/s is the real write bandwidth to the aperture: the
+/// number the write-combining phases of `docs/fb/wc-shadow-plan.md` have
+/// to move. Zero calls means there is no shadow (direct mode).
+pub static FB_FLUSH: OpStat = OpStat::new();
 
 /// Render every framebuffer cost counter, for `/proc/fbinfo`.
 pub fn render_fb_report() -> alloc::string::String {
@@ -308,6 +314,7 @@ pub fn render_fb_report() -> alloc::string::String {
     out.push_str(&FB_BLIT.render("fb_blit_scaled", hz));
     out.push_str(&FB_RENDER.render("fb_render_bytes", hz));
     out.push_str(&FB_SERIAL_MIRROR.render("fb_serial_mirror", hz));
+    out.push_str(&FB_FLUSH.render("fb_flush", hz));
     out
 }
 

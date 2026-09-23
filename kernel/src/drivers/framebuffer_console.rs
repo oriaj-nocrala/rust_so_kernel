@@ -461,7 +461,21 @@ fn dispatch_csi(
 /// [`kernel_alert`] can reach the same renderer without either duplicating
 /// the ANSI parser or taking the blocking `lock()`s that a `FileHandle`
 /// write can afford and a fault handler cannot.
+///
+/// One batch per call (`Framebuffer::begin_batch`): with a RAM shadow, the
+/// primitives below only draw into RAM and VRAM gets one copy of the
+/// union of what they touched, at the end. A write of 400 lines that
+/// scrolls 400 times is then 400 `memmove`s in RAM and one flush, instead
+/// of 400 full-screen copies. Batches nest, so callers that render several
+/// pieces under one lock (`kernel_write_bytes`, `kalert!`) wrap themselves
+/// too and flush once.
 fn render_bytes(state: &mut FbState, fb: &mut Framebuffer, buf: &[u8]) {
+    fb.begin_batch();
+    render_bytes_inner(state, fb, buf);
+    fb.end_batch();
+}
+
+fn render_bytes_inner(state: &mut FbState, fb: &mut Framebuffer, buf: &[u8]) {
     let t0 = crate::cpu::tsc::read();
     if FB_RAW_DIRTY.load(Ordering::SeqCst) {
         // Screen already belongs to (or was just handed back from) a
@@ -614,12 +628,14 @@ pub fn kernel_alert(args: core::fmt::Arguments) {
     let Some(mut fb_guard) = FRAMEBUFFER.try_lock() else { return };
     let Some(fb) = fb_guard.as_mut() else { return };
 
+    fb.begin_batch();
     let mut w = ConsoleWriter { state: &mut state, fb };
     // Reset the colour afterwards so the next writer — a shell prompt, some
     // other process's output — is not left painted red.
     let _ = w.write_str("\r\n\x1b[1;31m");
     let _ = w.write_fmt(args);
     let _ = w.write_str("\x1b[0m\r\n");
+    w.fb.end_batch();
     KERNEL_WROTE.store(true, Ordering::SeqCst);
 }
 
@@ -637,8 +653,10 @@ pub fn kernel_print(args: core::fmt::Arguments) {
     let Some(mut fb_guard) = FRAMEBUFFER.try_lock() else { return };
     let Some(fb) = fb_guard.as_mut() else { return };
 
+    fb.begin_batch();
     let mut w = ConsoleWriter { state: &mut state, fb };
     let _ = w.write_fmt(args);
+    w.fb.end_batch();
     KERNEL_WROTE.store(true, Ordering::SeqCst);
 }
 
@@ -651,6 +669,9 @@ pub fn kernel_write_bytes(buf: &[u8]) {
     let Some(mut fb_guard) = FRAMEBUFFER.try_lock() else { return };
     let Some(fb) = fb_guard.as_mut() else { return };
 
+    // One batch around the whole dump: byte-at-a-time `render_bytes`
+    // calls would otherwise each flush on their own.
+    fb.begin_batch();
     for &b in buf {
         if b == b'\n' {
             render_bytes(&mut state, fb, b"\r\n");
@@ -658,6 +679,7 @@ pub fn kernel_write_bytes(buf: &[u8]) {
             render_bytes(&mut state, fb, &[b]);
         }
     }
+    fb.end_batch();
     KERNEL_WROTE.store(true, Ordering::SeqCst);
 }
 

@@ -483,3 +483,119 @@ fn framebuffer_primitives_touch_exactly_their_own_pixels() {
     assert_eq!(px(0, 1), [0, 0, 0, 0]);
     assert_eq!(px(0, H - 1), [0, 0, 0, 0], "the vacated rows are cleared, not left stale");
 }
+
+/// The same primitives in shadow mode (`Framebuffer::attach_shadow`,
+/// `docs/fb/wc-shadow-plan.md` phase 1): they draw into a RAM shadow and
+/// VRAM only ever receives `flush`'s copy of the dirty rectangle. Two RAM
+/// buffers stand in for shadow and VRAM, the "VRAM" pre-filled with `0xAA`
+/// and with `stride > width`, as in the direct-mode test above.
+///
+/// What it pins down:
+/// 1. inside a batch, VRAM does not change at all;
+/// 2. after the outermost `end_batch`, VRAM's visible area equals the
+///    shadow's (a nested `end_batch` does not flush early);
+/// 3. `stride` padding in VRAM is never written, not even by a scroll;
+/// 4. outside a batch, every primitive leaves VRAM up to date by itself —
+///    the property that lets callers which never heard of the shadow
+///    (`panic.rs`, `draw_boot_screen`, `FBIO_BLIT`, the cursor ISR) work
+///    unchanged;
+/// 5. a flush copies only the dirty rectangle, not the whole screen.
+#[test_case]
+fn framebuffer_shadow_mode_flushes_exactly_what_changed() {
+    use alloc::boxed::Box;
+    use alloc::vec;
+    use crate::framebuffer::{Color, Framebuffer};
+
+    const W: usize = 32;
+    const H: usize = 24;
+    const STRIDE: usize = 40; // deliberately > W
+    const BPP: usize = 4;
+    const LEN: usize = H * STRIDE * BPP;
+
+    let vram: &'static mut [u8] = Box::leak(vec![0xAAu8; LEN].into_boxed_slice());
+    let shadow: &'static mut [u8] = Box::leak(vec![0u8; LEN].into_boxed_slice());
+    let vram_base = vram.as_ptr() as usize;
+    let shadow_base = shadow.as_ptr() as usize;
+    let mut fb = Framebuffer::new(vram, W, H, STRIDE, BPP);
+
+    // SAFETY (both closures): the buffers are leaked, alive for the rest of
+    // the boot, and every offset used below is inside `LEN`.
+    let vpx = |x: usize, y: usize| -> [u8; 4] {
+        let p = (vram_base + (y * STRIDE + x) * BPP) as *const u8;
+        unsafe { [*p, *p.add(1), *p.add(2), *p.add(3)] }
+    };
+    let spx = |x: usize, y: usize| -> [u8; 4] {
+        let p = (shadow_base + (y * STRIDE + x) * BPP) as *const u8;
+        unsafe { [*p, *p.add(1), *p.add(2), *p.add(3)] }
+    };
+    let vram_bytes = || -> alloc::vec::Vec<u8> {
+        unsafe { core::slice::from_raw_parts(vram_base as *const u8, LEN) }.to_vec()
+    };
+    let assert_in_sync = |what: &str| {
+        for y in 0..H {
+            for x in 0..W {
+                assert_eq!(vpx(x, y), spx(x, y), "{what}: VRAM differs from shadow at ({x},{y})");
+            }
+            for x in W..STRIDE {
+                assert_eq!(vpx(x, y), [0xAA; 4], "{what}: stride padding at ({x},{y}) was written");
+            }
+        }
+    };
+
+    // Attaching clears the visible VRAM to match the all-zero shadow, and
+    // nothing else.
+    assert!(fb.attach_shadow(shadow));
+    assert!(fb.has_shadow());
+    assert_eq!(vpx(0, 0), [0, 0, 0, 0], "attach flushes the black shadow to VRAM");
+    assert_in_sync("after attach_shadow");
+
+    // ── (4) Outside a batch: every primitive flushes itself ──────────
+    let c = Color::rgb(0x11, 0x22, 0x33);
+    let fg = Color::rgb(0xFF, 0xFF, 0xFF);
+    let bg = Color::rgb(0x01, 0x02, 0x03);
+    fb.fill_rect(2, 3, 5, 4, c);
+    assert_eq!(vpx(2, 3), [0x33, 0x22, 0x11, 0x00]);
+    assert_in_sync("unbatched fill_rect");
+    fb.draw_char(8, 8, b'A', fg, bg, 1);
+    assert_in_sync("unbatched draw_char (fast path)");
+    fb.draw_char(W - 3, 0, b'B', fg, bg, 1);
+    assert_in_sync("unbatched draw_char (clipped path)");
+    fb.xor_rect(8, 8, 8, 9);
+    assert_in_sync("unbatched xor_rect");
+    fb.blit_scaled(&[0x00_44_55_66; 4 * 3], 4, 3);
+    assert_in_sync("unbatched blit_scaled");
+    fb.fill_rect(0, 4, W, 1, c);
+    fb.scroll_up(4);
+    assert_eq!(vpx(0, 0), [0x33, 0x22, 0x11, 0x00], "the scroll reached VRAM");
+    assert_in_sync("unbatched scroll_up");
+
+    // ── (5) A flush copies the dirty rectangle, not the screen ───────
+    // Plant a sentinel straight into VRAM, away from the next primitive.
+    // A whole-screen flush would overwrite it with the shadow's pixel.
+    let sentinel = (vram_base + (20 * STRIDE + 30) * BPP) as *mut u8;
+    unsafe { *sentinel = 0x5A };
+    fb.fill_rect(0, 0, 2, 2, c);
+    assert_eq!(vpx(30, 20)[0], 0x5A, "a 2x2 fill flushed pixels outside its rectangle");
+    unsafe { *sentinel = spx(30, 20)[0] }; // put it back
+
+    // ── (1)/(2) Inside a batch nothing reaches VRAM until the end ────
+    let before = vram_bytes();
+    fb.begin_batch();
+    fb.fill_rect(0, 0, W, H, Color::rgb(0, 0, 0));
+    fb.begin_batch(); // nested, as kernel_write_bytes → render_bytes does
+    fb.draw_char(0, 0, b'X', fg, bg, 1);
+    fb.xor_rect(0, 0, 8, 9);
+    fb.fill_rect(0, 12, W, 1, c);
+    fb.scroll_up(4);
+    fb.end_batch(); // inner: must not flush
+    assert!(vram_bytes() == before, "VRAM changed inside a batch");
+    fb.fill_rect(5, 5, 3, 3, c);
+    assert!(vram_bytes() == before, "VRAM changed inside a batch");
+    fb.end_batch(); // outermost: flushes
+    assert_eq!(vpx(0, 8), [0x33, 0x22, 0x11, 0x00], "the batched scroll reached VRAM");
+    assert_in_sync("after the outermost end_batch");
+
+    // A second attach is refused: the shadow is set once, for good.
+    let other: &'static mut [u8] = Box::leak(vec![0u8; LEN].into_boxed_slice());
+    assert!(!fb.attach_shadow(other), "attach_shadow must not replace an attached shadow");
+}

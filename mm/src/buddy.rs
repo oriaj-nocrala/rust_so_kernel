@@ -474,7 +474,16 @@ impl BuddyAllocator {
     /// `phys_alloc` now does that when this returns `None`).
     pub unsafe fn allocate(&mut self, mem: &dyn PhysMap, order: usize) -> Option<PhysAddr> {
         debug_assert!(order >= MIN_ORDER, "Order {} below MIN_ORDER {}", order, MIN_ORDER);
-        debug_assert!(order <= MAX_ORDER, "Order {} exceeds MAX_ORDER {}", order, MAX_ORDER);
+        // A request bigger than the largest block is an ordinary failure,
+        // not a bug: it reaches here from `GlobalAlloc::alloc` for a large
+        // enough `Layout`, and that contract is "return null", never
+        // "panic". It was a `debug_assert!` (a panic in debug builds, an
+        // out-of-bounds `free_lists` index in release), which broke every
+        // best-effort caller that checks for null — the framebuffer shadow
+        // (`kernel::framebuffer::attach_shadow`) is where it surfaced.
+        if order > MAX_ORDER {
+            return None;
+        }
 
         let idx = self.order_to_index(order);
 
@@ -719,6 +728,16 @@ mod tests {
         let bits = (MAX_PHYS_ADDR as usize) >> last_order;
         let expected_end = BITMAP_OFFSETS[last_idx] + (bits + 7) / 8;
         assert_eq!(expected_end, BITMAP_BYTES);
+    }
+
+    #[test]
+    fn allocate_above_max_order_is_none_not_a_panic() {
+        let mem = VecMem::new(TEST_MEM_SIZE);
+        let mut buddy = new_allocator_with_region(&mem, 0, TEST_MEM_SIZE as u64);
+        assert_eq!(unsafe { buddy.allocate(&mem, MAX_ORDER + 1) }, None);
+        assert_eq!(unsafe { buddy.allocate(&mem, MAX_ORDER + 8) }, None);
+        // And the allocator is still usable afterwards.
+        assert!(unsafe { buddy.allocate(&mem, MIN_ORDER) }.is_some());
     }
 
     // ── add_region ───────────────────────────────────────────────────────

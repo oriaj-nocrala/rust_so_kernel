@@ -56,7 +56,7 @@ struct fb_blit_args {
 // Order and names match debug::render_fb_report.
 static const char *const OPS[] = {
     "fb_fill_rect", "fb_draw_char", "fb_scroll_up", "fb_cursor_xor",
-    "fb_blit_scaled", "fb_render_bytes", "fb_serial_mirror",
+    "fb_blit_scaled", "fb_render_bytes", "fb_serial_mirror", "fb_flush",
 };
 #define NOPS (sizeof(OPS) / sizeof(OPS[0]))
 
