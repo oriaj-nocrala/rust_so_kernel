@@ -33,6 +33,7 @@ pub mod logpart;
 pub mod memtype;
 pub mod mouse;
 pub mod msc;
+pub mod pci;
 pub mod pit;
 pub mod rtc;
 pub mod sp5100_tco;

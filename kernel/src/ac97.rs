@@ -86,6 +86,7 @@ impl Driver for Ac97Driver {
             return Err(DriverError::NotFound);
         };
         crate::pci::enable_bus_master_and_io(&dev);
+        crate::pci::claim(dev.bus, dev.device, dev.function, "ac97");
 
         let nam_base = dev.bar0 as u16;
         let nabm_base = dev.bar1 as u16;

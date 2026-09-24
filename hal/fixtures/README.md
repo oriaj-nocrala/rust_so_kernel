@@ -30,3 +30,15 @@ N=$(sudo blockdev --getsz /dev/$DEV)
 sudo dd if=/dev/$DEV of=stick-head.bin bs=512 count=34
 sudo dd if=/dev/$DEV of=stick-tail.bin bs=512 skip=$((N-33)) count=33
 ```
+
+`ryzen-pci-config.txt` / `ryzen-pci-sysfs.txt` — the first 64 bytes of the
+configuration space of every PCI function on the target board (ASUS PRIME
+B450M-A II + Ryzen 9 5900X), and Linux's own sysfs attributes for the same
+functions as an oracle independent of `hal::pci`'s decoder. Captured
+2026-09-24 from that machine's Linux. Regenerate (no root needed for the
+first 64 bytes):
+
+```bash
+for d in /sys/bus/pci/devices/*; do b=$(basename $d); echo "${b#0000:} $(head -c 64 $d/config | xxd -p | tr -d '\n')"; done
+for d in /sys/bus/pci/devices/*; do b=$(basename $d); s=$(cat $d/secondary_bus_number 2>/dev/null); u=$(cat $d/subordinate_bus_number 2>/dev/null); echo "${b#0000:} $(cat $d/vendor $d/device $d/class $d/revision $d/subsystem_vendor $d/subsystem_device | tr '\n' ' ')${s:--} ${u:--}"; done
+```

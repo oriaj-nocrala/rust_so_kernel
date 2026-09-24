@@ -175,15 +175,6 @@ pub fn revision_id(bus: u8, device: u8, function: u8) -> u8 {
     config_read32(bus, device, function, 0x08) as u8
 }
 
-fn class_triple(bus: u8, device: u8, function: u8) -> (u8, u8, u8) {
-    let dword = config_read32(bus, device, function, 0x08);
-    (
-        (dword >> 24) as u8, // base class
-        (dword >> 16) as u8, // sub-class
-        (dword >> 8) as u8,  // prog-IF
-    )
-}
-
 /// Reads BAR0 as a memory BAR, following the 64-bit form into BAR1.
 /// Returns 0 for an I/O BAR — callers wanting ports use `find_device`.
 fn memory_bar0(bus: u8, device: u8, function: u8) -> u64 {
@@ -201,15 +192,38 @@ fn memory_bar0(bus: u8, device: u8, function: u8) -> u64 {
     }
 }
 
-/// Scans every PCI bus for functions matching a class/sub-class/prog-IF
-/// triple, calling `found` with each. Stops early (returning `false` from
-/// `found` is not supported — the caller simply ignores extras) once
-/// `limit` functions have been reported.
+/// Calls `found` with every function on every bus, decoded from the first
+/// 64 bytes of its configuration space.
 ///
 /// A flat 0..=255 bus sweep rather than a recursive bridge walk: brute
 /// force costs one config read per (bus, device) pair that has no device —
 /// 8192 port reads worst case, microseconds — and unlike a recursive walk
 /// it cannot miss a bus behind a bridge this kernel doesn't understand.
+pub fn for_each_function(mut found: impl FnMut(hal::pci::Function)) {
+    for bus in 0..=255u8 {
+        for dev in 0..32u8 {
+            if config_read16(bus, dev, 0, 0x00) == 0xFFFF {
+                continue;
+            }
+            let header_type = (config_read32(bus, dev, 0, 0x0C) >> 16) as u8;
+            let max_function = if header_type & 0x80 != 0 { 8 } else { 1 };
+
+            for func in 0..max_function {
+                let mut cfg = [0u32; 16];
+                for (i, dword) in cfg.iter_mut().enumerate() {
+                    *dword = config_read32(bus, dev, func, (i * 4) as u8);
+                }
+                if let Some(f) = hal::pci::decode(bus, dev, func, &cfg) {
+                    found(f);
+                }
+            }
+        }
+    }
+}
+
+/// Every function matching a class/sub-class/prog-IF triple, with its
+/// memory BAR assembled, up to `limit` of them. Returns how many were
+/// reported.
 pub fn for_each_by_class(
     class: u8,
     subclass: u8,
@@ -218,39 +232,21 @@ pub fn for_each_by_class(
     mut found: impl FnMut(PciFunction),
 ) -> usize {
     let mut count = 0usize;
-    for bus in 0..=255u8 {
-        for dev in 0..32u8 {
-            let vendor_id = config_read16(bus, dev, 0, 0x00);
-            if vendor_id == 0xFFFF {
-                continue;
-            }
-            let header_type = (config_read32(bus, dev, 0, 0x0C) >> 16) as u8;
-            let max_function = if header_type & 0x80 != 0 { 8 } else { 1 };
-
-            for func in 0..max_function {
-                let vid = config_read16(bus, dev, func, 0x00);
-                if vid == 0xFFFF {
-                    continue;
-                }
-                if class_triple(bus, dev, func) != (class, subclass, progif) {
-                    continue;
-                }
-                found(PciFunction {
-                    bus,
-                    device: dev,
-                    function: func,
-                    vendor: vid,
-                    device_id: config_read16(bus, dev, func, 0x02),
-                    bar0: memory_bar0(bus, dev, func),
-                    interrupt_line: config_read32(bus, dev, func, 0x3C) as u8,
-                });
-                count += 1;
-                if count >= limit {
-                    return count;
-                }
-            }
+    for_each_function(|f| {
+        if count >= limit || (f.class, f.subclass, f.progif) != (class, subclass, progif) {
+            return;
         }
-    }
+        found(PciFunction {
+            bus: f.bus,
+            device: f.device,
+            function: f.function,
+            vendor: f.vendor,
+            device_id: f.device_id,
+            bar0: memory_bar0(f.bus, f.device, f.function),
+            interrupt_line: config_read32(f.bus, f.device, f.function, 0x3C) as u8,
+        });
+        count += 1;
+    });
     count
 }
 
@@ -265,4 +261,74 @@ pub fn enable_mem_and_bus_master(bus: u8, device: u8, function: u8) {
     let command = ((dword as u16) | 0b0000_0110) | (1 << 10);
     let new_dword = (dword & 0xFFFF_0000) | command as u32;
     config_write32(bus, device, function, 0x04, new_dword);
+}
+
+// ── Claims and /proc/pci ──────────────────────────────────────────────────────
+//
+// Which driver owns which function, so `/proc/pci` can say what nothing
+// drives (stage 1 of the self-improving-OS direction: the system has to
+// know what it is missing before anything can go and get it). A driver
+// claims a function once it has actually taken it over — enabled decoding,
+// found its registers — not merely matched its ID.
+
+/// More than every driver here claims today (≤ 4 xHCI + ac97 + watchdog +
+/// IDE); a claim past it is dropped and logged rather than panicking.
+const MAX_CLAIMS: usize = 16;
+
+#[derive(Clone, Copy)]
+struct Claim {
+    bdf: (u8, u8, u8),
+    driver: &'static str,
+}
+
+/// A real lock, not IF=0: claims are made from driver init and read from
+/// process context, never from an ISR, and never while allocating.
+static CLAIMS: spin::Mutex<[Option<Claim>; MAX_CLAIMS]> = spin::Mutex::new([None; MAX_CLAIMS]);
+
+/// Records that `driver` owns function `bus:device.function`.
+pub fn claim(bus: u8, device: u8, function: u8, driver: &'static str) {
+    let mut claims = CLAIMS.lock();
+    let bdf = (bus, device, function);
+    if let Some(slot) = claims.iter_mut().find(|c| c.map_or(true, |c| c.bdf == bdf)) {
+        *slot = Some(Claim { bdf, driver });
+    } else {
+        drop(claims);
+        crate::serial_println!(
+            "pci: claim table full, {:02x}:{:02x}.{} ({}) not recorded",
+            bus, device, function, driver
+        );
+    }
+}
+
+/// Claims every function `matches` accepts — for a driver that reaches its
+/// device through legacy ports rather than by finding it on the bus.
+pub fn claim_matching(driver: &'static str, matches: impl Fn(&hal::pci::Function) -> bool) {
+    let mut hits: [(u8, u8, u8); 4] = [(0, 0, 0); 4];
+    let mut n = 0;
+    for_each_function(|f| {
+        if n < hits.len() && matches(&f) {
+            hits[n] = (f.bus, f.device, f.function);
+            n += 1;
+        }
+    });
+    for &(b, d, f) in &hits[..n] {
+        claim(b, d, f, driver);
+    }
+}
+
+/// Renders `/proc/pci`: every function on the bus and who drives it.
+pub fn render_report() -> alloc::string::String {
+    let mut functions = alloc::vec::Vec::new();
+    for_each_function(|f| functions.push(f));
+    let claims = *CLAIMS.lock();
+    let driver_of = |f: &hal::pci::Function| {
+        claims
+            .iter()
+            .flatten()
+            .find(|c| c.bdf == (f.bus, f.device, f.function))
+            .map(|c| c.driver)
+    };
+    let mut out = alloc::string::String::new();
+    let _ = hal::pci::write_report(&mut out, &functions, driver_of);
+    out
 }

@@ -121,6 +121,7 @@ impl Driver for WatchdogDriver {
             DriverError::Invalid
         })?;
 
+        crate::pci::claim(f.bus, f.device, f.function, "sp5100_tco");
         WDT_VIRT.store(wdt.0, Ordering::Relaxed);
         ARMED_SECS.store(TIMEOUT_SECS as u32, Ordering::Relaxed);
         STATE.store(1, Ordering::Relaxed);

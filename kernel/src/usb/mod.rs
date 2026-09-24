@@ -101,7 +101,7 @@ impl Driver for UsbDriver {
     }
 
     fn init(&mut self) -> Result<(), DriverError> {
-        let mut found: [Option<u64>; MAX_CONTROLLERS] = [None; MAX_CONTROLLERS];
+        let mut found: [Option<(u64, (u8, u8, u8))>; MAX_CONTROLLERS] = [None; MAX_CONTROLLERS];
         let mut n = 0usize;
 
         crate::pci::for_each_by_class(
@@ -124,7 +124,7 @@ impl Driver for UsbDriver {
                     return;
                 }
                 crate::pci::enable_mem_and_bus_master(f.bus, f.device, f.function);
-                found[n] = Some(f.bar0);
+                found[n] = Some((f.bar0, (f.bus, f.device, f.function)));
                 n += 1;
             },
         );
@@ -140,9 +140,10 @@ impl Driver for UsbDriver {
         let mut init_failures = 0usize;
         {
             let mut slots = CONTROLLERS.lock();
-            for bar in found.iter().flatten() {
-                match xhci::Xhci::init(*bar) {
+            for &(bar, (bus, device, function)) in found.iter().flatten() {
+                match xhci::Xhci::init(bar) {
                     Ok(mut ctrl) => {
+                        crate::pci::claim(bus, device, function, "xhci");
                         scan.add(&ctrl.enumerate_ports());
                         for (slot, sectors) in ctrl.storage_devices() {
                             if STORAGE.get().is_none() {

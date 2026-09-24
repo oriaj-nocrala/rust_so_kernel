@@ -328,6 +328,7 @@ impl Inode for ProcDirInode {
             "kdebug" => Ok(Arc::new(KdebugInode)),
             "acpi" => Ok(Arc::new(AcpiInode)),
             "fbinfo" => Ok(Arc::new(FbInfoInode)),
+            "pci" => Ok(Arc::new(PciInode)),
             "dmesg" => Ok(Arc::new(DmesgInode)),
             "self" => Ok(Arc::new(SelfInode)),
             _ => {
@@ -351,13 +352,14 @@ impl Inode for ProcDirInode {
             5 => Ok(Some(DirEntry::new(204, FileType::Regular, b"acpi"))),
             6 => Ok(Some(DirEntry::new(205, FileType::Regular, b"dmesg"))),
             7 => Ok(Some(DirEntry::new(206, FileType::Regular, b"fbinfo"))),
+            8 => Ok(Some(DirEntry::new(207, FileType::Regular, b"pci"))),
             n => {
                 // Live pids, appended after the always-present entries above
                 // — this is what makes `ls /proc` / BusyBox `ps`'s
                 // `opendir("/proc")` scan see every process (previously
                 // direct lookup like `cat /proc/3/exe` worked but nothing
                 // enumerated them, see this module's top doc comment).
-                let idx = (n - 8) as usize;
+                let idx = (n - 9) as usize;
                 let pids = crate::process::scheduler::all_pids();
                 let Some(&pid) = pids.get(idx) else { return Ok(None); };
                 let name = format!("{}", pid);
@@ -479,6 +481,29 @@ impl Inode for FbInfoInode {
             return Err(Errno::EROFS);
         }
         Ok(Box::new(ProcFile { data: render_fbinfo().into_bytes(), offset: 0 }))
+    }
+}
+
+// ── pci file inode ───────────────────────────────────────────────────────────
+//
+// Every PCI function and the driver that claimed it (`-` for none) —
+// regenerated on every open(), same convention as `/proc/meminfo`. The
+// first three lines are a summary; `unclaimed` is the list of devices this
+// kernel does not drive. See `crate::pci::render_report` and `hal::pci`.
+struct PciInode;
+
+impl Inode for PciInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
+    fn stat(&self) -> Stat {
+        Stat::regular(207, crate::pci::render_report().len() as i64)
+    }
+
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+        if flags.is_write() {
+            return Err(Errno::EROFS);
+        }
+        Ok(Box::new(ProcFile { data: crate::pci::render_report().into_bytes(), offset: 0 }))
     }
 }
 

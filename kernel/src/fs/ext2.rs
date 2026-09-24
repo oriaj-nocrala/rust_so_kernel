@@ -276,7 +276,15 @@ pub fn init() -> Result<(), &'static str> {
     if !device.present() {
         return Err("no disk on the secondary IDE channel");
     }
-    mount_and_repair(device)
+    mount_and_repair(device)?;
+    // `block::ata` drives the secondary channel through its legacy ports
+    // (0x170/0x376), so it never finds its controller on the bus. Claim the
+    // IDE function whose secondary channel is in compatibility mode
+    // (prog-IF bit 2 clear) — the one those ports belong to.
+    crate::pci::claim_matching("ata", |f| {
+        (f.class, f.subclass) == (0x01, 0x01) && f.progif & 0x04 == 0
+    });
+    Ok(())
 }
 
 /// Mounts ext2 **read-only** from an arbitrary device — the USB pendrive's
