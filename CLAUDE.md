@@ -775,6 +775,16 @@ boot is the one numbered above the log's last boot at deploy time that prints
 the nonce. `--no-reboot`/`--no-deploy` for dry runs; `--classify` is its
 classifier alone, for testing against `usb-log.sh read --all --image` output.
 
+**Resuming the agent after the reboot: `scripts/metal-resume.sh`** (phase 6).
+tty1 logs in by itself (a kmscon drop-in, `/etc/systemd/system/
+kmsconvt@tty1.service.d/autologin.conf`, outside this repo) and `~/.zlogin`
+runs this script there. With a run pending it `--collect`s and then
+`claude --resume`s the session that launched it (`session=` in `pending`,
+from `CLAUDE_CODE_SESSION_ID`) in the foreground of tty1, with the verdict in
+the prompt. Brakes: `target/metal/budget` (automatic resumes left; missing or
+0 = collect only) and `target/metal/stop` (collect only). `--dry-run` says
+what it would do.
+
 **Testing jobs in QEMU:** put the job into a scratch copy of `disk.img` with
 `debugfs -w` (`mkdir /autorun`, `write job /autorun/job`, same for `nonce`)
 and boot it with `QEMU_DEBUG_DISK_IMG=<copy> QEMU_DEBUG_EXTRA_ARGS=-no-reboot`,

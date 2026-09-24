@@ -171,6 +171,8 @@ cmd_run() {
         echo "job=$JOB"
         echo "prev_boot_seq=$prev_seq"
         echo "usb_entry=$entry"
+        # The Claude Code session to resume afterwards (scripts/metal-resume.sh).
+        echo "session=${CLAUDE_CODE_SESSION_ID:-}"
     } > "$PENDING"
     cp "$JOB" "$STATE/pending.job"
     say "job on the stick, nonce $NONCE (log partition's last boot: #$prev_seq)"

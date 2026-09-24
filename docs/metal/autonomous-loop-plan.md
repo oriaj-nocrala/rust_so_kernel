@@ -5,7 +5,9 @@
 > sobrevive al reset, así que la fase 4 hace falta. Fase 3 hecha (QEMU) y
 > fase 5 (`scripts/metal-run.sh`) hecha y con su primera ida y vuelta real
 > en la Ryzen (`OK`). Fase 4 (watchdog en constanos) hecha y medida en la
-> Ryzen: un job colgado vuelve solo a Linux a los ~300 s. Siguiente: fase 6. Ver "Resultados" al final. Es la
+> Ryzen: un job colgado vuelve solo a Linux a los ~300 s. Fase 6 montada
+> (autologin + `scripts/metal-resume.sh`) y probada en seco; falta su primera
+> vuelta real. Ver "Resultados" al final. Es la
 > "etapa 0" de la dirección de largo plazo (un SO que un agente LLM pueda
 > observar, probar y mejorar; ver la memoria `self-improving-os-direction`).
 > No confundir con la etapa 0 de `docs/smp/smp-plan.md`.
@@ -330,3 +332,23 @@ entonces `--collect` muestra solo la salida de consola del job (las líneas
   `run-kernel-tests.sh` PASS, `boot-matrix.sh 4 2` 8/8.
 - Sigue sin cubrirse el tramo firmware → `fs::init`: un kernel que muere
   antes de armar el watchdog no se rescata.
+
+**2026-09-24, fase 6 (reanudar el agente solo), montada y probada en seco:**
+- **Autologin:** esta máquina no tiene gestor gráfico; tty1 la sirve kmscon
+  (`login` → `zsh`). Drop-in `/etc/systemd/system/kmsconvt@tty1.service.d/
+  autologin.conf`: `ExecStart=kmscon --vt=%I --no-switchvt --login --
+  /usr/bin/login -f oriaj`. Elegido por el usuario (único usuario real, máquina
+  en su casa) frente a un servicio de sistema.
+- **Gancho:** `~/.zlogin` ejecuta `scripts/metal-resume.sh` si `XDG_VTNR` es
+  1. `.zlogin` y no `.zprofile`, porque zsh lo lee después de `.zshrc`, que
+  es donde `~/.local/bin` (el `claude`) entra en el `PATH`.
+- **`scripts/metal-resume.sh`:** sin `target/metal/pending` no hace nada. Si
+  hay una ejecución pendiente: `--collect`, espera a la red, y
+  `claude --resume <sesión> "<veredicto + dónde está el log>"` **en primer
+  plano en tty1**, así que quien esté delante ve lo que hace y puede cortarlo.
+  `metal-run.sh` guarda la sesión (`CLAUDE_CODE_SESSION_ID`) en `pending`.
+- **Frenos:** `target/metal/budget` (reanudaciones automáticas que quedan;
+  sin el fichero o a 0 solo recoge) y `target/metal/stop` (solo recoge).
+  Cada reanudación resta 1.
+- Probado en seco: con `budget`=3 → «would collect, then resume the agent»;
+  con `stop` → «then stop»; sin pendiente → nada.
