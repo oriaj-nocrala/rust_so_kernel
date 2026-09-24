@@ -775,6 +775,7 @@ impl Inode for Ext2Inode {
         new_raw.set_links_count(2);
         new_raw.set_i_block(0, new_block);
         new_raw.set_size(f.core.sb.block_size as u64);
+        new_raw.set_blocks_512(f.core.sb.block_size / 512);
 
         let bs = f.core.sb.block_size as usize;
         let mut buf = alloc::vec![0u8; bs];

@@ -839,6 +839,56 @@ mod tests {
         }
     }
 
+    /// `i_blocks` oracle: a file written through `write_file_range` far
+    /// enough to need singly- and doubly-indirect pointer blocks, plus a
+    /// root directory grown by `add_dir_entry`, must leave every inode's
+    /// `i_blocks` exactly what `e2fsck` Pass 1 recounts. Before
+    /// `alloc_block_for`, nothing on the write path touched `i_blocks`,
+    /// and every file the kernel wrote read "i_blocks is 0, should be N".
+    #[test]
+    fn written_files_and_grown_dirs_keep_i_blocks_e2fsck_clean() {
+        let Some(bytes) = build_real_ext2_fixture(2048) else {
+            eprintln!("skipping e2fsck oracle test: mke2fs not runnable on this host");
+            return;
+        };
+        let core = Ext2Core::mount(alloc::boxed::Box::new(MemDisk::from_vec(bytes)))
+            .expect("mount a real mke2fs image");
+
+        // 300 KiB: past the 12 direct + 256 singly-indirect blocks.
+        let ino = core.alloc_inode(false).unwrap().expect("free inode");
+        let mut raw = RawInode::zeroed(core.sb.inode_size as usize);
+        raw.set_i_mode(0x8000 | 0o644);
+        raw.set_links_count(1);
+        let data: Vec<u8> = (0..300 * 1024).map(|i| (i % 251) as u8).collect();
+        core.write_file_range(ino, &mut raw, 0, &data).expect("write");
+        assert!(raw.i_block(13) != 0, "must reach the doubly-indirect range");
+        assert_eq!(core.read_inode(ino).unwrap().blocks_512(), raw.blocks_512());
+
+        let mut root = core.read_inode(ROOT_INO).unwrap();
+        core.add_dir_entry(ROOT_INO, &mut root, "big", ino, 1).expect("link big");
+        // Enough entries to grow root past its first block.
+        let blocks_before = root.blocks_512();
+        for i in 0..80 {
+            let name = alloc::format!("entry-with-a-longish-name-{i:03}");
+            let e = core.alloc_inode(false).unwrap().expect("free inode");
+            let mut r = RawInode::zeroed(core.sb.inode_size as usize);
+            r.set_i_mode(0x8000 | 0o644);
+            r.set_links_count(1);
+            core.write_inode(e, &r).unwrap();
+            core.add_dir_entry(ROOT_INO, &mut root, &name, e, 1).expect("link entry");
+        }
+        assert!(root.blocks_512() > blocks_before, "root must have grown");
+
+        let dump = dump_core_to_bytes(&core);
+        match e2fsck_says_clean(&dump) {
+            Some((clean, stdout, stderr)) => assert!(
+                clean,
+                "e2fsck -fn reported inconsistencies:\nstdout: {stdout}\nstderr: {stderr}"
+            ),
+            None => eprintln!("skipping e2fsck oracle assertion: e2fsck not runnable on this host"),
+        }
+    }
+
     /// The orphan-side oracle: a real `mke2fs` image, a real orphan
     /// inode created by `debugfs` itself, the full repair pipeline, and
     /// `e2fsck -fn` as the verdict. This is the test that fails if the

@@ -411,17 +411,28 @@ impl Ext2Core {
     /// Read (or allocate, if zero) the `index`-th pointer slot in an
     /// indirect/doubly-indirect pointer block, writing the new pointer back
     /// immediately — shared by both levels of `block_for_index_alloc`.
-    fn get_or_alloc_ptr(&self, container_block: u32, index: u32) -> Result<u32, Ext2Error> {
+    fn get_or_alloc_ptr(&self, raw: &mut RawInode, container_block: u32, index: u32) -> Result<u32, Ext2Error> {
         let mut buf = self.block_vec(container_block)?;
         let off = (index * 4) as usize;
         let existing = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
         if existing != 0 {
             return Ok(existing);
         }
-        let new_block = self.alloc_block()?.ok_or(Ext2Error::NoSpace)?;
+        let new_block = self.alloc_block_for(raw)?;
         buf[off..off + 4].copy_from_slice(&new_block.to_le_bytes());
         self.write_block(container_block, &buf)?;
         Ok(new_block)
+    }
+
+    /// Allocate one block on behalf of `raw`, charging it to the inode's
+    /// `i_blocks` — every block an inode owns, pointer blocks included,
+    /// must be counted there or `e2fsck` reports the inode ("i_blocks is
+    /// 0, should be 14"). The caller persists `raw`.
+    pub fn alloc_block_for(&self, raw: &mut RawInode) -> Result<u32, Ext2Error> {
+        let nb = self.alloc_block()?.ok_or(Ext2Error::NoSpace)?;
+        let spb = self.sb.block_size / SECTOR_SIZE as u32;
+        raw.set_blocks_512(raw.blocks_512() + spb);
+        Ok(nb)
     }
 
     /// Like `block_for_index`, but allocates whatever's missing (data
@@ -434,7 +445,7 @@ impl Ext2Core {
             if b != 0 {
                 return Ok(b);
             }
-            let nb = self.alloc_block()?.ok_or(Ext2Error::NoSpace)?;
+            let nb = self.alloc_block_for(raw)?;
             raw.set_i_block(index as usize, nb);
             return Ok(nb);
         }
@@ -444,13 +455,13 @@ impl Ext2Core {
         if indirect_index < ptrs_per_block {
             let indirect_block = raw.i_block(12);
             let indirect_block = if indirect_block == 0 {
-                let nb = self.alloc_block()?.ok_or(Ext2Error::NoSpace)?;
+                let nb = self.alloc_block_for(raw)?;
                 raw.set_i_block(12, nb);
                 nb
             } else {
                 indirect_block
             };
-            return self.get_or_alloc_ptr(indirect_block, indirect_index);
+            return self.get_or_alloc_ptr(raw, indirect_block, indirect_index);
         }
 
         let dbl_index = indirect_index - ptrs_per_block;
@@ -458,7 +469,7 @@ impl Ext2Core {
         if dbl_index < dbl_capacity {
             let dbl_block = raw.i_block(13);
             let dbl_block = if dbl_block == 0 {
-                let nb = self.alloc_block()?.ok_or(Ext2Error::NoSpace)?;
+                let nb = self.alloc_block_for(raw)?;
                 raw.set_i_block(13, nb);
                 nb
             } else {
@@ -466,8 +477,8 @@ impl Ext2Core {
             };
             let first_level_index = dbl_index / ptrs_per_block;
             let second_level_index = dbl_index % ptrs_per_block;
-            let first_level_block = self.get_or_alloc_ptr(dbl_block, first_level_index)?;
-            return self.get_or_alloc_ptr(first_level_block, second_level_index);
+            let first_level_block = self.get_or_alloc_ptr(raw, dbl_block, first_level_index)?;
+            return self.get_or_alloc_ptr(raw, first_level_block, second_level_index);
         }
 
         let tpl_index = dbl_index - dbl_capacity;
@@ -475,7 +486,7 @@ impl Ext2Core {
         if tpl_index < tpl_capacity {
             let tpl_block = raw.i_block(14);
             let tpl_block = if tpl_block == 0 {
-                let nb = self.alloc_block()?.ok_or(Ext2Error::NoSpace)?;
+                let nb = self.alloc_block_for(raw)?;
                 raw.set_i_block(14, nb);
                 nb
             } else {
@@ -485,9 +496,9 @@ impl Ext2Core {
             let rem = tpl_index % dbl_capacity;
             let second_level_index = rem / ptrs_per_block;
             let third_level_index = rem % ptrs_per_block;
-            let first_level_block = self.get_or_alloc_ptr(tpl_block, first_level_index)?;
-            let second_level_block = self.get_or_alloc_ptr(first_level_block, second_level_index)?;
-            return self.get_or_alloc_ptr(second_level_block, third_level_index);
+            let first_level_block = self.get_or_alloc_ptr(raw, tpl_block, first_level_index)?;
+            let second_level_block = self.get_or_alloc_ptr(raw, first_level_block, second_level_index)?;
+            return self.get_or_alloc_ptr(raw, second_level_block, third_level_index);
         }
 
         Err(Ext2Error::TooLarge) // beyond even triply-indirect capacity — genuinely unsupported

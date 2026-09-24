@@ -49,6 +49,12 @@ impl RawInode {
         self.buf[26..28].copy_from_slice(&v.to_le_bytes());
     }
 
+    /// `i_blocks`: 512-byte sectors held by this inode — data blocks and
+    /// indirect pointer blocks alike (what `e2fsck` Pass 1 recounts).
+    pub fn blocks_512(&self) -> u32 {
+        u32::from_le_bytes(self.buf[28..32].try_into().unwrap())
+    }
+
     pub fn set_blocks_512(&mut self, v: u32) {
         self.buf[28..32].copy_from_slice(&v.to_le_bytes());
     }
