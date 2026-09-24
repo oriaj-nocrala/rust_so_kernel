@@ -238,6 +238,22 @@ static USB_KEY_REPORTS: AtomicU64 = AtomicU64::new(0);
 /// held for a long stretch of typing, e.g. during a slow disk read.
 static USB_KEYS_DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Spurious 8259 interrupts (IRQ7/IRQ15 with no ISR bit set) since boot,
+/// and real interrupts on lines this kernel never unmasks. Neither used to
+/// have an IDT entry at all, so the first one on real hardware was a kernel
+/// panic (GPF, error 0x13B = vector 39) — the Ryzen, 2026-09-23, starting
+/// `doom`. Spurious ones are harmless and expected on metal; a nonzero
+/// `unexpected_irqs` means some line got unmasked that nothing services.
+static SPURIOUS_IRQS: AtomicU64 = AtomicU64::new(0);
+static UNEXPECTED_IRQS: AtomicU64 = AtomicU64::new(0);
+static LAST_UNEXPECTED_IRQ: AtomicU64 = AtomicU64::new(u64::MAX);
+
+pub fn inc_spurious_irqs() { SPURIOUS_IRQS.fetch_add(1, Ordering::Relaxed); }
+pub fn note_unexpected_irq(line: u8) {
+    UNEXPECTED_IRQS.fetch_add(1, Ordering::Relaxed);
+    LAST_UNEXPECTED_IRQ.store(line as u64, Ordering::Relaxed);
+}
+
 pub fn inc_forks()         { FORKS_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_execs()         { EXECS_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_reaps()         { REAPS_TOTAL.fetch_add(1, Ordering::Relaxed); }
@@ -350,6 +366,8 @@ pub fn render_report() -> alloc::string::String {
          usb_keyboards: {}\n\
          usb_key_reports: {}\n\
          usb_keys_dropped: {}\n\
+         spurious_irqs: {}\n\
+         unexpected_irqs: {} (last line {})\n\
          {}{}{}{}",
         mask, enabled,
         FORKS_TOTAL.load(Ordering::Relaxed),
@@ -365,6 +383,9 @@ pub fn render_report() -> alloc::string::String {
         crate::usb::keyboard_count(),
         USB_KEY_REPORTS.load(Ordering::Relaxed),
         USB_KEYS_DROPPED.load(Ordering::Relaxed),
+        SPURIOUS_IRQS.load(Ordering::Relaxed),
+        UNEXPECTED_IRQS.load(Ordering::Relaxed),
+        LAST_UNEXPECTED_IRQ.load(Ordering::Relaxed) as i64,
         SCHEDULER_LOCK.render("scheduler"),
         RAMFS_ENTRIES_LOCK.render("ramfs_entries_lock"),
         TF_REWIND.render(),
@@ -392,6 +413,9 @@ pub fn print_panic_snapshot() {
     crate::serial_println_raw!("  cow_faults_resolved: {}", COW_FAULTS_RESOLVED.load(Ordering::Relaxed));
     crate::serial_println_raw!("  cow_faults_failed: {}", COW_FAULTS_FAILED.load(Ordering::Relaxed));
     crate::serial_println_raw!("  switches_total: {}", SWITCHES_TOTAL.load(Ordering::Relaxed));
+    crate::serial_println_raw!("  spurious_irqs: {}", SPURIOUS_IRQS.load(Ordering::Relaxed));
+    crate::serial_println_raw!("  unexpected_irqs: {} (last line {})",
+        UNEXPECTED_IRQS.load(Ordering::Relaxed), LAST_UNEXPECTED_IRQ.load(Ordering::Relaxed) as i64);
     // These three lines used to read `diag`'s private fields / call its
     // `print_panic_line` methods directly. They now go through plain,
     // allocation-free accessors — the printed text is byte-for-byte what it

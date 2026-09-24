@@ -49,10 +49,13 @@ fn inb(port: u16) -> u8 {
 }
 
 /// Inicializa los PICs 8259
+///
+/// Leaves **every** line masked. Each line this kernel handles is unmasked
+/// explicitly afterwards (`enable_irq` in `init_hardware_interrupts` and
+/// `mouse::init`); a line nobody asked for stays off. This used to restore
+/// whatever masks the firmware had left, which on real hardware is not
+/// guaranteed to be "all masked".
 pub fn initialize() {
-    let pic1_mask = inb(PIC1_DATA);
-    let pic2_mask = inb(PIC2_DATA);
-
     // ICW1: Iniciar la secuencia de inicialización
     outb(PIC1_COMMAND, CMD_INIT);
     outb(PIC2_COMMAND, CMD_INIT);
@@ -69,9 +72,41 @@ pub fn initialize() {
     outb(PIC1_DATA, 1);
     outb(PIC2_DATA, 1);
 
-    // Restaurar máscaras
-    outb(PIC1_DATA, pic1_mask);
-    outb(PIC2_DATA, pic2_mask);
+    // Todo enmascarado; cada línea usada se habilita con `enable_irq`.
+    outb(PIC1_DATA, 0xFF);
+    outb(PIC2_DATA, 0xFF);
+}
+
+/// OCW3: read the In-Service Register on the next read of the command port.
+const CMD_READ_ISR: u8 = 0x0B;
+
+/// Is an interrupt on `irq_line` (7 or 15) a *spurious* one?
+///
+/// When a line drops before the CPU acknowledges it, the 8259 still has to
+/// hand the CPU a vector and gives its lowest-priority one — IRQ7 on the
+/// master, IRQ15 on the slave — without setting its ISR bit. Real hardware
+/// does this routinely (the 2026-09-23 Ryzen panic was one: a GPF with
+/// error code 0x13B, i.e. vector 39 delivered to an empty IDT slot);
+/// QEMU practically never does. A spurious interrupt must NOT be EOI'd on
+/// its own PIC — there is nothing in service there to end — but a spurious
+/// IRQ15 still went through the master's cascade line, which is in service
+/// and does need its EOI (`end_of_spurious`).
+pub fn is_spurious(irq_line: u8) -> bool {
+    let (cmd, bit) = if irq_line < 8 {
+        (PIC1_COMMAND, irq_line)
+    } else {
+        (PIC2_COMMAND, irq_line - 8)
+    };
+    outb(cmd, CMD_READ_ISR);
+    inb(cmd) & (1 << bit) == 0
+}
+
+/// The EOI a spurious interrupt on `irq_line` needs: none for the master's
+/// IRQ7, the master only (for the cascade) for the slave's IRQ15.
+pub fn end_of_spurious(irq_line: u8) {
+    if irq_line >= 8 {
+        outb(PIC1_COMMAND, CMD_END_OF_INTERRUPT);
+    }
 }
 
 /// Envía la señal de fin de interrupción (EOI)

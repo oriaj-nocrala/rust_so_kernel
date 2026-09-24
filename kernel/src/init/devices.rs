@@ -48,6 +48,22 @@ pub fn init_idt() {
         idt.add_handler(33, keyboard_interrupt_handler);
         idt.add_handler(36, serial_interrupt_handler);
         idt.add_handler(44, mouse_interrupt_handler);
+        // Every other 8259 vector gets a handler too. An empty IDT slot is
+        // not "ignored": delivering to it is a #GP, i.e. a kernel panic —
+        // and IRQ7/IRQ15 fire spuriously on real hardware whatever the
+        // masks say (see `pic::is_spurious`).
+        idt.add_handler(34, irq2_handler);
+        idt.add_handler(35, irq3_handler);
+        idt.add_handler(37, irq5_handler);
+        idt.add_handler(38, irq6_handler);
+        idt.add_handler(39, irq7_handler);
+        idt.add_handler(40, irq8_handler);
+        idt.add_handler(41, irq9_handler);
+        idt.add_handler(42, irq10_handler);
+        idt.add_handler(43, irq11_handler);
+        idt.add_handler(45, irq13_handler);
+        idt.add_handler(46, irq14_handler);
+        idt.add_handler(47, irq15_handler);
         // Syscalls are now handled via the `syscall` instruction (LSTAR MSR),
         // not via int 0x80.  No IDT entry needed.
         idt
@@ -126,6 +142,35 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_: ExceptionStackFrame) {
     };
     crate::mouse::process_byte(data);
     crate::interrupts::pic::end_of_interrupt(crate::interrupts::pic::Irq::Mouse.as_u8());
+}
+
+/// A PIC line with no driver behind it. IRQ7/IRQ15 are checked for the
+/// 8259's spurious case first, which needs a different EOI (see
+/// `pic::is_spurious`); anything else is a real interrupt on a line that
+/// should be masked — counted, EOI'd, and otherwise dropped.
+fn unhandled_pic_irq(line: u8) {
+    use crate::interrupts::pic;
+    if (line == 7 || line == 15) && pic::is_spurious(line) {
+        crate::debug::inc_spurious_irqs();
+        pic::end_of_spurious(line);
+        return;
+    }
+    crate::debug::note_unexpected_irq(line);
+    pic::end_of_interrupt(pic::PIC1_OFFSET + line);
+}
+
+macro_rules! unhandled_irq_handlers {
+    ($($name:ident => $line:expr),* $(,)?) => {$(
+        extern "x86-interrupt" fn $name(_: ExceptionStackFrame) {
+            unhandled_pic_irq($line);
+        }
+    )*};
+}
+
+unhandled_irq_handlers! {
+    irq2_handler => 2, irq3_handler => 3, irq5_handler => 5, irq6_handler => 6,
+    irq7_handler => 7, irq8_handler => 8, irq9_handler => 9, irq10_handler => 10,
+    irq11_handler => 11, irq13_handler => 13, irq14_handler => 14, irq15_handler => 15,
 }
 
 extern "x86-interrupt" fn divide_by_zero_handler(sf: ExceptionStackFrame) {
