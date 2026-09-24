@@ -79,9 +79,36 @@ pub struct InputEventDevice {
     // stays a pure per-reader concern, not a second kind of record mixed
     // into the shared RAW_KEY_EVENTS ring.
     pending_syn: bool,
+    /// This handle holds an `EVIOCGRAB` (see `keyboard::grab`). Released
+    /// on `EVIOCGRAB 0` or when the handle drops -- including when the
+    /// grabbing process dies, since its fd table is dropped with it.
+    grabbed: bool,
+}
+
+/// Linux's `EVIOCGRAB`, `_IOW('E', 0x90, int)`.
+const EVIOCGRAB: u64 = 0x4004_4590;
+
+impl Drop for InputEventDevice {
+    fn drop(&mut self) {
+        if self.grabbed {
+            crate::keyboard::ungrab();
+        }
+    }
 }
 
 impl FileHandle for InputEventDevice {
+    fn ioctl(&mut self, request: u64, arg: u64) -> Option<i64> {
+        if request != EVIOCGRAB {
+            return None;
+        }
+        Some(match (arg != 0, self.grabbed) {
+            (true, false) => { crate::keyboard::grab(); self.grabbed = true; 0 }
+            (false, true) => { crate::keyboard::ungrab(); self.grabbed = false; 0 }
+            (true, true) => -16, // EBUSY, as Linux answers a second grab
+            (false, false) => -22, // EINVAL: nothing to release
+        })
+    }
+
     fn read(&mut self, buf: &mut [u8]) -> FileResult<usize> {
         if buf.len() < RECORD_SIZE {
             return Ok(0);
@@ -121,7 +148,7 @@ impl FileHandle for InputEventDevice {
     }
 
     fn dup(&self) -> Option<Box<dyn FileHandle>> {
-        Some(Box::new(InputEventDevice { pending_syn: false }))
+        Some(Box::new(InputEventDevice { pending_syn: false, grabbed: false }))
     }
 
     fn name(&self) -> &str {
@@ -130,5 +157,5 @@ impl FileHandle for InputEventDevice {
 }
 
 pub fn open() -> Box<dyn FileHandle> {
-    Box::new(InputEventDevice { pending_syn: false })
+    Box::new(InputEventDevice { pending_syn: false, grabbed: false })
 }

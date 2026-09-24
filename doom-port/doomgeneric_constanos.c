@@ -66,6 +66,11 @@
 // (not a real Linux fbdev ioctl; real fbdev exposes the framebuffer via
 // mmap, which this kernel doesn't support for device memory).
 #define FBIO_BLIT 0x46420001UL
+// Linux's EVIOCGRAB (_IOW('E', 0x90, int)): while held, keys go to us only,
+// not to the tty -- otherwise everything typed in the game (arrows, the
+// `y` of "quit?") is replayed by the shell afterwards. The kernel drops the
+// grab when the fd closes, so a crash cannot leave the keyboard grabbed.
+#define EVIOCGRAB 0x40044590UL
 
 struct fb_blit_args {
     unsigned long ptr;
@@ -195,6 +200,7 @@ void DG_Init(void)
 {
     s_fbFd = open("/dev/fb", O_WRONLY);
     s_kbdFd = open("/dev/input/event0", O_RDONLY);
+    if (s_kbdFd >= 0) ioctl(s_kbdFd, EVIOCGRAB, 1);
     s_mouseFd = open("/dev/input/event1", O_RDONLY);
 
     // Drain events queued before we started: the kernel's raw-event ring

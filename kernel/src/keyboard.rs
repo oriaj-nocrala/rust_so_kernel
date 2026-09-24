@@ -23,6 +23,25 @@ use crate::keyboard_buffer::KEYBOARD_BUFFER;
 struct DecoderCell(UnsafeCell<hal::keyboard::KeyDecoder>);
 unsafe impl Sync for DecoderCell {}
 
+/// Open `/dev/input/event0` handles holding an `EVIOCGRAB`. While any do,
+/// key presses still produce evdev events (and Ctrl-C/Ctrl-\/Ctrl-Z still
+/// signal the foreground group), but no characters reach the tty. Without
+/// it, everything typed while a game had the keyboard -- arrows, WASD, the
+/// `y` of "quit?" -- sat in the tty buffer and `ash` replayed it after the
+/// game exited: an up-arrow recalled the last command, the `y` landed at
+/// its end, and an Enter ran it. Linux's grab also swallows Ctrl-C; this
+/// one keeps it, since there is no second console to switch to if a
+/// grabbing program hangs.
+static GRABS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub fn grab() {
+    GRABS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn ungrab() {
+    GRABS.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+}
+
 static DECODER: DecoderCell = DecoderCell(UnsafeCell::new(hal::keyboard::KeyDecoder::new()));
 
 // ============================================================================
@@ -44,8 +63,14 @@ pub fn process_scancode(scancode: u8) {
         crate::keyboard_buffer::RAW_KEY_EVENTS.push(raw.keycode, raw.pressed);
     }
 
+    let grabbed = GRABS.load(core::sync::atomic::Ordering::SeqCst) != 0;
     for &c in out.chars() {
-        push(c);
+        if grabbed {
+            // Signals only; the character itself is the grabber's.
+            let _ = crate::tty::feed_input(c);
+        } else {
+            push(c);
+        }
     }
 }
 

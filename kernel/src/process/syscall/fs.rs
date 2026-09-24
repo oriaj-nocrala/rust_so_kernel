@@ -889,6 +889,25 @@ pub(super) fn sys_ioctl(fd: i32, request: u64, argp: u64) -> SyscallResult {
 
     if fd < 0 { return errno::EBADF; }
 
+    // Device-specific requests first (`FileHandle::ioctl`, e.g. EVIOCGRAB
+    // on /dev/input/event0). The fd table is cloned out and the scheduler
+    // lock released before calling in, like sys_read's generic path.
+    let files = {
+        let sched = crate::process::irq_guard::SchedGuard::lock();
+        match sched.running_ref() {
+            Some(proc) => proc.files.clone(),
+            None => return errno::ESRCH,
+        }
+    };
+    let handled = match files.lock().get_mut(fd as usize) {
+        Ok(file) => file.ioctl(request, argp),
+        Err(_) => return errno::EBADF,
+    };
+    drop(files);
+    if let Some(r) = handled {
+        return r;
+    }
+
     #[derive(Clone, Copy, PartialEq)]
     enum FdKind { Serial, Fb, Other }
 

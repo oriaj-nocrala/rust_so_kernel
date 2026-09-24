@@ -142,6 +142,14 @@ pub trait FileHandle: Send {
         None
     }
 
+    /// A request `ioctl(2)` addressed to this device. `Some(result)` (a
+    /// return value or a negative errno) if the handle implements
+    /// `request`; `None` falls through to the generic ioctls (termios,
+    /// window size, ...). Called with no scheduler lock held.
+    fn ioctl(&mut self, _request: u64, _arg: u64) -> Option<i64> {
+        None
+    }
+
     /// Whether this open file description is in non-blocking mode.
     ///
     /// Only sockets answer this today: every other handle here either never
