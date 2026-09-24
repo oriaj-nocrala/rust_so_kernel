@@ -68,8 +68,10 @@ fn char_h() -> usize {
 }
 
 /// Rows of text for the screen height, about 44-54 lines: 16 px up to 720
-/// lines, 20 px to 1000, 24 px to 1400 (1920x1080 gets 147x44 cells of
-/// 13x24), 32 px above.
+/// lines, 20 px to 1000, 24 px to 1400 (1920x1080 gets 174x45 cells of
+/// 11x24), 32 px above. Needs `noto-sans-mono-bitmap` >= 0.3: 0.2 placed
+/// every glyph low in its raster, so descenders (g, j, p, q, y) ran off
+/// the bottom of the cell and were cut.
 fn pick_font(height: usize) -> RasterHeight {
     match height {
         0..=719 => RasterHeight::Size16,
