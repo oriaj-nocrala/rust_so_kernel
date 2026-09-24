@@ -29,6 +29,8 @@
 // itself* (which bits get cleared, which counters get adjusted, in what
 // order) changed, only how the fact of it gets reported upward.
 
+use hal::block::BlockDevice;
+
 use crate::bitmap::count_free_bits;
 use crate::error::Ext2Error;
 use crate::inode::RawInode;

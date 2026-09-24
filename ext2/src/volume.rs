@@ -35,6 +35,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use hal::block::{BlockDevice, SECTOR_SIZE};
+use hal::blockcache::{CachedDevice, CHUNK_SECTORS};
 
 use crate::bgd::{self, BlockGroupDesc};
 use crate::bitmap;
@@ -46,12 +47,20 @@ use crate::superblock::Superblock;
 /// allocation and free-count bookkeeping. See the module doc comment for
 /// exactly what has (and hasn't) moved here.
 pub struct Ext2Core {
-    /// Every sector read/write funnels through here — `AtaBlockDevice` at
-    /// real kernel boot, `hal::block::MemDisk` in this crate's own tests
-    /// (and the kernel's QEMU integration test).
-    pub device: Box<dyn BlockDevice>,
+    /// Every sector read/write funnels through here — `AtaBlockDevice` or
+    /// the USB pendrive at real kernel boot, `hal::block::MemDisk` in this
+    /// crate's own tests (and the kernel's QEMU integration test) — always
+    /// behind a write-through `CachedDevice`, which `mount` puts there.
+    /// Nothing else holds the wrapped device, so the cache cannot go stale.
+    pub device: CachedDevice,
     pub sb: Superblock,
 }
+
+/// Size of the block cache every mount gets, in `CHUNK_SECTORS`-sector
+/// chunks: 8192 x 4 KiB = 32 MiB, allocated only as it fills — enough to
+/// hold all of `freedoom1.wad` (28 MiB), so a second `doom` never touches
+/// the pendrive.
+pub const CACHE_CHUNKS: usize = 8192;
 
 impl Ext2Core {
     /// Parse the superblock and construct a mounted `Ext2Core`. Does NOT
@@ -65,6 +74,11 @@ impl Ext2Core {
         let mut raw = [0u8; 1024];
         device.read_sectors(2, 2, &mut raw).map_err(|_| Ext2Error::Io)?;
         let sb = Superblock::parse(&raw)?;
+        // Read-ahead must stop where the filesystem does: past it may lie
+        // another partition's window, which `hal::block::Partition` refuses.
+        let fs_sectors = sb.blocks_count as u64 * (sb.block_size as u64 / SECTOR_SIZE as u64);
+        let capacity = fs_sectors.min(u32::MAX as u64 / CHUNK_SECTORS as u64 * CHUNK_SECTORS as u64) as u32;
+        let device = CachedDevice::new(device, capacity, CACHE_CHUNKS);
         Ok(Self { device, sb })
     }
 
@@ -374,11 +388,21 @@ impl Ext2Core {
 
     /// Read the `index`-th block-pointer `u32` out of an indirect (or
     /// doubly-indirect first-level) pointer block — shared by both levels
-    /// of `block_for_index` above.
+    /// of `block_for_index` above. Reads only the sector holding it, into
+    /// a stack buffer: this runs two or three times per mapped block, and
+    /// a heap-allocated, zeroed whole block each time was most of what a
+    /// small `read()` cost.
     fn read_block_ptr(&self, block_num: u32, index: u32) -> Result<Option<u32>, Ext2Error> {
-        let buf = self.block_vec(block_num)?;
+        if block_num >= self.sb.blocks_count || index >= self.sb.block_size / 4 {
+            return Err(Ext2Error::Io);
+        }
+        let spb = self.sb.block_size / SECTOR_SIZE as u32;
         let off = (index * 4) as usize;
-        let b = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        let mut sector = [0u8; SECTOR_SIZE];
+        let lba = block_num * spb + (off / SECTOR_SIZE) as u32;
+        self.device.read_sectors(lba, 1, &mut sector).map_err(|_| Ext2Error::Io)?;
+        let o = off % SECTOR_SIZE;
+        let b = u32::from_le_bytes(sector[o..o + 4].try_into().unwrap());
         Ok(if b == 0 { None } else { Some(b) })
     }
 
@@ -472,8 +496,16 @@ impl Ext2Core {
     // ── File data read/write ─────────────────────────────────────────────
 
     /// Read `buf.len()` bytes of file data starting at byte `offset`.
+    ///
+    /// Whole blocks go straight into `buf`, and a run of blocks that are
+    /// also contiguous on disk is one device request (the USB pendrive
+    /// pays a full SCSI command per request); only a partial block at
+    /// either end goes through a scratch buffer.
     pub fn read_file_range(&self, raw: &RawInode, offset: usize, buf: &mut [u8]) -> Result<(), Ext2Error> {
         let bs = self.sb.block_size as usize;
+        let spb = self.sb.block_size / SECTOR_SIZE as u32;
+        // `read_sectors` takes a `u8` count (0 meaning 256).
+        let max_run = (255 / spb).max(1) as usize;
         let mut done = 0;
         while done < buf.len() {
             let file_pos = offset + done;
@@ -481,19 +513,66 @@ impl Ext2Core {
             let block_off = file_pos % bs;
             let n = (bs - block_off).min(buf.len() - done);
 
-            match self.block_for_index(raw, block_index)? {
-                Some(block_num) => {
-                    let block_buf = self.block_vec(block_num)?;
-                    buf[done..done + n].copy_from_slice(&block_buf[block_off..block_off + n]);
-                }
-                None => {
-                    // Hole (sparse file) or past what block_for_index supports — zero-fill.
-                    for b in &mut buf[done..done + n] { *b = 0; }
+            let Some(block_num) = self.block_for_index(raw, block_index)? else {
+                // Hole (sparse file) or past what block_for_index supports — zero-fill.
+                buf[done..done + n].fill(0);
+                done += n;
+                continue;
+            };
+            if n < bs {
+                self.read_partial_block(block_num, block_off, &mut buf[done..done + n])?;
+                done += n;
+                continue;
+            }
+
+            // Whole block: extend over following whole blocks that sit
+            // right after it on disk.
+            let mut run = 1usize;
+            while run < max_run && (buf.len() - done) >= (run + 1) * bs {
+                match self.block_for_index(raw, block_index + run as u32)? {
+                    Some(b) if b == block_num + run as u32 => run += 1,
+                    _ => break,
                 }
             }
-            done += n;
+            self.read_blocks(block_num, run as u32, &mut buf[done..done + run * bs])?;
+            done += run * bs;
         }
         Ok(())
+    }
+
+    /// Bytes `off..off + out.len()` of block `block_num`, reading only the
+    /// sectors they span — into a stack buffer when the block fits one.
+    fn read_partial_block(&self, block_num: u32, off: usize, out: &mut [u8]) -> Result<(), Ext2Error> {
+        const STACK_BYTES: usize = 4096;
+        let bs = self.sb.block_size as usize;
+        if bs > STACK_BYTES {
+            let block_buf = self.block_vec(block_num)?;
+            out.copy_from_slice(&block_buf[off..off + out.len()]);
+            return Ok(());
+        }
+        if block_num >= self.sb.blocks_count {
+            return Err(Ext2Error::Io);
+        }
+        let first = off / SECTOR_SIZE;
+        let count = (off + out.len()).div_ceil(SECTOR_SIZE) - first;
+        let mut tmp = [0u8; STACK_BYTES];
+        let spb = self.sb.block_size / SECTOR_SIZE as u32;
+        self.device
+            .read_sectors(block_num * spb + first as u32, count as u8, &mut tmp[..count * SECTOR_SIZE])
+            .map_err(|_| Ext2Error::Io)?;
+        let o = off - first * SECTOR_SIZE;
+        out.copy_from_slice(&tmp[o..o + out.len()]);
+        Ok(())
+    }
+
+    /// Read `count` consecutive filesystem blocks into `buf` in one device
+    /// request — `read_block`'s range check, over the whole run.
+    fn read_blocks(&self, first: u32, count: u32, buf: &mut [u8]) -> Result<(), Ext2Error> {
+        let spb = self.sb.block_size / SECTOR_SIZE as u32;
+        if first.checked_add(count).map_or(true, |end| end > self.sb.blocks_count) || count * spb > 255 {
+            return Err(Ext2Error::Io);
+        }
+        self.device.read_sectors(first * spb, (count * spb) as u8, buf).map_err(|_| Ext2Error::Io)
     }
 
     /// Write `data` at byte `offset`, allocating whatever blocks are
@@ -897,6 +976,41 @@ mod tests {
         let mut readback = alloc::vec![0u8; data.len()];
         core.read_file_range(&raw, offset, &mut readback).expect("read");
         assert_eq!(&readback, data);
+    }
+
+    /// `read_file_range` batches physically contiguous whole blocks into
+    /// one device request and reads partial blocks sector by sector. Check
+    /// it against the plain per-block definition over a file that crosses
+    /// direct -> singly -> doubly indirect, has holes, and whose data
+    /// blocks are interleaved with the pointer blocks allocated between
+    /// them (so runs break where they must) — at unaligned offsets too.
+    #[test]
+    fn read_file_range_matches_per_block_reads_across_indirect_levels_and_holes() {
+        let core = mount(minimal_image());
+        let mut raw = RawInode::zeroed(128);
+        let pattern = |i: usize| (i.wrapping_mul(7) ^ (i >> 10)) as u8;
+        for &(first, last) in &[(8usize, 16usize), (262, 272)] {
+            let data: alloc::vec::Vec<u8> = (first * BS..last * BS).map(pattern).collect();
+            core.write_file_range(ROOT_INO, &mut raw, first * BS, &data).expect("write");
+        }
+
+        let reference = |off: usize, len: usize| -> alloc::vec::Vec<u8> {
+            (off..off + len)
+                .map(|pos| match core.block_for_index(&raw, (pos / BS) as u32).unwrap() {
+                    Some(b) => core.block_vec(b).unwrap()[pos % BS],
+                    None => 0,
+                })
+                .collect()
+        };
+        let end = 272 * BS;
+        for &(off, len) in &[(0, end), (8 * BS, 8 * BS), (8 * BS + 3, 5 * BS), (11 * BS - 1, 3 * BS + 2), (250 * BS + 17, 22 * BS - 30)] {
+            let mut got = alloc::vec![0xEEu8; len];
+            core.read_file_range(&raw, off, &mut got).expect("read");
+            assert_eq!(got, reference(off, len), "off {} len {}", off, len);
+        }
+        // Spot-check the reference itself against what was written.
+        assert_eq!(reference(9 * BS, 4), (9 * BS..9 * BS + 4).map(pattern).collect::<alloc::vec::Vec<u8>>());
+        assert_eq!(reference(100 * BS, 4), alloc::vec![0u8; 4]);
     }
 
     #[test]

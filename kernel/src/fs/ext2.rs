@@ -216,6 +216,13 @@ impl From<ExtErr> for Errno {
 
 static EXT2: Once<Ext2Fs> = Once::new();
 
+/// The mounted filesystem's block-cache counters (`hal::blockcache`), for
+/// `/proc/kdebug` — `None` before (or without) a mount. Lock-free: plain
+/// atomic loads.
+pub fn cache_stats() -> Option<hal::blockcache::CacheStats> {
+    EXT2.get().map(|fs| fs.core.device.stats())
+}
+
 /// Serializes every mutating ext2 operation — see the module-level
 /// ROBUSTNESS doc comment for why this exists and why read-only paths
 /// don't take it.
