@@ -134,6 +134,7 @@ const SYS_UPTIME_MS: u64 = 400;
 const SYS_UPTIME_SEC: u64 = 401;
 const SYS_MEMINFO_KB: u64 = 402;
 const SYS_KDEBUG_CTL: u64 = 403;
+const SYS_REBOOT: u64 = 169;
 const SYS_MKDIR: u64 = 83;
 const SYS_UNLINK: u64 = 87;
 const SYS_SYMLINK: u64 = 88;
@@ -601,4 +602,15 @@ pub fn with_cstr<R>(s: &str, f: impl FnOnce(&[u8]) -> R) -> R {
     let n = s.len().min(63);
     buf[..n].copy_from_slice(&s.as_bytes()[..n]);
     f(&buf[..=n])
+}
+
+// ── Power ────────────────────────────────────────────────────────────────
+
+/// `reboot(LINUX_REBOOT_CMD_RESTART)` with Linux's magic numbers. Only
+/// returns on failure (negative errno).
+pub fn reboot() -> i64 {
+    const MAGIC1: u64 = 0xfee1_dead;
+    const MAGIC2: u64 = 672_274_793;
+    const CMD_RESTART: u64 = 0x0123_4567;
+    unsafe { syscall3(SYS_REBOOT, MAGIC1, MAGIC2, CMD_RESTART) }
 }

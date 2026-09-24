@@ -94,6 +94,35 @@ pub(super) fn sys_sync() -> SyscallResult {
     }
 }
 
+/// sys_reboot (Linux #169) — `reboot(magic, magic2, cmd, arg)` with
+/// Linux's magic numbers and command values, so mlibc/BusyBox callers work
+/// unchanged. See `crate::reboot` for what "safe" means here.
+///
+/// `RESTART` resets the machine; `HALT` and `POWER_OFF` both stop it after
+/// the same log flush (no ACPI S5 without an AML interpreter — Linux does
+/// the same when it has no power-off driver). `CAD_ON`/`CAD_OFF` are
+/// accepted and ignored: there is no Ctrl-Alt-Del handling to toggle.
+/// No permission check — every process is root here.
+pub(super) fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> SyscallResult {
+    const MAGIC1: u32 = 0xfee1_dead;
+    const MAGIC2: [u32; 4] = [672_274_793, 85_072_278, 369_367_448, 537_993_216];
+    const CMD_RESTART: u32 = 0x0123_4567;
+    const CMD_HALT: u32 = 0xCDEF_0123;
+    const CMD_POWER_OFF: u32 = 0x4321_FEDC;
+    const CMD_CAD_ON: u32 = 0x89AB_CDEF;
+    const CMD_CAD_OFF: u32 = 0;
+
+    if magic1 != MAGIC1 || !MAGIC2.contains(&magic2) {
+        return errno::EINVAL;
+    }
+    match cmd {
+        CMD_RESTART => crate::reboot::restart(),
+        CMD_HALT | CMD_POWER_OFF => crate::reboot::halt(),
+        CMD_CAD_ON | CMD_CAD_OFF => 0,
+        _ => errno::EINVAL,
+    }
+}
+
 /// sys_uptime_sec (custom #202) — seconds elapsed since kernel boot.
 ///
 /// Uses the active clocksource (TSC when available).

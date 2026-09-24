@@ -276,6 +276,7 @@ pub enum SyscallNumber {
     Setpgid = 109,
     Setsid = 112,
     Sync = 162,
+    Reboot = 169,
     Getpgid = 121,
     ArchPrctl = 158,
     Futex = 202,
@@ -358,6 +359,7 @@ impl SyscallNumber {
             121 => Some(Self::Getpgid),
             158 => Some(Self::ArchPrctl),
             162 => Some(Self::Sync),
+            169 => Some(Self::Reboot),
             202 => Some(Self::Futex),
             213 => Some(Self::EpollCreate),
             217 => Some(Self::GetDents64),
@@ -590,5 +592,6 @@ pub fn syscall_handler(
         SyscallNumber::KdebugCtl => misc::sys_kdebug_ctl(arg1, arg2, arg3),
         SyscallNumber::Statvfs => fs::sys_statvfs(arg1 as usize, arg2 as usize),
         SyscallNumber::Sync => misc::sys_sync(),
+        SyscallNumber::Reboot => misc::sys_reboot(arg1 as u32, arg2 as u32, arg3 as u32),
     }
 }

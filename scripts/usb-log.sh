@@ -99,7 +99,7 @@ import sys, zlib, struct, datetime
 
 STRIDE, MAX_SLOTS = 256, 16
 MARKER = b"CONSTANOS-KLOG-PARTITION v1\n"
-REASONS = {1: "periodic", 2: "sync", 3: "PANIC"}
+REASONS = {1: "periodic", 2: "sync", 3: "PANIC", 4: "reboot"}
 mode, want = sys.argv[1], sys.argv[2]
 data = sys.stdin.buffer.read()
 

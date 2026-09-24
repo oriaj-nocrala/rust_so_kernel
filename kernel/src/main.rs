@@ -36,6 +36,7 @@ mod mouse;
 mod panic;
 mod pci;
 mod process;
+mod reboot;
 mod pit;
 mod rtc;
 mod serial;

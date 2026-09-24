@@ -28,10 +28,17 @@ use crate::hal::{Driver, DriverError, KernelPhysMem};
 use crate::serial_println;
 
 static TOPOLOGY: spin::Once<AcpiTopology> = spin::Once::new();
+static RESET_REG: spin::Once<hal::acpi::ResetReg> = spin::Once::new();
 
 /// Returns the parsed topology, if ACPI parsing succeeded at boot.
 pub fn topology() -> Option<&'static AcpiTopology> {
     TOPOLOGY.get()
+}
+
+/// The FADT's reset register, if the firmware advertises one — the first
+/// method `crate::reboot` tries.
+pub fn reset_reg() -> Option<hal::acpi::ResetReg> {
+    RESET_REG.get().copied()
 }
 
 /// `crate::hal::Driver` adapter around the ACPI parse — this is what
@@ -59,6 +66,16 @@ impl Driver for AcpiDriver {
             serial_println!("[acpi] no RSDP address from bootloader — skipping ACPI parse");
             return Err(DriverError::NotFound);
         };
+
+        // Before the MADT: a machine whose MADT is unusable can still have
+        // a perfectly good reset register.
+        match hal::acpi::parse_reset_reg(&KernelPhysMem, rsdp_pa) {
+            Ok(reg) => {
+                serial_println!("[acpi] FADT reset register: {:?} value {:#04x}", reg.space, reg.value);
+                RESET_REG.call_once(|| reg);
+            }
+            Err(e) => serial_println!("[acpi] no FADT reset register: {:?}", e),
+        }
 
         let topo = match hal::acpi::parse(&KernelPhysMem, rsdp_pa) {
             Ok(topo) => topo,

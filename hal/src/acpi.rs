@@ -62,6 +62,29 @@ pub struct AcpiTopology {
     pub overrides: Vec<Iso>,
 }
 
+/// Where the FADT's `RESET_REG` lives (ACPI Generic Address Structure,
+/// address space IDs 0/1/2). Only the three spaces the spec allows for the
+/// reset register are represented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetSpace {
+    /// System memory (space ID 0) at this physical address.
+    Memory(u64),
+    /// System I/O (space ID 1): an x86 I/O port.
+    Io(u16),
+    /// PCI configuration space (space ID 2), bus 0 — the spec encodes the
+    /// device, function and register offset in the address.
+    PciConfig { device: u8, function: u8, offset: u8 },
+}
+
+/// The FADT's reset register and the byte to write to it — ACPI's own
+/// answer to "how does this machine reset", present when the firmware sets
+/// `RESET_REG_SUP` (FADT flags bit 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResetReg {
+    pub space: ResetSpace,
+    pub value: u8,
+}
+
 /// Reasons `parse()` can fail to produce a topology. Deliberately specific
 /// rather than a single "parse failed" bool — the kernel adapter logs which
 /// one happened, same detail level the original inline implementation
@@ -77,6 +100,24 @@ pub enum AcpiError {
     NoRootTable,
     /// The root table's entry list contained no MADT ("APIC") table.
     NoMadt,
+}
+
+/// Why `parse_reset_reg` found no usable reset register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetRegError {
+    /// The RSDP or root table itself was unusable.
+    Root(AcpiError),
+    /// No valid FADT ("FACP") in the root table.
+    NoFadt,
+    /// The FADT is older than ACPI 2.0 and too short to hold `RESET_REG`.
+    FadtTooShort,
+    /// The firmware does not set `RESET_REG_SUP`.
+    NotSupported,
+    /// The register is not an 8-bit, bit-offset-0 register — Linux refuses
+    /// those too (`acpi_reboot`), and so does this.
+    BadWidth { bit_width: u8, bit_offset: u8 },
+    /// An address space ID the spec does not allow for `RESET_REG`.
+    BadSpace(u8),
 }
 
 // ── Layout constants ─────────────────────────────────────────────────────────
@@ -174,9 +215,14 @@ fn parse_madt(mem: &dyn PhysMem, madt_pa: u64, madt_len: usize, topo: &mut AcpiT
 }
 
 /// Scans one root table's (XSDT or RSDT) entry array for a table whose
-/// signature is `b"APIC"` (the MADT), validating each candidate's checksum
-/// before trusting it. `entry_size` is 8 for XSDT, 4 for RSDT.
-fn find_madt(mem: &dyn PhysMem, root_pa: u64, root_len: usize, entry_size: usize) -> Option<(u64, usize)> {
+/// signature is `sig`, validating each candidate's checksum before
+/// trusting it. `entry_size` is 8 for XSDT, 4 for RSDT.
+fn find_table(
+    mem: &dyn PhysMem,
+    root: RootTable,
+    sig: &[u8; 4],
+) -> Option<(u64, usize)> {
+    let RootTable { pa: root_pa, len: root_len, entry_size } = root;
     if root_len < SDT_HEADER_LEN {
         return None;
     }
@@ -200,10 +246,9 @@ fn find_madt(mem: &dyn PhysMem, root_pa: u64, root_len: usize, entry_size: usize
         }
 
         let hdr = read_bytes::<SDT_HEADER_LEN>(mem, table_pa);
-        let sig = &hdr[0..4];
         let len = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
 
-        if sig != b"APIC" {
+        if hdr[0..4] != sig[..] {
             continue;
         }
         if len < SDT_HEADER_LEN || !checksum_ok(mem, table_pa, len) {
@@ -216,11 +261,17 @@ fn find_madt(mem: &dyn PhysMem, root_pa: u64, root_len: usize, entry_size: usize
 
 // ── Public entry point ───────────────────────────────────────────────────────
 
-/// Locates the RSDP at `rsdp_pa`, walks to the XSDT (preferred) or RSDT,
-/// finds the MADT, and extracts interrupt topology from it. Pure parsing —
-/// does no logging and touches no global state; the kernel adapter is
-/// responsible for both.
-pub fn parse(mem: &dyn PhysMem, rsdp_pa: u64) -> Result<AcpiTopology, AcpiError> {
+/// The XSDT or RSDT: where it is, how long, and how wide its entries are
+/// (8 bytes for the XSDT, 4 for the RSDT).
+#[derive(Clone, Copy)]
+struct RootTable {
+    pa: u64,
+    len: usize,
+    entry_size: usize,
+}
+
+/// Validates the RSDP at `rsdp_pa` and the root table it points at.
+fn root_table(mem: &dyn PhysMem, rsdp_pa: u64) -> Result<RootTable, AcpiError> {
     // RSDP, ACPI 2.0+ layout (36 bytes). On ACPI 1.0 (revision == 0) only
     // the first 20 bytes (up to and including rsdt_address) are
     // valid/present in memory — the fields past that must not be trusted
@@ -261,8 +312,16 @@ pub fn parse(mem: &dyn PhysMem, rsdp_pa: u64) -> Result<AcpiTopology, AcpiError>
     if root_len < SDT_HEADER_LEN || !checksum_ok(mem, root_pa, root_len) {
         return Err(AcpiError::BadChecksum);
     }
+    Ok(RootTable { pa: root_pa, len: root_len, entry_size })
+}
 
-    let Some((madt_pa, madt_len)) = find_madt(mem, root_pa, root_len, entry_size) else {
+/// Locates the RSDP at `rsdp_pa`, walks to the XSDT (preferred) or RSDT,
+/// finds the MADT, and extracts interrupt topology from it. Pure parsing —
+/// does no logging and touches no global state; the kernel adapter is
+/// responsible for both.
+pub fn parse(mem: &dyn PhysMem, rsdp_pa: u64) -> Result<AcpiTopology, AcpiError> {
+    let root = root_table(mem, rsdp_pa)?;
+    let Some((madt_pa, madt_len)) = find_table(mem, root, b"APIC") else {
         return Err(AcpiError::NoMadt);
     };
 
@@ -278,6 +337,53 @@ pub fn parse(mem: &dyn PhysMem, rsdp_pa: u64) -> Result<AcpiTopology, AcpiError>
     };
     parse_madt(mem, madt_pa, madt_len, &mut topo);
     Ok(topo)
+}
+
+// FADT field offsets (ACPI 6.x, table 5.9). `RESET_REG` and `RESET_VALUE`
+// arrived with ACPI 2.0; a 1.0 FADT is 116 bytes long and ends before them.
+const FADT_FLAGS: usize = 112;
+const FADT_RESET_REG: usize = 116;
+const FADT_RESET_VALUE: usize = 128;
+const FADT_FLAG_RESET_REG_SUP: u32 = 1 << 10;
+
+/// Finds the FADT and decodes its reset register, if the firmware
+/// advertises one. Independent of `parse` — a machine with a broken MADT
+/// can still have a perfectly good reset register.
+pub fn parse_reset_reg(mem: &dyn PhysMem, rsdp_pa: u64) -> Result<ResetReg, ResetRegError> {
+    let root = root_table(mem, rsdp_pa).map_err(ResetRegError::Root)?;
+    let (fadt_pa, fadt_len) = find_table(mem, root, b"FACP").ok_or(ResetRegError::NoFadt)?;
+    if fadt_len <= FADT_RESET_VALUE {
+        return Err(ResetRegError::FadtTooShort);
+    }
+
+    let flags = u32::from_le_bytes(read_bytes::<4>(mem, fadt_pa + FADT_FLAGS as u64));
+    if flags & FADT_FLAG_RESET_REG_SUP == 0 {
+        return Err(ResetRegError::NotSupported);
+    }
+
+    // Generic Address Structure: space ID, bit width, bit offset, access
+    // size, then a 64-bit address.
+    let gas = read_bytes::<12>(mem, fadt_pa + FADT_RESET_REG as u64);
+    let (space_id, bit_width, bit_offset) = (gas[0], gas[1], gas[2]);
+    let address = u64::from_le_bytes(gas[4..12].try_into().unwrap());
+    if bit_width != 8 || bit_offset != 0 {
+        return Err(ResetRegError::BadWidth { bit_width, bit_offset });
+    }
+
+    let space = match space_id {
+        0 => ResetSpace::Memory(address),
+        1 => ResetSpace::Io(address as u16),
+        // PCI config: device in bits 32-47, function in 16-31, register
+        // offset in 0-15 — bus 0 implied.
+        2 => ResetSpace::PciConfig {
+            device: (address >> 32) as u8,
+            function: (address >> 16) as u8,
+            offset: address as u8,
+        },
+        other => return Err(ResetRegError::BadSpace(other)),
+    };
+    let value = read_bytes::<1>(mem, fadt_pa + FADT_RESET_VALUE as u64)[0];
+    Ok(ResetReg { space, value })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -427,9 +533,9 @@ mod tests {
     fn xsdt_with_no_madt_is_reported() {
         let mut data = build_valid_image();
         // Retarget the XSDT's one entry to point at the XSDT table itself
-        // (self-referential, but harmless — find_madt only reads a
+        // (self-referential, but harmless — find_table only reads a
         // header-sized prefix) instead of the real MADT, and relabel that
-        // header's signature to something that isn't "APIC". find_madt then
+        // header's signature to something that isn't "APIC". find_table then
         // walks one real, valid-checksum, non-APIC entry and finds nothing.
         data[XSDT_PA + 36..XSDT_PA + 44].copy_from_slice(&(XSDT_PA as u64).to_le_bytes());
         data[XSDT_PA..XSDT_PA + 4].copy_from_slice(b"FACP");
@@ -480,5 +586,98 @@ mod tests {
         assert!(topo.cpus.is_empty());
         assert!(topo.io_apics.is_empty());
         assert!(topo.overrides.is_empty());
+    }
+    /// An image whose XSDT's single entry is a FADT (at `MADT_PA`, reused as
+    /// a free slot) of `fadt_len` bytes with the given flags, reset-register
+    /// GAS and reset value — checksums fixed throughout.
+    fn build_fadt_image(fadt_len: usize, flags: u32, gas: [u8; 12], value: u8) -> AVec<u8> {
+        let mut data = build_valid_image();
+        let fadt = MADT_PA;
+        data[fadt..fadt + 0x200].fill(0);
+        data[fadt..fadt + 4].copy_from_slice(b"FACP");
+        data[fadt + 4..fadt + 8].copy_from_slice(&(fadt_len as u32).to_le_bytes());
+        data[fadt + 112..fadt + 116].copy_from_slice(&flags.to_le_bytes());
+        if fadt_len > 128 {
+            data[fadt + 116..fadt + 128].copy_from_slice(&gas);
+            data[fadt + 128] = value;
+        }
+        fix_checksum(&mut data, fadt, fadt_len, fadt + 9);
+        data
+    }
+
+    fn gas(space: u8, width: u8, offset: u8, address: u64) -> [u8; 12] {
+        let mut g = [0u8; 12];
+        g[0] = space;
+        g[1] = width;
+        g[2] = offset;
+        g[3] = 1; // byte access
+        g[4..12].copy_from_slice(&address.to_le_bytes());
+        g
+    }
+
+    const RESET_SUP: u32 = 1 << 10;
+
+    #[test]
+    fn reset_reg_io_port_decodes() {
+        // What QEMU and most PC chipsets advertise: I/O port 0xCF9, value 6.
+        let mem = VecMem { data: build_fadt_image(244, RESET_SUP, gas(1, 8, 0, 0xCF9), 0x06) };
+        assert_eq!(
+            parse_reset_reg(&mem, RSDP_PA as u64),
+            Ok(ResetReg { space: ResetSpace::Io(0xCF9), value: 0x06 })
+        );
+    }
+
+    #[test]
+    fn reset_reg_pci_config_decodes_device_function_offset() {
+        let addr = (0x1Fu64 << 32) | (0x3 << 16) | 0x44;
+        let mem = VecMem { data: build_fadt_image(244, RESET_SUP, gas(2, 8, 0, addr), 0x0E) };
+        assert_eq!(
+            parse_reset_reg(&mem, RSDP_PA as u64),
+            Ok(ResetReg { space: ResetSpace::PciConfig { device: 0x1F, function: 3, offset: 0x44 }, value: 0x0E })
+        );
+    }
+
+    #[test]
+    fn reset_reg_requires_the_support_flag() {
+        let mem = VecMem { data: build_fadt_image(244, 0, gas(1, 8, 0, 0xCF9), 0x06) };
+        assert_eq!(parse_reset_reg(&mem, RSDP_PA as u64), Err(ResetRegError::NotSupported));
+    }
+
+    #[test]
+    fn reset_reg_absent_from_acpi1_fadt() {
+        // A 1.0 FADT (116 bytes) ends before RESET_REG; the flag bit must
+        // not make the parser read past the table.
+        let mem = VecMem { data: build_fadt_image(116, RESET_SUP, [0; 12], 0) };
+        assert_eq!(parse_reset_reg(&mem, RSDP_PA as u64), Err(ResetRegError::FadtTooShort));
+    }
+
+    #[test]
+    fn reset_reg_rejects_non_byte_register() {
+        let mem = VecMem { data: build_fadt_image(244, RESET_SUP, gas(1, 16, 0, 0xCF9), 0x06) };
+        assert_eq!(
+            parse_reset_reg(&mem, RSDP_PA as u64),
+            Err(ResetRegError::BadWidth { bit_width: 16, bit_offset: 0 })
+        );
+    }
+
+    #[test]
+    fn reset_reg_rejects_unknown_address_space() {
+        let mem = VecMem { data: build_fadt_image(244, RESET_SUP, gas(3, 8, 0, 0xCF9), 0x06) };
+        assert_eq!(parse_reset_reg(&mem, RSDP_PA as u64), Err(ResetRegError::BadSpace(3)));
+    }
+
+    #[test]
+    fn reset_reg_without_fadt() {
+        // The plain image's only table is the MADT.
+        let mem = VecMem { data: build_valid_image() };
+        assert_eq!(parse_reset_reg(&mem, RSDP_PA as u64), Err(ResetRegError::NoFadt));
+    }
+
+    #[test]
+    fn reset_reg_ignores_fadt_with_bad_checksum() {
+        let mut data = build_fadt_image(244, RESET_SUP, gas(1, 8, 0, 0xCF9), 0x06);
+        data[MADT_PA + 128] ^= 0xFF;
+        let mem = VecMem { data };
+        assert_eq!(parse_reset_reg(&mem, RSDP_PA as u64), Err(ResetRegError::NoFadt));
     }
 }

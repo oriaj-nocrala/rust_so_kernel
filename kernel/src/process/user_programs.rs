@@ -74,7 +74,7 @@ pub enum ProgramSource {
 /// includes `/mnt/bin` — no special-casing needed here, they just aren't
 /// registered in this table at all, and so don't show up in initramfs's
 /// `/bin` (`ls /bin`) either, only in `/mnt/bin`.
-static PROGRAMS: [(&str, ProgramSource); 13] = [
+static PROGRAMS: [(&str, ProgramSource); 14] = [
     ("uname",     ProgramSource::Elf(include_bytes!("../../embedded/uname.elf"))),
     ("shell",     ProgramSource::Elf(include_bytes!("../../embedded/shell.elf"))),
     ("snake",     ProgramSource::Elf(include_bytes!("../../embedded/snake.elf"))),
@@ -86,6 +86,7 @@ static PROGRAMS: [(&str, ProgramSource); 13] = [
     ("pipe_test", ProgramSource::Elf(include_bytes!("../../embedded/pipe_test.elf"))),
     ("signal_test", ProgramSource::Elf(include_bytes!("../../embedded/signal_test.elf"))),
     ("demo",      ProgramSource::Elf(include_bytes!("../../embedded/demo.elf"))),
+    ("reboot",    ProgramSource::Elf(include_bytes!("../../embedded/reboot.elf"))),
     ("kdebug",    ProgramSource::Elf(include_bytes!("../../embedded/kdebug.elf"))),
     // Manually vendored (not built by kernel/build.rs — no Makefile-based
     // C_PROGRAMS support yet): busybox-1.36.1 built out-of-tree against

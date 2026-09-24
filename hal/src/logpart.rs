@@ -69,6 +69,8 @@ pub enum Reason {
     Periodic = 1,
     Sync = 2,
     Panic = 3,
+    /// The last flush before `reboot(2)` resets the machine.
+    Reboot = 4,
 }
 
 impl Reason {
@@ -77,6 +79,7 @@ impl Reason {
             1 => Some(Reason::Periodic),
             2 => Some(Reason::Sync),
             3 => Some(Reason::Panic),
+            4 => Some(Reason::Reboot),
             _ => None,
         }
     }

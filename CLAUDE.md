@@ -96,7 +96,7 @@ so addresses actually resolve to real function names instead of bare hex.
 ### QEMU integration tests
 
 Real hardware-path behavior (drivers that need actual QEMU devices, not just host-testable
-pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 231 tests, <1s, no QEMU) is
+pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 239 tests, <1s, no QEMU) is
 asserted by a `#![feature(custom_test_frameworks)]` harness that boots the real kernel in
 QEMU and reports PASS/FAIL as a process exit code:
 
@@ -260,6 +260,7 @@ Implemented syscalls (Linux-compatible numbers — see `SyscallNumber` enum for 
 | 228 | `clock_gettime` | `CLOCK_REALTIME` is a real wall-clock reading (CMOS RTC read once at boot, see Time Subsystem below, plus uptime since); `CLOCK_MONOTONIC`/`CLOCK_BOOTTIME` are uptime, unaffected by wall-clock |
 | 400/401/402 | `uptime_ms`/`uptime_sec`/`meminfo_kb` | Custom, above the Linux syscall range — debug/introspection only |
 | 162 | `sync` | No write-back cache exists to flush (ext2 writes are synchronous), so this copies the kernel log ring to the USB stick's `constanos-log` partition — see the kernel-log-on-the-stick section. Reports failure, unlike Linux: `ENODEV` (no log partition), `EBUSY`, `EIO`. `kdebug sync` calls it |
+| 169 | `reboot` | Linux magic numbers + commands. `RESTART` flushes the kernel log to the USB stick (reason `reboot`), then resets: ACPI FADT `RESET_REG` → port `0xCF9` → 8042 `0xFE` (only if one answers) → triple fault (`kernel/src/reboot.rs`). `HALT`/`POWER_OFF` flush and stop (no S5 without AML). Backs the embedded `reboot` program. QEMU i440fx's FADT is ACPI 1.0 (no `RESET_REG`), so there `0xCF9` does the reset |
 | 403 | `kdebug_ctl` | Get/set `kernel::debug`'s runtime tracing mask (get: `cmd=0`; set: `cmd=1`, subsystem name + on/off) — backs the `kdebug` userspace program. `cmd=2` panics the kernel on purpose (`kdebug panic`, Linux's sysrq-c) to exercise the panic path on demand |
 | 404 | `statvfs` | Custom (real `statvfs(2)` has no fixed Linux syscall number of its own — glibc/mlibc implement it over `statfs`, which this port doesn't wire). One physical-memory pool backs every mount, so every path reports the same Buddy-allocator-derived total/free block counts — enough for `df` to run and show live numbers, not a real per-mount breakdown |
 
@@ -510,7 +511,7 @@ arbitration, exactly where two PS/2 keyboards would merge.
 **Split across the usual seam.** `hal::xhci` (register/TRB/ring/context
 arithmetic), `hal::usb` (descriptor parsing + setup packets) and
 `hal::hid` (boot-report diffing + the Set-1 table) are pure and host-tested
-— most of `hal`'s 231 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
+— most of `hal`'s 239 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
 DMA pages, doorbells and waiting. That line is drawn hard here because an
 xHCI bring-up failure is nearly unobservable (a wrong bit in a device
 context yields no fault, no log, just a Transfer Event that never arrives)

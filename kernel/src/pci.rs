@@ -37,6 +37,16 @@ fn config_write32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
     }
 }
 
+/// Writes one byte of bus 0 configuration space — read-modify-write of
+/// the containing dword, the only width mechanism #1 guarantees. Used for
+/// an ACPI reset register that lives in PCI config space (`crate::reboot`).
+pub fn config_write8(device: u8, function: u8, offset: u8, value: u8) {
+    let shift = (offset as u32 & 3) * 8;
+    let dword = config_read32(0, device, function, offset & 0xFC);
+    let dword = (dword & !(0xFF << shift)) | ((value as u32) << shift);
+    config_write32(0, device, function, offset & 0xFC, dword);
+}
+
 fn config_read16(bus: u8, device: u8, function: u8, offset: u8) -> u16 {
     let dword = config_read32(bus, device, function, offset & 0xFC);
     (dword >> ((offset as u32 & 2) * 8)) as u16
