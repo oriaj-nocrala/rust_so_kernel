@@ -5,9 +5,9 @@
 > sobrevive al reset, así que la fase 4 hace falta. Fase 3 hecha (QEMU) y
 > fase 5 (`scripts/metal-run.sh`) hecha y con su primera ida y vuelta real
 > en la Ryzen (`OK`). Fase 4 (watchdog en constanos) hecha y medida en la
-> Ryzen: un job colgado vuelve solo a Linux a los ~300 s. Fase 6 montada
-> (autologin + `scripts/metal-resume.sh`) y probada en seco; falta su primera
-> vuelta real. Ver "Resultados" al final. Es la
+> Ryzen: un job colgado vuelve solo a Linux a los ~300 s. Fase 6 hecha y
+> medida en la Ryzen: tras la vuelta, la sesión de Claude Code se retomó sola
+> en tty1. **El bucle está cerrado.** Ver "Resultados" al final. Es la
 > "etapa 0" de la dirección de largo plazo (un SO que un agente LLM pueda
 > observar, probar y mejorar; ver la memoria `self-improving-os-direction`).
 > No confundir con la etapa 0 de `docs/smp/smp-plan.md`.
@@ -352,3 +352,9 @@ entonces `--collect` muestra solo la salida de consola del job (las líneas
   Cada reanudación resta 1.
 - Probado en seco: con `budget`=3 → «would collect, then resume the agent»;
   con `stop` → «then stop»; sin pendiente → nada.
+
+**2026-09-24, fase 6, primera vuelta real:** `metal-run.sh resume-job.sh` →
+constanos (job `OK`, watchdog armado, 32 GiB de `MemTotal`) → Linux arriba a
+las 14:59:38 → autologin en tty1 → `metal-resume.sh` recogió (`OK exit=0 (boot
+#22)`), bajó `budget` de 3 a 2 y retomó esta misma sesión con el veredicto en el
+prompt. Nadie tocó la máquina entre el `systemctl reboot` y la sesión retomada.
