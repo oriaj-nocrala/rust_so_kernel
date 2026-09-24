@@ -308,6 +308,7 @@ extern "x86-interrupt" fn page_fault_handler(
                     crate::process::scheduler::current_pid_fast(), fault_addr,
                     sf.instruction_pointer, error_code
                 );
+                dump_user_stack(sf.stack_pointer);
                 kill_current_user_process("SEGFAULT (no VMA for address)");
                 // unreachable — kill_current_user_process diverges
             }
@@ -355,6 +356,57 @@ extern "x86-interrupt" fn page_fault_handler(
 /// ExceptionStackFrame (RIP, CS, RFLAGS, RSP, SS) and returned normally.
 /// This leaked GPR values (RAX..R15) from the killed process into the
 /// next process, causing data corruption and unpredictable behavior.
+/// Prints the user stack around `rsp` of the process that is about to be
+/// killed: the one post-mortem a segfault into garbage (`rip` 0, an RFLAGS
+/// value, another binary's address) can be read from — the words there are
+/// the return addresses of whoever led to it. Reads through the active page
+/// table and skips unmapped pages, so it cannot fault itself. Built for the
+/// 2026-09-24 hunt for `ash` dying at its `exit` builtin in autorun jobs.
+fn dump_user_stack(rsp: u64) {
+    use x86_64::structures::paging::{OffsetPageTable, PageTable, Translate};
+
+    let phys_offset = crate::memory::physical_memory_offset();
+    let (cr3, _) = x86_64::registers::control::Cr3::read();
+    let pml4 = unsafe {
+        &mut *((phys_offset + cr3.start_address().as_u64()).as_mut_ptr::<PageTable>())
+    };
+    let table = unsafe { OffsetPageTable::new(pml4, phys_offset) };
+
+    serial_println!("  user stack at rsp={:#x}:", rsp);
+    let start = rsp.wrapping_sub(8 * 8) & !7;
+    for i in 0..24u64 {
+        let addr = start.wrapping_add(i * 8);
+        match table.translate_addr(x86_64::VirtAddr::try_new(addr).unwrap_or(x86_64::VirtAddr::zero())) {
+            Some(phys) if addr >= 0x1000 && phys.as_u64() & 0xFFF <= 0xFF8 => {
+                let v = unsafe { *((phys_offset + phys.as_u64()).as_ptr::<u64>()) };
+                let mark = if addr == rsp { " <- rsp" } else { "" };
+                serial_println!("    {:#x}: {:#018x}{}", addr, v, mark);
+            }
+            _ => serial_println!("    {:#x}: (unmapped)", addr),
+        }
+    }
+
+    // A handler returns through the sigreturn trampoline; if its page no
+    // longer holds the trampoline, the return runs whatever is there.
+    use crate::memory::signal_trampoline::{TRAMPOLINE_CODE, TRAMPOLINE_VA};
+    match table.translate_addr(x86_64::VirtAddr::new(TRAMPOLINE_VA)) {
+        Some(phys) => {
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (phys_offset + phys.as_u64()).as_ptr::<u8>(),
+                    TRAMPOLINE_CODE.len(),
+                )
+            };
+            serial_println!(
+                "  sigreturn trampoline (phys {:#x}): {:02x?} {}",
+                phys.as_u64(), bytes,
+                if bytes == TRAMPOLINE_CODE { "intact" } else { "CORRUPTED" }
+            );
+        }
+        None => serial_println!("  sigreturn trampoline: not mapped"),
+    }
+}
+
 fn kill_current_user_process(reason: &str) -> ! {
     let tf_ptr = {
         let mut scheduler = crate::process::scheduler::local_scheduler();

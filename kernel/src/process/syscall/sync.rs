@@ -3,9 +3,8 @@
 // futex(202) — wait/wake, backs mlibc mutexes/condvars.
 
 use spin::Mutex;
-use core::sync::atomic::Ordering;
 use crate::process::TrapFrame;
-use super::{errno, SyscallResult, validate_user_buffer, CURRENT_SYSCALL_TF};
+use super::{errno, SyscallResult, validate_user_buffer, current_tf_ptr};
 use super::poll::MAX_PROCS;
 
 // ── futex(202) ─────────────────────────────────────────────────────────────
@@ -40,7 +39,7 @@ pub(super) fn sys_futex(uaddr: u64, futex_op: i32, val: i32, _timeout: u64) -> S
                 return errno::EAGAIN;
             }
 
-            let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame;
+            let tf_ptr = current_tf_ptr();
 
             // `_irq` is deliberately never dropped on the WAIT path — it
             // ends in `jump_to_user` (`-> !`), so interrupts intentionally

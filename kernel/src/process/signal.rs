@@ -181,6 +181,12 @@ unsafe fn push_signal_frame(proc: &mut Process, tf: *mut TrapFrame, sig: u32, ha
     // helper lives next to in mod.rs for why).
     super::ensure_user_pages_mapped(proc, tramp_slot, frame_size + 8);
 
+    crate::ktrace!(
+        crate::debug::PROC,
+        "signal: PID {} sig {} -> handler {:#x}; saved rip={:#x} rsp={:#x} cs={:#x}; frame at {:#x}",
+        proc.pid.0, sig, handler_addr, old_tf.rip, old_tf.rsp, old_tf.cs, frame_base
+    );
+
     unsafe {
         core::ptr::write(frame_base as *mut SignalFrame, frame);
         core::ptr::write(tramp_slot as *mut u64, TRAMPOLINE_VA);
@@ -206,6 +212,11 @@ unsafe fn push_signal_frame(proc: &mut Process, tf: *mut TrapFrame, sig: u32, ha
 /// is the only place that sets rsp to that value.
 pub unsafe fn pop_signal_frame(proc: &mut Process, tf: *mut TrapFrame, user_rsp: u64) {
     let frame = unsafe { core::ptr::read(user_rsp as *const SignalFrame) };
+    crate::ktrace!(
+        crate::debug::PROC,
+        "sigreturn: PID {} frame at {:#x} -> rip={:#x} rsp={:#x} cs={:#x}",
+        proc.pid.0, user_rsp, frame.saved_tf.rip, frame.saved_tf.rsp, frame.saved_tf.cs
+    );
     proc.blocked_signals = frame.saved_mask;
     unsafe { core::ptr::write(tf, frame.saved_tf) };
 }

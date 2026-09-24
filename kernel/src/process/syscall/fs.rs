@@ -9,9 +9,8 @@ use spin::Mutex;
 use crate::process::TrapFrame;
 use super::{
     errno, SyscallResult, with_current_process, validate_user_buffer,
-    resolve_path, current_cwd, read_user_str, current_tf_ptr, CURRENT_SYSCALL_TF,
+    resolve_path, current_cwd, read_user_str, current_tf_ptr,
 };
-use core::sync::atomic::Ordering;
 
 struct StdinWaiter {
     pid: usize,
@@ -79,7 +78,7 @@ pub(super) fn sys_read(fd: i32, buf: usize, count: usize) -> SyscallResult {
         // Buffer empty — register waiter and block.
         let pid = crate::process::scheduler::current_pid().unwrap_or(0);
         *STDIN_WAITER.lock() = Some(StdinWaiter { pid, user_buf: buf as u64 });
-        let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame;
+        let tf_ptr = current_tf_ptr();
         block_stdin_read(tf_ptr)
     } else {
         // Continuous cli from before the fd lookup through either the fast

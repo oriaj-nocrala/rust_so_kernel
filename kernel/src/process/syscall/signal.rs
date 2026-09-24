@@ -93,6 +93,11 @@ pub(super) fn sys_sigprocmask(how: i32, set_ptr: u64, oldset_ptr: u64) -> Syscal
 pub(super) fn sys_sigreturn() -> SyscallResult {
     let tf_ptr = current_tf_ptr() as *mut TrapFrame;
     let user_rsp = unsafe { (*tf_ptr).rsp };
+    crate::ktrace!(
+        crate::debug::PROC,
+        "sigreturn: entry PID {} tf={:p} user rsp={:#x} rip={:#x}",
+        crate::process::scheduler::current_pid_fast(), tf_ptr, user_rsp, unsafe { (*tf_ptr).rip }
+    );
 
     with_current_process(|proc| {
         unsafe { crate::process::signal::pop_signal_frame(proc, tf_ptr, user_rsp) };

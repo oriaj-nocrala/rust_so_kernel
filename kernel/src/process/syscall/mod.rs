@@ -44,7 +44,6 @@ pub(crate) use process_ctl::cancel_all_waiters;
 pub(crate) use poll::{poll_wakeup_for_fd0, poll_clear_on_timeout, poll_wakeup_for_socket};
 
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicU64, Ordering};
 use super::TrapFrame;
 
 // Scratch storage for syscall_entry_fast.
@@ -156,19 +155,38 @@ struct SavedRegisters {
 // CURRENT-SYSCALL TRAPFRAME
 // ============================================================================
 
-/// Address of the full TrapFrame on the kernel stack at syscall entry.
-/// SavedRegisters is the first 15 fields of TrapFrame; the hardware iretq
-/// fields (rip, cs, rflags, rsp, ss) follow immediately in memory.
-/// Single-CPU — safe under cli.
-static CURRENT_SYSCALL_TF: AtomicU64 = AtomicU64::new(0);
+
 
 /// The current syscall's on-stack TrapFrame pointer — for blocking file
 /// implementations (e.g. `pipe.rs`) that need it outside this module,
 /// mirroring how `sync::sys_futex`/`process_ctl::sys_nanosleep` use it
 /// internally.
+///
+/// Derived from the running process's own kernel stack, never from a global
+/// written at syscall entry: `syscall_entry_fast` always builds the frame at
+/// the very top of that stack (`KERNEL_RSP0`, then 20 pushes), and
+/// `KERNEL_RSP0` is switched with the process — Linux's `task_pt_regs`. The
+/// global this replaced (`CURRENT_SYSCALL_TF`) went stale whenever a syscall
+/// was preempted with interrupts on and another process made syscalls
+/// before it resumed: the resumed one then read *that* process's frame. In
+/// `syscall_handler_asm`'s post-syscall signal check, that meant delivering
+/// the parent's SIGCHLD into the dead child's frame — writing a signal frame
+/// over the parent's live stack at the child's rsp, with the parent never
+/// running the handler. Found on 2026-09-24 as `ash` crashing at its `exit`
+/// builtin (a `ret` into the clobbered stack) after short-lived children.
+///
+/// Null before any process has run (`KERNEL_RSP0` still 0) — what the
+/// in-kernel QEMU tests see, and what the old global returned there too.
 pub(crate) fn current_tf_ptr() -> *const TrapFrame {
-    CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame
+    let top = unsafe { crate::process::tss::KERNEL_RSP0 };
+    if top == 0 {
+        return core::ptr::null();
+    }
+    (top - core::mem::size_of::<TrapFrame>() as u64) as *const TrapFrame
 }
+
+// The stub pushes exactly 20 qwords (5 by hand in iretq layout, 15 GPRs).
+const _: () = assert!(core::mem::size_of::<TrapFrame>() == 20 * 8);
 
 // WAIT_WAITER has been removed — per-process waiting_for field in Process is used instead.
 // This supports multiple concurrent waitpid() callers (e.g. shell + ipc_ping).
@@ -178,7 +196,8 @@ extern "C" fn syscall_handler_asm(regs: &SavedRegisters) -> i64 {
     // Store the TrapFrame pointer (SavedRegisters shares the same layout as
     // the first 15 fields of TrapFrame; hardware pushed rip/cs/rflags/rsp/ss
     // immediately after on the kernel stack).
-    CURRENT_SYSCALL_TF.store(regs as *const SavedRegisters as u64, Ordering::Relaxed);
+    let tf_ptr = regs as *const SavedRegisters as *mut TrapFrame;
+    debug_assert_eq!(tf_ptr as *const TrapFrame, current_tf_ptr());
     let ret = syscall_handler(regs.rax, regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9);
 
     // Deliver pending signals before returning to user mode. This is the
@@ -187,7 +206,6 @@ extern "C" fn syscall_handler_asm(regs: &SavedRegisters) -> i64 {
     // just pops registers and `iretq`s directly), so it's handled here
     // instead of via `trapframe::jump_to_user` — see that function's doc
     // comment for the general design this mirrors.
-    let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *mut TrapFrame;
     unsafe { (*tf_ptr).rax = ret as u64; }
 
     let irq = super::irq_guard::InterruptGuard::new();

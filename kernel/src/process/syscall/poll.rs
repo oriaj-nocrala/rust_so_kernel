@@ -1,9 +1,8 @@
 // kernel/src/process/syscall/poll.rs
 //
 use spin::Mutex;
-use core::sync::atomic::Ordering;
 use crate::process::TrapFrame;
-use super::{errno, SyscallResult, validate_user_buffer, CURRENT_SYSCALL_TF};
+use super::{errno, SyscallResult, validate_user_buffer, current_tf_ptr};
 use usock::SocketId;
 use crate::ipc::unix;
 
@@ -635,7 +634,7 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u32, timeout_ms: i32) -> SyscallResul
     }
 
     // ── Slow path: block ──────────────────────────────────────────────────
-    let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame;
+    let tf_ptr = current_tf_ptr();
 
     // Pre-translate user buffer to physical address
     let phys_buf = match translate_user_buf_phys(fds_ptr, buf_size) {
@@ -824,7 +823,7 @@ pub(super) fn sys_epoll_wait(epfd: i32, events_ptr: u64, maxevents: i32, timeout
     }
 
     // ── Slow path: block ──────────────────────────────────────────────────
-    let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame;
+    let tf_ptr = current_tf_ptr();
 
     let phys_buf = match translate_user_buf_phys(events_ptr, buf_size) {
         Some(pa) => pa,

@@ -78,6 +78,7 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "socket_test",
     "fbbench",
     "fire",
+    "fork_exec_test",
 ];
 
 /// Not built here at all — see the busybox.elf handling below, which

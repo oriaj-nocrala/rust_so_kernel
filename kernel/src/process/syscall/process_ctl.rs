@@ -4,12 +4,11 @@
 // getpid/setpgid/getpgid/setsid/yield/nanosleep/arch_prctl/set_tid_address.
 
 use spin::Mutex;
-use core::sync::atomic::Ordering;
 use crate::serial_println;
 use crate::process::TrapFrame;
 use super::{
     errno, SyscallResult, with_scheduler, validate_user_buffer, resolve_path,
-    CURRENT_SYSCALL_TF,
+    current_tf_ptr,
 };
 
 // ── arch_prctl(158) ────────────────────────────────────────────────────────
@@ -78,7 +77,7 @@ pub(super) fn sys_set_tid_address(_tidptr: u64) -> SyscallResult {
 /// the next Ready process. If nothing else is Ready, `switch_to_next`
 /// returns the caller's own TrapFrame unchanged and this is a no-op.
 pub(super) fn sys_yield() -> SyscallResult {
-    let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame;
+    let tf_ptr = current_tf_ptr();
 
     // `_irq` is deliberately never dropped: this always ends in
     // `jump_to_user` (`-> !`), so interrupts intentionally stay off across
@@ -112,7 +111,7 @@ pub(super) fn sys_nanosleep(ns: u64) -> SyscallResult {
     let now = crate::time::ktime_get();
     let expiry = now.saturating_add(ns);
 
-    let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame;
+    let tf_ptr = current_tf_ptr();
 
     // `_irq` is deliberately never dropped — see sys_yield above.
     let _irq = crate::process::irq_guard::InterruptGuard::new();
@@ -254,7 +253,7 @@ pub(crate) fn cancel_all_waiters(pid: usize) {
 }
 
 pub(super) fn sys_fork() -> SyscallResult {
-    let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame;
+    let tf_ptr = current_tf_ptr();
 
     let _irq = crate::process::irq_guard::InterruptGuard::new();
 
@@ -704,7 +703,7 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
         if let Err(e) = validate_user_buffer(status_ptr as u64, 4) { return e; }
     }
 
-    let tf_ptr = CURRENT_SYSCALL_TF.load(Ordering::Relaxed) as *const TrapFrame;
+    let tf_ptr = current_tf_ptr();
 
     let irq = crate::process::irq_guard::InterruptGuard::new();
 
