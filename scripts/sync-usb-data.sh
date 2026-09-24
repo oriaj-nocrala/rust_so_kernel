@@ -88,7 +88,10 @@ sudo mount -t ext2 "$REAL_DEV" "$MNT"
 # --delete so a binary removed from disk-image-root/ stops being on the
 # stick too; --exclude lost+found because it is the filesystem's, not the
 # source tree's, and deleting it makes e2fsck recreate it later anyway.
-RSYNC_ARGS=(-a --delete --exclude 'lost+found' --info=stats1)
+# --itemize-changes: one line per file that differs, so --dry-run actually
+# says what it would write (with only --info=stats1 it printed byte totals
+# and no file names, whatever was about to change).
+RSYNC_ARGS=(-a --delete --exclude 'lost+found' --info=stats1 --itemize-changes)
 [[ $DRY_RUN -eq 1 ]] && RSYNC_ARGS+=(--dry-run)
 
 sudo rsync "${RSYNC_ARGS[@]}" "$SRC"/ "$MNT"/
