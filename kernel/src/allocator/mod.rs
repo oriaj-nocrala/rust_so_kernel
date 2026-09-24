@@ -251,17 +251,20 @@ unsafe impl GlobalAlloc for SlabGlobalAlloc {
     }
 }
 
-/// Reproduces the pre-extraction `SlabAllocator::allocate_large`/
-/// `SlabCache::expand` `serial_println_raw!` calls from the
-/// [`mm::slab::AllocEvent`] `mm::slab::SlabAllocator::allocate` now reports
-/// instead of printing directly (see `mm`'s crate doc comment).
+/// Reports [`mm::slab::AllocEvent`]s. Successes are `ktrace!(MM)` (off by
+/// default, `kdebug mm on`); failures always print. They used to all
+/// print: a "large" allocation is any kernel buffer over 2 KiB, so every
+/// exec, file read and cache fill wrote two lines — enough to wrap the
+/// 64 KiB `klog` ring within seconds of starting `doom`, losing the boot
+/// log the USB log partition exists to keep.
 fn log_alloc_event(event: &mm::slab::AllocEvent) {
     use mm::slab::AllocEvent;
     match event {
         AllocEvent::None => {}
         AllocEvent::Expand(t) => {
             if t.ok {
-                crate::serial_println_raw!(
+                crate::ktrace!(
+                    crate::debug::MM,
                     "Slab: Expanded {}B cache (+{} objects, total {})",
                     t.object_size, t.added_objects, t.total_objects
                 );
@@ -270,30 +273,34 @@ fn log_alloc_event(event: &mm::slab::AllocEvent) {
             }
         }
         AllocEvent::Large(t) => {
-            crate::serial_println_raw!(">>> allocate_large: size={} order={}", t.size, t.order);
             if t.ok {
-                crate::serial_println_raw!(">>> allocate_large: OK at {:#x}", t.result_addr);
+                crate::ktrace!(
+                    crate::debug::MM,
+                    "allocate_large: size={} order={} at {:#x}",
+                    t.size, t.order, t.result_addr
+                );
             } else {
-                crate::serial_println_raw!(">>> allocate_large: FAILED");
+                crate::serial_println_raw!(">>> allocate_large: size={} order={} FAILED", t.size, t.order);
             }
         }
     }
 }
 
-/// Reproduces the pre-extraction `SlabAllocator::deallocate`/
-/// `deallocate_large` `serial_println_raw!` calls from the
-/// [`mm::slab::DeallocEvent`] `mm::slab::SlabAllocator::deallocate` now
-/// reports instead of printing directly.
+/// Counterpart of [`log_alloc_event`] for [`mm::slab::DeallocEvent`]:
+/// routine frees are `ktrace!(MM)`, the hot-range warning always prints.
 fn log_dealloc_event(event: &mm::slab::DeallocEvent) {
     use mm::slab::DeallocEvent;
     if let DeallocEvent::Large(t) = event {
-        crate::serial_println_raw!(">>> Slab: Large dealloc");
-        crate::serial_println_raw!(
-            "[SLAB] deallocate_large: virt={:#x} phys={:#x} size={} order={}",
+        crate::ktrace!(
+            crate::debug::MM,
+            "deallocate_large: virt={:#x} phys={:#x} size={} order={}",
             t.virt, t.phys, t.size, t.order
         );
         if t.hot_range {
-            crate::serial_println_raw!("[SLAB]   ^^^ THIS IS IN THE HOT RANGE!");
+            crate::serial_println_raw!(
+                "[SLAB] deallocate_large in the HOT RANGE: virt={:#x} phys={:#x} size={} order={}",
+                t.virt, t.phys, t.size, t.order
+            );
         }
     }
 }
