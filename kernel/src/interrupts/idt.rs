@@ -124,9 +124,19 @@ impl<F> IdtEntry<F> {
 // Handler types
 // ============================================================================
 
-pub type ExceptionHandler = extern "x86-interrupt" fn(&mut ExceptionStackFrame);
-pub type ExceptionHandlerWithErrCode = extern "x86-interrupt" fn(&mut ExceptionStackFrame, error_code: u64);
-pub type DoubleFaultHandler = extern "x86-interrupt" fn(&mut ExceptionStackFrame, error_code: u64) -> !;
+// The frame is taken BY VALUE. The `x86-interrupt` ABI passes the CPU-pushed
+// frame by value; a handler declared as `&mut ExceptionStackFrame` compiles,
+// but then reads the frame's first word (RIP) as the reference — so
+// `instruction_pointer` returned the bytes *at* RIP and `code_segment & 3`
+// (the user-vs-kernel test in every fault handler) read code bytes at
+// RIP+8. Found 2026-09-23: fault reports printed `0xcccccccccccccc c3`
+// (`ret` + `int3` padding) and `0x480724448808048a` (instruction bytes) as
+// "RIP", confirmed in the disassembly (`lea rax,[rsp+0xc0]`, then a load
+// through it). Every handler signature below and in `init::devices` must
+// stay by-value.
+pub type ExceptionHandler = extern "x86-interrupt" fn(ExceptionStackFrame);
+pub type ExceptionHandlerWithErrCode = extern "x86-interrupt" fn(ExceptionStackFrame, error_code: u64);
+pub type DoubleFaultHandler = extern "x86-interrupt" fn(ExceptionStackFrame, error_code: u64) -> !;
 
 // ============================================================================
 // Interrupt Descriptor Table

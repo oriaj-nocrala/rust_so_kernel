@@ -71,7 +71,7 @@ const PF_RESERVED: u64 = 1 << 3;   // 1 = reserved PTE bit set
 // INTERRUPT HANDLERS
 // ============================================================================
 
-extern "x86-interrupt" fn keyboard_interrupt_handler(_: &mut ExceptionStackFrame) {
+extern "x86-interrupt" fn keyboard_interrupt_handler(_: ExceptionStackFrame) {
     let scancode = unsafe {
         x86_64::instructions::port::PortReadOnly::<u8>::new(0x60).read()
     };
@@ -90,7 +90,7 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_: &mut ExceptionStackFrame
 /// which physical source a byte came from.  This is what lets `qemu
 /// -serial stdio` be used to type/pipe input into the shell instead of the
 /// QEMU-monitor `sendkey` workaround.
-extern "x86-interrupt" fn serial_interrupt_handler(_: &mut ExceptionStackFrame) {
+extern "x86-interrupt" fn serial_interrupt_handler(_: ExceptionStackFrame) {
     use x86_64::instructions::port::Port;
     const LSR: u16 = 0x3FD;
     const RBR: u16 = 0x3F8;
@@ -120,7 +120,7 @@ extern "x86-interrupt" fn serial_interrupt_handler(_: &mut ExceptionStackFrame) 
 /// IRQ12 — PS/2 auxiliary device (mouse). Each byte belongs to a 3-byte
 /// packet; `mouse::process_byte` does the reassembly/decode, same shape
 /// as `keyboard::process_scancode` does for IRQ1.
-extern "x86-interrupt" fn mouse_interrupt_handler(_: &mut ExceptionStackFrame) {
+extern "x86-interrupt" fn mouse_interrupt_handler(_: ExceptionStackFrame) {
     let data = unsafe {
         x86_64::instructions::port::PortReadOnly::<u8>::new(0x60).read()
     };
@@ -128,7 +128,7 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_: &mut ExceptionStackFrame) {
     crate::interrupts::pic::end_of_interrupt(crate::interrupts::pic::Irq::Mouse.as_u8());
 }
 
-extern "x86-interrupt" fn divide_by_zero_handler(sf: &mut ExceptionStackFrame) {
+extern "x86-interrupt" fn divide_by_zero_handler(sf: ExceptionStackFrame) {
     if sf.code_segment & 0x3 != 0 {
         kill_current_user_process("DIVIDE BY ZERO");
         // unreachable — kill_current_user_process diverges
@@ -136,7 +136,7 @@ extern "x86-interrupt" fn divide_by_zero_handler(sf: &mut ExceptionStackFrame) {
     panic!("DIVIDE BY ZERO at {:#x}", sf.instruction_pointer);
 }
 
-extern "x86-interrupt" fn invalid_opcode_handler(sf: &mut ExceptionStackFrame) {
+extern "x86-interrupt" fn invalid_opcode_handler(sf: ExceptionStackFrame) {
     if sf.code_segment & 0x3 != 0 {
         kill_current_user_process("INVALID OPCODE");
         // unreachable — kill_current_user_process diverges
@@ -145,14 +145,14 @@ extern "x86-interrupt" fn invalid_opcode_handler(sf: &mut ExceptionStackFrame) {
 }
 
 extern "x86-interrupt" fn double_fault_handler(
-    sf: &mut ExceptionStackFrame,
+    sf: ExceptionStackFrame,
     error_code: u64
 ) -> ! {
     panic!("DOUBLE FAULT (error: {}) at {:#x}", error_code, sf.instruction_pointer);
 }
 
 extern "x86-interrupt" fn general_protection_fault_handler(
-    sf: &mut ExceptionStackFrame,
+    sf: ExceptionStackFrame,
     error_code: u64
 ) {
     if sf.code_segment & 0x3 != 0 {
@@ -170,7 +170,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 ///   3. Map page via demand_paging::map_demand_page
 ///   4. On failure: kill user process OR panic (kernel fault)
 extern "x86-interrupt" fn page_fault_handler(
-    sf: &mut ExceptionStackFrame,
+    sf: ExceptionStackFrame,
     error_code: u64
 ) {
     use crate::memory::demand_paging;
@@ -179,7 +179,7 @@ extern "x86-interrupt" fn page_fault_handler(
     let is_user = error_code & PF_USER != 0;
     let is_write = error_code & PF_WRITE != 0;
 
-    let _ = sf; // ExceptionStackFrame values unreliable for user-mode PFs
+    let _ = &sf; // (was "unreliable for user-mode PFs": that was the by-reference ABI bug, see idt.rs)
 
     // ── COW write fault: page present + write, no reserved bit ───
     //
@@ -259,8 +259,9 @@ extern "x86-interrupt" fn page_fault_handler(
         None => {
             if is_user {
                 serial_println!(
-                    "⚠️  Segfault: PID {} accessed {:#x} (no VMA)",
-                    crate::process::scheduler::current_pid_fast(), fault_addr
+                    "⚠️  Segfault: PID {} accessed {:#x} (no VMA) at rip {:#x} (error {:#b})",
+                    crate::process::scheduler::current_pid_fast(), fault_addr,
+                    sf.instruction_pointer, error_code
                 );
                 kill_current_user_process("SEGFAULT (no VMA for address)");
                 // unreachable — kill_current_user_process diverges
@@ -361,7 +362,7 @@ fn kill_current_user_process(reason: &str) -> ! {
     }
 }
 
-extern "x86-interrupt" fn timer_handler(_sf: &mut ExceptionStackFrame) {
+extern "x86-interrupt" fn timer_handler(_sf: ExceptionStackFrame) {
     unsafe {
         use x86_64::instructions::port::PortWriteOnly;
         PortWriteOnly::<u8>::new(0x20).write(0x20);
