@@ -31,9 +31,14 @@ extern "C" {
 /* Argument for signal() */
 typedef void (*__sighandler) (int);
 
+/* Linux values, which is what kernel/src/process/syscall/signal.rs
+   decodes. These were mlibc's own-ABI -2/-3: the kernel read SIG_DFL as a
+   handler at address -2, so the first Ctrl-C after any signal(SIG_DFL)
+   (ash resets SIGINT that way in every child) jumped to rip=-2 -- a panic
+   under `sleep`, a SIGSEGV under doom. */
 #define SIG_ERR ((__sighandler)(void *)(-1))
-#define SIG_DFL ((__sighandler)(void *)(-2))
-#define SIG_IGN ((__sighandler)(void *)(-3))
+#define SIG_DFL ((__sighandler)(void *)(0))
+#define SIG_IGN ((__sighandler)(void *)(1))
 
 #define SIGHUP 1
 #define SIGINT 2
@@ -97,9 +102,11 @@ typedef __mlibc_uint64 sigset_t;
 #define SIGUNUSED SIGSYS
 
 /* constants for sigprocmask() */
-#define SIG_BLOCK 1
-#define SIG_UNBLOCK 2
-#define SIG_SETMASK 3
+/* Linux values (the kernel's sys_sigprocmask). They were 1/2/3: SIG_BLOCK
+   unblocked, SIG_UNBLOCK replaced the whole mask, SIG_SETMASK was EINVAL. */
+#define SIG_BLOCK 0
+#define SIG_UNBLOCK 1
+#define SIG_SETMASK 2
 
 #define SA_NOCLDSTOP (1 << 0)
 #define SA_ONSTACK (1 << 1)
