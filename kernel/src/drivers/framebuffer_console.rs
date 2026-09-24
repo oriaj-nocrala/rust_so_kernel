@@ -261,7 +261,8 @@ pub fn mark_raw_dirty() {
 
 static CURSOR_DRAWN: AtomicBool = AtomicBool::new(false);
 static CURSOR_TICKS: AtomicU64 = AtomicU64::new(0);
-/// PIT runs at 100 Hz (`pit::init(100)`, see init/devices.rs); 50 ticks is
+/// The timer tick is 100 Hz (the LAPIC timer, or the PIT on the 8259
+/// fallback — see `interrupts::apic`); 50 ticks is
 /// a 500ms on/off period, the conventional terminal blink rate.
 const CURSOR_BLINK_TICKS: u64 = 50;
 

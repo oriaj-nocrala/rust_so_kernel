@@ -125,6 +125,13 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     crate::cpu::tsc::init();
     serial_println!("TSC: {} MHz", crate::cpu::tsc::freq_hz() / 1_000_000);
 
+    // ── LAPIC + I/O APIC ───────────────────────────────────────────
+    // Retires the 8259 + PIT: the LAPIC timer (calibrated against the TSC
+    // just above) takes over the 100 Hz tick, and the ISA lines enabled so
+    // far (keyboard, COM1, mouse) move to the I/O APIC. Best-effort: on any
+    // failure the PIC keeps delivering. Stage 1 of `docs/smp/smp-plan.md`.
+    crate::interrupts::apic::init();
+
     // ── Time subsystem ─────────────────────────────────────────────
     crate::time::init();
     serial_println!("clocksource: {}", crate::time::clocksource::clocksource_name());

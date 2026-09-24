@@ -21,6 +21,7 @@
 extern crate alloc;
 
 pub mod acpi;
+pub mod apic;
 pub mod ac97;
 pub mod block;
 pub mod blockcache;

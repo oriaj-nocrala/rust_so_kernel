@@ -96,7 +96,7 @@ so addresses actually resolve to real function names instead of bare hex.
 ### QEMU integration tests
 
 Real hardware-path behavior (drivers that need actual QEMU devices, not just host-testable
-pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 256 tests, <1s, no QEMU) is
+pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 272 tests, <1s, no QEMU) is
 asserted by a `#![feature(custom_test_frameworks)]` harness that boots the real kernel in
 QEMU and reports PASS/FAIL as a process exit code:
 
@@ -170,9 +170,10 @@ Kernel crate config in `kernel/.cargo/config.toml` enables `-Z build-std` to reb
 3. `memory::init_core()` — store physical memory offset, seed Buddy allocator
 4. `memory::test_allocators()` — smoke test slab + Vec + String
 5. `devices::draw_boot_screen()`
-6. `devices::init_hardware_interrupts()` — init PIC + PIT (preemptive timer)
+6. `devices::init_hardware_interrupts()` — init PIC + PIT (the PIT is what the TSC is calibrated against)
 6b. `mouse::init()` — best-effort PS/2 auxiliary device enable (IRQ12); bounded polls, never hangs boot on hardware with no PS/2 mouse
 6c. `ac97::init()` — best-effort PCI AC97 audio codec enable; bounded polls, never hangs boot on hardware/QEMU configs with no AC97 device
+6d. `cpu::tsc::init()` (calibrated against the PIT), then `interrupts::apic::init()` — retires the 8259 + PIT in favour of the LAPIC timer + I/O APIC (see Interrupt Controllers below)
 7. REPL initial prompt
 8. `process::tss::init()` — TSS + GDT (needed for ring-3 → ring-0 stack switch)
 9. `processes::init_all()` — create idle, user, and shell processes
@@ -513,7 +514,7 @@ arbitration, exactly where two PS/2 keyboards would merge.
 **Split across the usual seam.** `hal::xhci` (register/TRB/ring/context
 arithmetic), `hal::usb` (descriptor parsing + setup packets) and
 `hal::hid` (boot-report diffing + the Set-1 table) are pure and host-tested
-— most of `hal`'s 256 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
+— most of `hal`'s 272 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
 DMA pages, doorbells and waiting. That line is drawn hard here because an
 xHCI bring-up failure is nearly unobservable (a wrong bit in a device
 context yields no fault, no log, just a Transfer Event that never arrives)
@@ -861,6 +862,42 @@ present but no keyboard attached"; that case needs the active commands.
 the bring-up machine's shape. Verified: typing works in that configuration,
 `i8042_present=false` is reported, and with the USB keyboard also removed
 the no-input hold renders the filtered log and the red summary on screen.
+
+## Interrupt Controllers (`kernel/src/interrupts/`, `hal/src/apic.rs`)
+
+Stage 1 of `docs/smp/smp-plan.md`: the tick is the **LAPIC timer**
+(periodic, 100 Hz, calibrated against the already-calibrated TSC — the PIT
+is only needed once, to calibrate the TSC) and ISA lines (keyboard IRQ1,
+COM1 IRQ4, mouse IRQ12) arrive through the **I/O APIC**, with the MADT's
+interrupt source overrides applied. The 8259 stays initialised and remapped
+but fully masked, and LAPIC LINT0 (its ExtINT path) is masked too.
+`interrupts::apic::init` runs once, IF=0, right after `cpu::tsc::init`, and
+is best-effort: any failure (no MADT, no I/O APIC, CPUID without an APIC, a
+calibration that doesn't fit) leaves the 8259 + PIT delivering exactly as
+before. xAPIC through `memory::mmio::map`, or x2APIC MSRs if the firmware
+already turned x2APIC on (it can't be turned back off). Pure parts —
+register layout, LVT/divide/redirection encodings, calibration arithmetic,
+ISA→GSI routing with polarity/trigger — are host-tested in `hal::apic`.
+
+- **Vectors are unchanged**: timer 32, ISA line n at 32+n, so one IDT serves
+  both controllers. LAPIC spurious is `0xFF` (never EOI'd).
+- **Drivers call `interrupts::enable_isa_irq(line)` and
+  `interrupts::eoi(vector)`, never `pic::*` directly.** The first records the
+  line so `apic::init` re-routes whatever was enabled before the switch; the
+  second goes to whichever controller is live.
+- **Unhandled 34..47 vectors ask the LAPIC's ISR** whether it delivered
+  them (I/O APIC pin → LAPIC EOI) or they are 8259 leftovers (no LAPIC EOI —
+  it would end whatever else is in service).
+- **Edge-triggered lines are drained at the switch** (8042 and 16550 read
+  until empty): a device whose line was already high when its pin got
+  unmasked produces no edge and would never interrupt again.
+- `/proc/kdebug` shows `irq_controller:` (which one is live, the LAPIC
+  timer's count/divisor/input clock, the I/O APICs' GSI ranges and every
+  routed ISA line, or the fallback reason) and `timer_ticks: N over M ms of
+  uptime` — the tick rate check for the serial-less machine; counting
+  starts at the first `sti`, so compare two readings. Measured in QEMU:
+  input 1000 MHz, 523 ticks in 5.26 s; `-cpu max,-apic` exercises the
+  fallback.
 
 ## Time Subsystem (`kernel/src/time/`, `kernel/src/rtc.rs`)
 

@@ -51,8 +51,7 @@ fn inb(port: u16) -> u8 {
 /// Inicializa los PICs 8259
 ///
 /// Leaves **every** line masked. Each line this kernel handles is unmasked
-/// explicitly afterwards (`enable_irq` in `init_hardware_interrupts` and
-/// `mouse::init`); a line nobody asked for stays off. This used to restore
+/// explicitly afterwards (`interrupts::enable_isa_irq`); a line nobody asked for stays off. This used to restore
 /// whatever masks the firmware had left, which on real hardware is not
 /// guaranteed to be "all masked".
 pub fn initialize() {
@@ -107,6 +106,14 @@ pub fn end_of_spurious(irq_line: u8) {
     if irq_line >= 8 {
         outb(PIC1_COMMAND, CMD_END_OF_INTERRUPT);
     }
+}
+
+/// Masks every line on both 8259s — how `apic::init` retires them. They
+/// stay initialised and remapped (32..47), so a spurious IRQ7/IRQ15 they
+/// can still raise lands on a handled vector.
+pub fn mask_all() {
+    outb(PIC1_DATA, 0xFF);
+    outb(PIC2_DATA, 0xFF);
 }
 
 /// Envía la señal de fin de interrupción (EOI)

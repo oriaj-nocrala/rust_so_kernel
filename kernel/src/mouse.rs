@@ -8,7 +8,7 @@
 // /dev/input/event1 (drivers/dev_mouse_event.rs).
 //
 // This module owns everything that's genuinely hardware access or global
-// state: the `X86PortIo` construction, the `pic::enable_irq` calls (a
+// state: the `X86PortIo` construction, the `interrupts::enable_isa_irq` call (a
 // different seam/module than the 8042 protocol itself — see
 // `hal::mouse::enable_aux`'s doc comment), every `serial_println!`, and the
 // ISR-safe decoder + event-ring statics. The 8042 round-trip and the
@@ -55,8 +55,7 @@ impl Driver for MouseDriver {
         let io = X86PortIo;
         match hal::mouse::enable_aux(&io) {
             Ok(()) => {
-                crate::interrupts::pic::enable_irq(2); // cascade: master's slave-PIC input
-                crate::interrupts::pic::enable_irq(12); // the mouse's own line
+                crate::interrupts::enable_isa_irq(12);
                 crate::serial_println!("mouse: PS/2 auxiliary device enabled (IRQ12)");
                 Ok(())
             }

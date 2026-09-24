@@ -64,6 +64,8 @@ pub fn init_idt() {
         idt.add_handler(45, irq13_handler);
         idt.add_handler(46, irq14_handler);
         idt.add_handler(47, irq15_handler);
+        // The LAPIC's own spurious vector (see `apic::SPURIOUS_VECTOR`).
+        idt.add_handler(crate::interrupts::apic::SPURIOUS_VECTOR, lapic_spurious_handler);
         // Syscalls are now handled via the `syscall` instruction (LSTAR MSR),
         // not via int 0x80.  No IDT entry needed.
         idt
@@ -96,7 +98,7 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_: ExceptionStackFrame) {
     crate::process::syscall::stdin_wakeup();
     // Wake any process blocked in poll/epoll_wait watching stdin for POLLIN.
     crate::process::syscall::poll_wakeup_for_fd0();
-    crate::interrupts::pic::end_of_interrupt(crate::interrupts::pic::Irq::Keyboard.as_u8());
+    crate::interrupts::eoi(crate::interrupts::pic::Irq::Keyboard.as_u8());
 }
 
 /// COM1 receive interrupt — lets serial input act as stdin, alongside the
@@ -130,7 +132,7 @@ extern "x86-interrupt" fn serial_interrupt_handler(_: ExceptionStackFrame) {
             }
         }
     }
-    crate::interrupts::pic::end_of_interrupt(crate::interrupts::pic::Irq::Com1.as_u8());
+    crate::interrupts::eoi(crate::interrupts::pic::Irq::Com1.as_u8());
 }
 
 /// IRQ12 — PS/2 auxiliary device (mouse). Each byte belongs to a 3-byte
@@ -141,15 +143,25 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_: ExceptionStackFrame) {
         x86_64::instructions::port::PortReadOnly::<u8>::new(0x60).read()
     };
     crate::mouse::process_byte(data);
-    crate::interrupts::pic::end_of_interrupt(crate::interrupts::pic::Irq::Mouse.as_u8());
+    crate::interrupts::eoi(crate::interrupts::pic::Irq::Mouse.as_u8());
 }
 
 /// A PIC line with no driver behind it. IRQ7/IRQ15 are checked for the
 /// 8259's spurious case first, which needs a different EOI (see
 /// `pic::is_spurious`); anything else is a real interrupt on a line that
 /// should be masked — counted, EOI'd, and otherwise dropped.
+///
+/// Under the APIC these vectors can come from two places: an I/O APIC pin
+/// (the LAPIC has it in service and needs the EOI) or a leftover from the
+/// masked 8259 (the LAPIC does not, and must not get one — it would end
+/// whatever else is in service). The LAPIC's ISR says which.
 fn unhandled_pic_irq(line: u8) {
-    use crate::interrupts::pic;
+    use crate::interrupts::{apic, pic};
+    if apic::active() && apic::in_service(pic::PIC1_OFFSET + line) {
+        crate::debug::note_unexpected_irq(line);
+        apic::eoi();
+        return;
+    }
     if (line == 7 || line == 15) && pic::is_spurious(line) {
         crate::debug::inc_spurious_irqs();
         pic::end_of_spurious(line);
@@ -171,6 +183,11 @@ unhandled_irq_handlers! {
     irq2_handler => 2, irq3_handler => 3, irq5_handler => 5, irq6_handler => 6,
     irq7_handler => 7, irq8_handler => 8, irq9_handler => 9, irq10_handler => 10,
     irq11_handler => 11, irq13_handler => 13, irq14_handler => 14, irq15_handler => 15,
+}
+
+/// A LAPIC spurious interrupt: no ISR bit is set for it, so no EOI.
+extern "x86-interrupt" fn lapic_spurious_handler(_: ExceptionStackFrame) {
+    crate::debug::inc_spurious_irqs();
 }
 
 extern "x86-interrupt" fn divide_by_zero_handler(sf: ExceptionStackFrame) {
@@ -459,13 +476,6 @@ fn kill_current_user_process(reason: &str) -> ! {
     }
 }
 
-extern "x86-interrupt" fn timer_handler(_sf: ExceptionStackFrame) {
-    unsafe {
-        use x86_64::instructions::port::PortWriteOnly;
-        PortWriteOnly::<u8>::new(0x20).write(0x20);
-    }
-}
-
 // ============================================================================
 // HARDWARE INIT
 // ============================================================================
@@ -490,12 +500,17 @@ pub fn draw_boot_screen() {
     crate::drivers::framebuffer_console::reserve_pixels_at_top(bottom + 8);
 }
 
-/// PIC + PIT + load IDT.
+/// PIC + PIT + load IDT. The PIT is needed at least until `cpu::tsc::init`
+/// has calibrated against it; `interrupts::apic::init` then retires both in
+/// favour of the LAPIC timer and the I/O APIC, re-routing the ISA lines
+/// enabled here.
 pub fn init_hardware_interrupts() {
     crate::interrupts::pic::initialize();
+    // IRQ0 directly, not through `enable_isa_irq`: under the APIC the timer
+    // is the LAPIC's own, not an I/O APIC pin.
     crate::interrupts::pic::enable_irq(0);
-    crate::interrupts::pic::enable_irq(1);
-    crate::interrupts::pic::enable_irq(4); // COM1 (serial stdin)
+    crate::interrupts::enable_isa_irq(1);
+    crate::interrupts::enable_isa_irq(4); // COM1 (serial stdin)
     load_idt();
 
     crate::serial::init_interrupts();

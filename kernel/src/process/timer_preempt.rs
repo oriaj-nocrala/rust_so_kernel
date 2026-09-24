@@ -16,7 +16,14 @@ use core::arch::global_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 use super::trapframe::TrapFrame;
 
+/// Timer interrupts taken since boot. `/proc/kdebug` shows it beside the
+/// uptime, which is how the tick rate is checked on a machine with no
+/// serial: it should read 100 per second of uptime, whichever timer drives it.
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+pub fn ticks_total() -> u64 {
+    TICK_COUNT.load(Ordering::Relaxed)
+}
 
 global_asm!(
     ".global timer_interrupt_entry",
@@ -151,10 +158,9 @@ fn validate_resume_frame(tf: *const TrapFrame, kstack_top: u64, site: &'static s
 #[no_mangle]
 pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> *const TrapFrame {
     // ── 1. EOI (must be first — acknowledge interrupt) ────────────────
-    unsafe {
-        use x86_64::instructions::port::PortWriteOnly;
-        PortWriteOnly::<u8>::new(0x20).write(0x20);
-    }
+    // The LAPIC timer's, or the PIT's through the 8259 if the APIC switch
+    // declined (`interrupts::apic::init`) — both on vector 32.
+    crate::interrupts::eoi(crate::interrupts::apic::TIMER_VECTOR);
 
     crate::drivers::framebuffer_console::tick_cursor_blink();
 
@@ -170,10 +176,7 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> *const 
     // ── 2. Advance jiffies counter ────────────────────────────────────
     // crate::time::clockevent::tick();
 
-    // let tick_n = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
-    // if tick_n % 50 == 0 {
-    //     crate::serial_println!("[TICK] {}", tick_n);
-    // }
+    TICK_COUNT.fetch_add(1, Ordering::Relaxed);
 
     // ── 3. Fire expired hrtimers ──────────────────────────────────────
     //

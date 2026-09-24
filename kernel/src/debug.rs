@@ -368,6 +368,8 @@ pub fn render_report() -> alloc::string::String {
          usb_keys_dropped: {}\n\
          spurious_irqs: {}\n\
          unexpected_irqs: {} (last line {})\n\
+         irq_controller: {}\n\
+         timer_ticks: {} over {} ms of uptime\n\
          {}\n\
          {}{}{}{}",
         mask, enabled,
@@ -387,6 +389,9 @@ pub fn render_report() -> alloc::string::String {
         SPURIOUS_IRQS.load(Ordering::Relaxed),
         UNEXPECTED_IRQS.load(Ordering::Relaxed),
         LAST_UNEXPECTED_IRQ.load(Ordering::Relaxed) as i64,
+        crate::interrupts::apic::render(),
+        crate::process::timer_preempt::ticks_total(),
+        crate::cpu::tsc::uptime_ms(),
         alloc::format!(
             "{}\n{}",
             match crate::fs::ext2::cache_stats() {

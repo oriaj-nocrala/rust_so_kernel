@@ -153,7 +153,7 @@ macro_rules! serial_println_raw {
 
 /// Program the 16550 UART for interrupt-driven receive and enable the
 /// "data available" interrupt.  Must be called before the IRQ4 line is
-/// unmasked at the PIC (see `init::devices::init_hardware_interrupts`).
+/// unmasked (see `init::devices::init_hardware_interrupts`).
 ///
 /// Only configures the RX side. TX (`write_byte` / `RawSerialWriter`)
 /// already works against QEMU's default post-reset UART state without
