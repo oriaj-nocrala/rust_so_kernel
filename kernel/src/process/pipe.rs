@@ -148,6 +148,9 @@ fn deliver_and_wake(pid: usize, f: impl FnOnce(&super::Process) -> u64) {
     }) {
         let rax = f(&sched.wait_queue()[idx]);
         sched.wait_queue_mut()[idx].trapframe.rax = rax;
+        crate::ktrace!(crate::debug::FS, "pipe wake pid={} rax={:#x}", pid, rax);
+    } else {
+        crate::ktrace!(crate::debug::FS, "pipe wake pid={}: NOT BLOCKED, delivery dropped", pid);
     }
     sched.wake(pid);
 }
@@ -206,19 +209,26 @@ impl FileHandle for PipeReadEnd {
         }
 
         let mut pb = self.buf.lock();
+        crate::ktrace!(crate::debug::FS, "pipe read: want={} len={} writers={} write_waiter={}",
+            buf.len(), pb.len, pb.writers, pb.write_waiter.is_some());
 
         if pb.len > 0 {
             let n = pb.try_read(buf);
             let waiter = pb.write_waiter.take();
+            // Only as much as this read just freed: the blocked writer is
+            // told it wrote whatever `collect_from_writer` pulls, so pulling
+            // more than fits back in the ring silently dropped the excess.
+            let space = PIPE_CAPACITY - pb.len;
             drop(pb);
 
             if let Some(w) = waiter {
                 // Space freed — pull bytes straight from the blocked
                 // writer's buffer and stash them for future reads.
                 let mut tmp = [0u8; PIPE_CAPACITY];
-                let got = collect_from_writer(w, &mut tmp);
+                let got = collect_from_writer(w, &mut tmp[..space]);
                 if got > 0 {
-                    self.buf.lock().try_write(&tmp[..got]);
+                    let stored = self.buf.lock().try_write(&tmp[..got]);
+                    debug_assert_eq!(stored, got);
                 }
             }
             return Ok(n);
@@ -266,11 +276,17 @@ impl FileHandle for PipeWriteEnd {
         }
 
         let n = pb.try_write(buf);
+        crate::ktrace!(crate::debug::FS, "pipe write: want={} wrote={} len={} read_waiter={}",
+            buf.len(), n, pb.len, pb.read_waiter.is_some());
         if n > 0 {
             let waiter = pb.read_waiter.take();
+            // Take out only what the blocked reader asked for; the rest
+            // stays buffered for its next read (taking the whole ring and
+            // delivering `waiter.count` of it lost the remainder).
             let delivered = waiter.map(|w| {
                 let mut tmp = [0u8; PIPE_CAPACITY];
-                let got = pb.try_read(&mut tmp);
+                let want = w.count.min(PIPE_CAPACITY);
+                let got = pb.try_read(&mut tmp[..want]);
                 (w, tmp, got)
             });
             drop(pb);

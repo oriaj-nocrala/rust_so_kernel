@@ -348,7 +348,11 @@ pub(super) fn sys_connect(fd: i32, addr_ptr: u64, addrlen: u64) -> SyscallResult
             if unix::fd_is_nonblocking(fd) {
                 return errno::EAGAIN;
             }
-            match SOCKETS.with(|t| t.lookup(&addr)) {
+            let listener = SOCKETS.with(|t| t.lookup(&addr));
+            // `block_on` never returns: free what this frame owns first.
+            drop(addr);
+            drop(wakes);
+            match listener {
                 Some(listener) => unix::block_on(listener),
                 None => unix::errno_of(SockError::ConnRefused),
             }
@@ -422,7 +426,13 @@ pub(super) fn sys_sendto(
     };
 
     let data = unsafe { user_slice(buf, len) };
-    send_common(fd, data, Vec::new(), dest.as_ref(), flags)
+    match send_common(fd, data, Vec::new(), dest.as_ref(), flags) {
+        Ok(r) => r,
+        Err(sock) => {
+            drop(dest);
+            unix::block_on(sock)
+        }
+    }
 }
 
 pub(super) fn sys_recvfrom(
@@ -441,7 +451,8 @@ pub(super) fn sys_recvfrom(
 
     let out = match recv_common(fd, unsafe { user_slice_mut(buf, len) }, flags) {
         Ok(o) => o,
-        Err(e) => return e,
+        Err(RecvError::Errno(e)) => return e,
+        Err(RecvError::Block(sock)) => unix::block_on(sock),
     };
 
     // Ancillary descriptors have nowhere to go in a recvfrom(); closing them
@@ -491,7 +502,14 @@ pub(super) fn sys_sendmsg(fd: i32, msg_ptr: u64, flags: u32) -> SyscallResult {
         Err(e) => return e,
     };
 
-    send_common(fd, &data, fds, dest.as_ref(), flags)
+    match send_common(fd, &data, fds, dest.as_ref(), flags) {
+        Ok(r) => r,
+        Err(sock) => {
+            drop(data);
+            drop(dest);
+            unix::block_on(sock)
+        }
+    }
 }
 
 pub(super) fn sys_recvmsg(fd: i32, msg_ptr: u64, flags: u32) -> SyscallResult {
@@ -509,7 +527,11 @@ pub(super) fn sys_recvmsg(fd: i32, msg_ptr: u64, flags: u32) -> SyscallResult {
 
     let out = match recv_common(fd, &mut staging, flags) {
         Ok(o) => o,
-        Err(e) => return e,
+        Err(RecvError::Errno(e)) => return e,
+        Err(RecvError::Block(sock)) => {
+            drop(staging);
+            unix::block_on(sock)
+        }
     };
 
     if let Err(e) = scatter_iovecs(&msg, &staging[..out.n]) {
@@ -702,16 +724,21 @@ struct RecvResult {
     from: Option<UnixAddr>,
 }
 
+/// `Err(socket)`: the send must block on `socket`. The caller does the
+/// `unix::block_on` itself, after dropping whatever it owns — `block_on`
+/// never returns, so anything still alive in a caller's frame (the
+/// gathered `sendmsg` data, a destination address) would leak on every
+/// blocked send.
 fn send_common(
     fd: i32,
     data: &[u8],
     mut fds: Vec<Box<dyn FileHandle>>,
     dest: Option<&UnixAddr>,
     flags: u32,
-) -> SyscallResult {
+) -> Result<SyscallResult, SocketId> {
     let id = match unix::socket_of_fd(fd) {
         Ok(id) => id,
-        Err(e) => return e,
+        Err(e) => return Ok(e),
     };
 
     let (result, wakes) = SOCKETS.with(|t| {
@@ -725,25 +752,31 @@ fn send_common(
     unix::dispatch_wakes(&wakes);
 
     match result {
-        Ok(n) => n as i64,
+        Ok(n) => Ok(n as i64),
         Err(SockError::Again) => {
             if flags & MSG_DONTWAIT != 0 || unix::fd_is_nonblocking(fd) {
-                return errno::EAGAIN;
+                return Ok(errno::EAGAIN);
             }
             // `fds` still holds the descriptors the send didn't take; they
-            // drop here, which is correct — the retry re-reads them from the
-            // sender's fd table, which still has them open.
-            drop(fds);
-            unix::block_on(peer_or_self(id))
+            // drop on return, which is correct — the retry re-reads them
+            // from the sender's fd table, which still has them open.
+            Err(peer_or_self(id))
         }
-        Err(e) => unix::errno_of(e),
+        Err(e) => Ok(unix::errno_of(e)),
     }
 }
 
-fn recv_common(fd: i32, buf: &mut [u8], flags: u32) -> Result<RecvResult, i64> {
+enum RecvError {
+    Errno(i64),
+    /// Must block on this socket — the caller calls `unix::block_on` after
+    /// dropping what it owns (see `send_common`).
+    Block(SocketId),
+}
+
+fn recv_common(fd: i32, buf: &mut [u8], flags: u32) -> Result<RecvResult, RecvError> {
     let id = match unix::socket_of_fd(fd) {
         Ok(id) => id,
-        Err(e) => return Err(e),
+        Err(e) => return Err(RecvError::Errno(e)),
     };
     let peek = flags & MSG_PEEK != 0;
 
@@ -761,11 +794,11 @@ fn recv_common(fd: i32, buf: &mut [u8], flags: u32) -> Result<RecvResult, i64> {
         Ok((n, full_len, fds, from)) => Ok(RecvResult { n, full_len, fds, from }),
         Err(SockError::Again) => {
             if flags & MSG_DONTWAIT != 0 || unix::fd_is_nonblocking(fd) {
-                return Err(errno::EAGAIN);
+                return Err(RecvError::Errno(errno::EAGAIN));
             }
-            unix::block_on(id)
+            Err(RecvError::Block(id))
         }
-        Err(e) => Err(unix::errno_of(e)),
+        Err(e) => Err(RecvError::Errno(unix::errno_of(e))),
     }
 }
 

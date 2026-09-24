@@ -120,6 +120,13 @@ pub(super) fn sys_read(fd: i32, buf: usize, count: usize) -> SyscallResult {
             Ok(n) => n as i64,
             Err(crate::process::file::FileError::Again) => errno::EAGAIN,
             Err(crate::process::file::FileError::WouldBlock) => {
+                // `jump_to_user` never returns, so nothing on this stack
+                // frame is ever dropped: release the fd-table `Arc` first.
+                // Leaking it kept the table — and every pipe end in it —
+                // alive after the process exited, so a reader of that
+                // pipe never saw EOF (`seq 1 1100 | wc -c` hung whenever
+                // `seq` had blocked on a full pipe).
+                drop(files);
                 let tf_ptr = current_tf_ptr();
                 let next_tf = {
                     let mut scheduler = crate::process::scheduler::local_scheduler();
@@ -241,6 +248,10 @@ pub(super) fn sys_write(fd: i32, buf: usize, count: usize) -> SyscallResult {
         Err(crate::process::file::FileError::BrokenPipe) => errno::EPIPE,
         Err(crate::process::file::FileError::NoSpace) => errno::ENOSPC,
         Err(crate::process::file::FileError::WouldBlock) => {
+            // Same as `sys_read`'s WouldBlock arm: `jump_to_user` never
+            // returns, so drop the fd-table `Arc` before it or the table
+            // outlives the process (the pipe-EOF hang).
+            drop(files);
             let tf_ptr = current_tf_ptr();
             let next_tf = {
                 let mut scheduler = crate::process::scheduler::local_scheduler();
