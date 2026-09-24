@@ -193,6 +193,13 @@ pub fn arm<R: Regs>(wdt: &R, timeout_secs: u16) -> Result<Armed, TcoError> {
     Ok(Armed { control_before, was_fired, timeout_secs })
 }
 
+/// `tco_timer_stop`: clear the start bit. The count and action stay as
+/// they were, so a later `arm` starts from a known state anyway.
+pub fn disarm<R: Regs>(wdt: &R) {
+    let val = wdt.read32(WDT_CONTROL) & !CTL_START;
+    wdt.write32(WDT_CONTROL, val);
+}
+
 /// Seconds left before the reset (`tco_timer_get_timeleft`).
 pub fn time_left<R: Regs>(wdt: &R) -> u32 {
     wdt.read32(WDT_COUNT)
@@ -335,6 +342,18 @@ mod tests {
         let wdt = Window::with_dwords(CTL_DISABLED, 0);
         let _ = arm(&wdt, 60);
         assert!(wdt.writes().is_empty());
+    }
+
+    #[test]
+    fn disarm_clears_only_the_start_bit() {
+        let wdt = Window::with_dwords(0, 0);
+        arm(&wdt, 300).unwrap();
+        let before = wdt.read32(WDT_CONTROL);
+        disarm(&wdt);
+        assert!(!is_running(&wdt));
+        assert_eq!(wdt.read32(WDT_CONTROL), before & !CTL_START);
+        assert_eq!(wdt.writes().last(), Some(&(WDT_CONTROL, before & !CTL_START)));
+        assert_eq!(time_left(&wdt), 300, "count untouched");
     }
 
     #[test]

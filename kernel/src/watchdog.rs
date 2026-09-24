@@ -1,10 +1,19 @@
 // kernel/src/watchdog.rs
 //
-// The AMD FCH "TCO" hardware watchdog, armed only for unattended runs
+// The AMD FCH "TCO" hardware watchdog, for unattended runs
 // (docs/metal/autonomous-loop-plan.md, phase 4). A job that hangs the kernel
 // — or just a spinning process that never lets the job finish — must still
 // hand the machine back to Linux. Nothing here pings the watchdog: if the job
 // has not called reboot(2) by the time it expires, the reset is the point.
+//
+// Armed on EVERY boot, early (`arm_early`, right after the framebuffer is
+// set up, before ACPI/USB/storage), then disarmed once `autorun::detect`
+// says there is no job (`settle`). Whether a boot is unattended is only
+// known once `/mnt` is mounted, and arming only then left a hole: a kernel
+// that hung or panicked in the drivers before that point — USB bring-up is
+// the likeliest place on metal — stranded the machine. The cost is that a
+// manual boot that hangs before `/mnt` also resets after TIMEOUT_SECS, which
+// is no worse than hanging.
 //
 // Why constanos has to arm it itself: measured on the target board, the
 // reset that boots constanos disarms whatever Linux armed (systemd's 10-min
@@ -14,8 +23,8 @@
 // finds the SMBus function, maps the two MMIO windows uncached, and keeps
 // the mapping so `/proc/kdebug` can show the time left.
 //
-// What it does not cover: the stretch between the firmware and this point
-// of boot. A kernel that dies before `fs::init` is not rescued.
+// What it does not cover: firmware → bootloader → the first few steps of
+// `init::boot` (IDT, memory, PAT, framebuffer), before `arm_early` runs.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -32,6 +41,8 @@ pub const TIMEOUT_SECS: u16 = 300;
 /// Virtual address of the mapped watchdog window, 0 until armed.
 static WDT_VIRT: AtomicU64 = AtomicU64::new(0);
 static ARMED_SECS: AtomicU32 = AtomicU32::new(0);
+/// 0 = never armed, 1 = armed, 2 = disarmed by `settle` (no autorun job).
+static STATE: AtomicU32 = AtomicU32::new(0);
 
 /// An uncached MMIO window (from `memory::mmio::map`).
 struct MmioRegs(u64);
@@ -112,8 +123,9 @@ impl Driver for WatchdogDriver {
 
         WDT_VIRT.store(wdt.0, Ordering::Relaxed);
         ARMED_SECS.store(TIMEOUT_SECS as u32, Ordering::Relaxed);
+        STATE.store(1, Ordering::Relaxed);
         serial_println!(
-            "watchdog: ARMED, reset in {} s (count now {}); control was {:#x}{}; decode {}{}",
+            "watchdog: ARMED early, reset in {} s unless disarmed (count now {}); control was {:#x}{}; decode {}{}",
             armed.timeout_secs,
             sp5100_tco::time_left(&wdt),
             armed.control_before,
@@ -125,11 +137,45 @@ impl Driver for WatchdogDriver {
     }
 }
 
-/// Arms the watchdog if this boot is an unattended run. Call after
-/// `autorun::detect()`.
-pub fn arm_if_autorun() {
+/// Arms the watchdog on every boot, as early as MMIO mappings exist. Call
+/// right after the framebuffer setup in `init::boot`; `settle` undoes it for
+/// boots that turn out not to be unattended.
+pub fn arm_early() {
+    crate::hal::run_all(&mut [&mut WatchdogDriver]);
+}
+
+/// Keeps the watchdog for an unattended run, disarms it otherwise. Call
+/// right after `autorun::detect()`.
+pub fn settle() {
+    let virt = WDT_VIRT.load(Ordering::Relaxed);
+    if virt == 0 {
+        return;
+    }
+    let wdt = MmioRegs(virt);
     if crate::autorun::enabled() {
-        crate::hal::run_all(&mut [&mut WatchdogDriver]);
+        serial_println!("watchdog: kept armed for the autorun job, {} s left", sp5100_tco::time_left(&wdt));
+    } else {
+        sp5100_tco::disarm(&wdt);
+        STATE.store(2, Ordering::Relaxed);
+        serial_println!(
+            "watchdog: disarmed (no autorun job), {}",
+            if sp5100_tco::is_running(&wdt) { "BUT STILL RUNNING" } else { "stopped" }
+        );
+    }
+}
+
+/// Test hook for the early-hang path: a kernel built with
+/// `CONSTANOS_TEST_HANG_BEFORE_FS=1` in the environment spins forever right
+/// before mounting `/mnt`, which is exactly the stretch `arm_early` exists
+/// to cover. On the metal loop it must come back as a watchdog reset
+/// (`metal-run.sh --collect`: `NO-BOOT ... [watchdog reset: bootstatus=32]`,
+/// since the log partition is claimed after `/mnt`). Never set otherwise.
+pub fn test_hang_before_fs() {
+    if option_env!("CONSTANOS_TEST_HANG_BEFORE_FS").is_some() {
+        serial_println!("watchdog: CONSTANOS_TEST_HANG_BEFORE_FS — hanging before fs::init on purpose");
+        loop {
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -137,13 +183,14 @@ pub fn arm_if_autorun() {
 pub fn render() -> alloc::string::String {
     let virt = WDT_VIRT.load(Ordering::Relaxed);
     if virt == 0 {
-        return alloc::string::String::from("watchdog: off");
+        return alloc::string::String::from("watchdog: off (no supported hardware)");
     }
     let wdt = MmioRegs(virt);
     alloc::format!(
-        "watchdog: armed {} s, {} s left, {}",
+        "watchdog: {} (timeout {} s), {} s left, {}",
+        if STATE.load(Ordering::Relaxed) == 2 { "disarmed, no autorun job" } else { "armed" },
         ARMED_SECS.load(Ordering::Relaxed),
         sp5100_tco::time_left(&wdt),
-        if sp5100_tco::is_running(&wdt) { "running" } else { "STOPPED" }
+        if sp5100_tco::is_running(&wdt) { "running" } else { "stopped" }
     )
 }

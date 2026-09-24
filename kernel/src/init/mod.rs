@@ -78,6 +78,12 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
         serial_println!("framebuffer: no RAM shadow, drawing straight to VRAM");
     }
 
+    // ── Hardware watchdog (AMD FCH TCO) ────────────────────────────
+    // Armed on every boot as early as MMIO can be mapped, so a hang in any
+    // driver below still resets the machine during an unattended run;
+    // `watchdog::settle()` disarms it after `/mnt` if there is no job.
+    crate::watchdog::arm_early();
+
     // ── ACPI tables ────────────────────────────────────────────────
     // Best-effort, parse-only (bounded, never hangs boot) — see
     // `acpi::AcpiDriver`. Does NOT touch the existing 8259 PIC/IDT
@@ -147,12 +153,13 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     show_boot_log_if_no_keyboard();
 
     // ── VFS ────────────────────────────────────────────────────────
+    crate::watchdog::test_hang_before_fs();
     crate::fs::init();
     serial_println!("VFS: initramfs @ /bin, devfs @ /dev");
     // Unattended run? From here on a panic resets instead of halting.
     crate::autorun::detect();
-    // ...and the hardware watchdog resets a hang (autorun only).
-    crate::watchdog::arm_if_autorun();
+    // ...and the watchdog armed above stays armed only for that.
+    crate::watchdog::settle();
 
     // ── Kernel log → USB stick ─────────────────────────────────────
     // Claims the pendrive's raw `constanos-log` partition, if it has one;
