@@ -20,7 +20,10 @@
 #   FAIL     METAL-DONE <nonce> with any other status
 #   PANIC    METAL-BEGIN without DONE, last flush of that boot was a panic
 #   HANG     METAL-BEGIN without DONE, no panic (the log ends where it ends —
-#            the idle-task flush may have lost the tail)
+#            the idle-task flush may have lost the tail). constanos arms the
+#            FCH watchdog in autorun mode, so a hang resets after
+#            kernel/src/watchdog.rs's TIMEOUT_SECS; the verdict then carries
+#            "[watchdog reset: bootstatus=32]" from Linux's sp5100_tco.
 #   NO-JOB   a boot newer than the deploy exists but never printed the nonce
 #            (died before PID 1 reached the job; its log is saved)
 #   NO-BOOT  no boot newer than the deploy on the log partition at all
@@ -236,6 +239,15 @@ cmd_collect() {
 
     scripts/usb-log.sh read --all > "$run/all-boots.log" || die "reading the log partition failed"
     classify "$run" "$nonce" "$prev_seq"
+    # Linux's sp5100_tco driver reads the TCO's WatchDogFired bit at load:
+    # bootstatus 32 (WDIOF_CARDRESET) means the reset that brought us back
+    # was the watchdog constanos armed (kernel/src/watchdog.rs).
+    local bs
+    bs="$(cat /sys/class/watchdog/watchdog0/bootstatus 2>/dev/null || echo "?")"
+    echo "$bs" > "$run/watchdog-bootstatus"
+    if [[ "$bs" != "0" && "$bs" != "?" ]]; then
+        sed -i "1s/\$/ [watchdog reset: bootstatus=$bs]/" "$run/verdict"
+    fi
 
     # Remove the job whatever the verdict, so the next manual boot of the
     # stick is not an unattended run.

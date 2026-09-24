@@ -151,6 +151,8 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("VFS: initramfs @ /bin, devfs @ /dev");
     // Unattended run? From here on a panic resets instead of halting.
     crate::autorun::detect();
+    // ...and the hardware watchdog resets a hang (autorun only).
+    crate::watchdog::arm_if_autorun();
 
     // ── Kernel log → USB stick ─────────────────────────────────────
     // Claims the pendrive's raw `constanos-log` partition, if it has one;

@@ -169,6 +169,12 @@ pub struct PciFunction {
     pub interrupt_line: u8,
 }
 
+/// Revision ID (config offset 0x08, low byte). Drivers that pick a register
+/// layout by chipset revision need it (the SP5100 TCO watchdog does).
+pub fn revision_id(bus: u8, device: u8, function: u8) -> u8 {
+    config_read32(bus, device, function, 0x08) as u8
+}
+
 fn class_triple(bus: u8, device: u8, function: u8) -> (u8, u8, u8) {
     let dword = config_read32(bus, device, function, 0x08);
     (

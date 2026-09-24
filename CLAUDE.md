@@ -755,7 +755,15 @@ halting (`reboot::restart_from_panic`, lock-free). The job is never deleted
 by constanos (`/mnt` is read-only from the stick) — the host removes it.
 Measured on the Ryzen: `BootNext` needs no menu, `reboot` returns via the
 FADT reset register (SMI port `0xB2`), and the SP5100 TCO watchdog does
-*not* survive a reset (so constanos must arm it itself to recover from hangs).
+*not* survive a reset — so constanos arms it itself: in autorun mode only,
+right after `autorun::detect`, `kernel/src/watchdog.rs` (protocol in
+`hal::sp5100_tco`, Linux's `efch_mmio` layout, the one on this board) arms
+the FCH TCO for `TIMEOUT_SECS` (300) and never pings it. Measured: a job
+spinning forever came back to Linux ~300 s later with nobody at the machine,
+and Linux's `sp5100_tco` reported `bootstatus=32` (`WatchDogFired` survives
+the reset), which `metal-run.sh --collect` appends to the verdict.
+`/proc/kdebug` shows `watchdog: armed N s, M s left` (or `off`). Not covered:
+a kernel that dies before `fs::init`, i.e. before the watchdog is armed.
 
 **Host orchestrator: `scripts/metal-run.sh JOB.sh`** (build, deploy only if
 the kernel ELF changed, `sync-usb-data.sh`, job + nonce onto the stick,

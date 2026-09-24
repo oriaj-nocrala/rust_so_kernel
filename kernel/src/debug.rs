@@ -387,13 +387,17 @@ pub fn render_report() -> alloc::string::String {
         SPURIOUS_IRQS.load(Ordering::Relaxed),
         UNEXPECTED_IRQS.load(Ordering::Relaxed),
         LAST_UNEXPECTED_IRQ.load(Ordering::Relaxed) as i64,
-        match crate::fs::ext2::cache_stats() {
-            Some(c) => alloc::format!(
-                "ext2_cache: hits={} misses={} device_reads={} device_kib={} passthrough={}",
-                c.hits, c.misses, c.device_reads, c.device_sectors / 2, c.passthrough
-            ),
-            None => alloc::string::String::from("ext2_cache: (no ext2 mount)"),
-        },
+        alloc::format!(
+            "{}\n{}",
+            match crate::fs::ext2::cache_stats() {
+                Some(c) => alloc::format!(
+                    "ext2_cache: hits={} misses={} device_reads={} device_kib={} passthrough={}",
+                    c.hits, c.misses, c.device_reads, c.device_sectors / 2, c.passthrough
+                ),
+                None => alloc::string::String::from("ext2_cache: (no ext2 mount)"),
+            },
+            crate::watchdog::render(),
+        ),
         SCHEDULER_LOCK.render("scheduler"),
         RAMFS_ENTRIES_LOCK.render("ramfs_entries_lock"),
         TF_REWIND.render(),

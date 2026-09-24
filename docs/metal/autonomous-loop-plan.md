@@ -4,7 +4,8 @@
 > en la Ryzen, y el paso 4 (watchdog) respondido con logs: el TCO **no**
 > sobrevive al reset, así que la fase 4 hace falta. Fase 3 hecha (QEMU) y
 > fase 5 (`scripts/metal-run.sh`) hecha y con su primera ida y vuelta real
-> en la Ryzen (`OK`). Siguiente: fase 4 (driver del TCO). Ver "Resultados" al final. Es la
+> en la Ryzen (`OK`). Fase 4 (watchdog en constanos) hecha y medida en la
+> Ryzen: un job colgado vuelve solo a Linux a los ~300 s. Siguiente: fase 6. Ver "Resultados" al final. Es la
 > "etapa 0" de la dirección de largo plazo (un SO que un agente LLM pueda
 > observar, probar y mejorar; ver la memoria `self-improving-os-direction`).
 > No confundir con la etapa 0 de `docs/smp/smp-plan.md`.
@@ -306,3 +307,26 @@ veredicto. Lo único que falló fue el propio job: este busybox no acepta
 `head -3` (le falta `FEATURE_FANCY_HEAD`), hay que usar `head -n 3`. Desde
 entonces `--collect` muestra solo la salida de consola del job (las líneas
 `[fb]`); las trazas del kernel quedan en `boot.log`.
+
+**2026-09-24, fase 4 (driver del TCO), medida en la Ryzen:**
+- `hal::sp5100_tco` (protocolo de registros, 8 tests en host) +
+  `kernel/src/watchdog.rs` (busca el SMBus 0C/05, mapea las ventanas PM
+  `0xFED80300` y WDT `0xFEB00000` sin caché, arma a 300 s). Solo la variante
+  `efch_mmio` de Linux, la de esta placa (SMBus `1022:790b` rev `0x61`);
+  las demás se detectan y se informan como no implementadas. Solo en modo
+  autorun, justo después de `autorun::detect()`. Nadie lo alimenta.
+- Job de prueba: mostrar la cuenta, `sleep 5`, mostrarla otra vez,
+  `kdebug sync` y un bucle infinito. Resultado: `armed 300 s, 300 s left`
+  → `295 s left`; Linux se apagó a las 14:41:26, constanos hizo el `sync` a
+  las 14:41:45 y Linux volvió a arrancar a las 14:46:54, sin tocar nada.
+  `--collect`: `HANG last flush: sync (boot #21) [watchdog reset:
+  bootstatus=32]`.
+- **`bootstatus=32` distingue el reset del watchdog:** el bit `WatchDogFired`
+  sobrevive al reset y el driver de Linux lo lee al cargar. `--collect` lo
+  guarda y lo añade al veredicto.
+- Al arrancar constanos, `DECODEEN_WDT_TMREN` estaba a 0 (`decode enabled
+  here`): el reset borra también lo que Linux activó, igual que el timer.
+- En QEMU (sin FCH de AMD) el driver dice `no AMD FCH SMBus` y sigue;
+  `run-kernel-tests.sh` PASS, `boot-matrix.sh 4 2` 8/8.
+- Sigue sin cubrirse el tramo firmware → `fs::init`: un kernel que muere
+  antes de armar el watchdog no se rescata.

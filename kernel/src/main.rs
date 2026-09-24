@@ -46,6 +46,7 @@ mod test_framework;
 mod time;
 mod tty;
 mod usb;
+mod watchdog;
 
 use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};
 

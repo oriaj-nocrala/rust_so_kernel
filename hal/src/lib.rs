@@ -35,6 +35,7 @@ pub mod mouse;
 pub mod msc;
 pub mod pit;
 pub mod rtc;
+pub mod sp5100_tco;
 pub mod usb;
 pub mod xhci;
 
