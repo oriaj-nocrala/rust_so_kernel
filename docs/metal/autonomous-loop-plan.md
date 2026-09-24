@@ -2,7 +2,9 @@
 
 > **Estado (2026-09-24):** fase 1 cerrada y pasos 1-3 de la fase 2 medidos
 > en la Ryzen, y el paso 4 (watchdog) respondido con logs: el TCO **no**
-> sobrevive al reset, así que la fase 4 hace falta. Ver "Resultados" al final. Es la
+> sobrevive al reset, así que la fase 4 hace falta. Fase 3 hecha (QEMU) y
+> fase 5 (`scripts/metal-run.sh`) hecha y con su primera ida y vuelta real
+> en la Ryzen (`OK`). Siguiente: fase 4 (driver del TCO). Ver "Resultados" al final. Es la
 > "etapa 0" de la dirección de largo plazo (un SO que un agente LLM pueda
 > observar, probar y mejorar; ver la memoria `self-improving-os-direction`).
 > No confundir con la etapa 0 de `docs/smp/smp-plan.md`.
@@ -270,3 +272,37 @@ en ella. Hay dos niveles:
      host (8/8 fallos en paralelo, 0/8 tras el arreglo). Ahora
      `current_tf_ptr()` sale de la pila de kernel del proceso.
 - Estado de `wait` de este kernel: `0x200|code` / `0x400|sig<<24` (no Linux).
+
+**2026-09-24, fase 5 (`scripts/metal-run.sh`), verificada sin reiniciar:**
+- `metal-run.sh JOB.sh` / `--collect` / `--abort`, como en el diseño, más
+  `--no-deploy` y `--no-reboot`. El despliegue del kernel se salta solo si el
+  ELF tiene el mismo sha256 que en el último despliegue.
+- **Qué arranque es esta ejecución:** al programarla se guarda el número del
+  último arranque del log (`prev_boot_seq`); solo cuentan los arranques con
+  número mayor, y entre ellos el que imprime el nonce. Así un nonce viejo no
+  confunde, y un arranque nuevo que muere antes del job sale como `NO-JOB`
+  (veredicto nuevo) en vez de `NO-BOOT`.
+- **Permisos:** este usuario ya tiene `sudo` `NOPASSWD: ALL`, así que no hizo
+  falta ninguna regla nueva. El script usa `sudo -n` y falla al principio si
+  pidiera contraseña.
+- `sync-usb-data.sh` hace `rsync --delete`, así que tiene que ir **antes** de
+  escribir `autorun/` (si no, borra el job).
+- Probado en la Ryzen sin reiniciar: el job y el nonce llegan al pendrive,
+  un segundo intento se rechaza, `--collect` da `NO-BOOT`, borra `autorun/` y
+  archiva en `target/metal/runs/<nonce>/`. `e2fsck -fn` limpio tras cada
+  escritura.
+- Probado en QEMU de extremo a extremo (pendrives de `usb-log.sh mkimage` con
+  el job dentro, `-no-reboot`, tres en paralelo): `exit 0` → `OK`, `exit 3` →
+  `FAIL exit=3`, `kdebug panic` → `PANIC`; los logs guardados lo confirman.
+  `HANG`, `NO-JOB` y la selección por nonce, con logs derivados de esos.
+- En QEMU el reset lo hace `0xCF9` (la FADT de i440fx no trae `RESET_REG`).
+
+**2026-09-24, fase 5, primera ida y vuelta real en la Ryzen:** `metal-run.sh
+first-job.sh` (compilar, desplegar con la prueba en QEMU, sincronizar,
+`BootNext=0004`, reiniciar) → constanos ejecutó el job y volvió a Linux solo
+por el SMI (`0xB2 <- 0xBE`) → `--collect`: `OK exit=0 (boot #20)`, `autorun/`
+borrado, `BootNext` consumido. Nadie tocó la máquina. El log confirma el
+veredicto. Lo único que falló fue el propio job: este busybox no acepta
+`head -3` (le falta `FEATURE_FANCY_HEAD`), hay que usar `head -n 3`. Desde
+entonces `--collect` muestra solo la salida de consola del job (las líneas
+`[fb]`); las trazas del kernel quedan en `boot.log`.

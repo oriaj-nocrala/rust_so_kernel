@@ -757,6 +757,16 @@ Measured on the Ryzen: `BootNext` needs no menu, `reboot` returns via the
 FADT reset register (SMI port `0xB2`), and the SP5100 TCO watchdog does
 *not* survive a reset (so constanos must arm it itself to recover from hangs).
 
+**Host orchestrator: `scripts/metal-run.sh JOB.sh`** (build, deploy only if
+the kernel ELF changed, `sync-usb-data.sh`, job + nonce onto the stick,
+`BootNext` to the stick's entry found by `boot`'s PARTUUID, reboot), then
+`scripts/metal-run.sh --collect` back in Linux: verdict `OK`/`FAIL`/`PANIC`/
+`HANG`/`NO-JOB`/`NO-BOOT`, archived with the boot's log under
+`target/metal/runs/<nonce>/`; `--abort` undoes a run never booted. This run's
+boot is the one numbered above the log's last boot at deploy time that prints
+the nonce. `--no-reboot`/`--no-deploy` for dry runs; `--classify` is its
+classifier alone, for testing against `usb-log.sh read --all --image` output.
+
 **Testing jobs in QEMU:** put the job into a scratch copy of `disk.img` with
 `debugfs -w` (`mkdir /autorun`, `write job /autorun/job`, same for `nonce`)
 and boot it with `QEMU_DEBUG_DISK_IMG=<copy> QEMU_DEBUG_EXTRA_ARGS=-no-reboot`,
