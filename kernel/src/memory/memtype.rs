@@ -327,7 +327,6 @@ fn program_pat_inner() -> PatProgram {
 /// must not change the type of any entry a live mapping uses.
 unsafe fn write_pat_sdm_sequence(value: u64) {
     use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
-    use x86_64::instructions::tlb;
 
     #[inline(always)]
     unsafe fn wbinvd() {
@@ -347,14 +346,14 @@ unsafe fn write_pat_sdm_sequence(value: u64) {
         if pge {
             Cr4::write(cr4 - Cr4Flags::PAGE_GLOBAL);
         } else {
-            tlb::flush_all();
+            crate::memory::tlb::invalidate_all_this_cpu();
         }
 
         x86_64::registers::model_specific::Msr::new(IA32_PAT).write(value);
 
         wbinvd();
         // PGE is still clear here, so a CR3 reload flushes everything.
-        tlb::flush_all();
+        crate::memory::tlb::invalidate_all_this_cpu();
         Cr0::write(cr0);
         if pge {
             Cr4::write(cr4);
@@ -456,7 +455,7 @@ pub fn set_pat_index_range(virt: u64, len: u64, index: u8) -> Result<Retyped, Re
             // walked to, reached through the physical window; only its
             // caching bits change, so it maps the same frame as before.
             unsafe { core::ptr::write_volatile((offset + leaf.entry_phys) as *mut u64, new) };
-            x86_64::instructions::tlb::flush(VirtAddr::new(leaf.virt_base));
+            crate::memory::tlb::invalidate_kernel_page(VirtAddr::new(leaf.virt_base));
             v = leaf.virt_base + leaf.page_size;
         }
         // SAFETY: `wbinvd` writes back and invalidates caches; no memory

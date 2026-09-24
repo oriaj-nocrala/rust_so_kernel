@@ -63,7 +63,8 @@ where
         mapper
             .map_to(page, frame, flags, frame_allocator)
             .map_err(|_| "Failed to map user code page")?
-            .flush();
+            .ignore();
+        crate::memory::tlb::invalidate_page(page.start_address());
 
         // Copiar el código a esta página
         let dst = (phys_offset + frame.start_address().as_u64()).as_mut_ptr::<u8>();

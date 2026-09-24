@@ -55,7 +55,8 @@ where
         mapper
             .map_to(page, frame, flags, frame_allocator)
             .map_err(|_| "Failed to map user page")?
-            .flush();
+            .ignore();
+        crate::memory::tlb::invalidate_page(page.start_address());
     }
     
     crate::serial_println!("User pages mapped successfully");
@@ -76,7 +77,8 @@ pub unsafe fn unmap_user_pages(
             .unmap(page)
             .map_err(|_| "Failed to unmap user page")?
             .1
-            .flush();
+            .ignore();
+        crate::memory::tlb::invalidate_page(page.start_address());
     }
     
     Ok(())

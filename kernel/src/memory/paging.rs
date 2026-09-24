@@ -42,15 +42,17 @@ impl ActivePageTable {
         unsafe {
             self.mapper
                 .map_to(page, frame, flags, frame_allocator)?
-                .flush();
+                .ignore();
         }
+        crate::memory::tlb::invalidate_page(page.start_address());
         Ok(())
     }
     
     /// Unmapea una página
     pub fn unmap_page(&mut self, page: Page<Size4KiB>) -> Result<(), UnmapError> {
         let (_, flush) = self.mapper.unmap(page)?;
-        flush.flush();
+        flush.ignore();
+        crate::memory::tlb::invalidate_page(page.start_address());
         Ok(())
     }
 }

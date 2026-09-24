@@ -76,9 +76,12 @@ impl Driver for MouseDriver {
 // PACKET DECODE
 // ============================================================================
 
-/// In-progress 3-byte packet decoder. ISR-only writer (single IRQ line,
-/// never reentrant on one core), so a plain cell is enough — same trust
-/// model `keyboard.rs`'s `DecoderCell` uses.
+/// In-progress 3-byte packet decoder. Its only writer is the IRQ12 ISR,
+/// and one IRQ line is never delivered to two CPUs at once, so a plain
+/// cell is enough — even with SMP, as long as that stays true. A second
+/// writer (a USB mouse feeding PS/2-shaped packets, say) needs a lock
+/// here, exactly as `keyboard::DECODER` got one when the USB keyboard
+/// became its second writer.
 struct DecoderCell(UnsafeCell<hal::mouse::PacketDecoder>);
 unsafe impl Sync for DecoderCell {}
 

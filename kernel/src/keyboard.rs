@@ -10,18 +10,12 @@
 // transition into `RAW_KEY_EVENTS`, and routing each decoded char through
 // the tty line discipline (`tty::feed_input`) into `KEYBOARD_BUFFER`.
 //
-// process_scancode() is called from the keyboard ISR.
+// process_scancode() is called from the keyboard ISR and the USB poll.
 // read_key() is the non-blocking consumer API.
 
-use core::cell::UnsafeCell;
+use crate::allocator::KernelIrq;
 use crate::keyboard_buffer::KEYBOARD_BUFFER;
-
-/// The decoder's modifier state, touched only from the keyboard ISR (one
-/// IRQ line, never reentrant on one core) — same trust model the original
-/// `AtomicBool`s relied on, and the same one `mouse.rs`'s own `DecoderCell`
-/// uses for its ISR-only packet decoder state.
-struct DecoderCell(UnsafeCell<hal::keyboard::KeyDecoder>);
-unsafe impl Sync for DecoderCell {}
+use diag::IrqMutex;
 
 /// Open `/dev/input/event0` handles holding an `EVIOCGRAB`. While any do,
 /// key presses still produce evdev events (and Ctrl-C/Ctrl-\/Ctrl-Z still
@@ -42,18 +36,28 @@ pub fn ungrab() {
     GRABS.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
 }
 
-static DECODER: DecoderCell = DecoderCell(UnsafeCell::new(hal::keyboard::KeyDecoder::new()));
+/// The decoder's Shift/Ctrl/CapsLock/extended-prefix state. It has two
+/// writers: the PS/2 keyboard ISR (IRQ1) and the USB keyboard poll, which
+/// runs from the *timer* ISR (`usb::poll` → `process_scancode`). It used to
+/// be an `UnsafeCell` justified as "touched only from the keyboard ISR",
+/// which stopped being true the day the USB driver arrived; on one CPU the
+/// two ISRs still cannot overlap (each runs with IF=0), but that is `cli`
+/// doing the work of a lock, and with two CPUs IRQ1 and the tick can land
+/// on different ones. An `IrqMutex` makes the exclusion real and costs one
+/// uncontended atomic per scancode. The critical section is `process`
+/// alone — pure state-machine arithmetic, no allocation, no other lock —
+/// so the tty/signal work below runs outside it.
+static DECODER: IrqMutex<hal::keyboard::KeyDecoder, KernelIrq> =
+    IrqMutex::new(hal::keyboard::KeyDecoder::new());
 
 // ============================================================================
 // PUBLIC API
 // ============================================================================
 
-/// Called from the keyboard ISR with each raw scancode byte.
+/// Called with each raw Set-1 scancode byte, from the PS/2 keyboard ISR
+/// and from the USB keyboard poll (timer ISR).
 pub fn process_scancode(scancode: u8) {
-    // SAFETY: only ever called from the keyboard ISR, which never reentrs
-    // itself (single IRQ line, interrupts stay off for the ISR's duration).
-    let decoder = unsafe { &mut *DECODER.0.get() };
-    let out = decoder.process(scancode);
+    let out = DECODER.with(|decoder| decoder.process(scancode));
 
     // Raw press/release event — see `hal::keyboard::KeyOutput::raw`'s doc
     // comment: always emitted except for the bare 0xE0 prefix byte, before

@@ -263,7 +263,8 @@ impl OwnedPageTable {
 
         mapper
             .map_to(page, frame, flags, &mut buddy_alloc)?
-            .flush();
+            .ignore();
+        crate::memory::tlb::invalidate_page(page.start_address());
 
         Ok(frame)
     }
@@ -292,12 +293,13 @@ impl OwnedPageTable {
         mapper
             .map_to_with_table_flags(page, frame, flags, parent_flags, &mut buddy_alloc)
             .map_err(|_| "map_existing_frame: map_to failed")?
-            .flush();
+            .ignore();
+        crate::memory::tlb::invalidate_page(page.start_address());
         Ok(())
     }
 
     /// Update the flags of an already-mapped page without changing its physical frame.
-    /// Flushes the TLB entry via invlpg.
+    /// Invalidates the TLB entry through `memory::tlb`.
     /// Used for COW fork: mark parent's writable pages as read-only.
     pub unsafe fn update_page_flags(
         &self,
@@ -308,7 +310,8 @@ impl OwnedPageTable {
         mapper
             .update_flags(page, flags)
             .map_err(|_| "update_page_flags: failed")?
-            .flush();
+            .ignore();
+        crate::memory::tlb::invalidate_page(page.start_address());
         Ok(())
     }
 
@@ -328,14 +331,16 @@ impl OwnedPageTable {
         let (_, flush) = mapper
             .unmap(page)
             .map_err(|_| "unmap_and_remap: unmap failed")?;
-        flush.flush();
+        flush.ignore();
+        crate::memory::tlb::invalidate_page(page.start_address());
 
         // Remap with new frame; intermediate tables are reused.
         let mut buddy_alloc = BuddyFrameAllocator;
         mapper
             .map_to(page, new_frame, flags, &mut buddy_alloc)
             .map_err(|_| "unmap_and_remap: map_to failed")?
-            .flush();
+            .ignore();
+        crate::memory::tlb::invalidate_page(page.start_address());
 
         Ok(())
     }
@@ -358,7 +363,8 @@ impl OwnedPageTable {
         let (_, flush) = mapper
             .unmap(page)
             .map_err(|_| "unmap_page_and_free: unmap failed")?;
-        flush.flush();
+        flush.ignore();
+        crate::memory::tlb::invalidate_page(page.start_address());
 
         // Zero-frame is permanent — it has no refcount entry, never free it.
         if !crate::memory::cow::is_zero_frame(frame) {
@@ -402,7 +408,8 @@ impl OwnedPageTable {
             Ok(r) => r,
             Err(_) => return Ok(()),  // not mapped — nothing to free
         };
-        flush.flush();
+        flush.ignore();
+        crate::memory::tlb::invalidate_page(page.start_address());
         let event = buddy.deallocate(&crate::allocator::KernelPhysMap, frame.start_address(), 21);
         crate::allocator::log_phantom_event(event);
         Ok(())
@@ -678,9 +685,13 @@ unsafe fn split_physmap_2m(virt_addr: VirtAddr) -> Result<(), &'static str> {
         | (huge_flags & PageTableFlags::USER_ACCESSIBLE);
     pd_entry.set_frame(PhysFrame::containing_address(new_pt_phys), parent_flags);
 
-    // Cold, rare, structural change — a full flush is simpler and safer
-    // than invlpg-ing 512 individual addresses one at a time.
-    x86_64::instructions::tlb::flush_all();
+    // One `invlpg` anywhere inside the old 2 MiB page drops its TLB entry
+    // and the paging-structure-cache entries for it (SDM 4.10.4.1). This
+    // used to be a CR3 reload, which does *not* drop a GLOBAL entry — and
+    // the physmap's leaves can be GLOBAL. The stale entry mapped the same
+    // frames with the same attributes, so nothing broke; it just was not
+    // the invalidation it looked like.
+    crate::memory::tlb::invalidate_kernel_page(virt_addr);
 
     Ok(())
 }
@@ -729,7 +740,7 @@ pub unsafe fn unmap_kernel_guard_page(virt_addr: VirtAddr) -> Result<(), &'stati
     split_physmap_2m(virt_addr)?;
     let (pt, pt_idx) = walk_to_pt(virt_addr)?;
     pt[pt_idx].set_unused();
-    x86_64::instructions::tlb::flush(virt_addr);
+    crate::memory::tlb::invalidate_kernel_page(virt_addr);
     Ok(())
 }
 
@@ -762,6 +773,6 @@ pub unsafe fn remap_kernel_guard_page(virt_addr: VirtAddr) -> Result<(), &'stati
     let phys = PhysAddr::new(virt_addr.as_u64() - phys_offset.as_u64());
     pt[pt_idx].set_frame(PhysFrame::containing_address(phys), template_flags);
 
-    x86_64::instructions::tlb::flush(virt_addr);
+    crate::memory::tlb::invalidate_kernel_page(virt_addr);
     Ok(())
 }
