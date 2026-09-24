@@ -127,7 +127,7 @@ pub(super) fn sys_nanosleep(ns: u64) -> SyscallResult {
         }
 
         let pid = scheduler.current_pid().map(|p| p.0).unwrap_or(0);
-        serial_println!("[DBG] nanosleep PID {} for {} ns (expiry={})", pid, ns, expiry);
+        crate::ktrace!(crate::debug::SCHED, "nanosleep PID {} for {} ns (expiry={})", pid, ns, expiry);
 
         // Register the hrtimer.  QUEUE lock is acquired and released inside
         // start(); we still hold the scheduler lock, which is safe because

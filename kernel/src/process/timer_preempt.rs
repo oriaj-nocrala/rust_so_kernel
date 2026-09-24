@@ -195,7 +195,11 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> *const 
         let mut scheduler = super::scheduler::local_scheduler();
 
         for &pid in &wake_pids[..wake_count] {
-            crate::serial_println!("[ISR] hrtimer waking PID {}", pid);
+            // ktrace, not serial_println!: once per sleep (a game sleeps
+            // every frame) flooded the klog ring, and taking the SERIAL
+            // lock from the timer ISR can wait forever on the code it
+            // interrupted.
+            crate::ktrace!(crate::debug::SCHED, "hrtimer waking PID {}", pid);
             scheduler.wake(pid);
         }
 
