@@ -358,3 +358,18 @@ constanos (job `OK`, watchdog armado, 32 GiB de `MemTotal`) → Linux arriba a
 las 14:59:38 → autologin en tty1 → `metal-resume.sh` recogió (`OK exit=0 (boot
 #22)`), bajó `budget` de 3 a 2 y retomó esta misma sesión con el veredicto en el
 prompt. Nadie tocó la máquina entre el `systemctl reboot` y la sesión retomada.
+
+**2026-09-24, hueco del watchdog cerrado (715f588):** el TCO se arma en *todos*
+los arranques justo después del framebuffer (antes de ACPI/USB/almacenamiento)
+y `watchdog::settle` lo desarma tras `autorun::detect` si no hay job. Medido en
+la Ryzen:
+- Kernel con `CONSTANOS_TEST_HANG_BEFORE_FS=1` (se cuelga justo antes de
+  `fs::init`): Linux se apagó a las 15:05:48 y volvió a las 15:11:14 (5 min
+  26 s = 300 s + dos arranques de firmware). `--collect`: `NO-BOOT ...
+  [watchdog reset: bootstatus=32]`; ningún arranque nuevo en el log, como se
+  esperaba (la partición de log se reclama después de `/mnt`).
+- Kernel normal: `ARMED early ... count now 300` → `kept armed for the autorun
+  job, 299 s left` → `OK exit=0 (boot #23)`.
+- Ambas vueltas se retomaron solas (`budget` 2 → 0).
+- Pendiente de observar en metal: el desarmado en un arranque manual (sin job).
+  Cubierto por test en host; se ve en `/proc/kdebug` el próximo arranque a mano.

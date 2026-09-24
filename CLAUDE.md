@@ -758,12 +758,23 @@ FADT reset register (SMI port `0xB2`), and the SP5100 TCO watchdog does
 *not* survive a reset — so constanos arms it itself: in autorun mode only,
 right after `autorun::detect`, `kernel/src/watchdog.rs` (protocol in
 `hal::sp5100_tco`, Linux's `efch_mmio` layout, the one on this board) arms
-the FCH TCO for `TIMEOUT_SECS` (300) and never pings it. Measured: a job
+the FCH TCO for `TIMEOUT_SECS` (300) and never pings it — **armed on every
+boot**, right after the framebuffer setup (`watchdog::arm_early`, before
+ACPI/USB/storage), and disarmed by `watchdog::settle` after `autorun::detect`
+when there is no job, since whether a boot is unattended is only known once
+`/mnt` is mounted. Measured: a job
 spinning forever came back to Linux ~300 s later with nobody at the machine,
 and Linux's `sp5100_tco` reported `bootstatus=32` (`WatchDogFired` survives
 the reset), which `metal-run.sh --collect` appends to the verdict.
-`/proc/kdebug` shows `watchdog: armed N s, M s left` (or `off`). Not covered:
-a kernel that dies before `fs::init`, i.e. before the watchdog is armed.
+`/proc/kdebug` shows the watchdog's state and time left. Early-hang path
+measured too: a kernel built with `CONSTANOS_TEST_HANG_BEFORE_FS=1` (build-time
+hook, spins right before `fs::init`; the QEMU boot test in
+`deploy-usb-boot.sh` fails on it by design, so deploy it with `--no-test`)
+came back 5 min 26 s later as `NO-BOOT [watchdog reset: bootstatus=32]` — no
+log slot, the log partition being claimed after `/mnt`. Only
+firmware → bootloader → the first steps of `init::boot` remain uncovered. The
+disarm path (a manual boot, no job) is host-tested but not yet observed on
+metal: check `/proc/kdebug` on the next manual boot.
 
 **Host orchestrator: `scripts/metal-run.sh JOB.sh`** (build, deploy only if
 the kernel ELF changed, `sync-usb-data.sh`, job + nonce onto the stick,
