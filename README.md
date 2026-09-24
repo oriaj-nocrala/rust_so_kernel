@@ -14,6 +14,10 @@ Un kernel de sistema operativo x86_64 escrito en Rust desde cero, con multitarea
 
 *Y también corre Quake — motor de software rendering real, de punta a punta. Ver la sección de abajo.*
 
+![cmatrix corriendo en ConstanOS — lluvia de caracteres verdes sobre fondo negro en la consola del framebuffer](docs/cmatrix-screenshot.png)
+
+*`cmatrix` — el `cmatrix.c` de upstream sin tocar, sobre el port propio de ncurses, dibujado por la consola de texto del framebuffer.*
+
 ## 📋 Descripción
 
 Empezó como un proyecto de aprendizaje ("SO2") para explorar desarrollo de sistemas operativos en Rust, y creció hasta tener un scheduler preemptivo real, syscalls compatibles con la ABI de Linux, fork con copy-on-write, un loader de ELF, y un port de libc que permite compilar y correr programas en C sin modificaciones (más allá del target).

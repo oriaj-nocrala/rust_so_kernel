@@ -148,6 +148,18 @@ fn ansi_color(idx: u8, bright: bool) -> Color {
     if bright { ANSI_BRIGHT[i] } else { ANSI_COLORS[i] }
 }
 
+/// Palette entry 0 is a dark grey only so that black *text* stays visible on
+/// the black screen. As a background it has to be real black: programs that
+/// ask for `ESC[40m` (cmatrix, ncurses apps with a black pair) mean "the
+/// screen colour", and got a grey slab instead.
+fn ansi_bg(idx: u8) -> Color {
+    if idx & 7 == 0 { DEFAULT_BG } else { ansi_color(idx, false) }
+}
+
+fn color256_bg(n: u8) -> Color {
+    if n == 0 { DEFAULT_BG } else { color256(n) }
+}
+
 fn color256(n: u8) -> Color {
     match n {
         0..=7   => ANSI_COLORS[n as usize],
@@ -408,10 +420,10 @@ fn apply_sgr(params: &[u32], state: &mut FbState) {
                 }
             }
             39 => state.fg = DEFAULT_FG,
-            40..=47 => state.bg = ansi_color((params[i] - 40) as u8, false),
+            40..=47 => state.bg = ansi_bg((params[i] - 40) as u8),
             48 => {
                 if i + 2 < params.len() && params[i + 1] == 5 {
-                    state.bg = color256(params[i + 2] as u8);
+                    state.bg = color256_bg(params[i + 2] as u8);
                     i += 2;
                 } else if i + 4 < params.len() && params[i + 1] == 2 {
                     state.bg = Color::rgb(
