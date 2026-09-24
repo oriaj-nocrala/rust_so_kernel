@@ -15,9 +15,10 @@
 // Order, and why:
 //   1. The FADT's RESET_REG — the firmware's own statement of how this
 //      machine resets. Linux's default first choice too.
-//   2. Port 0xCF9 (the PCH/FCH reset control register) — what RESET_REG
-//      almost always points at on a PC anyway, including AMD's FCH; covers
-//      firmware that forgets to set RESET_REG_SUP.
+//      Not necessarily a chipset register: the AM4/Ryzen target's points at
+//      the SMI command port (0xB2 <- 0xBE), handing the reset to firmware.
+//   2. Port 0xCF9 (the PCH/FCH reset control register) — covers firmware
+//      that does not set RESET_REG_SUP, or whose RESET_REG does nothing.
 //   3. The 8042's pulse-reset command (0xFE) — only if a controller
 //      answers; the target Ryzen has none, and writing to an unanswered
 //      port is merely useless, but skipping it keeps the log honest.
@@ -56,6 +57,18 @@ fn prepare(what: &str) {
     }
 }
 
+/// Logs which method is about to be tried and gets that line onto the
+/// stick *before* trying it. A method that works leaves no chance to write
+/// anything afterwards, so the last `trying` line in the stick's log is the
+/// one that reset the machine — the only way to learn that on hardware
+/// with no serial capture. Incremental, so each costs a couple of sectors.
+/// Failures are ignored: `prepare` already reported whether the stick
+/// works.
+fn announce(args: core::fmt::Arguments) {
+    serial_println!("reboot: trying {}", args);
+    let _ = crate::block::logpart::flush(hal::logpart::Reason::Reboot);
+}
+
 /// Resets the machine. Never returns.
 pub fn restart() -> ! {
     prepare("restart");
@@ -65,15 +78,15 @@ pub fn restart() -> ! {
     if let Some(reg) = crate::acpi::reset_reg() {
         match reg.space {
             ResetSpace::Io(port) => {
-                serial_println!("reboot: ACPI reset register (port {:#x} <- {:#04x})", port, reg.value);
+                announce(format_args!("the ACPI reset register (port {:#x} <- {:#04x})", port, reg.value));
                 X86PortIo.outb(port, reg.value);
                 io_delay_us(METHOD_WAIT_US);
             }
             ResetSpace::PciConfig { device, function, offset } => {
-                serial_println!(
-                    "reboot: ACPI reset register (pci 00:{:02x}.{} +{:#x} <- {:#04x})",
+                announce(format_args!(
+                    "the ACPI reset register (pci 00:{:02x}.{} +{:#x} <- {:#04x})",
                     device, function, offset, reg.value
-                );
+                ));
                 crate::pci::config_write8(device, function, offset, reg.value);
                 io_delay_us(METHOD_WAIT_US);
             }
@@ -89,7 +102,7 @@ pub fn restart() -> ! {
     // reset (bit 1) first, then set the reset bit (bit 2) with "full
     // reset" (bit 3) so the platform power-cycles rather than doing a CPU-
     // only warm reset.
-    serial_println!("reboot: trying port 0xCF9");
+    announce(format_args!("port 0xCF9"));
     let cf9 = X86PortIo.inb(0xCF9) & !0x06;
     X86PortIo.outb(0xCF9, cf9 | 0x02);
     io_delay_us(50);
@@ -97,7 +110,7 @@ pub fn restart() -> ! {
     io_delay_us(METHOD_WAIT_US);
 
     if hal::i8042::controller_present(&X86PortIo) {
-        serial_println!("reboot: trying the 8042 pulse-reset");
+        announce(format_args!("the 8042 pulse-reset"));
         // Wait (bounded) for the input buffer to drain before the command.
         for _ in 0..10_000 {
             if X86PortIo.inb(0x64) & 0x02 == 0 {
@@ -109,7 +122,7 @@ pub fn restart() -> ! {
         io_delay_us(METHOD_WAIT_US);
     }
 
-    serial_println!("reboot: every reset method failed — forcing a triple fault");
+    announce(format_args!("a triple fault (every other reset method failed)"));
     triple_fault()
 }
 
