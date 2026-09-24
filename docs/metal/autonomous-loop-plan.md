@@ -251,3 +251,22 @@ en ella. Hay dos niveles:
 - **Conclusión:** el reset o el firmware desarman el TCO. Armarlo desde Linux
   no sirve; la fase 4 (driver en constanos) hace falta. El driver de Linux
   usa MMIO `0xfeb00000` en esta placa.
+
+**2026-09-24, fase 3 (autorun) hecha y verificada en QEMU:**
+- `kernel/src/autorun.rs` (flag, detectado tras `fs::init`), panic handler →
+  `reboot::restart_from_panic()` en modo autorun, PID 1 con
+  `METAL-BEGIN`/`METAL-DONE <nonce> exit=N|signal=N` + `reboot`.
+- Probado: job normal (`exit=3` sale como `exit=3`), `kdebug panic` en un job
+  → reset y QEMU termina (`-no-reboot`), 8 tests de userspace como jobs,
+  `run-kernel-tests.sh` PASS, `boot-matrix.sh 4 3` 12/12.
+- **El primer job encontró dos bugs reales del kernel**, invisibles en uso
+  interactivo:
+  1. `kill_and_switch_tf` no restauraba `fs_base`: el proceso siguiente
+     corría con el TLS del que murió (`ash` fallaba en `get_current_tcb`).
+     `sys_fork` copiaba además un `fs_base` desfasado.
+  2. `CURRENT_SYSCALL_TF` era un global: una syscall desalojada con IF=1 leía
+     al volver el marco de *otro* proceso, y le entregaba SIGCHLD escribiendo
+     el marco de señal sobre la pila viva del padre. Solo con carga en el
+     host (8/8 fallos en paralelo, 0/8 tras el arreglo). Ahora
+     `current_tf_ptr()` sale de la pila de kernel del proceso.
+- Estado de `wait` de este kernel: `0x200|code` / `0x400|sig<<24` (no Linux).

@@ -48,42 +48,118 @@ fn install_busybox_symlinks() {
     }
 }
 
+/// Unattended bare-metal run (docs/metal/autonomous-loop-plan.md, phase 3).
+/// The host leaves a script at `/mnt/autorun/job` (plus a one-line
+/// `/mnt/autorun/nonce` naming this run) and boots into us. The markers are
+/// what the host classifies the run by, reading them back off the stick's
+/// log partition: `METAL-BEGIN` alone means the job never finished (hang or
+/// panic); `METAL-DONE` carries its exit status. The nonce is what tells the
+/// host the log it found is *this* run's and not a previous boot's.
+///
+/// Returns only if there is no job, or `reboot` failed — then boot carries
+/// on into `ash` as usual. The job is never deleted here (`/mnt` is
+/// read-only on the stick); the host removes it after collecting.
+fn run_autorun_job() {
+    const JOB: &[u8] = b"/mnt/autorun/job\0";
+    if syscall::stat(JOB).is_err() {
+        return;
+    }
+
+    let mut nonce_buf = [0u8; 64];
+    let nonce = read_nonce(&mut nonce_buf);
+
+    println!("METAL-BEGIN {}", nonce);
+    // Get the marker onto the stick now: if the job hangs the machine, the
+    // periodic flush may never run again (and a spinning job starves it).
+    syscall::sync();
+
+    let pid = syscall::fork();
+    if pid == 0 {
+        let argv: [&[u8]; 3] = [b"busybox\0", b"ash\0", JOB];
+        syscall::exec_argv(b"/bin/busybox\0", &argv, &ENVP);
+        println!("init: exec of the autorun job failed");
+        syscall::exit(127);
+    } else if pid < 0 {
+        println!("METAL-DONE {} fork-failed={}", nonce, pid);
+    } else {
+        // This kernel's wait-status encoding, not Linux's — see
+        // `Process::wait_status_word` and mlibc-port's `abi-bits/wait.h`.
+        let (_, status) = syscall::waitpid_status(pid);
+        if status & 0x400 != 0 {
+            println!("METAL-DONE {} signal={}", nonce, (status >> 24) & 0xff);
+        } else if status & 0x200 != 0 {
+            println!("METAL-DONE {} exit={}", nonce, status & 0xff);
+        } else {
+            println!("METAL-DONE {} status={:#x}", nonce, status);
+        }
+    }
+
+    // reboot(2) flushes the log to the stick itself before resetting.
+    let r = syscall::reboot();
+    println!("init: autorun reboot failed ({}), starting ash", r);
+}
+
+/// First whitespace-delimited word of `/mnt/autorun/nonce`, or `"none"`.
+fn read_nonce(buf: &mut [u8; 64]) -> &str {
+    let fd = syscall::open(b"/mnt/autorun/nonce\0", 0);
+    if fd < 0 {
+        return "none";
+    }
+    let n = syscall::read(fd as i32, buf);
+    syscall::close(fd as i32);
+    if n <= 0 {
+        return "none";
+    }
+    let bytes = &buf[..n as usize];
+    let end = bytes
+        .iter()
+        .position(|b| b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    match core::str::from_utf8(&bytes[..end]) {
+        Ok(s) if !s.is_empty() => s,
+        _ => "none",
+    }
+}
+
+/// Environment for `ash` and for autorun jobs.
+/// /mnt/bin holds the userspace programs that were moved off the
+/// kernel binary onto the ext2 disk image (doom, quake, and most
+/// of the old C test programs — see kernel/build.rs's module doc
+/// comment and CLAUDE.md's Userspace Programs section). Listed
+/// last: /tmp/bin (busybox applet symlinks) and /bin (initramfs)
+/// should win on any name collision, same as before.
+/// HISTFILE on /mnt (ext2, disk.img) rather than /tmp (ramfs) —
+/// disk.img is the one mount that survives across `cargo run`
+/// invocations (see CLAUDE.md's ensure_ext2_disk_image), so
+/// command history actually persists across reboots instead of
+/// resetting every boot the way anything under /tmp would.
+/// TERM=linux matches this kernel's own framebuffer console
+/// (dispatch_csi in kernel/src/drivers/framebuffer_console.rs
+/// implements a "linux"-console-compatible subset of ANSI/SGR)
+/// and the terminfo entry actually shipped at
+/// /mnt/usr/share/terminfo/l/linux (scripts/build-terminfo.sh).
+/// Without this, any curses program (cmatrix, and anything
+/// else built against libncursesw.a later) inherits no $TERM
+/// at all and setupterm() fails with "Error opening terminal:
+/// unknown." — exported here so every program launched from
+/// ash gets it for free instead of needing `TERM=linux` typed
+/// by hand every time.
+const ENVP: [&[u8]; 3] = [
+    b"PATH=/tmp/bin:/bin:/mnt/bin\0",
+    b"HISTFILE=/mnt/.ash_history\0",
+    b"TERM=linux\0",
+];
+
 #[no_mangle]
 extern "C" fn _start() -> ! {
     install_busybox_symlinks();
+    run_autorun_job();
 
     loop {
         let pid = syscall::fork();
         if pid == 0 {
             let argv: [&[u8]; 2] = [b"busybox\0", b"ash\0"];
-            // /mnt/bin holds the userspace programs that were moved off the
-            // kernel binary onto the ext2 disk image (doom, quake, and most
-            // of the old C test programs — see kernel/build.rs's module doc
-            // comment and CLAUDE.md's Userspace Programs section). Listed
-            // last: /tmp/bin (busybox applet symlinks) and /bin (initramfs)
-            // should win on any name collision, same as before.
-            // HISTFILE on /mnt (ext2, disk.img) rather than /tmp (ramfs) —
-            // disk.img is the one mount that survives across `cargo run`
-            // invocations (see CLAUDE.md's ensure_ext2_disk_image), so
-            // command history actually persists across reboots instead of
-            // resetting every boot the way anything under /tmp would.
-            // TERM=linux matches this kernel's own framebuffer console
-            // (dispatch_csi in kernel/src/drivers/framebuffer_console.rs
-            // implements a "linux"-console-compatible subset of ANSI/SGR)
-            // and the terminfo entry actually shipped at
-            // /mnt/usr/share/terminfo/l/linux (scripts/build-terminfo.sh).
-            // Without this, any curses program (cmatrix, and anything
-            // else built against libncursesw.a later) inherits no $TERM
-            // at all and setupterm() fails with "Error opening terminal:
-            // unknown." — exported here so every program launched from
-            // ash gets it for free instead of needing `TERM=linux` typed
-            // by hand every time.
-            let envp: [&[u8]; 3] = [
-                b"PATH=/tmp/bin:/bin:/mnt/bin\0",
-                b"HISTFILE=/mnt/.ash_history\0",
-                b"TERM=linux\0",
-            ];
-            syscall::exec_argv(b"/bin/busybox\0", &argv, &envp);
+            syscall::exec_argv(b"/bin/busybox\0", &argv, &ENVP);
             // Only reached if exec failed.
             println!("init: exec /bin/busybox failed");
             syscall::exit(1);

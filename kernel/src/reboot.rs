@@ -74,7 +74,26 @@ pub fn restart() -> ! {
     prepare("restart");
     crate::kalert!("Reiniciando...");
     x86_64::instructions::interrupts::disable();
+    reset(announce)
+}
 
+/// `restart` for the panic handler (`autorun` mode): no `prepare`, no
+/// `kalert!`, no flush per method — each takes a lock the panicking code
+/// may hold, and the handler has already flushed the log itself
+/// (`logpart::on_panic`). Announces through the lock-free raw serial path,
+/// so the method that worked is still in the ring, just not on the stick.
+pub fn restart_from_panic() -> ! {
+    x86_64::instructions::interrupts::disable();
+    reset(announce_raw)
+}
+
+fn announce_raw(args: core::fmt::Arguments) {
+    crate::serial_println_raw!("reboot: trying {}", args);
+}
+
+/// Tries every reset method in order, reporting each through `announce`
+/// before trying it. Interrupts must already be off.
+fn reset(announce: fn(core::fmt::Arguments)) -> ! {
     if let Some(reg) = crate::acpi::reset_reg() {
         match reg.space {
             ResetSpace::Io(port) => {
@@ -93,7 +112,7 @@ pub fn restart() -> ! {
             // Not mapped anywhere this early-ending path could rely on;
             // 0xCF9 below is what firmware puts here in practice.
             ResetSpace::Memory(addr) => {
-                serial_println!("reboot: ACPI reset register in memory space ({:#x}) — skipped", addr);
+                crate::serial_println_raw!("reboot: ACPI reset register in memory space ({:#x}) — skipped", addr);
             }
         }
     }

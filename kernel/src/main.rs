@@ -15,6 +15,7 @@ extern crate alloc;
 mod ac97;
 mod acpi;
 mod allocator;
+mod autorun;
 mod block;
 mod cpu;
 mod debug;

@@ -135,6 +135,7 @@ const SYS_UPTIME_SEC: u64 = 401;
 const SYS_MEMINFO_KB: u64 = 402;
 const SYS_KDEBUG_CTL: u64 = 403;
 const SYS_REBOOT: u64 = 169;
+const SYS_SYNC: u64 = 162;
 const SYS_MKDIR: u64 = 83;
 const SYS_UNLINK: u64 = 87;
 const SYS_SYMLINK: u64 = 88;
@@ -357,6 +358,16 @@ pub fn waitpid(child_pid: i64) -> i64 {
     // kernel later wrote through — crashing on Rust's alignment/non-null
     // UB check the moment that garbage wasn't a valid aligned address.
     unsafe { syscall3(SYS_WAITPID, child_pid as u64, 0, 0) }
+}
+
+/// `waitpid` that also returns the child's raw wait status — this kernel's
+/// encoding, not Linux's: `0x200 | code` for an exit, `0x400 | sig << 24`
+/// for a kill (`Process::wait_status_word`, mlibc-port's `abi-bits/wait.h`).
+/// Returns `(waitpid's return value, status)`.
+pub fn waitpid_status(child_pid: i64) -> (i64, i32) {
+    let mut status: i32 = 0;
+    let r = unsafe { syscall3(SYS_WAITPID, child_pid as u64, &mut status as *mut i32 as u64, 0) };
+    (r, status)
 }
 
 /// Sends `sig` to `pid`. Only single-pid targets (no process groups).
@@ -605,6 +616,12 @@ pub fn with_cstr<R>(s: &str, f: impl FnOnce(&[u8]) -> R) -> R {
 }
 
 // ── Power ────────────────────────────────────────────────────────────────
+
+/// `sync(2)`: here, copies the kernel log ring to the USB stick's log
+/// partition (ext2 writes are already synchronous). Returns 0 or -errno.
+pub fn sync() -> i64 {
+    unsafe { syscall0(SYS_SYNC) }
+}
 
 /// `reboot(LINUX_REBOOT_CMD_RESTART)` with Linux's magic numbers. Only
 /// returns on failure (negative errno).

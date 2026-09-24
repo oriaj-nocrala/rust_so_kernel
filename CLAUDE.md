@@ -741,6 +741,29 @@ machine's own Linux after a reboot, prints it. `list` shows every boot kept.
   the same before and after a boot. Works on metal too: four Ryzen boots
   so far, with periodic, sync and panic flushes all read back.
 
+## Unattended Bare-Metal Runs (`kernel/src/autorun.rs`, `userspace/src/bin/shell.rs`, `docs/metal/autonomous-loop-plan.md`)
+
+Linux on the target machine can run a job on constanos and read the result
+back with nobody at the keyboard: it drops a script at `/mnt/autorun/job`
+(plus a one-line `/mnt/autorun/nonce`) on the stick's data partition,
+`efibootmgr --bootnext`s into the stick, and reads `constanos-log` after the
+machine comes back. PID 1 prints `METAL-BEGIN <nonce>`, `sync`s, runs the job
+with `ash`, prints `METAL-DONE <nonce> exit=N|signal=N`, and `reboot(2)`s.
+The kernel's half (`autorun::detect`, right after `fs::init`) is one flag: in
+autorun mode the panic handler resets after `logpart::on_panic` instead of
+halting (`reboot::restart_from_panic`, lock-free). The job is never deleted
+by constanos (`/mnt` is read-only from the stick) — the host removes it.
+Measured on the Ryzen: `BootNext` needs no menu, `reboot` returns via the
+FADT reset register (SMI port `0xB2`), and the SP5100 TCO watchdog does
+*not* survive a reset (so constanos must arm it itself to recover from hangs).
+
+**Testing jobs in QEMU:** put the job into a scratch copy of `disk.img` with
+`debugfs -w` (`mkdir /autorun`, `write job /autorun/job`, same for `nonce`)
+and boot it with `QEMU_DEBUG_DISK_IMG=<copy> QEMU_DEBUG_EXTRA_ARGS=-no-reboot`,
+so the job's final reset ends QEMU instead of re-running it. Keep
+`QEMU_DEBUG_STATE_DIR` short: the monitor socket path must be under 108 bytes.
+Timing bugs here showed up only under host load — run several in parallel.
+
 ## Kernel Log Ring + the No-Input Escape Hatch (`kernel/src/klog.rs`, `/proc/dmesg`)
 
 `klog` keeps every byte `serial_println!`/`serial_println_raw!` emits in a

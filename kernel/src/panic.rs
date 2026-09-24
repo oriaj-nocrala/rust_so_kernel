@@ -44,7 +44,7 @@ fn panic(info: &PanicInfo) -> ! {
         None => {
             crate::serial_println_raw!("  (framebuffer locked — skipping panic screen)");
             crate::block::logpart::on_panic();
-            loop { unsafe { core::arch::asm!("hlt"); } }
+            park()
         }
     };
 
@@ -82,7 +82,24 @@ fn panic(info: &PanicInfo) -> ! {
     // time out and the screen must not wait on it. Best-effort, never
     // blocks — see `block::logpart::on_panic`.
     crate::block::logpart::on_panic();
-    
+    park()
+}
+
+/// Where every panic ends. Normally a halt, leaving the panic screen up for
+/// whoever is at the machine. In an unattended run (`autorun`) nobody is,
+/// and a halted machine would stay in constanos until someone pressed
+/// reset — so after a pause long enough to read the screen if someone
+/// happens to be there, reset back to the host (the log is already on the
+/// stick: `on_panic` ran first).
+fn park() -> ! {
+    if crate::autorun::enabled() {
+        crate::serial_println_raw!("  autorun: resetting in 5 s");
+        // ~1 µs per POST-port write; interrupts are off, so no clock.
+        for _ in 0..5_000_000u32 {
+            unsafe { x86_64::instructions::port::Port::<u8>::new(0x80).write(0) };
+        }
+        crate::reboot::restart_from_panic();
+    }
     loop {
         unsafe { core::arch::asm!("hlt"); }
     }
