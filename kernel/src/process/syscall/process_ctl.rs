@@ -277,7 +277,11 @@ pub(super) fn sys_fork() -> SyscallResult {
                 tf_copy.rax = 0;
 
                 match unsafe { proc.address_space.fork() } {
-                    Ok(child_as) => (child_as, proc.pid, proc.fs_base, proc.files.lock().clone(), tf_copy, proc.cwd.clone(), proc.pgid, proc.exe_name.clone()),
+                    // FS base from the MSR, not `proc.fs_base`: that field is
+                    // only refreshed when the parent is switched out, so it is
+                    // stale if `arch_prctl` ran since — same reasoning as the
+                    // live `fpu::save` above.
+                    Ok(child_as) => (child_as, proc.pid, crate::process::scheduler::read_fs_base(), proc.files.lock().clone(), tf_copy, proc.cwd.clone(), proc.pgid, proc.exe_name.clone()),
                     Err(e) => {
                         serial_println!("fork: address_space.fork() failed: {}", e);
                         return errno::ENOMEM;

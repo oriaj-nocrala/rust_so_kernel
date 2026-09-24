@@ -92,7 +92,7 @@ impl Drop for TrackedSchedulerGuard {
 const IA32_FS_BASE: u32 = 0xC000_0100;
 
 #[inline(always)]
-fn read_fs_base() -> u64 {
+pub(crate) fn read_fs_base() -> u64 {
     let lo: u32;
     let hi: u32;
     unsafe {
@@ -587,6 +587,12 @@ impl Scheduler {
                 proc.address_space.activate();
             }
             super::tss::set_kernel_stack(proc.kernel_stack);
+            // The live FS base still belongs to the process just killed:
+            // without this the next one runs on the dead process's TLS
+            // pointer — 0 after a child that never set one, which faulted
+            // `ash` in mlibc's `get_current_tcb` the moment a script's
+            // external command exited (found by the first autorun job).
+            write_fs_base(proc.fs_base);
             unsafe { super::fpu::restore(&proc.fpu_state); }
 
             self.core.start_slice(proc.effective_priority);
@@ -1034,6 +1040,7 @@ impl Scheduler {
             unsafe {
                 proc.address_space.activate();
             }
+            write_fs_base(proc.fs_base);
             unsafe { super::fpu::restore(&proc.fpu_state); }
 
             self.core.start_slice(proc.effective_priority);
