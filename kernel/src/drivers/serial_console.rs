@@ -32,6 +32,11 @@ impl FileHandle for SerialConsole {
         Ok(n)
     }
 
+    /// COM1, and the `klog` ring too — so what a program writes here
+    /// reaches `/proc/dmesg` and the USB log partition, which on the
+    /// serial-less target machine are the only places it can be read.
+    /// It used to go to the port alone: correct in QEMU, silently lost on
+    /// metal.
     fn write(&mut self, buf: &[u8]) -> FileResult<usize> {
         use x86_64::instructions::port::Port;
 
@@ -41,6 +46,7 @@ impl FileHandle for SerialConsole {
                 port.write(byte);
             }
         }
+        crate::klog::push(buf);
 
         Ok(buf.len())
     }

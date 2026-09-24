@@ -787,7 +787,9 @@ pub(super) fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32) -
         return errno::EINVAL;
     }
     with_current_process(|proc| {
-        match proc.address_space.sys_mmap_anon(addr, length, prot) {
+        let r = proc.address_space.sys_mmap_anon(addr, length, prot);
+        crate::ktrace!(crate::debug::MM, "mmap pid={:?} addr={:#x} len={:#x} -> {:?}", proc.pid, addr, length, r);
+        match r {
             Ok(vaddr) => vaddr as i64,
             Err(_)    => errno::ENOMEM,
         }
@@ -800,7 +802,9 @@ pub(super) fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32) -
 /// Requires exact match on addr and length (no partial unmap).
 pub(super) fn sys_munmap(addr: u64, length: u64) -> SyscallResult {
     with_current_process(|proc| {
-        match unsafe { proc.address_space.sys_munmap(addr, length) } {
+        let r = unsafe { proc.address_space.sys_munmap(addr, length) };
+        crate::ktrace!(crate::debug::MM, "munmap pid={:?} addr={:#x} len={:#x} -> {:?}", proc.pid, addr, length, r);
+        match r {
             Ok(())  => 0,
             Err(_)  => errno::EINVAL,
         }

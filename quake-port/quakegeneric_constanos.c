@@ -58,6 +58,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 // Same custom, this-kernel-only ioctl request code as the DOOM port (see
 // sys_ioctl's FBIO_BLIT handling, kernel/src/process/syscall/fs.rs).
@@ -206,6 +207,27 @@ static void pump_input(void)
 void QG_Init(void)
 {
     s_fbFd = open("/dev/fb", O_WRONLY);
+
+    // From here on the screen is Quake's. Its console chatter (Sys_Printf:
+    // "PackFile: ...", "You got the shells", ...) goes to stdout, which is
+    // /dev/fb's text console — and the kernel console answers the first
+    // text write after an FBIO_BLIT with a full-screen clear (FB_RAW_DIRTY,
+    // kernel/src/drivers/framebuffer_console.rs), so every message was a
+    // black flash plus text over the game. Send stdout to /dev/console
+    // instead: serial and the kernel log (/proc/dmesg, the USB log
+    // partition), not the screen. stderr stays on the screen, and
+    // scripts/build-quake.sh makes Sys_Error write there, so a fatal error
+    // is still visible.
+    // Clear the text console once while stdout still points at it, so the
+    // letterbox around the game isn't left showing the shell and boot log.
+    fputs("\033[2J", stdout);
+    int con = open("/dev/console", O_WRONLY);
+    if (con >= 0) {
+        fflush(stdout);
+        dup2(con, 1);
+        close(con);
+        setvbuf(stdout, NULL, _IOLBF, 0);
+    }
     s_kbdFd = open("/dev/input/event0", O_RDONLY);
     s_mouseFd = open("/dev/input/event1", O_RDONLY);
 

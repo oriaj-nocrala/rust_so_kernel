@@ -80,6 +80,93 @@ PYEOF
     echo "build-quake: patched quakegeneric.c's heap to 64 MiB"
 fi
 
+# ── Patch quakegeneric.c's hunk out of malloc and into .bss ─────────────
+#
+# QuakeC strings are 32-bit `int` offsets from `pr_strings` (inside the
+# hunk), and the engine stores C strings that live elsewhere the same way:
+# `sv.worldmodel->name - pr_strings` (mod_known, .bss), `pr_string_temp -
+# pr_strings` (.bss), and so on. That only works while everything is within
+# 2 GiB of the hunk — true on the 32-bit DOS/Win32 Quake this code was
+# written for, false here: `malloc` of 64 MiB is an mmap at
+# USER_MMAP_BASE (0x4000_0000_0000), 64 TiB above the binary. The offset
+# truncates, and the first QuakeC string compare on it faults at
+# `0x4000_0000_0000 | <low 32 bits of the .bss address>`. Demos never
+# showed it (playback runs no server and no QuakeC); Single Player -> New
+# Game died in `strcmp` under `ED_LoadFromFile` (2026-09-23).
+#
+# A static hunk sits in .bss next to every other string the engine hands
+# to QuakeC, so all offsets fit in an int again — the layout the engine
+# assumes, rather than a patch at each of the `- pr_strings` sites.
+if ! grep -q "qg_hunk" quakegeneric/source/quakegeneric.c; then
+    python3 - "$REPO_ROOT/quakegeneric/source/quakegeneric.c" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+
+old = "\tparms.membase = malloc (parms.memsize);\n"
+new = ("\t{\n"
+       "\t\t/* In .bss, within 2 GiB of every string the engine hands to QuakeC\n"
+       "\t\t   as an int offset from pr_strings -- see scripts/build-quake.sh. */\n"
+       "\t\tstatic unsigned char qg_hunk[64*1024*1024];\n"
+       "\t\tparms.membase = qg_hunk;\n"
+       "\t}\n")
+
+if old not in content:
+    print("error: quakegeneric.c's QG_Create doesn't have the expected "
+          "'parms.membase = malloc (parms.memsize);' line (upstream "
+          "quakegeneric changed) -- scripts/build-quake.sh's static-hunk "
+          "patch needs updating", file=sys.stderr)
+    sys.exit(1)
+
+content = content.replace(old, new, 1)
+with open(path, "w") as f:
+    f.write(content)
+PYEOF
+    echo "build-quake: moved quakegeneric.c's hunk into .bss"
+fi
+
+# ── Patch sys_null.c's Sys_Error to print on stderr ────────────────────
+#
+# quake-port/quakegeneric_constanos.c points stdout at /dev/console once
+# the game owns the screen (console chatter drawn over the game made the
+# kernel console clear the whole screen on every message). Sys_Error must
+# still reach the screen — it is the only thing a failed run leaves behind
+# on the serial-less target machine — so it goes to stderr, which stays on
+# /dev/fb.
+if ! grep -q 'fprintf (stderr, "Sys_Error: ")' quakegeneric/source/sys_null.c; then
+    python3 - "$REPO_ROOT/quakegeneric/source/sys_null.c" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+
+old = ('\tprintf ("Sys_Error: ");   \n'
+       '\tva_start (argptr,error);\n'
+       '\tvprintf (error,argptr);\n'
+       '\tva_end (argptr);\n'
+       '\tprintf ("\\n");\n')
+new = ('\tfprintf (stderr, "Sys_Error: ");\n'
+       '\tva_start (argptr,error);\n'
+       '\tvfprintf (stderr, error, argptr);\n'
+       '\tva_end (argptr);\n'
+       '\tfprintf (stderr, "\\n");\n')
+
+if old not in content:
+    print("error: sys_null.c's Sys_Error doesn't have the expected body "
+          "(upstream quakegeneric changed) -- scripts/build-quake.sh's "
+          "Sys_Error-to-stderr patch needs updating", file=sys.stderr)
+    sys.exit(1)
+
+content = content.replace(old, new, 1)
+with open(path, "w") as f:
+    f.write(content)
+PYEOF
+    echo "build-quake: Sys_Error now prints on stderr"
+fi
+
 for tool in clang llvm-ar; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "error: required build tool '$tool' not found in PATH." >&2
