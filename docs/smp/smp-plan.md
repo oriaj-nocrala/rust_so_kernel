@@ -209,10 +209,8 @@ teclado PS/2 y USB funcionan, DOOM mantiene su velocidad (el tick sigue a
 Verificado: `boot-matrix 4 5` = 20/20, `run-kernel-tests` PASS, `hal` 272
 tests; teclado PS/2 y USB (`QEMU_DEBUG_NO_PS2=1 QEMU_USB_KBD=1`), 8G,
 `timer_ticks` ≈ 100/s (523 en 5,26 s), y la ruta de respaldo al 8259 con
-`-cpu max,-apic`. IRQ12 llega por el I/O APIC (bytes vistos en el
-decodificador con gdb), pero `/dev/input/event1` no entrega eventos en
-QEMU — **igual con el PIC**: el decodificador arranca desfasado un byte y
-descarta todos los paquetes. Bug previo, aparte de esta etapa. Pendiente:
+`-cpu max,-apic`, y el ratón PS/2 por IRQ12 (`mouse-move`/`mouse-button`
+del monitor → `cat /dev/input/event1 | wc -c` da los bytes exactos). Pendiente:
 la Ryzen (`/proc/kdebug`: `irq_controller`, `timer_ticks`, teclado USB).
 
 Esto además abre la puerta a MSI para el xHCI (dejar de sondear el USB a

@@ -91,9 +91,23 @@ pub fn process_byte(byte: u8) {
     // SAFETY: only ever called from the IRQ12 ISR, which never reentrs
     // itself.
     let decoder = unsafe { &mut *DECODER.0.get() };
-    if let Some(ev) = decoder.push_byte(byte) {
+    let before = decoder.resyncs();
+    // TSC uptime: calibrated long before IRQ12 is unmasked-and-live.
+    if let Some(ev) = decoder.push_byte_at(byte, crate::cpu::tsc::uptime_ms()) {
         MOUSE_EVENTS.push(ev);
     }
+    if decoder.resyncs() != before {
+        RESYNCS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Partial packets the decoder discarded to get back into step (see
+/// `hal::mouse::RESYNC_GAP_MS`). Mirrored out of the decoder so
+/// `/proc/kdebug` can read it without touching the ISR's cell.
+static RESYNCS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn resyncs() -> usize {
+    RESYNCS.load(Ordering::Relaxed)
 }
 
 // ============================================================================

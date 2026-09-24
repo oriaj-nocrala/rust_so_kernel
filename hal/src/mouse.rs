@@ -19,7 +19,7 @@
 //!
 //! Neither piece logs or touches a global — the kernel adapter
 //! (`kernel/src/mouse.rs`) owns the `spin`-free ISR-safe static, the
-//! `pic::enable_irq` calls, and every `serial_println!`.
+//! `interrupts::enable_isa_irq` call, and every `serial_println!`.
 
 use crate::PortIo;
 
@@ -42,11 +42,47 @@ pub struct MouseEvent {
 pub struct PacketDecoder {
     bytes: [u8; 3],
     index: usize,
+    /// When the previous byte arrived (`push_byte_at`'s clock).
+    last_ms: u64,
+    /// Partial packets discarded by the idle-gap rule.
+    resyncs: u32,
 }
+
+/// A partial packet older than this is discarded: the next byte starts a
+/// new packet. Linux's psmouse uses the same half second.
+///
+/// The bit-3 guard alone cannot recover from a lost or extra byte: once the
+/// count is shifted onto a byte that also has bit 3 set — a motion byte
+/// like `0x0A`, or a stray `0xFA` ACK — every later packet is assembled
+/// shifted, forever (either decoded as garbage or dropped as "overflow").
+/// Bytes of one packet arrive about a millisecond apart and a mouse that
+/// stops moving stops sending, so a long silence is a packet boundary.
+/// The margin is wide on purpose: the timestamp is taken when the ISR
+/// runs, not when the byte arrived, and a stretch with interrupts off must
+/// not split a real packet.
+pub const RESYNC_GAP_MS: u64 = 500;
 
 impl PacketDecoder {
     pub const fn new() -> Self {
-        PacketDecoder { bytes: [0; 3], index: 0 }
+        PacketDecoder { bytes: [0; 3], index: 0, last_ms: 0, resyncs: 0 }
+    }
+
+    /// How many partial packets the idle-gap rule has discarded.
+    pub const fn resyncs(&self) -> u32 {
+        self.resyncs
+    }
+
+    /// [`push_byte`](Self::push_byte) with the arrival time in
+    /// milliseconds (any monotonic clock): a partial packet followed by
+    /// more than [`RESYNC_GAP_MS`] of silence is discarded first, which is
+    /// what brings a desynchronised stream back into step.
+    pub fn push_byte_at(&mut self, byte: u8, now_ms: u64) -> Option<MouseEvent> {
+        if self.index > 0 && now_ms.saturating_sub(self.last_ms) > RESYNC_GAP_MS {
+            self.index = 0;
+            self.resyncs = self.resyncs.wrapping_add(1);
+        }
+        self.last_ms = now_ms;
+        self.push_byte(byte)
     }
 
     /// Feeds one raw byte from the auxiliary device. Reproduces
@@ -279,6 +315,86 @@ mod tests {
         assert_eq!(d.push_byte(0), None);
         let ev = d.push_byte(0).unwrap();
         assert_eq!(ev.buttons, 0b111);
+    }
+
+    /// The failure the gap rule exists for: one lost byte, and the next
+    /// start lands on a motion byte that happens to have bit 3 set. With
+    /// QEMU's `mouse_move 10 5` packets (`28 0A FB`) the shifted frames
+    /// `0A FB 28` decode as garbage and `FB 28 0A` drop as overflow — for
+    /// as long as the stream lasts.
+    #[test]
+    fn a_shifted_stream_stays_shifted_without_a_gap() {
+        let mut d = PacketDecoder::new();
+        let mut t = 0;
+        // Lost the leading 0x28 of the first packet.
+        for &b in &[0x0A, 0xFB] {
+            assert_eq!(d.push_byte_at(b, t), None);
+            t += 1;
+        }
+        let mut good = 0;
+        for _ in 0..10 {
+            for &b in &[0x28, 0x0A, 0xFB] {
+                if d.push_byte_at(b, t) == Some(MouseEvent { dx: 10, dy: -5, buttons: 0 }) {
+                    good += 1;
+                }
+                t += 1;
+            }
+        }
+        assert_eq!(good, 0);
+        assert_eq!(d.resyncs(), 0);
+    }
+
+    #[test]
+    fn a_gap_discards_the_partial_packet_and_resyncs() {
+        let mut d = PacketDecoder::new();
+        // Shifted as above, then the mouse stops: the stranded byte sits in
+        // the decoder until motion resumes after a pause.
+        for (i, &b) in [0x0A, 0xFB, 0x28, 0x0A, 0xFB, 0x28, 0x0A].iter().enumerate() {
+            d.push_byte_at(b, i as u64);
+        }
+        assert_eq!(d.index, 1);
+        let t = 6 + RESYNC_GAP_MS + 1;
+        assert_eq!(d.push_byte_at(0x28, t), None);
+        assert_eq!(d.push_byte_at(0x0A, t + 1), None);
+        assert_eq!(d.push_byte_at(0xFB, t + 2), Some(MouseEvent { dx: 10, dy: -5, buttons: 0 }));
+        assert_eq!(d.resyncs(), 1);
+    }
+
+    #[test]
+    fn a_stray_ack_is_dropped_at_the_next_pause() {
+        // A stray 0xFA (an ACK, bit 3 set) ahead of the first packet.
+        let mut d = PacketDecoder::new();
+        d.push_byte_at(0xFA, 0);
+        let t = RESYNC_GAP_MS + 1;
+        d.push_byte_at(0x28, t);
+        d.push_byte_at(0x0A, t + 1);
+        assert_eq!(d.push_byte_at(0xFB, t + 2), Some(MouseEvent { dx: 10, dy: -5, buttons: 0 }));
+    }
+
+    #[test]
+    fn slow_bytes_within_the_gap_stay_one_packet() {
+        let mut d = PacketDecoder::new();
+        // Interrupts held off for a while between bytes of one packet.
+        d.push_byte_at(0x28, 1000);
+        d.push_byte_at(0x0A, 1000 + RESYNC_GAP_MS);
+        assert_eq!(
+            d.push_byte_at(0xFB, 1000 + 2 * RESYNC_GAP_MS),
+            Some(MouseEvent { dx: 10, dy: -5, buttons: 0 })
+        );
+        assert_eq!(d.resyncs(), 0);
+    }
+
+    #[test]
+    fn a_gap_between_whole_packets_is_not_a_resync() {
+        let mut d = PacketDecoder::new();
+        for &b in &[0x28, 0x0A, 0xFB] {
+            d.push_byte_at(b, 0);
+        }
+        for &b in &[0x28, 0x0A] {
+            d.push_byte_at(b, 10_000);
+        }
+        assert_eq!(d.push_byte_at(0xFB, 10_000), Some(MouseEvent { dx: 10, dy: -5, buttons: 0 }));
+        assert_eq!(d.resyncs(), 0);
     }
 
     // ── 8042 enable sequence ─────────────────────────────────────────────

@@ -366,6 +366,7 @@ pub fn render_report() -> alloc::string::String {
          usb_keyboards: {}\n\
          usb_key_reports: {}\n\
          usb_keys_dropped: {}\n\
+         mouse_resyncs: {}\n\
          spurious_irqs: {}\n\
          unexpected_irqs: {} (last line {})\n\
          irq_controller: {}\n\
@@ -386,6 +387,7 @@ pub fn render_report() -> alloc::string::String {
         crate::usb::keyboard_count(),
         USB_KEY_REPORTS.load(Ordering::Relaxed),
         USB_KEYS_DROPPED.load(Ordering::Relaxed),
+        crate::mouse::resyncs(),
         SPURIOUS_IRQS.load(Ordering::Relaxed),
         UNEXPECTED_IRQS.load(Ordering::Relaxed),
         LAST_UNEXPECTED_IRQ.load(Ordering::Relaxed) as i64,
