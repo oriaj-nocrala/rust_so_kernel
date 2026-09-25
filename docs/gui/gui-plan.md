@@ -1,7 +1,8 @@
 # Plan: una GUI (memoria compartida → compositor → terminal con ventana)
 
 > **Estado (2026-09-25):** fase 1 hecha y verificada en QEMU y en la Ryzen
-> (ver su registro al final). Fases 2 y 3 sin empezar.
+> (ver su registro al final). Fase 2: 2.1 hecho y verificado en QEMU; 2.2-2.5
+> pendientes. Fase 3 sin empezar.
 
 ## Por qué ahora, y por qué así
 
@@ -190,41 +191,182 @@ Sellos de memfd (`F_ADD_SEALS`: Wayland los usa, pero no los exige),
 
 ---
 
-## Fase 2: el compositor (esbozo, a detallar al cerrar la fase 1)
+## Fase 2: el compositor
 
-Un programa de userspace en Rust (`userspace/src/bin/compositor.rs` o un
-crate propio) que:
+Un programa de userspace en Rust (`userspace/src/bin/compositor.rs`) que
+es el **único** que dibuja en la pantalla y lee la entrada mientras corre.
+Acepta clientes en un socket AF_UNIX (`/tmp/gui-0`, el análogo de
+`wayland-0`), recibe sus búferes como `memfd` por `SCM_RIGHTS`, compone y
+les manda la entrada de la ventana con foco.
 
-- es el **único** que abre `/dev/fb` y los `event*`;
-- acepta clientes en un socket AF_UNIX (`/tmp/gui-0`, el análogo de
-  `wayland-0`);
-- por cliente: `create_surface`, `attach(buffer_fd, w, h, stride)` vía
-  `SCM_RIGHTS`, `damage(rect)`, `commit`; y hacia el cliente: eventos de
-  entrada de la ventana con foco, y `frame_done` para regular el ritmo;
-- compone en su propio búfer y lo lleva a la pantalla.
+### Decisiones (tomadas con el usuario, 2026-09-25)
 
-**Decisión abierta: cómo llega el compositor a la pantalla.**
+- **Pantalla: `mmap` de la copia en RAM** (la opción (a) del esbozo), no
+  un `ioctl` que copie desde un memfd. El compositor compone directamente
+  en la copia en RAM y pide el volcado a VRAM con un `ioctl`. Así no hay
+  una copia de más por cuadro, y la regla "solo `Framebuffer::flush` toca
+  la VRAM" se mantiene.
+- **Rust**, con la lógica en un crate nuevo `gui/` testeable en el host,
+  como `usock` o `sched`. Encaja con la fase 3, que reutiliza la fuente
+  Noto (crate de Rust) y el parser ANSI.
 
-- **(a) `mmap` de `/dev/fb` que mapea la copia en RAM** (no la VRAM) más
-  un `ioctl(FBIO_FLUSH, rect)` que llama a `Framebuffer::flush`. Sin
-  copias extra, y la regla "solo `flush` toca la VRAM" se mantiene. Pero
-  la consola del kernel dibuja en esa misma copia, así que hace falta un
-  modo "gráfico" (el `KD_GRAPHICS` de Linux) en el que la consola deja de
-  dibujar mientras el compositor tiene `/dev/fb` abierto.
-- **(b) Un `ioctl` que copia un rectángulo de un memfd a la pantalla**
-  (un `FBIO_BLIT` con daño). Es más simple, pero añade una copia por
-  cuadro.
+### 2.1 Kernel: `/dev/fb0`, modo gráfico y `mmap` de la copia en RAM
 
-La (a) encaja mejor con lo que ya existe; la (b) es el camino rápido para
-una primera versión. En los dos casos, `kalert!` y la pantalla de pánico
-tienen que seguir viéndose con el compositor activo.
+**Un dispositivo aparte, `/dev/fb0`**, distinto de `/dev/fb`, que es la
+consola de texto: ash escribe ahí por sus fds 1 y 2. Se abre en
+exclusiva (un segundo `open` da `EBUSY`), y **tenerlo abierto es el modo
+gráfico**, el `KD_GRAPHICS` de Linux. El modo acaba en el `Drop` del
+último handle, igual que `EVIOCGRAB`. Por eso un compositor que muere,
+incluso con `SIGKILL`, devuelve la pantalla a la consola sin que nadie
+tenga que acordarse. `dup`/`fork` comparten un `Arc` interno, y el modo
+acaba cuando cae la última referencia.
 
-Los búferes van siempre como `memfd` por `SCM_RIGHTS`, que crea el
-cliente: el protocolo nunca pasa punteros ni direcciones, y un cliente
-que muere solo suelta su referencia al objeto.
+En modo gráfico:
 
-**Probar en QEMU:** `scripts/qemu-debug.sh` ya tiene `screendump` y
-`mouse-move`.
+- **La consola no dibuja.** `render_bytes` deja de pintar, aunque sigue
+  duplicando a serie y a `klog`, y el parpadeo del cursor (ISR) se
+  detiene. Lo que ash escriba mientras tanto no se ve, igual que en
+  Linux con `KD_GRAPHICS`. Al salir del modo, la pantalla se limpia y el
+  cursor vuelve arriba (el mecanismo de `FB_RAW_DIRTY`).
+- **`kalert!` y la pantalla de pánico siguen dibujando.** `kalert!`
+  pinta encima y el compositor lo tapa al repintar esa zona; el pánico
+  se queda, porque nadie repinta después.
+- **`FBIO_BLIT` sobre `/dev/fb` da `EBUSY`.** Si DOOM, en modo consola,
+  pintara encima del compositor, rompería lo que este cree que hay en
+  pantalla.
+
+**`mmap(fd de /dev/fb0, MAP_SHARED)`** mapea las páginas de la copia en
+RAM y **reutiliza la fase 1 entera**. La copia se envuelve una vez en un
+`ShmObject` *fijado* (`ShmObject::pinned(frames)`), construido con los
+frames que ya tiene y guardado en un `static`. El objeto nunca muere, así
+que tiene siempre su referencia sobre cada frame: `munmap` y la muerte
+del proceso hacen `dec_ref` por la vía normal y nunca llegan a 0.
+`set_size` da `EBUSY` sobre un objeto fijado. Así no hay un
+`VmaKind::Device` nuevo, ni un camino de fallo nuevo, ni caso especial en
+`fork`. Dos condiciones:
+
+- la copia es un bloque contiguo del Buddy dentro de la ventana de
+  memoria física (asignación grande del slab); hay que comprobarlo al
+  construirla, no suponerlo;
+- empieza `SHADOW_SKEW` bytes dentro de su asignación, así que el objeto
+  cubre desde la página que contiene el primer byte y
+  `FBIO_GET_INFO` dice el desplazamiento. Las páginas de los extremos
+  son de la misma asignación, llena de ceros: no se expone memoria de
+  nadie más.
+
+**`ioctl`s de `/dev/fb0`** (números propios, `0x4642_00xx`, como
+`FBIO_BLIT`):
+
+| Petición | Argumento | Hace |
+|---|---|---|
+| `FBIO_GET_INFO` | `{width, height, stride_px, bpp, offset, map_len}` | Geometría, y dónde empieza el píxel (0,0) dentro del `mmap` |
+| `FBIO_FLUSH` | `{n, rects: [{x,y,w,h}; ≤16]}` | `Framebuffer::touched` + `flush` de cada rectángulo, recortado a la pantalla |
+
+Sin copia en RAM (la asignación falló y la consola está en modo directo),
+`open("/dev/fb0")` da `ENODEV`. `/proc/fbinfo` gana una línea
+`mode: text|graphics (pid N)`.
+
+**Tests:** `userspace/c/fb0_test.c` en el disco (C, porque mlibc ya
+tiene `mmap`/`ioctl`). Comprueba el segundo `open` con `EBUSY`, `FBIO_BLIT`
+con `EBUSY`, que `mmap` + dibujar + `FBIO_FLUSH` dejan en la pantalla lo
+esperado (con `screendump` en QEMU, píxel a píxel) y que la consola
+vuelve tras `close`, tras `exit` y tras `SIGKILL`. Un `hw_tests` para el
+`ShmObject` fijado: `munmap` de todos los mapeos y la muerte de un
+proceso no liberan sus frames.
+
+### 2.2 Kernel: `poll` real sobre `/dev/input/event*`
+
+Hoy `fd_check_ready` (`syscall/poll.rs`) trata todo dispositivo como
+siempre listo. Un compositor que espere a sus clientes y a la entrada con
+un `poll` se quedaría girando al 100 %. Hace falta:
+
+- readiness real, que diga si el anillo del teclado o del ratón tiene
+  eventos (o un `SYN` pendiente de ese handle);
+- despertar desde los productores, con el patrón de
+  `poll_wakeup_for_fd0`: el ISR del teclado, el del ratón PS/2 y el
+  sondeo USB (CPU 0, en el tick);
+- lo mismo para `epoll`.
+
+Los mismos mecanismos que stdin: registrarse y bloquearse bajo el lock
+del planificador, y volver a comprobar tras registrarse (regla SMP
+"comprobar y dormir es un solo paso"). Test: `poll_test` gana un caso de
+`poll` sobre `event1` despertado por `qemu-debug.sh mouse-move`.
+
+### 2.3 Userspace: lo que le falta al crate `userspace`
+
+- **Un allocator global** (`#[global_allocator]`) sobre `mmap` anónimo:
+  listas libres por tamaño y bloques grandes directos a `mmap`/`munmap`.
+  Hasta ahora ningún programa de Rust usaba el heap.
+- **Wrappers:** `memfd_create`, `ftruncate`, `mmap` general
+  (`MAP_SHARED`, fd, offset), `ioctl`, `sendmsg`/`recvmsg` con
+  `SCM_RIGHTS` y `epoll`.
+
+### 2.4 El crate `gui/` (host, `cd gui && cargo test`)
+
+`no_std` + `alloc`, sin syscalls. Como `usock`, **nada bloquea y los
+efectos vuelven como datos**: mensajes que enviar, rectángulos que volcar
+y fds que cerrar. Tres módulos:
+
+- **`wire`**: el formato de Wayland tal cual. Cada mensaje es
+  `[object_id: u32][size << 16 | opcode: u32][args…]`, alineado a 4, y los
+  fds van aparte, en el orden de sus argumentos. Codificar y decodificar,
+  con los mensajes partidos entre lecturas.
+- **`region`**: rectángulos, recorte, unión y resta, lo que hace falta
+  para calcular el daño y quitar lo tapado.
+- **`compositor`**: el estado. Clientes, objetos por cliente, superficies
+  con estado *pendiente* y *actual* (el `commit` de Wayland aplica el
+  pendiente de golpe), orden Z, foco, puntero, y `compose(damage, dst)`
+  sobre un `&mut [u32]` genérico. Así los tests de host componen en un
+  `Vec` y comprueban píxeles.
+
+**El protocolo** (propio y mínimo, con los nombres de Wayland; objeto 1 =
+el compositor):
+
+| Objeto | Peticiones | Eventos |
+|---|---|---|
+| compositor | `create_pool(id, fd, size)`, `create_surface(id)`, `sync(id)` | `error(obj, code)`, `delete_id(id)` |
+| pool (un memfd) | `create_buffer(id, offset, w, h, stride, format)`, `destroy` | — |
+| buffer | `destroy` | `release` |
+| surface | `attach(buffer)`, `damage(x,y,w,h)`, `frame(id)`, `commit`, `set_title(str)`, `destroy` | `configure(w,h)`, `focus(in)`, `key(code, state)`, `motion(x,y)`, `button(code, state)` |
+| callback | — | `done(ms)` |
+
+Es la unión de `wl_compositor`, `wl_shm`, `wl_surface`, `xdg_toplevel` y
+`wl_seat` en pocos objetos. Portar `libwayland` más adelante supondría
+separarlos, no cambiar de modelo. Formato único: `XRGB8888`. El
+compositor mapea cada pool una vez. Un pool que el cliente encoge no
+puede romperlo, porque `ftruncate` con mapeos da `EBUSY` desde la fase 1.
+Un `offset + stride*h` fuera del pool es un `error` que desconecta al
+cliente, nunca una lectura fuera de límites.
+
+**Composición y ritmo:** en `commit`, el compositor copia el daño de la
+superficie a la pantalla, junto con lo que haya debajo y encima, y manda
+`release` del búfer enseguida, porque ya lo ha copiado. `frame(id)` se
+responde con `done` tras el siguiente volcado, como mucho a 60 Hz. No
+hay vsync que esperar.
+
+### 2.5 El compositor y un cliente de prueba
+
+- `compositor`: abre `/dev/fb0` y `event0`/`event1` (con `EVIOCGRAB`,
+  descartando lo que el anillo tenga de antes), escucha en `/tmp/gui-0` y
+  espera a todo con `epoll`. Ventanas en cascada, una barra de título
+  lisa (el texto llega con la fuente, en la fase 3), clic para foco y
+  subir, arrastrar por la barra y cursor dibujado por software.
+  **Ctrl+Alt+Retroceso lo cierra**: con el teclado capturado, es la única
+  salida sin un segundo terminal.
+- `gui_demo`: una ventana con un degradado animado que pide `frame` en
+  cada cuadro y registra teclas y clics en su propia salida.
+- **Prueba de extremo a extremo en QEMU** con `screendump`: el fondo, la
+  ventana en su sitio, que se mueva al arrastrarla con `mouse-move`, y la
+  consola de vuelta tras Ctrl+Alt+Retroceso.
+- Medir: tiempo de composición y volcado por cuadro en `/proc/fbinfo`
+  (`OpStat`) y fallos de página del primer toque a un búfer de 1080p.
+
+### Fuera de alcance (fase 2)
+
+Varios monitores, cambio de modo, vsync, transparencia (todo opaco),
+redimensionar ventanas desde el compositor, portapapeles, arrastrar y
+soltar, cursores de cliente, `libwayland` real y clientes en C (DOOM en
+ventana va después).
 
 ## Fase 3: primer cliente, un terminal con ventana
 
@@ -291,3 +433,43 @@ ciclos) y `pipe_cow_test`, `fork_exec_test`, `lifecycle_test`,
 `socket_test` y `pthread_test` en 0; `sched: invariants=ok`. El anillo
 del log dio la vuelta y se perdieron las líneas de los casos 1-9, pero
 el recuento final de fallos los cubre.
+
+### Fase 2.1 (2026-09-25)
+
+Hecho como se planeó, con estas diferencias y hallazgos:
+
+- **Abrir un dispositivo puede fallar.** `DeviceEntry::open` devuelve
+  `Result<_, Errno>`: `/dev/fb0` necesita `EBUSY` y `ENODEV`, y hasta ahora
+  todo dispositivo abría siempre. `vfs::Errno` gana `ENODEV`.
+- **En modo gráfico, `render_bytes` solo pinta para `kalert!`**, sin
+  borrar la pantalla ni dibujar el cursor. Si al entrar se hubiera
+  marcado `FB_RAW_DIRTY`, el primer `kalert!` habría borrado el cuadro
+  del compositor.
+- **El test de "no libera los frames" es de userspace, no un `hw_tests`.**
+  Mapear las ~1000 páginas, tocarlas y desmapear (tres veces, y un hijo
+  que muere con ellas mapeadas) deja `MemFree` igual al kB. Si el
+  `ShmObject` fijado no retuviera su referencia, subiría en el tamaño de
+  la pantalla (4 MB en QEMU).
+- **De paso: `pause(34)` y `getppid(110)`.** mlibc no tenía la sysdep de
+  `pause()`, y el `__ensure` de sysdep ausente *vuelve*, así que
+  `for (;;) pause();` giraba imprimiéndolo. Ahora es un `rt_sigsuspend`
+  con la máscara actual, dentro del kernel. `getppid()` devolvía siempre
+  1: el caso nuevo de `sigsuspend_test` que prueba `pause` hizo
+  `kill(getppid(), SIGUSR1)` y la señal le llegó a init.
+- **Limitación conocida, a la vista:** `kill` no despierta a un proceso
+  bloqueado en `nanosleep`, pipes o futex (sí en `sigsuspend`/`pause`).
+  Un `SIGKILL` a un proceso dentro de `sleep(100)` tarda esos 100 s.
+  Linux interrumpe esas esperas con señales fatales. Está documentado en
+  `sys_kill` como compromiso aceptado; no se ha tocado aquí.
+
+**Verificado en QEMU:** `fb0_test` 16/16. Con `screendump`, el fondo, el
+cuadrado rojo (volcado de pantalla completa) y el verde (volcado por su
+propio rectángulo) salen exactos píxel a píxel, a 1280x800. Después, la
+consola vuelve al cerrar, al salir y tras `SIGKILL`. `sigsuspend_test`
+6/6 (casos E y F nuevos). Con `-smp 4 -m 8G`: `fb0_test`,
+`sigsuspend_test`, `shm_test`, `lifecycle_test`, `pipe_cow_test`,
+`pipe_multi_test`, `fork_exec_test`, `socket_test`, `mlibc_signal_test`,
+`pthread_test` y `fpu_test` en 0. `run-kernel-tests.sh` PASS,
+`boot-matrix.sh 4 5` con 4 CPUs y 8 GiB 20/20, `cd vfs && cargo test`
+165/165. **Falta la Ryzen**, donde la copia en RAM es de 1920x1080 con
+stride 2048 y la VRAM es WC.

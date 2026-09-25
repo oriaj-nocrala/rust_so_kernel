@@ -249,6 +249,39 @@ pub fn mark_raw_dirty() {
     FB_RAW_DIRTY.store(true, Ordering::SeqCst);
 }
 
+/// Graphics mode (Linux's `KD_GRAPHICS`): someone holds `/dev/fb0` and
+/// the screen is theirs. The console keeps parsing what processes write
+/// to `/dev/fb` (and mirroring it to serial and `klog`) but draws none of
+/// it, and the cursor stops blinking. `kalert!` still draws — a process
+/// death must stay visible — and whoever owns the screen paints over it.
+static GRAPHICS: AtomicBool = AtomicBool::new(false);
+
+pub fn in_graphics_mode() -> bool {
+    GRAPHICS.load(Ordering::SeqCst)
+}
+
+/// `/dev/fb0` was opened. Whatever cursor was on screen is about to be
+/// painted over, so the console forgets it.
+pub fn enter_graphics_mode() {
+    GRAPHICS.store(true, Ordering::SeqCst);
+    CURSOR_DRAWN.store(false, Ordering::Relaxed);
+}
+
+/// The last `/dev/fb0` handle is gone. The console has no copy of the text
+/// the graphics client covered, so it starts over on a clear screen, as it
+/// does after a raw blit — now rather than at the next write, so a
+/// compositor that dies in the background does not leave its last frame
+/// up.
+pub fn leave_graphics_mode() {
+    GRAPHICS.store(false, Ordering::SeqCst);
+    FB_RAW_DIRTY.store(true, Ordering::SeqCst);
+    let mut state = FB_STATE.lock();
+    let mut fb_guard = FRAMEBUFFER.lock();
+    if let Some(fb) = fb_guard.as_mut() {
+        render_bytes(&mut state, fb, b"");
+    }
+}
+
 // ── Blinking text cursor ──────────────────────────────────────────────────────
 //
 // Renders as an inverse-video block over the current cell, toggled by
@@ -289,10 +322,11 @@ fn undraw_cursor_locked(state: &FbState, fb: &mut Framebuffer) {
 /// the whole strategy — missing an occasional 10ms tick just delays the
 /// next blink phase slightly, which is invisible to a human.
 pub fn tick_cursor_blink() {
-    // A raw-blit client (DOOM/Quake) owns the screen; any cursor state
-    // from before it started pointed at pixels that are long gone, and
-    // inverting "the same" rectangle now would just corrupt its frame.
-    if FB_RAW_DIRTY.load(Ordering::SeqCst) {
+    // A raw-blit client (DOOM/Quake) or a graphics-mode one (`/dev/fb0`)
+    // owns the screen; any cursor state from before it started pointed at
+    // pixels that are long gone, and inverting "the same" rectangle now
+    // would just corrupt its frame.
+    if FB_RAW_DIRTY.load(Ordering::SeqCst) || GRAPHICS.load(Ordering::SeqCst) {
         CURSOR_DRAWN.store(false, Ordering::Relaxed);
         return;
     }
@@ -602,7 +636,10 @@ fn render_bytes(state: &mut FbState, fb: &mut Framebuffer, buf: &[u8]) {
 
 fn render_bytes_inner(state: &mut FbState, fb: &mut Framebuffer, buf: &[u8]) {
     let t0 = crate::cpu::tsc::read();
-    if FB_RAW_DIRTY.load(Ordering::SeqCst) {
+    // Only `kalert!` renders in graphics mode: no cursor to undraw or to
+    // leave behind, and no clearing the graphics client's screen.
+    let graphics = GRAPHICS.load(Ordering::SeqCst);
+    if FB_RAW_DIRTY.load(Ordering::SeqCst) || graphics {
         // Screen already belongs to (or was just handed back from) a
         // raw-blit client — whatever the flag was tracking is stale.
         CURSOR_DRAWN.store(false, Ordering::Relaxed);
@@ -610,7 +647,7 @@ fn render_bytes_inner(state: &mut FbState, fb: &mut Framebuffer, buf: &[u8]) {
         undraw_cursor_locked(state, fb);
     }
 
-    if FB_RAW_DIRTY.swap(false, Ordering::SeqCst) {
+    if !graphics && FB_RAW_DIRTY.swap(false, Ordering::SeqCst) {
         fb.clear(DEFAULT_BG);
         state.col = 0;
         state.row = 0;
@@ -699,10 +736,12 @@ fn render_bytes_inner(state: &mut FbState, fb: &mut Framebuffer, buf: &[u8]) {
     // waiting up to one full blink period — same feel as a real
     // terminal, which keeps the cursor lit right after each keystroke
     // and only starts blinking once input pauses.
-    let (x, y, w, h) = cursor_cell_rect(state);
-    fb.xor_rect(x, y, w, h);
-    CURSOR_DRAWN.store(true, Ordering::Relaxed);
-    CURSOR_TICKS.store(0, Ordering::Relaxed);
+    if !graphics {
+        let (x, y, w, h) = cursor_cell_rect(state);
+        fb.xor_rect(x, y, w, h);
+        CURSOR_DRAWN.store(true, Ordering::Relaxed);
+        CURSOR_TICKS.store(0, Ordering::Relaxed);
+    }
 
     // `bytes` here is the *input* byte count, not framebuffer bytes — the
     // rate `/proc/fbinfo` derives from it is "console throughput in bytes
@@ -776,6 +815,9 @@ pub fn kernel_alert(args: core::fmt::Arguments) {
 pub fn kernel_print(args: core::fmt::Arguments) {
     use core::fmt::Write;
 
+    if in_graphics_mode() {
+        return;
+    }
     let Some(mut state) = FB_STATE.try_lock() else { return };
     let Some(mut fb_guard) = FRAMEBUFFER.try_lock() else { return };
     let Some(fb) = fb_guard.as_mut() else { return };
@@ -792,6 +834,9 @@ pub fn kernel_print(args: core::fmt::Arguments) {
 /// lines as they were handed to the serial port, which has no notion of a
 /// carriage return being required.
 pub fn kernel_write_bytes(buf: &[u8]) {
+    if in_graphics_mode() {
+        return;
+    }
     let Some(mut state) = FB_STATE.try_lock() else { return };
     let Some(mut fb_guard) = FRAMEBUFFER.try_lock() else { return };
     let Some(fb) = fb_guard.as_mut() else { return };
@@ -878,6 +923,10 @@ impl FileHandle for FramebufferConsole {
 
     fn write(&mut self, buf: &[u8]) -> FileResult<usize> {
         mirror_to_serial(buf);
+        if in_graphics_mode() {
+            // Not drawn: the screen belongs to `/dev/fb0`'s holder.
+            return Ok(buf.len());
+        }
 
         let mut state = FB_STATE.lock();
         let mut fb_guard = FRAMEBUFFER.lock();

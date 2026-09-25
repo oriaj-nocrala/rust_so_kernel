@@ -128,7 +128,19 @@ pub(super) fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> SyscallResult
     let new_mask = crate::process::signal::mask_from_user(unsafe { core::ptr::read_unaligned(mask_ptr as *const u64) })
         & !(1u64 << crate::process::signal::SIGKILL)
         & !(1u64 << crate::process::signal::SIGSTOP);
+    suspend(Some(new_mask))
+}
 
+/// pause(34): sleep until a signal that runs a handler, terminates or
+/// stops the process, then return `EINTR` — `sigsuspend` with the mask
+/// the process already has, which is exactly how Linux defines it.
+pub(super) fn sys_pause() -> SyscallResult {
+    suspend(None)
+}
+
+/// The body of `rt_sigsuspend`/`pause`: `new_mask` replaces the mask for
+/// the duration of the sleep, `None` keeps the current one.
+fn suspend(new_mask: Option<u64>) -> SyscallResult {
     let tf_ptr = current_tf_ptr();
     let irq = crate::process::irq_guard::InterruptGuard::new();
 
@@ -139,6 +151,7 @@ pub(super) fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> SyscallResult
             drop(irq);
             return errno::EINTR;
         };
+        let new_mask = new_mask.unwrap_or(proc.blocked_signals);
         proc.saved_sigmask = Some(proc.blocked_signals);
         proc.blocked_signals = new_mask;
         let immediate = crate::process::signal::has_actionable(proc);

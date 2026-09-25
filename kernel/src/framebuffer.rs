@@ -539,6 +539,36 @@ impl Framebuffer {
         self.height * self.stride * self.bytes_per_pixel
     }
 
+    /// The RAM shadow as whole pages, for `/dev/fb0` to hand to user space:
+    /// the page-aligned virtual address of the page holding its first byte,
+    /// how many pages cover it, and where pixel (0,0) sits in the first one.
+    /// `None` in direct mode.
+    ///
+    /// The partial pages at either end belong to the shadow's own
+    /// allocation (`attach_shadow`'s skew in front, the Buddy block's
+    /// rounding behind), zeroed and used by nothing else.
+    pub fn shadow_pages(&self) -> Option<(u64, usize, usize)> {
+        let start = self.shadow?.as_ptr() as u64;
+        let first = start & !0xFFF;
+        let end = start + self.byte_len() as u64;
+        Some((first, (end - first).div_ceil(4096) as usize, (start - first) as usize))
+    }
+
+    /// Copy one rectangle of the shadow to VRAM now, clipped to the
+    /// screen. `/dev/fb0`'s `FBIO_FLUSH`: the compositor writes the shadow
+    /// through its own mapping, and this is how VRAM hears about it.
+    pub fn flush_rect(&mut self, x: usize, y: usize, w: usize, h: usize) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let w = w.min(self.width - x);
+        let h = h.min(self.height - y);
+        if w == 0 || h == 0 {
+            return;
+        }
+        self.touched(x, y, w, h);
+    }
+
     /// Blits a `0x00RRGGBB`-packed `src_w`x`src_h` buffer onto the real
     /// framebuffer, nearest-neighbor scaled up by the largest integer
     /// factor that still fits (never distorts aspect ratio) and centered

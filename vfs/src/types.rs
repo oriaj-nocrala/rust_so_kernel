@@ -24,6 +24,7 @@ impl Errno {
     pub const EFAULT:  Self = Self(14);
     pub const EBUSY:   Self = Self(16);
     pub const EEXIST:  Self = Self(17);
+    pub const ENODEV:  Self = Self(19);
     pub const ENOTDIR: Self = Self(20);
     pub const EISDIR:  Self = Self(21);
     pub const EINVAL:  Self = Self(22);

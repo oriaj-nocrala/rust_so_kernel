@@ -246,6 +246,7 @@ pub enum SyscallNumber {
     Sigprocmask = 14,
     Sigreturn = 15,
     RtSigsuspend = 130,
+    Pause = 34,
     Poll = 7,
     Lseek = 8,
     Mmap = 9,
@@ -273,6 +274,7 @@ pub enum SyscallNumber {
     Yield = 24,
     Nanosleep = 35,
     GetPid = 39,
+    GetPpid = 110,
     Socket = 41,
     Connect = 42,
     Accept = 43,
@@ -330,6 +332,7 @@ impl SyscallNumber {
             14 => Some(Self::Sigprocmask),
             15 => Some(Self::Sigreturn),
             130 => Some(Self::RtSigsuspend),
+            34 => Some(Self::Pause),
             7  => Some(Self::Poll),
             8  => Some(Self::Lseek),
             9  => Some(Self::Mmap),
@@ -357,6 +360,7 @@ impl SyscallNumber {
             24 => Some(Self::Yield),
             35 => Some(Self::Nanosleep),
             39 => Some(Self::GetPid),
+            110 => Some(Self::GetPpid),
             41 => Some(Self::Socket),
             42 => Some(Self::Connect),
             43 => Some(Self::Accept),
@@ -501,7 +505,7 @@ fn resolve_path(raw: &str) -> alloc::string::String {
     crate::fs::vfs::normalize_path(&current_cwd(), raw)
 }
 
-fn validate_user_buffer(addr: u64, size: usize) -> Result<(), i64> {
+pub(crate) fn validate_user_buffer(addr: u64, size: usize) -> Result<(), i64> {
     if addr == 0 {
         return Err(errno::EFAULT);
     }
@@ -555,6 +559,7 @@ pub fn syscall_handler(
         SyscallNumber::Sigprocmask => signal::sys_sigprocmask(arg1 as i32, arg2, arg3),
         SyscallNumber::Sigreturn => signal::sys_sigreturn(),
         SyscallNumber::RtSigsuspend => signal::sys_rt_sigsuspend(arg1, arg2),
+        SyscallNumber::Pause => signal::sys_pause(),
         SyscallNumber::Poll => poll::sys_poll(arg1, arg2 as u32, arg3 as i32),
         SyscallNumber::Lseek => fs::sys_lseek(arg1 as i32, arg2 as i64, arg3 as i32),
         SyscallNumber::Mmap => fs::sys_mmap(arg1, arg2, arg3 as u32, arg4 as u32, arg5 as i32, _arg6),
@@ -582,6 +587,7 @@ pub fn syscall_handler(
         SyscallNumber::Yield => process_ctl::sys_yield(),
         SyscallNumber::Nanosleep => process_ctl::sys_nanosleep(arg1),
         SyscallNumber::GetPid => process_ctl::sys_getpid(),
+        SyscallNumber::GetPpid => process_ctl::sys_getppid(),
         SyscallNumber::Socket  => ipc::sys_socket(arg1 as i32, arg2 as i32, arg3 as i32),
         SyscallNumber::Connect => ipc::sys_connect(arg1 as i32, arg2, arg3),
         SyscallNumber::Accept  => ipc::sys_accept4(arg1 as i32, arg2, arg3, 0),

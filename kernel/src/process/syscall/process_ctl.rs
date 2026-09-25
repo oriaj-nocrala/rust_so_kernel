@@ -147,6 +147,15 @@ pub(super) fn sys_getpid() -> SyscallResult {
     })
 }
 
+/// getppid(110): the parent's pid — `Process::parent_pid`, which
+/// `reparent_children` points at PID 1 when the parent dies, so an orphan
+/// reads 1 exactly as on Linux. 0 for a process with no parent (PID 1).
+pub(super) fn sys_getppid() -> SyscallResult {
+    with_scheduler(|scheduler| {
+        scheduler.running_ref().and_then(|p| p.parent_pid).map(|pid| pid.0 as SyscallResult).unwrap_or(0)
+    })
+}
+
 /// sys_exit — terminate the calling process and switch immediately.
 ///
 /// Performs an immediate full context switch via kill_and_switch_tf +

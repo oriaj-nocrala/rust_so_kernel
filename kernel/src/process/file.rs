@@ -54,11 +54,11 @@ impl FileDescriptorTable {
         // prompt, enable job control...). Binding this to `/dev/null` (the
         // previous "for now" placeholder) made that check permanently
         // false, silently forcing every shell into non-interactive mode.
-        table.files[0] = Some(drivers::open_device("/dev/console")
+        table.files[0] = Some(drivers::open_device("/dev/console").ok()
             .unwrap_or_else(|| Box::new(NullFallback)));
 
         // FD 1: stdout (framebuffer)
-        table.files[1] = Some(drivers::open_device("/dev/fb")
+        table.files[1] = Some(drivers::open_device("/dev/fb").ok()
             .unwrap_or_else(|| Box::new(NullFallback)));
 
         // FD 2: stderr (framebuffer, same as stdout). Used to be bound to
@@ -68,7 +68,7 @@ impl FileDescriptorTable {
         // serial's own writes. Binding it to `/dev/fb` instead means stderr
         // is on-screen like stdout, and still reaches serial.log too via
         // `framebuffer_console`'s own `mirror_to_serial`.
-        table.files[2] = Some(drivers::open_device("/dev/fb")
+        table.files[2] = Some(drivers::open_device("/dev/fb").ok()
             .unwrap_or_else(|| Box::new(NullFallback)));
 
         table
@@ -195,15 +195,15 @@ impl Clone for FileDescriptorTable {
 
         if self.files[0].is_some() {
             new_table.files[0] = self.files[0].as_ref().unwrap().dup()
-                .or_else(|| crate::drivers::open_device("/dev/console"));
+                .or_else(|| crate::drivers::open_device("/dev/console").ok());
         }
         if self.files[1].is_some() {
             new_table.files[1] = self.files[1].as_ref().unwrap().dup()
-                .or_else(|| crate::drivers::open_device("/dev/fb"));
+                .or_else(|| crate::drivers::open_device("/dev/fb").ok());
         }
         if self.files[2].is_some() {
             new_table.files[2] = self.files[2].as_ref().unwrap().dup()
-                .or_else(|| crate::drivers::open_device("/dev/fb"));
+                .or_else(|| crate::drivers::open_device("/dev/fb").ok());
         }
 
         for i in 3..MAX_FILES {

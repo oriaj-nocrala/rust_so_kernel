@@ -217,7 +217,6 @@ impl Inode for DevInode {
 
     fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
         crate::drivers::open_device(&self.path)
-            .ok_or(Errno::ENOENT)
     }
 }
 

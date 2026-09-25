@@ -183,6 +183,13 @@ fn render_fbinfo() -> String {
     } else {
         out.push_str("shadow: none (drawing straight to VRAM)\n");
     }
+    // Graphics mode: `/dev/fb0` is open and the console draws nothing but
+    // `kalert!` (see `drivers::dev_fb0`).
+    out.push_str(if crate::drivers::framebuffer_console::in_graphics_mode() {
+        "mode: graphics (/dev/fb0 open)\n"
+    } else {
+        "mode: text\n"
+    });
 
     let r = crate::memory::memtype::report_for(x86_64::VirtAddr::new(virt));
     match r.phys {

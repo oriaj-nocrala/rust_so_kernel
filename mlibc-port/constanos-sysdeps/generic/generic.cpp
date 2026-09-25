@@ -64,6 +64,7 @@ constexpr long SYS_getdents64 = 217;
 constexpr long SYS_sigaction = 13;
 constexpr long SYS_sigprocmask = 14;
 constexpr long SYS_rt_sigsuspend = 130;
+constexpr long SYS_pause = 34;
 // SYS_sigreturn(15) is never called directly by userspace — only the
 // kernel-mapped trampoline page uses it (see kernel/src/memory/
 // signal_trampoline.rs); mlibc's sigaction() doesn't need to know it
@@ -113,6 +114,7 @@ constexpr long SYS_munmap = 11;
 constexpr long SYS_ioctl = 16;
 constexpr long SYS_nanosleep = 35;
 constexpr long SYS_getpid = 39;
+constexpr long SYS_getppid = 110;
 constexpr long SYS_clone = 56;
 constexpr long SYS_fork = 57;
 constexpr long SYS_execve = 59;
@@ -810,9 +812,10 @@ pid_t sys_getpid() {
 	return (pid_t)raw_syscall(SYS_getpid);
 }
 
+// It used to return 1 unconditionally, so `kill(getppid(), sig)` from a
+// child signalled init instead of its parent (sigsuspend_test's case E).
 pid_t sys_getppid() {
-	// Not tracked by this kernel; harmless placeholder.
-	return 1;
+	return (pid_t)raw_syscall(SYS_getppid);
 }
 
 // No real user/group model exists — this kernel is single-user, everything
@@ -1041,6 +1044,14 @@ int sys_sigprocmask(int how, const sigset_t *__restrict set,
 // forever with every signal blocked (waitproc's sigsuspend loop).
 int sys_sigsuspend(const sigset_t *set) {
 	long ret = raw_syscall(SYS_rt_sigsuspend, (long)set, (long)sizeof(sigset_t));
+	return ret < 0 ? (int)-ret : 0;
+}
+
+// pause(34): sigsuspend with the current mask, in the kernel. Always
+// EINTR. Without it pause() hit mlibc's missing-sysdep __ensure, which
+// returns — so `for (;;) pause();` spun printing it (fb0_test's child).
+int sys_pause() {
+	long ret = raw_syscall(SYS_pause);
 	return ret < 0 ? (int)-ret : 0;
 }
 

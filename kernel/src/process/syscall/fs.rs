@@ -1109,6 +1109,9 @@ pub(super) fn sys_ioctl(fd: i32, request: u64, argp: u64) -> SyscallResult {
         }
         FBIO_BLIT => {
             if fd_kind != Some(FdKind::Fb) { return errno::ENOTTY; }
+            // The screen belongs to `/dev/fb0`'s holder; drawing over it
+            // would break what that one believes is on screen.
+            if crate::drivers::framebuffer_console::in_graphics_mode() { return errno::EBUSY; }
             const SZ: usize = core::mem::size_of::<FbBlitArgs>();
             if let Err(e) = validate_user_buffer(argp, SZ) { return e; }
             let args = unsafe { core::ptr::read(argp as *const FbBlitArgs) };

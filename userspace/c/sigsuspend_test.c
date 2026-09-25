@@ -10,6 +10,11 @@
 //   C. SIGUSR1 sent by another process wakes it;
 //   D. an ignored signal does not: the child sends SIGUSR2 (SIG_IGN)
 //      first and SIGUSR1 later — only SIGUSR1 may end the wait.
+//   E. pause(34), sigsuspend with the current mask: SIGUSR1 from a child
+//      ends it with -1/EINTR after the handler ran;
+//   F. SIGKILL ends a process sleeping in pause() — which is only true
+//      because kill() wakes sigsuspend/pause sleepers (it wakes no other
+//      Blocked process).
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
@@ -125,6 +130,41 @@ static int case_kill_from_child(int ignored_first) {
     return !ok;
 }
 
+static int case_pause(void) {
+    got_usr1 = 0;
+    pid_t pid = fork();
+    if (pid == 0) {
+        nap_ms(100);
+        kill(getppid(), SIGUSR1);
+        _exit(0);
+    }
+    long t0 = now_ms();
+    int r = pause();
+    int e = errno;
+    long waited = now_ms() - t0;
+    waitpid(pid, NULL, 0);
+    int ok = r == -1 && e == EINTR && got_usr1 == 1 && waited >= 50;
+    printf("E pause: r=%d errno=%d handler=%d waited=%ldms -> %s\n",
+           r, e, (int)got_usr1, waited, ok ? "PASS" : "FAIL");
+    return !ok;
+}
+
+static int case_pause_sigkill(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        for (;;) pause();
+    }
+    nap_ms(100);
+    long t0 = now_ms();
+    kill(pid, SIGKILL);
+    int st = 0;
+    int w = waitpid(pid, &st, 0);
+    long waited = now_ms() - t0;
+    int ok = w == pid && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL && waited < 1000;
+    printf("F SIGKILL ends pause: waited=%ldms -> %s\n", waited, ok ? "PASS" : "FAIL");
+    return !ok;
+}
+
 int main(void) {
     install(SIGCHLD, on_chld);
     install(SIGUSR1, on_usr1);
@@ -135,6 +175,8 @@ int main(void) {
     fails += case_already_pending();
     fails += case_kill_from_child(0);
     fails += case_kill_from_child(1);
+    fails += case_pause();
+    fails += case_pause_sigkill();
     printf("sigsuspend_test: %s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }

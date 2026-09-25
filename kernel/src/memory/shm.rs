@@ -63,6 +63,10 @@ struct Inner {
 pub struct ShmObject {
     inner: IrqMutex<Inner, KernelIrq>,
     mappings: AtomicUsize,
+    /// Frames the object did not allocate and must never free or resize
+    /// away: the framebuffer's RAM copy behind `/dev/fb0` (see
+    /// [`ShmObject::pinned`]).
+    pinned: bool,
 }
 
 impl core::fmt::Debug for ShmObject {
@@ -91,6 +95,35 @@ impl ShmObject {
         Self {
             inner: IrqMutex::new(Inner { pages: Vec::new(), size: 0 }),
             mappings: AtomicUsize::new(0),
+            pinned: false,
+        }
+    }
+
+    /// An object over frames that already exist and belong to someone
+    /// else — the framebuffer's RAM copy, which `/dev/fb0` lets the
+    /// compositor map (`docs/gui/gui-plan.md`, phase 2.1). Mappings work
+    /// exactly as for a memfd: each PTE takes a reference, and unmapping or
+    /// the mapper's death drops it through the ordinary paths.
+    ///
+    /// **Must be kept alive forever** (a `static`): the object's own
+    /// reference on each frame is what keeps those `dec_ref`s from ever
+    /// reaching zero and handing the frames to the Buddy allocator, which
+    /// never gave them out as user pages. `Drop` refuses to release them
+    /// anyway, as a second guard, and so does `set_size`.
+    ///
+    /// # Safety
+    /// Every frame must stay allocated, and be memory it is harmless for
+    /// user space to read and write, for as long as the kernel runs; its
+    /// COW refcount must be untracked (zero) until now.
+    pub unsafe fn pinned(frames: Vec<PhysFrame>) -> Self {
+        for &frame in &frames {
+            crate::memory::cow::set_ref(frame, 1);
+        }
+        let size = frames.len() as u64 * PAGE;
+        Self {
+            inner: IrqMutex::new(Inner { pages: frames.into_iter().map(Some).collect(), size }),
+            mappings: AtomicUsize::new(0),
+            pinned: true,
         }
     }
 
@@ -116,6 +149,9 @@ impl ShmObject {
     pub fn set_size(&self, len: u64) -> Result<(), ShmError> {
         if len > MAX_SIZE {
             return Err(ShmError::TooBig);
+        }
+        if self.pinned {
+            return Err(ShmError::Busy);
         }
         self.inner.with(|i| Self::set_size_locked(&self.mappings, i, len))
     }
@@ -210,6 +246,9 @@ impl ShmObject {
     /// `write()` through an fd: copy `buf` in at byte `off`, growing the
     /// object if it ends past the size (as a regular file grows).
     pub fn write_at(&self, off: u64, buf: &[u8]) -> Result<usize, ShmError> {
+        if self.pinned {
+            return Err(ShmError::Busy);
+        }
         let end = off.checked_add(buf.len() as u64).ok_or(ShmError::TooBig)?;
         if end > MAX_SIZE {
             return Err(ShmError::TooBig);
@@ -242,6 +281,10 @@ impl ShmObject {
 
 impl Drop for ShmObject {
     fn drop(&mut self) {
+        if self.pinned {
+            // Not ours to free (see `pinned`); leak the references.
+            return;
+        }
         self.inner.with(|i| {
             for frame in i.pages.drain(..).flatten() {
                 release_frame(frame);
