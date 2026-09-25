@@ -132,6 +132,19 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     // failure the PIC keeps delivering. Stage 1 of `docs/smp/smp-plan.md`.
     crate::interrupts::apic::init();
 
+    // ── Per-CPU state ──────────────────────────────────────────────
+    // GDT + this CPU's TSS slot, IDT, GS, syscall MSRs, PAT, SSE, LAPIC +
+    // timer — everything a CPU holds for itself, through the same call every
+    // AP will make (stage 3 of `docs/smp/smp-plan.md`), then read back from
+    // the hardware. Right after the APIC, the last global decision it
+    // applies; before USB and the VFS, so a double fault from here on lands
+    // on this CPU's own IST stack.
+    if let Err((step, why)) = crate::cpu::init_this_cpu(0) {
+        panic!("BSP per-CPU init: step `{}` failed: {}", step, why);
+    }
+    serial_println!("{}", crate::cpu::render_init());
+    crate::cpu::percpu::measure_cpu_id_cost();
+
     // ── Time subsystem ─────────────────────────────────────────────
     crate::time::init();
     serial_println!("clocksource: {}", crate::time::clocksource::clocksource_name());
@@ -173,12 +186,6 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     // from here on the idle task, `sync(2)` and the panic handler copy the
     // log ring there. See `block::logpart`.
     crate::block::logpart::init();
-
-    // ── TSS + GDT ──────────────────────────────────────────────────
-    serial_println!("Step 9: Initializing TSS and GDT");
-    process::tss::init();
-    process::tss::init_syscall_msrs();
-    crate::cpu::percpu::measure_cpu_id_cost();
 
     // ── FPU/SSE ────────────────────────────────────────────────────
     // Must run before the first `Process` is created below — every

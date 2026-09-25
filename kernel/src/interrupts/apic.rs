@@ -311,16 +311,16 @@ fn try_init() -> Result<(), &'static str> {
     IOAPICS.with(|ios| *ios = wins);
     STATUS.call_once(|| Status { lapic_id, timer_count: count, timer_input_hz: input_hz });
 
+    BSP_APIC_BASE.store(raw | 1 << 11, Ordering::Relaxed);
+
     // ── Switch ──────────────────────────────────────────────────────────
     // IF=0 throughout, so the order below only has to leave the hardware
-    // consistent by the first `sti`, not at every step.
+    // consistent by the first `sti`, not at every step. That first `sti`
+    // comes after `cpu::init_this_cpu`, which programs this CPU's own LAPIC
+    // (LINT0, TPR, the timer) through `init_this_cpu` below — the same call
+    // every AP will make. Until then nothing can be delivered: the PIC is
+    // masked here and the LAPIC timer is stopped (calibration left it so).
     super::pic::mask_all();
-    lapic_write(lapic::TPR, 0);
-    // LINT0 carries the 8259's ExtINT in virtual-wire mode: masked, so the
-    // PIC can't reach this CPU even if something unmasks it later.
-    lapic_write(lapic::LVT_LINT0, lapic::LVT_MASKED);
-    lapic_write(lapic::LVT_ERROR, lapic::LVT_MASKED);
-    lapic_write(lapic::ESR, 0);
 
     let wanted = super::enabled_isa_lines();
     for line in 0..16u8 {
@@ -330,10 +330,90 @@ fn try_init() -> Result<(), &'static str> {
     }
     drain_edge_sources();
 
+    ACTIVE.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// The BSP's `IA32_APIC_BASE` (globally enabled). Every CPU must match its
+/// mode and, in xAPIC mode, its MMIO base: `LAPIC_VIRT` is one mapping for
+/// all of them (each CPU sees its own LAPIC behind the same address).
+static BSP_APIC_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// This CPU's local APIC: enabled in the BSP's mode, LINT0 (the 8259's
+/// ExtINT path) and error LVT masked, TPR 0, and the periodic timer at the
+/// count the BSP calibrated. Per-CPU step of `cpu::init_this_cpu`; nothing
+/// to do when the APIC is not in use (the 8259 + PIT fallback).
+pub fn init_this_cpu() {
+    if !active() {
+        return;
+    }
+    let Some(status) = STATUS.get() else { return };
+    let want = BSP_APIC_BASE.load(Ordering::Relaxed);
+
+    let mut base_msr = Msr::new(apic::IA32_APIC_BASE_MSR);
+    // SAFETY: IA32_APIC_BASE exists (the BSP found an APIC; every CPU in one
+    // package has one). Enable first, then x2APIC: the SDM forbids going
+    // straight from disabled to x2APIC.
+    unsafe {
+        let raw = base_msr.read();
+        if raw & (1 << 11) == 0 {
+            base_msr.write(raw | 1 << 11);
+        }
+        let raw = base_msr.read();
+        if want & (1 << 10) != 0 && raw & (1 << 10) == 0 {
+            base_msr.write(raw | 1 << 10);
+        }
+    }
+
+    lapic_write(lapic::SVR, SPURIOUS_VECTOR as u32 | lapic::SVR_ENABLE);
+    lapic_write(lapic::TPR, 0);
+    // LINT0 carries the 8259's ExtINT in virtual-wire mode: masked, so the
+    // PIC can't reach this CPU even if something unmasks it later.
+    lapic_write(lapic::LVT_LINT0, lapic::LVT_MASKED);
+    lapic_write(lapic::LVT_ERROR, lapic::LVT_MASKED);
+    lapic_write(lapic::ESR, 0);
+
     lapic_write(lapic::TIMER_DIVIDE, apic::divide_config(TIMER_DIVISOR).unwrap());
     lapic_write(lapic::LVT_TIMER, apic::lvt_timer(TIMER_VECTOR, TimerMode::Periodic, false));
-    lapic_write(lapic::TIMER_INITIAL, count);
-    ACTIVE.store(true, Ordering::Relaxed);
+    lapic_write(lapic::TIMER_INITIAL, status.timer_count);
+}
+
+/// Reads back what `init_this_cpu` set.
+pub fn verify_this_cpu() -> Result<(), &'static str> {
+    if !active() {
+        return Ok(());
+    }
+    let status = STATUS.get().ok_or("APIC active without a calibration")?;
+    let want = apic::ApicBase::decode(BSP_APIC_BASE.load(Ordering::Relaxed));
+    // SAFETY: as in `init_this_cpu`.
+    let have = apic::ApicBase::decode(unsafe { Msr::new(apic::IA32_APIC_BASE_MSR).read() });
+    if !have.enabled {
+        return Err("LAPIC globally disabled");
+    }
+    if have.x2apic != want.x2apic {
+        return Err("LAPIC mode (xAPIC/x2APIC) differs from the BSP's");
+    }
+    if !have.x2apic && have.phys != want.phys {
+        return Err("LAPIC MMIO base differs from the BSP's");
+    }
+    let svr = lapic_read(lapic::SVR);
+    if svr & lapic::SVR_ENABLE == 0 || svr & 0xFF != SPURIOUS_VECTOR as u32 {
+        return Err("LAPIC SVR not enabled on the spurious vector");
+    }
+    if lapic_read(lapic::TPR) & 0xFF != 0 {
+        return Err("LAPIC TPR not 0");
+    }
+    if lapic_read(lapic::LVT_LINT0) & lapic::LVT_MASKED == 0 {
+        return Err("LAPIC LINT0 unmasked");
+    }
+    // Bit 12 is delivery status (read-only): compare everything else.
+    let lvt = lapic_read(lapic::LVT_TIMER) & !(1 << 12);
+    if lvt != apic::lvt_timer(TIMER_VECTOR, TimerMode::Periodic, false) {
+        return Err("LAPIC timer LVT is not periodic on the timer vector");
+    }
+    if lapic_read(lapic::TIMER_INITIAL) != status.timer_count {
+        return Err("LAPIC timer count differs from the calibration");
+    }
     Ok(())
 }
 

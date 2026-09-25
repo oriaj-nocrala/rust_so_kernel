@@ -174,8 +174,9 @@ Kernel crate config in `kernel/.cargo/config.toml` enables `-Z build-std` to reb
 6b. `mouse::init()` — best-effort PS/2 auxiliary device enable (IRQ12); bounded polls, never hangs boot on hardware with no PS/2 mouse
 6c. `ac97::init()` — best-effort PCI AC97 audio codec enable; bounded polls, never hangs boot on hardware/QEMU configs with no AC97 device
 6d. `cpu::tsc::init()` (calibrated against the PIT), then `interrupts::apic::init()` — retires the 8259 + PIT in favour of the LAPIC timer + I/O APIC (see Interrupt Controllers below)
+6e. `cpu::init_this_cpu(0)` — everything the CPU holds for itself (GDT + its TSS slot, IDT, GS, syscall MSRs, PAT, SSE, LAPIC + timer), then read back; see Per-CPU Init below
 7. REPL initial prompt
-8. `process::tss::init()` — TSS + GDT (needed for ring-3 → ring-0 stack switch)
+8. `process::fpu::init()` — captures the FXSAVE template
 9. `processes::init_all()` — create idle, user, and shell processes
 10. `process::start_first_process()` — enable interrupts, jump to first trapframe
 
@@ -214,7 +215,7 @@ Kernel crate config in `kernel/.cargo/config.toml` enables `-Z build-std` to reb
 
 **FPU/SSE** (`process/fpu.rs`): `Process::fpu_state` (`Box<fpu::FpuState>`, a 512-byte `#[repr(align(16))]` FXSAVE image) is saved/restored via `fxsave`/`fxrstor` at every context-switch point that also saves/restores `fs_base` (`switch_to_next`, `block_current`, `stop_and_switch_tf` save-and-restore; `kill_and_switch_tf`/`start_first` restore-only — both restore `fs_base` too, which `kill_and_switch_tf` did not until 2026-09-24: the next process ran on the dead one's TLS pointer, and `ash` running a script faulted in mlibc's `get_current_tcb` whenever an external command exited). `sys_fork` likewise takes the parent's FS base from the live MSR, not the switch-time copy in `Process::fs_base`. `fpu::init()` enables SSE (`CR0.EM=0`/`MP=1`, `CR4.OSFXSR=1`/`OSXMMEXCPT=1`) and captures one real `fxsave` of the resulting clean state as the template every new `Process` starts from — must run before the first `Process` exists (wired into `init::boot()` right before `processes::init_all()`). `sys_fork` captures the parent's *live* registers with a fresh `fpu::save()` (real `fork()` semantics — the stored `Process::fpu_state` is stale as of its last preemption, not necessarily current); `sys_clone` (new thread) gets the default template instead (a fresh thread doesn't inherit register contents); `sys_exec` resets to the template, written directly to live hardware next to the `fs_base`/TLS reset since exec continues on the same CPU without an intervening switch. Verified via `fpu_test` (`userspace/c/fpu_test.c`): loads a distinctive 128-bit pattern into `xmm0` via inline asm, spins through a pure-integer loop long enough to span hundreds of real preemptions (confirmed via the `switches_total` counter below, not just elapsed time), and checks it survived intact.
 
-**TSS** (`process/tss.rs`): Provides the `DOUBLE_FAULT_IST_INDEX` IST stack and the kernel RSP0 stack used on ring-3 → ring-0 transitions.
+**TSS** (`process/tss.rs`): one per CPU, each with its own `DOUBLE_FAULT_IST_INDEX` IST stack and the kernel RSP0 stack used on ring-3 → ring-0 transitions (`set_kernel_stack` writes the current CPU's); all in one GDT — see Per-CPU Init.
 
 ## Syscall Interface (`kernel/src/process/syscall.rs`)
 
@@ -881,6 +882,24 @@ the bring-up machine's shape. Verified: typing works in that configuration,
 `i8042_present=false` is reported, and with the USB keyboard also removed
 the no-input hold renders the filtered log and the red summary on screen.
 
+## Per-CPU Init (`kernel/src/cpu/init.rs`, `kernel/src/process/tss.rs`)
+
+Stage 3 of `docs/smp/smp-plan.md`. **`cpu::init_this_cpu(cpu)` is the one
+place per-CPU state is set up**, and what an AP will get in stage 4 is
+exactly that list: control-register bits copied from the BSP (`CR0.WP/CD/NW`,
+`CR4.PGE`, `EFER.NXE` — the bootloader sets WP/NXE on the BSP only), the
+shared GDT + this CPU's TSS slot (`0x28 + 16·n`, one TSS and one
+double-fault IST stack per CPU), `lidt`, `PerCpu`/`KERNEL_GS_BASE`, the
+`syscall` MSRs, `IA32_PAT`, SSE's CR0/CR4 bits, and the local APIC + timer.
+Each step has a `verify_*` that reads its register back; the result per CPU
+is `cpu_init:` in `/proc/kdebug`. Global *decisions* stay where they were
+(`program_pat` picks the PAT, `apic::init` calibrates and routes the I/O
+APIC) and every CPU, the BSP included, *applies* them here. **Anything new
+that is per CPU gets a step here and a `verify_*`**, or an AP will run with
+the firmware's value. `hw_tests::init_this_cpu_restores_what_an_ap_lacks`
+resets the BSP's registers to an AP's and checks every step brings its
+register back.
+
 ## Interrupt Controllers (`kernel/src/interrupts/`, `hal/src/apic.rs`)
 
 Stage 1 of `docs/smp/smp-plan.md`: the tick is the **LAPIC timer**
@@ -1017,6 +1036,6 @@ Sysdeps added beyond the original bootstrap set (all in `generic/generic.cpp` un
   - **IF=0 is not mutual exclusion.** Shared state takes a real lock; `cli` only prevents reentry on the *same* CPU. `keyboard::DECODER` is the worked example: two ISRs (IRQ1 and the timer's USB poll) wrote it through an `UnsafeCell` justified as "only the keyboard ISR touches it" — never true once USB existed, safe only because `cli` serialized both on one CPU. It is an `IrqMutex` now.
   - **No new `static mut` or global `UnsafeCell` for shared state.** Per-CPU state gets indexed by `cpu::cpu_id()`; existing offenders are the plan's inventory, not precedent.
   - **Every PTE change invalidates through `memory::tlb`** (`invalidate_page` for user mappings, `invalidate_kernel_page` for kernel ones) — never `x86_64::instructions::tlb::*` or `MapperFlush::flush()`; consume a `MapperFlush` with `.ignore()` and pass its page. Stage 5's shootdown then changes those bodies, not every call site. `Cr3::write` is a switch, not an invalidation. `grep -rn 'instructions::tlb\|\.flush()' kernel/src/memory` should find only `tlb.rs`.
-  - **`gs` is used in exactly one place: `syscall_entry_fast`'s four-instruction `swapgs` window** (stage 2, `kernel/src/cpu/percpu.rs`). It loads this CPU's kernel stack from `PerCpu`, then swaps straight back, so every other path — the timer stub, rustc's `x86-interrupt` shims (which never `swapgs`), `jump_to_trapframe` — runs with user mode's GS_BASE and never reads it. Rust reaches per-CPU data through `cpu::cpu_id()`, which reads the task register (`str`), not `gs:`. **Do not add a `gs:` access anywhere else**; `percpu::check_gs_invariant` (every syscall + every tick) panics if `IA32_KERNEL_GS_BASE` stops pointing at `&PERCPU[cpu]`. Stage 3 must give each CPU its own TSS slot in one GDT at `FIRST_TSS_SELECTOR + 16·n`, or `cpu_id()` stops telling CPUs apart.
+  - **`gs` is used in exactly one place: `syscall_entry_fast`'s four-instruction `swapgs` window** (stage 2, `kernel/src/cpu/percpu.rs`). It loads this CPU's kernel stack from `PerCpu`, then swaps straight back, so every other path — the timer stub, rustc's `x86-interrupt` shims (which never `swapgs`), `jump_to_trapframe` — runs with user mode's GS_BASE and never reads it. Rust reaches per-CPU data through `cpu::cpu_id()`, which reads the task register (`str`), not `gs:`. **Do not add a `gs:` access anywhere else**; `percpu::check_gs_invariant` (every syscall + every tick) panics if `IA32_KERNEL_GS_BASE` stops pointing at `&PERCPU[cpu]`. Each CPU has its own TSS slot in one GDT at `FIRST_TSS_SELECTOR + 16·n` (stage 3, `process/tss.rs`) — one GDT per CPU with the TSS at the same index would make `cpu_id()` stop telling CPUs apart.
   - **Nothing new hangs off the timer tick** without saying whether it is global work (BSP only: `hrtimer`, the USB poll) or per-CPU work (scheduling).
 - **Nothing per-process may live in a per-CPU global across a preemption point.** The current syscall's frame is `syscall::current_tf_ptr()`, computed from the running process's own kernel stack top (this CPU's `PerCpu::kernel_rsp` `- sizeof(TrapFrame)`, where `syscall_entry_fast` always builds it — Linux's `task_pt_regs`). It used to be a global (`CURRENT_SYSCALL_TF`) stored at syscall entry, which went stale whenever a syscall was preempted with IF=1 and another process made syscalls before it resumed: the post-syscall signal check then delivered the parent's SIGCHLD into the dead child's frame and wrote the signal frame over the parent's live stack. Symptom: `ash` dying at its `exit` builtin (`rip` 0, 0x202, or an address in the child's binary) after a short-lived child, under host load only. Found 2026-09-24 by the first autorun job; the user-segfault stack dump (`init::devices::dump_user_stack`) and `ktrace!(PROC)` on signal delivery/`sigreturn` are what cornered it.

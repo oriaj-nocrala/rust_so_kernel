@@ -29,7 +29,8 @@
 //
 // Rust code reaches its CPU's data through `cpu_id()`, which reads the task
 // register instead of `gs:` — valid on every path, whatever GS holds. Each CPU
-// gets its own TSS descriptor slot in the GDT (stage 3), so `str` names the CPU.
+// has its own TSS descriptor slot in the one GDT (`process::tss`), so `str`
+// names the CPU.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use super::MAX_CPUS;
@@ -67,12 +68,13 @@ const IA32_GS_BASE: u32 = 0xC000_0101;
 const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
 /// The GDT selector of CPU 0's TSS; CPU n's is `FIRST_TSS_SELECTOR + 16 * n`
-/// (a TSS descriptor is 16 bytes in long mode). `process::tss::init` asserts
-/// the GDT really puts it there.
+/// (a TSS descriptor is 16 bytes in long mode). `process::tss` asserts the
+/// GDT really puts it there.
 pub const FIRST_TSS_SELECTOR: u16 = 0x28;
 
 /// Set up this CPU's `PerCpu` and point `IA32_KERNEL_GS_BASE` at it. Must run
-/// before the first `syscall` can execute. Stage 2: BSP only.
+/// before the first `syscall` can execute. Per-CPU step of
+/// `cpu::init_this_cpu`.
 pub fn init_this_cpu(cpu: usize) {
     let pc = &PERCPU[cpu];
     let addr = pc as *const PerCpu as u64;
@@ -87,7 +89,7 @@ pub fn init_this_cpu(cpu: usize) {
 }
 
 /// This CPU's id, from the task register: each CPU loads its own TSS
-/// selector. Before `process::tss::init` loads TR it reads 0 — only the BSP
+/// selector in `cpu::init_this_cpu`. Before that TR reads 0 — only the BSP
 /// runs that early, so that is CPU 0.
 #[inline(always)]
 pub fn cpu_id() -> usize {
@@ -141,6 +143,21 @@ pub fn check_gs_invariant() {
             cpu, kgs, gs, expected, self_ptr
         );
     }
+}
+
+/// `check_gs_invariant` without the panic, for `cpu::init_this_cpu`'s
+/// read-back.
+pub fn verify_this_cpu(cpu: usize) -> Result<(), &'static str> {
+    let expected = &PERCPU[cpu] as *const PerCpu as u64;
+    if unsafe { rdmsr(IA32_KERNEL_GS_BASE) } != expected {
+        return Err("KERNEL_GS_BASE is not this CPU's PerCpu");
+    }
+    if PERCPU[cpu].self_ptr.load(Ordering::Relaxed) != expected
+        || PERCPU[cpu].cpu_id.load(Ordering::Relaxed) != cpu as u64
+    {
+        return Err("PerCpu not initialised for this CPU");
+    }
+    Ok(())
 }
 
 /// Cycles per `cpu_id()`, measured once at boot for `/proc/kdebug` (stage 2

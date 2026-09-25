@@ -4,9 +4,10 @@
 > CLAUDE.md, `memory::tlb`, `keyboard::DECODER` tras un `IrqMutex`);
 > etapa 1 hecha y verificada en QEMU y en la Ryzen (LAPIC timer + I/O APIC,
 > `hal::apic`); etapa 2 hecha y verificada en QEMU y en la Ryzen
-> (`cpu::percpu`, `swapgs` solo en la entrada de `syscall`). El kernel sigue siendo
-> de una sola CPU: `cpu::cpu_id()` lee el TR y da `0` hasta que la etapa 3
-> dé una TSS a cada CPU, y no hay IPIs ni arranque de APs.
+> (`cpu::percpu`, `swapgs` solo en la entrada de `syscall`); etapa 3 hecha
+> y verificada en QEMU (`cpu::init_this_cpu`, una GDT con un slot de TSS por
+> CPU). El kernel sigue siendo de una sola CPU: no hay IPIs ni arranque de
+> APs.
 
 ## Por qué ahora
 
@@ -53,6 +54,9 @@ justificarlo.
 | CR0/CR4 de SSE (`fpu::init`) | `process/fpu.rs` | Por CPU |
 | `IDT` (`Once`) | `init/devices.rs:31` | Se puede compartir, pero cada CPU hace su `lidt` |
 | No hay `swapgs` ni `GS_BASE` | — | No existe un sitio donde guardar datos por CPU |
+| `CR0.WP`, `EFER.NXE` (añadido en la etapa 3) | los pone el bootloader, solo en la BSP | Sin NXE, el bit 63 de cada PTE NX es *reservado* y el primer acceso es un fallo de página; sin WP, una escritura del kernel en una página COW no falla y dos procesos comparten el marco |
+| `CR4.PGE`, `CR0.CD/NW` (añadido en la etapa 3) | firmware | Páginas globales y cachés: la API de TLB y el rendimiento dependen de ellos |
+| Modo y base de `IA32_APIC_BASE` (añadido en la etapa 3) | `interrupts/apic.rs` | Si la BSP está en x2APIC, cada AP también; en xAPIC, `LAPIC_VIRT` es un solo mapeo para todas y la base física debe coincidir |
 
 ### Interrupciones y tiempo
 
@@ -309,6 +313,53 @@ ya reconoce el job también por `METAL-DONE` (51abd1d).
 
 **Hecho cuando:** la BSP arranca a través de `init_this_cpu()` y nada por
 CPU se inicializa fuera de ella.
+
+**Estado:** hecha en QEMU el 2026-09-24 (`kernel/src/cpu/init.rs`, cuyo
+comentario de módulo es la referencia).
+
+- **Una GDT** de `5 + 2·MAX_CPUS` entradas; la TSS de la CPU n en
+  `0x28 + 16·n` (`process/tss.rs` lo comprueba con un assert por slot).
+  Cada CPU tiene su TSS y su pila IST de double fault (y una pila RSP0 de
+  arranque, hasta que su primer proceso ponga la suya). Adiós al
+  `static mut TSS`.
+- **`cpu::init_this_cpu(cpu)`** hace, en este orden: registros de control
+  (copia de la BSP de `CR0.WP/CD/NW`, `CR4.PGE`, `EFER.NXE` — la BSP los
+  registra como referencia), GDT + segmentos + TR, `lidt`, GS (`PerCpu`),
+  MSRs de `syscall`, PAT, SSE (CR0/CR4) y LAPIC local + timer. **Después lee
+  cada registro del hardware** (`verify_*` en cada módulo) y guarda el
+  resultado por CPU: `cpu_init:` en `/proc/kdebug` (`cpu0 ok (8)`, o qué paso
+  falló y por qué). Devuelve el primer paso que no cuadra; la BSP entra en
+  pánico con él, un AP (etapa 4) se quedará fuera.
+- **Decisión global y aplicación por CPU, separadas.** `program_pat` y
+  `apic::init` siguen corriendo en la BSP y *deciden* (el valor del PAT, la
+  cuenta del timer, el modo del APIC, el enrutado del I/O APIC); cada CPU,
+  la BSP incluida, *aplica* esa decisión en `init_this_cpu`. El timer del
+  LAPIC de la BSP ya no arranca en `apic::init` sino aquí. Dos cosas se
+  hacen además antes en la BSP, a propósito: el `lidt` (para que una
+  excepción de arranque sea un pánico y no un triple fault) y la escritura
+  del PAT (es cómo `program_pat` decide). Los pasos son idempotentes, así
+  que repetirlos no cambia nada.
+- **En el arranque**, `init_this_cpu(0)` va justo detrás de `apic::init`, es
+  decir, antes que en la etapa 2 (antes de USB y del VFS): un double fault
+  desde ahí ya cae en la pila IST de la CPU.
+- **Test** `hw_tests::init_this_cpu_restores_what_an_ap_lacks`: en la BSP
+  del arranque de tests, estropea uno a uno `CR0.WP`, `KERNEL_GS_BASE`,
+  `LSTAR`, el PAT y `CR4.OSXMMEXCPT` y comprueba que la verificación culpa
+  al paso correcto; luego los estropea todos a la vez (más `EFER.SCE`,
+  `STAR`, `FMASK`) como los tendría un AP y comprueba que `init_this_cpu`
+  los devuelve exactamente a sus valores. Probado por sabotaje: quitando el
+  paso del PAT, falla con `init_this_cpu did not restore `pat``. Fuera del
+  test, a propósito: `EFER.NXE` (borrarlo en una CPU viva es un fallo de
+  página inmediato), GDT/TR/IDT y el LAPIC (el arranque de tests no lo usa).
+
+Verificado: `run-kernel-tests` 9/9, `boot-matrix 4 5` = 20/20, 8G con
+`fpu_test` ALL_OK y `socket_test` exit 0, `timer_ticks` a 99,9 Hz (dos
+lecturas), y la ruta de respaldo (`-cpu max,-apic`) también con
+`cpu0 ok (8)`. Pendiente: la Ryzen (`cpu_init:` en `/proc/kdebug`).
+
+**Para la etapa 4:** `MAX_CPUS` es 8 y la Ryzen tiene 24 CPUs lógicas; la
+GDT, las TSS y las pilas crecen solas con la constante (40 KiB de pilas por
+CPU).
 
 ### Etapa 4 — arrancar los APs, inertes
 

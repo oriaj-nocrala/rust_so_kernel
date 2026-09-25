@@ -8,9 +8,9 @@
 // silently corrupted by a preemption landing mid-computation, since
 // nothing ever saved or restored it.
 //
-// `enable_sse()` must run once at boot, before any process is created —
-// `init()` does both that and capturing `TEMPLATE`, a real `fxsave` of the
-// resulting clean reset state, used to initialize every new process/thread
+// `init_this_cpu()` (CR0/CR4, per CPU — run from `cpu::init_this_cpu`)
+// must run before any process is created; `init()` then captures
+// `TEMPLATE`, a real `fxsave` of the resulting clean reset state, used to initialize every new process/thread
 // and to reset on `exec()` (real `execve()` resets FPU state too).
 // `sys_fork` is the one exception: a forked child gets a *copy* of the
 // parent's actual live registers (real `fork()` semantics), not the
@@ -26,19 +26,20 @@ pub struct FpuState(pub [u8; 512]);
 
 static TEMPLATE: spin::Once<FpuState> = spin::Once::new();
 
-/// Enable SSE and capture the resulting clean reset state as the template
-/// every new process/thread starts from. Call exactly once at boot,
-/// before `init::processes::init_all()` creates the first `Process`.
+/// Capture the clean reset state as the template every new process/thread
+/// starts from. Call exactly once at boot, after `cpu::init_this_cpu` has
+/// enabled SSE on the BSP and before `init::processes::init_all()` creates
+/// the first `Process`.
 pub fn init() {
-    unsafe {
-        enable_sse();
+    if let Err(e) = verify_this_cpu() {
+        panic!("fpu::init before SSE is enabled: {}", e);
     }
     let mut area = FpuState([0u8; 512]);
     unsafe {
         save(&mut area);
     }
     TEMPLATE.call_once(|| area);
-    crate::serial_println!("fpu: SSE enabled, default FXSAVE template captured");
+    crate::serial_println!("fpu: default FXSAVE template captured");
 }
 
 /// CR0.EM=0 (no #NM trap on SSE/x87 instructions — this kernel isn't
@@ -49,6 +50,32 @@ pub fn init() {
 /// CR4.OSFXSR=1 (enables `fxsave`/`fxrstor` and legacy SSE), CR4.OSXMMEXCPT=1
 /// (unmasked SIMD FP exceptions reported via #XM instead of silently
 /// disabled — matches what every real OS sets).
+pub fn init_this_cpu() {
+    // SAFETY: only SSE/x87 enable bits change; the kernel itself is built
+    // soft-float, so nothing in flight depends on their old values.
+    unsafe { enable_sse() }
+}
+
+const CR0_EM: u64 = 1 << 2;
+const CR0_MP: u64 = 1 << 1;
+const CR4_SSE: u64 = (1 << 9) | (1 << 10); // OSFXSR, OSXMMEXCPT
+
+/// Reads back what `init_this_cpu` set.
+pub fn verify_this_cpu() -> Result<(), &'static str> {
+    let (cr0, cr4): (u64, u64);
+    unsafe {
+        asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+    }
+    if cr0 & CR0_EM != 0 || cr0 & CR0_MP == 0 {
+        return Err("CR0.EM/MP not set up for SSE");
+    }
+    if cr4 & CR4_SSE != CR4_SSE {
+        return Err("CR4.OSFXSR/OSXMMEXCPT clear");
+    }
+    Ok(())
+}
+
 unsafe fn enable_sse() {
     let mut cr0: u64;
     unsafe { asm!("mov {}, cr0", out(reg) cr0, options(nostack, preserves_flags)); }

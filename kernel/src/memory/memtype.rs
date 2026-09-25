@@ -270,8 +270,10 @@ fn cpu_has_pat() -> bool {
 ///
 /// Must run before any process exists (every address space is cloned from
 /// the kernel's, so the walk covers them all) and before any later code
-/// could map `PWT`-only. Call it once per CPU: the SDM requires the PAT to
-/// be identical on all of them, so APs will need it too when SMP exists.
+/// could map `PWT`-only. BSP only, once: it *decides* the PAT. Every CPU —
+/// the BSP included — then gets the decided value from `init_this_cpu`
+/// (the SDM requires the PAT to be identical on all of them: a CPU left at
+/// the reset value would see the WC framebuffer mapping as write-through).
 ///
 /// The sequence is the SDM's (vol. 3A §11.11.8, which §11.12.4 points to
 /// for the PAT): caches off in no-fill mode, write back and invalidate,
@@ -282,7 +284,40 @@ fn cpu_has_pat() -> bool {
 pub fn program_pat() -> PatProgram {
     let r = program_pat_inner();
     PAT_PROGRAM.call_once(|| r);
+    if cpu_has_pat() {
+        // Whatever the outcome — programmed, already WC, blocked, even a
+        // mismatch — this is the PAT the BSP now runs with, so it is the one
+        // every other CPU must match.
+        PAT_REFERENCE.call_once(|| rdmsr(IA32_PAT));
+    }
     r
+}
+
+/// The BSP's `IA32_PAT` after `program_pat`; `None` without a PAT.
+static PAT_REFERENCE: spin::Once<u64> = spin::Once::new();
+
+/// Give this CPU the PAT `program_pat` settled on the BSP. Per-CPU step of
+/// `cpu::init_this_cpu`; writes only if this CPU's value differs.
+pub fn init_this_cpu() {
+    let Some(&want) = PAT_REFERENCE.get() else { return };
+    if rdmsr(IA32_PAT) != want {
+        // SAFETY: `want` is the PAT the BSP already runs with — a valid value
+        // (it was read back from hardware), and the one every mapping was
+        // made against.
+        unsafe { write_pat_sdm_sequence(want) };
+    }
+}
+
+/// Is this CPU's PAT the BSP's?
+pub fn verify_this_cpu() -> Result<(), &'static str> {
+    if !cpu_has_pat() {
+        return Ok(());
+    }
+    let want = *PAT_REFERENCE.get().ok_or("program_pat has not run")?;
+    if rdmsr(IA32_PAT) != want {
+        return Err("IA32_PAT differs from the BSP's");
+    }
+    Ok(())
 }
 
 fn program_pat_inner() -> PatProgram {

@@ -72,8 +72,23 @@ pub fn init_idt() {
     });
 }
 
-fn load_idt() {
+/// Shared by every CPU; each loads it itself (`cpu::init_this_cpu`). The
+/// BSP also loads it early in boot, so exceptions before that panic rather
+/// than triple-fault.
+pub fn load_idt() {
     IDT.get().unwrap().load();
+}
+
+/// Is this CPU's IDTR the kernel IDT?
+pub fn verify_idt() -> Result<(), &'static str> {
+    let idtr = x86_64::instructions::tables::sidt();
+    let idt = IDT.get().ok_or("IDT not built")?;
+    if idtr.base.as_u64() != idt as *const _ as u64
+        || idtr.limit as usize != core::mem::size_of::<InterruptDescriptorTable>() - 1
+    {
+        return Err("IDTR is not the kernel IDT");
+    }
+    Ok(())
 }
 
 // ============================================================================

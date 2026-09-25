@@ -778,3 +778,100 @@ fn set_pat_index_range_retypes_4k_leaves_and_refuses_the_rest() {
     }
     assert_eq!(leaf_for(VirtAddr::new(window)).unwrap().entry, entry_before);
 }
+
+/// Stage 3 of `docs/smp/smp-plan.md`: `cpu::init_this_cpu` is the *only*
+/// thing an AP will get, so every step in it must bring its register to the
+/// right value from wherever the CPU starts — not just leave the BSP's
+/// already-correct value alone. The BSP can't show that on its own (the
+/// bootloader and the early boot already set most of it), so this resets
+/// what can safely be reset on a live CPU to what an AP comes up with,
+/// checks the read-back notices each one, re-runs `init_this_cpu(0)`, and
+/// checks it all came back.
+///
+/// Left out on purpose: EFER.NXE (clearing it makes every NX PTE — the
+/// stack's included — a reserved-bit fault on the next access), the GDT/TR
+/// and the IDT (can't be torn down under the running code), and the LAPIC
+/// (the test boot never switches to it).
+///
+/// Resetting the PAT retypes whatever maps index 1 on this CPU for the few
+/// instructions until it is restored (another test here maps one page WC);
+/// QEMU doesn't model memory types, and the window is exactly the one an AP
+/// has between reset and this call.
+#[test_case]
+fn init_this_cpu_restores_what_an_ap_lacks() {
+    use x86_64::registers::model_specific::Msr;
+
+    const IA32_EFER: u32 = 0xC000_0080;
+    const IA32_STAR: u32 = 0xC000_0081;
+    const IA32_LSTAR: u32 = 0xC000_0082;
+    const IA32_FMASK: u32 = 0xC000_0084;
+    const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
+    const IA32_PAT: u32 = 0x277;
+    const PAT_POWER_ON: u64 = 0x0007_0406_0007_0406;
+    const CR0_WP: u64 = 1 << 16;
+    const CR4_OSXMMEXCPT: u64 = 1 << 10;
+
+    crate::cpu::verify_this_cpu(0).expect("BSP not fully initialised by boot_for_tests");
+
+    let read_cr = || -> (u64, u64) {
+        let (cr0, cr4): (u64, u64);
+        unsafe {
+            core::arch::asm!("mov {}, cr0", out(reg) cr0);
+            core::arch::asm!("mov {}, cr4", out(reg) cr4);
+        }
+        (cr0, cr4)
+    };
+    let msr = |m: u32| unsafe { Msr::new(m).read() };
+    let good = [IA32_EFER, IA32_STAR, IA32_LSTAR, IA32_FMASK, IA32_KERNEL_GS_BASE, IA32_PAT].map(msr);
+    let good_cr = read_cr();
+
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        // Each sabotage is checked to be *detected* before the next, so a
+        // step whose verify misses its own register fails here, by name.
+        let expect_fail = |step: &str| match crate::cpu::verify_this_cpu(0) {
+            Err((s, _)) => assert_eq!(s, step, "wrong step blamed"),
+            Ok(()) => panic!("verify did not notice the `{}` sabotage", step),
+        };
+
+        let (cr0, _) = read_cr();
+        core::arch::asm!("mov cr0, {}", in(reg) cr0 & !CR0_WP);
+        expect_fail("ctlregs");
+        core::arch::asm!("mov cr0, {}", in(reg) cr0);
+
+        Msr::new(IA32_KERNEL_GS_BASE).write(0);
+        expect_fail("gs");
+        Msr::new(IA32_KERNEL_GS_BASE).write(good[4]);
+
+        Msr::new(IA32_LSTAR).write(0);
+        expect_fail("syscall");
+        Msr::new(IA32_LSTAR).write(good[2]);
+
+        Msr::new(IA32_PAT).write(PAT_POWER_ON);
+        expect_fail("pat");
+        Msr::new(IA32_PAT).write(good[5]);
+
+        let (_, cr4) = read_cr();
+        core::arch::asm!("mov cr4, {}", in(reg) cr4 & !CR4_OSXMMEXCPT);
+        expect_fail("sse");
+        core::arch::asm!("mov cr4, {}", in(reg) cr4);
+
+        // Now all of it at once, as an AP would have it, and let
+        // `init_this_cpu` put it back.
+        Msr::new(IA32_EFER).write(good[0] & !1); // SCE
+        Msr::new(IA32_STAR).write(0);
+        Msr::new(IA32_LSTAR).write(0);
+        Msr::new(IA32_FMASK).write(0);
+        Msr::new(IA32_KERNEL_GS_BASE).write(0);
+        Msr::new(IA32_PAT).write(PAT_POWER_ON);
+        let (cr0, cr4) = read_cr();
+        core::arch::asm!("mov cr4, {}", in(reg) cr4 & !CR4_OSXMMEXCPT);
+        core::arch::asm!("mov cr0, {}", in(reg) cr0 & !CR0_WP);
+
+        if let Err((step, why)) = crate::cpu::init_this_cpu(0) {
+            panic!("init_this_cpu did not restore `{}`: {}", step, why);
+        }
+    });
+
+    assert_eq!([IA32_EFER, IA32_STAR, IA32_LSTAR, IA32_FMASK, IA32_KERNEL_GS_BASE, IA32_PAT].map(msr), good);
+    assert_eq!(read_cr(), good_cr);
+}
