@@ -512,8 +512,12 @@ impl FileHandle for RamFileHandle {
     }
 
     fn seek(&mut self, offset: i64, whence: i32) -> FileResult<i64> {
-        let mut cur = self.offset.lock();
+        // `data` before `offset`, like `read`/`write`: the handle's two
+        // locks are shared by every dup of it, and taking them in opposite
+        // orders is an ABBA deadlock the moment two CPUs run a read and a
+        // seek on one open file (stage 6 of `docs/smp/smp-plan.md`).
         let size = self.data.lock().len() as i64;
+        let mut cur = self.offset.lock();
         let new_pos = compute_seek(*cur as i64, size, offset, whence)?;
         *cur = new_pos as usize;
         Ok(new_pos)
