@@ -12,8 +12,8 @@
 > `memory::tlb`, `hal::tlb`, `tlb_selftest`); etapa 6 hecha y verificada en
 > QEMU y en la Ryzen (2026-09-25; ver su resolución: cada entrada del inventario resuelta
 > o asignada a la etapa 7, y cinco bugs reales encontrados por el camino).
-> Etapa 7 hecha y verificada en QEMU (2026-09-25; ver su resolución): los
-> APs ejecutan procesos. Falta verificarla en la Ryzen.
+> Etapa 7 hecha y verificada en QEMU y en la Ryzen (2026-09-25; ver su
+> resolución): los APs ejecutan procesos.
 
 ## Por qué ahora
 
@@ -854,6 +854,17 @@ un AP y ser desalojado a mitad del test; su primera corrida con 24 CPUs
 mandó el lector a la CPU del propio escritor ("reader never started").
 Corre con IF=0 (fijo en su CPU; sus esperas atienden shootdowns) y usa como
 lectores solo APs en idle distintos del suyo (`scheduler::cpu_is_idle`).
+
+**Verificada en la Ryzen** (2026-09-25, arranque #34, run
+`20260925-015646-c98dc4`, `OK exit=0`): 24/24 CPUs planificando; los 4
+carriles en paralelo sin un solo `FAIL` (esperaron 5 s, frente a 35 s en
+QEMU); `tlb_selftest` PASS contra 22 APs, stale 0; `max_concurrent=7`,
+`max_threads_parallel=3`, `invariants=ok`, `early_wakes` 2,
+`cow_faults_failed` 0; ningún proceso terminó con código distinto de 0 en
+lo que conserva el log. **Shootdowns: media 7 µs, máx. 4,9 ms** (13595,
+213888 IPIs) — los 69–213 ms de QEMU eran sobresuscripción del host, como se
+sospechaba; lejos del límite de 1 s. El ring perdió el principio del job
+(los tests secuenciales), no las mediciones.
 
 **Abierto:** la espera de un shootdown subió en QEMU bajo carga (media
 ~0,2–0,7 ms, máx. 69 ms con 8 vCPUs, frente a 13 µs/611 µs en los tests):
