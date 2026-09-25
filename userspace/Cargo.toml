@@ -12,6 +12,8 @@ path = "src/lib.rs"
 [dependencies]
 # The compositor's host-tested core (phase 2.4 of docs/gui/gui-plan.md).
 gui = { path = "../gui" }
+# The terminal emulator behind `term` (phase 3.4/3.5 of docs/gui/gui-plan.md).
+vt = { path = "../vt" }
 
 [profile.release]
 panic = "abort"

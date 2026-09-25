@@ -111,6 +111,7 @@ const POLLNVAL: i16 = 0x0020;
 const EPOLLIN:       u32 = 0x0000_0001;
 const EPOLLOUT:      u32 = 0x0000_0004;
 const EPOLLERR:      u32 = 0x0000_0008;
+const EPOLLHUP:      u32 = 0x0000_0010;
 const EPOLLET:       u32 = 0x8000_0000;
 
 const EPOLL_CTL_ADD: i32 = 1;
@@ -384,10 +385,7 @@ fn deliver_poll_result_phys(waiter: &PollWaiter, phys_offset: u64, write: bool) 
                     if watch.events & EPOLLIN  != 0 { poll_ev |= POLLIN; }
                     if watch.events & EPOLLOUT != 0 { poll_ev |= POLLOUT; }
                     let rev = fd_check_ready(socks, watch.fd, poll_ev);
-                    let mut epoll_rev: u32 = 0;
-                    if rev & POLLIN  != 0 { epoll_rev |= EPOLLIN; }
-                    if rev & POLLOUT != 0 { epoll_rev |= EPOLLOUT; }
-                    if rev & POLLERR != 0 { epoll_rev |= EPOLLERR; }
+                    let epoll_rev = epoll_revents(rev);
                     if epoll_rev != 0 {
                         let ev = EpollEvent { events: epoll_rev, data: watch.data };
                         let dst = (base + written as u64 * 12) as *mut EpollEvent;
@@ -401,6 +399,20 @@ fn deliver_poll_result_phys(waiter: &PollWaiter, phys_offset: u64, write: bool) 
             written
         }
     }
+}
+
+/// `poll` revents → epoll events. `POLLHUP` is reported whether or not it
+/// was asked for, as `POLLERR` is and as Linux does: a pty master whose
+/// last slave closed is *only* `POLLHUP` (it has no data), and dropping it
+/// here left an `epoll_wait` on the master asleep for good — the windowed
+/// terminal never saw its shell exit.
+fn epoll_revents(rev: i16) -> u32 {
+    let mut e = 0;
+    if rev & POLLIN  != 0 { e |= EPOLLIN; }
+    if rev & POLLOUT != 0 { e |= EPOLLOUT; }
+    if rev & POLLERR != 0 { e |= EPOLLERR; }
+    if rev & POLLHUP != 0 { e |= EPOLLHUP; }
+    e
 }
 
 // ── Waiter-scan helpers ────────────────────────────────────────────────────
@@ -631,10 +643,7 @@ fn epoll_ready(
             if watch.events & EPOLLIN  != 0 { poll_ev |= POLLIN; }
             if watch.events & EPOLLOUT != 0 { poll_ev |= POLLOUT; }
             let rev = fd_check_ready(socks, watch.fd, poll_ev);
-            let mut epoll_rev: u32 = 0;
-            if rev & POLLIN  != 0 { epoll_rev |= EPOLLIN; }
-            if rev & POLLOUT != 0 { epoll_rev |= EPOLLOUT; }
-            if rev & POLLERR != 0 { epoll_rev |= EPOLLERR; }
+            let epoll_rev = epoll_revents(rev);
             if epoll_rev != 0 {
                 if let Some(events_ptr) = events_ptr {
                     let ev = EpollEvent { events: epoll_rev, data: watch.data };

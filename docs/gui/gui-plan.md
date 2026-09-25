@@ -5,7 +5,8 @@
 > 2.2 a 2.5 hechos y verificados en QEMU y en la Ryzen (2.2 en el boot #43,
 > 2.3 y 2.5 en el #45; 2.4 son tests de host). Fase 2 cerrada. Fase 3 planificada
 > (decisiones del 2026-09-25); 3.1 a 3.3 hechos, 3.2 y 3.3 verificados en la
-> Ryzen (boot #46). 3.4 (`vt/`) hecho (tests de host). Siguiente: 3.5 (`term`).
+> Ryzen (boot #46). 3.4 (`vt/`) y 3.5 (`term`) hechos y verificados en
+> QEMU; falta la Ryzen.
 
 ## Por qué ahora, y por qué así
 
@@ -1032,3 +1033,52 @@ lo usará `userspace`. Todavía no es dependencia de nada; lo conecta 3.5.
   aplicado como `SGR`, Bloq Mayús sobre símbolos, Enter como `\n` y
   escribir en el relleno por los dos caminos, glifo y blanco — este
   último se escapaba hasta que el test tuvo una columna final en blanco).
+
+### Fase 3.5 (2026-09-25)
+
+`userspace/src/bin/term.rs`, embebido (398 KB: casi todo son los rásters
+de Noto en cuatro tamaños y dos pesos, porque el tamaño se elige al
+arrancar). Como se planeó, con estas decisiones y hallazgos:
+
+- **La fuente sale del `configure`.** El compositor sugiere la mitad de la
+  pantalla, así que `term` sabe su altura y usa la fuente que la consola
+  usaría en ella (`Font::for_screen_height`). 80×25 celdas, reducidas si
+  no caben con la barra de título y el desplazamiento en cascada. En QEMU
+  (1280x800): celdas de 9x20, ventana de 720x500.
+- **`TERM=xterm-256color`**, no el `linux` de la consola: `vt` es de tipo
+  xterm (ajuste diferido, `?1049`, `DECCKM`, 256 colores), y ese terminfo
+  ya viaja en el disco. Anuncia `REP` (`CSI n b`), que ncurses usa, así
+  que `vt` lo ganó (con un test).
+- **Autorrepetición de teclas en `term`**: 500 ms y luego ~30/s, como la
+  consola; el protocolo no la tiene. Al perder el foco se sueltan los
+  modificadores y se para la repetición.
+- **Un cuadro por `frame`**: el daño se acumula en la rejilla mientras el
+  compositor no ha devuelto el búfer (`release`) y el `done`; lo que llega
+  del maestro se lee entero (hasta 256 KiB por vuelta) y se dibuja una vez.
+- **^C y el grab (decisión del usuario):** el grab del teclado deja pasar
+  ^C/^\/^Z a la consola como salida de emergencia (`kernel/src/keyboard.rs`),
+  y el grupo en primer plano de la consola es el del compositor: el primer
+  ^C tecleado en `term` **mató al compositor**. Ahora el compositor ignora
+  `SIGINT` y `SIGTSTP`, y cada hijo que lanza vuelve a los valores por
+  defecto y se va a un grupo propio. `^\` (`SIGQUIT`) sigue terminando el
+  compositor como salida de emergencia; el precio es que un `^\` tecleado
+  en una ventana también lo hace. El kernel no cambió; DOOM y Quake siguen
+  igual.
+- **Bug del kernel: `epoll` perdía `POLLHUP`.** Traducía `POLLIN`/
+  `POLLOUT`/`POLLERR` y descartaba el cuelgue, que Linux informa siempre,
+  pedido o no. Un maestro de pty cuyo último esclavo se ha cerrado es *solo*
+  `POLLHUP` (no tiene datos), así que `term` dormía para siempre después
+  de `exit`. La traducción estaba duplicada; ahora es una función
+  (`epoll_revents`). `pty_test` no lo vio porque usa `poll`.
+
+**Verificado en QEMU:** `scripts/gui-e2e.sh term` (12 comprobaciones sobre
+`screendump`s: una fila roja de 80 columnas pintada con `printf` llena
+justo la fila 0 y el prompt sigue debajo, `^C` sobre `sleep 30` con el
+compositor vivo, `vi` en la pantalla alternativa y `:q` que devuelve la
+principal, `exit` que cierra la ventana, Ctrl+Alt+Backspace) PASS con
+PS/2, con teclado y ratón USB sin 8042 y con 8 GiB; `gui-e2e.sh` (modo
+`gui_demo`) PASS. Sin el arreglo de `EPOLLHUP`, T5 falla. En 0
+`pty_test`, `input_poll_test`, `userlib_test`, `socket_test`,
+`session_test`, `jobctl_test`, `wait_intr_test`, `lifecycle_test`,
+`pipe_multi_test`, `poll_test` e `ipc_ping`; `boot-matrix.sh 4 5` 20/20;
+`run-kernel-tests.sh` PASS; `vt` 58 tests.

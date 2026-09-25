@@ -107,7 +107,11 @@ const SYS_SIGACTION: u64 = 13;
 const SYS_SIGPROCMASK: u64 = 14;
 const SYS_FORK: u64 = 57;
 const SYS_KILL: u64 = 62;
+const SYS_SETSID: u64 = 112;
+const SYS_SETPGID: u64 = 109;
 
+pub const SIGINT: u32 = 2;
+pub const SIGQUIT: u32 = 3;
 pub const SIGKILL: u32 = 9;
 pub const SIGUSR1: u32 = 10;
 pub const SIGSEGV: u32 = 11;
@@ -115,6 +119,7 @@ pub const SIGUSR2: u32 = 12;
 pub const SIGPIPE: u32 = 13;
 pub const SIGTERM: u32 = 15;
 pub const SIGCHLD: u32 = 17;
+pub const SIGTSTP: u32 = 20;
 
 pub const SIG_BLOCK: i32 = 0;
 pub const SIG_UNBLOCK: i32 = 1;
@@ -368,6 +373,17 @@ pub fn waitpid_status(child_pid: i64) -> (i64, i32) {
     let mut status: i32 = 0;
     let r = unsafe { syscall3(SYS_WAITPID, child_pid as u64, &mut status as *mut i32 as u64, 0) };
     (r, status)
+}
+
+/// `setpgid(pid, pgid)`; `(0, 0)` makes the caller a group of its own.
+pub fn setpgid(pid: i64, pgid: i64) -> i64 {
+    unsafe { syscall2(SYS_SETPGID, pid as u64, pgid as u64) }
+}
+
+/// A new session and process group led by the caller (`EPERM` if a group
+/// with its pid already exists). Returns the new session id.
+pub fn setsid() -> i64 {
+    unsafe { syscall0(SYS_SETSID) }
 }
 
 /// Sends `sig` to `pid`. Only single-pid targets (no process groups).

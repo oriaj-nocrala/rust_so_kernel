@@ -10,7 +10,7 @@
 //! Recognised: everything the kernel console handles (`CUP`, `CUU`…,
 //! `ED`, `EL`, `SGR` with 16/256/RGB colour, bold, reverse) plus what
 //! `vi`, `less` and `top` use — `DECSTBM`, `IL`/`DL`/`ICH`/`DCH`/`ECH`,
-//! `SU`/`SD`, `CHA`/`VPA`/`HPA`/`CNL`/`CPL`, `IND`/`NEL`/`RI`, `DECSC`/
+//! `SU`/`SD`, `REP`, `CHA`/`VPA`/`HPA`/`CNL`/`CPL`, `IND`/`NEL`/`RI`, `DECSC`/
 //! `DECRC` (`ESC 7`/`8`, `CSI s`/`u`), `RIS`, and the private modes 1
 //! (`DECCKM`), 7 (autowrap), 25 (cursor), 47/1047/1048/1049 (alternate
 //! screen). `DSR 5n`/`6n` and `DA` are answered through
@@ -52,6 +52,8 @@ pub struct Parser {
     /// UTF-8: the code point so far and the continuation bytes still due.
     utf8: u32,
     utf8_need: u8,
+    /// The last character printed, for `REP`.
+    last: Option<char>,
     replies: Vec<u8>,
 }
 
@@ -72,6 +74,7 @@ impl Parser {
             intermediate: 0,
             utf8: 0,
             utf8_need: 0,
+            last: None,
             replies: Vec::new(),
         }
     }
@@ -96,12 +99,12 @@ impl Parser {
                 self.utf8 = self.utf8 << 6 | (b & 0x3F) as u32;
                 self.utf8_need -= 1;
                 if self.utf8_need == 0 {
-                    grid.print(char::from_u32(self.utf8).unwrap_or('\u{FFFD}'));
+                    self.print(grid, char::from_u32(self.utf8).unwrap_or('\u{FFFD}'));
                 }
                 return;
             }
             self.utf8_need = 0;
-            grid.print('\u{FFFD}');
+            self.print(grid, '\u{FFFD}');
         }
 
         match b {
@@ -156,13 +159,18 @@ impl Parser {
     fn ground(&mut self, grid: &mut Grid, b: u8) {
         match b {
             0x00..=0x1F | 0x7F => self.control(grid, b),
-            0x20..=0x7E => grid.print(b as char),
+            0x20..=0x7E => self.print(grid, b as char),
             0xC2..=0xDF => self.start_utf8(b & 0x1F, 1),
             0xE0..=0xEF => self.start_utf8(b & 0x0F, 2),
             0xF0..=0xF4 => self.start_utf8(b & 0x07, 3),
             // A stray continuation byte or an invalid lead.
-            _ => grid.print('\u{FFFD}'),
+            _ => self.print(grid, '\u{FFFD}'),
         }
+    }
+
+    fn print(&mut self, grid: &mut Grid, c: char) {
+        grid.print(c);
+        self.last = Some(c);
     }
 
     fn start_utf8(&mut self, bits: u8, need: u8) {
@@ -204,7 +212,10 @@ impl Parser {
                 grid.index();
             }
             b'M' => grid.reverse_index(),
-            b'c' => grid.reset(),
+            b'c' => {
+                grid.reset();
+                self.last = None;
+            }
             // `=`/`>` (keypad modes) and everything else: ignored.
             _ => {}
         }
@@ -293,6 +304,15 @@ impl Parser {
             b'S' => grid.scroll_up(self.n(0)),
             b'T' => grid.scroll_down(self.n(0)),
             b'X' => grid.erase_chars(self.n(0)),
+            // `REP`: xterm-256color's terminfo advertises it, so ncurses
+            // uses it. Capped at a screenful: the count is the program's.
+            b'b' => {
+                if let Some(c) = self.last {
+                    for _ in 0..self.n(0).min(grid.cols() * grid.rows()) {
+                        grid.print(c);
+                    }
+                }
+            }
             b'm' => self.sgr(grid),
             b'r' => {
                 let bottom = self.arg(1, grid.rows() as u32) as usize;
@@ -598,6 +618,15 @@ mod tests {
         p.feed(&mut g, b"\xE2\x82");
         p.feed(&mut g, b"\xAC");
         assert_eq!(g.cell(2, 4).ch, '€');
+    }
+
+    #[test]
+    fn rep_repeats_the_last_character_and_is_capped() {
+        let (mut g, mut p) = term(10, 2);
+        feed(&mut g, &mut p, "\x1b[3bab\x1b[3b");
+        assert_eq!(g.row_text(0), "abbbb", "nothing to repeat at first");
+        feed(&mut g, &mut p, "\x1b[2;1H\x1b[4294967295b");
+        assert_eq!(g.row_text(1), "bbbbbbbbbb");
     }
 
     #[test]

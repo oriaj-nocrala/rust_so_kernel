@@ -126,6 +126,13 @@ fn spawn(name: &[u8]) {
     path[prefix.len()..n].copy_from_slice(&name[..n - prefix.len()]);
     let pid = syscall::fork();
     if pid == 0 {
+        // A group of its own with the default ^C/^Z: the console's
+        // foreground group is ours, and a key typed into a terminal
+        // window would otherwise reach the client twice — once through
+        // the window and once as a console signal (see `main`).
+        syscall::setpgid(0, 0);
+        syscall::sigaction(syscall::SIGINT, 0);
+        syscall::sigaction(syscall::SIGTSTP, 0);
         // Nothing past stdio goes to the client: the kernel does not act on
         // close-on-exec, and a child holding our /dev/fb0 or grabbed
         // event0 would keep graphics mode and the keyboard after we die.
@@ -201,6 +208,15 @@ fn read_input(fd: i32, mut f: impl FnMut(u16, u16, i32)) {
 }
 
 fn main(args: Args) -> i32 {
+    // The keyboard grab still lets ^C/^\/^Z signal the console's
+    // foreground group — ours — as an escape hatch for a hung grabber
+    // (`kernel/src/keyboard.rs`). A ^C or ^Z typed into `term` is meant for
+    // the shell in that window, so both are ignored here; ^\ (SIGQUIT)
+    // still ends the compositor, which is the hatch that stays, and the
+    // price is that a ^\ typed into a window does too. Children get the
+    // defaults back and a group of their own (`spawn`).
+    syscall::sigaction(syscall::SIGINT, 1);
+    syscall::sigaction(syscall::SIGTSTP, 1);
     // ── the screen ────────────────────────────────────────────────────────
     let fb = open_path("/dev/fb0", syscall::O_RDWR);
     if fb < 0 {

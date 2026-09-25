@@ -17,8 +17,24 @@
 #   5. The keys did not reach ash (the keyboard was grabbed).
 #   6. Ctrl+Alt+Backspace quits; gui_demo sees EOF; the console comes back
 #      and typing works.
+#
+#   scripts/gui-e2e.sh term     # the windowed terminal instead (phase 3.5)
+#
+# `term` mode checks, in order (rows of colour drawn with printf are what
+# the screendumps are checked for, so no OCR is needed):
+#   T1. `compositor term` maps an 80x25 window with a focused title bar.
+#   T2. `clear; printf` of an 80-column red row: it fills row 0 exactly, the
+#       deferred wrap leaves no blank row after it, and a new prompt
+#       follows (parser -> grid -> render -> surface, end to end).
+#   T3. ^C ends a `sleep 30` in the window and the compositor survives it
+#       (the grab's console ^C must not reach it); a green row follows.
+#   T4. `vi` takes the alternate screen (the red row is gone) and `:q`
+#       brings the primary one back.
+#   T5. `exit` in the window: ash exits, term exits, the window goes away.
+#   T6. Ctrl+Alt+Backspace; the console comes back and typing works.
 # Exit status: number of failed checks.
 set -u
+MODE=${1:-demo}
 cd "$(dirname "$0")/.."
 Q=scripts/qemu-debug.sh
 STATE=${QEMU_DEBUG_STATE_DIR:-/tmp/qemu-debug-rust_so_kernel}
@@ -43,6 +59,12 @@ for y in range(H - 2):
             print(x, y); raise SystemExit
 print('none')"
 }
+has() { # has <png> <r,g,b> <x0> <y0> <x1> <y1>  -> yes/no
+    python3 -c "
+from PIL import Image
+im = Image.open('$1').convert('RGB'); want = tuple(int(v) for v in '$2'.split(','))
+print('yes' if any(im.getpixel((x, y)) == want for y in range($4, $6) for x in range($3, $5)) else 'no')"
+}
 shot() { $Q screendump "$OUT/$1.png" >/dev/null; echo "$OUT/$1.png"; }
 
 BG=32,48,64          # gui::compositor::BACKGROUND
@@ -51,6 +73,60 @@ FOCUSED=80,120,176   # TITLE_FOCUSED
 $Q stop >/dev/null 2>&1
 QEMU_DEBUG_SMP=${QEMU_DEBUG_SMP:-4} $Q start >/dev/null 2>&1 || { echo "start failed"; exit 99; }
 $Q wait-for "/ #" 120 >/dev/null || { echo "no shell prompt"; exit 99; }
+
+if [ "$MODE" = term ]; then
+    RED=224,108,117; GREEN=152,195,121; BLACK=0,0,0
+    # Content origin (40, 40 + title bar); cells are read from term's log.
+    X0=40; Y0=60
+    $Q send "compositor term" && $Q enter
+    $Q wait-for "term: 80x25 cells" 30 >/dev/null || bad "T1 term never started"
+    cell=$(grep -ao "term: 80x25 cells of [0-9]*x[0-9]*" "$STATE/serial.log" | tail -1 | grep -o "[0-9]*x[0-9]*$")
+    CW=${cell%x*}; CH=${cell#*x}; CW=${CW:-9}; CH=${CH:-20}
+    X1=$((X0 + 80 * CW)); Y1=$((Y0 + 25 * CH))
+    sleep 2
+    s=$(shot t1)
+    [ "$(px "$s" 45 45)" = "$FOCUSED" ] && ok "T1 focused term window at (40,40)" || bad "T1 title bar: $(px "$s" 45 45)"
+
+    $Q send "clear; printf '\\033[41m%80s\\033[0m\\n' ''" && $Q enter; sleep 2
+    s=$(shot t2)
+    mid=$((Y0 + CH / 2))
+    [ "$(px "$s" $((X0 + 2)) $mid)" = "$RED" ] && [ "$(px "$s" $((X1 - 2)) $mid)" = "$RED" ] \
+        && ok "T2 red row spans row 0" || bad "T2 row 0: $(px "$s" $((X0 + 2)) $mid) .. $(px "$s" $((X1 - 2)) $mid)"
+    [ "$(px "$s" $((X1 + 2)) $mid)" != "$RED" ] && ok "T2 nothing past column 80" || bad "T2 red outside the window"
+    [ "$(has "$s" "$RED" $X0 $((Y0 + CH)) $X1 $Y1)" = no ] && ok "T2 only one red row" || bad "T2 red below row 0"
+    [ "$(has "$s" "$BLACK" $X0 $((Y0 + CH)) $((X0 + 4 * CW)) $((Y0 + 2 * CH)))" = yes ] \
+        && [ "$(px "$s" $((X0 + 4 * CW + 2)) $((Y0 + CH + CH / 2)))" != "$BLACK" ] \
+        && ok "T2 prompt right below (deferred wrap)" || bad "T2 no prompt on row 1"
+
+    $Q send "sleep 30" && $Q enter; sleep 1; $Q key ctrl-c; sleep 1
+    $Q send "printf '\\033[42m%10s\\033[0m\\n' ''" && $Q enter; sleep 2
+    s=$(shot t3)
+    [ "$(has "$s" "$GREEN" $X0 $Y0 $X1 $Y1)" = yes ] && ok "T3 ^C ended sleep; the shell answers" || bad "T3 no green row"
+    [ "$(px "$s" 45 45)" = "$FOCUSED" ] && ok "T3 compositor survived ^C" || bad "T3 window gone: $(px "$s" 45 45)"
+    grep -aq "Killed PID [0-9]* (compositor)" "$STATE/serial.log" && bad "T3 compositor killed"
+
+    $Q send "vi /tmp/e2e.txt" && $Q enter; sleep 2
+    s=$(shot t4)
+    [ "$(has "$s" "$RED" $X0 $Y0 $X1 $Y1)" = no ] && ok "T4 vi on the alternate screen" || bad "T4 red row still visible in vi"
+    $Q send ":q" && $Q enter; sleep 2
+    s=$(shot t5)
+    [ "$(px "$s" $((X0 + 2)) $mid)" = "$RED" ] && [ "$(has "$s" "$GREEN" $X0 $Y0 $X1 $Y1)" = yes ] \
+        && ok "T4 :q restored the primary screen" || bad "T4 primary screen not restored"
+
+    $Q send "exit" && $Q enter
+    $Q wait-for "term: shell gone" 15 >/dev/null && ok "T5 exit: term saw the shell go" || bad "T5 term did not notice"
+    sleep 1
+    s=$(shot t6)
+    [ "$(px "$s" 45 45)" = "$BG" ] && ok "T5 window gone" || bad "T5 window still there: $(px "$s" 45 45)"
+
+    $Q key ctrl-alt-backspace; sleep 2
+    $Q send "echo console-is-back" && $Q enter
+    $Q wait-for "^.fb. console-is-back" 10 >/dev/null && ok "T6 console and keyboard back" || bad "T6 typing does not reach ash"
+    grep -aq "KERNEL PANIC" "$STATE/serial.log" && bad "kernel panic in the log"
+    $Q stop >/dev/null 2>&1
+    echo "gui-e2e term: $([ $fails = 0 ] && echo PASS || echo "FAIL ($fails)")"
+    exit $fails
+fi
 
 $Q send "compositor gui_demo" && $Q enter
 $Q wait-for "gui_demo: focus in" 30 >/dev/null || bad "gui_demo never got focus"

@@ -510,6 +510,9 @@ fn build_kernel() -> PathBuf {
     // A path dependency of `userspace` (the compositor's core): an edit
     // there changes the embedded Rust programs.
     watch_dir_recursive(&manifest_dir.join("gui/src"));
+    // `vt` is `term`'s emulator (phase 3.4/3.5), a path dependency of
+    // `userspace` exactly like `gui`.
+    watch_dir_recursive(&manifest_dir.join("vt/src"));
     watch_dir_recursive(&manifest_dir.join("mlibc-port"));
     watch_dir_recursive(&manifest_dir.join("doom-port"));
     watch_dir_recursive(&manifest_dir.join("quake-port"));
