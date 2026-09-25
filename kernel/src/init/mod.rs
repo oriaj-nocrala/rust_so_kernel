@@ -20,6 +20,11 @@ use crate::{
 
 pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     devices::init_idt();
+    // `vfs`'s locks answer TLB shootdowns while spinning, like the
+    // kernel's own (`crate::sync`); `vfs` can't name `memory::tlb` itself.
+    vfs::lock::set_relax_hook(|| {
+        crate::memory::tlb::service_pending();
+    });
 
     // ── Framebuffer setup ──────────────────────────────────────────
     // Stays here because buffer_mut() requires the &'static mut

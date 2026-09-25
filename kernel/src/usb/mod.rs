@@ -47,7 +47,7 @@
 
 pub mod xhci;
 
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use crate::hal::{Driver, DriverError};
 

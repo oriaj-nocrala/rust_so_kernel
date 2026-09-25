@@ -42,6 +42,7 @@ mod pit;
 mod rtc;
 mod serial;
 mod smp;
+mod sync;
 #[cfg(test)]
 mod test_framework;
 mod time;

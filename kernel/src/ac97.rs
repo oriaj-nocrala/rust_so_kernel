@@ -29,7 +29,7 @@
 // no lock held across the spin) until a buffer-descriptor slot frees.
 
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 pub use hal::ac97::{Ac97Regs, BDL_ENTRIES, BdlEntry, RING_SLOTS, SLOT_BYTES, SLOT_ORDER};
 

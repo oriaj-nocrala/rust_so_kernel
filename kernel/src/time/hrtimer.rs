@@ -19,7 +19,7 @@
 //   The callback must NOT attempt to re-acquire QUEUE.
 
 use alloc::vec::Vec;
-use spin::Mutex;
+use crate::sync::Mutex;
 
 pub enum HrTimerAction {
     /// Wake the process with this PID.
@@ -48,7 +48,7 @@ impl HrTimerQueue {
     }
 }
 
-static QUEUE: Mutex<HrTimerQueue> = Mutex::new(HrTimerQueue::new());
+static QUEUE: crate::sync::IrqLock<HrTimerQueue> = crate::sync::IrqLock::new(HrTimerQueue::new());
 
 /// Schedule a new hrtimer.
 ///

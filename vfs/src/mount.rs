@@ -22,7 +22,7 @@
 // See `docs/fs/vfs-extraction-plan.md`, step 4.
 
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
-use spin::Mutex;
+use crate::lock::Mutex;
 
 use crate::file::FileHandle;
 use crate::inode::{Filesystem, Inode};

@@ -86,7 +86,7 @@ struct State {
     flushes: u32,
 }
 
-static STATE: spin::Mutex<Option<State>> = spin::Mutex::new(None);
+static STATE: crate::sync::Mutex<Option<State>> = crate::sync::Mutex::new(None);
 
 /// Staging buffer for ring sectors on their way to the disk. Only touched
 /// while `STATE` is held; a static rather than part of `State` so building

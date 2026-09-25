@@ -283,7 +283,7 @@ struct Claim {
 
 /// A real lock, not IF=0: claims are made from driver init and read from
 /// process context, never from an ISR, and never while allocating.
-static CLAIMS: spin::Mutex<[Option<Claim>; MAX_CLAIMS]> = spin::Mutex::new([None; MAX_CLAIMS]);
+static CLAIMS: crate::sync::Mutex<[Option<Claim>; MAX_CLAIMS]> = crate::sync::Mutex::new([None; MAX_CLAIMS]);
 
 /// Records that `driver` owns function `bus:device.function`.
 pub fn claim(bus: u8, device: u8, function: u8, driver: &'static str) {

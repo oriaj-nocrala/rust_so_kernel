@@ -6,7 +6,7 @@
 // that parent/child processes after fork() see a consistent cursor.
 
 use alloc::boxed::Box;
-use spin::Mutex;
+use crate::sync::Mutex;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::{

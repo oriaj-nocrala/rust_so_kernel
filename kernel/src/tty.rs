@@ -21,7 +21,7 @@
 // the same once it puts the tty in raw mode via tcsetattr.
 
 use core::sync::atomic::{AtomicU32, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 pub const NCCS: usize = 11;
 
@@ -78,7 +78,7 @@ const fn default_termios() -> Termios {
     }
 }
 
-pub static TERMIOS: Mutex<Termios> = Mutex::new(default_termios());
+pub static TERMIOS: crate::sync::IrqLock<Termios> = crate::sync::IrqLock::new(default_termios());
 
 /// Foreground process group of the console tty (job control). Whatever
 /// group is foreground gets SIGINT/SIGQUIT/SIGTSTP from the keyboard/serial

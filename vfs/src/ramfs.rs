@@ -18,7 +18,7 @@
 
 use alloc::{boxed::Box, collections::BTreeMap, string::String, string::ToString, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use spin::Mutex;
+use crate::lock::Mutex;
 
 use crate::types::{DirEntry, Errno, FileType, OpenFlags, Stat};
 use crate::inode::{Filesystem, Inode};
@@ -174,7 +174,7 @@ impl RamDirNode {
 /// through to the `BTreeMap` so callers use it exactly like the plain
 /// guard they used to hold.
 struct TrackedEntriesGuard<'a> {
-    guard: spin::MutexGuard<'a, BTreeMap<String, Arc<dyn Inode>>>,
+    guard: crate::lock::MutexGuard<'a, BTreeMap<String, Arc<dyn Inode>>>,
     observer: &'static dyn DirLockObserver,
 }
 

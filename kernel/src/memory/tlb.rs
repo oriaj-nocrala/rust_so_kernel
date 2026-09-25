@@ -38,11 +38,13 @@
 //
 // A CPU waiting with IF=0 can't take the IPI, so every IF=0 wait that
 // could be on the other end of a shootdown calls `service_pending` itself:
-// the spin for `SENDER` (two CPUs shooting each other down), and — through
-// `diag::IrqControl::relax` — every `IrqMutex` spin (the sender may hold
-// `BUDDY`, see `unmap_page_and_free_2m_with_buddy`). A wait that does
-// neither (a plain `spin::Mutex` taken with IF=0, such as the scheduler's)
-// is a deadlock waiting for stage 7 to make it reachable.
+// the spin for `SENDER` (two CPUs shooting each other down), every
+// `IrqMutex` spin (through `diag::IrqControl::relax` — the sender may hold
+// `BUDDY`, see `unmap_page_and_free_2m_with_buddy`), every kernel
+// `crate::sync::Mutex` spin (its relax strategy — the scheduler's lock
+// among them, since stage 6), and the USB transfer waits, which poll the
+// controller with IF=0 for up to seconds. **A new IF=0 busy-wait must do
+// the same**; `spin::Mutex` itself must not be used in the kernel.
 //
 // The ordering that makes "who has it loaded" safe to read without a lock:
 // a CPU publishes `LOADED[cpu]` *before* writing CR3, and the sender reads

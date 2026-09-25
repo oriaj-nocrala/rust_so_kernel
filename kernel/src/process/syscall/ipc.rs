@@ -999,12 +999,12 @@ fn install_scm_rights(msg: &UserMsghdr, fds: Vec<Box<dyn FileHandle>>) -> Result
 
 // ── fd-table plumbing ───────────────────────────────────────────────────
 
-fn current_files() -> alloc::sync::Arc<spin::Mutex<crate::process::file::FileDescriptorTable>> {
+fn current_files() -> alloc::sync::Arc<crate::sync::Mutex<crate::process::file::FileDescriptorTable>> {
     let guard = crate::process::irq_guard::SchedGuard::lock();
     guard
         .running_ref()
         .map(|p| p.files.clone())
-        .unwrap_or_else(|| alloc::sync::Arc::new(spin::Mutex::new(
+        .unwrap_or_else(|| alloc::sync::Arc::new(crate::sync::Mutex::new(
             crate::process::file::FileDescriptorTable::new(),
         )))
 }

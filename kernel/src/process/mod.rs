@@ -3,7 +3,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use spin::Mutex;
+use crate::sync::Mutex;
 use x86_64::VirtAddr;
 use crate::memory::address_space::AddressSpace;
 

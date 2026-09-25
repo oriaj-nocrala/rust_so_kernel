@@ -41,6 +41,9 @@ use x86_64::VirtAddr;
 /// today's test cases need already initialized before `test_main` runs.
 pub fn boot_for_tests(boot_info: &'static mut BootInfo) {
     super::devices::init_idt();
+    vfs::lock::set_relax_hook(|| {
+        crate::memory::tlb::service_pending();
+    });
 
     let phys_mem_offset = VirtAddr::new(
         boot_info

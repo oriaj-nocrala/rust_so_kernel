@@ -119,7 +119,7 @@ fn write_fs_base(val: u64) {
         );
     }
 }
-use spin::Mutex;
+use crate::sync::Mutex;
 use x86_64::VirtAddr;
 use super::{Process, Pid, ProcessState, TrapFrame};
 use crate::memory::address_space::AddressSpace;

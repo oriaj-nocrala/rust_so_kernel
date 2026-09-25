@@ -3,7 +3,7 @@
 // Process lifecycle + control syscalls: fork/clone/exec/exit/waitpid/kill/
 // getpid/setpgid/getpgid/setsid/yield/nanosleep/arch_prctl/set_tid_address.
 
-use spin::Mutex;
+use crate::sync::Mutex;
 use crate::serial_println;
 use crate::process::TrapFrame;
 use super::{

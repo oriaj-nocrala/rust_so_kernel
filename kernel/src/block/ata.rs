@@ -12,7 +12,7 @@
 // No PCI/virtio needed: QEMU's default `pc` (i440fx) machine always
 // exposes the legacy PIIX3 IDE controller at these fixed ISA ports.
 
-use spin::Mutex;
+use crate::sync::Mutex;
 use x86_64::instructions::port::Port;
 
 const DATA: u16          = 0x170;

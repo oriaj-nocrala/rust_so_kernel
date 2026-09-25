@@ -1,7 +1,7 @@
 // kernel/src/process/syscall/poll.rs
 //
 use alloc::collections::BTreeMap;
-use spin::Mutex;
+use crate::sync::Mutex;
 use crate::process::TrapFrame;
 use super::{errno, SyscallResult, validate_user_buffer, current_tf_ptr};
 use usock::SocketId;
@@ -161,7 +161,7 @@ impl EpollInstanceTable {
     }
 }
 
-static EPOLL_INSTANCES: Mutex<EpollInstanceTable> = Mutex::new(EpollInstanceTable::new());
+static EPOLL_INSTANCES: crate::sync::IrqLock<EpollInstanceTable> = crate::sync::IrqLock::new(EpollInstanceTable::new());
 
 /// pid×fd → EpollInstanceId side table (0 = not an epoll fd).
 static EPOLL_FD_MAP: Mutex<BTreeMap<usize, [EpollInstanceId; MAX_FILES_PER_PROC]>> =
@@ -235,7 +235,7 @@ struct PollWaiter {
 }
 
 /// One entry per PID — a process can only have one outstanding poll/epoll_wait.
-static POLL_WAITERS: Mutex<BTreeMap<usize, PollWaiter>> = Mutex::new(BTreeMap::new());
+static POLL_WAITERS: crate::sync::IrqLock<BTreeMap<usize, PollWaiter>> = crate::sync::IrqLock::new(BTreeMap::new());
 
 // ── FD readiness ───────────────────────────────────────────────────────────
 

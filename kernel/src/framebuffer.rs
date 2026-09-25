@@ -1,5 +1,5 @@
 use font8x8::legacy::BASIC_LEGACY;
-use spin::Mutex;
+use crate::sync::Mutex;
 use core::ptr::NonNull;
 
 /// Glyph pixel size at `scale == 1`, derived from `BASIC_LEGACY` itself

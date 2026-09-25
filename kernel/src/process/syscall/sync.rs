@@ -2,7 +2,7 @@
 //
 // futex(202) — wait/wake, backs mlibc mutexes/condvars.
 
-use spin::Mutex;
+use crate::sync::Mutex;
 use crate::process::TrapFrame;
 use super::{errno, SyscallResult, validate_user_buffer, current_tf_ptr};
 use alloc::collections::BTreeMap;

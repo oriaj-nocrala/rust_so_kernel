@@ -32,8 +32,8 @@ static VERIFIED: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS]
 const DONE: u32 = 1 << 31;
 /// Per CPU: the first failing step's message. Written by that CPU during
 /// its init, read by `/proc/kdebug`; no ISR touches it.
-static FIRST_ERROR: [spin::Mutex<Option<&'static str>>; MAX_CPUS] =
-    [const { spin::Mutex::new(None) }; MAX_CPUS];
+static FIRST_ERROR: [crate::sync::Mutex<Option<&'static str>>; MAX_CPUS] =
+    [const { crate::sync::Mutex::new(None) }; MAX_CPUS];
 
 /// Set up everything CPU `cpu` holds for itself, then verify it. Interrupts
 /// must be off. The BSP calls this once in boot with `cpu = 0`; each AP will

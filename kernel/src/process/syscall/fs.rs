@@ -5,7 +5,7 @@
 // rmdir/unlink/symlink/readlink/chmod/fchmod/statvfs/getcwd/chdir, plus the
 // stdin blocking-read machinery (keyboard ISR wakeup path).
 
-use spin::Mutex;
+use crate::sync::Mutex;
 use crate::process::TrapFrame;
 use super::{
     errno, SyscallResult, with_current_process, validate_user_buffer,
@@ -17,7 +17,7 @@ struct StdinWaiter {
     user_buf: u64,
 }
 
-static STDIN_WAITER: Mutex<Option<StdinWaiter>> = Mutex::new(None);
+static STDIN_WAITER: crate::sync::IrqLock<Option<StdinWaiter>> = crate::sync::IrqLock::new(None);
 
 // ============================================================================
 // SYSCALL IMPLEMENTATIONS

@@ -123,6 +123,7 @@ extern crate alloc;
 pub mod dirent;
 pub mod file;
 pub mod inode;
+pub mod lock;
 pub mod mount;
 pub mod path;
 pub mod ramfs;

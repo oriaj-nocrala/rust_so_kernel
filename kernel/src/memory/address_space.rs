@@ -7,7 +7,7 @@
 // else is wiring changes.
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 use x86_64::{
     VirtAddr,
     structures::paging::{Page, PageTableFlags, PhysFrame, Size2MiB, Size4KiB, mapper::MapToError},

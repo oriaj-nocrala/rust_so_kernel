@@ -34,7 +34,7 @@
 // 100+ = mount placeholder dirs (index into `direct_children`, cosmetic only).
 
 use alloc::{boxed::Box, sync::Arc};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use crate::fs::{
     types::{DirEntry, Errno, FileType, OpenFlags, Stat},

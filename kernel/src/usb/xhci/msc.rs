@@ -498,6 +498,9 @@ impl Xhci {
             if spins > 1_000_000_000 {
                 break;
             }
+            // IF=0 here (transfers run with interrupts off, see
+            // `usb::storage_read`): answer shootdowns while waiting.
+            crate::memory::tlb::service_pending();
             core::hint::spin_loop();
         }
 

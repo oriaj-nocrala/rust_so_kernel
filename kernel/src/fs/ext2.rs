@@ -131,7 +131,8 @@
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use spin::{Mutex, Once};
+use crate::sync::Mutex;
+use spin::Once;
 
 use crate::block::BlockDevice;
 

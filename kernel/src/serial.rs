@@ -18,7 +18,7 @@
 
 use core::fmt;
 use x86_64::instructions::port::Port;
-use spin::Mutex;
+use crate::sync::Mutex;
 
 // ============================================================================
 // Locked writer (general use)
@@ -67,7 +67,21 @@ pub fn is_locked() -> bool {
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
-    SERIAL.lock().write_fmt(args).unwrap();
+    // With IF=0 this may be an ISR (the page-fault kill path, a signal's
+    // default action in the tick) that interrupted a holder of `SERIAL` on
+    // this very CPU, which can't release it until the ISR returns: waiting
+    // would hang the machine. So with IF=0 only *try*, and fall back to the
+    // lock-free writer — the line may interleave with the holder's, which
+    // is the same trade `serial_println_raw!` already makes. (Taking the
+    // lock with IF=0 on every print instead would keep interrupts off for
+    // the whole UART transmission, ~87 µs a character on a real 16550.)
+    if x86_64::instructions::interrupts::are_enabled() {
+        SERIAL.lock().write_fmt(args).unwrap();
+    } else if let Some(mut s) = SERIAL.try_lock() {
+        s.write_fmt(args).unwrap();
+    } else {
+        let _ = RawSerialWriter.write_fmt(args);
+    }
 }
 
 #[macro_export]
