@@ -84,7 +84,15 @@ fn run_autorun_job() {
     } else {
         // This kernel's wait-status encoding, not Linux's — see
         // `Process::wait_status_word` and mlibc-port's `abi-bits/wait.h`.
-        let (_, status) = syscall::waitpid_status(pid);
+        // Wait with -1, not `pid`: orphans the job leaves behind are PID 1's
+        // to reap (see `wait_reaping_orphans`), and until they are, they
+        // stay visible in /proc as zombies to the job itself.
+        let status = loop {
+            let (r, status) = syscall::waitpid_status(-1);
+            if r == pid || r < 0 {
+                break status;
+            }
+        };
         if status & 0x400 != 0 {
             println!("METAL-DONE {} signal={}", nonce, (status >> 24) & 0xff);
         } else if status & 0x200 != 0 {
