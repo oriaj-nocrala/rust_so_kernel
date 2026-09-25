@@ -96,7 +96,7 @@ so addresses actually resolve to real function names instead of bare hex.
 ### QEMU integration tests
 
 Real hardware-path behavior (drivers that need actual QEMU devices, not just host-testable
-pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 277 tests, <1s, no QEMU) is
+pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 282 tests, <1s, no QEMU) is
 asserted by a `#![feature(custom_test_frameworks)]` harness that boots the real kernel in
 QEMU and reports PASS/FAIL as a process exit code:
 
@@ -514,7 +514,7 @@ arbitration, exactly where two PS/2 keyboards would merge.
 **Split across the usual seam.** `hal::xhci` (register/TRB/ring/context
 arithmetic), `hal::usb` (descriptor parsing + setup packets) and
 `hal::hid` (boot-report diffing + the Set-1 table) are pure and host-tested
-— most of `hal`'s 277 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
+— most of `hal`'s 282 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
 DMA pages, doorbells and waiting. That line is drawn hard here because an
 xHCI bring-up failure is nearly unobservable (a wrong bit in a device
 context yields no fault, no log, just a Transfer Event that never arrives)
@@ -590,8 +590,26 @@ so rather than looking like it always worked.
 — enumeration waits milliseconds on hardware, which cannot happen in the
 timer ISR, and this kernel has no kernel-thread context to defer it to),
 external hubs (root-hub ports only; a hub needs the hub class driver plus
-route strings), and non-keyboard devices (addressed so they appear in the
-boot log, then left alone).
+route strings), and anything but boot keyboards, boot mice and storage
+(addressed so they appear in the boot log, then left alone).
+
+**USB mouse** (`hal::usb::find_boot_mouse`, `hal::hid::decode_boot_mouse`):
+the boot-protocol mouse joins the PS/2 mouse's event queue behind
+`/dev/input/event1` (`mouse::push_usb_event`), the keyboard's "feed the
+existing pipeline" decision again. **HID Y is positive down, so it is
+negated** into `MouseEvent`'s PS/2 convention (positive up), which the
+DOOM/Quake ports were written against — verified in QEMU that the same
+`mouse-move 10 -5` yields identical records through either mouse. The
+queue now has two producers, serialised by an `IrqMutex` (`mouse::PUSH`).
+Keyboard and mouse are looked up **independently per device**, and both
+endpoints go into one Configure Endpoint: a keyboard+mouse receiver has
+one interface of each, and the target machine's HyperX Pulsefire Core
+mouse declares a boot *keyboard* on interface 1 (for its macro buttons) —
+which is why the Ryzen reported two USB keyboards. An interface that
+refuses `SET_PROTOCOL` is dropped alone, never its sibling.
+`/proc/kdebug`: `usb_mice`, `usb_mouse_reports`. QEMU:
+`QEMU_USB_MOUSE=1` (QEMU has no composite device, so the two-interface
+path is only exercised on metal).
 
 **Testing it in QEMU:** both launchers attach `qemu-xhci` by default, so
 the bring-up path runs on every boot; `QEMU_USB_KBD=1` additionally

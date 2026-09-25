@@ -20,7 +20,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub use hal::mouse::MouseEvent;
 
+use diag::IrqMutex;
+
 use crate::hal::{Driver, DriverError, X86PortIo};
+use crate::allocator::KernelIrq;
 
 // ============================================================================
 // 8042 CONTROLLER INIT
@@ -77,10 +80,10 @@ impl Driver for MouseDriver {
 
 /// In-progress 3-byte packet decoder. Its only writer is the IRQ12 ISR,
 /// and one IRQ line is never delivered to two CPUs at once, so a plain
-/// cell is enough — even with SMP, as long as that stays true. A second
-/// writer (a USB mouse feeding PS/2-shaped packets, say) needs a lock
-/// here, exactly as `keyboard::DECODER` got one when the USB keyboard
-/// became its second writer.
+/// cell is enough — even with SMP, as long as that stays true. The USB
+/// mouse does not go through it (its reports arrive whole, see
+/// `push_usb_event`); it only shares the event queue below, whose
+/// producers are serialised by `PUSH`.
 struct DecoderCell(UnsafeCell<hal::mouse::PacketDecoder>);
 unsafe impl Sync for DecoderCell {}
 
@@ -94,7 +97,7 @@ pub fn process_byte(byte: u8) {
     let before = decoder.resyncs();
     // TSC uptime: calibrated long before IRQ12 is unmasked-and-live.
     if let Some(ev) = decoder.push_byte_at(byte, crate::cpu::tsc::uptime_ms()) {
-        MOUSE_EVENTS.push(ev);
+        push(ev);
     }
     if decoder.resyncs() != before {
         RESYNCS.fetch_add(1, Ordering::Relaxed);
@@ -154,6 +157,27 @@ impl MouseEventBuffer {
 }
 
 static MOUSE_EVENTS: MouseEventBuffer = MouseEventBuffer::new();
+
+/// Serialises the queue's *producers*. The ring is single-producer by
+/// construction (`write` is loaded, the slot filled, then `write` stored),
+/// and it has two: the PS/2 IRQ12 ISR and the USB mouse, decoded from the
+/// timer ISR's `usb::poll` (or from whoever is draining the xHCI event
+/// ring). On one CPU both run with IF=0 and cannot overlap, but that is
+/// `cli` doing a lock's job — the SMP rule `keyboard::DECODER` was
+/// converted under. The consumer (`read_event`) stays lock-free.
+static PUSH: IrqMutex<(), KernelIrq> = IrqMutex::new(());
+
+fn push(ev: MouseEvent) {
+    PUSH.with(|_| MOUSE_EVENTS.push(ev));
+}
+
+/// Entry point for the USB boot mouse (`usb::xhci`): one decoded report,
+/// already in PS/2 sign convention (see `hal::hid::decode_boot_mouse`).
+/// A report with no motion and the same buttons is still queued — the
+/// evdev layer drops it, the same as an all-zero PS/2 packet.
+pub fn push_usb_event(ev: MouseEvent) {
+    push(ev);
+}
 
 /// Non-blocking read of the next decoded packet, or `None` if the queue
 /// is empty.

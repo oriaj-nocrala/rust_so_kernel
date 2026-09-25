@@ -136,12 +136,16 @@ pub struct PortScan {
     pub connected: usize,
     /// Devices successfully reset, slotted and addressed.
     pub addressed: usize,
-    /// Addressed devices that were not HID boot keyboards.
+    /// Addressed devices that were neither HID boot devices nor storage.
     pub other_devices: usize,
     /// Ports where setup returned an error.
     pub failed: usize,
     /// HID boot keyboards now being polled.
     pub keyboards: usize,
+    /// HID boot mice now being polled. A device with both interfaces
+    /// (a keyboard+mouse receiver, a gaming mouse with macro keys) counts
+    /// in both.
+    pub mice: usize,
     /// Mass-storage devices that finished SCSI bring-up.
     pub storage: usize,
 }
@@ -168,6 +172,7 @@ pub struct PortOutcome {
     pub error: Option<XhciError>,
     pub addressed: bool,
     pub keyboard: bool,
+    pub mouse: bool,
     pub storage: bool,
     /// `idVendor`/`idProduct`, once the device descriptor has been read.
     /// Zero before that. Reported per port because the port *number* alone
@@ -190,6 +195,7 @@ impl PortOutcome {
             error: None,
             addressed: false,
             keyboard: false,
+            mouse: false,
             storage: false,
             vendor: 0,
             product: 0,
@@ -205,6 +211,7 @@ impl PortScan {
         self.other_devices += other.other_devices;
         self.failed += other.failed;
         self.keyboards += other.keyboards;
+        self.mice += other.mice;
         self.storage += other.storage;
     }
 }
@@ -331,20 +338,34 @@ impl Ring {
 /// What `configure_device` made of a device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeviceKind {
-    Keyboard,
+    /// At least one of the two is true.
+    Hid { keyboard: bool, mouse: bool },
     Storage,
     Other,
 }
 
-/// A HID boot keyboard this driver is actively polling.
-struct Keyboard {
-    /// Device Context Index of its interrupt IN endpoint.
+/// One HID boot interface's interrupt IN endpoint, with exactly one
+/// transfer outstanding on it at all times (see `queue_hid_report`).
+struct HidEndpoint {
+    /// Device Context Index of the interrupt IN endpoint.
     dci: u8,
     ring: Ring,
-    /// DMA page the 8-byte boot reports land in.
+    /// DMA page the boot reports land in.
     report: Dma,
     report_len: u16,
+}
+
+/// A HID boot keyboard this driver is actively polling.
+struct Keyboard {
+    ep: HidEndpoint,
     decoder: hal::hid::BootKeyboard,
+}
+
+/// Which of a device's HID endpoints a transfer event or a re-arm is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HidRole {
+    Keyboard,
+    Mouse,
 }
 
 /// One addressed USB device.
@@ -359,7 +380,19 @@ struct Device {
     /// Scratch page for control-transfer data stages.
     buf: Dma,
     keyboard: Option<Keyboard>,
+    /// A boot mouse needs no decoder state: each report is already
+    /// relative motion plus button levels (`hal::hid::decode_boot_mouse`).
+    mouse: Option<HidEndpoint>,
     storage: Option<msc::MassStorage>,
+}
+
+impl Device {
+    fn hid(&mut self, role: HidRole) -> Option<&mut HidEndpoint> {
+        match role {
+            HidRole::Keyboard => self.keyboard.as_mut().map(|k| &mut k.ep),
+            HidRole::Mouse => self.mouse.as_mut(),
+        }
+    }
 }
 
 // ── The controller ───────────────────────────────────────────────────────────
@@ -848,7 +881,7 @@ impl Xhci {
     fn service_events(&mut self, want: &dyn Fn(&Trb) -> bool) -> Option<Trb> {
         for _ in 0..RING_TRBS {
             let trb = self.next_event()?;
-            if self.handle_keyboard_event(&trb) {
+            if self.handle_hid_event(&trb) {
                 continue;
             }
             if want(&trb) {
@@ -859,10 +892,13 @@ impl Xhci {
         None
     }
 
-    /// Consumes a Transfer Event if it belongs to a keyboard's interrupt
-    /// endpoint: decodes the report into `pending_keys` and re-arms the
-    /// transfer. Returns whether it was a keyboard event.
-    fn handle_keyboard_event(&mut self, trb: &Trb) -> bool {
+    /// Consumes a Transfer Event if it belongs to a keyboard's or a
+    /// mouse's interrupt endpoint: a keyboard report is decoded into
+    /// `pending_keys`, a mouse report goes straight onto the mouse event
+    /// queue (`mouse::push_usb_event` takes no lock but its own, so it is
+    /// safe under `CONTROLLERS`); either way the transfer is re-armed.
+    /// Returns whether it was one of those.
+    fn handle_hid_event(&mut self, trb: &Trb) -> bool {
         if trb.trb_type() != x::TRB_TRANSFER_EVENT {
             return false;
         }
@@ -871,20 +907,31 @@ impl Xhci {
             return false;
         }
         let mut report = [0u8; 8];
-        let report_len = {
-            let Some(kb) = self.devices[slot as usize - 1].as_mut().and_then(|d| d.keyboard.as_mut()) else {
+        let (role, report_len) = {
+            let Some(dev) = self.devices[slot as usize - 1].as_mut() else {
                 return false;
             };
-            if kb.dci != trb.endpoint_id() {
+            let role = if dev.keyboard.as_ref().is_some_and(|k| k.ep.dci == trb.endpoint_id()) {
+                HidRole::Keyboard
+            } else if dev.mouse.as_ref().is_some_and(|m| m.dci == trb.endpoint_id()) {
+                HidRole::Mouse
+            } else {
                 return false;
-            }
-            kb.report.read_bytes(0, &mut report);
-            kb.report_len
+            };
+            let ep = dev.hid(role).expect("role was just matched");
+            ep.report.read_bytes(0, &mut report);
+            (role, ep.report_len)
         };
 
         let code = trb.completion_code();
-        if code == x::COMP_SUCCESS || code == x::COMP_SHORT_PACKET {
-            let valid = (report_len as u32).saturating_sub(trb.transfer_length()) as usize;
+        let ok = code == x::COMP_SUCCESS || code == x::COMP_SHORT_PACKET;
+        let valid = (report_len as u32).saturating_sub(trb.transfer_length()) as usize;
+        if ok && role == HidRole::Mouse {
+            if let Some(ev) = hal::hid::decode_boot_mouse(&report[..valid.min(report.len())]) {
+                crate::debug::inc_usb_mouse_reports();
+                crate::mouse::push_usb_event(ev);
+            }
+        } else if ok {
             let mut decoded = [0u8; 2 * hal::hid::MAX_EVENTS];
             let n = self.decode_report(slot, &report[..valid.min(report.len())], &mut decoded);
             let room = PENDING_KEYS - self.pending_len;
@@ -899,7 +946,7 @@ impl Xhci {
         // Re-arm regardless of completion code: a stalled endpoint would
         // need a Reset Endpoint command this driver doesn't issue, but a
         // transient error must not silently end input.
-        let _ = self.queue_keyboard_report(slot);
+        let _ = self.queue_hid_report(slot, role);
         true
     }
 
@@ -959,7 +1006,13 @@ impl Xhci {
             crate::debug::USB,
                     "xhci: p{} spd={} slot={} [{:04x}:{:04x}] {} OK{}",
                     out.port, out.speed, out.slot, out.vendor, out.product, out.stage,
-                    if out.keyboard { " KBD" } else if out.storage { " STORAGE" } else { "" },
+                    match (out.keyboard, out.mouse) {
+                        (true, true) => " KBD+MOUSE",
+                        (true, false) => " KBD",
+                        (false, true) => " MOUSE",
+                        _ if out.storage => " STORAGE",
+                        _ => "",
+                    },
                 ),
                 Some(e) => crate::serial_println!(
                     "xhci: p{} spd={} slot={} [{:04x}:{:04x}] sc={:#x} FAIL at {} ({:?} {})",
@@ -973,9 +1026,13 @@ impl Xhci {
             }
             if out.keyboard {
                 scan.keyboards += 1;
-            } else if out.storage {
+            }
+            if out.mouse {
+                scan.mice += 1;
+            }
+            if out.storage {
                 scan.storage += 1;
-            } else if out.error.is_none() {
+            } else if !out.keyboard && !out.mouse && out.error.is_none() {
                 scan.other_devices += 1;
             }
             if out.error.is_some() {
@@ -1083,7 +1140,10 @@ impl Xhci {
 
         match self.configure_device(slot, &mut out) {
             Ok(kind) => {
-                out.keyboard = kind == DeviceKind::Keyboard;
+                if let DeviceKind::Hid { keyboard, mouse } = kind {
+                    out.keyboard = keyboard;
+                    out.mouse = mouse;
+                }
                 out.storage = kind == DeviceKind::Storage;
                 out.stage = "done";
             }
@@ -1154,6 +1214,7 @@ impl Xhci {
             ep0,
             buf,
             keyboard: None,
+            mouse: None,
             storage: None,
         });
         Ok(())
@@ -1235,7 +1296,9 @@ impl Xhci {
             &mut config[..total as usize],
         )?;
 
-        let Some(kb) = usb::find_boot_keyboard(&config[..n]) else {
+        let kb = usb::find_boot_keyboard(&config[..n]);
+        let mouse = usb::find_boot_mouse(&config[..n]);
+        if kb.is_none() && mouse.is_none() {
             if let Some(ms) = usb::find_mass_storage(&config[..n]) {
                 out.stage = "msc";
                 return match self.configure_storage(slot, &ms) {
@@ -1249,36 +1312,63 @@ impl Xhci {
                     }
                 };
             }
-            crate::ktrace!(crate::debug::USB, "xhci: slot {} is neither a boot keyboard nor storage", slot);
+            crate::ktrace!(crate::debug::USB, "xhci: slot {} is neither a boot HID device nor storage", slot);
             return Ok(DeviceKind::Other);
-        };
-        crate::serial_println!(
-            "xhci: slot {} boot keyboard on interface {} ep {:#04x} ({} bytes, bInterval={})",
-            slot,
-            kb.interface,
-            kb.ep_address,
-            kb.ep_max_packet,
-            kb.ep_interval
-        );
+        }
+        for (what, hid) in [("keyboard", kb), ("mouse", mouse)] {
+            if let Some(i) = hid {
+                crate::serial_println!(
+                    "xhci: slot {} boot {} on interface {} ep {:#04x} ({} bytes, bInterval={})",
+                    slot, what, i.interface, i.ep_address, i.ep_max_packet, i.ep_interval
+                );
+            }
+        }
 
         // 4. SET_CONFIGURATION before Configure Endpoint: the device must
-        //    be in the configured state for its endpoints to exist.
+        //    be in the configured state for its endpoints to exist. Both
+        //    interfaces come from the same configuration blob, so they
+        //    share its value.
         out.stage = "setcfg";
-        self.control_out(slot, SetupPacket::set_configuration(kb.config_value))?;
+        let config_value = kb.or(mouse).map(|i| i.config_value).unwrap_or(1);
+        self.control_out(slot, SetupPacket::set_configuration(config_value))?;
         out.stage = "ep";
-        self.configure_keyboard_endpoint(slot, &kb)?;
+        self.configure_hid_endpoints(slot, kb.as_ref(), mouse.as_ref())?;
 
-        // 5. Boot protocol — the whole reason no HID report descriptor
-        //    parser is needed — then SET_IDLE so the device only reports
-        //    on change.
+        // 5. Boot protocol per interface — the whole reason no HID report
+        //    descriptor parser is needed — then SET_IDLE so the device only
+        //    reports on change. An interface that refuses boot protocol is
+        //    dropped on its own (its endpoint stays configured but is never
+        //    armed), so a mouse's refusal cannot cost the keyboard on the
+        //    same receiver, or the other way round.
         out.stage = "proto";
-        self.control_out(slot, SetupPacket::set_boot_protocol(kb.interface))?;
-        // SET_IDLE is optional and some devices STALL it; a failure here
-        // costs nothing but redundant reports.
-        let _ = self.control_out(slot, SetupPacket::set_idle(kb.interface));
-
-        self.queue_keyboard_report(slot)?;
-        Ok(DeviceKind::Keyboard)
+        let mut live = (false, false);
+        for (role, hid) in [(HidRole::Keyboard, kb), (HidRole::Mouse, mouse)] {
+            let Some(i) = hid else { continue };
+            if let Err(e) = self.control_out(slot, SetupPacket::set_boot_protocol(i.interface)) {
+                crate::serial_println!(
+                    "xhci: slot {} interface {} refused boot protocol ({:?} {}) — {:?} not used",
+                    slot, i.interface, e, describe(e), role
+                );
+                let dev = self.device(slot)?;
+                match role {
+                    HidRole::Keyboard => dev.keyboard = None,
+                    HidRole::Mouse => dev.mouse = None,
+                }
+                continue;
+            }
+            // SET_IDLE is optional and some devices STALL it; a failure
+            // here costs nothing but redundant reports.
+            let _ = self.control_out(slot, SetupPacket::set_idle(i.interface));
+            self.queue_hid_report(slot, role)?;
+            match role {
+                HidRole::Keyboard => live.0 = true,
+                HidRole::Mouse => live.1 = true,
+            }
+        }
+        if live == (false, false) {
+            return Err(XhciError::Unusable);
+        }
+        Ok(DeviceKind::Hid { keyboard: live.0, mouse: live.1 })
     }
 
     fn device(&mut self, slot: u8) -> Result<&mut Device> {
@@ -1312,54 +1402,87 @@ impl Xhci {
         Ok(())
     }
 
-    /// Adds the keyboard's interrupt IN endpoint to the device with a
-    /// Configure Endpoint command, and gives it its own transfer ring.
-    fn configure_keyboard_endpoint(&mut self, slot: u8, kb: &usb::BootKeyboardInterface) -> Result<()> {
-        let dci = x::endpoint_dci(kb.ep_number(), true);
-        let ring = Ring::alloc()?;
-        let report = Dma::alloc()?;
-
-        let (input, speed, port_speed_interval) = {
+    /// Adds the HID interrupt IN endpoints (a keyboard's, a mouse's, or
+    /// both) to the device with one Configure Endpoint command, each with
+    /// its own transfer ring — the same single-command shape as
+    /// `configure_storage`'s bulk pair.
+    fn configure_hid_endpoints(
+        &mut self,
+        slot: u8,
+        kb: Option<&usb::BootHidInterface>,
+        mouse: Option<&usb::BootHidInterface>,
+    ) -> Result<()> {
+        let (input, speed) = {
             let dev = self.device(slot)?;
-            (dev.input, dev.speed, x::endpoint_interval(dev.speed, kb.ep_interval))
+            (dev.input, dev.speed)
         };
 
+        let mut endpoints: [Option<(HidRole, &usb::BootHidInterface, u8)>; 2] = [None, None];
+        let mut add = x::ADD_SLOT;
+        let mut max_dci = 1u8;
+        for (n, (role, hid)) in [(HidRole::Keyboard, kb), (HidRole::Mouse, mouse)].into_iter().enumerate() {
+            if let Some(i) = hid {
+                let dci = x::endpoint_dci(i.ep_number(), true);
+                add |= x::add_flag(dci);
+                max_dci = max_dci.max(dci);
+                endpoints[n] = Some((role, i, dci));
+            }
+        }
+
         let mut ctrl_words = [0u32; 8];
-        x::build_input_control(&mut ctrl_words, x::ADD_SLOT | x::add_flag(dci));
+        x::build_input_control(&mut ctrl_words, add);
         self.write_context(&input, 0, &ctrl_words);
 
         // The slot context has to be re-supplied with Context Entries
-        // raised to cover the new endpoint — the controller sizes the
-        // device context from this field.
+        // raised to cover the highest new endpoint — the controller sizes
+        // the device context from this field.
         let root_port = self.root_port_of(slot);
         let mut slot_words = [0u32; 8];
-        x::build_slot_context(&mut slot_words, speed, root_port, dci);
+        x::build_slot_context(&mut slot_words, speed, root_port, max_dci);
         self.write_context(&input, 1, &slot_words);
 
-        let mut ep_words = [0u32; 8];
-        x::build_endpoint_context(
-            &mut ep_words,
-            x::EP_TYPE_INTERRUPT_IN,
-            kb.ep_max_packet,
-            port_speed_interval,
-            ring.dma.phys,
-            kb.ep_max_packet,
-        );
-        self.write_context(&input, dci as usize + 1, &ep_words);
+        let mut built: [Option<(HidRole, HidEndpoint)>; 2] = [None, None];
+        for (n, e) in endpoints.iter().enumerate() {
+            let Some((role, i, dci)) = *e else { continue };
+            let ring = Ring::alloc()?;
+            let report = Dma::alloc()?;
+            let mut ep_words = [0u32; 8];
+            x::build_endpoint_context(
+                &mut ep_words,
+                x::EP_TYPE_INTERRUPT_IN,
+                i.ep_max_packet,
+                x::endpoint_interval(speed, i.ep_interval),
+                ring.dma.phys,
+                i.ep_max_packet,
+            );
+            self.write_context(&input, dci as usize + 1, &ep_words);
+            // A boot keyboard report is exactly 8 bytes. A mouse's is 3 or
+            // 4, but its endpoint may declare a larger packet (the report
+            // protocol's size); a TRB shorter than what the device sends
+            // is a babble error, so the mouse gets its full max packet
+            // (capped — it is one DMA page) and `handle_hid_event` reads
+            // only the first 8 bytes back.
+            let report_len = match role {
+                HidRole::Keyboard => i.ep_max_packet.min(8),
+                HidRole::Mouse => i.ep_max_packet.clamp(3, 64),
+            };
+            built[n] = Some((role, HidEndpoint { dci, ring, report, report_len }));
+        }
 
         let cycle = self.cmd.state.cycle();
         let trb_phys = self.cmd.push(Trb::configure_endpoint(input.phys, slot, cycle));
         self.doorbell(0, 0);
         self.wait_for_command(trb_phys, 1000)?;
 
-        let report_len = kb.ep_max_packet.min(8);
-        self.device(slot)?.keyboard = Some(Keyboard {
-            dci,
-            ring,
-            report,
-            report_len,
-            decoder: hal::hid::BootKeyboard::new(),
-        });
+        let dev = self.device(slot)?;
+        for (role, ep) in built.into_iter().flatten() {
+            match role {
+                HidRole::Keyboard => {
+                    dev.keyboard = Some(Keyboard { ep, decoder: hal::hid::BootKeyboard::new() })
+                }
+                HidRole::Mouse => dev.mouse = Some(ep),
+            }
+        }
         Ok(())
     }
 
@@ -1372,19 +1495,19 @@ impl Xhci {
         ((dev.input.read_u32(self.input_ctx_offset(1) + 4) >> 16) & 0xFF) as u8
     }
 
-    /// Posts one Normal TRB on the keyboard's interrupt ring. The
+    /// Posts one Normal TRB on a HID endpoint's interrupt ring. The
     /// controller fills it at the endpoint's service interval and posts a
-    /// Transfer Event; `poll` re-arms it. Exactly one transfer is
-    /// outstanding at a time, which is all a keyboard needs and keeps the
-    /// ring's state trivially correct.
-    fn queue_keyboard_report(&mut self, slot: u8) -> Result<()> {
+    /// Transfer Event; `handle_hid_event` re-arms it. Exactly one transfer
+    /// is outstanding at a time, which is all a keyboard or a mouse needs
+    /// and keeps the ring's state trivially correct.
+    fn queue_hid_report(&mut self, slot: u8, role: HidRole) -> Result<()> {
         let dev = self.device(slot)?;
-        let Some(kb) = dev.keyboard.as_mut() else {
+        let Some(ep) = dev.hid(role) else {
             return Err(XhciError::Unusable);
         };
-        let cycle = kb.ring.state.cycle();
-        kb.ring.push(Trb::normal(kb.report.phys, kb.report_len as u32, cycle));
-        let dci = kb.dci;
+        let cycle = ep.ring.state.cycle();
+        ep.ring.push(Trb::normal(ep.report.phys, ep.report_len as u32, cycle));
+        let dci = ep.dci;
         self.doorbell(slot, dci);
         Ok(())
     }

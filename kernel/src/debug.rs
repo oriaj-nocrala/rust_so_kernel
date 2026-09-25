@@ -238,6 +238,11 @@ static USB_KEY_REPORTS: AtomicU64 = AtomicU64::new(0);
 /// held for a long stretch of typing, e.g. during a slow disk read.
 static USB_KEYS_DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// USB boot-mouse reports decoded and queued for `/dev/input/event1`. The
+/// mouse's counterpart of `usb_key_reports`: zero with a mouse being moved
+/// means its transfers never complete.
+static USB_MOUSE_REPORTS: AtomicU64 = AtomicU64::new(0);
+
 /// Spurious 8259 interrupts (IRQ7/IRQ15 with no ISR bit set) since boot,
 /// and real interrupts on lines this kernel never unmasks. Neither used to
 /// have an IDT entry at all, so the first one on real hardware was a kernel
@@ -262,6 +267,7 @@ pub fn inc_cow_failed()    { COW_FAULTS_FAILED.fetch_add(1, Ordering::Relaxed); 
 pub fn inc_switches()      { SWITCHES_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_usb_key_reports() { USB_KEY_REPORTS.fetch_add(1, Ordering::Relaxed); }
 pub fn add_usb_keys_dropped(n: u64) { USB_KEYS_DROPPED.fetch_add(n, Ordering::Relaxed); }
+pub fn inc_usb_mouse_reports() { USB_MOUSE_REPORTS.fetch_add(1, Ordering::Relaxed); }
 pub fn add_orphans_reclaimed(blocks: u64, inodes: u64) {
     ORPHAN_BLOCKS_RECLAIMED.fetch_add(blocks, Ordering::Relaxed);
     ORPHAN_INODES_RECLAIMED.fetch_add(inodes, Ordering::Relaxed);
@@ -366,6 +372,8 @@ pub fn render_report() -> alloc::string::String {
          usb_keyboards: {}\n\
          usb_key_reports: {}\n\
          usb_keys_dropped: {}\n\
+         usb_mice: {}\n\
+         usb_mouse_reports: {}\n\
          mouse_resyncs: {}\n\
          spurious_irqs: {}\n\
          unexpected_irqs: {} (last line {})\n\
@@ -387,6 +395,8 @@ pub fn render_report() -> alloc::string::String {
         crate::usb::keyboard_count(),
         USB_KEY_REPORTS.load(Ordering::Relaxed),
         USB_KEYS_DROPPED.load(Ordering::Relaxed),
+        crate::usb::mouse_count(),
+        USB_MOUSE_REPORTS.load(Ordering::Relaxed),
         crate::mouse::resyncs(),
         SPURIOUS_IRQS.load(Ordering::Relaxed),
         UNEXPECTED_IRQS.load(Ordering::Relaxed),

@@ -32,10 +32,11 @@
 // * **Hubs.** Only devices on root-hub ports are found. A keyboard behind
 //   an external hub needs the hub class driver plus route-string handling
 //   in the slot context, which is a second project.
-// * **Mice, anything else.** A device that is neither a HID boot-protocol
-//   keyboard nor Bulk-Only mass storage is addressed (so it is visible in
-//   the boot log) and then left alone. `/dev/input/event1` remains the
-//   PS/2 mouse.
+// * **Anything but boot keyboards, boot mice and storage.** Any other
+//   device is addressed (so it is visible in the boot log) and then left
+//   alone. A boot mouse's reports join the PS/2 mouse's event queue behind
+//   `/dev/input/event1` (`mouse::push_usb_event`), the same "feed the
+//   existing pipeline" decision as the keyboard's Set-1 translation.
 //
 // Mass storage (the boot pendrive, see `xhci/msc.rs`) is the second device
 // class; `storage()` / `storage_read()` / `storage_write()` below are what
@@ -66,6 +67,9 @@ static CONTROLLERS: Mutex<[Option<xhci::Xhci>; MAX_CONTROLLERS]> =
 /// Number of HID boot keyboards found at boot — read by the boot summary
 /// and by `/proc`-style introspection.
 static KEYBOARDS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Number of HID boot mice found at boot (`/proc/kdebug`'s `usb_mice`).
+static MICE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// A mass-storage device that finished bring-up: which controller, which
 /// slot, and its size in 512-byte sectors.
@@ -166,11 +170,12 @@ impl Driver for UsbDriver {
         }
 
         KEYBOARDS.store(scan.keyboards, core::sync::atomic::Ordering::Relaxed);
+        MICE.store(scan.mice, core::sync::atomic::Ordering::Relaxed);
         crate::serial_println!(
             "usb: {} controller(s) up ({} failed), {} port(s), {} connected, \
-             {} addressed, {} setup error(s), {} keyboard(s), {} storage",
+             {} addressed, {} setup error(s), {} keyboard(s), {} mouse/mice, {} storage",
             live, init_failures, scan.ports, scan.connected, scan.addressed,
-            scan.failed, scan.keyboards, scan.storage,
+            scan.failed, scan.keyboards, scan.mice, scan.storage,
         );
 
         // On the actual screen, not just to serial. This driver exists for
@@ -185,8 +190,8 @@ impl Driver for UsbDriver {
         // them in one line.
         if scan.keyboards > 0 {
             crate::kalert!(
-                "usb: {} teclado(s) USB OK, {} almacenamiento  [{} ctrl, {} puertos, {} conectados]",
-                scan.keyboards, scan.storage, live, scan.ports, scan.connected
+                "usb: {} teclado(s) USB OK, {} raton(es), {} almacenamiento  [{} ctrl, {} puertos, {} conectados]",
+                scan.keyboards, scan.mice, scan.storage, live, scan.ports, scan.connected
             );
         } else if live > 0 {
             crate::kalert!(
@@ -209,6 +214,13 @@ impl Driver for UsbDriver {
 /// Number of USB keyboards being polled.
 pub fn keyboard_count() -> usize {
     KEYBOARDS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Number of USB mice being polled. Their reports bypass `poll`'s
+/// scancode path entirely: `xhci::Xhci::handle_hid_event` pushes each one
+/// onto `mouse`'s event queue, the one `/dev/input/event1` reads.
+pub fn mouse_count() -> usize {
+    MICE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Drains every controller's event ring and feeds any keyboard input into

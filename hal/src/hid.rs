@@ -233,6 +233,38 @@ pub fn usage_to_set1(usage: u8) -> Option<Set1Code> {
     }
 }
 
+// ── Boot mouse ─────────────────────────────────────────────────────────
+
+/// Decodes one HID boot-protocol mouse report (HID 1.11 Appendix B.2):
+/// byte 0 buttons (bit 0 left, 1 right, 2 middle; the rest are
+/// device-specific), byte 1 X and byte 2 Y displacement as signed 8-bit
+/// counts. Anything after byte 2 (a wheel, extra buttons) is outside the
+/// boot protocol and ignored. `None` for a report too short to hold the
+/// three bytes — a device may send a zero-length report as a NAK stand-in.
+///
+/// Unlike the keyboard, no state is needed: a mouse report is already
+/// relative motion plus the button *level*, which is exactly what
+/// [`crate::mouse::MouseEvent`] carries (the evdev layer computes button
+/// edges per reader). Returned in that type so a USB mouse joins the PS/2
+/// mouse's event queue unchanged — the same "translate into the existing
+/// pipeline" decision the keyboard made with Set-1 scancodes.
+///
+/// **Y is negated.** HID reports Y positive *down* (screen coordinates);
+/// `MouseEvent` keeps the PS/2 convention, Y positive *up*, which is what
+/// `/dev/input/event1`'s readers (the DOOM and Quake ports) were written
+/// against. Passing HID's sign through would invert mouse-look pitch for
+/// USB mice only.
+pub fn decode_boot_mouse(report: &[u8]) -> Option<crate::mouse::MouseEvent> {
+    if report.len() < 3 {
+        return None;
+    }
+    Some(crate::mouse::MouseEvent {
+        dx: report[1] as i8 as i16,
+        dy: -(report[2] as i8 as i16),
+        buttons: report[0] & 0x07,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,5 +455,32 @@ mod tests {
             }
             seen[slot] = Some(usage);
         }
+    }
+
+    // ── Boot mouse ──────────────────────────────────────────────────────
+
+    #[test]
+    fn boot_mouse_report_decodes_signed_motion_and_buttons() {
+        // Left+middle held, 5 right, 3 down (HID) = 3 up negated -> -3.
+        let ev = decode_boot_mouse(&[0b101, 5, 3]).unwrap();
+        assert_eq!(ev, crate::mouse::MouseEvent { dx: 5, dy: -3, buttons: 0b101 });
+        // Extremes: 0x80 = -128 on both axes; Y -128 (up) becomes +128.
+        let ev = decode_boot_mouse(&[0, 0x80, 0x80]).unwrap();
+        assert_eq!((ev.dx, ev.dy), (-128, 128));
+        let ev = decode_boot_mouse(&[0, 0x7F, 0x7F]).unwrap();
+        assert_eq!((ev.dx, ev.dy), (127, -127));
+    }
+
+    #[test]
+    fn boot_mouse_ignores_extra_buttons_and_trailing_bytes() {
+        // Buttons 4/5 (bits 3-4) and a wheel byte are not boot protocol.
+        let ev = decode_boot_mouse(&[0b11010, 1, 0xFF, 0x01, 0, 0, 0, 0]).unwrap();
+        assert_eq!(ev, crate::mouse::MouseEvent { dx: 1, dy: 1, buttons: 0b010 });
+    }
+
+    #[test]
+    fn boot_mouse_rejects_short_reports() {
+        assert!(decode_boot_mouse(&[]).is_none());
+        assert!(decode_boot_mouse(&[1, 2]).is_none());
     }
 }

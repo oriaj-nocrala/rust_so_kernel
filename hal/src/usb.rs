@@ -25,11 +25,13 @@ pub const DESC_ENDPOINT: u8 = 0x05;
 /// descriptor of a USB 3 device and carries `bMaxBurst`.
 pub const DESC_SS_ENDPOINT_COMPANION: u8 = 0x30;
 
-/// USB class/subclass/protocol triple identifying a boot-protocol keyboard
-/// (USB HID 1.11 §4.3 + Appendix B: "Boot Interface Subclass").
+/// USB class/subclass/protocol triples identifying the two boot-protocol
+/// HID devices (USB HID 1.11 §4.3 + Appendix B: "Boot Interface
+/// Subclass").
 pub const CLASS_HID: u8 = 0x03;
 pub const SUBCLASS_BOOT: u8 = 0x01;
 pub const PROTOCOL_KEYBOARD: u8 = 0x01;
+pub const PROTOCOL_MOUSE: u8 = 0x02;
 
 /// Endpoint transfer types (`bmAttributes & 0x03`).
 pub const XFER_BULK: u8 = 0x02;
@@ -95,10 +97,10 @@ pub fn config_value(buf: &[u8]) -> Option<u8> {
     Some(buf[5])
 }
 
-/// Everything needed to drive one boot-protocol keyboard interface, found
-/// by walking a configuration blob.
+/// Everything needed to drive one boot-protocol HID interface (keyboard or
+/// mouse), found by walking a configuration blob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BootKeyboardInterface {
+pub struct BootHidInterface {
     /// `bConfigurationValue` to pass to `SET_CONFIGURATION`.
     pub config_value: u8,
     /// `bInterfaceNumber` — the `wIndex` of the HID class requests
@@ -107,15 +109,15 @@ pub struct BootKeyboardInterface {
     /// `bEndpointAddress` of the interrupt IN endpoint, including its
     /// direction bit (0x80).
     pub ep_address: u8,
-    /// `wMaxPacketSize` of that endpoint (8 for a boot keyboard, but read
-    /// rather than assumed).
+    /// `wMaxPacketSize` of that endpoint (8 for a boot keyboard, 3-8 for a
+    /// boot mouse — read rather than assumed).
     pub ep_max_packet: u16,
     /// `bInterval`, in the encoding of the device's own speed — see
     /// `hal::xhci::endpoint_interval`.
     pub ep_interval: u8,
 }
 
-impl BootKeyboardInterface {
+impl BootHidInterface {
     /// Endpoint number without the direction bit (1..=15).
     pub fn ep_number(&self) -> u8 {
         self.ep_address & 0x0F
@@ -124,6 +126,24 @@ impl BootKeyboardInterface {
 
 /// Walks a configuration descriptor blob looking for a HID boot-protocol
 /// keyboard interface and its interrupt IN endpoint.
+pub fn find_boot_keyboard(config: &[u8]) -> Option<BootHidInterface> {
+    find_boot_interface(config, PROTOCOL_KEYBOARD)
+}
+
+/// Same walk as [`find_boot_keyboard`], for a boot-protocol mouse.
+///
+/// One device can carry both: a wireless keyboard+mouse receiver exposes
+/// one interface of each, and gaming mice commonly declare a boot
+/// *keyboard* interface next to the mouse one to send their macro
+/// buttons' keystrokes (the HyperX Pulsefire Core on the target machine
+/// does exactly that — interface 0 mouse, interface 1 keyboard). So the
+/// two are looked up independently, never "first HID interface wins".
+pub fn find_boot_mouse(config: &[u8]) -> Option<BootHidInterface> {
+    find_boot_interface(config, PROTOCOL_MOUSE)
+}
+
+/// The walk behind [`find_boot_keyboard`] / [`find_boot_mouse`]: the first
+/// boot-subclass HID interface with bInterfaceProtocol `protocol`.
 ///
 /// The walk is the classic "descriptor soup" iteration: each descriptor
 /// starts with `[bLength, bDescriptorType]` and the next one begins
@@ -139,7 +159,7 @@ impl BootKeyboardInterface {
 /// Only interfaces with alternate setting 0 are considered: a boot
 /// keyboard has no reason to need another, and taking one would require a
 /// `SET_INTERFACE` this driver doesn't issue.
-pub fn find_boot_keyboard(config: &[u8]) -> Option<BootKeyboardInterface> {
+fn find_boot_interface(config: &[u8], wanted_protocol: u8) -> Option<BootHidInterface> {
     let config_value = config_value(config)?;
 
     let mut pos = 0usize;
@@ -165,7 +185,7 @@ pub fn find_boot_keyboard(config: &[u8]) -> Option<BootKeyboardInterface> {
                 current_if = if alt == 0
                     && class == CLASS_HID
                     && subclass == SUBCLASS_BOOT
-                    && protocol == PROTOCOL_KEYBOARD
+                    && protocol == wanted_protocol
                 {
                     Some(desc[2])
                 } else {
@@ -178,7 +198,7 @@ pub fn find_boot_keyboard(config: &[u8]) -> Option<BootKeyboardInterface> {
                     let attributes = desc[3];
                     let is_in = ep_address & 0x80 != 0;
                     if is_in && attributes & 0x03 == XFER_INTERRUPT {
-                        return Some(BootKeyboardInterface {
+                        return Some(BootHidInterface {
                             config_value,
                             interface,
                             ep_address,
@@ -231,7 +251,7 @@ pub struct MassStorageInterface {
 /// setting 0, and returns it once both of its bulk endpoints have been
 /// seen.
 ///
-/// Same three guards as [`find_boot_keyboard`]. One addition: a USB 3
+/// Same three guards as [`find_boot_interface`]. One addition: a USB 3
 /// device follows every endpoint descriptor with a SuperSpeed Endpoint
 /// Companion, whose `bMaxBurst` belongs to the endpoint *just before it* —
 /// so the walk remembers which endpoint it last recorded and patches that
@@ -533,6 +553,31 @@ mod tests {
         blob.extend_from_slice(&endpoint_desc(0x81, XFER_INTERRUPT, 8, 10));
         let kb = find_boot_keyboard(&blob).unwrap();
         assert_eq!((kb.interface, kb.ep_address), (1, 0x81));
+    }
+
+    /// The HyperX Pulsefire Core on the target machine, read from its own
+    /// Linux sysfs: interface 0 boot mouse (ep 0x81), interface 1 boot
+    /// keyboard for the macro buttons (ep 0x82), interface 2 a vendor HID.
+    /// Each lookup must find its own interface, not the first boot one.
+    #[test]
+    fn mouse_and_keyboard_on_one_device_are_found_separately() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&config_header(66, 1));
+        blob.extend_from_slice(&interface_desc(0, 0, CLASS_HID, SUBCLASS_BOOT, PROTOCOL_MOUSE));
+        blob.extend_from_slice(&endpoint_desc(0x81, XFER_INTERRUPT, 8, 1));
+        blob.extend_from_slice(&interface_desc(1, 0, CLASS_HID, SUBCLASS_BOOT, PROTOCOL_KEYBOARD));
+        blob.extend_from_slice(&endpoint_desc(0x82, XFER_INTERRUPT, 8, 1));
+        blob.extend_from_slice(&interface_desc(2, 0, CLASS_HID, 0x00, 0x00));
+        blob.extend_from_slice(&endpoint_desc(0x83, XFER_INTERRUPT, 64, 1));
+        let m = find_boot_mouse(&blob).unwrap();
+        assert_eq!((m.interface, m.ep_address, m.ep_max_packet), (0, 0x81, 8));
+        let kb = find_boot_keyboard(&blob).unwrap();
+        assert_eq!((kb.interface, kb.ep_address), (1, 0x82));
+    }
+
+    #[test]
+    fn keyboard_only_device_has_no_mouse() {
+        assert!(find_boot_mouse(&plain_keyboard()).is_none());
     }
 
     #[test]

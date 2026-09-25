@@ -17,7 +17,7 @@
 #   scripts/qemu-debug.sh key ctrl-c
 #   scripts/qemu-debug.sh enter                    # shortcut for: key ret
 #   scripts/qemu-debug.sh mouse-move dx dy          # relative PS/2 motion (HMP mouse_move)
-#   scripts/qemu-debug.sh mouse-button val          # HMP bitmask: 1=left, 2=middle, 4=right, 0=release
+#   scripts/qemu-debug.sh mouse-button val          # HMP bitmask: 1=left, 2=right, 4=middle, 0=release
 #   scripts/qemu-debug.sh screendump [out.png]      # defaults to STATE_DIR/screen.png
 #   scripts/qemu-debug.sh log [N]                   # tail -n N serial.log (default 100)
 #   scripts/qemu-debug.sh rawlog [N]                # like log, but ANSI/control bytes shown
@@ -48,6 +48,9 @@
 #                            to make USB the only input path, as on metal
 #   QEMU_USB_KBD=1           attach a USB keyboard to it, and route `send`
 #                            through it instead of the PS/2 8042
+#   QEMU_USB_MOUSE=1         attach a USB mouse to it; `mouse-move`/
+#                            `mouse-button` then arrive through xHCI (QEMU
+#                            routes them to the newest mouse)
 #   QEMU_USB_STORAGE=<img>   attach <img> (raw, or .qcow2) as a USB mass-storage stick —
 #                            the boot pendrive's shape; pass a scratch copy,
 #                            the kernel mounts it read-write eventually
@@ -281,6 +284,9 @@ cmd_start() {
         if [ -n "${QEMU_USB_KBD:-}" ]; then
             qemu_args+=(-device "usb-kbd,bus=xhci.0")
         fi
+        if [ -n "${QEMU_USB_MOUSE:-}" ]; then
+            qemu_args+=(-device "usb-mouse,bus=xhci.0")
+        fi
         if [ -n "${QEMU_USB_STORAGE:-}" ]; then
             local stick_fmt="raw"
             case "$QEMU_USB_STORAGE" in *.qcow2) stick_fmt="qcow2" ;; esac
@@ -435,7 +441,8 @@ cmd_mouse_move() {
 
 cmd_mouse_button() {
     is_running || { echo "Not running." >&2; exit 1; }
-    # QEMU HMP bitmask: 1=left, 2=middle, 4=right. 0 releases all buttons.
+    # QEMU HMP bitmask: 1=left, 2=right, 4=middle (measured: 2 -> BTN_RIGHT,
+    # 4 -> BTN_MIDDLE on both PS/2 and USB). 0 releases all buttons.
     mon "mouse_button $1"
 }
 
