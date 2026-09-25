@@ -156,7 +156,7 @@ Testing section and `docs/drivers/roadmap.md`'s Phase 2 for more.
 | `vfs` | `vfs/` | Host-testable VFS core: `Inode`/`Filesystem`/`FileHandle` traits, mount table + path resolution, and ramfs (`cd vfs && cargo test`) |
 | `diag` | `diag/` | Host-testable always-on diagnostic instruments (`LockDiag`, `DirLockDiag`, `TfRewindDiag`, `IfViolationDiag`, `OpStat`) extracted out of `kernel/src/debug.rs` (`cd diag && cargo test`) |
 | `usock` | `usock/` | Host-testable AF_UNIX socket core: socket state machines, stream/datagram queues, backlog, `sockaddr_un` parsing, the abstract namespace and `SCM_RIGHTS`, generic over the passed-descriptor type (`cd usock && cargo test`) |
-| `sched` | `sched/` | Host-testable scheduler core: priority run queues, wait queue, decay-on-preemption, aging, quantum arithmetic, and an invariant checker + property tests, generic over the scheduled entity (`cd sched && cargo test`) |
+| `sched` | `sched/` | Host-testable scheduler core: priority run queues, wait queue, decay-on-preemption, aging, quantum arithmetic, and an invariant checker + property tests, generic over the scheduled entity; plus the one-shot `WaitCell` and the EINTR-or-restart rule behind interruptible waits (`cd sched && cargo test`) |
 | `qemu-test-runner` | `qemu-test-runner/` | Host-side driver for the QEMU integration tests (`scripts/run-kernel-tests.sh`) |
 
 Despite the heading, only `so2`+`kernel` form the actual Cargo workspace (`members = ["kernel"]` in the root `Cargo.toml`). `hal`/`ext2`/`mm`/`vfs`/`diag`/`sched`/`usock`/`qemu-test-runner` are each deliberately their own workspace root (empty `[workspace]` table in their own `Cargo.toml`, see the root `Cargo.toml`'s `exclude` comment for why — mainly that this workspace's `panic = "abort"` profile would break their unwinding `cargo test` harnesses) and are pulled into `kernel` via plain `path` dependencies instead: `kernel` depends on `hal`, `ext2`, `mm`, `vfs`, `diag`, `sched`, and `usock`; `ext2` also depends on `hal` (`hal::block::BlockDevice`). `vfs` depends on neither `hal`, `ext2`, nor `mm` — only `spin`. Each of the extracted logic crates (`hal`/`ext2`/`mm`/`vfs`/`diag`/`sched`/`usock`) exists for the same reason: `kernel` itself cannot run `cargo test` on the host (see `## QEMU integration tests` above — the `-Z build-std` + double bin-target-build lang-item collision), so logic that can be made to speak in plain types instead of this kernel's concrete globals gets moved out where a plain `cargo test` reaches it.
@@ -244,15 +244,15 @@ Implemented syscalls (Linux-compatible numbers — see `SyscallNumber` enum for 
 | 77 | `ftruncate` | memfds only (`EINVAL` otherwise); shrinking a mapped object is `EBUSY` |
 | 319 | `memfd_create` | A shared-memory object behind a new fd; `read`/`write`/`lseek`/`fstat` work on it |
 | 12 | `brk` | Heap break |
-| 13/14/15 | `sigaction`/`sigprocmask`/`sigreturn` | POSIX signals. `sigset_t` crosses the boundary in Linux's layout (bit N-1 = signal N, what mlibc's `sigaddset` writes) and is shifted to the kernel's bit-N masks (`signal::mask_from_user`); until 2026-09-25 it was taken as-is, so every C program's mask named the signal one below the one it meant |
+| 13/14/15 | `sigaction`/`sigprocmask`/`sigreturn` | POSIX signals. `sigaction` reads the handler and `sa_flags` (`SA_RESTART` only, at offset 16 of this port's `struct sigaction`, whose value is `1<<3`, not Linux's); dispositions, `SA_RESTART` and the mask are inherited by `fork` (and copied into a `clone`d thread) since 2026-09-25 — every child used to start all-default with an empty mask. `sigset_t` crosses the boundary in Linux's layout (bit N-1 = signal N, what mlibc's `sigaddset` writes) and is shifted to the kernel's bit-N masks (`signal::mask_from_user`); until 2026-09-25 it was taken as-is, so every C program's mask named the signal one below the one it meant |
 | 34 | `pause` | `rt_sigsuspend` with the mask the process already has (`signal::suspend(None)`), always `EINTR`. mlibc's `pause()` hit a missing-sysdep `__ensure` that *returns*, so `for (;;) pause();` spun printing it |
-| 130 | `rt_sigsuspend` | Swap the mask and sleep until a signal that runs a handler, terminates or stops (an ignored one does not wake it); returns `EINTR` with the old mask restored — through the handler frame's saved mask (`Process::saved_sigmask`, Linux's `TIF_RESTORE_SIGMASK`) or by `deliver_pending` if no handler runs. Check and block under the scheduler lock; every signal sender calls `Scheduler::wake_sigsuspended` after queueing, the one exception to "signals never wake a Blocked process". Backs ash's `wait` (`userspace/c/sigsuspend_test.c`) |
+| 130 | `rt_sigsuspend` | Swap the mask and sleep until a signal that runs a handler, terminates or stops (an ignored one does not wake it); returns `EINTR` with the old mask restored — through the handler frame's saved mask (`Process::saved_sigmask`, Linux's `TIF_RESTORE_SIGMASK`) or by `deliver_pending` if no handler runs. Check and block under the scheduler lock; every signal sender calls `Scheduler::interrupt_blocked` after queueing (see Interruptible waits below). Backs ash's `wait` (`userspace/c/sigsuspend_test.c`) |
 | 16 | `ioctl` | TCGETS/TCSETS* (termios, `isatty()`), TIOCGWINSZ, TIOCG/SPGRP, plus the custom `FBIO_BLIT` (`0x4642_0001`) on `/dev/fb` — full-frame scaled blit for the DOOM port, see `FbBlitArgs` |
 | 20 | `writev` | Vectored write |
 | 22 | `pipe` | Anonymous pipe |
 | 24 | `yield` | Voluntary context switch |
 | 32/33 | `dup`/`dup2` | Duplicate fd (real shared-offset semantics) |
-| 35 | `nanosleep` | Sleep via hrtimer |
+| 35 | `nanosleep` | Sleep via hrtimer. Takes plain nanoseconds, not a `timespec` (this port's ABI); a signal ends it with `EINTR`, and mlibc's `sys_sleep` measures what was left (it used to discard the result, so an interrupted sleep looked finished) |
 | 39 | `getpid` | Return current PID |
 | 110 | `getppid` | `Process::parent_pid` (1 after reparenting, 0 for PID 1). mlibc's sysdep returned 1 unconditionally until 2026-09-25, so `kill(getppid(), sig)` signalled init |
 | 41-55, 288 | `socket`/`connect`/`accept`/`sendto`/`recvfrom`/`sendmsg`/`recvmsg`/`shutdown`/`bind`/`listen`/`getsockname`/`getpeername`/`socketpair`/`setsockopt`/`getsockopt`/`accept4` | Real AF_UNIX sockets — see the AF_UNIX section below. Linux signatures throughout (`struct sockaddr_un`, `struct msghdr` with a real iovec array and `SCM_RIGHTS` control messages); `AF_INET` is `EAFNOSUPPORT`, there being no network stack |
@@ -260,7 +260,7 @@ Implemented syscalls (Linux-compatible numbers — see `SyscallNumber` enum for 
 | 59 | `exec` | `(path, argv, envp)` — real argc/argv/envp built onto the new stack, see `memory/elf_loader.rs::build_initial_stack`. Caught signals go back to `SIG_DFL` (ignored stay ignored; mask and pending carry over) — until 2026-09-25 handlers survived exec, and `sh -c 'true & sleep 1'` died of SIGSEGV every time in ash's handler inside the exec'd `sleep` |
 | 60 | `exit` | Terminate process (immediate switch). Its children go to PID 1 (`Scheduler::reparent_children`, from `kill_current`, so every death path); a zombie a blocked `waitpid` is woken for is reaped right there (`reap_zombie`) — it used to stay queued until some later `waitpid` found it again, so PID 1's `busybox --install` child was a zombie for the whole uptime (`userspace/c/lifecycle_test.c`) |
 | 61 | `waitpid` | Real POSIX pid overloads (`>0` exact/`0` own pgid/`-1` any child/`<-1` group), `WNOHANG`/`WUNTRACED`, real exit status incl. `WIFSIGNALED`. No matching child is `ECHILD` even with `WNOHANG` (ash's `wait` reaps until it sees it) |
-| 62 | `kill` | Send a signal (single pid, no process groups) |
+| 62 | `kill` | Send a signal (`pid > 0`, `0` and `< -1` for groups). Ends the target's wait if it is Blocked in an interruptible one — see Interruptible waits below |
 | 72 | `fcntl` | Only `F_DUPFD`/`F_DUPFD_CLOEXEC` do something; rest are validity-checked stubs |
 | 21 | `access` | `F_OK`/`R_OK`/`X_OK` just mean "resolves" (no uid/permission model); `W_OK` actually probes writability — opens the path `O_WRONLY` and issues a zero-length `write()`, since every read-only filesystem's regular-file handle unconditionally errors on `write()` regardless of length, while `RamFileHandle`'s `write()` with an empty buffer is a true no-op |
 | 82/83/84/87 | `rename`/`mkdir`/`rmdir`/`unlink` | VFS mutation — ramfs (`/tmp`) and ext2 (`/mnt`) both support these (real alloc/free of blocks+inodes on ext2, see the ext2 section below); devfs/initramfs/procfs remain read-only |
@@ -989,8 +989,9 @@ self-test.
   CPU): their wakers use
   `wake_or_defer`/`deliver_to_waiter`, which leave `Process::wake_pending`
   for `block_current` to consume instead of blocking — **only for waiters
-  that register on the way to blocking and are removed by the wakeup
-  itself**, or a stale one leaves a pending wakeup for some later block.
+  that register on the way to blocking and whose wait the waker has
+  claimed** (see Interruptible Waits), or a stale one leaves a pending
+  wakeup for some later block.
   Sockets also close the check→register gap with `unix::WAKE_EPOCH` (read
   before the operation, compared after registering). Counters:
   `early_wakes`, and the `sched:` block of `/proc/kdebug` (per-CPU pid,
@@ -1001,6 +1002,48 @@ self-test.
 - Ash's `wait` builtin works since 2026-09-25 (`rt_sigsuspend`, see the
   syscall table); it took three fixes — the syscall itself, the `sigset_t`
   bit layout, and `waitpid`'s `WNOHANG`-before-`ECHILD` order.
+
+## Interruptible Waits (`kernel/src/process/wait.rs`, `sched/src/wait.rs`)
+
+A signal ends a blocked wait, as on Linux (`wait_intr_test`: 27 cases).
+Until 2026-09-25 it only queued, and a `SIGKILL` to `sleep 100` took
+100 s — every waker woke a pid blindly, so a registration left behind by
+an early wakeup would have acted on the process's *next* wait, and
+cleaning registrations up from the signal path is impossible: each
+registry lock (pipe buffer, `POLL_WAITERS`, `SOCKETS`, `STDIN_WAITER`)
+comes before `SCHEDULER`, and signals are sent holding it.
+
+- **One-shot cell per wait** (`sched::WaitCell`, host-tested with a
+  real two-thread race, proven by sabotage). Every registration of a wait
+  holds the same `Arc<WaitCell>`. **A waker `claim`s it before touching
+  the waiter** — before taking pipe bytes for a reader, writing
+  `revents`, consuming a key — and drops the entry if it cannot; a signal
+  `cancel`s it (`Scheduler::interrupt_blocked`, which replaced
+  `wake_sigsuspended` and runs after every signal is queued). Exactly one
+  wins, lock-free; cancelled entries go stale and are dropped when found.
+  A claimed wait completes and the handler runs after, as on Linux.
+- **`block_current(tf, Wait)`** names the wait: syscall number, return
+  `rip` (taken before a socket rewinds it), `RestartPolicy`, and how to
+  interrupt it (`Interruptible::Cell`, `WaitPid` — clears `waiting_for` —
+  or `No`, the old behaviour). The cell comes from `begin_wait` (under the
+  scheduler lock) or `arm_wait` (pipes and sockets: registered under their
+  own lock, armed after dropping it); a path that registers and then does
+  not sleep calls `abandon_wait`. `block_current` also refuses to sleep
+  when an actionable signal is already pending (queued while the process
+  was still running) — the check-then-sleep rule for signals.
+- **EINTR or restart is decided at delivery** (`signal::deliver_pending`,
+  `sched::wait::restarts`): a handler with `SA_RESTART` re-executes
+  read/write/futex/waitpid/sockets/stdin (`rip = ret_rip - 2`, `rax = nr`,
+  arguments still in the saved registers); nanosleep and poll return
+  `EINTR` whenever a handler runs; a stop or no handler re-executes, so
+  `SIGSTOP`/`SIGCONT` is invisible to the call. A restarted `nanosleep`
+  sleeps its full duration again.
+- `sigsuspend`/`pause` keep their own path (`in_sigsuspend`). A child's
+  death calls `interrupt_blocked` **after** completing the parent's
+  `waitpid`, so SIGCHLD never turns a completed wait into `EINTR`.
+- `deliver_one` now discards ignored signals on its way to the first one
+  that acts (it stopped at the first ignored one). `/proc/kdebug`:
+  `waits_interrupted`.
 
 ## TLB Shootdown (`kernel/src/memory/tlb.rs`, `hal/src/tlb.rs`, `kernel/src/tlb_selftest.rs`)
 
@@ -1087,7 +1130,7 @@ and `include_bytes!`'d from `kernel/embedded/`. Everything else runnable-
 but-not-boot-critical — `doom`, `quake`, and most of the old C test
 programs (`hello`, `pthread_test`, `producer_consumer`,
 `mlibc_signal_test`, `stat_test`, `argv_test`, `jobctl_test`,
-`ext2_robust_test`, `fpu_test`, `socket_test`, `pipe_cow_test`, `sigsuspend_test`, `lifecycle_test`, `shm_test`, `pipe_multi_test`) — is built straight to
+`ext2_robust_test`, `fpu_test`, `socket_test`, `pipe_cow_test`, `sigsuspend_test`, `lifecycle_test`, `shm_test`, `pipe_multi_test`, `fb0_test`, `wait_intr_test`) — is built straight to
 `disk-image-root/bin/` instead and shipped on the ext2 disk image
 (`disk.img`, mounted at `/mnt`) rather than baked into the kernel ELF.
 This split exists because `kernel/embedded/`'s ELFs (mostly `doom.elf`/

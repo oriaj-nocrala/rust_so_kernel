@@ -71,9 +71,14 @@ pub(super) fn sys_futex(uaddr: u64, futex_op: i32, val: i32, _timeout: u64) -> S
                 if i32::from_ne_bytes(word) != val {
                     return errno::EAGAIN;
                 }
-                waiters.insert(pid, FutexWaiter { uaddr, as_id });
+                let cell = sched.begin_wait();
+                waiters.insert(pid, FutexWaiter { uaddr, as_id, cell });
                 unsafe { (*(tf_ptr as *mut TrapFrame)).rax = 0; }
-                let next = sched.block_current(tf_ptr);
+                let ret_rip = unsafe { (*tf_ptr).rip };
+                let next = sched.block_current(tf_ptr, crate::process::wait::Wait::cell(
+                    202, ret_rip, crate::process::wait::RestartPolicy::SaRestart,
+                    crate::process::wait::Cleanup::None,
+                ));
                 drop(waiters);
                 next
             };
@@ -95,18 +100,22 @@ pub(super) fn sys_futex(uaddr: u64, futex_op: i32, val: i32, _timeout: u64) -> S
             let mut woken_count = 0usize;
             {
                 let mut waiters = FUTEX_WAITERS.lock();
-                for (&pid, w) in waiters.iter() {
+                // A waiter a signal interrupted is dropped without counting:
+                // the wakeup goes to one still asleep instead of being lost
+                // on one that has gone back to its loop.
+                waiters.retain(|&pid, w| {
                     if woken_count >= woken_pids.len() || woken_count as i32 >= max_wake {
-                        break;
+                        return true;
                     }
-                    if w.uaddr == uaddr && w.as_id == as_id {
+                    if w.uaddr != uaddr || w.as_id != as_id {
+                        return true;
+                    }
+                    if w.cell.claim() {
                         woken_pids[woken_count] = pid;
                         woken_count += 1;
                     }
-                }
-                for pid in &woken_pids[..woken_count] {
-                    waiters.remove(pid);
-                }
+                    false
+                });
             }
 
             if woken_count > 0 {
@@ -121,10 +130,12 @@ pub(super) fn sys_futex(uaddr: u64, futex_op: i32, val: i32, _timeout: u64) -> S
     }
 }
 
-#[derive(Clone, Copy)]
 struct FutexWaiter {
     uaddr: u64,
     as_id: u64,
+    /// The wait's cell (`process::wait`): claimed by FUTEX_WAKE, cancelled
+    /// by a signal.
+    cell: alloc::sync::Arc<crate::process::wait::WaitCell>,
 }
 
 /// One outstanding FUTEX_WAIT per PID — mirrors POLL_WAITERS. Keyed by pid

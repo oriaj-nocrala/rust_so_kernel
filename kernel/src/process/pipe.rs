@@ -41,10 +41,19 @@
 // Blocked readers and blocked writers each wait in a FIFO queue. This used
 // to be one `Option` slot per end, and a second process blocking on the
 // same end replaced the first, which then never woke (`pipe_multi_test`;
-// found by four children using one pipe as a barrier). A waiter cannot go
-// stale in the queue: a blocked process leaves `Blocked` only through the
-// wakeup that removes it here (`kill` queues a signal and never force-wakes
-// a blocked process — see `sys_kill`).
+// found by four children using one pipe as a barrier).
+//
+// A SIGNAL CAN END A WAIT
+//
+// Each waiter carries its wait's cell (`process::wait`). A signal that
+// interrupts a blocked reader or writer cancels the cell and leaves the
+// entry here, stale — the signal is sent under the scheduler lock, which
+// must not nest this buffer's. So every waker claims the cell *before* it
+// does anything for the waiter: before taking bytes out of the ring for a
+// reader (they would be lost with it), before collecting a writer's bytes
+// (it has returned EINTR, having written nothing), before an EOF/EPIPE
+// wakeup. An entry that cannot be claimed is dropped. Until 2026-09-25
+// signals never ended these waits at all, and this queue relied on that.
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -61,6 +70,26 @@ struct PipeWaiter {
     pid: usize,
     user_buf: u64,
     count: usize,
+    cell: Arc<super::wait::WaitCell>,
+}
+
+impl PipeWaiter {
+    /// For the waiting process's `block_current`: a cell it arms once the
+    /// buffer lock is dropped (`scheduler::arm_wait`).
+    fn new(pid: usize, user_buf: u64, count: usize) -> (Self, Arc<super::wait::WaitCell>) {
+        let cell = Arc::new(super::wait::WaitCell::new());
+        (Self { pid, user_buf, count, cell: cell.clone() }, cell)
+    }
+}
+
+/// Pop the oldest waiter a waker can still claim, dropping stale ones.
+fn pop_claimed(q: &mut VecDeque<PipeWaiter>) -> Option<PipeWaiter> {
+    while let Some(w) = q.pop_front() {
+        if w.cell.claim() {
+            return Some(w);
+        }
+    }
+    None
 }
 
 pub struct PipeBuffer {
@@ -112,7 +141,7 @@ impl PipeBuffer {
     fn take_deliveries(&mut self) -> Vec<(PipeWaiter, Vec<u8>)> {
         let mut deliveries = Vec::new();
         while self.len > 0 {
-            let Some(w) = self.read_waiters.pop_front() else { break };
+            let Some(w) = pop_claimed(&mut self.read_waiters) else { break };
             let mut data = alloc::vec![0u8; w.count.min(self.len)];
             let got = self.try_read(&mut data);
             data.truncate(got);
@@ -152,11 +181,11 @@ unsafe fn copy_from_user(proc: &Process, user_addr: u64, dst: &mut [u8]) -> usiz
 }
 
 /// Run `f` on the waiting process `pid` to compute its syscall return value,
-/// then wake it. Usually it is Blocked; with several CPUs it can also still
-/// be running, between registering here and blocking — then the result
-/// waits in `Process::wake_pending` for its `block_current` (a pipe waiter is
-/// registered only on the way to blocking and removed by this very wakeup,
-/// so it is never stale). `f` returns the `rax` value.
+/// then wake it. Only for a waiter whose cell the caller has claimed, so it
+/// is still in this wait: usually Blocked; with several CPUs it can also
+/// still be running, between registering here and blocking — then the
+/// result waits in `Process::wake_pending` for its `block_current`. `f`
+/// returns the `rax` value.
 fn deliver_and_wake(pid: usize, f: impl FnOnce(&super::Process) -> u64) {
     let mut sched = super::scheduler::local_scheduler();
     if !sched.deliver_to_waiter(pid, f) {
@@ -229,7 +258,7 @@ impl FileHandle for PipeReadEnd {
                 if space == 0 {
                     break;
                 }
-                let Some(w) = pb.write_waiters.pop_front() else { break };
+                let Some(w) = pop_claimed(&mut pb.write_waiters) else { break };
                 pb.reserved += space;
                 drop(pb);
                 let mut tmp = [0u8; PIPE_CAPACITY];
@@ -256,11 +285,10 @@ impl FileHandle for PipeReadEnd {
             return Ok(0); // EOF
         }
 
-        pb.read_waiters.push_back(PipeWaiter {
-            pid,
-            user_buf: buf.as_ptr() as u64,
-            count: buf.len(),
-        });
+        let (waiter, cell) = PipeWaiter::new(pid, buf.as_ptr() as u64, buf.len());
+        pb.read_waiters.push_back(waiter);
+        drop(pb);
+        super::scheduler::arm_wait(cell);
         Err(FileError::WouldBlock)
     }
 
@@ -307,11 +335,10 @@ impl FileHandle for PipeWriteEnd {
         }
 
         // Buffer full — block until a reader frees space.
-        pb.write_waiters.push_back(PipeWaiter {
-            pid,
-            user_buf: buf.as_ptr() as u64,
-            count: buf.len(),
-        });
+        let (waiter, cell) = PipeWaiter::new(pid, buf.as_ptr() as u64, buf.len());
+        pb.write_waiters.push_back(waiter);
+        drop(pb);
+        super::scheduler::arm_wait(cell);
         Err(FileError::WouldBlock)
     }
 
@@ -330,7 +357,7 @@ impl Drop for PipeReadEnd {
         if pb.readers == 0 {
             let waiters = core::mem::take(&mut pb.write_waiters);
             drop(pb);
-            for w in waiters {
+            for w in waiters.into_iter().filter(|w| w.cell.claim()) {
                 wake_writer_error(w, super::syscall::errno::EPIPE);
             }
         }
@@ -344,7 +371,7 @@ impl Drop for PipeWriteEnd {
         if pb.writers == 0 {
             let waiters = core::mem::take(&mut pb.read_waiters);
             drop(pb);
-            for w in waiters {
+            for w in waiters.into_iter().filter(|w| w.cell.claim()) {
                 wake_reader(w, &[]); // EOF
             }
         }

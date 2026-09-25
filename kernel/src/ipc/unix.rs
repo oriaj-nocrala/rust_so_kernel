@@ -104,6 +104,9 @@ pub fn wake_epoch() -> u64 {
 struct Waiter {
     pid: usize,
     sock: SocketId,
+    /// The wait's cell (`process::wait`): claimed by `dispatch_wakes`,
+    /// cancelled by a signal.
+    cell: alloc::sync::Arc<crate::process::wait::WaitCell>,
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -361,7 +364,13 @@ pub fn block_on(sock: SocketId, epoch: u64) -> ! {
         // A wakeup that lands after the registration but before this block
         // is left pending on the process (`Scheduler::wake_or_defer`), and
         // `block_current` then returns this same, rewound frame.
-        sched.block_current(tf_ptr)
+        // Interruptible: `register_retry` rewound `rip` onto the `syscall`,
+        // so the call returns to 2 bytes past it.
+        let (nr, ret_rip) = unsafe { ((*tf_ptr).rax, (*tf_ptr).rip + 2) };
+        sched.block_current(tf_ptr, crate::process::wait::Wait::cell(
+            nr, ret_rip, crate::process::wait::RestartPolicy::SaRestart,
+            crate::process::wait::Cleanup::None,
+        ))
     };
     unsafe { crate::process::trapframe::jump_to_user(next_tf) }
 }
@@ -405,15 +414,24 @@ fn register_retry(sock: SocketId, epoch: u64) -> bool {
     }
 
     let pid = crate::process::scheduler::current_pid().unwrap_or(0);
+    let cell = alloc::sync::Arc::new(crate::process::wait::WaitCell::new());
     WAITERS.with(|w| {
-        if !w.iter().any(|x| x.pid == pid && x.sock == sock) {
-            w.push(Waiter { pid, sock });
-        }
+        // One entry per (process, socket): an older one is from a wait a
+        // signal ended, and goes.
+        w.retain(|x| !(x.pid == pid && x.sock == sock));
+        w.push(Waiter { pid, sock, cell: cell.clone() });
     });
     if WAKE_EPOCH.load(Ordering::SeqCst) != epoch {
-        WAITERS.with(|w| w.retain(|x| !(x.pid == pid && x.sock == sock)));
-        return false;
+        if cell.cancel() {
+            WAITERS.with(|w| w.retain(|x| !(x.pid == pid && x.sock == sock)));
+            return false;
+        }
+        // A waker already claimed this wait and will wake us — through
+        // `wake_pending` if we are still running when it gets there. So
+        // block after all: retrying now would leave that wakeup pending
+        // for some later, unrelated block.
     }
+    crate::process::scheduler::arm_wait(cell);
 
     unsafe {
         // Rewind onto the `syscall` instruction (0F 05, two bytes) so the
@@ -452,7 +470,9 @@ pub fn dispatch_wakes(wakes: &Wakes) {
             let hit = wakes.readable.contains(&waiter.sock)
                 || wakes.writable.contains(&waiter.sock)
                 || wakes.acceptable.contains(&waiter.sock);
-            if hit {
+            // Claimed before waking; a waiter a signal interrupted is
+            // just dropped.
+            if hit && waiter.cell.claim() {
                 pids.push(waiter.pid);
             }
             !hit

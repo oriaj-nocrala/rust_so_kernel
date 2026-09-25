@@ -751,9 +751,29 @@ void sys_thread_exit() {
 	__builtin_trap();
 }
 
+static long monotonic_ns() {
+	long ts[2] = {0, 0};
+	raw_syscall(SYS_clock_gettime, 1 /* CLOCK_MONOTONIC */, (long)ts);
+	return ts[0] * 1000000000L + ts[1];
+}
+
+// The kernel's nanosleep takes plain nanoseconds and reports no remaining
+// time, so what is left of an interrupted sleep is measured here — it is
+// what sleep() returns. The result used to be discarded: an interrupted
+// sleep looked finished (nanosleep 0, sleep() 0) once signals started
+// ending sleeps on 2026-09-25.
 int sys_sleep(time_t *secs, long *nanos) {
 	long ns = (*secs) * 1000000000L + *nanos;
-	raw_syscall(SYS_nanosleep, ns);
+	long t0 = monotonic_ns();
+	long ret = raw_syscall(SYS_nanosleep, ns);
+	if (ret < 0) {
+		long left = ns - (monotonic_ns() - t0);
+		if (left < 0)
+			left = 0;
+		*secs = left / 1000000000L;
+		*nanos = left % 1000000000L;
+		return (int)-ret;
+	}
 	*secs = 0;
 	*nanos = 0;
 	return 0;

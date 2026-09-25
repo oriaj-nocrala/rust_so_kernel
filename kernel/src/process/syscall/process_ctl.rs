@@ -132,9 +132,16 @@ pub(super) fn sys_nanosleep(ns: u64) -> SyscallResult {
         // start(); we still hold the scheduler lock, which is safe because
         // the ISR path acquires QUEUE first then the scheduler — and ISRs
         // cannot fire while cli is in effect.
-        crate::time::hrtimer::start(expiry, crate::time::hrtimer::HrTimerAction::WakePid(pid));
+        let cell = scheduler.begin_wait();
+        let timer = crate::time::hrtimer::start(expiry, crate::time::hrtimer::HrTimerAction::Wake { pid, cell });
 
-        scheduler.block_current(tf_ptr)
+        // A signal ends the sleep with EINTR once a handler runs (no
+        // remaining time is reported: mlibc passes no `rem`).
+        let ret_rip = unsafe { (*tf_ptr).rip };
+        scheduler.block_current(tf_ptr, crate::process::wait::Wait::cell(
+            35, ret_rip, crate::process::wait::RestartPolicy::NoHandlerOnly,
+            crate::process::wait::Cleanup::Timer(timer),
+        ))
         // scheduler lock dropped here
     };
 
@@ -276,7 +283,7 @@ pub(super) fn sys_fork() -> SyscallResult {
     unsafe { crate::process::fpu::save(&mut parent_fpu_state); }
 
     // Collect what we need from the running process
-    let (child_as, parent_pid, parent_fs_base, files, child_tf, parent_cwd, parent_pgid, parent_exe_name) = {
+    let (child_as, parent_pid, parent_fs_base, files, child_tf, parent_cwd, parent_pgid, parent_exe_name, parent_signals) = {
         let scheduler = crate::process::scheduler::local_scheduler();
         match scheduler.running_ref() {
             Some(proc) => {
@@ -289,7 +296,8 @@ pub(super) fn sys_fork() -> SyscallResult {
                     // only refreshed when the parent is switched out, so it is
                     // stale if `arch_prctl` ran since — same reasoning as the
                     // live `fpu::save` above.
-                    Ok(child_as) => (child_as, proc.pid, crate::process::scheduler::read_fs_base(), proc.files.lock().clone(), tf_copy, proc.cwd.clone(), proc.pgid, proc.exe_name.clone()),
+                    Ok(child_as) => (child_as, proc.pid, crate::process::scheduler::read_fs_base(), proc.files.lock().clone(), tf_copy, proc.cwd.clone(), proc.pgid, proc.exe_name.clone(),
+                        (proc.signal_handlers, proc.sig_restart, proc.blocked_signals)),
                     Err(e) => {
                         serial_println!("fork: address_space.fork() failed: {}", e);
                         return errno::ENOMEM;
@@ -314,6 +322,13 @@ pub(super) fn sys_fork() -> SyscallResult {
             )
         );
         child.fs_base = parent_fs_base; // inherit TLS base from parent
+        // POSIX fork(): dispositions (with their SA_RESTART) and the signal
+        // mask are inherited; pending signals are not. Every child used to
+        // start with all-default handlers and an empty mask, so a signal
+        // between fork and the child's own sigaction ran the default action
+        // (SIGINT killed a child its shell had set to ignore it) and one
+        // the parent had blocked around fork arrived in the child anyway.
+        (child.signal_handlers, child.sig_restart, child.blocked_signals) = parent_signals;
         child.set_name("child");
         scheduler.add_process(child);
         pid.0 as SyscallResult
@@ -349,10 +364,11 @@ pub(super) fn sys_fork() -> SyscallResult {
 /// thread's `Process` immediately instead of waiting for a collector that
 /// will never come).
 pub(super) fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
-    let (parent_pid, address_space, files, parent_cwd, parent_pgid, parent_exe_name) = {
+    let (parent_pid, address_space, files, parent_cwd, parent_pgid, parent_exe_name, parent_signals) = {
         let sched = crate::process::scheduler::local_scheduler();
         match sched.running_ref() {
-            Some(proc) => (proc.pid, proc.address_space.clone(), proc.files.clone(), proc.cwd.clone(), proc.pgid, proc.exe_name.clone()),
+            Some(proc) => (proc.pid, proc.address_space.clone(), proc.files.clone(), proc.cwd.clone(), proc.pgid, proc.exe_name.clone(),
+                (proc.signal_handlers, proc.sig_restart, proc.blocked_signals)),
             None => return errno::ESRCH,
         }
     };
@@ -384,6 +400,10 @@ pub(super) fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
             kernel_stack, address_space, files, owned_stack_vma, parent_cwd, parent_pgid, parent_exe_name,
         )
     );
+    // A copy, not Linux's shared table (CLONE_SIGHAND): enough that a
+    // signal landing on a new thread runs the handler its process
+    // installed, rather than the default action.
+    (thread.signal_handlers, thread.sig_restart, thread.blocked_signals) = parent_signals;
     thread.set_name("thread");
     scheduler.add_process(thread);
     pid.0 as SyscallResult
@@ -575,6 +595,7 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
                         *action = crate::process::SignalAction::Default;
                     }
                 }
+                proc.sig_restart = 0;
                 crate::ktrace!(crate::debug::SCHED, "exec: dropping old AS");
                 // Replace address space with freshly loaded one. This drops
                 // this Process's Arc reference to whatever it had before —
@@ -841,7 +862,15 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
                     proc.waiting_options = options;
                     proc.waiting_status_ptr = status_ptr;
                 }
-                Outcome::Block(scheduler.block_current(tf_ptr))
+                // Interruptible: a signal clears `waiting_for` instead
+                // (`process::wait`).
+                let ret_rip = unsafe { (*tf_ptr).rip };
+                Outcome::Block(scheduler.block_current(tf_ptr, crate::process::wait::Wait {
+                    how: crate::process::wait::Interruptible::WaitPid,
+                    nr: 61,
+                    ret_rip,
+                    policy: crate::process::wait::RestartPolicy::SaRestart,
+                }))
             }
         }
     };
@@ -882,14 +911,14 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
 /// this kernel has no permission model to bound it, so it just returns
 /// `EINVAL` rather than doing something surprising.
 ///
-/// Only queues the signal on Blocked/Ready/Zombie targets — never
-/// force-wakes them; see the doc comment inside for why. The one deliberate
-/// exception is `SIGCONT` against a currently-`Stopped` target (single or
-/// group): that's the *only* wakeup a stopped process ever gets (see
-/// `Process::state`'s `Stopped` doc comment), so it's force-woken via
-/// `wake_stopped` in addition to (not instead of) the normal
-/// `queue_signal` — if a handler is installed for SIGCONT, it still runs
-/// once the process resumes and passes through `deliver_pending`.
+/// Queues the signal, then `Scheduler::interrupt_blocked` ends the wait of
+/// any target Blocked in an interruptible one (`process::wait`: sleeps,
+/// pipes, sockets, futex, poll, waitpid, stdin, sigsuspend) that the
+/// signal would act on. `SIGCONT` against a `Stopped` target also
+/// force-wakes it via `wake_stopped` — that's the *only* wakeup a stopped
+/// process ever gets (see `Process::state`'s `Stopped` doc comment) — in
+/// addition to (not instead of) the normal `queue_signal`, so a handler
+/// installed for SIGCONT still runs once the process resumes.
 pub(super) fn sys_kill(target_pid: i64, sig: u32) -> SyscallResult {
     if sig == 0 || sig as usize >= crate::process::signal::NUM_SIGNALS {
         return errno::EINVAL;
@@ -934,25 +963,14 @@ pub(super) fn sys_kill(target_pid: i64, sig: u32) -> SyscallResult {
                 }
                 0
             } else {
-                // Just queue the signal — never force-wake a Blocked target.
-                // Whatever it's actually blocked on (pipe data, a futex, a
-                // timer) has its own wakeup path that sets a *correct* return
-                // value for that specific wait; a generic wake() here would
-                // resume it with whatever stale rax was live before it blocked
-                // (pipe/futex reads never preset one, unlike nanosleep), and —
-                // worse — removes it from wait_queue before its real wakeup
-                // gets a chance to find it there, silently losing whatever
-                // that wakeup was about to deliver. Confirmed by
-                // mlibc_signal_test.c: a kill()-woken pipe reader raced its
-                // sibling's write() and read back "" instead of the message,
-                // because deliver_and_wake's wait_queue scan found nothing —
-                // kill() had already moved it to Ready. The tradeoff (no
-                // instant SIGKILL for something blocked forever on a condition
-                // that will never occur) is accepted for this minimal
-                // implementation — delivery still happens the next time this
-                // process wakes for its own real reason and passes through a
-                // jump_to_user checkpoint. SIGCONT against a Stopped target is
-                // the one exception (see this function's doc comment).
+                // Queue, then interrupt the target's wait if it is in an
+                // interruptible one. It used to be queue-only: a generic
+                // `wake()` resumed the target with a stale `rax` and left its
+                // registration behind for the real wakeup to act on (a pipe
+                // reader woken this way read back "" — `mlibc_signal_test`),
+                // so a SIGKILL to `sleep 100` waited out the 100 s. A
+                // wait's one-shot cell now decides which of the signal and
+                // the waker ends it (`process::wait`).
                 if sig == crate::process::signal::SIGCONT {
                     sched.wake_stopped(target_pid);
                 }
@@ -960,9 +978,7 @@ pub(super) fn sys_kill(target_pid: i64, sig: u32) -> SyscallResult {
                     Some(proc) => crate::process::signal::queue_signal(proc, sig),
                     None => return errno::ESRCH,
                 }
-                // The exception to "never force-wake": `rt_sigsuspend` is
-                // waiting for exactly this.
-                sched.wake_sigsuspended();
+                sched.interrupt_blocked();
                 0
             }
         }

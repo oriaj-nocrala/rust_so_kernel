@@ -22,8 +22,11 @@ use alloc::vec::Vec;
 use crate::sync::Mutex;
 
 pub enum HrTimerAction {
-    /// Wake the process with this PID.
-    WakePid(usize),
+    /// Wake process `pid` out of the wait `cell` belongs to — only if the
+    /// timer wins that cell (`process::wait`): a signal or an event may
+    /// have ended the wait already, and the process may be asleep in a new
+    /// one by the time this fires.
+    Wake { pid: usize, cell: alloc::sync::Arc<crate::process::wait::WaitCell> },
     /// Call a kernel function (must not lock QUEUE).
     KernelFn(fn()),
 }
@@ -83,10 +86,12 @@ pub fn cancel(id: u32) -> bool {
 ///
 /// Drains all timers whose `expiry_ns <= now_ns`.
 ///   - `KernelFn` actions are called *while holding QUEUE* (see invariant above).
-///   - `WakePid` PIDs are collected into `pids_out`; QUEUE is released first.
+///   - `Wake` timers whose cell they win are collected into `pids_out`;
+///     QUEUE is released first. One that loses (the wait already ended) is
+///     dropped here.
 ///
 /// Returns the number of `(pid, timer id)` pairs written into `pids_out`.
-/// If more than 8 timers with WakePid expire in the same tick, the rest stay
+/// If more than 8 timers with Wake expire in the same tick, the rest stay
 /// queued and fire on the next tick, at most 10 ms later. (They used to be
 /// removed and dropped here, despite this comment saying otherwise — a lost
 /// wakeup for whoever slept on them.)
@@ -100,7 +105,7 @@ pub fn tick(now_ns: u64, pids_out: &mut [(usize, u32); 8]) -> usize {
         if t.expiry_ns > now_ns {
             break; // remaining timers are in the future
         }
-        if count == pids_out.len() && matches!(t.action, HrTimerAction::WakePid(_)) {
+        if count == pids_out.len() && matches!(t.action, HrTimerAction::Wake { .. }) {
             break; // no room: next tick
         }
         let timer = q.timers.remove(0);
@@ -109,9 +114,11 @@ pub fn tick(now_ns: u64, pids_out: &mut [(usize, u32); 8]) -> usize {
                 // Call while holding the lock — caller's invariant says f won't re-lock.
                 f();
             }
-            HrTimerAction::WakePid(pid) => {
-                pids_out[count] = (pid, timer.id);
-                count += 1;
+            HrTimerAction::Wake { pid, cell } => {
+                if cell.claim() {
+                    pids_out[count] = (pid, timer.id);
+                    count += 1;
+                }
             }
         }
     }

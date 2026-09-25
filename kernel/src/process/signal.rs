@@ -117,8 +117,11 @@ pub fn queue_signal(proc: &mut Process, sig: u32) {
 pub fn deliver_pending(proc: &mut Process, tf: *mut TrapFrame) -> SignalOutcome {
     // On its way back to user mode, so no longer in `rt_sigsuspend` — even
     // if something other than a signal woke it. A flag left set would let
-    // `wake_sigsuspended` end some later, unrelated block.
+    // `interrupt_blocked` end some later, unrelated block.
     proc.in_sigsuspend = false;
+    if let Some(i) = proc.interrupted.take() {
+        finish_interrupted_call(proc, tf, i);
+    }
     let outcome = deliver_one(proc, tf);
     // Returning to user mode without a handler frame to carry it: whatever
     // `rt_sigsuspend` replaced goes back now (a pushed frame took it with
@@ -155,13 +158,81 @@ pub fn has_actionable(proc: &Process) -> bool {
     false
 }
 
-fn deliver_one(proc: &mut Process, tf: *mut TrapFrame) -> SignalOutcome {
-    let deliverable = proc.pending_signals & !proc.blocked_signals;
-    if deliverable == 0 {
-        return SignalOutcome::None;
+/// What delivering `sig` does, without delivering it.
+fn effect_of(proc: &Process, sig: u32) -> sched::SignalEffect {
+    use sched::SignalEffect;
+    match proc.signal_handlers[sig as usize] {
+        _ if sig == SIGSTOP => SignalEffect::Stop,
+        SignalAction::Ignore => SignalEffect::Nothing,
+        SignalAction::Default => {
+            if sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU {
+                SignalEffect::Stop
+            } else if default_terminates(sig) {
+                SignalEffect::Terminate
+            } else {
+                SignalEffect::Nothing
+            }
+        }
+        SignalAction::Handler(_) => SignalEffect::Handler { sa_restart: proc.sig_restart & (1u64 << sig) != 0 },
     }
-    let sig = deliverable.trailing_zeros();
-    proc.pending_signals &= !(1u64 << sig);
+}
+
+/// What the next delivery will do: the first deliverable signal that is
+/// not ignored (`deliver_one` discards the ignored ones on the way).
+fn next_effect(proc: &Process) -> sched::SignalEffect {
+    let mut deliverable = proc.pending_signals & !proc.blocked_signals;
+    while deliverable != 0 {
+        let sig = deliverable.trailing_zeros();
+        deliverable &= deliverable - 1;
+        let e = effect_of(proc, sig);
+        if e != sched::SignalEffect::Nothing {
+            return e;
+        }
+    }
+    sched::SignalEffect::Nothing
+}
+
+/// A signal ended this process's wait (`process::wait`): make the call it
+/// was in return `EINTR`, or re-execute it, according to what the signal
+/// is about to do — before `deliver_one` saves the frame into a handler's
+/// signal frame, so the handler's `sigreturn` lands on the right one.
+fn finish_interrupted_call(proc: &Process, tf: *mut TrapFrame, i: super::wait::Interrupted) {
+    const EINTR: i64 = -4;
+    let restart = sched::wait::restarts(i.policy, next_effect(proc));
+    crate::ktrace!(
+        crate::debug::PROC,
+        "interrupted: PID {} syscall {} -> {}",
+        proc.pid.0, i.nr, if restart { "restart" } else { "EINTR" }
+    );
+    unsafe {
+        if restart {
+            // Back onto the `syscall` instruction with its number in rax,
+            // the arguments still in their saved registers.
+            (*tf).rip = i.ret_rip - 2;
+            (*tf).rax = i.nr;
+        } else {
+            (*tf).rip = i.ret_rip;
+            (*tf).rax = EINTR as u64;
+        }
+    }
+}
+
+fn deliver_one(proc: &mut Process, tf: *mut TrapFrame) -> SignalOutcome {
+    // Ignored signals are discarded on the way to the first one that does
+    // something. Stopping at an ignored one (as this did) left an
+    // actionable one behind it pending until the next return to user mode.
+    let mut sig;
+    loop {
+        let deliverable = proc.pending_signals & !proc.blocked_signals;
+        if deliverable == 0 {
+            return SignalOutcome::None;
+        }
+        sig = deliverable.trailing_zeros();
+        proc.pending_signals &= !(1u64 << sig);
+        if effect_of(proc, sig) != sched::SignalEffect::Nothing {
+            break;
+        }
+    }
 
     match proc.signal_handlers[sig as usize] {
         // SIGSTOP can never be caught/ignored (sys_sigaction rejects

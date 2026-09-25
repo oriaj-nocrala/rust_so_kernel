@@ -16,26 +16,44 @@ const SIG_IGN: u64 = 1;
 /// rather than the full struct — this kernel's userspace test programs use
 /// a matching minimal ABI (see `userspace/src/syscall.rs::sigaction`).
 pub(super) fn sys_sigaction(sig: u32, act_ptr: u64, oldact_ptr: u64) -> SyscallResult {
+    // This port's `struct sigaction` (`abi-bits/signal.h`): handler at 0,
+    // `sa_mask` (a u64) at 8, `int sa_flags` at 16. `SA_RESTART` is that
+    // header's value, not Linux's (0x10000000): the port's header is the
+    // ABI both sides are built against.
+    const SA_FLAGS_OFFSET: u64 = 16;
+    const SA_RESTART: i32 = 1 << 3;
+    const ACT_LEN: usize = 20;
+
     if sig == 0 || sig as usize >= crate::process::signal::NUM_SIGNALS
         || sig == crate::process::signal::SIGKILL || sig == crate::process::signal::SIGSTOP {
         return errno::EINVAL;
     }
     if act_ptr != 0 {
-        if let Err(e) = validate_user_buffer(act_ptr, 8) { return e; }
+        if let Err(e) = validate_user_buffer(act_ptr, ACT_LEN) { return e; }
     }
     if oldact_ptr != 0 {
-        if let Err(e) = validate_user_buffer(oldact_ptr, 8) { return e; }
+        if let Err(e) = validate_user_buffer(oldact_ptr, ACT_LEN) { return e; }
     }
 
     with_current_process(|proc| {
+        let bit = 1u64 << sig;
         let old = proc.signal_handlers[sig as usize];
+        let old_restart = proc.sig_restart & bit != 0;
         if act_ptr != 0 {
-            let handler_addr = unsafe { *(act_ptr as *const u64) };
+            let handler_addr = unsafe { core::ptr::read_unaligned(act_ptr as *const u64) };
+            let flags = unsafe { core::ptr::read_unaligned((act_ptr + SA_FLAGS_OFFSET) as *const i32) };
             proc.signal_handlers[sig as usize] = match handler_addr {
                 SIG_DFL => crate::process::SignalAction::Default,
                 SIG_IGN => crate::process::SignalAction::Ignore,
                 addr => crate::process::SignalAction::Handler(addr),
             };
+            // Decides whether a wait this signal interrupts is re-executed
+            // or fails with EINTR (`process::wait`).
+            if flags & SA_RESTART != 0 {
+                proc.sig_restart |= bit;
+            } else {
+                proc.sig_restart &= !bit;
+            }
         }
         if oldact_ptr != 0 {
             let old_addr = match old {
@@ -43,7 +61,13 @@ pub(super) fn sys_sigaction(sig: u32, act_ptr: u64, oldact_ptr: u64) -> SyscallR
                 crate::process::SignalAction::Ignore => SIG_IGN,
                 crate::process::SignalAction::Handler(addr) => addr,
             };
-            unsafe { *(oldact_ptr as *mut u64) = old_addr; }
+            unsafe {
+                core::ptr::write_unaligned(oldact_ptr as *mut u64, old_addr);
+                core::ptr::write_unaligned(
+                    (oldact_ptr + SA_FLAGS_OFFSET) as *mut i32,
+                    if old_restart { SA_RESTART } else { 0 },
+                );
+            }
         }
         0
     })
@@ -112,7 +136,7 @@ pub(super) fn sys_sigreturn() -> SyscallResult {
 /// mask back and return `EINTR` (it never returns anything else). The
 /// swap, the check and the block happen under one hold of the scheduler
 /// lock — the same lock every signal sender holds while queueing and then
-/// calling `Scheduler::wake_sigsuspended` — so a signal sent from another
+/// calling `Scheduler::interrupt_blocked` — so a signal sent from another
 /// CPU is either seen by the check or finds this process Blocked.
 ///
 /// The old mask travels in `Process::saved_sigmask`: a handler frame
@@ -168,7 +192,9 @@ fn suspend(new_mask: Option<u64>) -> SyscallResult {
         } else {
             proc.in_sigsuspend = true;
             unsafe { (*(tf_ptr as *mut TrapFrame)).rax = errno::EINTR as u64; }
-            let next = scheduler.block_current(tf_ptr);
+            // Not a `process::wait` wait: `interrupt_blocked` wakes it by
+            // `in_sigsuspend`, with rax preset to EINTR above.
+            let next = scheduler.block_current(tf_ptr, crate::process::wait::Wait::uninterruptible());
             if next == tf_ptr {
                 // A stale `wake_pending` let `block_current` return without
                 // blocking: a spurious wakeup, which sigsuspend's callers

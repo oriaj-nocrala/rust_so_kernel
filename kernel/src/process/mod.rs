@@ -17,6 +17,7 @@ pub mod file;
 pub mod fpu;
 pub mod pipe;
 pub mod signal;
+pub mod wait;
 pub mod user_test_fileio;
 pub mod user_programs;
 
@@ -201,8 +202,7 @@ pub struct Process {
     /// `fs::vfs::normalize_path`). Survives `exec()` (same `Process`, never
     /// reset) like real POSIX cwd; NOT shared between `clone()`-created
     /// threads (each gets its own `String` copy at creation time) — a
-    /// simplification vs. real Linux `CLONE_FS`, same spirit as
-    /// `signal_handlers` not being inherited across `fork()`.
+    /// simplification vs. real Linux `CLONE_FS`.
     pub cwd: alloc::string::String,
 
     /// The `PROGRAMS` registry name (see `user_programs.rs`) that resolved
@@ -226,12 +226,13 @@ pub struct Process {
     /// handler runs, `signal::deliver_pending` restores it directly.
     pub saved_sigmask: Option<u64>,
     /// Blocked in `rt_sigsuspend`: the one wait a signal ends. Signal
-    /// senders call `Scheduler::wake_sigsuspended`, which wakes a process
+    /// senders call `Scheduler::interrupt_blocked`, which wakes a process
     /// with this set once a signal it would act on is pending and unblocked.
     pub in_sigsuspend: bool,
-    /// Per-signal disposition; index = signal number. Not inherited across
-    /// `fork()` in this implementation (every new `Process` starts with all
-    /// `Default` — a simplification vs. real POSIX, which does inherit).
+    /// Per-signal disposition; index = signal number. Inherited by `fork()`
+    /// (with `sig_restart` and the mask) and reset to `Default` for caught
+    /// signals by `exec()`, as POSIX says. A `clone()`d thread gets a copy
+    /// at creation rather than a shared table (Linux's `CLONE_SIGHAND`).
     pub signal_handlers: [SignalAction; signal::NUM_SIGNALS],
 
     // ── TrapFrame SAVE/RESUME sequence tracking ───────────────────────────
@@ -269,6 +270,20 @@ pub struct Process {
     /// whose callers (pipes, sockets) register waiters only on the way to
     /// blocking, so it can never outlive the syscall that registered.
     pub wake_pending: Option<WakePending>,
+
+    /// The cell of the wait this process is registering for, between
+    /// `Scheduler::begin_wait`/`arm_wait` and the `block_current` that
+    /// takes it into `wait` (see `process::wait`).
+    pub armed_wait: Option<Arc<wait::WaitCell>>,
+    /// The wait this process is Blocked in, if it named one — what a
+    /// signal interrupts (`Scheduler::interrupt_blocked`).
+    pub wait: Option<wait::ActiveWait>,
+    /// Set when a signal ended the wait; `signal::deliver_pending` turns
+    /// it into `EINTR` or a re-executed call.
+    pub interrupted: Option<wait::Interrupted>,
+    /// `SA_RESTART`, one bit per signal (bit N = signal N), from
+    /// `sigaction`. Reset with the handlers on `exec`.
+    pub sig_restart: u64,
 }
 
 impl Process {
@@ -344,6 +359,10 @@ impl Process {
             tf_awaiting_resume: false,
             tf_last_resumed_seq: None,
             wake_pending: None,
+            armed_wait: None,
+            wait: None,
+            interrupted: None,
+            sig_restart: 0,
         }
     }
 
@@ -420,6 +439,10 @@ impl Process {
             tf_awaiting_resume: false,
             tf_last_resumed_seq: None,
             wake_pending: None,
+            armed_wait: None,
+            wait: None,
+            interrupted: None,
+            sig_restart: 0,
         }
     }
 
@@ -486,6 +509,10 @@ impl Process {
             tf_awaiting_resume: false,
             tf_last_resumed_seq: None,
             wake_pending: None,
+            armed_wait: None,
+            wait: None,
+            interrupted: None,
+            sig_restart: 0,
         }
     }
 
@@ -579,6 +606,10 @@ impl Process {
             tf_awaiting_resume: false,
             tf_last_resumed_seq: None,
             wake_pending: None,
+            armed_wait: None,
+            wait: None,
+            interrupted: None,
+            sig_restart: 0,
         }
     }
 

@@ -785,16 +785,24 @@ impl Scheduler {
                 super::signal::queue_signal(proc, sig);
             }
         }
-        self.wake_sigsuspended();
+        self.interrupt_blocked();
     }
 
-    /// Wake every process blocked in `rt_sigsuspend` that now has a signal
-    /// it would act on. Signals otherwise never wake a Blocked process (see
-    /// `sys_kill`), so every place that queues one calls this afterwards,
-    /// under the same lock hold — `rt_sigsuspend` checks and blocks under
-    /// this lock too, so a signal sent from another CPU cannot fall between
-    /// its check and its block. Its `rax` was preset to `EINTR`.
-    pub fn wake_sigsuspended(&mut self) {
+    /// Wake every Blocked process a newly queued signal should interrupt.
+    /// Every place that queues a signal calls this afterwards, under the
+    /// same lock hold; `block_current` checks under this lock too
+    /// (`interrupt_before_blocking`), so a signal sent from another CPU
+    /// cannot fall between a check and a block.
+    ///
+    /// `rt_sigsuspend`/`pause` sleepers are woken as before (their `rax`
+    /// was preset to `EINTR`). Any other wait is interrupted if it named
+    /// itself interruptible (`process::wait`) and the signal wins its
+    /// cell — a waker that already claimed the wait completes the call
+    /// instead, and the signal is delivered after it, as on Linux. It
+    /// used to be only the sigsuspend half: a signal to any other Blocked
+    /// process was queued and waited for the natural wakeup, so a
+    /// `SIGKILL` to a process in `sleep 100` took 100 s.
+    pub fn interrupt_blocked(&mut self) {
         loop {
             let woke = self.core.wake_matching(
                 |p| matches!(p.state, ProcessState::Blocked)
@@ -808,6 +816,25 @@ impl Scheduler {
             if !woke {
                 break;
             }
+            self.kick_idle(false);
+        }
+        loop {
+            // The cell is cancelled in the predicate: `wake_matching`
+            // prepares exactly the entry it returned `true` for.
+            let woke = self.core.wake_matching(
+                |p| matches!(p.state, ProcessState::Blocked)
+                    && !p.in_sigsuspend
+                    && super::signal::has_actionable(p)
+                    && p.wait.as_ref().is_some_and(try_interrupt),
+                |p| {
+                    finish_interrupt(p);
+                    p.state = ProcessState::Ready;
+                },
+            );
+            if !woke {
+                break;
+            }
+            crate::debug::inc_waits_interrupted();
             self.kick_idle(false);
         }
     }
@@ -842,14 +869,20 @@ impl Scheduler {
     /// this process was on its way here (`Process::wake_pending`): with
     /// another CPU as the waker, "register as a waiter, then block" is no
     /// longer one step, and a wakeup in between would otherwise be lost.
-    pub fn block_current(&mut self, current_tf: *const TrapFrame) -> *const TrapFrame {
+    pub fn block_current(&mut self, current_tf: *const TrapFrame, wait: super::wait::Wait) -> *const TrapFrame {
         let me = crate::cpu::cpu_id();
         if let Some(proc) = self.running[me].as_deref_mut() {
             if let Some(pending) = proc.wake_pending.take() {
                 if let super::WakePending::Return(rax) = pending {
                     unsafe { (*(current_tf as *mut TrapFrame)).rax = rax; }
                 }
+                // Claimed by the waker that left this wakeup.
+                proc.armed_wait = None;
                 crate::debug::inc_early_wakes();
+                return current_tf;
+            }
+            if interrupt_before_blocking(proc, wait) {
+                crate::debug::inc_waits_interrupted();
                 return current_tf;
             }
         }
@@ -859,6 +892,23 @@ impl Scheduler {
             unsafe { *proc.trapframe = *current_tf; }
             proc.fs_base = read_fs_base();
             unsafe { super::fpu::save(&mut proc.fpu_state); }
+            let armed = proc.armed_wait.take();
+            proc.wait = match wait.how {
+                super::wait::Interruptible::No => {
+                    // Nothing will ever claim a cell this wait did not use.
+                    if let Some(c) = armed {
+                        c.cancel();
+                    }
+                    None
+                }
+                super::wait::Interruptible::Cell(_) => Some(super::wait::ActiveWait { wait, cell: armed }),
+                super::wait::Interruptible::WaitPid => {
+                    if let Some(c) = armed {
+                        c.cancel();
+                    }
+                    Some(super::wait::ActiveWait { wait, cell: None })
+                }
+            };
             proc.state = ProcessState::Blocked;
             note_leaving(&proc);
             self.core.park(proc);
@@ -867,6 +917,36 @@ impl Scheduler {
         clear_current_fast();
         let next = self.pick_next();
         self.switch_in(next, "block_current")
+    }
+
+    /// Arm a fresh wait cell on this CPU's running process and return it,
+    /// for the caller to register wherever its waker looks (see
+    /// `process::wait`). Must be followed by `block_current` with an
+    /// `Interruptible::Cell` wait, or by `abandon_wait`.
+    pub fn begin_wait(&mut self) -> alloc::sync::Arc<super::wait::WaitCell> {
+        let cell = alloc::sync::Arc::new(super::wait::WaitCell::new());
+        self.arm(cell.clone());
+        cell
+    }
+
+    /// Make `cell` the running process's armed wait. A cell armed before
+    /// and never slept in is cancelled, so what registered it goes stale.
+    pub fn arm(&mut self, cell: alloc::sync::Arc<super::wait::WaitCell>) {
+        if let Some(p) = self.running_mut() {
+            if let Some(old) = p.armed_wait.replace(cell) {
+                old.cancel();
+            }
+        }
+    }
+
+    /// The running process registered for a wait and is not going to sleep
+    /// in it after all (it found what it wanted on a re-check).
+    pub fn abandon_wait(&mut self) {
+        if let Some(p) = self.running_mut() {
+            if let Some(c) = p.armed_wait.take() {
+                c.cancel();
+            }
+        }
     }
 
     /// Wake a Blocked process: move it from wait_queue to its run_queue.
@@ -972,7 +1052,6 @@ impl Scheduler {
                 super::signal::queue_signal(parent, super::signal::SIGCHLD);
             }
         }
-        self.wake_sigsuspended();
 
         // Real exit status, if `dead_pid` is parked as a zombie. Threads
         // aren't (reaped immediately in `kill_current`), so this stays at
@@ -1009,6 +1088,10 @@ impl Scheduler {
             self.reap_zombie(dead_pid);
             self.wake(pid);
         }
+        // Last: a parent whose `waitpid` this death just completed must get
+        // its child's pid, not EINTR from the SIGCHLD queued above — the
+        // call completes and the handler runs after it, as on Linux.
+        self.interrupt_blocked();
     }
 
     /// Remove zombie `pid` from the wait queue and free it. Its kernel stack
@@ -1075,12 +1158,12 @@ impl Scheduler {
                 super::signal::queue_signal(parent, super::signal::SIGCHLD);
             }
         }
-        self.wake_sigsuspended();
 
         let Some((stopped_pgid, status_word)) = self.core.wait_queue().iter()
             .find(|p| p.pid.0 == stopped_pid && matches!(p.state, ProcessState::Stopped))
             .map(|p| (p.pgid, p.stop_status_word()))
         else {
+            self.interrupt_blocked();
             return;
         };
 
@@ -1107,6 +1190,8 @@ impl Scheduler {
             }
             self.wake(pid);
         }
+        // Last, for the reason `notify_child_death` gives.
+        self.interrupt_blocked();
     }
 
     /// If the process about to resume (`self.running`) has a pending
@@ -1443,6 +1528,75 @@ pub fn render() -> alloc::string::String {
 
 pub fn current_pid() -> Option<usize> {
     local_scheduler().current_pid().map(|pid| pid.0)
+}
+
+/// `Scheduler::arm` for callers outside the scheduler lock that registered
+/// under a lock of their own which must not nest it (a pipe's buffer, the
+/// socket waiter list): register with `cell`, drop that lock, then arm.
+/// A waker that claims `cell` in between finds the process running and
+/// leaves `wake_pending`. Same calling context as `current_pid`.
+pub fn arm_wait(cell: alloc::sync::Arc<super::wait::WaitCell>) {
+    local_scheduler().arm(cell);
+}
+
+/// A signal is interrupting `w` if it can win the wait's cell (or the
+/// wait has no cell to race for: `waitpid`). Called with the scheduler lock
+/// held; the cancel is final, so the caller must go on to interrupt.
+fn try_interrupt(w: &super::wait::ActiveWait) -> bool {
+    match w.wait.how {
+        super::wait::Interruptible::No => false,
+        super::wait::Interruptible::Cell(_) => w.cell.as_ref().is_some_and(|c| c.cancel()),
+        super::wait::Interruptible::WaitPid => true,
+    }
+}
+
+/// The rest of an interruption once `try_interrupt` has won: tidy up,
+/// and leave what the call becomes to signal delivery.
+fn finish_interrupt(p: &mut Process) {
+    let Some(w) = p.wait.take() else { return };
+    match w.wait.how {
+        super::wait::Interruptible::Cell(super::wait::Cleanup::Timer(id)) => {
+            crate::time::hrtimer::cancel(id);
+        }
+        super::wait::Interruptible::WaitPid => {
+            p.waiting_for = None;
+            p.waiting_options = 0;
+            p.waiting_status_ptr = 0;
+        }
+        _ => {}
+    }
+    p.interrupted = Some(super::wait::Interrupted {
+        nr: w.wait.nr,
+        ret_rip: w.wait.ret_rip,
+        policy: w.wait.policy,
+    });
+}
+
+/// `block_current`'s half of "check-then-sleep is one step": a signal the
+/// process would act on was queued while it was still running (so no
+/// `interrupt_blocked` could find it Blocked). Then it does not sleep; the
+/// call is interrupted right here, exactly as if it had slept and been
+/// woken. `false` if the wait is not interruptible or a waker already
+/// claimed it (then that waker wakes it).
+fn interrupt_before_blocking(p: &mut Process, wait: super::wait::Wait) -> bool {
+    if p.in_sigsuspend || !super::signal::has_actionable(p) {
+        return false;
+    }
+    let active = super::wait::ActiveWait {
+        wait,
+        cell: match wait.how {
+            super::wait::Interruptible::Cell(_) => p.armed_wait.take(),
+            _ => None,
+        },
+    };
+    if !try_interrupt(&active) {
+        // Put a claimed cell back: `block_current` parks with it.
+        p.armed_wait = active.cell;
+        return false;
+    }
+    p.wait = Some(active);
+    finish_interrupt(p);
+    true
 }
 
 /// Same as `current_pid()`, but self-contained (`cli`/`sti` around the

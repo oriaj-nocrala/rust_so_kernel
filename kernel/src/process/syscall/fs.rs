@@ -15,6 +15,24 @@ use super::{
 struct StdinWaiter {
     pid: usize,
     user_buf: u64,
+    /// The wait's cell (`process::wait`): claimed by `stdin_wakeup` before
+    /// it consumes a key for this reader.
+    cell: alloc::sync::Arc<crate::process::wait::WaitCell>,
+}
+
+/// The interruptible wait of a `read`/`write` that blocks in a
+/// `FileHandle` (a pipe, a socket, the console): restarted under
+/// `SA_RESTART`, EINTR otherwise. The syscall number is read from the frame
+/// rather than assumed — `writev` blocks through `sys_write` — and
+/// `entry_rip` is taken before the handle runs, since a socket rewinds the
+/// frame's `rip` on its way to blocking.
+fn io_wait(tf: *const TrapFrame, entry_rip: u64) -> crate::process::wait::Wait {
+    crate::process::wait::Wait::cell(
+        unsafe { (*tf).rax },
+        entry_rip,
+        crate::process::wait::RestartPolicy::SaRestart,
+        crate::process::wait::Cleanup::None,
+    )
 }
 
 static STDIN_WAITER: crate::sync::IrqLock<Option<StdinWaiter>> = crate::sync::IrqLock::new(None);
@@ -91,6 +109,7 @@ pub(super) fn sys_read(fd: i32, buf: usize, count: usize) -> SyscallResult {
         // every early-return path below automatically; on the WouldBlock
         // path it's deliberately left undropped, same reasoning as above.
         let _irq = crate::process::irq_guard::InterruptGuard::new();
+        let entry_rip = unsafe { (*current_tf_ptr()).rip };
 
         let files = {
             let scheduler = crate::process::scheduler::local_scheduler();
@@ -127,7 +146,7 @@ pub(super) fn sys_read(fd: i32, buf: usize, count: usize) -> SyscallResult {
                 let tf_ptr = current_tf_ptr();
                 let next_tf = {
                     let mut scheduler = crate::process::scheduler::local_scheduler();
-                    scheduler.block_current(tf_ptr)
+                    scheduler.block_current(tf_ptr, io_wait(tf_ptr, entry_rip))
                 };
                 unsafe { crate::process::trapframe::jump_to_user(next_tf) }
             }
@@ -158,9 +177,11 @@ fn block_stdin_read(current_tf: *const TrapFrame, user_buf: u64) -> ! {
         if crate::keyboard::read_key_peek() {
             None
         } else {
-            *waiter = Some(StdinWaiter { pid, user_buf });
+            let cell = sched.begin_wait();
+            *waiter = Some(StdinWaiter { pid, user_buf, cell });
             drop(waiter);
-            Some(sched.block_current(current_tf))
+            let entry_rip = unsafe { (*current_tf).rip };
+            Some(sched.block_current(current_tf, io_wait(current_tf, entry_rip)))
         }
         // Lock dropped here; sti happens via iretq of the next process.
     };
@@ -194,12 +215,19 @@ pub(crate) fn stdin_wakeup() {
     };
     let Some(waiter) = waiter else { return; };
 
-    // Consume the character that was just pushed by the keyboard ISR.
-    let Some(c) = crate::keyboard::read_key() else {
-        // Shouldn't happen (ISR pushed it just before calling us), but be safe.
-        *STDIN_WAITER.lock() = Some(waiter);
+    if !crate::keyboard::read_key_peek() {
+        // Shouldn't happen (the ISR pushed a key just before calling us).
+        if waiter.cell.is_armed() {
+            *STDIN_WAITER.lock() = Some(waiter);
+        }
         return;
-    };
+    }
+    // Before consuming the key: a reader a signal interrupted is gone, and
+    // the key belongs to whoever reads next.
+    if !waiter.cell.claim() {
+        return;
+    }
+    let key = crate::keyboard::read_key();
 
     let user_buf = waiter.user_buf;
     let pid = waiter.pid;
@@ -212,10 +240,15 @@ pub(crate) fn stdin_wakeup() {
     // `AddressSpace::copy_to_user`), and set rax=1 as the return value.
     // Taking the address space's `IrqMutex` from this ISR is safe: every
     // holder runs with IF=0, so none can be the code this interrupted.
+    // Without a key after all (another CPU took it between the peek and
+    // here), the claimed wait is ended by re-executing the read.
     for proc in sched.wait_queue_mut().iter_mut() {
         if proc.pid.0 == pid && matches!(proc.state, crate::process::ProcessState::Blocked) {
-            if unsafe { proc.address_space.copy_to_user(user_buf, &[c as u8]) } == 1 {
-                proc.trapframe.rax = 1; // syscall return value: 1 byte read
+            match key {
+                Some(c) if unsafe { proc.address_space.copy_to_user(user_buf, &[c as u8]) } == 1 => {
+                    proc.trapframe.rax = 1; // syscall return value: 1 byte read
+                }
+                _ => proc.trapframe.rip -= 2, // rax still holds read's number
             }
             break;
         }
@@ -236,6 +269,7 @@ pub(super) fn sys_write(fd: i32, buf: usize, count: usize) -> SyscallResult {
     crate::ktrace!(crate::debug::FS, "sys_write: fd={} count={}", fd, count);
 
     let _irq = crate::process::irq_guard::InterruptGuard::new();
+    let entry_rip = unsafe { (*current_tf_ptr()).rip };
 
     let files = {
         let scheduler = crate::process::scheduler::local_scheduler();
@@ -271,7 +305,7 @@ pub(super) fn sys_write(fd: i32, buf: usize, count: usize) -> SyscallResult {
             let tf_ptr = current_tf_ptr();
             let next_tf = {
                 let mut scheduler = crate::process::scheduler::local_scheduler();
-                scheduler.block_current(tf_ptr)
+                scheduler.block_current(tf_ptr, io_wait(tf_ptr, entry_rip))
             };
             unsafe { crate::process::trapframe::jump_to_user(next_tf) }
         }

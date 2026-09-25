@@ -169,6 +169,9 @@ pub use core::SchedCore;
 
 pub mod invariants;
 
+pub mod wait;
+pub use wait::{RestartPolicy, SignalEffect, WaitCell};
+
 #[cfg(test)]
 mod fairness;
 

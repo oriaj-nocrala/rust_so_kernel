@@ -220,7 +220,7 @@ enum PollWaiterKind {
 }
 
 /// Describes a process blocked in poll() or epoll_wait().
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PollWaiter {
     pid:      usize,
     /// Physical address of the user result buffer (pre-translated at block time).
@@ -232,6 +232,16 @@ struct PollWaiter {
     timer_id: Option<u32>,
     /// This process's fd → socket mapping at block time — see `SocketMap`.
     socks:    SocketMap,
+    /// The wait's cell (`process::wait`), set by `block_poll_waiter`:
+    /// claimed by whichever of an event and the timeout comes first,
+    /// cancelled by a signal.
+    cell:     Option<alloc::sync::Arc<crate::process::wait::WaitCell>>,
+}
+
+impl PollWaiter {
+    fn claim(&self) -> bool {
+        self.cell.as_ref().is_some_and(|c| c.claim())
+    }
 }
 
 /// One entry per PID — a process can only have one outstanding poll/epoll_wait.
@@ -289,8 +299,11 @@ fn fd_check_ready(socks: &SocketMap, fd: i32, events: i16) -> i16 {
 /// For EpollWait: writes ready EpollEvent structs starting at phys_buf.
 /// Returns the number of ready fds/events.
 ///
-/// Called with cli held, after POLL_WAITERS has been released.
-fn deliver_poll_result_phys(waiter: &PollWaiter, phys_offset: u64) -> usize {
+/// Called with cli held, after POLL_WAITERS has been released. With
+/// `write` false it only counts: a waker that has not claimed the wait's
+/// cell yet must not write into memory the process may have moved on
+/// from (`process::wait`).
+fn deliver_poll_result_phys(waiter: &PollWaiter, phys_offset: u64, write: bool) -> usize {
     let socks = &waiter.socks;
     match waiter.kind {
         PollWaiterKind::Poll { nfds } => {
@@ -300,7 +313,9 @@ fn deliver_poll_result_phys(waiter: &PollWaiter, phys_offset: u64) -> usize {
             for i in 0..nfds as usize {
                 let pfd = unsafe { *base.add(i) };
                 let rev = fd_check_ready(socks, pfd.fd, pfd.events);
-                unsafe { (*base.add(i)).revents = rev; }
+                if write {
+                    unsafe { (*base.add(i)).revents = rev; }
+                }
                 if rev != 0 { ready += 1; }
             }
             ready
@@ -328,7 +343,9 @@ fn deliver_poll_result_phys(waiter: &PollWaiter, phys_offset: u64) -> usize {
                     if epoll_rev != 0 {
                         let ev = EpollEvent { events: epoll_rev, data: watch.data };
                         let dst = (base + written as u64 * 12) as *mut EpollEvent;
-                        unsafe { core::ptr::write_unaligned(dst, ev); }
+                        if write {
+                            unsafe { core::ptr::write_unaligned(dst, ev); }
+                        }
                         written += 1;
                     }
                 }
@@ -443,10 +460,17 @@ pub(crate) fn poll_wakeup_for_fd0() {
 
     let Some(waiter) = waiter else { return; };
 
-    let count = deliver_poll_result_phys(&waiter, phys_offset);
-    if count == 0 {
-        POLL_WAITERS.lock().insert(waiter.pid, waiter);
+    // Count first, claim second, write third: nothing may be written into
+    // a waiter's memory before its wait is won (a signal may have ended
+    // it), and a 0 count must leave the wait armed.
+    if deliver_poll_result_phys(&waiter, phys_offset, false) == 0 {
+        if waiter.cell.as_ref().is_some_and(|c| c.is_armed()) {
+            POLL_WAITERS.lock().insert(waiter.pid, waiter);
+        }
         return;
+    }
+    if !waiter.claim() {
+        return; // stale: a signal (or the timeout) ended that wait
     }
 
     // Cancel timeout timer (if any)
@@ -454,6 +478,7 @@ pub(crate) fn poll_wakeup_for_fd0() {
         crate::time::hrtimer::cancel(tid);
     }
 
+    let count = deliver_poll_result_phys(&waiter, phys_offset, true);
     let mut sched = crate::process::scheduler::local_scheduler();
     sched.wake_with_retval(waiter.pid, count as u64);
     // sched guard dropped; caller (keyboard ISR) still holds IF=0
@@ -487,12 +512,15 @@ fn poll_wakeup_for_socket_inner(sock: SocketId) {
     };
 
     let Some(waiter) = waiter else { return; };
+    if !waiter.claim() {
+        return; // stale: a signal (or the timeout) ended that wait
+    }
 
     if let Some(tid) = waiter.timer_id {
         crate::time::hrtimer::cancel(tid);
     }
 
-    let count = deliver_poll_result_phys(&waiter, phys_offset);
+    let count = deliver_poll_result_phys(&waiter, phys_offset, true);
     let mut sched = crate::process::scheduler::local_scheduler();
     sched.wake_with_retval(waiter.pid, count as u64);
 }
@@ -674,6 +702,7 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u32, timeout_ms: i32) -> SyscallResul
         kind: PollWaiterKind::Poll { nfds },
         timer_id: None,
         socks,
+        cell: None,
     };
     block_poll_waiter(tf_ptr, waiter, timeout_ms, ready_now)
 }
@@ -705,17 +734,19 @@ fn block_poll_waiter(
     let socks = waiter.socks;
     let next_tf = {
         let mut sched = crate::process::scheduler::local_scheduler();
+        let cell = sched.begin_wait();
 
         // Register hrtimer if timeout_ms > 0 (< 0 waits forever).
         waiter.timer_id = if timeout_ms > 0 {
             let expiry = crate::time::ktime_get() + timeout_ms as u64 * 1_000_000;
             Some(crate::time::hrtimer::start(
                 expiry,
-                crate::time::hrtimer::HrTimerAction::WakePid(pid),
+                crate::time::hrtimer::HrTimerAction::Wake { pid, cell: cell.clone() },
             ))
         } else {
             None
         };
+        waiter.cell = Some(cell);
         let timer_id = waiter.timer_id;
         POLL_WAITERS.lock().insert(pid, waiter);
 
@@ -724,11 +755,20 @@ fn block_poll_waiter(
             if let Some(tid) = timer_id {
                 crate::time::hrtimer::cancel(tid);
             }
+            sched.abandon_wait();
             None
         } else {
+            // A signal ends the wait with EINTR once a handler runs.
+            let (nr, ret_rip) = unsafe { ((*tf_ptr).rax, (*tf_ptr).rip) };
             // Pre-set rax=0 (timeout return value)
             unsafe { (*(tf_ptr as *mut TrapFrame)).rax = 0; }
-            Some(sched.block_current(tf_ptr))
+            let cleanup = match timer_id {
+                Some(id) => crate::process::wait::Cleanup::Timer(id),
+                None => crate::process::wait::Cleanup::None,
+            };
+            Some(sched.block_current(tf_ptr, crate::process::wait::Wait::cell(
+                nr, ret_rip, crate::process::wait::RestartPolicy::NoHandlerOnly, cleanup,
+            )))
         }
     };
     match next_tf {
@@ -900,6 +940,7 @@ pub(super) fn sys_epoll_wait(epfd: i32, events_ptr: u64, maxevents: i32, timeout
         kind: PollWaiterKind::EpollWait { epoll_id, maxevents: maxevents as usize },
         timer_id: None,
         socks,
+        cell: None,
     };
     block_poll_waiter(tf_ptr, waiter, timeout_ms, |socks| {
         epoll_ready(epoll_id, socks, None, maxevents as usize) > 0
