@@ -3,8 +3,8 @@
 > **Estado (2026-09-24):** etapa 0 hecha (reglas SMP-ready en el
 > CLAUDE.md, `memory::tlb`, `keyboard::DECODER` tras un `IrqMutex`);
 > etapa 1 hecha y verificada en QEMU y en la Ryzen (LAPIC timer + I/O APIC,
-> `hal::apic`); etapa 2 hecha y verificada en QEMU (`cpu::percpu`, `swapgs`
-> solo en la entrada de `syscall`; falta la Ryzen). El kernel sigue siendo
+> `hal::apic`); etapa 2 hecha y verificada en QEMU y en la Ryzen
+> (`cpu::percpu`, `swapgs` solo en la entrada de `syscall`). El kernel sigue siendo
 > de una sola CPU: `cpu::cpu_id()` lee el TR y da `0` hasta que la etapa 3
 > dé una TSS a cada CPU, y no hay IPIs ni arranque de APs.
 
@@ -269,10 +269,12 @@ referencia):
   `user_rsp_scratch` y `cpu_id`.
 - **`cpu_id()` lee el task register (`str`)**, no `gs:` ni RDPID: vale en
   cualquier camino, sea cual sea el estado de GS, y no depende de ninguna
-  característica de CPUID. Coste medido en QEMU (TCG, así que no dice nada
-  del metal): 677 ciclos de TSC por llamada, frente a 546 de RDPID;
-  `/proc/kdebug` (`percpu:`) lo mide en cada arranque, y **falta leerlo en
-  la Ryzen** para confirmar la elección. **Impone una condición a la
+  característica de CPUID. Coste medido en la Ryzen (boot #28, `percpu:`
+  en `/proc/kdebug`, que lo mide en cada arranque; bucle de 1000 llamadas
+  a `opt-level 0`, con su propio overhead incluido): **37,6 ciclos de TSC
+  por llamada frente a 33,0 de RDPID** — unos 4,5 ciclos de diferencia, que
+  no justifican depender de RDPID. (En QEMU/TCG: 677 frente a 546, sin
+  valor para el metal.) **Impone una condición a la
   etapa 3:** una sola GDT con un slot de TSS por CPU, en
   `FIRST_TSS_SELECTOR + 16·n` (con una GDT por CPU y la TSS en el mismo
   índice, `str` daría lo mismo en todas). `tss::init` comprueba el selector
@@ -287,6 +289,11 @@ referencia):
 Verificado: `grep` no encuentra ni `SYSCALL_USER_RFLAGS` ni `KERNEL_RSP0`;
 `boot-matrix 4 5` = 20/20 (dos veces), `run-kernel-tests` PASS,
 `fpu_test` ALL_OK, `socket_test` PASS, DOOM y Quake corriendo sus demos.
+En la Ryzen (2026-09-24, boots #27 y #28 por `metal-run.sh`): 200
+fork+exec, `fpu_test` ALL_OK, `socket_test` PASS, `METAL-DONE exit=0`, sin
+pánico del detector. El primer intento se clasificó NO-JOB porque el bucle
+desbordó el ring de `klog` (64 KiB) y borró `METAL-BEGIN`; el clasificador
+ya reconoce el job también por `METAL-DONE` (51abd1d).
 
 ### Etapa 3 — TSS, GDT, IST y MSRs por CPU
 
