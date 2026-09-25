@@ -33,9 +33,17 @@
 // unreachable once the table covers all of RAM, but if it ever happens the
 // cost is a leaked frame, not two processes sharing one.
 //
-// All accesses must be under `cli` (single CPU — no atomics needed).
+// The counts are `AtomicU8`s (stage 6 of `docs/smp/smp-plan.md`). They
+// used to be plain bytes whose read-modify-writes were kept whole by IF=0
+// — true on one CPU only; two CPUs dropping their share of one frame at
+// once could both read 2, both write 1, and the frame would never be freed
+// (or, the other way round, freed while still mapped). The *decisions*
+// built on a count are made under the owning address space's lock
+// (`AddressSpace::lock`): a count can only rise through `fork()` of an
+// address space that maps the frame, which holds that lock, so a faulting
+// thread that reads 1 under the same lock really is the last owner.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use x86_64::{PhysAddr, structures::paging::PhysFrame};
 
 /// Largest table the Buddy allocator can hand out in one block
@@ -45,11 +53,11 @@ use x86_64::{PhysAddr, structures::paging::PhysFrame};
 const MAX_TABLE_ORDER: usize = 28;
 
 /// Base of the refcount table, or null before `init_refcount_table`.
-static mut FRAME_REFCOUNTS: *mut u8 = core::ptr::null_mut();
+static FRAME_REFCOUNTS: AtomicPtr<AtomicU8> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Number of frames the table covers. Zero before `init_refcount_table`,
 /// which makes every accessor take its fail-safe path.
-static mut TRACKED_FRAMES: usize = 0;
+static TRACKED_FRAMES: AtomicUsize = AtomicUsize::new(0);
 
 /// Size, allocate and zero the frame refcount table.
 ///
@@ -79,15 +87,18 @@ pub unsafe fn init_refcount_table(max_phys_addr: u64) {
     let virt = (crate::memory::physical_memory_offset() + addr.as_u64()).as_mut_ptr::<u8>();
     core::ptr::write_bytes(virt, 0, 1usize << order);
 
-    FRAME_REFCOUNTS = virt;
-    TRACKED_FRAMES = frames.min(1usize << order);
+    let tracked = frames.min(1usize << order);
+    // Pointer first, count second (Release): a reader that sees the count
+    // sees the pointer.
+    FRAME_REFCOUNTS.store(virt.cast::<AtomicU8>(), Ordering::Release);
+    TRACKED_FRAMES.store(tracked, Ordering::Release);
 
     crate::serial_println!(
         "COW: refcount table {} KiB at phys {:#x}, covers {} frames ({} MiB of RAM)",
         (1usize << order) / 1024,
         addr.as_u64(),
-        TRACKED_FRAMES,
-        (TRACKED_FRAMES * 4096) / (1024 * 1024),
+        tracked,
+        (tracked * 4096) / (1024 * 1024),
     );
 }
 
@@ -95,115 +106,54 @@ pub unsafe fn init_refcount_table(max_phys_addr: u64) {
 /// `/proc/kdebug`'s report so a machine whose RAM outruns the table says
 /// so instead of corrupting memory quietly.
 pub fn tracked_frames() -> usize {
-    unsafe { TRACKED_FRAMES }
-}
-
-#[inline]
-fn frame_idx(frame: PhysFrame) -> usize {
-    (frame.start_address().as_u64() / 4096) as usize
+    TRACKED_FRAMES.load(Ordering::Acquire)
 }
 
 /// Slot for `frame`, or `None` if it falls outside the tracked range.
 #[inline]
-unsafe fn slot(frame: PhysFrame) -> Option<*mut u8> {
-    let idx = frame_idx(frame);
-    if idx < TRACKED_FRAMES {
-        Some(FRAME_REFCOUNTS.add(idx))
+fn slot(frame: PhysFrame) -> Option<&'static AtomicU8> {
+    let idx = (frame.start_address().as_u64() / 4096) as usize;
+    if idx < TRACKED_FRAMES.load(Ordering::Acquire) {
+        // SAFETY: the table is `TRACKED_FRAMES` bytes long, never freed,
+        // and published before its length.
+        Some(unsafe { &*FRAME_REFCOUNTS.load(Ordering::Relaxed).add(idx) })
     } else {
         None
     }
 }
 
-/// Check whether the calling accessor's invariant ("must be called with
-/// interrupts disabled") actually holds, recording anything that doesn't
-/// into the per-accessor counter passed in (see `debug::COW_IF_VIOLATIONS_*`
-/// for `inc_ref`/`dec_ref`/`get_ref`, and `debug::COW_IF_ENABLED_SET_REF`
-/// for `set_ref`, which is instrumented the same way despite not being a
-/// real violation — see its own doc comment) instead of just
-/// asserting/panicking — this is a bug hunt, not a case where crashing
-/// harder helps, and a live counter survives to be read from
-/// `/proc/kdebug`/the panic snapshot even on a run that goes on to
-/// hang/double-fault before a fix could ever print anything. Split by
-/// accessor (rather than one shared counter) because `set_ref` (a plain
-/// write — always into a just-allocated, exclusively-owned frame index,
-/// so not itself a lost-update hazard) and `inc_ref`/`dec_ref` (a real
-/// non-atomic read-modify-write, the actual lost-update hazard if a
-/// timer tick lands mid-sequence and something else touches the same
-/// frame index before it resumes) have very different risk profiles —
-/// a shared "last caller" would hide whichever violation happened
-/// second. One relaxed load + branch — same cost model as `ktrace!`.
-#[inline]
-#[track_caller]
-fn check_if_disabled(diag: &crate::debug::IfViolationDiag) {
-    if x86_64::instructions::interrupts::are_enabled() {
-        diag.record(core::panic::Location::caller());
-    }
-}
-
 /// Set the refcount of a data frame to an explicit value.
-/// Called after allocating a new data frame (set to 1).
-///
-/// # Safety
-/// Unlike `inc_ref`/`dec_ref` below, this one does NOT actually require
-/// interrupts disabled, and callers running with IF=1 are not a bug.
-/// `FRAME_REFCOUNTS[idx] = count` is a single-byte store — indivisible on
-/// this architecture regardless of interrupt state — and every call site
-/// writes into a frame index that was *just* allocated and is exclusively
-/// owned by the caller at that point (no other code path can be racing to
-/// touch the same index), so there is no read-modify-write sequence for a
-/// timer tick to land in the middle of and no lost update to lose. This
-/// was originally documented the same as the other three accessors, on
-/// the theory that "all `cow.rs` accessors" shared one invariant; measured
-/// instead of assumed: `sys_exec`/`memory/elf_loader.rs` legitimately call
-/// this with interrupts enabled ~675 times per boot in the normal ELF-load
-/// path (`elf_loader.rs`'s PT_LOAD segment loop), and every one of those is
-/// correct, not a race. Note the counter's `last_caller` reports
-/// `page_table_manager.rs`'s `map_user_page`, not `elf_loader` — that is
-/// the immediate call site, one frame below where the IF=1 actually
-/// originates; don't read the mismatch as the counter pointing somewhere
-/// unexpected. The accompanying
-/// `debug::COW_IF_ENABLED_SET_REF` counter is informational — evidence of
-/// how this accessor is actually used — not a fault detector; see its own
-/// doc comment. `inc_ref`/`dec_ref` (real non-atomic read-modify-write) and
-/// `get_ref` (a plain read, tracked for completeness) still have a genuine
-/// "interrupts disabled" contract — see their doc comments below.
-#[track_caller]
-pub unsafe fn set_ref(frame: PhysFrame, count: u8) {
-    check_if_disabled(&crate::debug::COW_IF_ENABLED_SET_REF);
+/// Called after allocating a new data frame (set to 1), before the frame
+/// is mapped anywhere — nobody else can be touching its count.
+pub fn set_ref(frame: PhysFrame, count: u8) {
     // Untracked: nothing to record. Harmless on its own — `get_ref` below
     // reports such a frame as shared regardless, which is the conservative
     // answer this accessor would otherwise be overriding to 1.
-    if let Some(p) = slot(frame) {
-        *p = count;
+    if let Some(c) = slot(frame) {
+        c.store(count, Ordering::Release);
     }
 }
 
 /// Increment the refcount of a frame (COW share — parent and child now own it).
-///
-/// # Safety
-/// Must be called with interrupts disabled (single CPU).
-#[track_caller]
-pub unsafe fn inc_ref(frame: PhysFrame) {
-    check_if_disabled(&crate::debug::COW_IF_VIOLATIONS_INC_REF);
+pub fn inc_ref(frame: PhysFrame) {
     // Untracked: no count to raise, and none is needed — `get_ref` already
     // answers "shared" and `dec_ref` never reaches zero for such a frame.
-    if let Some(p) = slot(frame) {
-        *p = (*p).saturating_add(1);
+    if let Some(c) = slot(frame) {
+        let _ = c.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_add(1)));
     }
 }
 
 /// Decrement the refcount of a frame.  Returns the NEW refcount value.
-/// When the new value is 0, the caller should free the frame to the Buddy allocator.
-///
-/// # Safety
-/// Must be called with interrupts disabled (single CPU).
-#[track_caller]
-pub unsafe fn dec_ref(frame: PhysFrame) -> u8 {
-    check_if_disabled(&crate::debug::COW_IF_VIOLATIONS_DEC_REF);
+/// When the new value is 0, the caller should free the frame to the Buddy
+/// allocator — and exactly one caller sees 0, since the decrement and the
+/// read of its result are one atomic operation.
+pub fn dec_ref(frame: PhysFrame) -> u8 {
     match slot(frame) {
-        Some(p) => {
-            *p = (*p).saturating_sub(1);
-            *p
+        Some(c) => {
+            let old = c
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_sub(1)))
+                .unwrap_or(0);
+            old.saturating_sub(1)
         }
         // Untracked: never report zero. Callers free the frame to the
         // Buddy allocator on a zero return, and an untracked frame may
@@ -214,14 +164,9 @@ pub unsafe fn dec_ref(frame: PhysFrame) -> u8 {
 }
 
 /// Read the refcount of a frame without modifying it.
-///
-/// # Safety
-/// Must be called with interrupts disabled (single CPU).
-#[track_caller]
-pub unsafe fn get_ref(frame: PhysFrame) -> u8 {
-    check_if_disabled(&crate::debug::COW_IF_VIOLATIONS_GET_REF);
+pub fn get_ref(frame: PhysFrame) -> u8 {
     match slot(frame) {
-        Some(p) => *p,
+        Some(c) => c.load(Ordering::Acquire),
         // Untracked: report "shared" so the COW fault handler copies
         // instead of handing the faulting process write access to a frame
         // someone else may still own. Costs a copy that may be needless;

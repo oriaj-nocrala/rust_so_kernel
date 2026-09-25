@@ -173,13 +173,13 @@ unsafe fn push_signal_frame(proc: &mut Process, tf: *mut TrapFrame, sig: u32, ha
         saved_tf: old_tf,
     };
 
-    // The target stack region may dip below anything this process has
-    // actually touched yet (e.g. its first-ever signal, delivered while
-    // still near the top of a freshly-mapped stack) — demand-page it now,
-    // since this write happens from kernel-mode code, which this kernel's
-    // fault handler never demand-pages on its own (see the function this
-    // helper lives next to in mod.rs for why).
-    super::ensure_user_pages_mapped(proc, tramp_slot, frame_size + 8);
+    // Make the target stack region mapped and privately writable before
+    // writing it through its virtual address: it may dip below anything
+    // this process has touched yet (its first-ever signal, near the top of
+    // a fresh stack), or still be COW-shared. The fault handler would
+    // resolve either, but this runs under the scheduler lock, where a
+    // fault is best avoided.
+    proc.address_space.prepare_user_write(tramp_slot, frame_size + 8);
 
     crate::ktrace!(
         crate::debug::PROC,

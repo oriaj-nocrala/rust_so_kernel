@@ -155,7 +155,7 @@ fn block_stdin_read(current_tf: *const TrapFrame) -> ! {
 /// Called by the keyboard ISR after a key is pushed into the buffer.
 ///
 /// If a process is blocked on stdin, delivers the character to its user
-/// buffer (via physical-memory translation), sets rax=1 in its saved
+/// buffer (through its address space), sets rax=1 in its saved
 /// TrapFrame, and moves it back to the run queue.
 /// Deliver `sig` to every process in group `pgid` — used by the tty line
 /// discipline (Ctrl-C/Ctrl-Z, see `tty::feed_input`) from ISR context,
@@ -180,24 +180,20 @@ pub(crate) fn stdin_wakeup() {
         return;
     };
 
-    let phys_offset = crate::memory::physical_memory_offset();
     let user_buf = waiter.user_buf;
     let pid = waiter.pid;
 
     let mut sched = crate::process::scheduler::local_scheduler();
 
-    // Find the blocked process, translate its user buffer to a kernel VA,
-    // write the character, and set rax=1 as the syscall return value.
+    // Find the blocked process, write the character into its buffer through
+    // its own address space (with a user write's semantics — a COW-shared
+    // or zero-frame page gets a private copy first, see
+    // `AddressSpace::copy_to_user`), and set rax=1 as the return value.
+    // Taking the address space's `IrqMutex` from this ISR is safe: every
+    // holder runs with IF=0, so none can be the code this interrupted.
     for proc in sched.wait_queue_mut().iter_mut() {
         if proc.pid.0 == pid && matches!(proc.state, crate::process::ProcessState::Blocked) {
-            use x86_64::{VirtAddr, structures::paging::{Page, Size4KiB}};
-
-            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(user_buf));
-            let offset = user_buf & 0xFFF;
-
-            if let Some(frame) = unsafe { proc.address_space.translate_page(page) } {
-                let dst = phys_offset + frame.start_address().as_u64() + offset;
-                unsafe { *(dst.as_mut_ptr::<u8>()) = c as u8; }
+            if unsafe { proc.address_space.copy_to_user(user_buf, &[c as u8]) } == 1 {
                 proc.trapframe.rax = 1; // syscall return value: 1 byte read
             }
             break;

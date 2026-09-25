@@ -521,6 +521,16 @@ pub(crate) fn poll_clear_on_timeout(pid: usize) {
 /// Translate a user virtual address to a physical address and verify the
 /// buffer fits within a single 4K page (required for our single-page pre-translation).
 ///
+/// The waker writes the result through that physical address later, from
+/// another context, so the page is first made privately writable
+/// (`AddressSpace::prepare_user_write`): translating a COW-shared page or
+/// the zero frame would hand the waker a frame that other address spaces
+/// read — the result would appear in the fork parent's copy, or in every
+/// untouched anonymous page in the system. What this cannot cover is the
+/// page being shared again *while* the caller sleeps, by a sibling
+/// thread's `fork()`; that needs the waker to write through the address
+/// space instead of a saved physical address.
+///
 /// cli must be held.  Returns None on error (EFAULT).
 fn translate_user_buf_phys(user_va: u64, size: usize) -> Option<u64> {
     use x86_64::{VirtAddr, structures::paging::{Page, Size4KiB}};
@@ -530,7 +540,12 @@ fn translate_user_buf_phys(user_va: u64, size: usize) -> Option<u64> {
     if offset + size as u64 > 0x1000 { return None; }
     let sched = crate::process::scheduler::local_scheduler();
     sched.running_ref()
-        .and_then(|proc| unsafe { proc.address_space.translate_page(page) })
+        .and_then(|proc| unsafe {
+            if !proc.address_space.prepare_user_write(user_va, size as u64) {
+                return None;
+            }
+            proc.address_space.translate_page(page)
+        })
         .map(|frame| frame.start_address().as_u64() + offset)
 }
 

@@ -33,8 +33,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use spin::Mutex;
-use x86_64::{VirtAddr, structures::paging::{Page, Size4KiB}};
+use crate::sync::Mutex;
 
 use super::file::{FileError, FileHandle, FileResult};
 use super::{Process, ProcessState};
@@ -94,49 +93,17 @@ impl PipeBuffer {
     }
 }
 
-/// Copy `src` into a blocked process's user buffer (translated via that
-/// process's own `AddressSpace`). Returns bytes actually copied.
+/// Copy `src` into a blocked process's user buffer, through that process's
+/// own `AddressSpace` — with a user write's semantics (demand-mapped,
+/// COW-broken; see `AddressSpace::copy_to_user`). Returns bytes copied.
 unsafe fn copy_to_user(proc: &Process, user_addr: u64, src: &[u8]) -> usize {
-    // The target buffer may not be demand-paged yet (e.g. a freshly
-    // allocated, never-written stack slot) — map it now rather than
-    // silently truncating the copy at the first unmapped page below.
-    super::ensure_user_pages_mapped(proc, user_addr, src.len() as u64);
-
-    let phys_offset = crate::memory::physical_memory_offset();
-    let mut done = 0usize;
-    while done < src.len() {
-        let vaddr = user_addr + done as u64;
-        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
-        let page_off = (vaddr & 0xFFF) as usize;
-        let chunk = core::cmp::min(src.len() - done, 0x1000 - page_off);
-
-        let Some(frame) = (unsafe { proc.address_space.translate_page(page) }) else { break; };
-        let dst = (phys_offset + frame.start_address().as_u64() + page_off as u64).as_mut_ptr::<u8>();
-        unsafe { core::ptr::copy_nonoverlapping(src[done..done + chunk].as_ptr(), dst, chunk); }
-        done += chunk;
-    }
-    done
+    proc.address_space.copy_to_user(user_addr, src)
 }
 
-/// Copy from a blocked process's user buffer into `dst` (translated via
-/// that process's own `AddressSpace`). Returns bytes actually copied.
+/// Copy from a blocked process's user buffer into `dst`, through that
+/// process's own `AddressSpace`. Returns bytes copied.
 unsafe fn copy_from_user(proc: &Process, user_addr: u64, dst: &mut [u8]) -> usize {
-    super::ensure_user_pages_mapped(proc, user_addr, dst.len() as u64);
-
-    let phys_offset = crate::memory::physical_memory_offset();
-    let mut done = 0usize;
-    while done < dst.len() {
-        let vaddr = user_addr + done as u64;
-        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
-        let page_off = (vaddr & 0xFFF) as usize;
-        let chunk = core::cmp::min(dst.len() - done, 0x1000 - page_off);
-
-        let Some(frame) = (unsafe { proc.address_space.translate_page(page) }) else { break; };
-        let src = (phys_offset + frame.start_address().as_u64() + page_off as u64).as_mut_ptr::<u8>();
-        unsafe { core::ptr::copy_nonoverlapping(src, dst[done..done + chunk].as_mut_ptr(), chunk); }
-        done += chunk;
-    }
-    done
+    proc.address_space.copy_from_user(user_addr, dst)
 }
 
 /// Find `pid` in the wait queue (must be Blocked), run `f` on it to compute

@@ -228,7 +228,7 @@ impl OwnedPageTable {
     // MAP WITHOUT ACTIVATING
     // ====================================================================
 
-    unsafe fn create_mapper(&self) -> OffsetPageTable<'static> {
+    pub(super) unsafe fn create_mapper(&self) -> OffsetPageTable<'static> {
         let phys_offset = crate::memory::physical_memory_offset();
         let pml4_virt = phys_offset + self.pml4_phys().as_u64();
         let pml4: &mut PageTable = &mut *pml4_virt.as_mut_ptr::<PageTable>();
@@ -240,6 +240,13 @@ impl OwnedPageTable {
     pub unsafe fn translate_page(&self, page: Page<Size4KiB>) -> Option<PhysFrame> {
         let mapper = self.create_mapper();
         mapper.translate_page(page).ok()
+    }
+
+    /// Whether `addr` is mapped at all, by a page of any size (a 4 KiB
+    /// `translate_page` reports a 2 MiB mapping as absent).
+    pub unsafe fn is_mapped(&self, addr: VirtAddr) -> bool {
+        use x86_64::structures::paging::Translate;
+        self.create_mapper().translate_addr(addr).is_some()
     }
 
     /// Map one user page.  Allocates data + intermediate frames from Buddy.
@@ -311,36 +318,6 @@ impl OwnedPageTable {
             .map_err(|_| "update_page_flags: failed")?
             .ignore();
         crate::memory::tlb::invalidate_page(self.pml4_phys(), page.start_address());
-        Ok(())
-    }
-
-    /// Unmap a page then remap it to a new physical frame with new flags.
-    /// Used in COW fault resolution: replace a shared read-only frame with
-    /// a private writable copy.
-    /// Intermediate PT frames are preserved (unmap does not free them).
-    pub unsafe fn unmap_and_remap(
-        &self,
-        page: Page<Size4KiB>,
-        new_frame: PhysFrame,
-        flags: PageTableFlags,
-    ) -> Result<(), &'static str> {
-        let mut mapper = self.create_mapper();
-
-        // Clear the leaf PT entry; intermediate tables remain intact.
-        let (_, flush) = mapper
-            .unmap(page)
-            .map_err(|_| "unmap_and_remap: unmap failed")?;
-        flush.ignore();
-        crate::memory::tlb::invalidate_page(self.pml4_phys(), page.start_address());
-
-        // Remap with new frame; intermediate tables are reused.
-        let mut buddy_alloc = BuddyFrameAllocator;
-        mapper
-            .map_to(page, new_frame, flags, &mut buddy_alloc)
-            .map_err(|_| "unmap_and_remap: map_to failed")?
-            .ignore();
-        crate::memory::tlb::invalidate_page(self.pml4_phys(), page.start_address());
-
         Ok(())
     }
 
@@ -582,10 +559,10 @@ impl OwnedPageTable {
     /// Point an already-present 4 KiB leaf at `frame` with `flags`, in one
     /// store, then invalidate. Unlike `unmap_and_remap`, the entry is never
     /// not-present in between: a CPU running this table that walks it
-    /// mid-change sees the old frame or the new one, never a fault. (That
-    /// window in `unmap_and_remap` is harmless on one CPU and a bug once a
-    /// thread of the same process runs on another — see stage 6 of
-    /// `docs/smp/smp-plan.md`.) Refcounts are the caller's business.
+    /// mid-change sees the old frame or the new one, never a fault — which
+    /// is why the COW fault uses it (the unmap-then-map it replaced left
+    /// the entry zero in between: a fault in the face of a sibling thread
+    /// on another CPU). Refcounts are the caller's business.
     pub unsafe fn replace_frame(
         &self,
         page: Page<Size4KiB>,

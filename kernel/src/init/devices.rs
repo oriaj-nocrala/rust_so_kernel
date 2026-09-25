@@ -296,21 +296,16 @@ extern "x86-interrupt" fn page_fault_handler(
     // registered VMA, so a fault on real kernel memory still correctly
     // falls through un-resolved either way.
     //
-    // Uses the lock-free fast path: find_vma_fast + current_as_fast.
-    // Safe because the fault handler runs with IF=0 (no preemption).
+    // `current_as_fast` is lock-free (per-CPU, valid while this process
+    // runs here); the VMA lookup and the PTE change both happen under the
+    // address space's own lock, inside `handle_cow_fault`.
     if (error_code & (PF_PRESENT | PF_WRITE)) == (PF_PRESENT | PF_WRITE)
         && (error_code & PF_RESERVED) == 0
     {
         let handled = unsafe {
-            if let Some((_, vma)) = crate::process::scheduler::find_vma_fast(fault_addr) {
-                let vma_flags = vma.page_table_flags();
-                crate::process::scheduler::current_as_fast()
-                    .map(|as_| as_.handle_cow_fault(fault_addr, vma_flags))
-                    .unwrap_or(Err("no AS"))
-                    .is_ok()
-            } else {
-                false
-            }
+            crate::process::scheduler::current_as_fast()
+                .map(|as_| as_.handle_cow_fault(fault_addr).is_ok())
+                .unwrap_or(false)
         };
 
         if handled {
@@ -344,12 +339,17 @@ extern "x86-interrupt" fn page_fault_handler(
         );
     }
 
-    // Step 2: VMA lookup — lock-free fast path. Also tries growing a
+    // Step 2: VMA lookup + map, under the address space's lock (see
+    // `AddressSpace::handle_not_present_fault`). Also grows a
     // GrowableStack VMA (the user stack) downward if the address is just
-    // below it — see find_vma_fast_or_grow's doc comment.
-    let (pid, vma) = match unsafe { crate::process::scheduler::find_vma_fast_or_grow(fault_addr) } {
-        Some(result) => result,
-        None => {
+    // below it. A page a sibling thread mapped meanwhile is success.
+    let result = match unsafe { crate::process::scheduler::current_as_fast() } {
+        Some(as_) => unsafe { as_.handle_not_present_fault(fault_addr, is_write) },
+        None => Err(crate::memory::address_space::FaultError::NoVma),
+    };
+    match result {
+        Ok(()) => {}
+        Err(crate::memory::address_space::FaultError::NoVma) => {
             if is_user {
                 serial_println!(
                     "⚠️  Segfault: PID {} accessed {:#x} (no VMA) at rip {:#x} (error {:#b})",
@@ -365,22 +365,20 @@ extern "x86-interrupt" fn page_fault_handler(
                 fault_addr, error_code, sf.instruction_pointer
             );
         }
-    };
-
-    // Step 3: Map the page (passes is_write for zero-page optimisation).
-    if let Err(reason) = demand_paging::map_demand_page(fault_addr, &vma, pid, is_write) {
-        if is_user {
-            serial_println!(
-                "⚠️  Demand paging failed for PID {}: {} (addr {:#x})",
-                pid, reason, fault_addr
+        Err(crate::memory::address_space::FaultError::Failed(reason)) => {
+            if is_user {
+                serial_println!(
+                    "⚠️  Demand paging failed for PID {}: {} (addr {:#x})",
+                    crate::process::scheduler::current_pid_fast(), reason, fault_addr
+                );
+                kill_current_user_process("DEMAND PAGING FAILED");
+                // unreachable — kill_current_user_process diverges
+            }
+            panic!(
+                "PAGE FAULT (kernel, map failed)\n  Address: {:#x}\n  Reason: {}\n  RIP: {:#x}",
+                fault_addr, reason, sf.instruction_pointer
             );
-            kill_current_user_process("DEMAND PAGING FAILED");
-            // unreachable — kill_current_user_process diverges
         }
-        panic!(
-            "PAGE FAULT (kernel, map failed)\n  Address: {:#x}\n  Reason: {}\n  RIP: {:#x}",
-            fault_addr, reason, sf.instruction_pointer
-        );
     }
 
     // Success — CPU retries the faulting instruction on iret.

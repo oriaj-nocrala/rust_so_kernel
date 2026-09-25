@@ -79,7 +79,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 // `RewindEvent` and `tf_record()` below reproduces that exact line. The two
 // allocation-free `print_panic_line` methods are gone the same way —
 // `print_panic_snapshot` formats and prints from plain accessors instead.
-pub use diag::{DirLockDiag, IfViolationDiag, LockDiag, OpStat, RewindEvent, TfRewindDiag};
+pub use diag::{DirLockDiag, LockDiag, OpStat, RewindEvent, TfRewindDiag};
 
 /// Diagnostics for the scheduler's per-CPU lock — see `scheduler::
 /// local_scheduler()`, which is the only thing that acquires it.
@@ -111,27 +111,6 @@ pub fn tf_record(pid: u64, site: &'static str, old_seq: u64, new_seq: u64) {
     );
 }
 
-/// See `IfViolationDiag`'s doc comment — tracks `memory::cow.rs` accessor
-/// calls reached with interrupts enabled, split one counter per accessor
-/// (`inc_ref`/`dec_ref` are the real non-atomic read-modify-write
-/// lost-update hazard; `get_ref` is a plain read, tracked for
-/// completeness; `set_ref` is a plain write into an exclusively-owned
-/// index, not itself racy — see `COW_IF_ENABLED_SET_REF` below, which
-/// is *not* one of these three real violations) so a violation in one
-/// doesn't hide a same-boot violation in another behind a single shared
-/// "last caller".
-pub static COW_IF_VIOLATIONS_INC_REF: IfViolationDiag = IfViolationDiag::new();
-pub static COW_IF_VIOLATIONS_DEC_REF: IfViolationDiag = IfViolationDiag::new();
-pub static COW_IF_VIOLATIONS_GET_REF: IfViolationDiag = IfViolationDiag::new();
-/// `memory::cow::set_ref` reached with interrupts enabled. Despite reusing
-/// `IfViolationDiag` (same counter/last-line shape as the three above, and
-/// worth keeping in the same family for a symmetrical `/proc/kdebug`
-/// report), this one is NOT a violation: `set_ref` never actually required
-/// interrupts disabled (see its doc comment in `memory/cow.rs`), so this
-/// counter is purely informational — it fires ~675 times per boot from
-/// `sys_exec`/`memory/elf_loader.rs`'s normal ELF-load path, and that is
-/// expected, correct behavior, not evidence of a bug to chase.
-pub static COW_IF_ENABLED_SET_REF: IfViolationDiag = IfViolationDiag::new();
 
 // ── Subsystems ───────────────────────────────────────────────────────────────
 
@@ -381,7 +360,7 @@ pub fn render_report() -> alloc::string::String {
          timer_ticks: {} over {} ms of uptime\n\
          {}\n\
          {}\n\
-         {}{}{}{}",
+         {}{}{}",
         mask, enabled,
         FORKS_TOTAL.load(Ordering::Relaxed),
         EXECS_TOTAL.load(Ordering::Relaxed),
@@ -420,13 +399,6 @@ pub fn render_report() -> alloc::string::String {
         SCHEDULER_LOCK.render("scheduler"),
         RAMFS_ENTRIES_LOCK.render("ramfs_entries_lock"),
         TF_REWIND.render(),
-        alloc::format!(
-            "{}{}{}{}",
-            COW_IF_VIOLATIONS_INC_REF.render("cow_if_violations_inc_ref"),
-            COW_IF_VIOLATIONS_DEC_REF.render("cow_if_violations_dec_ref"),
-            COW_IF_VIOLATIONS_GET_REF.render("cow_if_violations_get_ref"),
-            COW_IF_ENABLED_SET_REF.render("cow_if_enabled_set_ref"),
-        ),
     )
 }
 
@@ -476,16 +448,6 @@ pub fn print_panic_snapshot() {
         "  cow_tracked_frames: {} ({} MiB of RAM)",
         crate::memory::cow::tracked_frames(),
         (crate::memory::cow::tracked_frames() * 4096) / (1024 * 1024),
-    );
-    crate::serial_println_raw!(
-        "  cow_if_violations: inc_ref count={} last_line={} | dec_ref count={} last_line={} | get_ref count={} last_line={}",
-        COW_IF_VIOLATIONS_INC_REF.count(), COW_IF_VIOLATIONS_INC_REF.last_line(),
-        COW_IF_VIOLATIONS_DEC_REF.count(), COW_IF_VIOLATIONS_DEC_REF.last_line(),
-        COW_IF_VIOLATIONS_GET_REF.count(), COW_IF_VIOLATIONS_GET_REF.last_line(),
-    );
-    crate::serial_println_raw!(
-        "  cow_if_enabled_set_ref: count={} last_line={} (informational — set_ref does not require IF=0, see memory/cow.rs)",
-        COW_IF_ENABLED_SET_REF.count(), COW_IF_ENABLED_SET_REF.last_line(),
     );
 }
 

@@ -4,13 +4,14 @@
 //
 // This module provides two functions:
 //   1. `is_demand_pageable(error_code)` — pre-filter on CPU error code
-//   2. `map_demand_page(fault_addr, vma, pid)` — allocate, zero, map
+//   2. `map_demand_page(pt, fault_addr, vma, is_write)` — allocate, zero, map
 //
 // The PAGE FAULT HANDLER (in init/devices.rs) is responsible for:
 //   - Reading CR2
 //   - Calling `is_demand_pageable` to filter
-//   - Looking up the VMA via the scheduler (process layer)
-//   - Calling `map_demand_page` with the VMA
+//   - Finding the running process's AddressSpace (process layer, lock-free)
+//   - Calling `AddressSpace::handle_not_present_fault`, which looks the VMA
+//     up and calls `map_demand_page` under that address space's lock
 //
 // This keeps the dependency arrow one-way:
 //   init/devices → memory (demand_paging)
@@ -26,15 +27,11 @@
 
 use x86_64::{
     VirtAddr,
-    registers::control::Cr3,
-    structures::paging::{
-        FrameAllocator, Mapper, OffsetPageTable, Page, PageTable,
-        PageTableFlags, Size2MiB, Size4KiB,
-    },
+    structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size2MiB, Size4KiB},
 };
 
 use crate::memory::vma::{Vma, VmaKind};
-use crate::memory::page_table_manager::BuddyFrameAllocator;
+use crate::memory::page_table_manager::{BuddyFrameAllocator, OwnedPageTable};
 
 // Page fault error code bits
 const PF_PRESENT: u64 = 1 << 0;    // 0 = not present, 1 = protection violation
@@ -68,7 +65,7 @@ pub fn read_cr2() -> u64 {
 /// (`sys_read` into a buffer straight off `malloc()`, never touched from
 /// user mode first) reliably panicked the kernel here before this fix.
 /// Safe to drop the check for the same reason the COW case already is:
-/// the caller's subsequent VMA lookup (`find_vma_fast`) only ever matches
+/// the caller's subsequent VMA lookup (`AddressSpace::handle_not_present_fault`) only ever matches
 /// an address inside the *current* process's own registered VMA, so a
 /// fault on real kernel memory still correctly falls through un-resolved
 /// (panics) either way — this only ever widens what's demand-pageable,
@@ -88,36 +85,29 @@ pub fn is_demand_pageable(error_code: u64) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Build an `OffsetPageTable` over the currently active CR3.
-///
-/// # Safety
-/// The caller must ensure single-CPU access (e.g. interrupts disabled).
-unsafe fn create_cr3_mapper() -> OffsetPageTable<'static> {
-    let phys_offset = crate::memory::physical_memory_offset();
-    let (cr3_frame, _) = Cr3::read();
-    let pml4_virt = phys_offset + cr3_frame.start_address().as_u64();
-    let pml4: &mut PageTable = &mut *pml4_virt.as_mut_ptr::<PageTable>();
-    OffsetPageTable::new(pml4, phys_offset)
-}
-
-/// Allocate a physical frame, zero it, and map it at `fault_addr` using
-/// the flags from `vma`.
+/// Allocate a physical frame, zero it, and map it at `fault_addr` in `pt`
+/// using the flags from `vma`.
 ///
 /// When `is_write` is false and the VMA is Anonymous, the shared zero frame
 /// is mapped read-only instead of allocating a real frame (zero-page trick).
 /// A subsequent write fault will be handled by the COW path, which detects
 /// the zero frame and allocates a private writable copy.
 ///
-/// `pid` is used only for the log message.
+/// `pt` is the table of the address space that owns `vma` — not
+/// necessarily the one loaded in CR3: a pipe writer completing a blocked
+/// reader's `read()` maps into the *reader's* table. The caller holds that
+/// address space's lock (`AddressSpace::handle_not_present_fault` and the
+/// copy helpers next to it), so two threads faulting on one page cannot
+/// both map it.
 ///
 /// # Errors
 /// - VMA kind is Code (code pages should be pre-mapped)
 /// - Frame allocation failed (OOM)
 /// - Page table mapping failed
-pub fn map_demand_page(
+pub(super) unsafe fn map_demand_page(
+    pt: &OwnedPageTable,
     fault_addr: u64,
     vma: &Vma,
-    pid: usize,
     is_write: bool,
 ) -> Result<(), &'static str> {
     match vma.kind {
@@ -125,7 +115,7 @@ pub fn map_demand_page(
             return Err("Code page not present (should be pre-mapped)");
         }
         VmaKind::Huge2M => {
-            return map_demand_page_2m(fault_addr, vma, pid);
+            return map_demand_page_2m(pt, fault_addr, vma);
         }
         VmaKind::Anonymous | VmaKind::GrowableStack => { /* fall through */ }
     }
@@ -139,14 +129,11 @@ pub fn map_demand_page(
         let zero = crate::memory::cow::zero_frame();
         let ro_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
         let mut buddy_alloc = BuddyFrameAllocator;
-        unsafe {
-            let mut mapper = create_cr3_mapper();
-            mapper
-                .map_to(page, zero, ro_flags, &mut buddy_alloc)
-                .map_err(|_| "zero-page: map_to failed")?
-                .ignore();
-        }
-        crate::memory::tlb::invalidate_page(Cr3::read().0.start_address(), page.start_address());
+        pt.create_mapper()
+            .map_to(page, zero, ro_flags, &mut buddy_alloc)
+            .map_err(|_| "zero-page: map_to failed")?
+            .ignore();
+        crate::memory::tlb::invalidate_page(pt.pml4_phys(), page.start_address());
         return Ok(());
     }
 
@@ -156,28 +143,23 @@ pub fn map_demand_page(
         .allocate_frame()
         .ok_or("Demand paging: frame allocation failed (OOM)")?;
 
-    unsafe { crate::memory::cow::set_ref(frame, 1); }
+    crate::memory::cow::set_ref(frame, 1);
 
-    unsafe {
-        let phys_offset = crate::memory::physical_memory_offset();
-        let frame_virt = phys_offset + frame.start_address().as_u64();
-        core::ptr::write_bytes(frame_virt.as_mut_ptr::<u8>(), 0, 4096);
-    }
+    let phys_offset = crate::memory::physical_memory_offset();
+    let frame_virt = phys_offset + frame.start_address().as_u64();
+    core::ptr::write_bytes(frame_virt.as_mut_ptr::<u8>(), 0, 4096);
 
-    unsafe {
-        let mut mapper = create_cr3_mapper();
-        mapper
-            .map_to(page, frame, vma.page_table_flags(), &mut buddy_alloc)
-            .map_err(|_| "Demand paging: map_to failed")?
-            .ignore();
-    }
-    crate::memory::tlb::invalidate_page(Cr3::read().0.start_address(), page.start_address());
+    pt.create_mapper()
+        .map_to(page, frame, vma.page_table_flags(), &mut buddy_alloc)
+        .map_err(|_| "Demand paging: map_to failed")?
+        .ignore();
+    crate::memory::tlb::invalidate_page(pt.pml4_phys(), page.start_address());
 
     Ok(())
 }
 
 /// Map a 2 MiB huge page for `fault_addr` inside a `Huge2M` VMA.
-fn map_demand_page_2m(fault_addr: u64, vma: &Vma, _pid: usize) -> Result<(), &'static str> {
+unsafe fn map_demand_page_2m(pt: &OwnedPageTable, fault_addr: u64, vma: &Vma) -> Result<(), &'static str> {
     const PAGE_2M: u64 = 0x200000;
     let page_start = fault_addr & !(PAGE_2M - 1);
     let page = Page::<Size2MiB>::containing_address(VirtAddr::new(page_start));
@@ -188,21 +170,16 @@ fn map_demand_page_2m(fault_addr: u64, vma: &Vma, _pid: usize) -> Result<(), &'s
         .ok_or("Demand paging 2M: OOM")?;
 
     // Zero-fill 2 MiB.
-    unsafe {
-        let phys_offset = crate::memory::physical_memory_offset();
-        let virt = (phys_offset + frame.start_address().as_u64()).as_mut_ptr::<u8>();
-        core::ptr::write_bytes(virt, 0, 0x200000);
-    }
+    let phys_offset = crate::memory::physical_memory_offset();
+    let virt = (phys_offset + frame.start_address().as_u64()).as_mut_ptr::<u8>();
+    core::ptr::write_bytes(virt, 0, 0x200000);
 
     // map_to for Size2MiB sets the HUGE_PAGE bit automatically.
-    unsafe {
-        let mut mapper = create_cr3_mapper();
-        mapper
-            .map_to(page, frame, vma.page_table_flags(), &mut buddy_alloc)
-            .map_err(|_| "map_to 2M failed")?
-            .ignore();
-    }
-    crate::memory::tlb::invalidate_page(Cr3::read().0.start_address(), page.start_address());
+    pt.create_mapper()
+        .map_to(page, frame, vma.page_table_flags(), &mut buddy_alloc)
+        .map_err(|_| "map_to 2M failed")?
+        .ignore();
+    crate::memory::tlb::invalidate_page(pt.pml4_phys(), page.start_address());
 
     Ok(())
 }
