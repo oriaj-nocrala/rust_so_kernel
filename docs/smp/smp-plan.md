@@ -2,9 +2,11 @@
 
 > **Estado (2026-09-24):** etapa 0 hecha (reglas SMP-ready en el
 > CLAUDE.md, `memory::tlb`, `keyboard::DECODER` tras un `IrqMutex`);
-> etapa 1 hecha y verificada en QEMU (LAPIC timer + I/O APIC, `hal::apic`;
-> falta verla en la Ryzen). El kernel sigue siendo de una sola CPU:
-> `cpu::cpu_id()` devuelve `0` siempre, y no hay IPIs ni arranque de APs.
+> etapa 1 hecha y verificada en QEMU y en la Ryzen (LAPIC timer + I/O APIC,
+> `hal::apic`); etapa 2 hecha y verificada en QEMU (`cpu::percpu`, `swapgs`
+> solo en la entrada de `syscall`; falta la Ryzen). El kernel sigue siendo
+> de una sola CPU: `cpu::cpu_id()` lee el TR y da `0` hasta que la etapa 3
+> dé una TSS a cada CPU, y no hay IPIs ni arranque de APs.
 
 ## Por qué ahora
 
@@ -245,10 +247,53 @@ Añadir un detector permanente a `diag`: comprobar en cada entrada que
 `KERNEL_RSP0`, y `boot-matrix` con 20 arranques, `socket_test`,
 `fpu_test`, DOOM y Quake funcionan.
 
+**Estado:** hecha en QEMU el 2026-09-24, **con un diseño distinto al de
+arriba** (`kernel/src/cpu/percpu.rs`, cuyo comentario de módulo es la
+referencia):
+
+- **`gs` solo existe dentro de `syscall_entry_fast`.** El stub hace
+  `swapgs`, guarda el RSP de usuario y carga el del kernel por `gs:`, empuja
+  el RSP de usuario y vuelve a hacer `swapgs`: cuatro instrucciones, con
+  IF=0. Ni el stub del timer, ni los shims `x86-interrupt`, ni
+  `jump_to_trapframe` tocan GS. El diseño "GS_BASE es por CPU mientras
+  corre el kernel" de Linux exigía un `swapgs` en cada entrada y salida a
+  ring 3, y los shims de rustc no hacen ninguno de los dos: un fallo de
+  página desde usuario habría corrido con el GS del usuario, y la ruta de
+  kill sale por `jump_to_trapframe`, que no puede saber si su entrada hizo
+  `swapgs`. Con el par a cuatro instrucciones no hay nada que desincronizar,
+  y lo que el usuario deje en GS_BASE no puede afectar al kernel, porque el
+  kernel nunca lo lee.
+- **`SYSCALL_USER_RFLAGS` desapareció sin reemplazo:** R11 ya no se
+  reutiliza como temporal, así que el RFLAGS de usuario se empuja
+  directamente. `PerCpu` tiene `self_ptr`, `kernel_rsp`,
+  `user_rsp_scratch` y `cpu_id`.
+- **`cpu_id()` lee el task register (`str`)**, no `gs:` ni RDPID: vale en
+  cualquier camino, sea cual sea el estado de GS, y no depende de ninguna
+  característica de CPUID. Coste medido en QEMU (TCG, así que no dice nada
+  del metal): 677 ciclos de TSC por llamada, frente a 546 de RDPID;
+  `/proc/kdebug` (`percpu:`) lo mide en cada arranque, y **falta leerlo en
+  la Ryzen** para confirmar la elección. **Impone una condición a la
+  etapa 3:** una sola GDT con un slot de TSS por CPU, en
+  `FIRST_TSS_SELECTOR + 16·n` (con una GDT por CPU y la TSS en el mismo
+  índice, `str` daría lo mismo en todas). `tss::init` comprueba el selector
+  con un assert.
+- **Detector permanente:** `check_gs_invariant` (en `percpu.rs`, no en
+  `diag`: entra en pánico, no cuenta nada) comprueba que
+  `IA32_KERNEL_GS_BASE == &PERCPU[cpu]` en cada syscall y en cada tick.
+  Probado con sabotaje: borrando el segundo `swapgs` del stub, sin la
+  comprobación por syscall el síntoma era un DOUBLE FAULT pelado; con ella,
+  `per-CPU GS invariant broken on cpu 0: KERNEL_GS_BASE=0x0 ...`.
+
+Verificado: `grep` no encuentra ni `SYSCALL_USER_RFLAGS` ni `KERNEL_RSP0`;
+`boot-matrix 4 5` = 20/20 (dos veces), `run-kernel-tests` PASS,
+`fpu_test` ALL_OK, `socket_test` PASS, DOOM y Quake corriendo sus demos.
+
 ### Etapa 3 — TSS, GDT, IST y MSRs por CPU
 
 - Una TSS y un juego de pilas IST por CPU, dentro o al lado de `PerCpu`.
-- GDT con un slot de TSS por CPU (o una GDT por CPU).
+- GDT con un slot de TSS por CPU, en `FIRST_TSS_SELECTOR + 16·n`. **No**
+  una GDT por CPU con la TSS en el mismo índice: `cpu::cpu_id()` lee el TR
+  y dejaría de distinguir CPUs (ver el estado de la etapa 2).
 - Una función `cpu::init_this_cpu()` que haga todo lo que es por CPU:
   GDT/TSS, `lidt`, MSRs de syscall, `IA32_PAT`, CR0/CR4 de SSE, LAPIC y
   su timer. La BSP la llama en el arranque; los APs la llamarán en la

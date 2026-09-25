@@ -380,6 +380,7 @@ pub fn render_report() -> alloc::string::String {
          irq_controller: {}\n\
          timer_ticks: {} over {} ms of uptime\n\
          {}\n\
+         {}\n\
          {}{}{}{}",
         mask, enabled,
         FORKS_TOTAL.load(Ordering::Relaxed),
@@ -404,6 +405,7 @@ pub fn render_report() -> alloc::string::String {
         crate::interrupts::apic::render(),
         crate::process::timer_preempt::ticks_total(),
         crate::cpu::tsc::uptime_ms(),
+        crate::cpu::percpu::render(),
         alloc::format!(
             "{}\n{}",
             match crate::fs::ext2::cache_stats() {

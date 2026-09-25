@@ -178,6 +178,7 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("Step 9: Initializing TSS and GDT");
     process::tss::init();
     process::tss::init_syscall_msrs();
+    crate::cpu::percpu::measure_cpu_id_cost();
 
     // ── FPU/SSE ────────────────────────────────────────────────────
     // Must run before the first `Process` is created below — every

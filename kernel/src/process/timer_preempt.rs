@@ -178,6 +178,9 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> *const 
 
     TICK_COUNT.fetch_add(1, Ordering::Relaxed);
 
+    // Per-CPU GS invariant (`cpu/percpu.rs`): two rdmsrs, 100 Hz.
+    crate::cpu::percpu::check_gs_invariant();
+
     // ── 3. Fire expired hrtimers ──────────────────────────────────────
     //
     // tick() acquires QUEUE, drains expired timers, releases QUEUE, then

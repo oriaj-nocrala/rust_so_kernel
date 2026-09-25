@@ -46,22 +46,18 @@ pub(crate) use poll::{poll_wakeup_for_fd0, poll_clear_on_timeout, poll_wakeup_fo
 use core::arch::global_asm;
 use super::TrapFrame;
 
-// Scratch storage for syscall_entry_fast.
-// Single-CPU only; safe because SFMASK clears IF on syscall entry,
-// so this is never re-entered before we switch to the kernel stack.
-#[no_mangle]
-static mut SYSCALL_USER_RFLAGS: u64 = 0;
-
 // syscall_entry_fast — kernel entry point for the `syscall` instruction.
 //
 // On entry (CPU-set):  RCX=user RIP, R11=user RFLAGS, RSP=user RSP, IF=0
 //
 // Strategy:
-//  1. Save R11 (user RFLAGS) to static SYSCALL_USER_RFLAGS.
-//  2. Move user RSP into R11, switch RSP to KERNEL_RSP0.
-//  3. Build a 5-field iretq frame so we reuse the existing TrapFrame
-//     layout and return via iretq (no sysretq complexity).
-//  4. Push 15 GPRs, call handler, restore, iretq.
+//  1. `swapgs`, stash the user RSP in this CPU's `PerCpu`, load this CPU's
+//     kernel RSP from it, push the user RSP, `swapgs` back. That window is
+//     the only place the kernel ever uses `gs:` — see `cpu/percpu.rs`'s
+//     module comment for why it is kept that small.
+//  2. Build the rest of a 5-field iretq frame so we reuse the existing
+//     TrapFrame layout and return via iretq (no sysretq complexity).
+//  3. Push 15 GPRs, call handler, restore, iretq.
 //
 // Clobbers: RCX (user RIP) and R11 (user RFLAGS) — identical to what the
 // `syscall` instruction itself clobbers; userspace wrappers already declare both.
@@ -82,22 +78,20 @@ global_asm!(
 
     // On entry (CPU): %rcx=user RIP, %r11=user RFLAGS, %rsp=user RSP, IF=0.
 
-    // 1. Save user RFLAGS (%r11) before repurposing %r11 for user RSP.
-    "movq %r11, SYSCALL_USER_RFLAGS(%rip)",
-
-    // 2. %r11 ← user RSP; switch %rsp to kernel stack.
-    "movq %rsp, %r11",
-    "movq KERNEL_RSP0(%rip), %rsp",
-
-    // 3. Build 5-field iretq frame: SS, user-RSP, RFLAGS, CS, user-RIP.
+    // 1. GS window: KERNEL_GS_BASE holds &PERCPU[this cpu] outside it.
+    "swapgs",
+    "movq %rsp, %gs:{user_rsp}",
+    "movq %gs:{kernel_rsp}, %rsp",
     "pushq $0x1b",                             // user SS  (ring-3 data: 0x18|3)
-    "pushq %r11",                              // user RSP
-    "movq SYSCALL_USER_RFLAGS(%rip), %r11",   // reload user RFLAGS
+    "pushq %gs:{user_rsp}",                    // user RSP
+    "swapgs",
+
+    // 2. Rest of the iretq frame: RFLAGS, CS, user-RIP.
     "pushq %r11",                              // user RFLAGS
     "pushq $0x23",                             // user CS  (ring-3 code: 0x20|3)
     "pushq %rcx",                              // user RIP
 
-    // 4. Save 15 GPRs — same layout as TrapFrame.
+    // 3. Save 15 GPRs — same layout as TrapFrame.
     //    %rcx=user RIP, %r11=user RFLAGS: both architecturally clobbered by
     //    `syscall`; userspace wrappers already declare out("rcx")_ / out("r11")_.
     //    %r10: original user value preserved (never touched above).
@@ -140,6 +134,8 @@ global_asm!(
     "popq %rax",
 
     "iretq",
+    user_rsp = const crate::cpu::percpu::OFF_USER_RSP_SCRATCH,
+    kernel_rsp = const crate::cpu::percpu::OFF_KERNEL_RSP,
     options(att_syntax),
 );
 
@@ -164,8 +160,8 @@ struct SavedRegisters {
 ///
 /// Derived from the running process's own kernel stack, never from a global
 /// written at syscall entry: `syscall_entry_fast` always builds the frame at
-/// the very top of that stack (`KERNEL_RSP0`, then 20 pushes), and
-/// `KERNEL_RSP0` is switched with the process — Linux's `task_pt_regs`. The
+/// the very top of that stack (this CPU's `PerCpu::kernel_rsp`, then 20
+/// pushes), and that is switched with the process — Linux's `task_pt_regs`. The
 /// global this replaced (`CURRENT_SYSCALL_TF`) went stale whenever a syscall
 /// was preempted with interrupts on and another process made syscalls
 /// before it resumed: the resumed one then read *that* process's frame. In
@@ -175,10 +171,10 @@ struct SavedRegisters {
 /// running the handler. Found on 2026-09-24 as `ash` crashing at its `exit`
 /// builtin (a `ret` into the clobbered stack) after short-lived children.
 ///
-/// Null before any process has run (`KERNEL_RSP0` still 0) — what the
+/// Null before any process has run (`kernel_rsp` still 0) — what the
 /// in-kernel QEMU tests see, and what the old global returned there too.
 pub(crate) fn current_tf_ptr() -> *const TrapFrame {
-    let top = unsafe { crate::process::tss::KERNEL_RSP0 };
+    let top = crate::cpu::percpu::kernel_rsp();
     if top == 0 {
         return core::ptr::null();
     }
@@ -198,6 +194,10 @@ extern "C" fn syscall_handler_asm(regs: &SavedRegisters) -> i64 {
     // immediately after on the kernel stack).
     let tf_ptr = regs as *const SavedRegisters as *mut TrapFrame;
     debug_assert_eq!(tf_ptr as *const TrapFrame, current_tf_ptr());
+    // The stub just left its GS window; if it left GS swapped, say so here
+    // rather than as a double fault on the *next* `syscall`, which would
+    // then load its stack through the user's GS_BASE.
+    crate::cpu::percpu::check_gs_invariant();
     let ret = syscall_handler(regs.rax, regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9);
 
     // Deliver pending signals before returning to user mode. This is the

@@ -19,13 +19,6 @@ struct Selectors {
 // TSS estático - ubicación fija en memoria
 static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
-/// Top of the current process's kernel stack.
-/// Mirrored from TSS.privilege_stack_table[0] so that syscall_entry_fast
-/// can load it without parsing the TSS structure.
-/// Single-CPU only — safe because syscall entry always runs with IF=0.
-#[no_mangle]
-pub static mut KERNEL_RSP0: u64 = 0;
-
 // GDT se inicializa una vez
 static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
 
@@ -80,6 +73,14 @@ pub fn init() {
         })
     });
     
+    // `cpu::cpu_id()` reads the CPU number out of TR, which only works if
+    // the TSS sits where `percpu` expects it.
+    assert_eq!(
+        GDT.get().unwrap().1.tss_selector.0,
+        crate::cpu::percpu::FIRST_TSS_SELECTOR,
+        "TSS selector moved: cpu::cpu_id() would misread TR",
+    );
+
     // Cargar GDT
     GDT.get().unwrap().0.load();
     
@@ -94,6 +95,8 @@ pub fn init() {
         // Cargar TSS
         load_tss(GDT.get().unwrap().1.tss_selector);
     }
+
+    crate::cpu::percpu::init_this_cpu(0);
 
     crate::serial_println!("TSS and GDT initialized");
 }
@@ -111,8 +114,9 @@ pub fn get_user_selectors() -> (SegmentSelector, SegmentSelector) {
 pub fn set_kernel_stack(stack_top: VirtAddr) {
     unsafe {
         TSS.privilege_stack_table[0] = stack_top;
-        KERNEL_RSP0 = stack_top.as_u64();
     }
+    // Where `syscall_entry_fast` finds it (the TSS's copy serves interrupts).
+    crate::cpu::percpu::set_kernel_rsp(stack_top.as_u64());
 }
 
 /// Configure MSRs so that the `syscall` instruction enters the kernel via
