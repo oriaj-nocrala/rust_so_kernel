@@ -4,7 +4,8 @@
 > (ver su registro al final). Fase 2: 2.1 hecho y verificado en QEMU y en la Ryzen;
 > 2.2 a 2.5 hechos y verificados en QEMU y en la Ryzen (2.2 en el boot #43,
 > 2.3 y 2.5 en el #45; 2.4 son tests de host). Fase 2 cerrada. Fase 3 planificada
-> (decisiones del 2026-09-25); 3.1, 3.2 y 3.3 hechos, en QEMU.
+> (decisiones del 2026-09-25); 3.1 a 3.3 hechos, 3.2 y 3.3 verificados en la
+> Ryzen (boot #46). Siguiente: 3.4 (`vt/`).
 
 ## Por qué ahora, y por qué así
 
@@ -978,4 +979,14 @@ esclavo). A mano, `script` de BusyBox con ash dentro: `tty` da
 `userlib_test`, `poll_test`, `input_poll_test`, `shm_test` y `fb0_test`;
 `boot-matrix.sh 4 5` 20/20; `run-kernel-tests.sh` PASS; `gui-e2e.sh`
 PASS; `vfs` 166 tests.
+
+**Verificado en la Ryzen (boot #46, `target/metal/pty-job.sh`, sin nadie
+delante):** `pty_test` con sus 11 casos en PASS, ash en un esclavo
+incluido; `session_test` PASS; en 0 `jobctl_test`, `lifecycle_test`,
+`wait_intr_test`, `sigsuspend_test`, `mlibc_signal_test`, `socket_test`,
+`pipe_multi_test` y `userlib_test`. `script` de BusyBox: `tty` da
+`/dev/pts/0` y `stty size` da `44 174`, el tamaño de la consola a
+1920x1080. `sched: max_concurrent=4 invariants=ok`. El principio del log se
+perdió (el anillo de 64 KiB se desbordó con las trazas de `exec`), pero la
+sección de resultados y el `METAL-DONE exit=0` están enteros.
 
