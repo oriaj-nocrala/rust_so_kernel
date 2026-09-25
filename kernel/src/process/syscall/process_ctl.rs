@@ -575,7 +575,7 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
                 proc.trapframe.rsp    = loaded.user_stack_top.as_u64();
                 proc.trapframe.cs     = 0x23;
                 proc.trapframe.ss     = 0x1b;
-                proc.trapframe.rflags = 0x200;
+                proc.trapframe.rflags = 0x202; // IF, plus bit 1 (reserved, always 1)
                 proc.trapframe.rax = 0; proc.trapframe.rbx = 0; proc.trapframe.rcx = 0;
                 proc.trapframe.rdx = 0; proc.trapframe.rsi = 0; proc.trapframe.rdi = 0;
                 proc.trapframe.rbp = 0; proc.trapframe.r8  = 0; proc.trapframe.r9  = 0;

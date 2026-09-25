@@ -254,7 +254,7 @@ impl Process {
         
         trapframe.rip = entry.as_u64();
         trapframe.cs = 0x08;
-        trapframe.rflags = 0x200;
+        trapframe.rflags = 0x202; // IF, plus bit 1 (reserved, always 1)
         trapframe.rsp = kernel_stack.as_u64() - 8;
         trapframe.ss = 0x10;
         
@@ -327,7 +327,7 @@ impl Process {
         
         trapframe.rip = entry.as_u64();
         trapframe.cs = 0x23;
-        trapframe.rflags = 0x200;
+        trapframe.rflags = 0x202; // IF, plus bit 1 (reserved, always 1)
         trapframe.rsp = user_stack.as_u64();
         trapframe.ss = 0x1b;
         
@@ -480,7 +480,7 @@ impl Process {
 
         trapframe.rip = entry.as_u64();
         trapframe.cs = 0x23;
-        trapframe.rflags = 0x200;
+        trapframe.rflags = 0x202; // IF, plus bit 1 (reserved, always 1)
         trapframe.rsp = stack.as_u64();
         trapframe.ss = 0x1b;
 
