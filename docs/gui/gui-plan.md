@@ -2,8 +2,8 @@
 
 > **Estado (2026-09-25):** fase 1 hecha y verificada en QEMU y en la Ryzen
 > (ver su registro al final). Fase 2: 2.1 hecho y verificado en QEMU y en la Ryzen;
-> 2.2 y 2.3 hechos y verificados en QEMU (falta la Ryzen); 2.4 hecho (crate
-> `gui/`, tests de host); 2.5 pendiente. Fase 3 sin empezar.
+> 2.2, 2.3 y 2.5 hechos y verificados en QEMU (falta la Ryzen); 2.4 hecho
+> (crate `gui/`, tests de host). Fase 3 sin empezar.
 
 ## Por qué ahora, y por qué así
 
@@ -613,3 +613,63 @@ test: quitar la comprobación de límites del búfer, ignorar el daño
 (copiar todo), invertir el orden Z y no terminar el arrastre al soltar
 (este último no lo detectaba nadie hasta añadir un movimiento después de
 soltar).
+
+### Fase 2.5 (2026-09-25)
+
+`compositor` y `gui_demo` (Rust, embebidos) sobre el crate `gui`. Primera
+ventana en QEMU a la primera: cascada en (40, 40), barra de título con
+foco, degradado animado, cursor por software.
+
+- **`compositor [prog...]`**: `/dev/fb0` mapeado, `event0` con
+  `EVIOCGRAB` (se descarta lo que el anillo tenía de antes) y `event1`,
+  escucha en `/tmp/gui-0` y espera con un solo `epoll`. Como mucho un
+  `compose` + `FBIO_FLUSH` cada 16 ms. Lanza cada `prog` tras escuchar, y
+  **el hijo cierra todo fd ≥ 3 antes del `exec`**: el kernel no aplica
+  close-on-exec, y un cliente que heredase `/dev/fb0` y el `event0`
+  capturado mantenía el modo gráfico y el teclado tras morir el
+  compositor. Un cliente que no lee sus eventos (`send` con
+  `MSG_DONTWAIT` incompleto) se desconecta, como hace libwayland. Antes de
+  mapear un pool se comprueba con `fstat` que el memfd es tan grande como
+  dice el cliente: tocar una página más allá del objeto mataría al
+  compositor, no al cliente.
+- **`REL_Y` del ratón viene con el convenio PS/2** (positivo hacia
+  arriba, lo que esperan DOOM y Quake); el compositor lo niega.
+- **argv para Rust**: `userspace::args` + la macro `entry!`, un `_start`
+  desnudo que pasa el `rsp` de entrada. `println!` pasó a expandir a un
+  bloque (no servía en un brazo de `match`).
+- **Ritmo**: `gui_demo` va a 48-49 fps y no a 60. El `epoll_wait` con
+  plazo se despierta en el siguiente tick de 10 ms, así que un cuadro de
+  16 ms cuesta 20.
+- **Medido en QEMU**: 1797 cuadros en 1555 ms de `compose` + `FBIO_FLUSH`
+  (~0,9 ms por cuadro, reloj en ms, así que orientativo). La cifra que
+  importa es la de la Ryzen, con VRAM en WC; los fallos de página del
+  primer toque a un búfer de 1080p quedan por medir allí.
+
+**Bug del kernel encontrado aquí** (arreglado y con test propio): matar el
+compositor con `SIGKILL` colgaba todas las CPUs. Una muerte por señal o
+por fallo dejaba la tabla de fds en el zombi, y el `waitpid` que lo
+recogía la soltaba con `SCHEDULER` tomado; el `Drop` de un socket AF_UNIX
+vuelve a tomarlo. Hasta la recogida, además, sus pares no veían EOF.
+Ahora `kill_current` mueve la tabla a `process::dead_files`, que se vacía
+sin locks y con IF=0 al entrar a cada syscall y en el bucle idle (el
+primer intento la vaciaba con IF=1 en el idle y el `Drop` de una tubería
+hizo saltar la aserción de `local_scheduler`). Test: caso E de
+`lifecycle_test` (EOF en socket y tubería *antes* de recoger al hijo;
+con el arreglo saboteado da FAIL). Y la pantalla de pánico se caía con un
+pánico anidado al dibujar un mensaje con un carácter no ASCII (la fuente
+8x8 tiene 128 glifos): ahora dibuja `?`.
+
+**Prueba de extremo a extremo: `scripts/gui-e2e.sh`** (11 comprobaciones
+sobre `screendump` y el log): ventana y cursor en su sitio, movimiento
+1:1, arrastre por la barra, clic y teclas en la ventana y no en ash,
+Ctrl+Alt+Retroceso, EOF en el cliente y consola de vuelta. **PASS por
+PS/2 y por USB** (`QEMU_USB_KBD=1 QEMU_USB_MOUSE=1 QEMU_DEBUG_NO_PS2=1`,
+8 GiB). A mano, además: dos clientes (orden Z, clic para subir y foco) y
+`SIGKILL` del compositor.
+
+**Regresión** con `-smp 4 -m 8G`: 17 programas de prueba en 0
+(`wait_intr_test`, `sigsuspend_test`, `lifecycle_test`, `pipe_multi_test`,
+`pipe_cow_test`, `socket_test`, `mlibc_signal_test`, `jobctl_test`,
+`shm_test`, `fork_exec_test`, `pthread_test`, `userlib_test`,
+`poll_test`, `ipc_ping`, `pipe_test`, `signal_test`, `mmap_test`),
+`run-kernel-tests.sh` PASS, `boot-matrix.sh 4 4` 16/16, `gui` 27/27.

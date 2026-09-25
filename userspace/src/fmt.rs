@@ -40,15 +40,19 @@ macro_rules! print {
 macro_rules! println {
     () => { $crate::print!("\n") };
     ($($arg:tt)*) => {
-        $crate::fmt::fprint(1, format_args!($($arg)*));
-        $crate::fmt::fprint(1, format_args!("\n"));
+        {
+            $crate::fmt::fprint(1, format_args!($($arg)*));
+            $crate::fmt::fprint(1, format_args!("\n"));
+        }
     };
 }
 
 #[macro_export]
 macro_rules! eprintln {
     ($($arg:tt)*) => {
-        $crate::fmt::fprint(2, format_args!($($arg)*));
-        $crate::fmt::fprint(2, format_args!("\n"));
+        {
+            $crate::fmt::fprint(2, format_args!($($arg)*));
+            $crate::fmt::fprint(2, format_args!("\n"));
+        }
     };
 }

@@ -101,6 +101,7 @@ const SYS_LISTEN: u64 = 50;
 const SYS_GETSOCKNAME: u64 = 51;
 const SYS_GETPEERNAME: u64 = 52;
 const SYS_SOCKETPAIR: u64 = 53;
+const SYS_ACCEPT4: u64 = 288;
 const SYS_PIPE: u64 = 22;
 const SYS_SIGACTION: u64 = 13;
 const SYS_SIGPROCMASK: u64 = 14;
@@ -561,6 +562,15 @@ pub fn accept(fd: i32) -> i64 {
     unsafe { syscall3(SYS_ACCEPT, fd as u64, 0, 0) }
 }
 
+pub const SOCK_NONBLOCK: i32 = 0o4000;
+pub const EAGAIN: i64 = -11;
+
+/// `accept4(fd, NULL, NULL, flags)`; `SOCK_NONBLOCK` makes the new socket
+/// non-blocking.
+pub fn accept4(fd: i32, flags: i32) -> i64 {
+    unsafe { syscall4(SYS_ACCEPT4, fd as u64, 0, 0, flags as u64) }
+}
+
 pub fn accept_from(fd: i32, addr: &mut SockAddrUn, addrlen: &mut u32) -> i64 {
     unsafe {
         syscall3(SYS_ACCEPT, fd as u64, addr as *mut SockAddrUn as u64,
@@ -578,6 +588,13 @@ pub fn sendto(fd: i32, buf: &[u8], addr: &SockAddrUn, addrlen: u32) -> i64 {
     unsafe {
         syscall6(SYS_SENDTO, fd as u64, buf.as_ptr() as u64, buf.len() as u64, 0,
                  addr as *const SockAddrUn as u64, addrlen as u64)
+    }
+}
+
+/// `send` with `MSG_*` flags (`MSG_DONTWAIT`).
+pub fn send_flags(fd: i32, buf: &[u8], flags: u32) -> i64 {
+    unsafe {
+        syscall6(SYS_SENDTO, fd as u64, buf.as_ptr() as u64, buf.len() as u64, flags as u64, 0, 0)
     }
 }
 
