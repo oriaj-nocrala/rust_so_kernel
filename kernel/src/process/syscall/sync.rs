@@ -5,7 +5,7 @@
 use spin::Mutex;
 use crate::process::TrapFrame;
 use super::{errno, SyscallResult, validate_user_buffer, current_tf_ptr};
-use super::poll::MAX_PROCS;
+use alloc::collections::BTreeMap;
 
 // ── futex(202) ─────────────────────────────────────────────────────────────
 
@@ -55,9 +55,7 @@ pub(super) fn sys_futex(uaddr: u64, futex_op: i32, val: i32, _timeout: u64) -> S
                 }
             };
 
-            if pid < MAX_PROCS {
-                FUTEX_WAITERS.lock()[pid] = Some(FutexWaiter { uaddr, as_id });
-            }
+            FUTEX_WAITERS.lock().insert(pid, FutexWaiter { uaddr, as_id });
 
             let next_tf = {
                 let mut scheduler = crate::process::scheduler::local_scheduler();
@@ -82,17 +80,17 @@ pub(super) fn sys_futex(uaddr: u64, futex_op: i32, val: i32, _timeout: u64) -> S
             let mut woken_count = 0usize;
             {
                 let mut waiters = FUTEX_WAITERS.lock();
-                for (pid, slot) in waiters.iter_mut().enumerate() {
+                for (&pid, w) in waiters.iter() {
                     if woken_count >= woken_pids.len() || woken_count as i32 >= max_wake {
                         break;
                     }
-                    if let Some(w) = slot {
-                        if w.uaddr == uaddr && w.as_id == as_id {
-                            woken_pids[woken_count] = pid;
-                            woken_count += 1;
-                            *slot = None;
-                        }
+                    if w.uaddr == uaddr && w.as_id == as_id {
+                        woken_pids[woken_count] = pid;
+                        woken_count += 1;
                     }
+                }
+                for pid in &woken_pids[..woken_count] {
+                    waiters.remove(pid);
                 }
             }
 
@@ -114,13 +112,15 @@ struct FutexWaiter {
     as_id: u64,
 }
 
-/// One outstanding FUTEX_WAIT per PID — mirrors POLL_WAITERS/RECV_WAITER.
-static FUTEX_WAITERS: Mutex<[Option<FutexWaiter>; MAX_PROCS]> = Mutex::new([None; MAX_PROCS]);
+/// One outstanding FUTEX_WAIT per PID — mirrors POLL_WAITERS. Keyed by pid
+/// with no bound: it was a `[_; 32]` array, and a pid >= 32 blocked in
+/// FUTEX_WAIT without registering, so no FUTEX_WAKE ever found it —
+/// `pthread_join` hung for good once pids passed 32 (found by the SMP
+/// stage-5 metal job, whose 100-exec warm-up made the first thread pid 104).
+static FUTEX_WAITERS: Mutex<BTreeMap<usize, FutexWaiter>> = Mutex::new(BTreeMap::new());
 
 /// Clear a pending futex wait for a process (called on exit).
 pub(super) fn futex_cancel_waiter(pid: usize) {
-    if pid < MAX_PROCS {
-        FUTEX_WAITERS.lock()[pid] = None;
-    }
+    FUTEX_WAITERS.lock().remove(&pid);
 }
 

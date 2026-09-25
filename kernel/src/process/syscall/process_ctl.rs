@@ -208,7 +208,7 @@ pub(super) fn sys_exit(status: i32) -> SyscallResult {
     // Cancel any pending poll/epoll wait and clear side tables. Deliberately
     // runs with interrupts STILL OFF (`irq` is not dropped until the RSP
     // switch inside `jump_to_user`): all three cleanups are non-blocking
-    // spin-lock critical sections over fixed arrays (POLL_WAITERS /
+    // spin-lock critical sections over pid-keyed maps (POLL_WAITERS /
     // EPOLL_FD_MAP / FUTEX_WAITERS) — nothing here needs IF=1. Keeping IF=0
     // closes the bug-2 window where a timer tick lands while the CPU is still
     // on the dying process's kernel stack (queued for deferred free by

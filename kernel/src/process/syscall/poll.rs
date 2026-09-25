@@ -1,5 +1,6 @@
 // kernel/src/process/syscall/poll.rs
 //
+use alloc::collections::BTreeMap;
 use spin::Mutex;
 use crate::process::TrapFrame;
 use super::{errno, SyscallResult, validate_user_buffer, current_tf_ptr};
@@ -7,7 +8,6 @@ use usock::SocketId;
 use crate::ipc::unix;
 
 /// Upper bound on pids tracked by the per-pid side tables below.
-pub(super) const MAX_PROCS: usize = 32;
 /// Must match `FileDescriptorTable`'s own `MAX_FILES`.
 pub(super) const MAX_FILES_PER_PROC: usize = 16;
 
@@ -54,9 +54,13 @@ fn snapshot_sockets() -> SocketMap {
 //
 // Architecture:
 //   - `fd_check_ready(socks, fd, events)` checks FD readiness without consuming data.
-//   - `POLL_WAITERS[pid]` stores a blocked process's buffer info for wakeup delivery.
+//   - `POLL_WAITERS` (pid → waiter) stores a blocked process's buffer info for wakeup delivery.
 //   - `EPOLL_INSTANCES` holds per-epoll-fd watch lists.
-//   - `EPOLL_FD_MAP[pid][fd]` maps epoll FDs to EpollInstanceIds.
+//   - `EPOLL_FD_MAP` (pid → [fd]) maps epoll FDs to EpollInstanceIds.
+//   Both are keyed by pid with no bound. They were `[_; 32]` arrays that
+//   silently skipped pid >= 32: a `poll()` with no timeout from such a pid
+//   blocked without registering and was never woken, and `epoll_*` said
+//   ESRCH.
 //   - Wakeup hooks: `poll_wakeup_for_fd0` (keyboard ISR) and
 //     `poll_wakeup_for_socket` (the socket layer).
 //
@@ -160,8 +164,8 @@ impl EpollInstanceTable {
 static EPOLL_INSTANCES: Mutex<EpollInstanceTable> = Mutex::new(EpollInstanceTable::new());
 
 /// pid×fd → EpollInstanceId side table (0 = not an epoll fd).
-static EPOLL_FD_MAP: Mutex<[[EpollInstanceId; MAX_FILES_PER_PROC]; MAX_PROCS]> =
-    Mutex::new([[0; MAX_FILES_PER_PROC]; MAX_PROCS]);
+static EPOLL_FD_MAP: Mutex<BTreeMap<usize, [EpollInstanceId; MAX_FILES_PER_PROC]>> =
+    Mutex::new(BTreeMap::new());
 
 /// FileHandle marker stored in the FD table for epoll FDs.
 struct EpollHandle {
@@ -185,24 +189,26 @@ impl crate::process::file::FileHandle for EpollHandle {
 // ── EPOLL_FD_MAP helpers ───────────────────────────────────────────────────
 
 fn get_epoll_fd(pid: usize, fd: usize) -> EpollInstanceId {
-    if pid < MAX_PROCS && fd < MAX_FILES_PER_PROC {
-        EPOLL_FD_MAP.lock()[pid][fd]
+    if fd < MAX_FILES_PER_PROC {
+        EPOLL_FD_MAP.lock().get(&pid).map_or(0, |fds| fds[fd])
     } else {
         0
     }
 }
 
 fn set_epoll_fd(pid: usize, fd: usize, epoll_id: EpollInstanceId) {
-    if pid < MAX_PROCS && fd < MAX_FILES_PER_PROC {
-        EPOLL_FD_MAP.lock()[pid][fd] = epoll_id;
+    if fd < MAX_FILES_PER_PROC {
+        let mut map = EPOLL_FD_MAP.lock();
+        if epoll_id != 0 {
+            map.entry(pid).or_insert([0; MAX_FILES_PER_PROC])[fd] = epoll_id;
+        } else if let Some(fds) = map.get_mut(&pid) {
+            fds[fd] = 0;
+        }
     }
 }
 
 pub(super) fn clear_epoll_fd_all(pid: usize) {
-    if pid < MAX_PROCS {
-        let mut map = EPOLL_FD_MAP.lock();
-        map[pid] = [0; MAX_FILES_PER_PROC];
-    }
+    EPOLL_FD_MAP.lock().remove(&pid);
 }
 
 // ── Poll waiter ────────────────────────────────────────────────────────────
@@ -228,9 +234,8 @@ struct PollWaiter {
     socks:    SocketMap,
 }
 
-/// One slot per PID — a process can only have one outstanding poll/epoll_wait.
-static POLL_WAITERS: Mutex<[Option<PollWaiter>; MAX_PROCS]> =
-    Mutex::new([None; MAX_PROCS]);
+/// One entry per PID — a process can only have one outstanding poll/epoll_wait.
+static POLL_WAITERS: Mutex<BTreeMap<usize, PollWaiter>> = Mutex::new(BTreeMap::new());
 
 // ── FD readiness ───────────────────────────────────────────────────────────
 
@@ -430,25 +435,17 @@ pub(crate) fn poll_wakeup_for_fd0() {
     // Take the waiter (if any) watching fd=0 for POLLIN.
     let waiter = {
         let mut waiters = POLL_WAITERS.lock();
-        let mut found = None;
-        for (i, slot) in waiters.iter().enumerate() {
-            if let Some(w) = slot {
-                if poll_waiter_watches_stdin(w, phys_offset) {
-                    found = Some(i);
-                    break;
-                }
-            }
-        }
-        found.and_then(|i| waiters[i].take())
+        let found = waiters.iter()
+            .find(|(_, w)| poll_waiter_watches_stdin(w, phys_offset))
+            .map(|(&pid, _)| pid);
+        found.and_then(|pid| waiters.remove(&pid))
     };
 
     let Some(waiter) = waiter else { return; };
 
     let count = deliver_poll_result_phys(&waiter, phys_offset);
     if count == 0 {
-        if waiter.pid < MAX_PROCS {
-            POLL_WAITERS.lock()[waiter.pid] = Some(waiter);
-        }
+        POLL_WAITERS.lock().insert(waiter.pid, waiter);
         return;
     }
 
@@ -483,16 +480,10 @@ fn poll_wakeup_for_socket_inner(sock: SocketId) {
 
     let waiter = {
         let mut waiters = POLL_WAITERS.lock();
-        let mut found = None;
-        for (i, slot) in waiters.iter().enumerate() {
-            if let Some(w) = slot {
-                if poll_waiter_watches_socket(w, sock, phys_offset) {
-                    found = Some(i);
-                    break;
-                }
-            }
-        }
-        found.and_then(|i| waiters[i].take())
+        let found = waiters.iter()
+            .find(|(_, w)| poll_waiter_watches_socket(w, sock, phys_offset))
+            .map(|(&pid, _)| pid);
+        found.and_then(|pid| waiters.remove(&pid))
     };
 
     let Some(waiter) = waiter else { return; };
@@ -508,11 +499,7 @@ fn poll_wakeup_for_socket_inner(sock: SocketId) {
 
 /// Cancel a pending poll/epoll waiter for a process (called on exit).
 pub(super) fn poll_cancel_waiter(pid: usize) {
-    if pid >= MAX_PROCS { return; }
-    let waiter = {
-        let mut waiters = POLL_WAITERS.lock();
-        waiters[pid].take()
-    };
+    let waiter = POLL_WAITERS.lock().remove(&pid);
     if let Some(w) = waiter {
         if let Some(tid) = w.timer_id {
             crate::time::hrtimer::cancel(tid);
@@ -526,8 +513,7 @@ pub(super) fn poll_cancel_waiter(pid: usize) {
 /// released, satisfying the lock order: POLL_WAITERS → SCHEDULER.
 /// The timer has already fired so there is nothing to cancel.
 pub(crate) fn poll_clear_on_timeout(pid: usize) {
-    if pid >= MAX_PROCS { return; }
-    POLL_WAITERS.lock()[pid] = None;
+    POLL_WAITERS.lock().remove(&pid);
 }
 
 // ── Helper: translate user VA → phys + page-boundary check ────────────────
@@ -657,16 +643,14 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u32, timeout_ms: i32) -> SyscallResul
     };
 
     // Store waiter
-    if pid < MAX_PROCS {
-        POLL_WAITERS.lock()[pid] = Some(PollWaiter {
-            pid,
-            phys_buf,
-            phys_len: buf_size,
-            kind: PollWaiterKind::Poll { nfds },
-            timer_id,
-            socks,
-        });
-    }
+    POLL_WAITERS.lock().insert(pid, PollWaiter {
+        pid,
+        phys_buf,
+        phys_len: buf_size,
+        kind: PollWaiterKind::Poll { nfds },
+        timer_id,
+        socks,
+    });
 
     let next_tf = {
         let mut sched = crate::process::scheduler::local_scheduler();
@@ -727,7 +711,6 @@ pub(super) fn sys_epoll_create(_size: i32) -> SyscallResult {
 /// epoll_ctl(233) — modify an epoll instance's interest list.
 pub(super) fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> SyscallResult {
     let pid = crate::process::scheduler::current_pid().unwrap_or(0);
-    if pid >= MAX_PROCS { return errno::ESRCH; }
     if epfd < 0 || (epfd as usize) >= MAX_FILES_PER_PROC { return errno::EBADF; }
 
     let epoll_id = get_epoll_fd(pid, epfd as usize);
@@ -802,7 +785,6 @@ pub(super) fn sys_epoll_wait(epfd: i32, events_ptr: u64, maxevents: i32, timeout
     if let Err(e) = validate_user_buffer(events_ptr, buf_size) { return e; }
 
     let pid = crate::process::scheduler::current_pid().unwrap_or(0);
-    if pid >= MAX_PROCS { return errno::ESRCH; }
     if epfd < 0 || (epfd as usize) >= MAX_FILES_PER_PROC { return errno::EBADF; }
 
     let epoll_id = get_epoll_fd(pid, epfd as usize);
@@ -843,16 +825,14 @@ pub(super) fn sys_epoll_wait(epfd: i32, events_ptr: u64, maxevents: i32, timeout
         None
     };
 
-    if pid < MAX_PROCS {
-        POLL_WAITERS.lock()[pid] = Some(PollWaiter {
-            pid,
-            phys_buf,
-            phys_len: buf_size,
-            kind: PollWaiterKind::EpollWait { epoll_id, maxevents: maxevents as usize },
-            timer_id,
-            socks,
-        });
-    }
+    POLL_WAITERS.lock().insert(pid, PollWaiter {
+        pid,
+        phys_buf,
+        phys_len: buf_size,
+        kind: PollWaiterKind::EpollWait { epoll_id, maxevents: maxevents as usize },
+        timer_id,
+        socks,
+    });
 
     let next_tf = {
         let mut sched = crate::process::scheduler::local_scheduler();

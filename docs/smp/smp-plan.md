@@ -539,6 +539,14 @@ Encontrado por el camino:
   `timer_preempt` (2026-08-06) lo rechaza. `pthread_test` entraba en pánico
   en cuanto un hilo nuevo se reanudaba por primera vez desde el tick. No es
   de esta etapa (arreglado aparte: `0x202`).
+- **`FUTEX_WAITERS`, `POLL_WAITERS` y `EPOLL_FD_MAP` eran arrays de 32
+  entradas indexados por PID** que ignoraban en silencio los PID >= 32: un
+  `FUTEX_WAIT` (o un `poll` sin timeout) de esos PID bloqueaba sin
+  registrarse y nunca despertaba. El primer job de metal de esta etapa se
+  quedó en `pthread_join` (PID 104, tras 100 `exec` de calentamiento) hasta
+  que el watchdog reinició; en QEMU, determinista en la 7.ª ejecución
+  seguida de `pthread_test`, también con `-smp 1`. No es de esta etapa;
+  ahora son `BTreeMap` por PID, sin límite.
 - **Coste:** cada página guarda de una kstack (fork, exit) es un shootdown
   del kernel a todas las CPUs: 24 al arrancar al shell con `-smp 4`.
 
