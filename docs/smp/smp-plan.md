@@ -10,7 +10,7 @@
 > `hal::smp`): los APs arrancan, pasan `init_this_cpu` y se quedan en `hlt`;
 > etapa 5 hecha y verificada en QEMU y en la Ryzen (TLB shootdown por IPI,
 > `memory::tlb`, `hal::tlb`, `tlb_selftest`); etapa 6 hecha y verificada en
-> QEMU (2026-09-25; ver su resolución: cada entrada del inventario resuelta
+> QEMU y en la Ryzen (2026-09-25; ver su resolución: cada entrada del inventario resuelta
 > o asignada a la etapa 7, y cinco bugs reales encontrados por el camino).
 > Los procesos siguen corriendo en una sola CPU.
 
@@ -681,6 +681,14 @@ CPU salvo el último, y ninguno en el inventario):
    Ahora los tres con el scheduler y `FUTEX_WAITERS` tomados, y el valor se
    lee a través del espacio de direcciones (un fallo ahí llegaría a la ruta
    de muerte, que toma el scheduler lock).
+
+**Verificada en la Ryzen** (2026-09-25, arranque #33, run
+`20260925-005102-3992b9`, `OK exit=0`): 24/24 CPUs, `pipe_cow_test` PASS
+(A y B), `pthread_test` x3, `producer_consumer`, `mlibc_signal_test`,
+`fpu_test` y `socket_test` con exit 0; `tlb_selftest` PASS contra 23 APs,
+stale 0; 13540 shootdowns (210220 IPIs), espera media 6 µs, máx. 550 µs;
+`cow_faults_failed` 0. El ring perdió el principio del job (el
+calentamiento de 100 `exec`), no las mediciones.
 
 **Para la etapa 7** (lo que esta auditoría deja escrito y no resuelve):
 
