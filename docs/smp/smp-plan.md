@@ -8,8 +8,8 @@
 > y verificada en QEMU y en la Ryzen (`cpu::init_this_cpu`, una GDT con un slot de TSS por
 > CPU); etapa 4 hecha y verificada en QEMU y en la Ryzen (`kernel/src/smp.rs`,
 > `hal::smp`): los APs arrancan, pasan `init_this_cpu` y se quedan en `hlt`;
-> etapa 5 hecha y verificada en QEMU (TLB shootdown por IPI, `memory::tlb`,
-> `hal::tlb`, `tlb_selftest`), pendiente de la Ryzen. Los procesos siguen
+> etapa 5 hecha y verificada en QEMU y en la Ryzen (TLB shootdown por IPI,
+> `memory::tlb`, `hal::tlb`, `tlb_selftest`). Los procesos siguen
 > corriendo en una sola CPU.
 
 ## Por qué ahora
@@ -463,7 +463,14 @@ bucle una página, el otro la desmapea o fuerza COW) no ve nunca la
 traducción vieja. Todavía no hay procesos en los APs, así que el test
 dispara el shootdown a mano desde los APs inertes.
 
-**Estado:** hecha en QEMU el 2026-09-24. Referencias: el comentario de módulo
+**Estado:** hecha en QEMU el 2026-09-24 y verificada en la Ryzen el
+2026-09-25 (boot #32, run 20260925-001309-438cc9, `METAL-DONE exit=0`, job
+`target/metal/smp-stage5-job.sh`): `tlb_selftest: PASS (23 APs x 200 rounds,
+reads user 506999 kernel 764437, stale 0, mutual 2000x2)`; `tlb: ready
+0xffffff, 13509 shootdowns (209507 IPIs), wait avg 5 us max 867 us`; 24/24
+CPUs `ok (8)`; tras 100 fork+exec, `pthread_test`, `fpu_test` y `socket_test`
+PASS. El primer intento (boot #31) se colgó en `pthread_join`: el bug de las
+tablas por PID de más abajo, no esta etapa. Referencias: el comentario de módulo
 de `kernel/src/memory/tlb.rs` (protocolo) y el de `kernel/src/tlb_selftest.rs`
 (la prueba).
 
