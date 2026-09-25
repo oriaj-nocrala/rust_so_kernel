@@ -6,7 +6,7 @@
 > `hal::apic`); etapa 2 hecha y verificada en QEMU y en la Ryzen
 > (`cpu::percpu`, `swapgs` solo en la entrada de `syscall`); etapa 3 hecha
 > y verificada en QEMU y en la Ryzen (`cpu::init_this_cpu`, una GDT con un slot de TSS por
-> CPU); etapa 4 hecha y verificada en QEMU (`kernel/src/smp.rs`,
+> CPU); etapa 4 hecha y verificada en QEMU y en la Ryzen (`kernel/src/smp.rs`,
 > `hal::smp`): los APs arrancan, pasan `init_this_cpu` y se quedan en `hlt`.
 > Los procesos siguen corriendo en una sola CPU; no hay IPIs más allá del
 > arranque.
@@ -432,7 +432,14 @@ con `fpu_test` ALL_OK y `socket_test` exit 0; `-smp 40` da 32 online y
 `8 beyond MAX_CPUS=32`; `-cpu max,-apic` no intenta nada y lo dice. Probado por
 sabotaje (un `hlt` tras llegar a modo largo): `NO-RESPONSE(stage 2)` en ambos
 APs y el arranque llega al shell igual. Cada AP tarda ~10,2 ms en QEMU, casi
-todo el retardo de INIT. Pendiente: la Ryzen (`target/metal/smp-stage4-job.sh`).
+todo el retardo de INIT. En la Ryzen (2026-09-24, boot #30, run
+20260924-225723-534d3f, `METAL-DONE exit=0`, job
+`target/metal/smp-stage4-job.sh`): `smp: madt 24 cpus, 24 online`, las 24 con
+`cpuN ok (8)`, ~10,1 ms por AP (numeración en orden de MADT: apic 0,2,4…26 y
+luego 1,3,5…27), `fpu_test` ALL_OK, `socket_test` PASS tras 100 fork+exec, y
+`timer_ticks` 290@3840 ms → 353@4466 ms ≈ 100 Hz: los APs no tocan el tick.
+`spurious_irqs: 1` (en QEMU, 0): sin investigar; el vector espurio del LAPIC
+se cuenta y se ignora, y ningún AP lo EOIa.
 
 Fuera, a propósito: las entradas x2APIC (tipo 9) de la MADT, que solo aparecen
 con IDs de APIC > 255 (la Ryzen llega a 27).
