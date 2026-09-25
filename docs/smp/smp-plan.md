@@ -5,7 +5,7 @@
 > etapa 1 hecha y verificada en QEMU y en la Ryzen (LAPIC timer + I/O APIC,
 > `hal::apic`); etapa 2 hecha y verificada en QEMU y en la Ryzen
 > (`cpu::percpu`, `swapgs` solo en la entrada de `syscall`); etapa 3 hecha
-> y verificada en QEMU (`cpu::init_this_cpu`, una GDT con un slot de TSS por
+> y verificada en QEMU y en la Ryzen (`cpu::init_this_cpu`, una GDT con un slot de TSS por
 > CPU). El kernel sigue siendo de una sola CPU: no hay IPIs ni arranque de
 > APs.
 
@@ -355,7 +355,13 @@ comentario de módulo es la referencia).
 Verificado: `run-kernel-tests` 9/9, `boot-matrix 4 5` = 20/20, 8G con
 `fpu_test` ALL_OK y `socket_test` exit 0, `timer_ticks` a 99,9 Hz (dos
 lecturas), y la ruta de respaldo (`-cpu max,-apic`) también con
-`cpu0 ok (8)`. Pendiente: la Ryzen (`cpu_init:` en `/proc/kdebug`).
+`cpu0 ok (8)`. En la Ryzen (2026-09-24, boot #29, run
+20260924-222935-e399b8, `METAL-DONE exit=0`): `cpu_init: cpu0 ok (8)`, PAT
+programado (`...0106`, entrada 1 = WC), xAPIC con el timer a la cuenta
+calibrada (62494, div 16), `fpu_test` ALL_OK y `socket_test` PASS tras 100
+fork+exec. No se tomaron dos lecturas de `timer_ticks` (una sola no mide la
+frecuencia); el timer lo programa ahora `init_this_cpu`, y la cuenta y el LVT
+los comprueba su propia verificación.
 
 **Para la etapa 4:** `MAX_CPUS` es 8 y la Ryzen tiene 24 CPUs lógicas; la
 GDT, las TSS y las pilas crecen solas con la constante (40 KiB de pilas por
