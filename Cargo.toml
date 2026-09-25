@@ -41,7 +41,7 @@ members = ["kernel"]
 # `qemu-test-runner` is invoked as an external binary (see
 # `scripts/run-kernel-tests.sh`), not depended on by anything in this
 # workspace.
-exclude = ["hal", "ext2", "mm", "vfs", "diag", "sched", "usock", "qemu-test-runner"]
+exclude = ["hal", "ext2", "mm", "vfs", "diag", "sched", "usock", "gui", "qemu-test-runner"]
 
 [profile.dev]
 panic = "abort"

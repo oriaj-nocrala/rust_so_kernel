@@ -1,0 +1,14 @@
+[package]
+name = "gui"
+version = "0.1.0"
+edition = "2021"
+
+# Host-testable core of the userspace compositor (phase 2.4 of
+# docs/gui/gui-plan.md): the wire format, rectangle regions and the
+# compositor's state machine. no_std + alloc, no syscalls — `cd gui && cargo
+# test`. Its own workspace root (empty table below), like `usock`/`hal`:
+# the parent workspace's `panic = "abort"` would break the test harness.
+# `userspace` depends on it by path.
+[workspace]
+
+[dependencies]

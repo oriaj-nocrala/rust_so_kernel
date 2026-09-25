@@ -2,8 +2,8 @@
 
 > **Estado (2026-09-25):** fase 1 hecha y verificada en QEMU y en la Ryzen
 > (ver su registro al final). Fase 2: 2.1 hecho y verificado en QEMU y en la Ryzen;
-> 2.2 y 2.3 hechos y verificados en QEMU (falta la Ryzen); 2.4-2.5
-> pendientes. Fase 3 sin empezar.
+> 2.2 y 2.3 hechos y verificados en QEMU (falta la Ryzen); 2.4 hecho (crate
+> `gui/`, tests de host); 2.5 pendiente. Fase 3 sin empezar.
 
 ## Por qué ahora, y por qué así
 
@@ -570,3 +570,46 @@ el bucle de 5 MiB agota los VMAs y muere.
 PASS; `mmap_test`, `poll_test`, `ipc_ping`, `pipe_test` y `signal_test`
 en 0; `boot-matrix.sh 4 3` 12/12 (todos los programas de Rust, PID 1
 incluido, enlazan ahora el allocator).
+
+### Fase 2.4 (2026-09-25)
+
+El crate `gui/` (`cd gui && cargo test`, 27 tests, sin QEMU), con los
+cuatro módulos: `region`, `wire`, `protocol` (las peticiones y eventos
+tipados, separados de `wire`) y `compositor`. Compila también para
+`x86_64-unknown-none` como dependencia de `userspace`, y el `build.rs`
+raíz vigila `gui/src` (a diferencia de `hal`/`usock`, sus cambios acaban
+en programas embebidos).
+
+Decisiones que el plan no fijaba:
+
+- **Cada superficie guarda su propia copia.** Como `release` sale en el
+  mismo `commit`, el cliente puede reescribir el búfer enseguida; sin
+  copia no habría de dónde repintar una ventana al destaparla. `commit`
+  copia solo el daño (o todo, si la superficie cambia de tamaño o se
+  mapea) y `compose` lee únicamente copias, nunca memoria del cliente.
+  Coste: `w x h x 4` bytes por ventana.
+- **El mapeo del pool es lo único síncrono.** `client_data` recibe un
+  cierre `map(fd, size)`; el fd se añade a `take_fds_to_close()` tanto si
+  el mapeo sale bien como si no. Los fds recibidos que ningún mensaje
+  reclama también se cierran al quitar al cliente.
+- **Un búfer guarda el `Rc` de la memoria de su pool**, así que destruir
+  el pool no invalida sus búferes (regla de Wayland). `attach` captura el
+  búfer entero, así que destruirlo antes del `commit` tampoco rompe nada.
+- **`compose(dst, stride)` devuelve los rectángulos que volcar**, como
+  mucho 16 (lo que acepta `FBIO_FLUSH`); con más, su caja envolvente.
+- Colocación en cascada desde (40, 40), barra de título de 20 px (color
+  según el foco), cursor de 11x16 dibujado por software, y
+  Ctrl+Alt+Retroceso marca `quit_requested()` sin llegar a ningún cliente.
+  `configure` propone la mitad de la pantalla.
+
+**Tests:** `region` contra un mapa de bits (300 semillas × 30 operaciones
+de unir, restar y recortar, comprobando además que los rectángulos nunca
+se solapan); `wire` con el mensaje cortado en cada byte posible;
+`protocol` ida y vuelta de toda petición y evento; el compositor
+conducido con peticiones codificadas de verdad y comprobado píxel a
+píxel, sobre una pantalla con `stride` mayor que el ancho cuyo relleno
+debe quedar intacto. **Probados por sabotaje**, cada uno detectado por su
+test: quitar la comprobación de límites del búfer, ignorar el daño
+(copiar todo), invertir el orden Z y no terminar el arrastre al soltar
+(este último no lo detectaba nadie hasta añadir un movimiento después de
+soltar).

@@ -507,6 +507,9 @@ fn build_kernel() -> PathBuf {
     watch_dir_recursive(&kernel_dir.join("src"));
     watch_dir_recursive(&manifest_dir.join("userspace/src"));
     watch_dir_recursive(&manifest_dir.join("userspace/c"));
+    // A path dependency of `userspace` (the compositor's core): an edit
+    // there changes the embedded Rust programs.
+    watch_dir_recursive(&manifest_dir.join("gui/src"));
     watch_dir_recursive(&manifest_dir.join("mlibc-port"));
     watch_dir_recursive(&manifest_dir.join("doom-port"));
     watch_dir_recursive(&manifest_dir.join("quake-port"));
