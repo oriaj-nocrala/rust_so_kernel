@@ -1,7 +1,10 @@
 #![no_std]
 
+extern crate alloc;
+
 pub mod syscall;
 pub mod fmt;
+pub mod heap;
 
 use core::panic::PanicInfo;
 

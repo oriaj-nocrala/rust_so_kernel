@@ -50,6 +50,7 @@ const RUST_PROGRAMS: &[(&str, &str)] = &[
     ("signal_test", "signal_test.elf"),
     ("demo",       "demo.elf"),
     ("reboot",     "reboot.elf"),
+    ("userlib_test", "userlib_test.elf"),
 ];
 
 /// C binaries that stay embedded in the kernel: (source file stem, embedded

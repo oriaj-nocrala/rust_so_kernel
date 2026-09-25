@@ -2,7 +2,7 @@
 
 > **Estado (2026-09-25):** fase 1 hecha y verificada en QEMU y en la Ryzen
 > (ver su registro al final). Fase 2: 2.1 hecho y verificado en QEMU y en la Ryzen;
-> 2.2 hecho y verificado en QEMU (falta la Ryzen); 2.3 en curso; 2.4-2.5
+> 2.2 y 2.3 hechos y verificados en QEMU (falta la Ryzen); 2.4-2.5
 > pendientes. Fase 3 sin empezar.
 
 ## Por qué ahora, y por qué así
@@ -524,3 +524,49 @@ evento, y no a los 10 s del timeout. `poll_test`, `ipc_ping`,
 `socket_test`, `wait_intr_test`, `pipe_multi_test` y `sigsuspend_test`
 en 0, `invariants=ok`. `run-kernel-tests.sh` PASS, `boot-matrix.sh 4 4`
 (4 CPUs, 8 GiB) 16/16, `cd vfs && cargo test` 166/166.
+
+### Fase 2.3 (2026-09-25)
+
+Hecho como se planeó. Lo que decidió la forma del allocator
+(`userspace/src/heap.rs`) fue el `mmap` del kernel, no un diseño genérico:
+
+- **64 VMAs por proceso.** Clases de potencias de dos de 16 B a 64 KiB,
+  con listas libres intrusivas, cortadas de chunks de 1 MiB que nunca se
+  devuelven. Por encima de 64 KiB, un `mmap` por bloque y `munmap` al
+  liberar. Así miles de objetos pequeños ocupan pocos VMAs y solo los
+  grandes (framebuffers, `Vec` enormes) gastan uno cada uno. El resto de
+  un chunk abandonado no cuesta RAM: nunca se toca, nunca se pagina.
+- **`munmap` exige el VMA exacto**, dirección y longitud. `large_len`
+  recalcula la longitud desde el `Layout` con el mismo redondeo del
+  `mmap`, incluido el de 2 MiB: una petición de 2 MiB o más se convierte
+  en un VMA de páginas de 2 MiB cuya longitud el kernel redondea. Los
+  chunks se quedan en 1 MiB para no caer nunca en ese camino.
+- **Alineación:** `mmap` da 4 KiB. Un bloque de clase `c` queda alineado a
+  `min(c, 4096)`. Una alineación mayor que 4096 devuelve null en vez de
+  fingirse.
+- Un spin lock que cede la CPU (`yield`) al esperar. Hoy los programas de
+  Rust tienen un solo hilo; el lock deja correcto un hilo futuro.
+
+Wrappers nuevos en `syscall.rs`: `mmap` completo (`MAP_SHARED`, fd,
+offset), `memfd_create`, `ftruncate`, `ioctl`, `sendmsg`/`recvmsg` con
+las estructuras de Linux, y encima `send_fds`/`recv_fds` (`SCM_RIGHTS`,
+hasta 8 fds; lo que no cabe se cierra y sale `MSG_CTRUNC`), y
+`epoll_create`/`epoll_ctl`/`epoll_wait` (`epoll_event` empaquetado, 12
+bytes).
+
+**Test: `userlib_test`** (Rust, embebido), 30 comprobaciones: `Box`/`Vec`/
+`format!`, reutilización de un bloque liberado, toda alineación hasta
+4096 y el rechazo de 8192, 100000 cajas en 1-3 chunks, bloques de 1 y
+3 MiB a cero y devueltos (`MemFree` igual antes y después), 200 × 5 MiB
+seguidos, un `Vec` que crece a 4 MB por todos los caminos de `realloc`;
+memfd con dos mapeos que se ven entre sí y `EBUSY` al encoger; un memfd
+pasado a un hijo por `SCM_RIGHTS` que escribe en su propio mapeo y el
+padre lo lee; 2 fds en hueco para 1; `epoll` con su dato de vuelta;
+`TIOCGWINSZ`. **Probado por sabotaje:** con la longitud de `munmap`
+desfasada una página fallan "unmapped on drop" y "memory given back", y
+el bucle de 5 MiB agota los VMAs y muere.
+
+**Verificado en QEMU con `-smp 4`, 512 MiB y 8 GiB:** `userlib_test`
+PASS; `mmap_test`, `poll_test`, `ipc_ping`, `pipe_test` y `signal_test`
+en 0; `boot-matrix.sh 4 3` 12/12 (todos los programas de Rust, PID 1
+incluido, enlazan ahora el allocator).

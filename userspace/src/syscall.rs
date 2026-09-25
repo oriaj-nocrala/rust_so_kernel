@@ -83,7 +83,6 @@ const SYS_POLL: u64 = 7;
 #[allow(dead_code)]
 const SYS_LSEEK: u64 = 8;
 const SYS_MMAP: u64 = 9;
-#[allow(dead_code)]
 const SYS_MUNMAP: u64 = 11;
 #[allow(dead_code)]
 const SYS_YIELD: u64 = 24;
@@ -122,14 +121,14 @@ pub const SIG_SETMASK: i32 = 2;
 const SYS_EXEC: u64 = 59;
 const SYS_EXIT: u64 = 60;
 const SYS_WAITPID: u64 = 61;
-#[allow(dead_code)]
 const SYS_EPOLL_CREATE: u64 = 213;
 const SYS_GETDENTS64: u64 = 217;
 const SYS_CLOCK_GETTIME: u64 = 228;
-#[allow(dead_code)]
 const SYS_EPOLL_WAIT: u64 = 232;
-#[allow(dead_code)]
 const SYS_EPOLL_CTL: u64 = 233;
+const SYS_IOCTL: u64 = 16;
+const SYS_FTRUNCATE: u64 = 77;
+const SYS_MEMFD_CREATE: u64 = 319;
 const SYS_UPTIME_MS: u64 = 400;
 const SYS_UPTIME_SEC: u64 = 401;
 const SYS_MEMINFO_KB: u64 = 402;
@@ -445,17 +444,45 @@ pub fn clock_gettime() -> (i64, i64) {
 
 // ── Memory ───────────────────────────────────────────────────────────────
 
-const MAP_ANONYMOUS: u32 = 0x20;
 pub const PROT_READ: u32 = 0x1;
 pub const PROT_WRITE: u32 = 0x2;
+pub const MAP_SHARED: u32 = 0x01;
+pub const MAP_PRIVATE: u32 = 0x02;
+pub const MAP_ANONYMOUS: u32 = 0x20;
 
-/// Anonymous-only mmap (matches kernel's sys_mmap restriction: fd must be -1
-/// and MAP_ANONYMOUS must be set). Returns the mapped address, or a negative
-/// errno.
-pub fn mmap_anon(addr_hint: u64, length: u64, prot: u32) -> i64 {
+/// `mmap(2)` in full (`kernel/src/process/syscall/fs.rs::sys_mmap`): private
+/// anonymous memory (`fd == -1`), or `MAP_SHARED` of a memfd / of a fresh
+/// shared object (`MAP_SHARED|MAP_ANONYMOUS`). A nonzero `addr` is taken as
+/// `MAP_FIXED`. Returns the address, or a negative errno.
+pub fn mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: u64) -> i64 {
     unsafe {
-        syscall5(SYS_MMAP, addr_hint, length, prot as u64, MAP_ANONYMOUS as u64, (-1i64) as u64)
+        syscall6(SYS_MMAP, addr, length, prot as u64, flags as u64, fd as i64 as u64, offset)
     }
+}
+
+/// Private anonymous memory, zero-filled on demand.
+pub fn mmap_anon(addr_hint: u64, length: u64, prot: u32) -> i64 {
+    mmap(addr_hint, length, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+}
+
+pub const MFD_CLOEXEC: u32 = 1;
+
+/// A shared-memory object of size 0 behind a new fd; size it with
+/// [`ftruncate`], map it with [`mmap`] + `MAP_SHARED`, pass it with
+/// [`send_fds`]. `name_cstr` must be NUL-terminated (display only).
+pub fn memfd_create(name_cstr: &[u8], flags: u32) -> i64 {
+    unsafe { syscall2(SYS_MEMFD_CREATE, name_cstr.as_ptr() as u64, flags as u64) }
+}
+
+/// memfds only (`EINVAL` otherwise). Shrinking a mapped object is `EBUSY`.
+pub fn ftruncate(fd: i32, length: u64) -> i64 {
+    unsafe { syscall2(SYS_FTRUNCATE, fd as u64, length) }
+}
+
+/// `ioctl(fd, request, argp)`; `argp` is whatever the request expects
+/// (usually a pointer to its argument struct, cast to `u64`).
+pub fn ioctl(fd: i32, request: u64, argp: u64) -> i64 {
+    unsafe { syscall3(SYS_IOCTL, fd as u64, request, argp) }
 }
 
 pub fn munmap(addr: u64, length: u64) -> i64 {
@@ -582,6 +609,175 @@ pub fn getpeername(fd: i32, addr: &mut SockAddrUn, addrlen: &mut u32) -> i64 {
     unsafe {
         syscall3(SYS_GETPEERNAME, fd as u64, addr as *mut SockAddrUn as u64,
                  addrlen as *mut u32 as u64)
+    }
+}
+
+// ── sendmsg / recvmsg with SCM_RIGHTS ─────────────────────────────────
+//
+// Linux x86-64 layouts, which the kernel reads verbatim
+// (`kernel/src/process/syscall/ipc.rs::read_msghdr`).
+
+pub const MSG_DONTWAIT: u32 = 0x40;
+pub const MSG_TRUNC: i32 = 0x20;
+pub const MSG_CTRUNC: i32 = 0x8;
+const SOL_SOCKET: i32 = 1;
+const SCM_RIGHTS: i32 = 1;
+/// Most descriptors [`send_fds`]/[`recv_fds`] carry in one message.
+pub const MAX_PASSED_FDS: usize = 8;
+
+#[repr(C)]
+pub struct IoVec {
+    pub base: *mut u8,
+    pub len: usize,
+}
+
+#[repr(C)]
+pub struct MsgHdr {
+    pub name: *mut u8,
+    pub namelen: u32,
+    pub iov: *mut IoVec,
+    pub iovlen: usize,
+    pub control: *mut u8,
+    pub controllen: usize,
+    pub flags: i32,
+}
+
+#[repr(C)]
+struct CmsgHdr {
+    len: usize,
+    level: i32,
+    ty: i32,
+}
+
+const CMSG_HDR: usize = core::mem::size_of::<CmsgHdr>();
+
+/// Control buffer for one `SCM_RIGHTS` message of up to `MAX_PASSED_FDS`,
+/// 8-aligned as `CMSG_ALIGN` requires.
+#[repr(C, align(8))]
+struct CmsgBuf([u8; CMSG_HDR + 4 * MAX_PASSED_FDS]);
+
+pub fn sendmsg(fd: i32, msg: &MsgHdr, flags: u32) -> i64 {
+    unsafe { syscall3(SYS_SENDMSG, fd as u64, msg as *const MsgHdr as u64, flags as u64) }
+}
+
+pub fn recvmsg(fd: i32, msg: &mut MsgHdr, flags: u32) -> i64 {
+    unsafe { syscall3(SYS_RECVMSG, fd as u64, msg as *mut MsgHdr as u64, flags as u64) }
+}
+
+/// Sends `data` with `fds` attached (`SCM_RIGHTS`). The receiver gets its
+/// own descriptors for the same files; ours stay open. `data` must not be
+/// empty on a stream socket (nothing would carry the descriptors), and at
+/// most [`MAX_PASSED_FDS`] go at once (`EINVAL` beyond).
+pub fn send_fds(fd: i32, data: &[u8], fds: &[i32], flags: u32) -> i64 {
+    if fds.len() > MAX_PASSED_FDS {
+        return -22; // EINVAL
+    }
+    let mut iov = IoVec { base: data.as_ptr() as *mut u8, len: data.len() };
+    let mut cbuf = CmsgBuf([0; CMSG_HDR + 4 * MAX_PASSED_FDS]);
+    let clen = CMSG_HDR + 4 * fds.len();
+    let hdr = CmsgHdr { len: clen, level: SOL_SOCKET, ty: SCM_RIGHTS };
+    unsafe {
+        core::ptr::write(cbuf.0.as_mut_ptr() as *mut CmsgHdr, hdr);
+        for (i, f) in fds.iter().enumerate() {
+            core::ptr::write_unaligned(cbuf.0.as_mut_ptr().add(CMSG_HDR + 4 * i) as *mut i32, *f);
+        }
+    }
+    let msg = MsgHdr {
+        name: core::ptr::null_mut(),
+        namelen: 0,
+        iov: &mut iov,
+        iovlen: 1,
+        control: if fds.is_empty() { core::ptr::null_mut() } else { cbuf.0.as_mut_ptr() },
+        controllen: if fds.is_empty() { 0 } else { clen },
+        flags: 0,
+    };
+    sendmsg(fd, &msg, flags)
+}
+
+/// What [`recv_fds`] got: bytes of data, descriptors installed into `fds`,
+/// and the `MSG_*` flags the kernel set (`MSG_TRUNC`, `MSG_CTRUNC`).
+pub struct Received {
+    pub len: usize,
+    pub nfds: usize,
+    pub flags: i32,
+}
+
+/// Receives into `buf`, installing any passed descriptors into `fds` (they
+/// are new fds of this process, to close when done). Descriptors that do
+/// not fit in `fds` are closed and `MSG_CTRUNC` is set, as on Linux.
+/// Returns the negative errno on failure; 0 bytes with 0 fds is EOF.
+pub fn recv_fds(fd: i32, buf: &mut [u8], fds: &mut [i32], flags: u32) -> Result<Received, i64> {
+    let room = fds.len().min(MAX_PASSED_FDS);
+    let mut iov = IoVec { base: buf.as_mut_ptr(), len: buf.len() };
+    let mut cbuf = CmsgBuf([0; CMSG_HDR + 4 * MAX_PASSED_FDS]);
+    let mut msg = MsgHdr {
+        name: core::ptr::null_mut(),
+        namelen: 0,
+        iov: &mut iov,
+        iovlen: 1,
+        control: cbuf.0.as_mut_ptr(),
+        controllen: CMSG_HDR + 4 * room,
+        flags: 0,
+    };
+    let n = recvmsg(fd, &mut msg, flags);
+    if n < 0 {
+        return Err(n);
+    }
+    let mut nfds = 0;
+    if msg.controllen >= CMSG_HDR {
+        let hdr = unsafe { core::ptr::read(cbuf.0.as_ptr() as *const CmsgHdr) };
+        if hdr.level == SOL_SOCKET && hdr.ty == SCM_RIGHTS && hdr.len >= CMSG_HDR {
+            nfds = ((hdr.len - CMSG_HDR) / 4).min(room);
+            for (i, slot) in fds.iter_mut().take(nfds).enumerate() {
+                *slot = unsafe {
+                    core::ptr::read_unaligned(cbuf.0.as_ptr().add(CMSG_HDR + 4 * i) as *const i32)
+                };
+            }
+        }
+    }
+    Ok(Received { len: n as usize, nfds, flags: msg.flags })
+}
+
+// ── epoll ────────────────────────────────────────────────────────────────
+
+pub const EPOLLIN: u32 = 0x001;
+pub const EPOLLOUT: u32 = 0x004;
+pub const EPOLLERR: u32 = 0x008;
+pub const EPOLLHUP: u32 = 0x010;
+pub const EPOLLET: u32 = 0x8000_0000;
+pub const EPOLL_CTL_ADD: i32 = 1;
+pub const EPOLL_CTL_DEL: i32 = 2;
+pub const EPOLL_CTL_MOD: i32 = 3;
+/// `sys_epoll_wait` refuses more than this per call.
+pub const EPOLL_MAX_EVENTS: usize = 16;
+
+/// `struct epoll_event`: packed on x86-64 Linux (12 bytes), and so here.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+pub struct EpollEvent {
+    pub events: u32,
+    pub data: u64,
+}
+
+pub fn epoll_create() -> i64 {
+    unsafe { syscall1(SYS_EPOLL_CREATE, 1) }
+}
+
+/// `data` comes back unchanged in every event for `fd`.
+pub fn epoll_ctl(epfd: i32, op: i32, fd: i32, events: u32, data: u64) -> i64 {
+    let ev = EpollEvent { events, data };
+    unsafe {
+        syscall4(SYS_EPOLL_CTL, epfd as u64, op as u64, fd as u64, &ev as *const EpollEvent as u64)
+    }
+}
+
+/// Fills at most `min(events.len(), EPOLL_MAX_EVENTS)` entries. `-1` waits
+/// forever, `0` does not wait.
+pub fn epoll_wait(epfd: i32, events: &mut [EpollEvent], timeout_ms: i32) -> i64 {
+    let max = events.len().min(EPOLL_MAX_EVENTS);
+    unsafe {
+        syscall4(SYS_EPOLL_WAIT, epfd as u64, events.as_mut_ptr() as u64, max as u64,
+                 timeout_ms as i64 as u64)
     }
 }
 

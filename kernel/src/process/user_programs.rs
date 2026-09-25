@@ -74,7 +74,7 @@ pub enum ProgramSource {
 /// includes `/mnt/bin` — no special-casing needed here, they just aren't
 /// registered in this table at all, and so don't show up in initramfs's
 /// `/bin` (`ls /bin`) either, only in `/mnt/bin`.
-static PROGRAMS: [(&str, ProgramSource); 14] = [
+static PROGRAMS: [(&str, ProgramSource); 15] = [
     ("uname",     ProgramSource::Elf(include_bytes!("../../embedded/uname.elf"))),
     ("shell",     ProgramSource::Elf(include_bytes!("../../embedded/shell.elf"))),
     ("snake",     ProgramSource::Elf(include_bytes!("../../embedded/snake.elf"))),
@@ -83,6 +83,7 @@ static PROGRAMS: [(&str, ProgramSource); 14] = [
     ("ipc_ping",  ProgramSource::Elf(include_bytes!("../../embedded/ipc_ping.elf"))),
     ("mmap_test", ProgramSource::Elf(include_bytes!("../../embedded/mmap_test.elf"))),
     ("poll_test", ProgramSource::Elf(include_bytes!("../../embedded/poll_test.elf"))),
+    ("userlib_test", ProgramSource::Elf(include_bytes!("../../embedded/userlib_test.elf"))),
     ("pipe_test", ProgramSource::Elf(include_bytes!("../../embedded/pipe_test.elf"))),
     ("signal_test", ProgramSource::Elf(include_bytes!("../../embedded/signal_test.elf"))),
     ("demo",      ProgramSource::Elf(include_bytes!("../../embedded/demo.elf"))),
