@@ -2,8 +2,9 @@
 
 > **Estado (2026-09-25):** fase 1 hecha y verificada en QEMU y en la Ryzen
 > (ver su registro al final). Fase 2: 2.1 hecho y verificado en QEMU y en la Ryzen;
-> 2.2, 2.3 y 2.5 hechos y verificados en QEMU (falta la Ryzen); 2.4 hecho
-> (crate `gui/`, tests de host). Fase 3 sin empezar.
+> 2.2 a 2.5 hechos y verificados en QEMU y en la Ryzen (2.2 en el boot #43,
+> 2.3 y 2.5 en el #45; 2.4 son tests de host). Fase 2 cerrada. Fase 3 sin
+> empezar.
 
 ## Por qué ahora, y por qué así
 
@@ -673,3 +674,16 @@ PS/2 y por USB** (`QEMU_USB_KBD=1 QEMU_USB_MOUSE=1 QEMU_DEBUG_NO_PS2=1`,
 `shm_test`, `fork_exec_test`, `pthread_test`, `userlib_test`,
 `poll_test`, `ipc_ping`, `pipe_test`, `signal_test`, `mmap_test`),
 `run-kernel-tests.sh` PASS, `boot-matrix.sh 4 4` 16/16, `gui` 27/27.
+
+**Verificado en la Ryzen (boot #45, `target/metal/gui-job.sh`, sin nadie
+delante):** `userlib_test`, `lifecycle_test` (caso E incluido),
+`input_poll_test`, `wait_intr_test`, `sigsuspend_test`, `socket_test`,
+`pipe_multi_test` y `fb0_test` en 0. El compositor a 1920x1080 (stride
+2048, VRAM en WC), matado con `SIGKILL` dos veces: el cliente ve el EOF,
+`/dev/fb0` queda libre (`mode: text`) y la máquina sigue viva (antes de
+7716122 ese `SIGKILL` colgaba todas las CPUs). `gui_demo` a 50 fps tanto
+con 320x200 como con 1900x1000 (el techo lo pone el tick de 10 ms, no el
+volcado). `fb_flush` durante las dos pruebas: 831 volcados, 3,19 GB, a
+~5,6 GB/s, así que una ventana de 1900x1000 (7,6 MB por cuadro) cuesta
+~1,4 ms de volcado por cuadro. `invariants=ok`. Los fallos de página del
+primer toque no se midieron aparte; no aparecen en el ritmo.
