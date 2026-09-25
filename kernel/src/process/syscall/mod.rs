@@ -249,6 +249,8 @@ pub enum SyscallNumber {
     Poll = 7,
     Lseek = 8,
     Mmap = 9,
+    Ftruncate = 77,
+    MemfdCreate = 319,
     Getcwd = 79,
     Chdir = 80,
     Rename = 82,
@@ -331,6 +333,8 @@ impl SyscallNumber {
             7  => Some(Self::Poll),
             8  => Some(Self::Lseek),
             9  => Some(Self::Mmap),
+            77 => Some(Self::Ftruncate),
+            319 => Some(Self::MemfdCreate),
             79 => Some(Self::Getcwd),
             80 => Some(Self::Chdir),
             82 => Some(Self::Rename),
@@ -423,6 +427,8 @@ pub mod errno {
     pub const ENOTTY: i64 = -25;
     pub const ESPIPE: i64 = -29;
     pub const ENOSPC: i64 = -28;
+    pub const EFBIG: i64 = -27;
+    pub const EMFILE: i64 = -24;
     pub const ERANGE: i64 = -34;
     pub const ENOSYS: i64 = -38;
     pub const ELOOP: i64 = -40;
@@ -551,7 +557,9 @@ pub fn syscall_handler(
         SyscallNumber::RtSigsuspend => signal::sys_rt_sigsuspend(arg1, arg2),
         SyscallNumber::Poll => poll::sys_poll(arg1, arg2 as u32, arg3 as i32),
         SyscallNumber::Lseek => fs::sys_lseek(arg1 as i32, arg2 as i64, arg3 as i32),
-        SyscallNumber::Mmap => fs::sys_mmap(arg1, arg2, arg3 as u32, arg4 as u32, arg5 as i32),
+        SyscallNumber::Mmap => fs::sys_mmap(arg1, arg2, arg3 as u32, arg4 as u32, arg5 as i32, _arg6),
+        SyscallNumber::Ftruncate => fs::sys_ftruncate(arg1 as i32, arg2 as i64),
+        SyscallNumber::MemfdCreate => fs::sys_memfd_create(arg1, arg2 as u32),
         SyscallNumber::Getcwd => fs::sys_getcwd(arg1 as usize, arg2 as usize),
         SyscallNumber::Chdir => fs::sys_chdir(arg1 as usize),
         SyscallNumber::Rename => fs::sys_rename(arg1 as usize, arg2 as usize),

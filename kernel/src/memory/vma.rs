@@ -11,7 +11,11 @@
 // This file only exports the data types and VmaList container.
 // ───────────────────────────────────────────────────────────────────
 
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use x86_64::structures::paging::PageTableFlags;
+
+use super::shm::ShmObject;
 
 // ============================================================================
 // Constants
@@ -29,11 +33,7 @@ const STACK_GROWTH_GUARD_PAGES: u64 = 64; // 256 KiB
 /// matches a real OS's `RLIMIT_STACK`-style ceiling (8 MiB is a common
 /// real-world default). A single global constant rather than a per-VMA
 /// field on `VmaKind::GrowableStack`: every stack in this kernel wants the
-/// same cap, and keeping `VmaKind` a plain fieldless enum keeps `Vma`
-/// (and the fixed-size `[Option<Vma>; MAX_VMAS_PER_PROCESS]` array backing
-/// every process's VMA list) exactly the same size it always was — see
-/// `elf_loader::STACK_PAGES`'s doc comment for why that matters here more
-/// than it would look at first glance.
+/// same cap.
 pub const STACK_MAX_PAGES: usize = 2048; // 8 MiB
 
 // ============================================================================
@@ -60,10 +60,47 @@ pub enum VmaKind {
     /// actually used, same idea as a real OS's `RLIMIT_STACK`-capped
     /// growable stack VMA. See `VmaList::grow_stack`.
     GrowableStack,
+    /// Pages of a `ShmObject` (`memfd_create`, `MAP_SHARED`): every
+    /// mapping of the object maps the object's own frames, so writes are
+    /// seen by all of them. Never COW, never the zero frame, never
+    /// write-protected by `fork`. `Vma::shm` names the object.
+    Shared,
+}
+
+/// A `Shared` VMA's hold on its object: the object stays alive while any
+/// VMA maps it, and `ShmObject::mappings` counts these (a clone is one
+/// more) — the bound that keeps a frame's `u8` refcount from saturating.
+#[derive(Debug)]
+pub struct ShmMapping {
+    pub obj: Arc<ShmObject>,
+    /// Object page mapped at the VMA's `start`.
+    pub offset_pages: usize,
+}
+
+impl ShmMapping {
+    pub fn new(obj: Arc<ShmObject>, offset_pages: usize) -> Self {
+        obj.mapping_added();
+        Self { obj, offset_pages }
+    }
+}
+
+impl Clone for ShmMapping {
+    fn clone(&self) -> Self {
+        Self::new(self.obj.clone(), self.offset_pages)
+    }
+}
+
+impl Drop for ShmMapping {
+    fn drop(&mut self) {
+        self.obj.mapping_removed();
+    }
 }
 
 /// A single virtual memory area.
-#[derive(Debug, Clone, Copy)]
+///
+/// Not `Copy`: a `Shared` VMA holds its object (`shm`), and copying one
+/// has to count as one more mapping of it.
+#[derive(Debug, Clone)]
 pub struct Vma {
     /// Page-aligned start address.
     pub start: u64,
@@ -74,6 +111,8 @@ pub struct Vma {
     pub flags: u64,
     /// Backing type.
     pub kind: VmaKind,
+    /// The object behind a `Shared` VMA; `None` for every other kind.
+    pub shm: Option<ShmMapping>,
 }
 
 impl Vma {
@@ -100,59 +139,53 @@ impl Vma {
 // Per-process VMA list (owned by AddressSpace)
 // ============================================================================
 
+/// A process's VMAs, at most `MAX_VMAS_PER_PROCESS`, in the order they
+/// were added (`find` returns the first match, which matters where two
+/// ELF segments share a page).
+///
+/// A `Vec`, not an inline array: `VmaList` used to be
+/// `[Option<Vma>; 64]` by value, and at `opt-level 0` every `new()` and
+/// `IrqMutex::new` copies it through the stack. Growing `Vma` by the
+/// `shm` field took that copy past the bootloader's 80 KiB boot stack
+/// (a double fault loading PID 1). Empty, this is three words; `fork`
+/// clones only the VMAs that exist. Allocates under the address-space
+/// lock, which the lock order allows (address space → `SLAB_ALLOCATOR`).
 #[derive(Clone)]
 pub struct VmaList {
-    entries: [Option<Vma>; MAX_VMAS_PER_PROCESS],
+    entries: Vec<Vma>,
 }
 
 impl VmaList {
     pub const fn new() -> Self {
-        Self {
-            entries: [None; MAX_VMAS_PER_PROCESS],
-        }
+        Self { entries: Vec::new() }
     }
 
     /// Register a VMA.  Returns error if the list is full.
     pub fn add(&mut self, vma: Vma) -> Result<(), &'static str> {
-        for slot in self.entries.iter_mut() {
-            if slot.is_none() {
-                *slot = Some(vma);
-                return Ok(());
-            }
+        if self.entries.len() >= MAX_VMAS_PER_PROCESS {
+            return Err("VMA list full");
         }
-        Err("VMA list full")
+        self.entries.try_reserve(1).map_err(|_| "VMA list: out of memory")?;
+        self.entries.push(vma);
+        Ok(())
     }
 
     /// Find the VMA containing `addr`, if any.
     pub fn find(&self, addr: u64) -> Option<&Vma> {
-        self.entries
-            .iter()
-            .filter_map(|v| v.as_ref())
-            .find(|v| v.contains(addr))
+        self.entries.iter().find(|v| v.contains(addr))
     }
 
     /// Remove the VMA that starts exactly at `start`.
     /// Returns the removed VMA, or `Err` if not found.
     pub fn remove(&mut self, start: u64) -> Result<Vma, &'static str> {
-        for slot in self.entries.iter_mut() {
-            if let Some(v) = slot {
-                if v.start == start {
-                    let vma = *v;
-                    *slot = None;
-                    return Ok(vma);
-                }
-            }
-        }
-        Err("VMA not found")
+        let i = self.entries.iter().position(|v| v.start == start).ok_or("VMA not found")?;
+        Ok(self.entries.remove(i))
     }
 
     /// Returns true if any existing VMA overlaps [start, start + size_pages * 4096).
     pub fn overlaps(&self, start: u64, size_pages: usize) -> bool {
         let end = start + size_pages as u64 * 4096;
-        self.entries
-            .iter()
-            .filter_map(|v| v.as_ref())
-            .any(|v| v.start < end && v.end() > start)
+        self.entries.iter().any(|v| v.start < end && v.end() > start)
     }
 
     /// Try to grow a `GrowableStack` VMA downward to cover `addr` (which
@@ -177,8 +210,7 @@ impl VmaList {
         // scan below needs its own immutable iteration, so don't hold a
         // `&mut` into `self.entries` across it).
         let mut target: Option<(usize, u64, usize)> = None; // (index, old_start, new_size_pages)
-        for (i, slot) in self.entries.iter().enumerate() {
-            let Some(vma) = slot else { continue };
+        for (i, vma) in self.entries.iter().enumerate() {
             if vma.kind != VmaKind::GrowableStack {
                 continue;
             }
@@ -200,28 +232,26 @@ impl VmaList {
         let (idx, old_start, new_size_pages) = target?;
 
         let would_overlap = self.entries.iter().enumerate()
-            .filter_map(|(j, s)| if j == idx { None } else { s.as_ref() })
+            .filter_map(|(j, v)| if j == idx { None } else { Some(v) })
             .any(|other| other.start < old_start && other.end() > page_addr);
         if would_overlap {
             return None;
         }
 
-        let slot = self.entries[idx].as_mut().unwrap();
+        let slot = &mut self.entries[idx];
         slot.start = page_addr;
         slot.size_pages = new_size_pages;
-        Some(*slot)
+        Some(slot.clone())
     }
 
     /// Remove all VMAs (for process exit).
     pub fn clear(&mut self) {
-        for slot in self.entries.iter_mut() {
-            *slot = None;
-        }
+        self.entries.clear();
     }
 
     /// Iterator over registered VMAs.
     pub fn iter(&self) -> impl Iterator<Item = &Vma> {
-        self.entries.iter().filter_map(|v| v.as_ref())
+        self.entries.iter()
     }
 
     /// Debug: print all VMAs to serial.
@@ -234,6 +264,7 @@ impl VmaList {
                 VmaKind::Code => "code",
                 VmaKind::Huge2M => "huge2m",
                 VmaKind::GrowableStack => "stack(grows down)",
+                VmaKind::Shared => "shared",
             };
             crate::serial_println!(
                 "  {:#x}..{:#x} ({} pages) [{}] flags={:#x}",

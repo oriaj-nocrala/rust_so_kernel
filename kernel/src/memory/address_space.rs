@@ -100,10 +100,10 @@ impl AddressSpace {
         self.vmas.with(|v| v.add(vma))
     }
 
-    /// Find the VMA containing `addr`, if any.
-    /// Returns a copy (Vma is Copy).
+    /// Find the VMA containing `addr`, if any. Returns a clone (for a
+    /// `Shared` VMA, one more short-lived hold on its object).
     pub fn find_vma(&self, addr: u64) -> Option<Vma> {
-        self.vmas.with(|v| v.find(addr).copied())
+        self.vmas.with(|v| v.find(addr).cloned())
     }
 
     /// Debug: print all VMAs (uses serial, no allocation).
@@ -178,9 +178,19 @@ impl AddressSpace {
             child.mmap_base.store(self.mmap_base.load(Ordering::Relaxed), Ordering::Relaxed);
 
             for vma in vmas.iter() {
+                // The clone above counted one more mapping of every object.
+                if vma.shm.as_ref().is_some_and(|m| m.obj.mappings() > crate::memory::shm::MAX_MAPPINGS) {
+                    return Err("fork: shared object mapped too many times");
+                }
                 let orig_flags = vma.page_table_flags();
-                // Shared mapping is always read-only regardless of original flags.
-                let shared_flags = orig_flags & !PageTableFlags::WRITABLE;
+                // A `Shared` VMA keeps its flags: both sides write the
+                // object's frames. Every other kind is read-only until the
+                // COW fault copies it.
+                let shared_flags = if vma.kind == VmaKind::Shared {
+                    orig_flags
+                } else {
+                    orig_flags & !PageTableFlags::WRITABLE
+                };
 
                 for page_idx in 0..vma.size_pages {
                     let addr = vma.start + page_idx as u64 * 4096;
@@ -201,7 +211,7 @@ impl AddressSpace {
                     }
 
                     // Mark the parent's page read-only (COW protection).
-                    if orig_flags.contains(PageTableFlags::WRITABLE) {
+                    if orig_flags.contains(PageTableFlags::WRITABLE) && vma.kind != VmaKind::Shared {
                         self.page_table.update_page_flags(page, shared_flags)?;
                     }
 
@@ -232,7 +242,7 @@ impl AddressSpace {
         self.vmas.with(|vmas| {
             let vma = vmas
                 .find(fault_addr)
-                .copied()
+                .cloned()
                 .or_else(|| vmas.grow_stack(fault_addr))
                 .ok_or(FaultError::NoVma)?;
             if self.page_table.is_mapped(VirtAddr::new(fault_addr)) {
@@ -250,9 +260,9 @@ impl AddressSpace {
     /// As [`Self::handle_not_present_fault`].
     pub unsafe fn handle_cow_fault(&self, fault_addr: u64) -> Result<(), FaultError> {
         let r = self.vmas.with(|vmas| {
-            let vma = vmas.find(fault_addr).copied().ok_or(FaultError::NoVma)?;
+            let vma = vmas.find(fault_addr).cloned().ok_or(FaultError::NoVma)?;
             let page = Page::<Size4KiB>::containing_address(VirtAddr::new(fault_addr));
-            self.make_writable_locked(page, vma.page_table_flags()).map_err(FaultError::Failed)
+            self.make_writable_locked(page, &vma).map_err(FaultError::Failed)
         });
         if r.is_ok() { crate::debug::inc_cow_resolved(); } else { crate::debug::inc_cow_failed(); }
         r
@@ -260,15 +270,20 @@ impl AddressSpace {
 
     /// Give `page` a private, writable frame: resolve COW sharing or the
     /// zero frame. Already writable is success (a sibling thread got there
-    /// first). Caller holds `vmas`; `vma_flags` are the covering VMA's.
+    /// first). Caller holds `vmas`; `vma` is the covering VMA.
+    ///
+    /// A `Shared` page is never copied — that would silently stop it being
+    /// shared. It is mapped writable from its first fault if its VMA is, so
+    /// a write fault on one means the VMA is read-only: an error.
     ///
     ///   - zero frame: a fresh zeroed frame (the zero frame is never counted);
     ///   - refcount ≤ 1 (last owner): just restore WRITABLE — no copy;
     ///   - refcount ≥ 2 (shared): copy into a new frame, swap it in with one
     ///     PTE store (`replace_frame`), drop our share of the old one.
-    unsafe fn make_writable_locked(&self, page: Page<Size4KiB>, vma_flags: PageTableFlags) -> Result<(), &'static str> {
+    unsafe fn make_writable_locked(&self, page: Page<Size4KiB>, vma: &Vma) -> Result<(), &'static str> {
         use crate::debug::MM;
 
+        let vma_flags = vma.page_table_flags();
         if !vma_flags.contains(PageTableFlags::WRITABLE) {
             return Err("COW: write to a read-only VMA");
         }
@@ -278,6 +293,9 @@ impl AddressSpace {
         }
         if pte & PageTableFlags::WRITABLE.bits() != 0 {
             return Ok(());
+        }
+        if vma.kind == VmaKind::Shared {
+            return Err("shared page mapped read-only in a writable VMA");
         }
         let old_frame = self.page_table.translate_page(page).ok_or("COW: page not mapped")?;
         let phys_offset = crate::memory::physical_memory_offset();
@@ -358,7 +376,7 @@ impl AddressSpace {
         let mut page_addr = addr & !0xFFF;
         let mut all = true;
         while page_addr <= last {
-            let ok = match vmas.find(page_addr).copied().or_else(|| vmas.grow_stack(page_addr)) {
+            let ok = match vmas.find(page_addr).cloned().or_else(|| vmas.grow_stack(page_addr)) {
                 None => false,
                 Some(vma) => {
                     let page = Page::<Size4KiB>::containing_address(VirtAddr::new(page_addr));
@@ -367,7 +385,7 @@ impl AddressSpace {
                     } else if vma.kind == VmaKind::Huge2M {
                         true // never COW-shared: fork does not share huge pages
                     } else {
-                        self.make_writable_locked(page, vma.page_table_flags()).is_ok()
+                        self.make_writable_locked(page, &vma).is_ok()
                     }
                 }
             };
@@ -411,7 +429,7 @@ impl AddressSpace {
                 let mut page_addr = user_addr & !0xFFF;
                 while page_addr <= last {
                     if !self.page_table.is_mapped(VirtAddr::new(page_addr)) {
-                        if let Some(vma) = vmas.find(page_addr).copied() {
+                        if let Some(vma) = vmas.find(page_addr).cloned() {
                             let _ = super::demand_paging::map_demand_page(&self.page_table, page_addr, &vma, false);
                         }
                     }
@@ -505,6 +523,7 @@ impl AddressSpace {
                     size_pages,
                     flags: flags.bits(),
                     kind: VmaKind::Huge2M,
+                    shm: None,
                 };
                 vmas.add(vma).map_err(|_| "mmap: VMA list full")?;
                 Ok(vaddr)
@@ -539,8 +558,63 @@ impl AddressSpace {
                 size_pages,
                 flags: flags.bits(),
                 kind: VmaKind::Anonymous,
+                shm: None,
             };
             vmas.add(vma).map_err(|_| "mmap: VMA list full")?;
+            Ok(vaddr)
+        })
+    }
+
+    /// `mmap(MAP_SHARED)`: map `length` bytes of `obj`, starting at its
+    /// page `offset_pages`. Nothing is mapped yet — each page is faulted in
+    /// from the object (`demand_paging::map_shared_page`). The VMA may run
+    /// past the object's current size, as in Linux; touching that part
+    /// kills the process (Linux's `SIGBUS`), unless the object grows first.
+    ///
+    /// Addresses are picked as for 4 KiB anonymous mappings (`addr == 0`)
+    /// or taken as `MAP_FIXED`; never huge pages.
+    pub fn mmap_shared(
+        &self,
+        addr: u64,
+        length: u64,
+        prot: u32,
+        obj: alloc::sync::Arc<super::shm::ShmObject>,
+        offset_pages: usize,
+    ) -> Result<u64, &'static str> {
+        if length == 0 {
+            return Err("mmap: zero length");
+        }
+        if addr & 0xFFF != 0 {
+            return Err("mmap: addr not page-aligned");
+        }
+        if obj.mappings() >= super::shm::MAX_MAPPINGS {
+            return Err("mmap: shared object mapped too many times");
+        }
+        const PROT_WRITE: u32 = 2;
+        let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        if prot & PROT_WRITE != 0 {
+            flags |= PageTableFlags::WRITABLE;
+        }
+        let size_pages = length.div_ceil(4096) as usize;
+        self.vmas.with(|vmas| {
+            let vaddr = if addr == 0 {
+                let base = self.mmap_base.load(Ordering::Relaxed);
+                self.mmap_base.store(base + size_pages as u64 * 4096 + 4096, Ordering::Relaxed);
+                base
+            } else {
+                if vmas.overlaps(addr, size_pages) {
+                    return Err("mmap: MAP_FIXED conflict with existing VMA");
+                }
+                addr
+            };
+            vmas.add(Vma {
+                start: vaddr,
+                size_pages,
+                flags: flags.bits(),
+                kind: VmaKind::Shared,
+                shm: Some(super::vma::ShmMapping::new(obj, offset_pages)),
+            })
+            .map_err(|_| "mmap: VMA list full")?;
             Ok(vaddr)
         })
     }
@@ -577,7 +651,9 @@ impl AddressSpace {
             }
 
             match vma.kind {
-                VmaKind::Anonymous | VmaKind::Code | VmaKind::GrowableStack => {
+                // `Shared`: each PTE holds its own reference; the object's
+                // survives until `vma` (and with it the object) drops.
+                VmaKind::Anonymous | VmaKind::Code | VmaKind::GrowableStack | VmaKind::Shared => {
                     for i in 0..vma.size_pages {
                         let va = vma.start + i as u64 * 4096;
                         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));

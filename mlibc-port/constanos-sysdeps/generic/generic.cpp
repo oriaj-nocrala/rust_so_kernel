@@ -72,6 +72,9 @@ constexpr long SYS_rt_sigsuspend = 130;
 constexpr long SYS_poll = 7;
 constexpr long SYS_lseek = 8;
 constexpr long SYS_mmap = 9;
+constexpr long SYS_sched_yield = 24;
+constexpr long SYS_ftruncate = 77;
+constexpr long SYS_memfd_create = 319;
 constexpr long SYS_getcwd = 79;
 constexpr long SYS_chdir = 80;
 constexpr long SYS_rename = 82;
@@ -660,16 +663,51 @@ int sys_pselect(int num_fds, fd_set *read_set, fd_set *write_set, fd_set *except
 	return 0;
 }
 
+// The kernel takes any nonzero address as MAP_FIXED, so a hint without
+// MAP_FIXED is dropped here (Linux treats it as advisory anyway). flags, fd
+// and offset go through as they are: MAP_SHARED of a memfd, and
+// MAP_SHARED|MAP_ANONYMOUS, are real shared memory (docs/gui/gui-plan.md).
 int sys_vm_map(void *hint, size_t size, int prot, int flags,
-		int fd, off_t, void **window) {
-	__ensure(flags & MAP_ANONYMOUS);
-	(void)fd;
-	long ret = raw_syscall(SYS_mmap, (long)hint, (long)size, prot,
-			MAP_ANONYMOUS, -1);
+		int fd, off_t offset, void **window) {
+	void *addr = (flags & MAP_FIXED) ? hint : nullptr;
+	long ret = raw_syscall(SYS_mmap, (long)addr, (long)size, prot,
+			flags, fd, (long)offset);
 	if (ret < 0)
 		return (int)-ret;
 	*window = (void *)ret;
 	return 0;
+}
+
+int sys_memfd_create(const char *name, int flags, int *fd) {
+	long ret = raw_syscall(SYS_memfd_create, (long)name, flags);
+	if (ret < 0)
+		return (int)-ret;
+	*fd = (int)ret;
+	return 0;
+}
+
+} // namespace mlibc
+
+// mlibc defines memfd_create() only under the Linux option, which this port
+// leaves off; setup-mlibc.sh declares it in <sys/mman.h> for every port.
+extern "C" int memfd_create(const char *name, unsigned int flags) {
+	int fd;
+	if (int e = mlibc::sys_memfd_create(name, (int)flags, &fd)) {
+		errno = e;
+		return -1;
+	}
+	return fd;
+}
+
+namespace mlibc {
+
+void sys_yield() {
+	raw_syscall(SYS_sched_yield);
+}
+
+int sys_ftruncate(int fd, size_t size) {
+	long ret = raw_syscall(SYS_ftruncate, fd, (long)size);
+	return ret < 0 ? (int)-ret : 0;
 }
 
 int sys_vm_unmap(void *pointer, size_t size) {

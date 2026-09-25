@@ -1,6 +1,7 @@
 // kernel/src/ipc/mod.rs
 //
-// Kernel IPC subsystem: AF_UNIX sockets.
+// Kernel IPC subsystem: AF_UNIX sockets, and `memfd` (shared memory
+// behind an fd, `memfd.rs`).
 //
 // This used to be `channel.rs`, a bespoke primitive of fixed 64-byte
 // messages reached through a `socket()` that took no arguments — no domain,
@@ -13,6 +14,7 @@
 // getsockname/getpeername/socketpair/set-getsockopt) is in
 // `process/syscall/ipc.rs`, on top of this module.
 
+pub mod memfd;
 pub mod unix;
 
 pub use unix::{UnixSocketHandle, SOCKETS};

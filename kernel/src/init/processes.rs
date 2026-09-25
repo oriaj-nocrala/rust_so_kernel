@@ -322,6 +322,7 @@ fn load_raw_process(
         size_pages: num_code_pages,
         flags: flags.bits(),
         kind: VmaKind::Code,
+        shm: None,
     }).map_err(|_| "Failed to register code VMA")?;
 
     // Stack VMA (demand-paged)
@@ -337,6 +338,7 @@ fn load_raw_process(
         size_pages: stack_pages,
         flags: stack_flags.bits(),
         kind: VmaKind::Anonymous,
+        shm: None,
     }).map_err(|_| "Failed to register stack VMA")?;
 
     let user_stack_top = VirtAddr::new(

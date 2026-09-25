@@ -95,6 +95,42 @@ PYEOF
     echo "setup-mlibc: patched do_scanf's suppressed-conversion count bug"
 fi
 
+# ── 1b. Declare memfd_create outside the Linux option (idempotent) ────────
+#
+# mlibc declares (sys/mman.h) and defines (sys-mman.cpp) `memfd_create` only
+# under `__MLIBC_LINUX_OPTION`, which this port leaves off (see the `free`
+# applet note in CLAUDE.md). The kernel has the syscall (docs/gui/gui-plan.md),
+# so the port defines the wrapper itself (generic.cpp) and this moves the
+# declaration out of the guard, into <sys/mman.h> where callers look for it.
+if ! grep -q "memfd_create: declared for every port" mlibc/options/posix/include/sys/mman.h; then
+    python3 - "$REPO_ROOT/mlibc/options/posix/include/sys/mman.h" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+
+old_decl = "int memfd_create(const char *__name, unsigned int __flags);\n"
+old_guard = "#if __MLIBC_LINUX_OPTION\n"
+if content.count(old_decl) != 1 or content.count(old_guard) != 1:
+    print("error: mlibc's sys/mman.h memfd_create declaration doesn't match "
+          "the expected text (upstream mlibc changed) -- setup-mlibc.sh's "
+          "memfd patch needs updating", file=sys.stderr)
+    sys.exit(1)
+
+content = content.replace(old_decl, "", 1)
+content = content.replace(
+    old_guard,
+    "/* memfd_create: declared for every port; constanos defines it in its\n"
+    " * sysdeps (generic.cpp) since the Linux option is off. */\n"
+    "int memfd_create(const char *__name, unsigned int __flags);\n\n" + old_guard,
+    1)
+with open(path, "w") as f:
+    f.write(content)
+PYEOF
+    echo "setup-mlibc: declared memfd_create outside the Linux option"
+fi
+
 # ── 2. Register 'constanos' in mlibc/meson.build (idempotent) ─────────────
 
 if ! grep -q "host_machine.system() == 'constanos'" mlibc/meson.build; then

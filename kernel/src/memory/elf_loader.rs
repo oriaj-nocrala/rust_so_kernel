@@ -134,6 +134,7 @@ pub unsafe fn load_elf(
         size_pages: STACK_PAGES,
         flags: stack_flags.bits(),
         kind: VmaKind::GrowableStack,
+        shm: None,
     }).map_err(|_| "ELF loader: failed to register stack VMA")?;
 
     crate::serial_println!(
@@ -223,6 +224,7 @@ pub unsafe fn load_elf(
             size_pages: 1,
             flags: tramp_flags.bits(),
             kind: VmaKind::Code,
+            shm: None,
         }).map_err(|_| "ELF loader: failed to register trampoline VMA")?;
     }
 
@@ -473,6 +475,7 @@ unsafe fn load_segment(
         size_pages: num_pages,
         flags: flags.bits(),
         kind: vma_kind,
+        shm: None,
     }).map_err(|_| "ELF loader: failed to register VMA")?;
 
     Ok(())

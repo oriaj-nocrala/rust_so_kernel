@@ -11,6 +11,8 @@
 // this host-testable crate can reach. See `docs/fs/vfs-extraction-plan.md`.
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::any::Any;
 
 // ============================================================================
 // ERRORS
@@ -186,6 +188,15 @@ pub trait FileHandle: Send {
     fn chmod(&mut self, _mode: u32) -> FileResult<()> {
         Ok(())
     }
+
+    /// The shared-memory object behind this handle, for `mmap(MAP_SHARED)`
+    /// — `socket_id()`'s technique again: `dyn FileHandle` cannot be
+    /// downcast in `no_std`, and this crate cannot name the kernel's
+    /// object type, so the kernel gets an `Arc<dyn Any>` and downcasts it.
+    /// Default `None`: the file cannot be mapped (`ENODEV`, as in Linux).
+    fn shm_object(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -321,6 +332,11 @@ mod tests {
     fn default_chmod_is_ok() {
         let mut h = MinimalHandle;
         assert_eq!(h.chmod(0o644), Ok(()));
+    }
+
+    #[test]
+    fn default_shm_object_is_none() {
+        assert!(MinimalHandle.shm_object().is_none());
     }
 
     /// A handle that overrides `seek`/`dup`, to prove the defaults tested

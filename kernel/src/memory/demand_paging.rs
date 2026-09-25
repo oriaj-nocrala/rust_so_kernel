@@ -117,6 +117,9 @@ pub(super) unsafe fn map_demand_page(
         VmaKind::Huge2M => {
             return map_demand_page_2m(pt, fault_addr, vma);
         }
+        VmaKind::Shared => {
+            return map_shared_page(pt, fault_addr, vma);
+        }
         VmaKind::Anonymous | VmaKind::GrowableStack => { /* fall through */ }
     }
 
@@ -155,6 +158,24 @@ pub(super) unsafe fn map_demand_page(
         .ignore();
     crate::memory::tlb::invalidate_page(pt.pml4_phys(), page.start_address());
 
+    Ok(())
+}
+
+/// Map the object's own frame for `fault_addr` inside a `Shared` VMA,
+/// read or write alike: never the zero frame, which a later write would
+/// have to replace in every address space at once. The frame comes with
+/// the reference this PTE holds (`ShmObject::frame_for_mapping`).
+unsafe fn map_shared_page(pt: &OwnedPageTable, fault_addr: u64, vma: &Vma) -> Result<(), &'static str> {
+    let m = vma.shm.as_ref().ok_or("shared VMA without an object")?;
+    let page_addr = fault_addr & !0xFFF;
+    let idx = m.offset_pages + ((page_addr - vma.start) / 4096) as usize;
+    let frame = m.obj.frame_for_mapping(idx)?;
+    let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(page_addr));
+    if let Err(e) = pt.map_existing_frame(page, frame, vma.page_table_flags()) {
+        // The reference taken for this PTE; the object still holds its own.
+        crate::memory::cow::dec_ref(frame);
+        return Err(e);
+    }
     Ok(())
 }
 

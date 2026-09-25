@@ -795,19 +795,114 @@ pub(super) fn sys_pipe(pipefd_ptr: u64) -> SyscallResult {
 
 /// mmap(9): void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 ///
-/// Only MAP_ANONYMOUS (0x20) is supported.  fd must be -1.
-/// Returns the mapped virtual address on success, or ENOMEM / EINVAL.
-pub(super) fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32) -> SyscallResult {
+/// Two kinds of mapping:
+/// - `MAP_PRIVATE|MAP_ANONYMOUS` (or plain `MAP_ANONYMOUS`), `fd == -1`:
+///   private zero-filled memory, COW across `fork`.
+/// - `MAP_SHARED`: the pages of a shared-memory object
+///   (`memory::shm::ShmObject`) — a `memfd_create` fd's, or a fresh one for
+///   `MAP_SHARED|MAP_ANONYMOUS`, which is then shared across `fork`.
+///   `offset` must be page-aligned. An fd that is not a memfd is `ENODEV`
+///   (files on ext2/ramfs cannot be mapped yet).
+///
+/// `MAP_PRIVATE` of an fd (a COW snapshot of a file) is not supported:
+/// `EINVAL`. `addr != 0` is taken as `MAP_FIXED`, as before.
+pub(super) fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, offset: u64) -> SyscallResult {
+    const MAP_SHARED: u32 = 0x01;
+    const MAP_PRIVATE: u32 = 0x02;
     const MAP_ANONYMOUS: u32 = 0x20;
-    if flags & MAP_ANONYMOUS == 0 || fd != -1 {
+    let anon = flags & MAP_ANONYMOUS != 0;
+    if flags & MAP_SHARED == 0 {
+        if !anon || fd != -1 {
+            return errno::EINVAL;
+        }
+        return with_current_process(|proc| {
+            let r = proc.address_space.sys_mmap_anon(addr, length, prot);
+            crate::ktrace!(crate::debug::MM, "mmap pid={:?} addr={:#x} len={:#x} -> {:?}", proc.pid, addr, length, r);
+            match r {
+                Ok(vaddr) => vaddr as i64,
+                Err(_)    => errno::ENOMEM,
+            }
+        });
+    }
+
+    use crate::memory::shm::ShmObject;
+    use alloc::sync::Arc;
+    if flags & MAP_PRIVATE != 0 || offset & 0xFFF != 0 || length == 0 || addr & 0xFFF != 0 {
         return errno::EINVAL;
     }
     with_current_process(|proc| {
-        let r = proc.address_space.sys_mmap_anon(addr, length, prot);
-        crate::ktrace!(crate::debug::MM, "mmap pid={:?} addr={:#x} len={:#x} -> {:?}", proc.pid, addr, length, r);
+        let obj: Arc<ShmObject> = if anon {
+            let obj = Arc::new(ShmObject::new());
+            if obj.set_size(length).is_err() {
+                return errno::ENOMEM;
+            }
+            obj
+        } else {
+            let files = proc.files.lock();
+            let Ok(handle) = files.get(fd as usize) else { return errno::EBADF };
+            match handle.shm_object().map(|o| o.downcast::<ShmObject>()) {
+                Some(Ok(obj)) => obj,
+                _ => return errno::ENODEV,
+            }
+        };
+        let r = proc.address_space.mmap_shared(addr, length, prot, obj, (offset / 4096) as usize);
+        crate::ktrace!(crate::debug::MM, "mmap shared pid={:?} addr={:#x} len={:#x} fd={} off={:#x} -> {:?}",
+            proc.pid, addr, length, fd, offset, r);
         match r {
             Ok(vaddr) => vaddr as i64,
             Err(_)    => errno::ENOMEM,
+        }
+    })
+}
+
+/// memfd_create(319): int memfd_create(const char *name, unsigned flags)
+///
+/// A new shared-memory object of size 0 behind a new fd (`ipc::memfd`).
+/// `name` is only for Linux's `/proc/<pid>/fd` display, which this kernel
+/// does not have, so it is not kept. `MFD_CLOEXEC` is accepted and, like
+/// every close-on-exec flag here, not acted on; `MFD_ALLOW_SEALING` is
+/// accepted, but seals themselves (`F_ADD_SEALS`) are not implemented.
+pub(super) fn sys_memfd_create(name_ptr: u64, flags: u32) -> SyscallResult {
+    const MFD_CLOEXEC: u32 = 1;
+    const MFD_ALLOW_SEALING: u32 = 2;
+    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING) != 0 {
+        return errno::EINVAL;
+    }
+    if let Err(e) = validate_user_buffer(name_ptr, 1) {
+        return e;
+    }
+    let handle = alloc::boxed::Box::new(crate::ipc::memfd::MemfdHandle::new());
+    with_current_process(|proc| match proc.files.lock().allocate(handle) {
+        Ok(fd) => fd as i64,
+        Err(_) => errno::EMFILE,
+    })
+}
+
+/// ftruncate(77): int ftruncate(int fd, off_t length)
+///
+/// Only memfds (`EINVAL` for anything else, Linux's answer for a
+/// non-regular file). Growing is always allowed; shrinking a mapped object
+/// is `EBUSY` (Linux allows it and `SIGBUS`es the mappings — see
+/// `ShmObject::set_size`).
+pub(super) fn sys_ftruncate(fd: i32, length: i64) -> SyscallResult {
+    use crate::memory::shm::{ShmError, ShmObject};
+    if length < 0 {
+        return errno::EINVAL;
+    }
+    // Under the scheduler lock, like `lseek`; the object's own lock and
+    // `BUDDY` (a shrink frees frames) come after it in the lock order.
+    with_current_process(|proc| {
+        let files = proc.files.lock();
+        let Ok(handle) = files.get(fd as usize) else { return errno::EBADF };
+        let obj = match handle.shm_object().map(|o| o.downcast::<ShmObject>()) {
+            Some(Ok(obj)) => obj,
+            _ => return errno::EINVAL,
+        };
+        match obj.set_size(length as u64) {
+            Ok(()) => 0,
+            Err(ShmError::TooBig) => errno::EFBIG,
+            Err(ShmError::Busy) => errno::EBUSY,
+            Err(ShmError::NoMemory) => errno::ENOMEM,
         }
     })
 }

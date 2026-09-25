@@ -6,6 +6,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod frame_allocator;
 pub mod page_table_manager;
 pub mod vma;
+pub mod shm;
 pub mod cow;
 pub mod demand_paging;
 pub mod address_space;
