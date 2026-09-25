@@ -1,8 +1,8 @@
 # Plan: una GUI (memoria compartida → compositor → terminal con ventana)
 
 > **Estado (2026-09-25):** fase 1 hecha y verificada en QEMU y en la Ryzen
-> (ver su registro al final). Fase 2: 2.1 hecho y verificado en QEMU; 2.2-2.5
-> pendientes. Fase 3 sin empezar.
+> (ver su registro al final). Fase 2: 2.1 hecho y verificado en QEMU y en la Ryzen;
+> 2.2-2.5 pendientes. Fase 3 sin empezar.
 
 ## Por qué ahora, y por qué así
 
@@ -471,5 +471,13 @@ consola vuelve al cerrar, al salir y tras `SIGKILL`. `sigsuspend_test`
 `pipe_multi_test`, `fork_exec_test`, `socket_test`, `mlibc_signal_test`,
 `pthread_test` y `fpu_test` en 0. `run-kernel-tests.sh` PASS,
 `boot-matrix.sh 4 5` con 4 CPUs y 8 GiB 20/20, `cd vfs && cargo test`
-165/165. **Falta la Ryzen**, donde la copia en RAM es de 1920x1080 con
-stride 2048 y la VRAM es WC.
+165/165.
+
+**Verificado en la Ryzen (boot #41, `target/metal/fb0-job.sh`):**
+`fb0_test` 16/16 a 1920x1080, stride 2048 (`map_len` 8 849 472, el mismo
+`offset` 2112), con la VRAM en WC. `MemFree` de 33 407 460 a 33 407 396 kB
+con 8,6 MB de pantalla mapeados y desmapeados. `sigsuspend_test` 6/6 (F:
+1 ms), `shm_test`, `lifecycle_test`, `pipe_cow_test`, `pipe_multi_test`,
+`fork_exec_test`, `socket_test` y `pthread_test` en 0, e
+`invariants=ok`. El anillo del log dio la vuelta, pero solo perdió el
+arranque: todas las líneas de resultados están.
