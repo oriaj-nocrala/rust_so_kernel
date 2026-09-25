@@ -2,7 +2,8 @@
 
 > **Estado (2026-09-25):** fase 1 hecha y verificada en QEMU y en la Ryzen
 > (ver su registro al final). Fase 2: 2.1 hecho y verificado en QEMU y en la Ryzen;
-> 2.2-2.5 pendientes. Fase 3 sin empezar.
+> 2.2 hecho y verificado en QEMU (falta la Ryzen); 2.3 en curso; 2.4-2.5
+> pendientes. Fase 3 sin empezar.
 
 ## Por qué ahora, y por qué así
 
