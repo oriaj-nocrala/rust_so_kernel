@@ -977,7 +977,12 @@ self-test.
   registry first, then that lock, so it finds them Blocked), and re-check
   readiness once registered, restarting the syscall (`rip -= 2`) if
   something slipped in. Pipes and sockets can't (they register inside
-  `FileHandle::read` with the fd table held): their wakers use
+  `FileHandle::read` with the fd table held; a pipe keeps a FIFO queue of
+  waiters per end — it used to keep one, and a second blocked reader
+  stranded the first, `userspace/c/pipe_multi_test.c` — and looks up the
+  current pid *before* locking its buffer: `sys_fork` holds `SCHEDULER`
+  while it `dup`s every pipe, so the reverse nesting deadlocked every
+  CPU): their wakers use
   `wake_or_defer`/`deliver_to_waiter`, which leave `Process::wake_pending`
   for `block_current` to consume instead of blocking — **only for waiters
   that register on the way to blocking and are removed by the wakeup
@@ -1078,7 +1083,7 @@ and `include_bytes!`'d from `kernel/embedded/`. Everything else runnable-
 but-not-boot-critical — `doom`, `quake`, and most of the old C test
 programs (`hello`, `pthread_test`, `producer_consumer`,
 `mlibc_signal_test`, `stat_test`, `argv_test`, `jobctl_test`,
-`ext2_robust_test`, `fpu_test`, `socket_test`, `pipe_cow_test`, `sigsuspend_test`, `lifecycle_test`) — is built straight to
+`ext2_robust_test`, `fpu_test`, `socket_test`, `pipe_cow_test`, `sigsuspend_test`, `lifecycle_test`, `shm_test`, `pipe_multi_test`) — is built straight to
 `disk-image-root/bin/` instead and shipped on the ext2 disk image
 (`disk.img`, mounted at `/mnt`) rather than baked into the kernel ELF.
 This split exists because `kernel/embedded/`'s ELFs (mostly `doom.elf`/

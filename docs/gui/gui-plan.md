@@ -1,7 +1,7 @@
 # Plan: una GUI (memoria compartida → compositor → terminal con ventana)
 
-> **Estado (2026-09-25):** fase 1 hecha y verificada en QEMU (ver su
-> registro al final); falta la vuelta en la Ryzen. Fases 2 y 3 sin empezar.
+> **Estado (2026-09-25):** fase 1 hecha y verificada en QEMU y en la Ryzen
+> (ver su registro al final). Fases 2 y 3 sin empezar.
 
 ## Por qué ahora, y por qué así
 
@@ -283,4 +283,11 @@ de deriva); `pipe_cow_test`, `fork_exec_test`, `lifecycle_test`,
 `socket_test`, `mmap_test`, `pthread_test`, `producer_consumer`,
 `fpu_test`, `mlibc_signal_test` y `sigsuspend_test` en 0;
 `run-kernel-tests.sh` PASS; `boot-matrix.sh 4 5` con 4 CPUs y 8 GiB:
-20/20 OK. **Pendiente:** la vuelta en la Ryzen.
+20/20 OK.
+
+**Verificado en la Ryzen (boot #38, 24 CPUs):** `shm_test: PASS (0
+failed)`, con `MemFree` estable (33 407 676 → 33 407 728 kB en 100
+ciclos) y `pipe_cow_test`, `fork_exec_test`, `lifecycle_test`,
+`socket_test` y `pthread_test` en 0; `sched: invariants=ok`. El anillo
+del log dio la vuelta y se perdieron las líneas de los casos 1-9, pero
+el recuento final de fallos los cubre.

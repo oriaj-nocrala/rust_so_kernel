@@ -29,10 +29,27 @@
 //
 // Lock order: `PipeBuffer`'s mutex is always dropped before taking
 // `SCHEDULER` (never nested), matching `sys_futex`'s FUTEX_WAITERS ->
-// SCHEDULER pattern.
+// SCHEDULER pattern. That includes asking for the current pid: `read` and
+// `write` look it up *before* locking the buffer. They used to do it with
+// the buffer locked, on the way to registering as a waiter — while
+// `sys_fork` holds `SCHEDULER` and locks every pipe it `dup`s: an ABBA
+// deadlock that froze all CPUs (`pipe_multi_test`, a child blocking on a
+// pipe while its parent forked the next one).
+//
+// SEVERAL WAITERS PER END
+//
+// Blocked readers and blocked writers each wait in a FIFO queue. This used
+// to be one `Option` slot per end, and a second process blocking on the
+// same end replaced the first, which then never woke (`pipe_multi_test`;
+// found by four children using one pipe as a barrier). A waiter cannot go
+// stale in the queue: a blocked process leaves `Blocked` only through the
+// wakeup that removes it here (`kill` queues a signal and never force-wakes
+// a blocked process — see `sys_kill`).
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use crate::sync::Mutex;
 
 use super::file::{FileError, FileHandle, FileResult};
@@ -54,8 +71,14 @@ pub struct PipeBuffer {
     len: usize,
     readers: u32,
     writers: u32,
-    read_waiter: Option<PipeWaiter>,
-    write_waiter: Option<PipeWaiter>,
+    read_waiters: VecDeque<PipeWaiter>,
+    write_waiters: VecDeque<PipeWaiter>,
+    /// Free space promised to a blocked writer whose bytes a reader is
+    /// collecting with this lock dropped (it cannot be held across the
+    /// scheduler lock). `try_write` leaves it alone, so another writer on
+    /// another CPU cannot fill it in between and make those bytes — which
+    /// their writer was already told it wrote — not fit.
+    reserved: usize,
 }
 
 impl PipeBuffer {
@@ -66,8 +89,9 @@ impl PipeBuffer {
             len: 0,
             readers: 1,
             writers: 1,
-            read_waiter: None,
-            write_waiter: None,
+            read_waiters: VecDeque::new(),
+            write_waiters: VecDeque::new(),
+            reserved: 0,
         }
     }
 
@@ -81,8 +105,29 @@ impl PipeBuffer {
         n
     }
 
+    /// Take buffered bytes for blocked readers, oldest first, each only
+    /// what it asked for (the rest stays buffered). Called wherever bytes
+    /// enter the ring, so a reader never sleeps while the ring has data;
+    /// the caller wakes them with this lock dropped.
+    fn take_deliveries(&mut self) -> Vec<(PipeWaiter, Vec<u8>)> {
+        let mut deliveries = Vec::new();
+        while self.len > 0 {
+            let Some(w) = self.read_waiters.pop_front() else { break };
+            let mut data = alloc::vec![0u8; w.count.min(self.len)];
+            let got = self.try_read(&mut data);
+            data.truncate(got);
+            deliveries.push((w, data));
+        }
+        deliveries
+    }
+
+    /// Space a writer may use now: what is free, minus what is reserved.
+    fn space(&self) -> usize {
+        PIPE_CAPACITY - self.len - self.reserved
+    }
+
     fn try_write(&mut self, buf: &[u8]) -> usize {
-        let space = PIPE_CAPACITY - self.len;
+        let space = self.space();
         let n = core::cmp::min(buf.len(), space);
         let tail = (self.head + self.len) % PIPE_CAPACITY;
         for i in 0..n {
@@ -168,27 +213,40 @@ impl FileHandle for PipeReadEnd {
             return Ok(0);
         }
 
+        // Before the buffer lock: see the lock-order note at the top.
+        let pid = super::scheduler::current_pid().unwrap_or(0);
         let mut pb = self.buf.lock();
-        crate::ktrace!(crate::debug::FS, "pipe read: want={} len={} writers={} write_waiter={}",
-            buf.len(), pb.len, pb.writers, pb.write_waiter.is_some());
+        crate::ktrace!(crate::debug::FS, "pipe read: want={} len={} writers={} write_waiters={}",
+            buf.len(), pb.len, pb.writers, pb.write_waiters.len());
 
         if pb.len > 0 {
             let n = pb.try_read(buf);
-            let waiter = pb.write_waiter.take();
-            // Only as much as this read just freed: the blocked writer is
-            // told it wrote whatever `collect_from_writer` pulls, so pulling
-            // more than fits back in the ring silently dropped the excess.
-            let space = PIPE_CAPACITY - pb.len;
-            drop(pb);
-
-            if let Some(w) = waiter {
-                // Space freed — pull bytes straight from the blocked
-                // writer's buffer and stash them for future reads.
+            // The space this read freed goes to blocked writers, oldest
+            // first, each told it wrote whatever `collect_from_writer`
+            // pulled — so never more than is free.
+            loop {
+                let space = pb.space();
+                if space == 0 {
+                    break;
+                }
+                let Some(w) = pb.write_waiters.pop_front() else { break };
+                pb.reserved += space;
+                drop(pb);
                 let mut tmp = [0u8; PIPE_CAPACITY];
                 let got = collect_from_writer(w, &mut tmp[..space]);
-                if got > 0 {
-                    let stored = self.buf.lock().try_write(&tmp[..got]);
-                    debug_assert_eq!(stored, got);
+                pb = self.buf.lock();
+                pb.reserved -= space;
+                let stored = pb.try_write(&tmp[..got]);
+                debug_assert_eq!(stored, got);
+                // A reader may have found the ring empty and queued while
+                // the lock was dropped.
+                let deliveries = pb.take_deliveries();
+                if !deliveries.is_empty() {
+                    drop(pb);
+                    for (w, data) in deliveries {
+                        wake_reader(w, &data);
+                    }
+                    pb = self.buf.lock();
                 }
             }
             return Ok(n);
@@ -198,8 +256,7 @@ impl FileHandle for PipeReadEnd {
             return Ok(0); // EOF
         }
 
-        let pid = super::scheduler::current_pid().unwrap_or(0);
-        pb.read_waiter = Some(PipeWaiter {
+        pb.read_waiters.push_back(PipeWaiter {
             pid,
             user_buf: buf.as_ptr() as u64,
             count: buf.len(),
@@ -229,6 +286,8 @@ impl FileHandle for PipeWriteEnd {
             return Ok(0);
         }
 
+        // Before the buffer lock: see the lock-order note at the top.
+        let pid = super::scheduler::current_pid().unwrap_or(0);
         let mut pb = self.buf.lock();
 
         if pb.readers == 0 {
@@ -236,29 +295,19 @@ impl FileHandle for PipeWriteEnd {
         }
 
         let n = pb.try_write(buf);
-        crate::ktrace!(crate::debug::FS, "pipe write: want={} wrote={} len={} read_waiter={}",
-            buf.len(), n, pb.len, pb.read_waiter.is_some());
+        crate::ktrace!(crate::debug::FS, "pipe write: want={} wrote={} len={} read_waiters={}",
+            buf.len(), n, pb.len, pb.read_waiters.len());
         if n > 0 {
-            let waiter = pb.read_waiter.take();
-            // Take out only what the blocked reader asked for; the rest
-            // stays buffered for its next read (taking the whole ring and
-            // delivering `waiter.count` of it lost the remainder).
-            let delivered = waiter.map(|w| {
-                let mut tmp = [0u8; PIPE_CAPACITY];
-                let want = w.count.min(PIPE_CAPACITY);
-                let got = pb.try_read(&mut tmp[..want]);
-                (w, tmp, got)
-            });
+            let deliveries = pb.take_deliveries();
             drop(pb);
-            if let Some((w, tmp, got)) = delivered {
-                wake_reader(w, &tmp[..got]);
+            for (w, data) in deliveries {
+                wake_reader(w, &data);
             }
             return Ok(n);
         }
 
         // Buffer full — block until a reader frees space.
-        let pid = super::scheduler::current_pid().unwrap_or(0);
-        pb.write_waiter = Some(PipeWaiter {
+        pb.write_waiters.push_back(PipeWaiter {
             pid,
             user_buf: buf.as_ptr() as u64,
             count: buf.len(),
@@ -279,9 +328,9 @@ impl Drop for PipeReadEnd {
         let mut pb = self.buf.lock();
         pb.readers -= 1;
         if pb.readers == 0 {
-            let waiter = pb.write_waiter.take();
+            let waiters = core::mem::take(&mut pb.write_waiters);
             drop(pb);
-            if let Some(w) = waiter {
+            for w in waiters {
                 wake_writer_error(w, super::syscall::errno::EPIPE);
             }
         }
@@ -293,9 +342,9 @@ impl Drop for PipeWriteEnd {
         let mut pb = self.buf.lock();
         pb.writers -= 1;
         if pb.writers == 0 {
-            let waiter = pb.read_waiter.take();
+            let waiters = core::mem::take(&mut pb.read_waiters);
             drop(pb);
-            if let Some(w) = waiter {
+            for w in waiters {
                 wake_reader(w, &[]); // EOF
             }
         }

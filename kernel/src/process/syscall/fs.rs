@@ -774,8 +774,8 @@ pub(super) fn sys_pipe(pipefd_ptr: u64) -> SyscallResult {
                 // Rolling back by dropping the read end here (while SCHEDULER
                 // is held via with_current_process) is safe ONLY because this
                 // pipe was just created in this same call and has never been
-                // exposed to another process — its write_waiter is always
-                // None, so PipeReadEnd::drop() cannot reach the wake path
+                // exposed to another process — its write_waiters queue is always
+                // empty, so PipeReadEnd::drop() cannot reach the wake path
                 // that would need to re-lock SCHEDULER. Don't reuse this
                 // pattern for closing an fd a process has actually had open.
                 let _ = files.close(rfd);

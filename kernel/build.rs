@@ -83,6 +83,7 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "sigsuspend_test",
     "lifecycle_test",
     "shm_test",
+    "pipe_multi_test",
 ];
 
 /// Not built here at all — see the busybox.elf handling below, which
