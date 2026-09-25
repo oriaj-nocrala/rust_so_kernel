@@ -1,0 +1,17 @@
+[package]
+name = "vt"
+version = "0.1.0"
+edition = "2021"
+
+# Host-testable terminal emulator (phase 3.4 of docs/gui/gui-plan.md): a
+# cell grid, the escape-sequence parser, rendering into a plain `&mut [u32]`
+# and the evdev keymap. no_std + alloc, no syscalls — `cd vt && cargo test`.
+# Its own workspace root (empty table below), like `gui`/`tty`: the parent
+# workspace's `panic = "abort"` would break the test harness. The windowed
+# terminal (`userspace`, phase 3.5) will depend on it by path.
+[workspace]
+
+[dependencies]
+# Same crate, version and sizes as the kernel console (kernel/Cargo.toml),
+# so a window and the console draw identical glyphs.
+noto-sans-mono-bitmap = { version = "0.3.2", default-features = false, features = ["regular", "bold", "size_16", "size_20", "size_24", "size_32", "unicode-basic-latin"] }

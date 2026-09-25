@@ -5,7 +5,7 @@
 > 2.2 a 2.5 hechos y verificados en QEMU y en la Ryzen (2.2 en el boot #43,
 > 2.3 y 2.5 en el #45; 2.4 son tests de host). Fase 2 cerrada. Fase 3 planificada
 > (decisiones del 2026-09-25); 3.1 a 3.3 hechos, 3.2 y 3.3 verificados en la
-> Ryzen (boot #46). Siguiente: 3.4 (`vt/`).
+> Ryzen (boot #46). 3.4 (`vt/`) hecho (tests de host). Siguiente: 3.5 (`term`).
 
 ## Por qué ahora, y por qué así
 
@@ -990,3 +990,45 @@ incluido; `session_test` PASS; en 0 `jobctl_test`, `lifecycle_test`,
 perdió (el anillo de 64 KiB se desbordó con las trazas de `exec`), pero la
 sección de resultados y el `METAL-DONE exit=0` están enteros.
 
+### Fase 3.4 (2026-09-25)
+
+Crate `vt/` (`cd vt && cargo test`: 57 tests, 0,02 s), en cinco módulos:
+`grid`, `parser`, `render`, `keymap` y `palette`, más `Terminal` (rejilla +
+parser). Compila también para `x86_64-unknown-none` con `build-std`, como
+lo usará `userspace`. Todavía no es dependencia de nada; lo conecta 3.5.
+
+- **Semántica de xterm donde la consola es más simple**, porque los
+  programas a pantalla completa dependen de ella: **ajuste de línea
+  diferido** (escribir en la última columna deja el ajuste pendiente; sin
+  eso, la celda de abajo a la derecha desplaza la pantalla, que es la
+  línea de estado de `vi` y `less`), **`BS` mueve y no borra** (la
+  consola borra), y **`LF` no vuelve al principio** (lo hace `ONLCR` del
+  pty). Borrar usa el fondo actual, como la consola.
+- **Parser:** el de la consola más `DECSTBM`, `IL`/`DL`/`ICH`/`DCH`/`ECH`,
+  `SU`/`SD`, `CHA`/`VPA`/`HPA`/`CNL`/`CPL`, `IND`/`NEL`/`RI`,
+  `DECSC`/`DECRC` (`ESC 7`/`8` y `CSI s`/`u`), `RIS` y los modos privados
+  1 (`DECCKM`), 7, 25 y 47/1047/1048/1049. `DSR 5n`/`6n` y `DA` se
+  responden como datos (`take_replies`). Las cadenas de control (`OSC`,
+  `DCS`…) se leen hasta su final y se tiran; los C0 dentro de una
+  secuencia se ejecutan y `CAN`/`SUB` la abortan. Decodifica UTF-8: un
+  carácter es una celda y lo que la fuente no tiene se dibuja como `?`.
+- **Teclado, donde el pty pide otra cosa que la consola:** Enter manda
+  `\r` (lo convierte `ICRNL`), Retroceso manda `DEL` (el `VERASE` del
+  pty) y por eso Supr manda `ESC [3~` (el `DEL` de la consola borraría
+  hacia atrás). Las flechas y Inicio/Fin siguen `DECCKM`, Alt antepone
+  `ESC`, y `release_all` suelta los modificadores al perder el foco (las
+  liberaciones irían a otra ventana). Sin autorrepetición: el protocolo
+  no la tiene y le toca a `term`.
+- **Render:** a `&mut [u32]` desde el píxel (0, 0), solo las filas
+  dañadas; el daño incluye la fila que dejó el cursor y la nueva. Los
+  glifos se comprueban píxel a píxel contra el raster mezclado con la
+  fórmula del kernel (la cobertura de Noto no llega a 255, así que no hay
+  píxeles de primer plano puro), y el relleno a la derecha de la rejilla
+  nunca se escribe.
+- **Probado por sabotaje:** 13 de 13 detectados (ajuste inmediato, `LF`
+  sin región, `IL` fuera de la región, C0 que aborta un `CSI`, el daño sin
+  la fila vieja del cursor, `?1049l` sin restaurar el cursor, borrar con
+  el fondo por defecto, `DSR` sin base 1, un `m` con marcador privado
+  aplicado como `SGR`, Bloq Mayús sobre símbolos, Enter como `\n` y
+  escribir en el relleno por los dos caminos, glifo y blanco — este
+  último se escapaba hasta que el test tuvo una columna final en blanco).
