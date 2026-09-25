@@ -36,6 +36,7 @@ pub mod mouse;
 pub mod msc;
 pub mod pci;
 pub mod pit;
+pub mod ring;
 pub mod rtc;
 pub mod smp;
 pub mod sp5100_tco;
