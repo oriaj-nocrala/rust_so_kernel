@@ -15,7 +15,7 @@ pub(super) fn sys_uptime_ms() -> SyscallResult {
 /// Mainly a debugging aid: run something in a loop (e.g. `sh` a script that
 /// spawns/kills threads or processes many times) and watch this between
 /// runs to catch a leak — see kernel_stack's `pending_stack_frees` /
-/// `free_kernel_stack` for the leak this was added to verify.
+/// `try_free_kernel_stack` for the leak this was added to verify.
 pub(super) fn sys_meminfo_kb() -> SyscallResult {
     (crate::allocator::free_bytes() / 1024) as SyscallResult
 }
@@ -70,8 +70,13 @@ pub(super) fn sys_kdebug_ctl(cmd: u64, name_ptr: u64, enable: u64) -> SyscallRes
         // The TLB-shootdown self-test (`tlb_selftest`) against every online
         // AP: 0 = no stale read, 1 = stale reads, ENODEV = no AP, ETIMEDOUT
         // = an AP stopped answering. The report goes to the kernel log.
-        // `kdebug tlbtest`.
-        3 => match crate::tlb_selftest::run(200, crate::cpu::MAX_CPUS) {
+        // `kdebug tlbtest`. With IF=0 throughout: since stage 7 this
+        // syscall can run on an AP and be preempted onto another CPU
+        // mid-test, and the writer must stay on the CPU it excluded from
+        // the readers (the self-test's waits answer shootdowns themselves).
+        3 => match x86_64::instructions::interrupts::without_interrupts(|| {
+            crate::tlb_selftest::run(200, crate::cpu::MAX_CPUS)
+        }) {
             Ok(r) if r.stale == 0 => 0,
             Ok(_) => 1,
             Err("no online AP") => errno::ENODEV,

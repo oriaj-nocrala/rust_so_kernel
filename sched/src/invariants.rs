@@ -35,8 +35,11 @@ pub enum Violation {
     /// A run-queue entity's effective priority is outside its legal band.
     PriorityOutOfRange { pid: usize, effective: u8, base: u8, floor: u8 },
     /// The same pid appears more than once across the run queues and the
-    /// wait queue.
+    /// wait queue (and, for `check_invariants_with_running`, the running
+    /// slots of every CPU).
     DuplicatePid { pid: usize },
+    /// A non-idle entity in a CPU's running slot still reports Ready.
+    RunningNotRunning { pid: usize },
 }
 
 #[cfg(test)]
@@ -428,6 +431,131 @@ mod tests {
                 base,
                 "pid {pid} moved off its base on a call after already reaching it"
             );
+        }
+    }
+
+    // ========================================================================
+    // B4: several CPUs, one core (stage 7 of docs/smp/smp-plan.md)
+    // ========================================================================
+
+    /// B4. The kernel's SMP shape: one `SchedCore`, one running slot per CPU,
+    /// every operation made by a randomly chosen CPU — preempt (requeue +
+    /// pick), block (park + pick), exit (drop + pick), wake from any CPU,
+    /// per-CPU ticks, aging — with the pick skipping a random entity the way
+    /// the kernel skips one whose kernel stack another CPU is still leaving
+    /// (`pop_next_ready_where`). After every operation:
+    /// `check_invariants_with_running` over all running slots (no entity on
+    /// two CPUs, or on one and queued), and conservation (queued + running
+    /// == created - exited).
+    ///
+    /// What this cannot catch by itself: "one entity running on two CPUs"
+    /// is not representable inside the core — every operation moves an
+    /// owned `Box<E>` — so the duplicate-running check is pinned by
+    /// `invariants_with_running_catch_double_running` instead, and this test
+    /// is what keeps conservation and the core's own invariants honest under
+    /// the SMP operation mix.
+    #[test]
+    fn property_several_cpus_never_run_one_entity_twice() {
+        const CPUS: usize = 4;
+        const OPS_PER_SEED: usize = 4000;
+        for seed in [7u64, 99, 0xC0FFEE, 31337] {
+            let mut rng = Xorshift64::new(seed);
+            let mut core = SchedCore::<Ent>::new();
+            let clock = FakeClock::new();
+            let mut running: [Option<Box<Ent>>; CPUS] = [None, None, None, None];
+            let mut live: Vec<usize> = Vec::new();
+
+            for _ in 0..8 {
+                let pid = core.allocate_pid();
+                let base = 1 + rng.below(10) as u8;
+                core.add_reset_to_base(ent(pid, base, base));
+                live.push(pid);
+            }
+
+            for op_idx in 0..OPS_PER_SEED {
+                let cpu = rng.below(CPUS as u64) as usize;
+                // An entity "another CPU is still leaving": never picked now.
+                let leaving = if live.is_empty() { usize::MAX } else {
+                    live[rng.below(live.len() as u64) as usize]
+                };
+                let pick = |core: &mut SchedCore<Ent>| {
+                    core.pop_next_ready_where(|e| e.pid() != leaving).map(|mut e| {
+                        e.set_ready(false);
+                        e
+                    })
+                };
+                match rng.below(8) {
+                    // Preempt: this CPU's entity back to Ready, pick next.
+                    0 | 1 => {
+                        if let Some(mut e) = running[cpu].take() {
+                            e.set_ready(true);
+                            core.requeue_preempted(e);
+                        }
+                        running[cpu] = pick(&mut core);
+                        if let Some(e) = &running[cpu] {
+                            core.start_slice_on(cpu, e.effective_priority());
+                        }
+                    }
+                    // Block.
+                    2 => {
+                        if let Some(e) = running[cpu].take() {
+                            core.park(e);
+                        }
+                        running[cpu] = pick(&mut core);
+                    }
+                    // Exit (never waited for here).
+                    3 => {
+                        if let Some(e) = running[cpu].take() {
+                            live.retain(|&p| p != e.pid());
+                        }
+                        running[cpu] = pick(&mut core);
+                    }
+                    // Wake a random live pid, from whichever CPU.
+                    4 => {
+                        if !live.is_empty() {
+                            let pid = live[rng.below(live.len() as u64) as usize];
+                            core.wake_matching(|e| e.pid() == pid, |e| e.set_ready(true));
+                        }
+                    }
+                    // Create.
+                    5 => {
+                        let pid = core.allocate_pid();
+                        let base = 1 + rng.below(10) as u8;
+                        core.add_reset_to_base(ent(pid, base, base));
+                        live.push(pid);
+                    }
+                    // Tick on this CPU; the global aging clock ticks with CPU 0.
+                    6 => {
+                        if cpu == 0 {
+                            clock.advance(1);
+                            if core.advance_ticks(&clock) {
+                                core.age_processes();
+                            }
+                        }
+                        if core.consume_quantum_on(cpu) {
+                            if let Some(mut e) = running[cpu].take() {
+                                e.set_ready(true);
+                                core.requeue_preempted(e);
+                            }
+                            running[cpu] = pick(&mut core);
+                        }
+                    }
+                    // An idle CPU picks up work.
+                    7 => {
+                        if running[cpu].is_none() {
+                            running[cpu] = pick(&mut core);
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+
+                let slots = running.iter().filter_map(|r| r.as_deref());
+                if let Err(v) = core.check_invariants_with_running(slots.clone()) {
+                    panic!("seed={seed} op={op_idx}: {v:?}");
+                }
+                let total = core.iter_queued().count() + slots.count();
+                assert_eq!(total, live.len(), "seed={seed} op={op_idx}: conservation");
+            }
         }
     }
 

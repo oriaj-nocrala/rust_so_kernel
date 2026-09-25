@@ -100,24 +100,12 @@ fn kernel_stack_base(stack_top: VirtAddr) -> (VirtAddr, x86_64::PhysAddr) {
     (virt_base, phys_base)
 }
 
-/// Return a kernel stack (as returned by `allocate_kernel_stack`) to the Buddy.
-///
-/// Callers must make sure the CPU isn't still executing on this stack —
-/// see `Scheduler::pending_stack_frees` for the one place that matters.
-pub fn free_kernel_stack(stack_top: VirtAddr) {
-    let (virt_base, phys_base) = kernel_stack_base(stack_top);
-    unsafe {
-        // MUST happen before phys_free: see remap_kernel_guard_page's doc
-        // comment — Buddy's intrusive free list writes into this exact
-        // address, which is still unmapped (the guard page) otherwise.
-        crate::memory::page_table_manager::remap_kernel_guard_page(virt_base)
-            .expect("Failed to remove kernel stack guard page before freeing");
-        crate::allocator::phys_free(phys_base, KERNEL_STACK_ORDER);
-    }
-}
-
-/// Like `free_kernel_stack`, but never blocks — returns `false` instead of
-/// waiting if the Buddy lock is currently held elsewhere.
+/// Return a kernel stack (as returned by `allocate_kernel_stack`) to the
+/// Buddy — never blocking: returns `false` instead of waiting if the Buddy
+/// lock is currently held elsewhere. The only way a kernel stack is freed:
+/// every dead process's goes through `Scheduler::pending_stack_frees`, since
+/// stage 7 of docs/smp/smp-plan.md also the zombies `waitpid` reaps (another
+/// CPU may still be on the stack).
 ///
 /// Needed from timer-interrupt context (`Scheduler::tick`'s
 /// `pending_stack_frees` drain): that ISR can interrupt *any* kernel code,
@@ -150,27 +138,32 @@ pub fn try_free_kernel_stack(stack_top: VirtAddr) -> bool {
 // PROCESS CREATORS
 // ============================================================================
 
-/// Idle process — uses kernel address space.
+/// One idle process per CPU that will schedule — the BSP, and every online
+/// AP unless built with `CONSTANOS_NOSMP` (stage 7 of docs/smp/smp-plan.md).
+/// All pid 0, as Linux's idle tasks are; each lives in its CPU's slot of the
+/// scheduler, never in a run queue, so no other CPU can pick it.
 fn create_idle_process() {
-    let kernel_stack = allocate_kernel_stack();
-    let address_space = AddressSpace::kernel();
+    for cpu in crate::smp::scheduling_cpus() {
+        let kernel_stack = allocate_kernel_stack();
+        let address_space = AddressSpace::kernel();
 
-    let mut idle_proc = Box::new(Process::new_kernel(
-        Pid(0),
-        VirtAddr::new(idle_task as *const () as u64),
-        kernel_stack,
-        address_space,
-    ));
+        let mut idle_proc = Box::new(Process::new_kernel(
+            Pid(0),
+            VirtAddr::new(idle_task as *const () as u64),
+            kernel_stack,
+            address_space,
+        ));
 
-    idle_proc.set_name("idle");
-    idle_proc.set_priority(0);
+        idle_proc.set_name("idle");
+        idle_proc.set_priority(0);
 
-    {
-        let mut scheduler = crate::process::scheduler::local_scheduler();
-        scheduler.add_process(idle_proc);
+        {
+            let mut scheduler = crate::process::scheduler::local_scheduler();
+            scheduler.add_idle(cpu, idle_proc);
+        }
+
+        serial_println!("✅ Created idle process for CPU {} (PID 0)", cpu);
     }
-
-    serial_println!("✅ Created idle process (PID 0)");
 }
 
 /// Create user processes from the embedded program registry.
@@ -372,8 +365,11 @@ fn idle_task() -> ! {
         // Copies the kernel log to the USB stick every few seconds, when
         // nothing else wants the CPU — see `block::logpart` for why here
         // and not in the timer ISR. Two atomic loads when there is nothing
-        // to do.
+        // to do. Any CPU's idle may be the one that does it (`periodic`
+        // lets only one through per period), so a process spinning on one
+        // CPU no longer starves the flush.
         crate::block::logpart::periodic();
-        unsafe { core::arch::asm!("hlt"); }
+        // `run_on` jobs, then `hlt`.
+        crate::smp::idle_once();
     }
 }

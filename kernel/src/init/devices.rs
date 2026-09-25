@@ -69,6 +69,9 @@ pub fn init_idt() {
         // Inter-processor interrupts (stage 5 of `docs/smp/smp-plan.md`).
         idt.add_handler(crate::memory::tlb::SHOOTDOWN_VECTOR, tlb_shootdown_handler);
         idt.add_handler(crate::smp::WAKE_VECTOR, wake_ipi_handler);
+        // Stage 7: a raw entry like the timer's — it may switch processes.
+        idt.entries[crate::process::scheduler::RESCHED_VECTOR as usize]
+            .set_handler_addr(crate::process::timer_preempt::resched_interrupt_entry as u64);
         // Syscalls are now handled via the `syscall` instruction (LSTAR MSR),
         // not via int 0x80.  No IDT entry needed.
         idt

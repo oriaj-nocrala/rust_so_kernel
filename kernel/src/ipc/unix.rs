@@ -61,7 +61,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use diag::IrqMutex;
 use usock::{PollMask, SockError, SocketId, SocketTable, UnixAddr, Wakes};
@@ -85,6 +85,21 @@ pub static SOCKETS: IrqMutex<SocketTable<Box<dyn FileHandle>>, KernelIrq> =
 /// enough here — this is only ever touched with interrupts already off, and
 /// nothing inside the critical section allocates except the `Vec` itself.
 static WAITERS: IrqMutex<Vec<Waiter>, KernelIrq> = IrqMutex::new(Vec::new());
+
+/// Bumped by every `dispatch_wakes` that wakes anything, *before* it scans
+/// `WAITERS`. Closes the gap between a socket operation failing with
+/// `Again` and its caller registering in `WAITERS` (stage 7 of
+/// docs/smp/smp-plan.md): a wakeup run entirely inside that gap, on another
+/// CPU, finds no waiter — but it moves this counter, which the caller read
+/// before its operation and checks again after registering (`register_retry`),
+/// and then retries instead of sleeping on a wakeup that already happened.
+static WAKE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Read before a socket operation that may have to block; hand the value to
+/// `block_on`/`register_retry`. See `WAKE_EPOCH`.
+pub fn wake_epoch() -> u64 {
+    WAKE_EPOCH.load(Ordering::SeqCst)
+}
 
 struct Waiter {
     pid: usize,
@@ -140,6 +155,8 @@ impl UnixSocketHandle {
 
 impl FileHandle for UnixSocketHandle {
     fn read(&mut self, buf: &mut [u8]) -> FileResult<usize> {
+        loop {
+        let epoch = wake_epoch();
         let (result, wakes) = SOCKETS.with(|t| {
             let mut wakes = Wakes::default();
             let r = t.recv(self.id, buf, false).map(|o| {
@@ -152,7 +169,7 @@ impl FileHandle for UnixSocketHandle {
         });
         dispatch_wakes(&wakes);
 
-        match result {
+        return match result {
             Ok((n, fds)) => {
                 drop(fds); // closes any SCM_RIGHTS a read() could not report
                 Ok(n)
@@ -161,14 +178,19 @@ impl FileHandle for UnixSocketHandle {
                 Err(FileError::Again)
             }
             Err(SockError::Again) => {
-                register_retry(self.id);
+                if !register_retry(self.id, epoch) {
+                    continue;
+                }
                 Err(FileError::WouldBlock)
             }
             Err(e) => Err(file_error_of(e)),
+        };
         }
     }
 
     fn write(&mut self, buf: &[u8]) -> FileResult<usize> {
+        loop {
+        let epoch = wake_epoch();
         let mut fds = Vec::new();
         let (result, wakes) = SOCKETS.with(|t| {
             let r = t.send(self.id, buf, &mut fds, None);
@@ -180,7 +202,7 @@ impl FileHandle for UnixSocketHandle {
         });
         dispatch_wakes(&wakes);
 
-        match result {
+        return match result {
             Ok(n) => Ok(n),
             Err(SockError::Again) if self.nonblock.load(Ordering::Relaxed) => {
                 Err(FileError::Again)
@@ -188,10 +210,13 @@ impl FileHandle for UnixSocketHandle {
             Err(SockError::Again) => {
                 // Wait on the *peer's* queue: that is the one that has to
                 // drain before this send can make progress.
-                register_retry(self.peer_or_self());
+                if !register_retry(self.peer_or_self(), epoch) {
+                    continue;
+                }
                 Err(FileError::WouldBlock)
             }
             Err(e) => Err(file_error_of(e)),
+        };
         }
     }
 
@@ -314,17 +339,28 @@ pub fn fd_is_nonblocking(fd: i32) -> bool {
 /// That is true for every caller (`CURRENT_SYSCALL_TF` is set by
 /// `syscall_handler_asm` and only read here and in the other blocking
 /// syscalls).
-pub fn block_on(sock: SocketId) -> ! {
+pub fn block_on(sock: SocketId, epoch: u64) -> ! {
     // Deliberately never dropped: this function ends in `jump_to_user`, so
     // interrupts stay off across the jump and are restored by the next
     // process's own `iretq` — the same shape every other blocking syscall
     // path here uses.
     let _irq = crate::process::irq_guard::InterruptGuard::new();
-    register_retry(sock);
-
     let tf_ptr = crate::process::syscall::current_tf_ptr();
+    if !register_retry(sock, epoch) {
+        // A wakeup already came and went: re-execute the syscall now
+        // instead of sleeping (`rax` still holds its number, see
+        // `register_retry`).
+        unsafe {
+            (*(tf_ptr as *mut crate::process::TrapFrame)).rip -= 2;
+            crate::process::trapframe::jump_to_user(tf_ptr)
+        }
+    }
+
     let next_tf = {
         let mut sched = crate::process::scheduler::local_scheduler();
+        // A wakeup that lands after the registration but before this block
+        // is left pending on the process (`Scheduler::wake_or_defer`), and
+        // `block_current` then returns this same, rewound frame.
         sched.block_current(tf_ptr)
     };
     unsafe { crate::process::trapframe::jump_to_user(next_tf) }
@@ -345,13 +381,17 @@ pub fn block_on(sock: SocketId) -> ! {
 /// sites satisfy this: `sys_read`/`sys_write`'s `WouldBlock` arms end in
 /// `jump_to_user` and never return.
 ///
+/// Returns `false`, with nothing registered and the frame left alone, if a
+/// wakeup ran since `epoch` was read (`WAKE_EPOCH`): the caller must retry
+/// its operation rather than sleep.
+///
 /// Known wart, inherited rather than introduced: a multi-iovec `writev()`
 /// that fills the socket partway through re-executes from the first iovec
 /// after the retry, re-sending what already went out. The same call is
 /// already broken for a pipe today (it loses its running total instead),
 /// and fixing it properly means making `sys_writev` a single `write()` of a
 /// gathered buffer — out of scope here.
-fn register_retry(sock: SocketId) {
+fn register_retry(sock: SocketId, epoch: u64) -> bool {
     let tf = crate::process::syscall::current_tf_ptr() as *mut crate::process::TrapFrame;
     if tf.is_null() {
         // No syscall frame: the caller is kernel code driving a socket
@@ -361,7 +401,7 @@ fn register_retry(sock: SocketId) {
         // the caller to see — so record nothing rather than rewinding a
         // frame that does not exist. Found by that test: this used to
         // dereference the null pointer unconditionally.
-        return;
+        return true;
     }
 
     let pid = crate::process::scheduler::current_pid().unwrap_or(0);
@@ -370,6 +410,10 @@ fn register_retry(sock: SocketId) {
             w.push(Waiter { pid, sock });
         }
     });
+    if WAKE_EPOCH.load(Ordering::SeqCst) != epoch {
+        WAITERS.with(|w| w.retain(|x| !(x.pid == pid && x.sock == sock)));
+        return false;
+    }
 
     unsafe {
         // Rewind onto the `syscall` instruction (0F 05, two bytes) so the
@@ -378,6 +422,7 @@ fn register_retry(sock: SocketId) {
         // overwrites that slot when the handler returns normally.
         (*tf).rip -= 2;
     }
+    true
 }
 
 /// Wake every process parked on any of the sockets named in `wakes`.
@@ -398,6 +443,8 @@ pub fn dispatch_wakes(wakes: &Wakes) {
     if wakes.is_empty() {
         return;
     }
+    // Before the scan, never after: see `WAKE_EPOCH`.
+    WAKE_EPOCH.fetch_add(1, Ordering::SeqCst);
 
     let mut pids: Vec<usize> = Vec::new();
     WAITERS.with(|w| {
@@ -416,7 +463,9 @@ pub fn dispatch_wakes(wakes: &Wakes) {
         x86_64::instructions::interrupts::without_interrupts(|| {
             let mut sched = crate::process::scheduler::local_scheduler();
             for pid in pids {
-                sched.wake(pid);
+                // The waiter may still be on its way to `block_current` on
+                // another CPU: then the wakeup waits for it there.
+                sched.wake_or_defer(pid, crate::process::WakePending::Restart);
             }
         });
     }

@@ -198,6 +198,10 @@ static ORPHAN_INODES_RECLAIMED: AtomicU64 = AtomicU64::new(0);
 /// instrumentation around instead of deleting it, useful for the next
 /// scheduler investigation too).
 static SWITCHES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Blocks that did not happen because the wakeup got there first — another
+/// CPU ran the whole wakeup between the waiter registering and blocking
+/// (`Process::wake_pending`). Nonzero proves that window is real.
+static EARLY_WAKES: AtomicU64 = AtomicU64::new(0);
 
 /// USB HID boot-keyboard reports decoded since boot (`usb::poll`). The
 /// counter that separates the two failure modes of a USB keyboard that
@@ -244,6 +248,7 @@ pub fn inc_reaps()         { REAPS_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_cow_resolved()  { COW_FAULTS_RESOLVED.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_cow_failed()    { COW_FAULTS_FAILED.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_switches()      { SWITCHES_TOTAL.fetch_add(1, Ordering::Relaxed); }
+pub fn inc_early_wakes()   { EARLY_WAKES.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_usb_key_reports() { USB_KEY_REPORTS.fetch_add(1, Ordering::Relaxed); }
 pub fn add_usb_keys_dropped(n: u64) { USB_KEYS_DROPPED.fetch_add(n, Ordering::Relaxed); }
 pub fn inc_usb_mouse_reports() { USB_MOUSE_REPORTS.fetch_add(1, Ordering::Relaxed); }
@@ -347,6 +352,7 @@ pub fn render_report() -> alloc::string::String {
          orphan_blocks_reclaimed: {}\n\
          orphan_inodes_reclaimed: {}\n\
          switches_total: {}\n\
+         early_wakes: {}\n\
          cow_tracked_frames: {} ({} MiB of RAM)\n\
          usb_keyboards: {}\n\
          usb_key_reports: {}\n\
@@ -370,6 +376,7 @@ pub fn render_report() -> alloc::string::String {
         ORPHAN_BLOCKS_RECLAIMED.load(Ordering::Relaxed),
         ORPHAN_INODES_RECLAIMED.load(Ordering::Relaxed),
         SWITCHES_TOTAL.load(Ordering::Relaxed),
+        EARLY_WAKES.load(Ordering::Relaxed),
         crate::memory::cow::tracked_frames(),
         (crate::memory::cow::tracked_frames() * 4096) / (1024 * 1024),
         crate::usb::keyboard_count(),
@@ -384,7 +391,7 @@ pub fn render_report() -> alloc::string::String {
         crate::interrupts::apic::render(),
         crate::process::timer_preempt::ticks_total(),
         crate::cpu::tsc::uptime_ms(),
-        alloc::format!("{}\n{}\n{}\n{}", crate::cpu::percpu::render(), crate::smp::render(), crate::cpu::render_init(), crate::memory::tlb::render()),
+        alloc::format!("{}\n{}\n{}\n{}\n{}", crate::cpu::percpu::render(), crate::smp::render(), crate::cpu::render_init(), crate::memory::tlb::render(), crate::process::scheduler::render().trim_end()),
         alloc::format!(
             "{}\n{}",
             match crate::fs::ext2::cache_stats() {

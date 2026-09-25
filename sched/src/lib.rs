@@ -187,6 +187,11 @@ pub const AGING_EPOCH: u32 = 50;
 /// Floor effective priority never decays below.
 pub const MIN_EFFECTIVE_PRIORITY: u8 = 1;
 
+/// CPUs whose time slices [`SchedCore`] accounts separately (stage 7 of
+/// `docs/smp/smp-plan.md`: one core, one run-queue set, one slice per CPU).
+/// Must equal the kernel's `cpu::MAX_CPUS`, which asserts it.
+pub const MAX_CPUS: usize = 32;
+
 /// Time slice, in timer ticks, granted to an entity scheduled at
 /// `effective_priority`.
 ///

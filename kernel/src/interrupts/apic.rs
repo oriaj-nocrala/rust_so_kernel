@@ -409,13 +409,25 @@ pub fn init_this_cpu() {
     }
 }
 
-/// Does this CPU get the periodic tick? Stage 4 of `docs/smp/smp-plan.md`:
-/// only the BSP. The tick is what schedules (`timer_interrupt_entry`), and an
-/// AP has no process to schedule until stage 7 — whose job it is to make
-/// this every CPU. Masked, not merely unprogrammed: an AP runs with IF=1 in
-/// its `hlt` loop and must never take vector 32.
+/// Does this CPU get the periodic tick from `init_this_cpu`? Only the BSP:
+/// an AP's tick is what schedules on it (`timer_interrupt_entry`), and it
+/// has nothing to schedule until it enters the scheduler — where
+/// `start_timer_on_ap` unmasks it (stage 7 of `docs/smp/smp-plan.md`).
+/// Masked, not merely unprogrammed: an AP runs with IF=1 in its boot `hlt`
+/// loop and must never take vector 32 there.
 fn runs_timer() -> bool {
     crate::cpu::cpu_id() == 0
+}
+
+/// Starts this AP's periodic tick — the same period as the BSP's, from the
+/// same calibration. Called as the AP enters the scheduler, IF=0.
+pub fn start_timer_on_ap() {
+    if !active() {
+        return;
+    }
+    let Some(status) = STATUS.get() else { return };
+    lapic_write(lapic::LVT_TIMER, apic::lvt_timer(TIMER_VECTOR, TimerMode::Periodic, false));
+    lapic_write(lapic::TIMER_INITIAL, status.timer_count);
 }
 
 /// Reads back what `init_this_cpu` set.

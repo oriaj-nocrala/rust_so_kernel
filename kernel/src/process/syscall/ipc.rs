@@ -330,6 +330,7 @@ pub(super) fn sys_connect(fd: i32, addr_ptr: u64, addrlen: u64) -> SyscallResult
         }
     }
 
+    let epoch = unix::wake_epoch();
     let (result, wakes) = SOCKETS.with(|t| {
         let r = t.connect(id, &addr);
         let w = match &r {
@@ -353,7 +354,7 @@ pub(super) fn sys_connect(fd: i32, addr_ptr: u64, addrlen: u64) -> SyscallResult
             drop(addr);
             drop(wakes);
             match listener {
-                Some(listener) => unix::block_on(listener),
+                Some(listener) => unix::block_on(listener, epoch),
                 None => unix::errno_of(SockError::ConnRefused),
             }
         }
@@ -367,6 +368,7 @@ pub(super) fn sys_accept4(fd: i32, addr_ptr: u64, len_ptr: u64, flags: i32) -> S
         Err(e) => return e,
     };
 
+    let epoch = unix::wake_epoch();
     let (result, wakes) = SOCKETS.with(|t| {
         let r = t.accept(id);
         let w = match &r {
@@ -385,7 +387,7 @@ pub(super) fn sys_accept4(fd: i32, addr_ptr: u64, len_ptr: u64, flags: i32) -> S
             if unix::fd_is_nonblocking(fd) || flags & SOCK_NONBLOCK != 0 {
                 return errno::EAGAIN;
             }
-            unix::block_on(id);
+            unix::block_on(id, epoch);
         }
         Err(e) => return unix::errno_of(e),
     };
@@ -426,11 +428,12 @@ pub(super) fn sys_sendto(
     };
 
     let data = unsafe { user_slice(buf, len) };
+    let epoch = unix::wake_epoch();
     match send_common(fd, data, Vec::new(), dest.as_ref(), flags) {
         Ok(r) => r,
         Err(sock) => {
             drop(dest);
-            unix::block_on(sock)
+            unix::block_on(sock, epoch)
         }
     }
 }
@@ -449,10 +452,11 @@ pub(super) fn sys_recvfrom(
         }
     }
 
+    let epoch = unix::wake_epoch();
     let out = match recv_common(fd, unsafe { user_slice_mut(buf, len) }, flags) {
         Ok(o) => o,
         Err(RecvError::Errno(e)) => return e,
-        Err(RecvError::Block(sock)) => unix::block_on(sock),
+        Err(RecvError::Block(sock)) => unix::block_on(sock, epoch),
     };
 
     // Ancillary descriptors have nowhere to go in a recvfrom(); closing them
@@ -502,12 +506,13 @@ pub(super) fn sys_sendmsg(fd: i32, msg_ptr: u64, flags: u32) -> SyscallResult {
         Err(e) => return e,
     };
 
+    let epoch = unix::wake_epoch();
     match send_common(fd, &data, fds, dest.as_ref(), flags) {
         Ok(r) => r,
         Err(sock) => {
             drop(data);
             drop(dest);
-            unix::block_on(sock)
+            unix::block_on(sock, epoch)
         }
     }
 }
@@ -525,12 +530,13 @@ pub(super) fn sys_recvmsg(fd: i32, msg_ptr: u64, flags: u32) -> SyscallResult {
     };
     let mut staging = alloc::vec![0u8; total];
 
+    let epoch = unix::wake_epoch();
     let out = match recv_common(fd, &mut staging, flags) {
         Ok(o) => o,
         Err(RecvError::Errno(e)) => return e,
         Err(RecvError::Block(sock)) => {
             drop(staging);
-            unix::block_on(sock)
+            unix::block_on(sock, epoch)
         }
     };
 

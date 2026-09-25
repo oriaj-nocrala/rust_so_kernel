@@ -281,9 +281,17 @@ fn mutual(cpu: usize) -> Result<(), &'static str> {
 /// Runs all three parts against up to `max_aps` online APs (the mutual
 /// part against the first). `Err` is a harness failure — an AP that never
 /// answered — not a stale read: those are `Report::stale`.
+///
+/// Call with IF=0: the caller is the writer and must not move to another
+/// CPU mid-test. Since APs run processes (stage 7 of docs/smp/smp-plan.md)
+/// the readers are the APs that are idle right now, never the caller's own
+/// CPU — its reader would wait for a writer that is itself.
 pub fn run(rounds: u32, max_aps: usize) -> Result<Report, &'static str> {
-    let aps: alloc::vec::Vec<usize> =
-        (1..crate::cpu::MAX_CPUS).filter(|&c| crate::smp::is_online_ap(c)).take(max_aps).collect();
+    let me = crate::cpu::cpu_id();
+    let aps: alloc::vec::Vec<usize> = (1..crate::cpu::MAX_CPUS)
+        .filter(|&c| c != me && crate::smp::is_online_ap(c) && crate::process::scheduler::cpu_is_idle(c))
+        .take(max_aps)
+        .collect();
     if aps.is_empty() {
         return Err("no online AP");
     }

@@ -28,6 +28,17 @@ pub use file::{FileDescriptorTable, FileHandle};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pid(pub usize);
 
+/// What `block_current` does with a wakeup that beat the block — see
+/// `Process::wake_pending`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakePending {
+    /// Resume at the saved frame as it is: a socket wait, whose frame is
+    /// already rewound onto the `syscall` instruction.
+    Restart,
+    /// The waker completed the operation: return this from the syscall.
+    Return(u64),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
     Ready,
@@ -240,6 +251,14 @@ pub struct Process {
     /// strictly greater than this is resuming stale/already-consumed
     /// content — the other rewind signature.
     pub tf_last_resumed_seq: Option<u64>,
+
+    /// A wakeup that arrived while this process was still running — on
+    /// another CPU, between registering as a waiter and blocking (stage 7
+    /// of `docs/smp/smp-plan.md`). `block_current` consumes it instead of
+    /// blocking. Only set by `Scheduler::wake_or_defer`/`deliver_to_waiter`,
+    /// whose callers (pipes, sockets) register waiters only on the way to
+    /// blocking, so it can never outlive the syscall that registered.
+    pub wake_pending: Option<WakePending>,
 }
 
 impl Process {
@@ -312,6 +331,7 @@ impl Process {
             tf_seq: 0,
             tf_awaiting_resume: false,
             tf_last_resumed_seq: None,
+            wake_pending: None,
         }
     }
 
@@ -385,6 +405,7 @@ impl Process {
             tf_seq: 0,
             tf_awaiting_resume: false,
             tf_last_resumed_seq: None,
+            wake_pending: None,
         }
     }
 
@@ -448,6 +469,7 @@ impl Process {
             tf_seq: 0,
             tf_awaiting_resume: false,
             tf_last_resumed_seq: None,
+            wake_pending: None,
         }
     }
 
@@ -538,6 +560,7 @@ impl Process {
             tf_seq: 0,
             tf_awaiting_resume: false,
             tf_last_resumed_seq: None,
+            wake_pending: None,
         }
     }
 
@@ -596,16 +619,25 @@ impl Process {
     }
 }
 
-/// Start the first user process.
+/// Start the first user process — and, with it, the APs (stage 7 of
+/// `docs/smp/smp-plan.md`): from here on every scheduling CPU takes work.
 pub fn start_first_process() -> ! {
     let tf_ptr = {
         let mut scheduler = scheduler::local_scheduler();
         scheduler.start_first()
     };
+    crate::smp::release_aps();
 
     unsafe {
         core::arch::asm!("sti");
     }
 
+    unsafe { trapframe::jump_to_trapframe(tf_ptr) }
+}
+/// An AP enters the scheduler, from its boot loop (`smp::release_aps`),
+/// IF=0: onto its idle process, with its tick running.
+pub fn start_ap_scheduling() -> ! {
+    let tf_ptr = scheduler::local_scheduler().start_ap();
+    crate::interrupts::apic::start_timer_on_ap();
     unsafe { trapframe::jump_to_trapframe(tf_ptr) }
 }

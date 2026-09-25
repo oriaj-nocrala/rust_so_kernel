@@ -85,10 +85,12 @@ pub fn cancel(id: u32) -> bool {
 ///   - `KernelFn` actions are called *while holding QUEUE* (see invariant above).
 ///   - `WakePid` PIDs are collected into `pids_out`; QUEUE is released first.
 ///
-/// Returns the number of PIDs written into `pids_out`.
-/// If more than 8 timers with WakePid fire in the same tick, extras are
-/// silently dropped — they will be processed in the next tick at most 10 ms later.
-pub fn tick(now_ns: u64, pids_out: &mut [usize; 8]) -> usize {
+/// Returns the number of `(pid, timer id)` pairs written into `pids_out`.
+/// If more than 8 timers with WakePid expire in the same tick, the rest stay
+/// queued and fire on the next tick, at most 10 ms later. (They used to be
+/// removed and dropped here, despite this comment saying otherwise — a lost
+/// wakeup for whoever slept on them.)
+pub fn tick(now_ns: u64, pids_out: &mut [(usize, u32); 8]) -> usize {
     let mut count = 0usize;
 
     let mut q = QUEUE.lock();
@@ -98,6 +100,9 @@ pub fn tick(now_ns: u64, pids_out: &mut [usize; 8]) -> usize {
         if t.expiry_ns > now_ns {
             break; // remaining timers are in the future
         }
+        if count == pids_out.len() && matches!(t.action, HrTimerAction::WakePid(_)) {
+            break; // no room: next tick
+        }
         let timer = q.timers.remove(0);
         match timer.action {
             HrTimerAction::KernelFn(f) => {
@@ -105,11 +110,8 @@ pub fn tick(now_ns: u64, pids_out: &mut [usize; 8]) -> usize {
                 f();
             }
             HrTimerAction::WakePid(pid) => {
-                if count < 8 {
-                    pids_out[count] = pid;
-                    count += 1;
-                }
-                // If count == 8, drop the PID; it will be retried next tick.
+                pids_out[count] = (pid, timer.id);
+                count += 1;
             }
         }
     }

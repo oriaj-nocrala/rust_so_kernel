@@ -31,14 +31,18 @@ pub struct TrapFrame {
     pub ss: u64,
 }
 
-// Función en assembly para saltar a un TrapFrame
-// Esto se usa SOLO para arrancar el primer proceso
+// Jump to a TrapFrame: restore every register and `iretq`.
+//
+// RDI = the frame, RSI = this CPU's `scheduler::LEAVING` slot. The slot is
+// cleared right after RSP leaves the stack this code was running on — from
+// that instruction on, nothing touches that stack again, so another CPU may
+// resume the process that owns it (stage 7 of docs/smp/smp-plan.md).
 global_asm!(
-    ".global jump_to_trapframe",
-    "jump_to_trapframe:",
+    ".global jump_to_trapframe_raw",
+    "jump_to_trapframe_raw:",
     
-    // RDI contiene el puntero al TrapFrame
     "mov rsp, rdi",  // Apuntar RSP al TrapFrame
+    "mov qword ptr [rsi], 0",
     
     // Restaurar registros generales
     "pop r15",
@@ -62,7 +66,13 @@ global_asm!(
 );
 
 extern "C" {
-    pub fn jump_to_trapframe(tf: *const TrapFrame) -> !;
+    fn jump_to_trapframe_raw(tf: *const TrapFrame, leaving: *mut u64) -> !;
+}
+
+/// Restore every register from `tf` and `iretq` into it, releasing the
+/// kernel stack this CPU was on (`scheduler::LEAVING`) on the way.
+pub unsafe fn jump_to_trapframe(tf: *const TrapFrame) -> ! {
+    unsafe { jump_to_trapframe_raw(tf, super::scheduler::leaving_slot()) }
 }
 
 /// Every "about to iretq into a process" call site in this kernel should

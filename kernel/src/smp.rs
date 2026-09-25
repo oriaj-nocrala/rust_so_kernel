@@ -4,12 +4,15 @@
 //
 // Each AP the MADT lists is woken with INIT-SIPI-SIPI, climbs from real mode
 // to long mode through a trampoline in low memory, runs the same
-// `cpu::init_this_cpu` the BSP ran, and then sits in `sti; hlt` forever:
-// inert. Its LAPIC timer is masked (`interrupts::apic::runs_timer`) and the
-// I/O APIC routes nothing to it. Two IPIs wake it (stage 5): a TLB shootdown
-// (`memory::tlb`), and `WAKE_VECTOR`, after which it runs whatever
+// `cpu::init_this_cpu` the BSP ran, and then sits in `sti; hlt`, inert, until
+// the BSP starts the first process: `release_aps` then sends every AP into
+// the scheduler (stage 7), on its own idle process, with its LAPIC timer
+// unmasked (`interrupts::apic::start_timer_on_ap`). Built with
+// `CONSTANOS_NOSMP=1` they stay inert for good — the single-CPU comparison
+// decision 6 of the plan asks for. The I/O APIC routes nothing to an AP.
+// Two IPIs besides the scheduler's reach it: a TLB shootdown
+// (`memory::tlb`), and `WAKE_VECTOR`, after which its idle loop runs whatever
 // `run_on` left in its mailbox — the TLB self-test's way onto an AP.
-// Stage 7 gives it processes.
 //
 // The pure half — where the trampoline goes, ICR encodings, the sequence
 // and its delays, CPU numbering — is `hal::smp`, host-tested.
@@ -39,7 +42,7 @@
 // Every wait is bounded by the TSC and by a spin count, like every boot-time
 // wait here: an AP that never answers is logged and left out, never a hang.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use hal::smp::{self as hsmp, Step};
 
@@ -201,6 +204,55 @@ pub const WAKE_VECTOR: u8 = 0xF1;
 /// Per-CPU mailbox: a `fn(usize)` as `usize`, 0 when empty. The AP clears
 /// it after the call returns.
 static MAILBOX: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+
+/// Set by `release_aps`: the APs leave their boot loop for the scheduler.
+static GO: AtomicBool = AtomicBool::new(false);
+
+/// Built with `CONSTANOS_NOSMP=1` (any value but `0`): the APs still start
+/// — the TLB self-test needs them — but never run processes.
+pub fn nosmp() -> bool {
+    matches!(option_env!("CONSTANOS_NOSMP"), Some(v) if v != "0")
+}
+
+/// Sends every online AP into the scheduler. BSP, once, as the first
+/// process starts (`process::start_first_process`), with every AP's idle
+/// process already created.
+pub fn release_aps() {
+    if nosmp() {
+        return;
+    }
+    GO.store(true, Ordering::Release);
+    for cpu in (1..MAX_CPUS).filter(|&c| is_online_ap(c)) {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            crate::interrupts::apic::send_ipi(apic_id(cpu), hal::smp::icr::fixed(WAKE_VECTOR))
+        });
+    }
+}
+
+/// CPUs that will run processes: the BSP, and every online AP unless
+/// `nosmp()`.
+pub fn scheduling_cpus() -> impl Iterator<Item = usize> {
+    (0..MAX_CPUS).filter(|&c| c == 0 || (!nosmp() && is_online_ap(c)))
+}
+
+/// One pass of an idle process's loop: run what `run_on` left in this CPU's
+/// mailbox, else `hlt` until the next interrupt. Entered and left with IF=1.
+pub fn idle_once() {
+    let cpu = crate::cpu::cpu_id();
+    x86_64::instructions::interrupts::disable();
+    let work = MAILBOX[cpu].load(Ordering::Acquire);
+    if work != 0 {
+        // SAFETY: only `run_on` stores here, and only `fn(usize)`s.
+        let f: fn(usize) = unsafe { core::mem::transmute(work) };
+        x86_64::instructions::interrupts::enable();
+        f(cpu);
+        MAILBOX[cpu].store(0, Ordering::Release);
+        return;
+    }
+    // SAFETY: `sti; hlt` as one sequence: a `WAKE_VECTOR` sent after the
+    // check above is still pending at the `hlt` and wakes it.
+    unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)) };
+}
 
 /// Each AP's stack; they are never freed (an inert AP lives on it forever).
 const AP_STACK_SIZE: usize = 64 * 1024;
@@ -458,6 +510,9 @@ extern "sysv64" fn ap_entry(cpu: u64) -> ! {
             // while the mailbox is checked, so a `WAKE_VECTOR` sent after
             // the check is still pending at the `hlt` and wakes it.
             loop {
+                if GO.load(Ordering::Acquire) {
+                    crate::process::start_ap_scheduling();
+                }
                 let work = MAILBOX[cpu].load(Ordering::Acquire);
                 if work != 0 {
                     // SAFETY: only `run_on` stores here, and only `fn(usize)`s.
@@ -494,11 +549,13 @@ pub fn is_online_ap(cpu: usize) -> bool {
     cpu < MAX_CPUS && ApState::from_u8(STATE[cpu].load(Ordering::Acquire)) == ApState::Online
 }
 
-/// Runs `f(cpu)` on the online AP `cpu`, with IF=1, from its idle loop.
+/// Runs `f(cpu)` on the online AP `cpu`, with IF=1, from its idle loop
+/// (the boot loop before the scheduler starts, its idle process after —
+/// so the job waits while the AP runs a process). The scheduler does not
+/// take the AP off its idle process while the job runs (`ap_busy`).
 /// Returns once it is posted; `ap_busy` says when it has returned. `false`
 /// if `cpu` is not an online AP or its mailbox is still busy. For
-/// self-tests (see `tlb_selftest`) — stage 7's scheduler is what gives APs
-/// real work.
+/// self-tests (see `tlb_selftest`).
 pub fn run_on(cpu: usize, f: fn(usize)) -> bool {
     if !is_online_ap(cpu) {
         return false;
@@ -516,7 +573,7 @@ pub fn run_on(cpu: usize, f: fn(usize)) -> bool {
 
 /// Is `cpu` still running what `run_on` gave it?
 pub fn ap_busy(cpu: usize) -> bool {
-    MAILBOX[cpu].load(Ordering::Acquire) != 0
+    cpu < MAX_CPUS && MAILBOX[cpu].load(Ordering::Acquire) != 0
 }
 
 /// How many CPUs are running (the BSP included).

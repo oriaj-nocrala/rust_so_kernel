@@ -14,7 +14,7 @@
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 
 use crate::invariants::Violation;
-use crate::{queue_index, quantum_for, Clock, SchedEntity, AGING_EPOCH, MIN_EFFECTIVE_PRIORITY, NUM_PRIORITIES};
+use crate::{queue_index, quantum_for, Clock, SchedEntity, AGING_EPOCH, MAX_CPUS, MIN_EFFECTIVE_PRIORITY, NUM_PRIORITIES};
 
 /// The run queues, wait queue, and pid counter for one scheduler instance.
 ///
@@ -45,9 +45,10 @@ pub struct SchedCore<E: SchedEntity> {
     /// of `Scheduler::next_pid`.
     next_pid: usize,
 
-    /// Remaining ticks for the running process. Moved out of
-    /// `Scheduler::remaining_ticks`.
-    remaining_ticks: u32,
+    /// Remaining ticks of the slice each CPU is running. Moved out of
+    /// `Scheduler::remaining_ticks`; one per CPU since stage 7 of
+    /// `docs/smp/smp-plan.md`, when one core started feeding several CPUs.
+    remaining_ticks: [u32; MAX_CPUS],
 
     /// The [`Clock`] reading at which the most recent aging epoch was
     /// declared (or 0, if none ever has been).
@@ -77,7 +78,7 @@ impl<E: SchedEntity> SchedCore<E> {
             run_queues: [const { VecDeque::new() }; NUM_PRIORITIES],
             wait_queue: VecDeque::new(),
             next_pid: 1,
-            remaining_ticks: 0,
+            remaining_ticks: [0; MAX_CPUS],
             last_epoch_tick: 0,
         }
     }
@@ -267,6 +268,29 @@ impl<E: SchedEntity> SchedCore<E> {
         None
     }
 
+    /// [`Self::pop_next_ready`], skipping entities `eligible` rejects: the
+    /// same strict-priority, FIFO-within-a-queue order among the eligible
+    /// ones, and every rejected entity stays exactly where it was.
+    ///
+    /// Stage 7 of `docs/smp/smp-plan.md`: with several CPUs picking from one
+    /// core, an entity can be Ready while another CPU is still executing on
+    /// its kernel stack (it has just switched away and not yet left it) —
+    /// the kernel adapter rejects those until that CPU is off the stack.
+    pub fn pop_next_ready_where(&mut self, mut eligible: impl FnMut(&E) -> bool) -> Option<Box<E>> {
+        for priority in (0..NUM_PRIORITIES).rev() {
+            let queue = &mut self.run_queues[priority];
+            if let Some(i) = queue.iter().position(|e| eligible(e)) {
+                return queue.remove(i);
+            }
+        }
+        None
+    }
+
+    /// Is any entity Ready (queued in a run queue)?
+    pub fn has_ready(&self) -> bool {
+        self.run_queues.iter().any(|q| !q.is_empty())
+    }
+
     /// The first entity `start_first` (boot) should run.
     ///
     /// Deliberately NOT the same scan as [`Self::pop_next_ready`], and must
@@ -386,7 +410,13 @@ impl<E: SchedEntity> SchedCore<E> {
     /// five `self.remaining_ticks = sched::quantum_for(...)` assignments in
     /// the kernel adapter.
     pub fn start_slice(&mut self, effective_priority: u8) {
-        self.remaining_ticks = quantum_for(effective_priority);
+        self.start_slice_on(0, effective_priority);
+    }
+
+    /// [`Self::start_slice`] for CPU `cpu`'s slice. Each CPU's slice is
+    /// independent: starting one never touches another's.
+    pub fn start_slice_on(&mut self, cpu: usize, effective_priority: u8) {
+        self.remaining_ticks[cpu] = quantum_for(effective_priority);
     }
 
     /// Read `clock` and report whether an aging epoch has been crossed
@@ -449,10 +479,16 @@ impl<E: SchedEntity> SchedCore<E> {
     /// with no slice outstanding (e.g. before `start_slice` has ever been
     /// called) — keep it.
     pub fn consume_quantum(&mut self) -> bool {
-        if self.remaining_ticks > 0 {
-            self.remaining_ticks -= 1;
+        self.consume_quantum_on(0)
+    }
+
+    /// [`Self::consume_quantum`] for CPU `cpu`'s slice.
+    pub fn consume_quantum_on(&mut self, cpu: usize) -> bool {
+        let left = &mut self.remaining_ticks[cpu];
+        if *left > 0 {
+            *left -= 1;
         }
-        self.remaining_ticks == 0
+        *left == 0
     }
 
     // ========================================================================
@@ -567,15 +603,52 @@ impl<E: SchedEntity> SchedCore<E> {
         }
 
         // (3) DuplicatePid — across run queues plus the wait queue.
+        self.check_unique_pids(core::iter::empty())
+    }
+
+    /// [`Self::check_invariants`], plus the entities the adapter holds
+    /// outside the core — one `running` slot per CPU (stage 7 of
+    /// `docs/smp/smp-plan.md`). Adds two checks the core alone cannot make:
+    ///
+    /// - **`DuplicatePid`** now spans the running slots too: an entity
+    ///   running on one CPU must not also be queued, or running on a second
+    ///   CPU. That is the SMP scheduler's first safety property — two CPUs
+    ///   resuming one entity's saved state would run it twice at once.
+    /// - **`RunningNotRunning`**: a running entity must not report
+    ///   `is_ready()` — the adapter marks it Running as it takes it, and a
+    ///   Ready entity in a running slot is one some path forgot to hand
+    ///   back.
+    ///
+    /// Idle entities are skipped by both: the kernel gives every CPU its own
+    /// idle entity, all with pid 0, as Linux does.
+    pub fn check_invariants_with_running<'a>(
+        &self,
+        running: impl Iterator<Item = &'a E> + Clone,
+    ) -> Result<(), Violation>
+    where
+        E: 'a,
+    {
+        self.check_invariants()?;
+        for entity in running.clone() {
+            if !entity.is_idle() && entity.is_ready() {
+                return Err(Violation::RunningNotRunning { pid: entity.pid() });
+            }
+        }
+        self.check_unique_pids(running.filter(|e| !e.is_idle()))
+    }
+
+    fn check_unique_pids<'a>(&self, extra: impl Iterator<Item = &'a E>) -> Result<(), Violation>
+    where
+        E: 'a,
+    {
         let mut seen: Vec<usize> = Vec::new();
-        for entity in self.iter_queued() {
-            let pid = entity.pid();
+        let queued = self.iter_queued().map(|e| e.pid());
+        for pid in queued.chain(extra.map(|e| e.pid())) {
             if seen.contains(&pid) {
                 return Err(Violation::DuplicatePid { pid });
             }
             seen.push(pid);
         }
-
         Ok(())
     }
 }
@@ -649,6 +722,89 @@ pub(crate) mod tests {
 
     pub(crate) fn parked(pid: usize, base: u8, eff: u8) -> Box<Ent> {
         Box::new(Ent { pid, base, eff, ready: false })
+    }
+
+    impl Ent {
+        /// What the kernel adapter does to `Process::state` as an entity
+        /// moves between a run queue (Ready) and a CPU or the wait queue.
+        pub(crate) fn set_ready(&mut self, ready: bool) {
+            self.ready = ready;
+        }
+    }
+
+    /// Stage 7: each CPU's slice is its own — exhausting one never ends
+    /// another's, and starting one never refills another's. Sabotage (one
+    /// shared counter again) fails the first assertion.
+    #[test]
+    fn slices_are_per_cpu() {
+        let mut core = SchedCore::<Ent>::new();
+        core.start_slice_on(0, 0); // quantum_for(0) == BASE_QUANTUM == 2
+        core.start_slice_on(1, 10);
+        assert!(!core.consume_quantum_on(0));
+        assert!(core.consume_quantum_on(0), "cpu 0's 2-tick slice ends on its 2nd tick");
+        assert!(!core.consume_quantum_on(1), "cpu 1's slice is untouched by cpu 0's ticks");
+        core.start_slice_on(0, 0);
+        for _ in 0..(crate::quantum_for(10) - 2) {
+            assert!(!core.consume_quantum_on(1));
+        }
+        assert!(core.consume_quantum_on(1));
+        assert!(!core.consume_quantum_on(0), "refilling cpu 0 left it a full slice");
+    }
+
+    /// `pop_next_ready_where` keeps strict priority and FIFO order among the
+    /// eligible entities, and leaves a rejected one exactly where it was.
+    #[test]
+    fn pop_next_ready_where_skips_without_reordering() {
+        let mut core = SchedCore::<Ent>::new();
+        core.add_reset_to_base(ent(1, 5, 5));
+        core.add_reset_to_base(ent(2, 5, 5));
+        core.add_reset_to_base(ent(3, 5, 5));
+        core.add_reset_to_base(ent(4, 3, 3));
+        assert_eq!(core.pop_next_ready_where(|e| e.pid() != 1).unwrap().pid(), 2);
+        assert_eq!(core.pop_next_ready_where(|e| e.pid() != 1).unwrap().pid(), 3);
+        // Only the rejected entity is left at priority 5: fall through to 3.
+        assert_eq!(core.pop_next_ready_where(|e| e.pid() != 1).unwrap().pid(), 4);
+        assert!(core.pop_next_ready_where(|e| e.pid() != 1).is_none());
+        assert!(core.has_ready());
+        assert_eq!(core.pop_next_ready().unwrap().pid(), 1, "the skipped entity is still queued");
+        assert!(!core.has_ready());
+    }
+
+    /// `check_invariants_with_running` sees the running slots: an entity
+    /// running on one CPU and also queued, or running on two CPUs, is a
+    /// `DuplicatePid`; a Ready entity in a running slot is
+    /// `RunningNotRunning`; any number of idle (pid 0) entities is fine.
+    #[test]
+    fn invariants_with_running_catch_double_running() {
+        let mut core = SchedCore::<Ent>::new();
+        core.add_reset_to_base(ent(1, 5, 5));
+        let idle_a = parked(0, 0, 0);
+        let idle_b = parked(0, 0, 0);
+        let mut run2 = ent(2, 5, 5);
+        run2.set_ready(false);
+        let ok = [&*idle_a, &*idle_b, &*run2];
+        assert_eq!(core.check_invariants_with_running(ok.iter().copied()), Ok(()));
+
+        let twice = [&*run2, &*run2];
+        assert_eq!(
+            core.check_invariants_with_running(twice.iter().copied()),
+            Err(Violation::DuplicatePid { pid: 2 })
+        );
+
+        let mut also_queued = ent(1, 5, 5);
+        also_queued.set_ready(false);
+        let q = [&*also_queued];
+        assert_eq!(
+            core.check_invariants_with_running(q.iter().copied()),
+            Err(Violation::DuplicatePid { pid: 1 })
+        );
+
+        let still_ready = ent(9, 5, 5);
+        let r = [&*still_ready];
+        assert_eq!(
+            core.check_invariants_with_running(r.iter().copied()),
+            Err(Violation::RunningNotRunning { pid: 9 })
+        );
     }
 
     /// 1. `add_reset_to_base` resets effective priority to base and lands

@@ -76,10 +76,8 @@ pub(super) fn sys_read(fd: i32, buf: usize, count: usize) -> SyscallResult {
         }
 
         // Buffer empty — register waiter and block.
-        let pid = crate::process::scheduler::current_pid().unwrap_or(0);
-        *STDIN_WAITER.lock() = Some(StdinWaiter { pid, user_buf: buf as u64 });
         let tf_ptr = current_tf_ptr();
-        block_stdin_read(tf_ptr)
+        block_stdin_read(tf_ptr, buf as u64)
     } else {
         // Continuous cli from before the fd lookup through either the fast
         // return or the block — same shape as sys_futex's FUTEX_WAIT. This
@@ -143,13 +141,36 @@ pub(super) fn sys_read(fd: i32, buf: usize, count: usize) -> SyscallResult {
 /// cli must already be in effect when this is called.
 /// Saves the current TrapFrame into the process Box, moves the process to the
 /// wait_queue, and jumps to the next Ready process.  Never returns.
-fn block_stdin_read(current_tf: *const TrapFrame) -> ! {
+///
+/// Registering in `STDIN_WAITER` and blocking are one step under the
+/// scheduler lock (stage 7 of docs/smp/smp-plan.md): `stdin_wakeup` takes
+/// `STDIN_WAITER` and then the scheduler lock, so it never finds this
+/// process between the two, running on another CPU. And the keyboard buffer
+/// is checked again with `STDIN_WAITER` held: the ISR pushes a key *before*
+/// it takes `STDIN_WAITER`, so a key that arrived after the caller's check
+/// is either seen here or finds this waiter — the syscall is re-executed in
+/// the first case (`rip -= 2`, `rax` still its number).
+fn block_stdin_read(current_tf: *const TrapFrame, user_buf: u64) -> ! {
     let next_tf = {
         let mut sched = crate::process::scheduler::local_scheduler();
-        sched.block_current(current_tf)
+        let pid = sched.current_pid().map(|p| p.0).unwrap_or(0);
+        let mut waiter = STDIN_WAITER.lock();
+        if crate::keyboard::read_key_peek() {
+            None
+        } else {
+            *waiter = Some(StdinWaiter { pid, user_buf });
+            drop(waiter);
+            Some(sched.block_current(current_tf))
+        }
         // Lock dropped here; sti happens via iretq of the next process.
     };
-    unsafe { crate::process::trapframe::jump_to_user(next_tf) }
+    match next_tf {
+        Some(tf) => unsafe { crate::process::trapframe::jump_to_user(tf) },
+        None => unsafe {
+            (*(current_tf as *mut TrapFrame)).rip -= 2;
+            crate::process::trapframe::jump_to_user(current_tf)
+        },
+    }
 }
 
 /// Called by the keyboard ISR after a key is pushed into the buffer.

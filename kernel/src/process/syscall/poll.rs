@@ -507,13 +507,19 @@ pub(super) fn poll_cancel_waiter(pid: usize) {
     }
 }
 
-/// Clear the POLL_WAITERS slot after an hrtimer timeout woke the process.
+/// Clear the POLL_WAITERS slot of a poll/epoll_wait whose timeout `timer`
+/// just fired — only if it is still that wait's: an event may have woken
+/// the process already, and on another CPU it may already be blocked in a
+/// new poll with a new waiter under the same pid.
 ///
-/// Called from the timer ISR (timer_preempt) AFTER the scheduler lock is
-/// released, satisfying the lock order: POLL_WAITERS → SCHEDULER.
+/// Called from the timer ISR (timer_preempt) *before* the process is woken,
+/// with the scheduler lock not held: lock order POLL_WAITERS → SCHEDULER.
 /// The timer has already fired so there is nothing to cancel.
-pub(crate) fn poll_clear_on_timeout(pid: usize) {
-    POLL_WAITERS.lock().remove(&pid);
+pub(crate) fn poll_clear_on_timeout(pid: usize, timer: u32) {
+    let mut waiters = POLL_WAITERS.lock();
+    if waiters.get(&pid).map_or(false, |w| w.timer_id == Some(timer)) {
+        waiters.remove(&pid);
+    }
 }
 
 // ── Helper: translate user VA → phys + page-boundary check ────────────────
@@ -557,6 +563,19 @@ fn check_epoll_ready_uva(
     events_ptr: u64,
     maxevents: usize,
 ) -> usize {
+    epoll_ready(epoll_id, socks, Some(events_ptr), maxevents)
+}
+
+/// How many of `epoll_id`'s watches are ready (at most `maxevents`),
+/// writing each as a `struct epoll_event` to `events_ptr` (a user VA of the
+/// running process) when given — `None` only counts, which is safe under
+/// the scheduler lock, where touching user memory is not.
+fn epoll_ready(
+    epoll_id: EpollInstanceId,
+    socks: &SocketMap,
+    events_ptr: Option<u64>,
+    maxevents: usize,
+) -> usize {
     let instances = EPOLL_INSTANCES.lock();
     let inst = match instances.get(epoll_id) {
         Some(i) => i,
@@ -575,12 +594,14 @@ fn check_epoll_ready_uva(
             if rev & POLLOUT != 0 { epoll_rev |= EPOLLOUT; }
             if rev & POLLERR != 0 { epoll_rev |= EPOLLERR; }
             if epoll_rev != 0 {
-                let ev = EpollEvent { events: epoll_rev, data: watch.data };
-                unsafe {
-                    core::ptr::write_unaligned(
-                        (events_ptr + written as u64 * 12) as *mut EpollEvent,
-                        ev,
-                    );
+                if let Some(events_ptr) = events_ptr {
+                    let ev = EpollEvent { events: epoll_rev, data: watch.data };
+                    unsafe {
+                        core::ptr::write_unaligned(
+                            (events_ptr + written as u64 * 12) as *mut EpollEvent,
+                            ev,
+                        );
+                    }
                 }
                 written += 1;
             }
@@ -643,35 +664,80 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u32, timeout_ms: i32) -> SyscallResul
         None => return errno::EFAULT,
     };
 
-    // Pre-set rax=0 (timeout return value)
-    unsafe { (*(tf_ptr as *mut TrapFrame)).rax = 0; }
-
-    // Register hrtimer if timeout_ms > 0
-    let timer_id = if timeout_ms > 0 {
-        let expiry = crate::time::ktime_get() + timeout_ms as u64 * 1_000_000;
-        Some(crate::time::hrtimer::start(
-            expiry,
-            crate::time::hrtimer::HrTimerAction::WakePid(pid),
-        ))
-    } else {
-        None // timeout_ms < 0 → wait forever
+    let ready_now = |socks: &SocketMap| {
+        (0..nfds as usize).any(|i| fd_check_ready(socks, fds[i].fd, fds[i].events) != 0)
     };
-
-    // Store waiter
-    POLL_WAITERS.lock().insert(pid, PollWaiter {
+    let waiter = PollWaiter {
         pid,
         phys_buf,
         phys_len: buf_size,
         kind: PollWaiterKind::Poll { nfds },
-        timer_id,
+        timer_id: None,
         socks,
-    });
+    };
+    block_poll_waiter(tf_ptr, waiter, timeout_ms, ready_now)
+}
 
+/// The blocking half shared by `poll` and `epoll_wait`: register `waiter`
+/// (and its timeout), then block — or, if `ready_now` finds something ready
+/// after all, restart the syscall instead.
+///
+/// Registering and blocking happen under the scheduler lock, as one step
+/// (stage 7 of docs/smp/smp-plan.md). A waker takes `POLL_WAITERS` and only
+/// then the scheduler lock, so once it can see this waiter the process is
+/// already Blocked — it can no longer be running on another CPU, between
+/// registering and blocking, where `wake_with_retval` would miss it. The
+/// same goes for the timeout's hrtimer, which the tick also turns into a
+/// wakeup under the scheduler lock.
+///
+/// The re-check closes the gap before that: an event on another CPU between
+/// the caller's fast-path check and this registration found no waiter to
+/// wake. Checked again once a waker would find us; if something is ready
+/// the waiter is withdrawn and the syscall re-executed (`rip -= 2`, `rax`
+/// still its number), which reports it through the fast path.
+fn block_poll_waiter(
+    tf_ptr: *const TrapFrame,
+    mut waiter: PollWaiter,
+    timeout_ms: i32,
+    ready_now: impl FnOnce(&SocketMap) -> bool,
+) -> SyscallResult {
+    let pid = waiter.pid;
+    let socks = waiter.socks;
     let next_tf = {
         let mut sched = crate::process::scheduler::local_scheduler();
-        sched.block_current(tf_ptr)
+
+        // Register hrtimer if timeout_ms > 0 (< 0 waits forever).
+        waiter.timer_id = if timeout_ms > 0 {
+            let expiry = crate::time::ktime_get() + timeout_ms as u64 * 1_000_000;
+            Some(crate::time::hrtimer::start(
+                expiry,
+                crate::time::hrtimer::HrTimerAction::WakePid(pid),
+            ))
+        } else {
+            None
+        };
+        let timer_id = waiter.timer_id;
+        POLL_WAITERS.lock().insert(pid, waiter);
+
+        if ready_now(&socks) {
+            POLL_WAITERS.lock().remove(&pid);
+            if let Some(tid) = timer_id {
+                crate::time::hrtimer::cancel(tid);
+            }
+            None
+        } else {
+            // Pre-set rax=0 (timeout return value)
+            unsafe { (*(tf_ptr as *mut TrapFrame)).rax = 0; }
+            Some(sched.block_current(tf_ptr))
+        }
     };
-    unsafe { crate::process::trapframe::jump_to_user(next_tf) }
+    match next_tf {
+        Some(tf) => unsafe { crate::process::trapframe::jump_to_user(tf) },
+        None => unsafe {
+            (*(tf_ptr as *mut TrapFrame)).rip -= 2;
+            crate::process::trapframe::jump_to_user(tf_ptr)
+        },
+    }
 }
 
 // ── sys_epoll_create ───────────────────────────────────────────────────────
@@ -827,32 +893,15 @@ pub(super) fn sys_epoll_wait(epfd: i32, events_ptr: u64, maxevents: i32, timeout
         None => return errno::EFAULT,
     };
 
-    // Pre-set rax=0 (timeout)
-    unsafe { (*(tf_ptr as *mut TrapFrame)).rax = 0; }
-
-    let timer_id = if timeout_ms > 0 {
-        let expiry = crate::time::ktime_get() + timeout_ms as u64 * 1_000_000;
-        Some(crate::time::hrtimer::start(
-            expiry,
-            crate::time::hrtimer::HrTimerAction::WakePid(pid),
-        ))
-    } else {
-        None
-    };
-
-    POLL_WAITERS.lock().insert(pid, PollWaiter {
+    let waiter = PollWaiter {
         pid,
         phys_buf,
         phys_len: buf_size,
         kind: PollWaiterKind::EpollWait { epoll_id, maxevents: maxevents as usize },
-        timer_id,
+        timer_id: None,
         socks,
-    });
-
-    let next_tf = {
-        let mut sched = crate::process::scheduler::local_scheduler();
-        sched.block_current(tf_ptr)
     };
-    unsafe { crate::process::trapframe::jump_to_user(next_tf) }
+    block_poll_waiter(tf_ptr, waiter, timeout_ms, |socks| {
+        epoll_ready(epoll_id, socks, None, maxevents as usize) > 0
+    })
 }
-

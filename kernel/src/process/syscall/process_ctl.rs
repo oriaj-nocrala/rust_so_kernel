@@ -559,8 +559,19 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
                 // if that was a shared (thread) address space, the actual
                 // page table/pages are only freed once every other thread
                 // sharing it has also exited (Arc refcount reaches 0).
-                proc.address_space = alloc::sync::Arc::new(loaded.address_space);
-                crate::ktrace!(crate::debug::SCHED, "exec: old AS dropped, new AS in place");
+                //
+                // Not dropped *here*, though: this CPU's CR3 still points at
+                // the old page table, and a PML4 freed while loaded is a
+                // frame another CPU can allocate and overwrite at once —
+                // this CPU then fetches its next instruction through
+                // garbage (found by stage 7 of docs/smp/smp-plan.md: a
+                // silent triple fault under concurrent execs). Kept alive
+                // until the new one is active, below.
+                let old_space = core::mem::replace(
+                    &mut proc.address_space,
+                    alloc::sync::Arc::new(loaded.address_space),
+                );
+                crate::ktrace!(crate::debug::SCHED, "exec: new AS in place");
                 crate::debug::inc_execs();
 
                 // The page-fault fast path caches a raw pointer to the
@@ -609,6 +620,7 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
 
                 crate::ktrace!(crate::debug::SCHED, "exec: activating new CR3");
                 unsafe { proc.address_space.activate(); }
+                drop(old_space);
                 crate::ktrace!(crate::debug::SCHED, "exec: CR3 active, jumping to entry={:#x}", proc.trapframe.rip);
                 // This direct field-by-field rewrite (above) discards
                 // whatever trapframe content this process had before exec —
@@ -749,14 +761,17 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
         };
 
         if let Some(pos) = zombie_pos {
-            // Safe to free the zombie's kernel stack and write the status
-            // straight into `status_ptr` right here: we're running on the
-            // *parent's* stack in the parent's own address space (this is
-            // its own waitpid() syscall), never the dead child's.
+            // Safe to write the status straight into `status_ptr` right
+            // here: we're running on the *parent's* stack in the parent's
+            // own address space (this is its own waitpid() syscall). The
+            // zombie's kernel stack is another matter since stage 7: the
+            // child's `sys_exit` may still be unwinding on it on another
+            // CPU, so it goes through the same deferred free as a thread's
+            // (freed by a later tick once no CPU is on it).
             let proc = scheduler.wait_queue_mut().remove(pos).unwrap();
             let status = proc.wait_status_word();
             let pid = proc.pid.0;
-            crate::init::processes::free_kernel_stack(proc.kernel_stack);
+            scheduler.defer_stack_free(proc.kernel_stack);
             crate::debug::inc_reaps();
             if status_ptr != 0 {
                 // write_unaligned, not write: `validate_user_buffer` only

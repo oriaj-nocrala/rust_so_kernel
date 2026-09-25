@@ -494,6 +494,11 @@ fn build_kernel() -> PathBuf {
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let kernel_dir = manifest_dir.join("kernel");
 
+    // Build-time kernel switches read with `option_env!` (the nested build
+    // inherits this environment, and rustc's own dep-info reruns it when
+    // they change — but only if this script runs at all).
+    println!("cargo:rerun-if-env-changed=CONSTANOS_NOSMP");
+
     // Every *input* of the nested kernel build (which itself builds all
     // userspace) must be watched from up here too — the nested build only
     // runs at all if this script reruns. NOT kernel/embedded: those files

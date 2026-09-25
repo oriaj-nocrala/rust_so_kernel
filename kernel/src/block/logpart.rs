@@ -226,10 +226,14 @@ pub fn periodic() {
         return;
     }
     let now = crate::time::ktime_get();
-    if now.wrapping_sub(LAST_FLUSH_NS.load(Ordering::Relaxed)) < PERIOD_NS {
+    let last = LAST_FLUSH_NS.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) < PERIOD_NS {
         return;
     }
-    LAST_FLUSH_NS.store(now, Ordering::Relaxed);
+    // Every CPU's idle process calls this: one of them per period flushes.
+    if LAST_FLUSH_NS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
     if crate::klog::mark() as u64 == FLUSHED_TO.load(Ordering::Relaxed) {
         return;
     }

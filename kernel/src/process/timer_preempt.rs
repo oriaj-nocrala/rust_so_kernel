@@ -25,67 +25,96 @@ pub fn ticks_total() -> u64 {
     TICK_COUNT.load(Ordering::Relaxed)
 }
 
-global_asm!(
-    ".global timer_interrupt_entry",
-    "timer_interrupt_entry:",
-    
-    // The direction flag (DF) is NOT cleared by interrupt delivery: a tick
-    // landing between a memmove's `std` and its `cld` would otherwise run the
-    // whole ISR (and its memcpys — including the trapframe box copy) with
-    // DF=1, copying BACKWARD. That was the root cause of months of
-    // intermittent hangs and heap-jump faults; see
-    // docs/hang-hunt-bug2-findings.md. The rustc x86-interrupt shims emit
-    // `cld` for the IDT handlers; this hand-written asm must too.
-    "cld",
-    
-    // Save ALL registers
-    "push rax",
-    "push rbx",
-    "push rcx",
-    "push rdx",
-    "push rsi",
-    "push rdi",
-    "push rbp",
-    "push r8",
-    "push r9",
-    "push r10",
-    "push r11",
-    "push r12",
-    "push r13",
-    "push r14",
-    "push r15",
-    
-    // Call handler with pointer to current TrapFrame
-    "mov rdi, rsp",
-    "call timer_preempt_handler",
-    
-    // Handler returns new TrapFrame pointer in RAX
-    // Switch RSP to new TrapFrame (may be same or different process)
-    "mov rsp, rax",
-    
-    // Restore registers from the (possibly new) process
-    "pop r15",
-    "pop r14",
-    "pop r13",
-    "pop r12",
-    "pop r11",
-    "pop r10",
-    "pop r9",
-    "pop r8",
-    "pop rbp",
-    "pop rdi",
-    "pop rsi",
-    "pop rdx",
-    "pop rcx",
-    "pop rbx",
-    "pop rax",
-    
-    // IRETQ to the (possibly new) process
-    "iretq",
-);
+/// What the timer and reschedule-IPI handlers return to their asm stubs,
+/// in RAX:RDX: the frame to resume, and this CPU's `scheduler::LEAVING`
+/// slot, cleared by the stub the moment RSP has left the old stack.
+#[repr(C)]
+pub struct Resume {
+    tf: *const TrapFrame,
+    leaving: *mut u64,
+}
+
+impl Resume {
+    fn to(tf: *const TrapFrame) -> Self {
+        Self { tf, leaving: super::scheduler::leaving_slot() }
+    }
+}
+
+/// An interrupt entry that can switch processes: save every GPR on the
+/// interrupted stack, call `$handler(frame)`, then resume whichever frame it
+/// returned.
+macro_rules! switching_entry {
+    ($entry:literal, $handler:literal) => {
+        global_asm!(
+            concat!(".global ", $entry),
+            concat!($entry, ":"),
+
+            // The direction flag (DF) is NOT cleared by interrupt delivery: a
+            // tick landing between a memmove's `std` and its `cld` would
+            // otherwise run the whole ISR (and its memcpys — including the
+            // trapframe box copy) with DF=1, copying BACKWARD. That was the
+            // root cause of months of intermittent hangs and heap-jump faults;
+            // see docs/hang-hunt-bug2-findings.md. The rustc x86-interrupt
+            // shims emit `cld` for the IDT handlers; this hand-written asm
+            // must too.
+            "cld",
+
+            // Save ALL registers
+            "push rax",
+            "push rbx",
+            "push rcx",
+            "push rdx",
+            "push rsi",
+            "push rdi",
+            "push rbp",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+
+            // Call handler with pointer to current TrapFrame
+            "mov rdi, rsp",
+            concat!("call ", $handler),
+
+            // Handler returns (new TrapFrame, LEAVING slot) in RAX:RDX.
+            // Switch RSP to the new TrapFrame (may be same or different
+            // process), then release the stack we were on.
+            "mov rsp, rax",
+            "mov qword ptr [rdx], 0",
+
+            // Restore registers from the (possibly new) process
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rbp",
+            "pop rdi",
+            "pop rsi",
+            "pop rdx",
+            "pop rcx",
+            "pop rbx",
+            "pop rax",
+
+            // IRETQ to the (possibly new) process
+            "iretq",
+        );
+    };
+}
+
+switching_entry!("timer_interrupt_entry", "timer_preempt_handler");
+switching_entry!("resched_interrupt_entry", "resched_ipi_handler");
 
 extern "C" {
     pub fn timer_interrupt_entry();
+    pub fn resched_interrupt_entry();
 }
 
 /// Validate a TrapFrame that `timer_interrupt_entry`'s asm is about to iretq
@@ -156,97 +185,120 @@ fn validate_resume_frame(tf: *const TrapFrame, kstack_top: u64, site: &'static s
 }
 
 #[no_mangle]
-pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> *const TrapFrame {
+pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> Resume {
     // ── 1. EOI (must be first — acknowledge interrupt) ────────────────
     // The LAPIC timer's, or the PIT's through the 8259 if the APIC switch
     // declined (`interrupts::apic::init`) — both on vector 32.
     crate::interrupts::eoi(crate::interrupts::apic::TIMER_VECTOR);
 
-    crate::drivers::framebuffer_console::tick_cursor_blink();
-
-    // ── 1b. USB keyboard input ────────────────────────────────────────
-    // The xHCI driver has no interrupt of its own (see `usb/mod.rs`), so
-    // its event ring is drained here, at 100 Hz. Cheap in the common case:
-    // one uncached read of a TRB's cycle bit per controller. Runs before
-    // the scheduler lock is taken below — `poll` feeds decoded keys
-    // through `tty::feed_input`, which can take that same lock to deliver
-    // SIGINT, and a spin lock is not reentrant.
-    crate::usb::poll();
-
-    // ── 2. Advance jiffies counter ────────────────────────────────────
-    // crate::time::clockevent::tick();
-
-    TICK_COUNT.fetch_add(1, Ordering::Relaxed);
-
     // Per-CPU GS invariant (`cpu/percpu.rs`): two rdmsrs, 100 Hz.
     crate::cpu::percpu::check_gs_invariant();
 
-    // ── 3. Fire expired hrtimers ──────────────────────────────────────
-    //
-    // tick() acquires QUEUE, drains expired timers, releases QUEUE, then
-    // returns a list of PIDs to wake.  QUEUE is always released before we
-    // acquire the scheduler lock below (ABBA-deadlock prevention).
-    let mut wake_pids = [0usize; 8];
-    let wake_count = {
+    // ── 2. Global work: CPU 0 only ────────────────────────────────────
+    // Every CPU that schedules gets this tick (stage 7 of
+    // docs/smp/smp-plan.md); what is not per-CPU runs once per period, on
+    // the BSP (decision 3): the cursor, the USB poll, `TICK_COUNT` (the
+    // 100 Hz check of `/proc/kdebug`) and the hrtimers.
+    let bsp = crate::cpu::cpu_id() == 0;
+    let mut wake_pids = [(0usize, 0u32); 8];
+    let mut wake_count = 0;
+    if bsp {
+        crate::drivers::framebuffer_console::tick_cursor_blink();
+
+        // The xHCI driver has no interrupt of its own (see `usb/mod.rs`), so
+        // its event ring is drained here, at 100 Hz. Cheap in the common
+        // case: one uncached read of a TRB's cycle bit per controller. Runs
+        // before the scheduler lock is taken below — `poll` feeds decoded
+        // keys through `tty::feed_input`, which can take that same lock to
+        // deliver SIGINT, and a spin lock is not reentrant.
+        crate::usb::poll();
+
+        TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+
+        // tick() acquires QUEUE, drains expired timers, releases QUEUE, then
+        // returns a list of PIDs to wake. QUEUE is always released before we
+        // acquire the scheduler lock below (ABBA-deadlock prevention).
         let now_ns = crate::time::ktime_get();
-        crate::time::hrtimer::tick(now_ns, &mut wake_pids)
-    };
+        wake_count = crate::time::hrtimer::tick(now_ns, &mut wake_pids);
 
-    // ── 4. Scheduler: wake hrtimer PIDs + tick time slice ────────────
-    //
-    // Acquire scheduler lock once for all wakeups + the tick decision.
-    // Release it before clearing POLL_WAITERS to obey lock order:
-    //   POLL_WAITERS → SCHEDULER (never the reverse).
-    let next_tf = {
-        let mut scheduler = super::scheduler::local_scheduler();
-
-        for &pid in &wake_pids[..wake_count] {
-            // ktrace, not serial_println!: once per sleep (a game sleeps
-            // every frame) flooded the klog ring, and taking the SERIAL
-            // lock from the timer ISR can wait forever on the code it
-            // interrupted.
-            crate::ktrace!(crate::debug::SCHED, "hrtimer waking PID {}", pid);
-            scheduler.wake(pid);
+        // A timed-out poll/epoll waiter is removed *before* its process is
+        // woken, not after: once woken it can run on another CPU at once and
+        // register a new waiter under the same pid, which a clear after the
+        // wake would then delete (the process would sleep forever). Lock
+        // order POLL_WAITERS → SCHEDULER is kept either way: not nested.
+        for &(pid, timer) in &wake_pids[..wake_count] {
+            crate::process::syscall::poll_clear_on_timeout(pid, timer);
         }
-
-        if !scheduler.tick(unsafe { (*current_tf).rsp }) {
-            // Slice still has ticks remaining — continue current process,
-            // but it may have just been sent a signal (e.g. by another
-            // process's kill() while this one was running) — check before
-            // resuming it. Still clear poll waiters for any pids woken by
-            // hrtimer either way.
-            let tf = scheduler.resolve_signals(current_tf);
-            scheduler.resolve_wait_status();
-            let kstack_top = scheduler.running_ref().map(|p| p.kernel_stack.as_u64()).unwrap_or(0);
-            drop(scheduler);
-            for &pid in &wake_pids[..wake_count] {
-                crate::process::syscall::poll_clear_on_timeout(pid);
-            }
-            validate_resume_frame(tf, kstack_top, "timer-no-switch");
-            return tf;
-        }
-
-        // ── 5. Time slice exhausted — context switch ──────────────────
-        let tf = scheduler.switch_to_next(current_tf);
-        let tf = scheduler.resolve_signals(tf);
-        // A process woken from a blocked waitpid() (see `Scheduler::
-        // notify_child_death`) most commonly gets picked up right here —
-        // this is the scheduler's main "what runs next" decision point,
-        // called on every exhausted time slice. Must flush its pending
-        // status now, same as every other "about to return to user mode"
-        // site (`trapframe::jump_to_user`, the syscall-return epilogue).
-        scheduler.resolve_wait_status();
-        let kstack_top = scheduler.running_ref().map(|p| p.kernel_stack.as_u64()).unwrap_or(0);
-        validate_resume_frame(tf, kstack_top, "timer-switch");
-        tf
-        // scheduler lock released here
-    };
-
-    // Clear stale POLL_WAITERS slots for PIDs woken by hrtimer timeout.
-    // Must happen after the scheduler lock is released (lock-order rule).
-    for &pid in &wake_pids[..wake_count] {
-        crate::process::syscall::poll_clear_on_timeout(pid);
     }
 
-    next_tf
+    // ── 3. Scheduler: wake hrtimer PIDs + tick time slice ────────────
+    let mut scheduler = super::scheduler::local_scheduler();
+
+    for &(pid, _) in &wake_pids[..wake_count] {
+        // ktrace, not serial_println!: once per sleep (a game sleeps
+        // every frame) flooded the klog ring, and taking the SERIAL
+        // lock from the timer ISR can wait forever on the code it
+        // interrupted.
+        crate::ktrace!(crate::debug::SCHED, "hrtimer waking PID {}", pid);
+        scheduler.wake(pid);
+    }
+
+    // Not scheduling yet (boot, before `start_first_process`; the QEMU
+    // integration tests): there is nothing to preempt.
+    if scheduler.running_ref().is_none() {
+        return Resume::to(current_tf);
+    }
+
+    if !scheduler.tick(unsafe { (*current_tf).rsp }) {
+        // Slice still has ticks remaining — continue current process,
+        // but it may have just been sent a signal (e.g. by another
+        // process's kill() while this one was running) — check before
+        // resuming it.
+        let tf = scheduler.resolve_signals(current_tf);
+        scheduler.resolve_wait_status();
+        let kstack_top = scheduler.running_ref().map(|p| p.kernel_stack.as_u64()).unwrap_or(0);
+        drop(scheduler);
+        validate_resume_frame(tf, kstack_top, "timer-no-switch");
+        return Resume::to(tf);
+    }
+
+    // ── 4. Time slice exhausted (or idle with work) — context switch ──
+    let tf = switch_and_resolve(&mut scheduler, current_tf);
+    let kstack_top = scheduler.running_ref().map(|p| p.kernel_stack.as_u64()).unwrap_or(0);
+    drop(scheduler);
+    validate_resume_frame(tf, kstack_top, "timer-switch");
+    Resume::to(tf)
+}
+
+/// `switch_to_next`, then everything owed to a process about to return to
+/// user mode: pending signals, and a reaped child's wait status (see
+/// `Scheduler::notify_child_death`) — this is the scheduler's main "what
+/// runs next" decision point, and a process woken from a blocked waitpid()
+/// is most commonly picked up right here.
+fn switch_and_resolve(
+    scheduler: &mut super::scheduler::TrackedSchedulerGuard,
+    current_tf: *const TrapFrame,
+) -> *const TrapFrame {
+    let tf = scheduler.switch_to_next(current_tf);
+    let tf = scheduler.resolve_signals(tf);
+    scheduler.resolve_wait_status();
+    tf
+}
+
+/// The reschedule IPI (`scheduler::RESCHED_VECTOR`): another CPU made work
+/// Ready while this one idles. Switch now instead of at the next tick.
+/// Arriving anywhere else — the CPU stopped idling between the send and the
+/// delivery — it is a no-op.
+#[no_mangle]
+pub extern "C" fn resched_ipi_handler(current_tf: *const TrapFrame) -> Resume {
+    crate::interrupts::eoi(super::scheduler::RESCHED_VECTOR);
+    let mut scheduler = super::scheduler::local_scheduler();
+    if !scheduler.resched_due() {
+        return Resume::to(current_tf);
+    }
+    let tf = switch_and_resolve(&mut scheduler, current_tf);
+    let kstack_top = scheduler.running_ref().map(|p| p.kernel_stack.as_u64()).unwrap_or(0);
+    drop(scheduler);
+    validate_resume_frame(tf, kstack_top, "resched-ipi");
+    Resume::to(tf)
 }

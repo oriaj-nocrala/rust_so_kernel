@@ -36,7 +36,7 @@ use alloc::sync::Arc;
 use crate::sync::Mutex;
 
 use super::file::{FileError, FileHandle, FileResult};
-use super::{Process, ProcessState};
+use super::Process;
 
 const PIPE_CAPACITY: usize = 4096;
 
@@ -106,20 +106,17 @@ unsafe fn copy_from_user(proc: &Process, user_addr: u64, dst: &mut [u8]) -> usiz
     proc.address_space.copy_from_user(user_addr, dst)
 }
 
-/// Find `pid` in the wait queue (must be Blocked), run `f` on it to compute
-/// its syscall return value, then wake it. `f` returns the `rax` value.
+/// Run `f` on the waiting process `pid` to compute its syscall return value,
+/// then wake it. Usually it is Blocked; with several CPUs it can also still
+/// be running, between registering here and blocking — then the result
+/// waits in `Process::wake_pending` for its `block_current` (a pipe waiter is
+/// registered only on the way to blocking and removed by this very wakeup,
+/// so it is never stale). `f` returns the `rax` value.
 fn deliver_and_wake(pid: usize, f: impl FnOnce(&super::Process) -> u64) {
     let mut sched = super::scheduler::local_scheduler();
-    if let Some(idx) = sched.wait_queue().iter().position(|p| {
-        p.pid.0 == pid && matches!(p.state, ProcessState::Blocked)
-    }) {
-        let rax = f(&sched.wait_queue()[idx]);
-        sched.wait_queue_mut()[idx].trapframe.rax = rax;
-        crate::ktrace!(crate::debug::FS, "pipe wake pid={} rax={:#x}", pid, rax);
-    } else {
-        crate::ktrace!(crate::debug::FS, "pipe wake pid={}: NOT BLOCKED, delivery dropped", pid);
+    if !sched.deliver_to_waiter(pid, f) {
+        crate::ktrace!(crate::debug::FS, "pipe wake pid={}: NOT WAITING, delivery dropped", pid);
     }
-    sched.wake(pid);
 }
 
 /// Hand `data` straight to a blocked reader (or wake it with a 0-byte EOF
@@ -136,15 +133,11 @@ fn wake_reader(waiter: PipeWaiter, data: &[u8]) {
 /// bytes actually copied so the caller can push them into the ring buffer.
 fn collect_from_writer(waiter: PipeWaiter, dst: &mut [u8]) -> usize {
     let want = core::cmp::min(dst.len(), waiter.count);
-    let mut sched = super::scheduler::local_scheduler();
     let mut got = 0usize;
-    if let Some(idx) = sched.wait_queue().iter().position(|p| {
-        p.pid.0 == waiter.pid && matches!(p.state, ProcessState::Blocked)
-    }) {
-        got = unsafe { copy_from_user(&sched.wait_queue()[idx], waiter.user_buf, &mut dst[..want]) };
-        sched.wait_queue_mut()[idx].trapframe.rax = got as u64;
-    }
-    sched.wake(waiter.pid);
+    deliver_and_wake(waiter.pid, |proc| {
+        got = unsafe { copy_from_user(proc, waiter.user_buf, &mut dst[..want]) };
+        got as u64
+    });
     got
 }
 
