@@ -151,7 +151,10 @@ fn main(args: Args) -> i32 {
                         Request::Frame { surface: SURFACE, id: cb },
                         Request::Commit { surface: SURFACE },
                     ]) {
-                        return 1;
+                        // The compositor closed between its last event and
+                        // this send (EPIPE): the same ending as an EOF.
+                        println!("gui_demo: compositor gone after {} frames", frames);
+                        return 0;
                     }
                 }
                 Event::Key { code, pressed, .. } => {

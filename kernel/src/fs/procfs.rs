@@ -121,9 +121,9 @@ fn render_proc_stat(pid: usize, snap: &crate::process::scheduler::ProcStatSnapsh
         crate::process::ProcessState::Stopped => 'T',
     };
     format!(
-        "{pid} ({comm}) {state} {ppid} {pgid} {pgid} 0 -1 0 0 0 0 0 0 0 0 0 {priority} 0 0 0 0 0 0\n",
+        "{pid} ({comm}) {state} {ppid} {pgid} {sid} 0 -1 0 0 0 0 0 0 0 0 0 {priority} 0 0 0 0 0 0\n",
         pid = pid, comm = comm, state = state,
-        ppid = snap.ppid, pgid = snap.pgid, priority = snap.priority,
+        ppid = snap.ppid, pgid = snap.pgid, sid = snap.sid, priority = snap.priority,
     )
 }
 

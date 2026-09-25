@@ -4,7 +4,7 @@
 > (ver su registro al final). Fase 2: 2.1 hecho y verificado en QEMU y en la Ryzen;
 > 2.2 a 2.5 hechos y verificados en QEMU y en la Ryzen (2.2 en el boot #43,
 > 2.3 y 2.5 en el #45; 2.4 son tests de host). Fase 2 cerrada. Fase 3 planificada
-> (decisiones del 2026-09-25) y empezada por 3.1.
+> (decisiones del 2026-09-25); 3.1 y 3.2 hechos.
 
 ## Por qué ahora, y por qué así
 
@@ -440,25 +440,31 @@ crudo, `cat` en canónico con retroceso y `^U`, `^D` a mitad de línea, un
 en canónico, `read` nunca devuelve media línea salvo que el búfer sea más
 pequeño).
 
-### 3.2 Kernel: sesiones y tty de control
+### 3.2 Kernel: sesiones
 
-- `Process` gana `sid` y `ctty: Option<TtyRef>`, heredados en `fork` y
-  `clone`. `setsid` real: falla con `EPERM` si ya es líder de grupo y, si
-  no, crea sesión y grupo nuevos sin tty de control. `getsid` (124).
-  `setpgid` pasa a exigir la misma sesión.
-- **Tty de control:** `TIOCSCTTY` desde un líder de sesión sin tty, y el
-  primer `open` del esclavo sin `O_NOCTTY` por un líder sin tty, como en
-  Linux. `TIOCNOTTY` lo suelta. `/dev/tty` abre el tty de control del
-  proceso (`ENXIO` si no tiene).
-- **Estado por tty:** `termios`, grupo en primer plano, sesión y
-  `winsize` viven en el tty, no en statics. La consola sigue con su estado
-  global y su camino de siempre (`feed_input`, fd 0), y sus `ioctl`s no
-  cambian.
+- `Process` gana `sid`, heredado en `fork` y `clone`. `setsid` real:
+  falla con `EPERM` si ya existe un grupo con el pid del que llama y, si
+  no, crea sesión y grupo nuevos. `getsid` (124).
+- `setpgid` sigue las reglas de POSIX: solo sobre uno mismo o un hijo
+  (`ESRCH`), en la misma sesión y sin ser líder de sesión (`EPERM`), y
+  unirse a un grupo solo si existe en la sesión (`EPERM`).
 - `SIGWINCH` (28) y `SIGURG` (23) se ignoran por defecto, como en Linux.
-- `TIOCGSID`.
+- `/proc/<pid>/stat` da la sesión real en el campo 6.
+
+El tty de control (`TIOCSCTTY`, `TIOCNOTTY`, `/dev/tty`, `TIOCGSID`) y el
+estado por tty pasan al 3.3: sin un pty no hay ningún tty sobre el que
+actuar ni con el que probarlos. La consola sigue con su estado global y su
+camino de siempre (`feed_input`, fd 0), y sus `ioctl`s no cambian.
 
 ### 3.3 Kernel: el pty
 
+- **El tty de control** (de 3.2): `Process` gana `ctty`. `TIOCSCTTY`
+  desde un líder de sesión sin tty, y el primer `open` del esclavo sin
+  `O_NOCTTY` por un líder sin tty, como en Linux (`tty::jobctl`).
+  `TIOCNOTTY` lo suelta, `/dev/tty` abre el del proceso (`ENXIO` si no
+  tiene) y `TIOCGSID`. `termios`, grupo en primer plano, sesión y
+  `winsize` viven en el pty. Cuando el líder de sesión muere, la sesión
+  pierde su tty de control.
 - **`/dev/ptmx`**: cada `open` crea un par (hasta 16) y devuelve el
   maestro. `TIOCGPTN` da el número y `TIOCSPTLCK` lo desbloquea; el
   esclavo, `/dev/pts/N`, no se puede abrir hasta entonces. `/dev/pts`
@@ -879,4 +885,39 @@ lo conectan 3.2 y 3.3.
   `VDISABLE`, `EIO` antes de abrir un esclavo, una línea leída que dejaba
   una marca de EOF, el hueco del fin de línea, `SIGTTOU` ignorada y el
   despertar del escritor del maestro).
+
+### Fase 3.2 (2026-09-25)
+
+Sesiones reales: `Process::sid`, `setsid` y `getsid` reales, `setpgid`
+con las reglas de POSIX y `SIGWINCH`/`SIGURG` ignoradas por defecto (hasta
+ahora terminaban el proceso: un cambio de tamaño del terminal habría
+matado a todo programa sin manejador). `sys_getsid` en el port de mlibc.
+Test nuevo en el disco, `session_test` (20 comprobaciones: `setsid` desde
+un líder y desde un hijo, herencia en `fork`, `setpgid` entre sesiones,
+sobre un no hijo, a un grupo inexistente y al de un hermano, `getsid` de
+nadie, las dos señales y el campo 6 de `/proc/self/stat`).
+
+El tty de control se mueve al 3.3 (ver arriba).
+
+**Verificado en QEMU** (`-smp 4`, 8 GiB): `session_test` PASS; en 0
+`jobctl_test`, `lifecycle_test`, `wait_intr_test`, `sigsuspend_test`,
+`mlibc_signal_test`, `pipe_multi_test`, `socket_test`, `fork_exec_test` y
+`userlib_test`; `^C`, `^Z` y `jobs` en ash; `boot-matrix.sh 4 5` 20/20;
+`run-kernel-tests.sh` PASS; `gui-e2e.sh` 3/3.
+
+**`gui-e2e` destapó una carrera en `gui_demo`**, no en el kernel. Si el
+compositor cierra justo cuando `gui_demo` manda un cuadro, el `send`
+falla con `EPIPE` y `gui_demo` salía con 1 sin decir nada, así que la
+comprobación 6 no veía "compositor gone". Ahora ese camino lo dice
+también.
+
+**Bug abierto, anterior al 3.2** (se reproduce igual en `ab6a120`): con
+un trabajo parado, `sleep 2 & wait` en ash no vuelve nunca. Traza con
+`kdebug proc on`: tras recoger el `sleep`, `waitpid(-1, WNOHANG|WUNTRACED)`
+da 0, porque el hijo parado existe y su parada ya se contó, y ash vuelve a
+`sigsuspend` sin nada que lo despierte (`dowait` repite `waitone` mientras
+el pid sea ≥ 0). En el host, la `busybox` 1.36.1 de Arch hace ese mismo
+último `wait4` = 0 y termina sin `rt_sigsuspend` (`strace`). Queda saber
+si esa `busybox` no es el mismo código que el submódulo o si hay una
+diferencia de kernel que falta.
 

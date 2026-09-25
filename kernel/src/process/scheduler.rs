@@ -1656,6 +1656,7 @@ pub fn all_pids() -> alloc::vec::Vec<usize> {
 pub struct ProcStatSnapshot {
     pub ppid: usize,
     pub pgid: u32,
+    pub sid: u32,
     pub name: [u8; 16],
     pub state: crate::process::ProcessState,
     pub priority: u8,
@@ -1668,6 +1669,7 @@ pub fn proc_stat_snapshot(pid: usize) -> Option<ProcStatSnapshot> {
         .map(|p| ProcStatSnapshot {
             ppid: p.parent_pid.map(|pp| pp.0).unwrap_or(0),
             pgid: p.pgid,
+            sid: p.sid,
             name: p.name,
             state: p.state,
             priority: p.effective_priority,

@@ -124,6 +124,7 @@ constexpr long SYS_kill = 62;
 constexpr long SYS_setpgid = 109;
 constexpr long SYS_setsid = 112;
 constexpr long SYS_getpgid = 121;
+constexpr long SYS_getsid = 124;
 constexpr long SYS_arch_prctl = 158;
 
 // Not real syscall numbers — internal ioctl `request` values this port
@@ -558,6 +559,14 @@ int sys_getpgid(pid_t pid, pid_t *pgid) {
 	if (ret < 0)
 		return (int)-ret;
 	*pgid = (pid_t)ret;
+	return 0;
+}
+
+int sys_getsid(pid_t pid, pid_t *sid) {
+	long ret = raw_syscall(SYS_getsid, pid);
+	if (ret < 0)
+		return (int)-ret;
+	*sid = (pid_t)ret;
 	return 0;
 }
 

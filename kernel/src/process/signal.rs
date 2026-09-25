@@ -45,6 +45,8 @@ pub const SIGSTOP: u32 = 19;
 pub const SIGTSTP: u32 = 20;
 pub const SIGTTIN: u32 = 21;
 pub const SIGTTOU: u32 = 22;
+pub const SIGURG: u32 = 23;
+pub const SIGWINCH: u32 = 28;
 
 // 64, not 32: `pending_signals`/`blocked_signals` are `u64` bitmasks, so 64
 // is the natural width — and mlibc's pthread subsystem unconditionally
@@ -92,11 +94,13 @@ pub enum SignalOutcome {
     Stop(u32),
 }
 
-/// SIGCHLD and SIGCONT default to Ignore; everything else this kernel
-/// raises defaults to Terminate *except* SIGSTOP/SIGTSTP, which
+/// SIGCHLD, SIGCONT, SIGURG and SIGWINCH default to Ignore, as in Linux;
+/// everything else defaults to Terminate *except* SIGSTOP/SIGTSTP, which
 /// `deliver_pending` checks before ever consulting this (see there).
+/// SIGWINCH and SIGURG used to terminate: a terminal resize would have
+/// killed every foreground program that had not installed a handler.
 fn default_terminates(sig: u32) -> bool {
-    sig != SIGCHLD && sig != SIGCONT
+    !matches!(sig, SIGCHLD | SIGCONT | SIGURG | SIGWINCH)
 }
 
 /// Set `sig`'s pending bit. Pending state is independent of whether the

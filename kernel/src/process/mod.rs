@@ -143,9 +143,15 @@ pub struct Process {
     /// Process group id (job control). Defaults to this process's own pid
     /// (group leader) at creation; `fork()`/`clone()` inherit the parent's
     /// pgid unless `setpgid()` later changes it — matches real POSIX
-    /// default behavior. There is no separate session-id concept tracked —
-    /// `setsid()` is approximated as "become your own group leader".
+    /// default behavior.
     pub pgid: u32,
+
+    /// Session id (phase 3.2 of `docs/gui/gui-plan.md`). The pid of the
+    /// session's leader; inherited by `fork()`/`clone()`, changed only by
+    /// `setsid()`. PID 1 leads session 1, and every process descends from
+    /// it. Until 2026-09-25 there was none: `setsid()` only made the caller
+    /// a group leader, and `setpgid()` could move a process into any group.
+    pub sid: u32,
 
     /// Set when this process is currently `ProcessState::Stopped`, to the
     /// signal that stopped it (SIGSTOP or SIGTSTP) — read by
@@ -343,6 +349,7 @@ impl Process {
             pending_wait_status: None,
             killed_by_signal: None,
             pgid: pid.0 as u32,
+            sid: pid.0 as u32,
             stopped_by_signal: None,
             stop_reported: false,
             fs_base: 0,
@@ -423,6 +430,7 @@ impl Process {
             pending_wait_status: None,
             killed_by_signal: None,
             pgid: pid.0 as u32,
+            sid: pid.0 as u32,
             stopped_by_signal: None,
             stop_reported: false,
             fs_base: 0,
@@ -466,6 +474,7 @@ impl Process {
         files: FileDescriptorTable,
         cwd: alloc::string::String,
         parent_pgid: u32,
+        parent_sid: u32,
         exe_name: alloc::string::String,
         fpu_state: Box<fpu::FpuState>,
     ) -> Self {
@@ -493,6 +502,7 @@ impl Process {
             pending_wait_status: None,
             killed_by_signal: None,
             pgid: parent_pgid,
+            sid: parent_sid,
             stopped_by_signal: None,
             stop_reported: false,
             fs_base: 0,
@@ -540,6 +550,7 @@ impl Process {
         owned_stack_vma: Option<(u64, usize)>,
         cwd: alloc::string::String,
         parent_pgid: u32,
+        parent_sid: u32,
         exe_name: alloc::string::String,
     ) -> Self {
         let mut trapframe = Box::new(TrapFrame::default());
@@ -590,6 +601,7 @@ impl Process {
             pending_wait_status: None,
             killed_by_signal: None,
             pgid: parent_pgid,
+            sid: parent_sid,
             stopped_by_signal: None,
             stop_reported: false,
             fs_base: 0,

@@ -283,7 +283,7 @@ pub(super) fn sys_fork() -> SyscallResult {
     unsafe { crate::process::fpu::save(&mut parent_fpu_state); }
 
     // Collect what we need from the running process
-    let (child_as, parent_pid, parent_fs_base, files, child_tf, parent_cwd, parent_pgid, parent_exe_name, parent_signals) = {
+    let (child_as, parent_pid, parent_fs_base, files, child_tf, parent_cwd, (parent_pgid, parent_sid), parent_exe_name, parent_signals) = {
         let scheduler = crate::process::scheduler::local_scheduler();
         match scheduler.running_ref() {
             Some(proc) => {
@@ -296,7 +296,7 @@ pub(super) fn sys_fork() -> SyscallResult {
                     // only refreshed when the parent is switched out, so it is
                     // stale if `arch_prctl` ran since — same reasoning as the
                     // live `fpu::save` above.
-                    Ok(child_as) => (child_as, proc.pid, crate::process::scheduler::read_fs_base(), proc.files.lock().clone(), tf_copy, proc.cwd.clone(), proc.pgid, proc.exe_name.clone(),
+                    Ok(child_as) => (child_as, proc.pid, crate::process::scheduler::read_fs_base(), proc.files.lock().clone(), tf_copy, proc.cwd.clone(), (proc.pgid, proc.sid), proc.exe_name.clone(),
                         (proc.signal_handlers, proc.sig_restart, proc.blocked_signals)),
                     Err(e) => {
                         serial_println!("fork: address_space.fork() failed: {}", e);
@@ -317,7 +317,7 @@ pub(super) fn sys_fork() -> SyscallResult {
         let mut child = alloc::boxed::Box::new(
             crate::process::Process::new_user_from_fork(
                 pid, parent_pid, alloc::boxed::Box::new(child_tf),
-                kernel_stack, child_as, files, parent_cwd, parent_pgid, parent_exe_name,
+                kernel_stack, child_as, files, parent_cwd, parent_pgid, parent_sid, parent_exe_name,
                 alloc::boxed::Box::new(parent_fpu_state),
             )
         );
@@ -364,10 +364,10 @@ pub(super) fn sys_fork() -> SyscallResult {
 /// thread's `Process` immediately instead of waiting for a collector that
 /// will never come).
 pub(super) fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
-    let (parent_pid, address_space, files, parent_cwd, parent_pgid, parent_exe_name, parent_signals) = {
+    let (parent_pid, address_space, files, parent_cwd, (parent_pgid, parent_sid), parent_exe_name, parent_signals) = {
         let sched = crate::process::scheduler::local_scheduler();
         match sched.running_ref() {
-            Some(proc) => (proc.pid, proc.address_space.clone(), proc.files.clone(), proc.cwd.clone(), proc.pgid, proc.exe_name.clone(),
+            Some(proc) => (proc.pid, proc.address_space.clone(), proc.files.clone(), proc.cwd.clone(), (proc.pgid, proc.sid), proc.exe_name.clone(),
                 (proc.signal_handlers, proc.sig_restart, proc.blocked_signals)),
             None => return errno::ESRCH,
         }
@@ -397,7 +397,7 @@ pub(super) fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
         crate::process::Process::new_thread(
             pid, parent_pid,
             x86_64::VirtAddr::new(entry), x86_64::VirtAddr::new(stack),
-            kernel_stack, address_space, files, owned_stack_vma, parent_cwd, parent_pgid, parent_exe_name,
+            kernel_stack, address_space, files, owned_stack_vma, parent_cwd, parent_pgid, parent_sid, parent_exe_name,
         )
     );
     // A copy, not Linux's shared table (CLONE_SIGHAND): enough that a
@@ -985,40 +985,80 @@ pub(super) fn sys_kill(target_pid: i64, sig: u32) -> SyscallResult {
     })
 }
 
-// ── setpgid(109) / getpgid(121) / setsid(112) ───────────────────────────────
+// ── setpgid(109) / getpgid(121) / getsid(124) / setsid(112) ───────────────────────────────
 
 /// setpgid(109): int setpgid(pid_t pid, pid_t pgid)
 ///
 /// `pid == 0` means "the caller"; `pgid == 0` means "use `pid`'s own pid as
-/// its new group id" (become a group leader) — matches real POSIX. No
-/// session concept is tracked, so (unlike real POSIX) this never checks
-/// "is `pid` a session leader" — every process can always repoint its pgid.
+/// its new group id" (become a group leader). POSIX's rules, now that
+/// sessions exist (phase 3.2 of `docs/gui/gui-plan.md`):
+///
+/// - the target is the caller or one of its children (`ESRCH` otherwise);
+/// - a child must be in the caller's session, and no session leader may
+///   change group (`EPERM`);
+/// - joining an existing group needs that group to be in the caller's
+///   session (`EPERM`).
+///
+/// Not enforced: `EACCES` for a child that has already `exec`'d (nothing
+/// records that). ash calls `setpgid` from both sides of a `fork` and
+/// ignores the loser's error, so allowing the late call changes nothing.
 pub(super) fn sys_setpgid(pid: i64, pgid: i64) -> SyscallResult {
     if pid < 0 || pgid < 0 {
         return errno::EINVAL;
     }
 
     with_scheduler(|sched| {
-        let caller_pid = sched.current_pid().map(|p| p.0).unwrap_or(0);
+        let (caller_pid, caller_sid) = match sched.running_ref() {
+            Some(p) => (p.pid.0, p.sid),
+            None => return errno::ESRCH,
+        };
         let target_pid = if pid == 0 { caller_pid } else { pid as usize };
         let new_pgid = if pgid == 0 { target_pid as u32 } else { pgid as u32 };
 
-        if target_pid == caller_pid {
-            match sched.running_mut() {
-                Some(proc) => { proc.pgid = new_pgid; 0 }
-                None => errno::ESRCH,
-            }
+        let (target_sid, target_parent) = if target_pid == caller_pid {
+            (caller_sid, None)
         } else {
-            match sched.find_process_mut(target_pid) {
-                Some(proc) => { proc.pgid = new_pgid; 0 }
-                None => errno::ESRCH,
+            match sched.iter_all().find(|p| p.pid.0 == target_pid) {
+                Some(p) => (p.sid, p.parent_pid.map(|pp| pp.0)),
+                None => return errno::ESRCH,
             }
+        };
+        if target_pid != caller_pid && target_parent != Some(caller_pid) {
+            return errno::ESRCH;
+        }
+        if target_sid != caller_sid || target_sid == target_pid as u32 {
+            return errno::EPERM;
+        }
+        if new_pgid != target_pid as u32
+            && !sched.iter_all().any(|p| p.pgid == new_pgid && p.sid == caller_sid)
+        {
+            return errno::EPERM;
+        }
+
+        let target = if target_pid == caller_pid {
+            sched.running_mut()
+        } else {
+            sched.find_process_mut(target_pid)
+        };
+        match target {
+            Some(proc) => { proc.pgid = new_pgid; 0 }
+            None => errno::ESRCH,
         }
     })
 }
 
 /// getpgid(121): pid_t getpgid(pid_t pid)
 pub(super) fn sys_getpgid(pid: i64) -> SyscallResult {
+    lookup_id(pid, |p| p.pgid)
+}
+
+/// getsid(124): pid_t getsid(pid_t pid)
+pub(super) fn sys_getsid(pid: i64) -> SyscallResult {
+    lookup_id(pid, |p| p.sid)
+}
+
+/// `pid` (0 = the caller) → `field` of it, or `ESRCH`.
+fn lookup_id(pid: i64, field: fn(&crate::process::Process) -> u32) -> SyscallResult {
     if pid < 0 {
         return errno::EINVAL;
     }
@@ -1028,28 +1068,36 @@ pub(super) fn sys_getpgid(pid: i64) -> SyscallResult {
         let target_pid = if pid == 0 { caller_pid } else { pid as usize };
 
         if target_pid == caller_pid {
-            sched.running_ref().map(|p| p.pgid as SyscallResult).unwrap_or(errno::ESRCH)
+            sched.running_ref().map(|p| field(p) as SyscallResult).unwrap_or(errno::ESRCH)
         } else {
-            sched.find_process_mut(target_pid).map(|p| p.pgid as SyscallResult).unwrap_or(errno::ESRCH)
+            sched.iter_all().find(|p| p.pid.0 == target_pid)
+                .map(|p| field(p) as SyscallResult).unwrap_or(errno::ESRCH)
         }
     })
 }
 
 /// setsid(112): pid_t setsid(void)
 ///
-/// No real session tracking exists — approximated as "become your own
-/// process group leader", rejected with `EPERM` if already one (the real
-/// POSIX rule: a process that's already a group leader can't `setsid()`).
+/// A new session and a new process group, both named after the caller,
+/// with no controlling terminal. `EPERM` if a process group with the
+/// caller's pid already exists — the caller leads one, or one it led
+/// outlived it — since the new group could not be told apart from it.
+/// Until 2026-09-25 this only made the caller a group leader, and no
+/// session id existed at all.
 pub(super) fn sys_setsid() -> SyscallResult {
     with_scheduler(|sched| {
+        let pid = match sched.running_ref() {
+            Some(p) => p.pid.0 as u32,
+            None => return errno::ESRCH,
+        };
+        if sched.iter_all().any(|p| p.pgid == pid) {
+            return errno::EPERM;
+        }
         match sched.running_mut() {
             Some(proc) => {
-                if proc.pgid == proc.pid.0 as u32 {
-                    errno::EPERM
-                } else {
-                    proc.pgid = proc.pid.0 as u32;
-                    proc.pid.0 as SyscallResult
-                }
+                proc.pgid = pid;
+                proc.sid = pid;
+                pid as SyscallResult
             }
             None => errno::ESRCH,
         }
