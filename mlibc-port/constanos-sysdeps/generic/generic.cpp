@@ -143,6 +143,21 @@ constexpr long FUTEX_WAKE = 1;
 // (e.g. stdio's buffering globals).
 extern "C" void *__dso_handle = (void *)&__dso_handle;
 
+// What crtbegin.o's __do_global_dtors_aux does, and what mlibc's static
+// build expects from it (options/lsb/generic/dso_exit.cpp: "in static
+// builds, these should be provided by the crtbegin.o/crtend.o"). We link
+// with -nostdlib and only crt1.o + libc.a, so nothing ever ran the C++
+// global destructors registered through __cxa_atexit(..., &__dso_handle) —
+// among them mlibc's stdio_guard, which flushes every FILE at exit. On a
+// terminal stdout is line-buffered and nothing was lost; to a file or a
+// pipe it is fully buffered, and `hello > f` or `fpu_test | wc -l` got 0
+// bytes. exit() runs this through __dlapi_exit's .fini_array pass, after
+// the plain atexit() handlers, as with crtbegin.o.
+extern "C" void __cxa_finalize(void *dso);
+[[gnu::destructor]] static void constanos_run_global_dtors() {
+	__cxa_finalize(&__dso_handle);
+}
+
 namespace mlibc {
 
 void sys_libc_log(const char *message) {
