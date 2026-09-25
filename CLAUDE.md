@@ -240,7 +240,8 @@ Implemented syscalls (Linux-compatible numbers — see `SyscallNumber` enum for 
 | 8 | `lseek` | Reposition file offset |
 | 9/11 | `mmap`/`munmap` | Anonymous memory mapping |
 | 12 | `brk` | Heap break |
-| 13/14/15 | `sigaction`/`sigprocmask`/`sigreturn` | POSIX signals |
+| 13/14/15 | `sigaction`/`sigprocmask`/`sigreturn` | POSIX signals. `sigset_t` crosses the boundary in Linux's layout (bit N-1 = signal N, what mlibc's `sigaddset` writes) and is shifted to the kernel's bit-N masks (`signal::mask_from_user`); until 2026-09-25 it was taken as-is, so every C program's mask named the signal one below the one it meant |
+| 130 | `rt_sigsuspend` | Swap the mask and sleep until a signal that runs a handler, terminates or stops (an ignored one does not wake it); returns `EINTR` with the old mask restored — through the handler frame's saved mask (`Process::saved_sigmask`, Linux's `TIF_RESTORE_SIGMASK`) or by `deliver_pending` if no handler runs. Check and block under the scheduler lock; every signal sender calls `Scheduler::wake_sigsuspended` after queueing, the one exception to "signals never wake a Blocked process". Backs ash's `wait` (`userspace/c/sigsuspend_test.c`) |
 | 16 | `ioctl` | TCGETS/TCSETS* (termios, `isatty()`), TIOCGWINSZ, TIOCG/SPGRP, plus the custom `FBIO_BLIT` (`0x4642_0001`) on `/dev/fb` — full-frame scaled blit for the DOOM port, see `FbBlitArgs` |
 | 20 | `writev` | Vectored write |
 | 22 | `pipe` | Anonymous pipe |
@@ -252,7 +253,7 @@ Implemented syscalls (Linux-compatible numbers — see `SyscallNumber` enum for 
 | 56/57 | `clone`/`fork` | Threads (shared AddressSpace+fds) / COW process fork |
 | 59 | `exec` | `(path, argv, envp)` — real argc/argv/envp built onto the new stack, see `memory/elf_loader.rs::build_initial_stack` |
 | 60 | `exit` | Terminate process (immediate switch) |
-| 61 | `waitpid` | Real POSIX pid overloads (`>0` exact/`0` own pgid/`-1` any child/`<-1` group), `WNOHANG`/`WUNTRACED`, real exit status incl. `WIFSIGNALED` |
+| 61 | `waitpid` | Real POSIX pid overloads (`>0` exact/`0` own pgid/`-1` any child/`<-1` group), `WNOHANG`/`WUNTRACED`, real exit status incl. `WIFSIGNALED`. No matching child is `ECHILD` even with `WNOHANG` (ash's `wait` reaps until it sees it) |
 | 62 | `kill` | Send a signal (single pid, no process groups) |
 | 72 | `fcntl` | Only `F_DUPFD`/`F_DUPFD_CLOEXEC` do something; rest are validity-checked stubs |
 | 21 | `access` | `F_OK`/`R_OK`/`X_OK` just mean "resolves" (no uid/permission model); `W_OK` actually probes writability — opens the path `O_WRONLY` and issues a zero-length `write()`, since every read-only filesystem's regular-file handle unconditionally errors on `write()` regardless of length, while `RamFileHandle`'s `write()` with an empty buffer is a true no-op |
@@ -984,8 +985,9 @@ self-test.
   reschedule IPIs, `leaving_skips`, and `invariants=` —
   `sched::SchedCore::check_invariants_with_running` run on the live
   scheduler).
-- Ash's `wait` builtin does not work (`sigsuspend` is missing from the mlibc
-  port): scripts that start background jobs wait on marker files instead.
+- Ash's `wait` builtin works since 2026-09-25 (`rt_sigsuspend`, see the
+  syscall table); it took three fixes — the syscall itself, the `sigset_t`
+  bit layout, and `waitpid`'s `WNOHANG`-before-`ECHILD` order.
 
 ## TLB Shootdown (`kernel/src/memory/tlb.rs`, `hal/src/tlb.rs`, `kernel/src/tlb_selftest.rs`)
 
@@ -1072,7 +1074,7 @@ and `include_bytes!`'d from `kernel/embedded/`. Everything else runnable-
 but-not-boot-critical — `doom`, `quake`, and most of the old C test
 programs (`hello`, `pthread_test`, `producer_consumer`,
 `mlibc_signal_test`, `stat_test`, `argv_test`, `jobctl_test`,
-`ext2_robust_test`, `fpu_test`, `socket_test`, `pipe_cow_test`) — is built straight to
+`ext2_robust_test`, `fpu_test`, `socket_test`, `pipe_cow_test`, `sigsuspend_test`) — is built straight to
 `disk-image-root/bin/` instead and shipped on the ext2 disk image
 (`disk.img`, mounted at `/mnt`) rather than baked into the kernel ELF.
 This split exists because `kernel/embedded/`'s ELFs (mostly `doom.elf`/

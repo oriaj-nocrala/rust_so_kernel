@@ -219,6 +219,16 @@ pub struct Process {
     pub pending_signals: u64,
     /// Bitmask of currently blocked signals (`sigprocmask`).
     pub blocked_signals: u64,
+    /// The mask `rt_sigsuspend` replaced, to be put back once it returns —
+    /// Linux's `saved_sigmask` + `TIF_RESTORE_SIGMASK`. A handler frame
+    /// pushed while this is set saves *this* mask rather than the temporary
+    /// one, so the handler's `sigreturn` restores what the caller had; if no
+    /// handler runs, `signal::deliver_pending` restores it directly.
+    pub saved_sigmask: Option<u64>,
+    /// Blocked in `rt_sigsuspend`: the one wait a signal ends. Signal
+    /// senders call `Scheduler::wake_sigsuspended`, which wakes a process
+    /// with this set once a signal it would act on is pending and unblocked.
+    pub in_sigsuspend: bool,
     /// Per-signal disposition; index = signal number. Not inherited across
     /// `fork()` in this implementation (every new `Process` starts with all
     /// `Default` — a simplification vs. real POSIX, which does inherit).
@@ -327,6 +337,8 @@ impl Process {
             exe_name: alloc::string::String::new(),
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
+            saved_sigmask: None,
+            in_sigsuspend: false,
             pending_signals: 0,
             tf_seq: 0,
             tf_awaiting_resume: false,
@@ -401,6 +413,8 @@ impl Process {
             exe_name: alloc::string::String::new(),
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
+            saved_sigmask: None,
+            in_sigsuspend: false,
             pending_signals: 0,
             tf_seq: 0,
             tf_awaiting_resume: false,
@@ -465,6 +479,8 @@ impl Process {
             exe_name,
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
+            saved_sigmask: None,
+            in_sigsuspend: false,
             pending_signals: 0,
             tf_seq: 0,
             tf_awaiting_resume: false,
@@ -556,6 +572,8 @@ impl Process {
             exe_name,
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
             blocked_signals: 0,
+            saved_sigmask: None,
+            in_sigsuspend: false,
             pending_signals: 0,
             tf_seq: 0,
             tf_awaiting_resume: false,

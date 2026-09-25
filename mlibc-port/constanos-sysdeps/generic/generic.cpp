@@ -63,6 +63,7 @@ constexpr long SYS_fstat = 5;
 constexpr long SYS_getdents64 = 217;
 constexpr long SYS_sigaction = 13;
 constexpr long SYS_sigprocmask = 14;
+constexpr long SYS_rt_sigsuspend = 130;
 // SYS_sigreturn(15) is never called directly by userspace — only the
 // kernel-mapped trampoline page uses it (see kernel/src/memory/
 // signal_trampoline.rs); mlibc's sigaction() doesn't need to know it
@@ -972,11 +973,21 @@ int sys_sigaction(int sig, const struct sigaction *__restrict act,
 	return ret < 0 ? (int)-ret : 0;
 }
 
-// sigset_t is already a plain uint64_t in this port (abi-bits/signal.h) —
-// matches this kernel's 32-signal bitmask directly, no conversion needed.
+// sigset_t is a plain uint64_t in this port (abi-bits/signal.h) in Linux's
+// layout (bit N-1 = signal N, as mlibc's sigaddset writes it); the kernel
+// converts to its own bit-N numbering at the syscall boundary.
 int sys_sigprocmask(int how, const sigset_t *__restrict set,
 		sigset_t *__restrict old) {
 	long ret = raw_syscall(SYS_sigprocmask, how, (long)set, (long)old);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+// rt_sigsuspend(130) always "fails" with EINTR once a handled signal has
+// run — mlibc's sigsuspend() stores the returned errno and returns -1.
+// Without this, sigsuspend() was ENOSYS and BusyBox ash's `wait` spun
+// forever with every signal blocked (waitproc's sigsuspend loop).
+int sys_sigsuspend(const sigset_t *set) {
+	long ret = raw_syscall(SYS_rt_sigsuspend, (long)set, (long)sizeof(sigset_t));
 	return ret < 0 ? (int)-ret : 0;
 }
 

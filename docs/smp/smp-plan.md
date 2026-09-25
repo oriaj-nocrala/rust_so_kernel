@@ -866,12 +866,16 @@ lo que conserva el log. **Shootdowns: media 7 µs, máx. 4,9 ms** (13595,
 sospechaba; lejos del límite de 1 s. El ring perdió el principio del job
 (los tests secuenciales), no las mediciones.
 
-**Abierto:** la espera de un shootdown subió en QEMU bajo carga (media
-~0,2–0,7 ms, máx. 69 ms con 8 vCPUs, frente a 13 µs/611 µs en los tests):
-coincide con E/S PIO de ATA emulada, que en QEMU TCG serializa las vCPUs; la
-Ryzen no tiene ATA. Medir en metal antes de tocar nada (el límite es 1 s).
-Y `wait` de ash no funciona (`sigsuspend` falta en el port de mlibc): los
-jobs de metal esperan con ficheros-testigo.
+**Cerrado después:** la espera de un shootdown que subía en QEMU bajo carga
+(media ~0,2–0,7 ms, máx. 69 ms con 8 vCPUs) era sobresuscripción del host y
+E/S PIO de ATA emulada: en la Ryzen, media 7 µs, máx. 4,9 ms (arriba). Y
+`wait` de ash funciona desde el 2026-09-25: faltaba `rt_sigsuspend` (mlibc
+devolvía `ENOSYS` y ash giraba con todas las señales bloqueadas), el
+`sigset_t` cruzaba el syscall con la numeración desplazada un bit (bloquear
+SIGUSR1 bloqueaba SIGKILL) y `waitpid` con `WNOHANG` devolvía 0 en vez de
+`ECHILD` sin hijos, así que el `dowait` de ash volvía a dormir sin nada que
+lo despertara. Test: `userspace/c/sigsuspend_test.c`. Los jobs de metal ya
+pueden usar `wait` en vez de ficheros-testigo.
 
 ## Qué queda fuera
 

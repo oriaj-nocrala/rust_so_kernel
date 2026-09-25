@@ -53,6 +53,21 @@ pub const SIGTTOU: u32 = 22;
 // though this kernel never actually raises it.
 pub const NUM_SIGNALS: usize = 64;
 
+/// A user `sigset_t` (Linux layout: bit N-1 = signal N, what mlibc's
+/// `sigaddset` writes) to this kernel's internal mask (bit N = signal N).
+/// `sigprocmask`/`rt_sigsuspend` used to take the user's word as-is, so
+/// every mask a C program set named the signal one below the one it meant:
+/// blocking SIGCHLD blocked signal 16, blocking SIGUSR1 blocked SIGKILL
+/// (then dropped as unblockable). Signal 64 has no internal slot.
+pub fn mask_from_user(set: u64) -> u64 {
+    set << 1
+}
+
+/// Inverse of `mask_from_user`.
+pub fn mask_to_user(mask: u64) -> u64 {
+    mask >> 1
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SignalAction {
     Default,
@@ -100,6 +115,47 @@ pub fn queue_signal(proc: &mut Process, sig: u32) {
 /// necessarily `proc.trapframe` (see call sites: the live on-stack syscall
 /// frame during `syscall_handler_asm`, `proc.trapframe` everywhere else).
 pub fn deliver_pending(proc: &mut Process, tf: *mut TrapFrame) -> SignalOutcome {
+    // On its way back to user mode, so no longer in `rt_sigsuspend` — even
+    // if something other than a signal woke it. A flag left set would let
+    // `wake_sigsuspended` end some later, unrelated block.
+    proc.in_sigsuspend = false;
+    let outcome = deliver_one(proc, tf);
+    // Returning to user mode without a handler frame to carry it: whatever
+    // `rt_sigsuspend` replaced goes back now (a pushed frame took it with
+    // `saved_sigmask.take()`; Terminate makes it moot).
+    if !matches!(outcome, SignalOutcome::Delivered | SignalOutcome::Terminate(_)) {
+        if let Some(mask) = proc.saved_sigmask.take() {
+            proc.blocked_signals = mask;
+        }
+    }
+    outcome
+}
+
+/// Whether `proc` has a pending, unblocked signal it would act on — run a
+/// handler, terminate or stop. An ignored one (explicitly, or SIGCHLD/SIGCONT
+/// by default) does not count: it would not end an `rt_sigsuspend` in Linux
+/// either, where such signals are discarded when sent.
+pub fn has_actionable(proc: &Process) -> bool {
+    let mut deliverable = proc.pending_signals & !proc.blocked_signals;
+    while deliverable != 0 {
+        let sig = deliverable.trailing_zeros();
+        deliverable &= deliverable - 1;
+        let acts = match proc.signal_handlers[sig as usize] {
+            _ if sig == SIGSTOP => true,
+            SignalAction::Ignore => false,
+            SignalAction::Default => {
+                sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU || default_terminates(sig)
+            }
+            SignalAction::Handler(_) => true,
+        };
+        if acts {
+            return true;
+        }
+    }
+    false
+}
+
+fn deliver_one(proc: &mut Process, tf: *mut TrapFrame) -> SignalOutcome {
     let deliverable = proc.pending_signals & !proc.blocked_signals;
     if deliverable == 0 {
         return SignalOutcome::None;
@@ -169,7 +225,9 @@ unsafe fn push_signal_frame(proc: &mut Process, tf: *mut TrapFrame, sig: u32, ha
     let tramp_slot = frame_base - 8;
 
     let frame = SignalFrame {
-        saved_mask: proc.blocked_signals,
+        // After `rt_sigsuspend`, the handler's `sigreturn` must restore the
+        // caller's mask, not sigsuspend's temporary one.
+        saved_mask: proc.saved_sigmask.take().unwrap_or(proc.blocked_signals),
         saved_tf: old_tf,
     };
 

@@ -387,7 +387,8 @@ pub fn sigaction(sig: u32, handler: u64) -> i64 {
 }
 
 /// `how` is one of `SIG_BLOCK`/`SIG_UNBLOCK`/`SIG_SETMASK`; `mask` is a
-/// bitmask (bit N = signal N). Returns the previous mask via `old_mask`.
+/// Linux `sigset_t` (bit N-1 = signal N). Returns the previous mask via
+/// `old_mask`, same layout.
 pub fn sigprocmask(how: i32, mask: u64, old_mask: Option<&mut u64>) -> i64 {
     let set: u64 = mask;
     let old_ptr = match old_mask {

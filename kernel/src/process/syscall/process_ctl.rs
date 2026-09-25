@@ -795,13 +795,17 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
                 unsafe { core::ptr::write_unaligned(status_ptr as *mut i32, status); }
             }
             Outcome::Return(pid as SyscallResult)
-        } else if options & WNOHANG != 0 {
-            Outcome::Return(0)
         } else {
+            // ECHILD before WNOHANG, as in Linux: "no such child" is an
+            // error even when not blocking. BusyBox ash's `wait` keeps
+            // reaping with WNOHANG until it sees ECHILD — a 0 here sent it
+            // back to sigsuspend with nothing left to wake it.
             let has_any = scheduler.iter_all()
                 .any(|p| p.parent_pid == caller_pid && target.matches(p.pid.0, p.pgid));
             if !has_any {
                 Outcome::Return(errno::ECHILD)
+            } else if options & WNOHANG != 0 {
+                Outcome::Return(0)
             } else {
                 // Not reapable yet — record what we are waiting for (and
                 // where to eventually write its status — see `Process::
@@ -820,6 +824,13 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
         }
     };
 
+    crate::ktrace!(
+        crate::debug::PROC,
+        "waitpid: PID {} pid={} options={:#x} -> {}{}",
+        crate::process::scheduler::current_pid_fast(), pid_arg, options,
+        match outcome { Outcome::Return(v) => v, Outcome::Block(_) => 0 },
+        if matches!(outcome, Outcome::Block(_)) { " (block)" } else { "" }
+    );
     match outcome {
         Outcome::Return(v) => {
             drop(irq);
@@ -924,9 +935,13 @@ pub(super) fn sys_kill(target_pid: i64, sig: u32) -> SyscallResult {
                     sched.wake_stopped(target_pid);
                 }
                 match sched.find_process_mut(target_pid) {
-                    Some(proc) => { crate::process::signal::queue_signal(proc, sig); 0 }
-                    None => errno::ESRCH,
+                    Some(proc) => crate::process::signal::queue_signal(proc, sig),
+                    None => return errno::ESRCH,
                 }
+                // The exception to "never force-wake": `rt_sigsuspend` is
+                // waiting for exactly this.
+                sched.wake_sigsuspended();
+                0
             }
         }
     })

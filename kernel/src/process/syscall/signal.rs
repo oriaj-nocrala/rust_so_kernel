@@ -1,6 +1,6 @@
 // kernel/src/process/syscall/signal.rs
 //
-// sigaction(13) / sigprocmask(14) / sigreturn(15).
+// sigaction(13) / sigprocmask(14) / sigreturn(15) / rt_sigsuspend(130).
 
 use crate::process::TrapFrame;
 use super::{errno, SyscallResult, with_current_process, validate_user_buffer, current_tf_ptr};
@@ -55,8 +55,8 @@ const SIG_SETMASK: i32 = 2;
 
 /// rt_sigprocmask(14): int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
 ///
-/// `sigset_t` here is a single `u64` bitmask (this kernel supports 32
-/// signals, so no wider representation is needed).
+/// `sigset_t` is a single `u64` in Linux's layout (bit N-1 = signal N),
+/// converted at this boundary — see `signal::mask_from_user`.
 pub(super) fn sys_sigprocmask(how: i32, set_ptr: u64, oldset_ptr: u64) -> SyscallResult {
     if set_ptr != 0 {
         if let Err(e) = validate_user_buffer(set_ptr, 8) { return e; }
@@ -68,7 +68,7 @@ pub(super) fn sys_sigprocmask(how: i32, set_ptr: u64, oldset_ptr: u64) -> Syscal
     with_current_process(|proc| {
         let old_mask = proc.blocked_signals;
         if set_ptr != 0 {
-            let set = unsafe { *(set_ptr as *const u64) };
+            let set = crate::process::signal::mask_from_user(unsafe { *(set_ptr as *const u64) });
             // SIGKILL can never be blocked.
             let set = set & !(1u64 << crate::process::signal::SIGKILL);
             proc.blocked_signals = match how {
@@ -79,7 +79,7 @@ pub(super) fn sys_sigprocmask(how: i32, set_ptr: u64, oldset_ptr: u64) -> Syscal
             };
         }
         if oldset_ptr != 0 {
-            unsafe { *(oldset_ptr as *mut u64) = old_mask; }
+            unsafe { *(oldset_ptr as *mut u64) = crate::process::signal::mask_to_user(old_mask); }
         }
         0
     })
@@ -103,4 +103,79 @@ pub(super) fn sys_sigreturn() -> SyscallResult {
         unsafe { crate::process::signal::pop_signal_frame(proc, tf_ptr, user_rsp) };
         unsafe { (*tf_ptr).rax as i64 }
     })
+}
+
+/// rt_sigsuspend(130): int sigsuspend(const sigset_t *mask)
+///
+/// Replace the signal mask with `*mask` and sleep until a signal arrives
+/// that runs a handler, terminates or stops the process; then put the old
+/// mask back and return `EINTR` (it never returns anything else). The
+/// swap, the check and the block happen under one hold of the scheduler
+/// lock — the same lock every signal sender holds while queueing and then
+/// calling `Scheduler::wake_sigsuspended` — so a signal sent from another
+/// CPU is either seen by the check or finds this process Blocked.
+///
+/// The old mask travels in `Process::saved_sigmask`: a handler frame
+/// pushed on the way out saves it (so the handler's `sigreturn` restores
+/// it), and if none is pushed `signal::deliver_pending` restores it.
+/// That is what makes BusyBox ash's `waitproc` work: it blocks every
+/// signal, then `sigsuspend`s with the old mask to wait for SIGCHLD.
+pub(super) fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: u64) -> SyscallResult {
+    if sigsetsize != 8 {
+        return errno::EINVAL;
+    }
+    if let Err(e) = validate_user_buffer(mask_ptr, 8) { return e; }
+    let new_mask = crate::process::signal::mask_from_user(unsafe { core::ptr::read_unaligned(mask_ptr as *const u64) })
+        & !(1u64 << crate::process::signal::SIGKILL)
+        & !(1u64 << crate::process::signal::SIGSTOP);
+
+    let tf_ptr = current_tf_ptr();
+    let irq = crate::process::irq_guard::InterruptGuard::new();
+
+    let next_tf = {
+        let mut scheduler = crate::process::scheduler::local_scheduler();
+        let Some(proc) = scheduler.running_mut() else {
+            drop(scheduler);
+            drop(irq);
+            return errno::EINTR;
+        };
+        proc.saved_sigmask = Some(proc.blocked_signals);
+        proc.blocked_signals = new_mask;
+        let immediate = crate::process::signal::has_actionable(proc);
+        crate::ktrace!(
+            crate::debug::PROC,
+            "sigsuspend: PID {} mask {:#x} (was {:#x}) pending {:#x} -> {}",
+            proc.pid.0, new_mask, proc.saved_sigmask.unwrap_or(0), proc.pending_signals,
+            if immediate { "return" } else { "block" }
+        );
+        if immediate {
+            // Already pending: return at once; the syscall-return path
+            // delivers it with the temporary mask still in force.
+            None
+        } else {
+            proc.in_sigsuspend = true;
+            unsafe { (*(tf_ptr as *mut TrapFrame)).rax = errno::EINTR as u64; }
+            let next = scheduler.block_current(tf_ptr);
+            if next == tf_ptr {
+                // A stale `wake_pending` let `block_current` return without
+                // blocking: a spurious wakeup, which sigsuspend's callers
+                // loop on anyway.
+                if let Some(proc) = scheduler.running_mut() {
+                    proc.in_sigsuspend = false;
+                }
+                None
+            } else {
+                Some(next)
+            }
+        }
+    };
+
+    match next_tf {
+        None => {
+            drop(irq);
+            errno::EINTR
+        }
+        // Diverges; interrupts stay off across the jump (see `sys_waitpid`).
+        Some(next) => unsafe { crate::process::trapframe::jump_to_user(next) },
+    }
 }

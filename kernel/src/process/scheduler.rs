@@ -781,6 +781,31 @@ impl Scheduler {
                 super::signal::queue_signal(proc, sig);
             }
         }
+        self.wake_sigsuspended();
+    }
+
+    /// Wake every process blocked in `rt_sigsuspend` that now has a signal
+    /// it would act on. Signals otherwise never wake a Blocked process (see
+    /// `sys_kill`), so every place that queues one calls this afterwards,
+    /// under the same lock hold — `rt_sigsuspend` checks and blocks under
+    /// this lock too, so a signal sent from another CPU cannot fall between
+    /// its check and its block. Its `rax` was preset to `EINTR`.
+    pub fn wake_sigsuspended(&mut self) {
+        loop {
+            let woke = self.core.wake_matching(
+                |p| matches!(p.state, ProcessState::Blocked)
+                    && p.in_sigsuspend
+                    && super::signal::has_actionable(p),
+                |p| {
+                    p.in_sigsuspend = false;
+                    p.state = ProcessState::Ready;
+                },
+            );
+            if !woke {
+                break;
+            }
+            self.kick_idle(false);
+        }
     }
 
     /// Wake a Stopped process (SIGCONT): move it from `wait_queue` back to
@@ -943,6 +968,7 @@ impl Scheduler {
                 super::signal::queue_signal(parent, super::signal::SIGCHLD);
             }
         }
+        self.wake_sigsuspended();
 
         // Real exit status, if `dead_pid` is parked as a zombie. Threads
         // aren't (reaped immediately in `kill_current`), so this stays at
@@ -991,6 +1017,7 @@ impl Scheduler {
                 super::signal::queue_signal(parent, super::signal::SIGCHLD);
             }
         }
+        self.wake_sigsuspended();
 
         let Some((stopped_pgid, status_word)) = self.core.wait_queue().iter()
             .find(|p| p.pid.0 == stopped_pid && matches!(p.state, ProcessState::Stopped))
