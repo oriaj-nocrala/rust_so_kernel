@@ -371,6 +371,8 @@ fn idle_task() -> ! {
         // lets only one through per period), so a process spinning on one
         // CPU no longer starves the flush.
         crate::block::logpart::periodic();
+        // Files of processes killed while nothing else ran a syscall.
+        crate::process::dead_files::drain();
         // `run_on` jobs, then `hlt`.
         crate::smp::idle_once();
     }

@@ -673,6 +673,16 @@ impl Scheduler {
             assert!(proc.pid.0 != 0, "kill_current on an idle process");
             note_leaving(&proc);
             self.reparent_children(proc.pid);
+            // Its files close now, as Linux's `do_exit` does — but not
+            // here, under this lock: see `dead_files`. (`sys_exit` has
+            // already swapped in an empty table; this moves that one.)
+            let files = core::mem::replace(
+                &mut proc.files,
+                alloc::sync::Arc::new(crate::sync::Mutex::new(
+                    crate::process::file::FileDescriptorTable::new(),
+                )),
+            );
+            super::dead_files::defer(files);
             crate::serial_println!(
                 "💀 Killed PID {} ({}): {}",
                 proc.pid.0,

@@ -383,7 +383,13 @@ impl Framebuffer {
     ) {
         let buffer = self.draw_buffer();
 
-        let glyph: [u8; 8] = BASIC_LEGACY[ascii as usize];
+        // The 8x8 font is ASCII only. This path draws the panic screen, and
+        // a panic message is Rust text: one '—' in it made the panic
+        // handler index past the table and panic again, losing the screen.
+        let glyph: [u8; 8] = match BASIC_LEGACY.get(ascii as usize) {
+            Some(g) => *g,
+            None => BASIC_LEGACY[b'?' as usize],
+        };
 
         // Fast path: compose one pixel row of the cell into a stack buffer
         // and write it as a single contiguous span, instead of 8 separate

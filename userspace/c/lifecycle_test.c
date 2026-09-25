@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
 
 static void nap_ms(long ms) {
     struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
@@ -113,6 +114,51 @@ static int case_exec(const char *self, const char *mode, int want_signal) {
     return !ok;
 }
 
+// E: a child killed by SIGKILL while holding a socket and a pipe. Its files
+// must close at death, as on Linux -- the parent sees EOF on both *before*
+// reaping it -- and reaping it must not hang. Until 2026-09-25 a signal
+// death kept the fd table in the zombie and the reap dropped it under the
+// scheduler lock: a socket's Drop takes that lock again, and every CPU hung.
+static int case_killed_with_files(void) {
+    int sv[2], pp[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0 || pipe(pp) < 0) {
+        printf("E killed child's files close: setup failed -> FAIL\n");
+        return 1;
+    }
+    int pid = fork();
+    if (pid == 0) {
+        close(sv[0]);
+        close(pp[0]);
+        char c;
+        read(sv[1], &c, 1); // sleeps holding sv[1] and pp[1] until killed
+        _exit(0);
+    }
+    close(sv[1]);
+    close(pp[1]);
+    nap_ms(100);
+    kill(pid, SIGKILL);
+    // EOF with the zombie still unreaped. Never block here: without the fix
+    // EOF only comes at the reap, and a blocking read would hang the test
+    // instead of failing it. The socket is polled with MSG_DONTWAIT; the
+    // pipe (whose poll is always "ready" here) is read only once the socket
+    // saw EOF -- both close together, when the dead table is dropped.
+    int eof_sock = 0, eof_pipe = 0;
+    char c;
+    for (int i = 0; i < 40 && !eof_sock; i++) {
+        if (recv(sv[0], &c, 1, MSG_DONTWAIT) == 0) eof_sock = 1;
+        else nap_ms(50);
+    }
+    if (eof_sock && read(pp[0], &c, 1) == 0) eof_pipe = 1;
+    int status = 0;
+    int r = waitpid(pid, &status, 0);
+    int ok = eof_sock && eof_pipe && r == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
+    printf("E killed child's files close: socket EOF %d, pipe EOF %d, reaped %d -> %s\n",
+           eof_sock, eof_pipe, r == pid, ok ? "PASS" : "FAIL");
+    close(sv[0]);
+    close(pp[0]);
+    return !ok;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1) {
         // Exec'd image for C/D: raise and see what the kernel does with it.
@@ -125,6 +171,7 @@ int main(int argc, char **argv) {
     fails += case_live_orphan();
     fails += case_exec(self, "usr1", 1);
     fails += case_exec(self, "usr2", 0);
+    fails += case_killed_with_files();
     printf("lifecycle_test: %s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }

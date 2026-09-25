@@ -542,6 +542,10 @@ pub fn syscall_handler(
     //     }
     // }
 
+    // Close what processes killed by a signal or a fault left open: this
+    // is process context with no lock held (see `process::dead_files`).
+    crate::process::dead_files::drain();
+
     let syscall = match SyscallNumber::from_u64(syscall_num) {
         Some(s) => s,
         None => return errno::ENOSYS,

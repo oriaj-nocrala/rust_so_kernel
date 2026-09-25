@@ -14,6 +14,7 @@ pub mod tss;
 pub mod syscall;
 pub(crate) mod irq_guard;
 pub mod file;
+pub mod dead_files;
 pub mod fpu;
 pub mod pipe;
 pub mod signal;
