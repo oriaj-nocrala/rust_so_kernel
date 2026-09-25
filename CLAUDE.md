@@ -96,7 +96,7 @@ so addresses actually resolve to real function names instead of bare hex.
 ### QEMU integration tests
 
 Real hardware-path behavior (drivers that need actual QEMU devices, not just host-testable
-pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 299 tests, <1s, no QEMU) is
+pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 302 tests, <1s, no QEMU) is
 asserted by a `#![feature(custom_test_frameworks)]` harness that boots the real kernel in
 QEMU and reports PASS/FAIL as a process exit code:
 
@@ -203,9 +203,11 @@ Kernel crate config in `kernel/.cargo/config.toml` enables `-Z build-std` to reb
 
 **VMAs** (`memory/vma.rs`): Up to 16 VMAs per process. Two kinds: `Code` (pre-loaded, not demand-paged) and `Anonymous` (zero-filled on demand — stack, heap).
 
-**COW frame refcounts** (`memory/cow.rs`): one byte per physical frame, sized at boot from the highest *usable* physical address the bootloader reported and allocated out of the Buddy allocator (`init_refcount_table`, called from `init::memory::init_core` — before the first `fork()`, after the Buddy can serve the table's own frames). Coverage is reported as `cow_tracked_frames` in `/proc/kdebug` and in `panic.rs`'s snapshot. It was a fixed `[u8; 512 MiB / 4 KiB]` BSS array until 2026-09-21, and that ceiling did not degrade above the bound — it broke `fork()` outright, because every accessor failed *unsafely* on an untracked index: `inc_ref` no-op (the share was never recorded), `get_ref` → 0 so the COW fault handler read "sole owner" and restored WRITABLE **without copying** (two processes writing one physical frame), and `dec_ref` → 0, which by this module's convention means "free it" (a child's exit handed the parent's still-mapped frames back to the Buddy allocator). Measured: `-m 768M`, the first QEMU size with any RAM above the old bound, killed PID 1 with `SEGFAULT (no VMA)` the instant `busybox --install`'s child exited, deterministically, while `-m 512M` was clean — and that was the sole blocker to reaching a shell prompt on the real AM4/Ryzen machine, where all of RAM is above 512 MiB. Out-of-range indices now fail **safe** instead (`get_ref` → 2 so COW copies, `dec_ref` → 1 so nothing is freed underneath a live mapping): unreachable once the table covers all of RAM, and a leaked frame rather than a shared one if it ever is.
+**COW frame refcounts** (`memory/cow.rs`): one byte per physical frame, sized at boot from the highest *usable* physical address the bootloader reported and allocated out of the Buddy allocator (`init_refcount_table`, called from `init::memory::init_core` — before the first `fork()`, after the Buddy can serve the table's own frames). Coverage is reported as `cow_tracked_frames` in `/proc/kdebug` and in `panic.rs`'s snapshot. It was a fixed `[u8; 512 MiB / 4 KiB]` BSS array until 2026-09-21, and that ceiling did not degrade above the bound — it broke `fork()` outright, because every accessor failed *unsafely* on an untracked index: `inc_ref` no-op (the share was never recorded), `get_ref` → 0 so the COW fault handler read "sole owner" and restored WRITABLE **without copying** (two processes writing one physical frame), and `dec_ref` → 0, which by this module's convention means "free it" (a child's exit handed the parent's still-mapped frames back to the Buddy allocator). Measured: `-m 768M`, the first QEMU size with any RAM above the old bound, killed PID 1 with `SEGFAULT (no VMA)` the instant `busybox --install`'s child exited, deterministically, while `-m 512M` was clean — and that was the sole blocker to reaching a shell prompt on the real AM4/Ryzen machine, where all of RAM is above 512 MiB. Out-of-range indices now fail **safe** instead (`get_ref` → 2 so COW copies, `dec_ref` → 1 so nothing is freed underneath a live mapping): unreachable once the table covers all of RAM, and a leaked frame rather than a shared one if it ever is. The counts are `AtomicU8`s (stage 6): their read-modify-writes used to be kept whole only by IF=0; the decisions made on a count ("1 → I am the last owner") are made under the address-space lock below, and `fork` — the only way a count rises — holds the same lock.
 
-**Demand paging** (`memory/demand_paging.rs`): Page fault handler (in `init/devices.rs`) reads CR2, finds the faulting VMA, calls `map_demand_page` to allocate a physical frame from Buddy, zero it, and map it. Kernel-mode faults panic; user-mode faults outside any VMA kill the process.
+**Demand paging** (`memory/demand_paging.rs`): Page fault handler (in `init/devices.rs`) reads CR2 and calls `AddressSpace::handle_not_present_fault`/`handle_cow_fault` on the running process's address space, which find the VMA and call `map_demand_page` (allocate a frame from Buddy, zero it, map it — into *that* address space's table, not whatever CR3 holds) under the address space's lock. Kernel-mode faults panic; user-mode faults outside any VMA kill the process.
+
+**The address-space lock** (`AddressSpace::vmas`, an `IrqMutex`, stage 6 of `docs/smp/smp-plan.md`): every VMA lookup and every PTE change of a user address space — demand paging, COW resolution, `fork`'s write-protect, `mmap`/`munmap` — happens inside it, so two threads faulting on one page serialise and the second finds it resolved (a spurious fault is success, not a failed `map_to`). **Kernel code that writes into another process's user memory goes through `AddressSpace::copy_to_user`/`copy_from_user`/`prepare_user_write`**, never `translate_page` + a physmap write: the frame behind a translated page can be the shared zero frame or a COW frame still shared with a fork sibling. `pipe.rs` did exactly that and wrote readers' data into the global zero frame (every untouched anonymous page then read it) and into fork parents' pages — `userspace/c/pipe_cow_test.c`. Lock order: scheduler → address space → `BUDDY`/`SLAB_ALLOCATOR`; never touch user memory by virtual address while holding it (that fault takes it again).
 
 **ELF loader** (`memory/elf_loader.rs`): Parses ELF64 PT_LOAD segments, maps them into a fresh `AddressSpace`, zeros BSS, and registers demand-paged stack. Static executables only (no dynamic linker). `build_initial_stack` writes a real, dynamically-sized SysV ABI initial stack frame (argc/argv/envp/auxv) onto the pre-mapped top stack page — sized from whatever `sys_exec` read out of the caller's argv/envp arrays, capped to fit in one page (`E2BIG` if it doesn't).
 
@@ -519,7 +521,7 @@ arbitration, exactly where two PS/2 keyboards would merge.
 **Split across the usual seam.** `hal::xhci` (register/TRB/ring/context
 arithmetic), `hal::usb` (descriptor parsing + setup packets) and
 `hal::hid` (boot-report diffing + the Set-1 table) are pure and host-tested
-— most of `hal`'s 299 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
+— most of `hal`'s 302 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
 DMA pages, doorbells and waiting. That line is drawn hard here because an
 xHCI bring-up failure is nearly unobservable (a wrong bit in a device
 context yields no fault, no log, just a Transfer Event that never arrives)
@@ -605,7 +607,7 @@ existing pipeline" decision again. **HID Y is positive down, so it is
 negated** into `MouseEvent`'s PS/2 convention (positive up), which the
 DOOM/Quake ports were written against — verified in QEMU that the same
 `mouse-move 10 -5` yields identical records through either mouse. The
-queue now has two producers, serialised by an `IrqMutex` (`mouse::PUSH`).
+queue now has two producers — a `hal::ring::Ring` behind an `IrqMutex` (`mouse::MOUSE_EVENTS`; the keyboard queues likewise, see Key Design Invariants' SMP rules).
 Keyboard and mouse are looked up **independently per device**, and both
 endpoints go into one Configure Endpoint: a keyboard+mouse receiver has
 one interface of each, and the target machine's HyperX Pulsefire Core
@@ -940,17 +942,17 @@ published before the CR3 write — so **every CR3 load goes through
 covered by `this_cpu_ready`). One request at a time; the wait is bounded
 (1 s, then a panic naming the CPUs). **A CPU spinning with IF=0 cannot take
 the IPI**, so such spins call `tlb::service_pending`: the wait for the
-sender slot, and every `diag::IrqMutex` spin (`IrqControl::relax`). A plain
-`spin::Mutex` taken with IF=0 (the scheduler's) does not — unreachable
-while the APs take no locks, a stage-7 requirement. `/proc/kdebug`'s `tlb:`
+sender slot, every `diag::IrqMutex` spin (`IrqControl::relax`), every
+kernel lock (`crate::sync::Mutex`/`IrqLock`, whose relax strategy does it —
+the scheduler's lock included), `vfs`'s locks (through
+`vfs::lock::set_relax_hook`) and the USB transfer waits. `/proc/kdebug`'s `tlb:`
 line counts shootdowns, IPIs and wait times. Tested by
 `hw_tests::tlb_shootdown_leaves_no_stale_translation` and on demand by
 `kdebug tlbtest`, both `tlb_selftest::run`: an AP reads a page in a loop
 while the BSP moves it between frames; sabotaged (no IPI) it reports
 thousands of stale reads, so QEMU's TLB model does keep old entries.
-**`OwnedPageTable::unmap_and_remap` (the COW path) leaves the PTE zero
-between its two halves** — harmless on one CPU, a fault in another thread's
-face once threads span CPUs; `replace_frame` changes a leaf in one store.
+The COW path swaps frames with `replace_frame` (one PTE store); the
+unmap-then-map it replaced left the entry zero in between.
 
 ## Interrupt Controllers (`kernel/src/interrupts/`, `hal/src/apic.rs`)
 
@@ -994,7 +996,7 @@ Monotonic time (`time::clocksource`, TSC-backed when available, jiffies fallback
 
 `/proc` enumerates every live pid for real (`scheduler::all_pids()`, walking `running` + every run queue + the wait queue) — `ls /proc`/`opendir("/proc")` see them all, not just pids looked up by exact name (previously the only way in). Each `/proc/<pid>/stat` renders the classic Linux `stat` format (`fn render_proc_stat`) from a live `Process` snapshot — this is what backs BusyBox `ps`/`top`.
 
-**Real symlinks** (`Inode::readlink()`, `resolve()`/`resolve_no_follow()`, both with an 8-hop `ELOOP` guard, now live in the host-testable `vfs` crate — `vfs::mount::MountTable::resolve`/`resolve_no_follow`, and `normalize_path` in `vfs::path`; `cd vfs && cargo test` runs 150 host tests, no QEMU, covering these plus `RamFs`, `Inode`/`Filesystem`, and the getdents64 helpers. `kernel/src/fs/vfs.rs` is the thin adapter that owns the single `static MOUNTS: MountTable` and re-exposes these as free functions with unchanged signatures, see `vfs/src/lib.rs`'s doc comment). `resolve()` follows a symlink at every path component including the final one (`open`/`stat` semantics); `resolve_no_follow()` leaves the leaf alone (`lstat`/`readlink` semantics). `fs::procfs` produces synthetic symlinks (`/proc/self`, `/proc/<pid>/exe`); ramfs (`/tmp`, `vfs::ramfs::RamFs`) supports creating *real* ones via the `symlink()` syscall (`Inode::symlink`, only writable filesystem that implements it — same `EROFS`-by-default convention as `create`/`mkdir`). This is what backs PID 1's real `busybox --install -s /tmp/bin` at boot (see Userspace Programs below) — no synthetic, kernel-computed symlinks anywhere anymore; `/tmp/bin/<applet>` are indistinguishable from symlinks a real Linux install would create.
+**Real symlinks** (`Inode::readlink()`, `resolve()`/`resolve_no_follow()`, both with an 8-hop `ELOOP` guard, now live in the host-testable `vfs` crate — `vfs::mount::MountTable::resolve`/`resolve_no_follow`, and `normalize_path` in `vfs::path`; `cd vfs && cargo test` runs 164 host tests, no QEMU, covering these plus `RamFs`, `Inode`/`Filesystem`, and the getdents64 helpers. `kernel/src/fs/vfs.rs` is the thin adapter that owns the single `static MOUNTS: MountTable` and re-exposes these as free functions with unchanged signatures, see `vfs/src/lib.rs`'s doc comment). `resolve()` follows a symlink at every path component including the final one (`open`/`stat` semantics); `resolve_no_follow()` leaves the leaf alone (`lstat`/`readlink` semantics). `fs::procfs` produces synthetic symlinks (`/proc/self`, `/proc/<pid>/exe`); ramfs (`/tmp`, `vfs::ramfs::RamFs`) supports creating *real* ones via the `symlink()` syscall (`Inode::symlink`, only writable filesystem that implements it — same `EROFS`-by-default convention as `create`/`mkdir`). This is what backs PID 1's real `busybox --install -s /tmp/bin` at boot (see Userspace Programs below) — no synthetic, kernel-computed symlinks anywhere anymore; `/tmp/bin/<applet>` are indistinguishable from symlinks a real Linux install would create.
 
 **Permission bits** (`fs::types::Stat`): no real per-inode permission model — `regular()` (initramfs/ext2/procfs) hardcodes `0o444`, `regular_writable()` (ramfs only) hardcodes `0o644`. Added because BusyBox `vi`'s readonly check is `access(fn, W_OK) < 0 || !(st_mode & (S_IWUSR|...))` — fixing `access()` alone wasn't enough; every regular file reported zero write bits regardless of which filesystem it actually lived on, so `vi` opened `/tmp/*` files `[Readonly]` too.
 
@@ -1012,7 +1014,7 @@ and `include_bytes!`'d from `kernel/embedded/`. Everything else runnable-
 but-not-boot-critical — `doom`, `quake`, and most of the old C test
 programs (`hello`, `pthread_test`, `producer_consumer`,
 `mlibc_signal_test`, `stat_test`, `argv_test`, `jobctl_test`,
-`ext2_robust_test`, `fpu_test`, `socket_test`) — is built straight to
+`ext2_robust_test`, `fpu_test`, `socket_test`, `pipe_cow_test`) — is built straight to
 `disk-image-root/bin/` instead and shipped on the ext2 disk image
 (`disk.img`, mounted at `/mnt`) rather than baked into the kernel ELF.
 This split exists because `kernel/embedded/`'s ELFs (mostly `doom.elf`/
@@ -1090,4 +1092,6 @@ Sysdeps added beyond the original bootstrap set (all in `generic/generic.cpp` un
   - **Every PTE change invalidates through `memory::tlb`** (`invalidate_page(pml4, addr)` for user mappings, `invalidate_kernel_page` for kernel ones) — never `x86_64::instructions::tlb::*` or `MapperFlush::flush()`; consume a `MapperFlush` with `.ignore()` and pass its page. Since stage 5 these shoot down the other CPUs (see TLB Shootdown). **Every CR3 load goes through `tlb::switch_to`**, which records it — a bare `Cr3::write` makes this CPU invisible to user-mapping shootdowns. `grep -rn 'instructions::tlb\|\.flush()' kernel/src/memory` should find only `tlb.rs`.
   - **`gs` is used in exactly one place: `syscall_entry_fast`'s four-instruction `swapgs` window** (stage 2, `kernel/src/cpu/percpu.rs`). It loads this CPU's kernel stack from `PerCpu`, then swaps straight back, so every other path — the timer stub, rustc's `x86-interrupt` shims (which never `swapgs`), `jump_to_trapframe` — runs with user mode's GS_BASE and never reads it. Rust reaches per-CPU data through `cpu::cpu_id()`, which reads the task register (`str`), not `gs:`. **Do not add a `gs:` access anywhere else**; `percpu::check_gs_invariant` (every syscall + every tick) panics if `IA32_KERNEL_GS_BASE` stops pointing at `&PERCPU[cpu]`. Each CPU has its own TSS slot in one GDT at `FIRST_TSS_SELECTOR + 16·n` (stage 3, `process/tss.rs`) — one GDT per CPU with the TSS at the same index would make `cpu_id()` stop telling CPUs apart.
   - **Nothing new hangs off the timer tick** without saying whether it is global work (BSP only: `hrtimer`, the USB poll) or per-CPU work (scheduling).
+  - **Kernel locks are `crate::sync::Mutex`, never `spin::Mutex`** (stage 6, `kernel/src/sync.rs`): its relax strategy answers TLB shootdowns, so no CPU can spin on a lock with IF=0 while the holder waits for that CPU's acknowledgement. **A lock an ISR also takes is an `IrqLock` or `diag::IrqMutex`**, or the ISR uses `try_lock` (`FB_STATE`, `FRAMEBUFFER`, `CONTROLLERS`): a plain lock held by a syscall with IF=1 is a deadlock with *one* CPU the moment that ISR lands on it — syscalls enter with IF=0 but most re-enable it at their first guard, and `TERMIOS`, `EPOLL_INSTANCES` and `SERIAL` had exactly that bug. (`serial_println!` with IF=0 only *tries* the lock and falls back to the lock-free writer.) **Any other IF=0 busy-wait calls `memory::tlb::service_pending`** (the USB transfer waits do). Lock order and the full per-lock audit: the stage 6 resolution in `docs/smp/smp-plan.md`.
+  - **Check-then-sleep must be one step.** Checking a condition, registering as a waiter and blocking were kept together only by IF=0 on one CPU; with a waker on another CPU, a wakeup in between is lost. `FUTEX_WAIT` holds the scheduler lock and `FUTEX_WAITERS` across all three; `poll`, stdin, pipes and sockets still have the gap (stage 7).
 - **Nothing per-process may live in a per-CPU global across a preemption point.** The current syscall's frame is `syscall::current_tf_ptr()`, computed from the running process's own kernel stack top (this CPU's `PerCpu::kernel_rsp` `- sizeof(TrapFrame)`, where `syscall_entry_fast` always builds it — Linux's `task_pt_regs`). It used to be a global (`CURRENT_SYSCALL_TF`) stored at syscall entry, which went stale whenever a syscall was preempted with IF=1 and another process made syscalls before it resumed: the post-syscall signal check then delivered the parent's SIGCHLD into the dead child's frame and wrote the signal frame over the parent's live stack. Symptom: `ash` dying at its `exit` builtin (`rip` 0, 0x202, or an address in the child's binary) after a short-lived child, under host load only. Found 2026-09-24 by the first autorun job; the user-segfault stack dump (`init::devices::dump_user_stack`) and `ktrace!(PROC)` on signal delivery/`sigreturn` are what cornered it.

@@ -9,8 +9,10 @@
 > CPU); etapa 4 hecha y verificada en QEMU y en la Ryzen (`kernel/src/smp.rs`,
 > `hal::smp`): los APs arrancan, pasan `init_this_cpu` y se quedan en `hlt`;
 > etapa 5 hecha y verificada en QEMU y en la Ryzen (TLB shootdown por IPI,
-> `memory::tlb`, `hal::tlb`, `tlb_selftest`). Los procesos siguen
-> corriendo en una sola CPU.
+> `memory::tlb`, `hal::tlb`, `tlb_selftest`); etapa 6 hecha y verificada en
+> QEMU (2026-09-25; ver su resolución: cada entrada del inventario resuelta
+> o asignada a la etapa 7, y cinco bugs reales encontrados por el camino).
+> Los procesos siguen corriendo en una sola CPU.
 
 ## Por qué ahora
 
@@ -540,7 +542,8 @@ Encontrado por el camino:
   `OwnedPageTable::replace_frame`, que la prueba usa).
 - **Toda espera con IF=0 sobre un `spin::Mutex` normal** (el del scheduler,
   entre otros) no atiende shootdowns: si el emisor tiene ese lock, bloqueo.
-  Inalcanzable mientras los APs no toman locks; es un requisito de la etapa 7.
+  Inalcanzable mientras los APs no toman locks. *(Resuelto en la etapa 6:
+  `crate::sync::Mutex`.)*
 - **`rflags = 0x200` en todo `TrapFrame` nuevo** (`process/mod.rs` ×3, `exec`):
   el bit 1 está reservado y siempre a 1, y el validador de marcos de
   `timer_preempt` (2026-08-06) lo rechaza. `pthread_test` entraba en pánico
@@ -579,6 +582,120 @@ El inventario de arriba, entrada por entrada:
 
 **Hecho cuando:** cada entrada del inventario tiene una resolución
 escrita en este documento, y el CLAUDE.md está actualizado.
+
+#### Resolución (2026-09-25)
+
+Tres mecanismos estructurales, para que la regla no dependa de que cada
+sitio nuevo se acuerde:
+
+- **`crate::sync::Mutex`** (`kernel/src/sync.rs`) sustituye a `spin::Mutex`
+  en todo el kernel: su estrategia de espera llama a
+  `tlb::service_pending`, así que *ningún* lock del kernel puede dejar a
+  una CPU girando con IF=0 sin atender un shootdown. El lock del scheduler
+  queda cubierto sin tocarlo. `vfs` (ramfs, `MountTable`) tiene lo mismo
+  por un gancho (`vfs::lock::set_relax_hook`, conectado en `init::boot`),
+  porque no puede nombrar al kernel. Queda fuera `diag::TrackedMutex`, que
+  el kernel no usa.
+- **`crate::sync::IrqLock`** (el `spin_lock_irqsave` de Linux: guarda IF,
+  `cli`, gira, restaura al soltar) para los locks que *también* toma un
+  ISR: `TERMIOS`, `hrtimer::QUEUE`, `STDIN_WAITER`, `POLL_WAITERS`,
+  `EPOLL_INSTANCES`. Un lock así, tomado desde un syscall con IF=1, es un
+  bloqueo con **una sola CPU** en cuanto el ISR cae en esa CPU; los
+  syscalls entran con IF=0 (`IA32_FMASK`) pero casi todos lo reactivan en
+  su primer guard. `TERMIOS` (IRQ1 → `tty::feed_input` contra el ioctl
+  `TCSETS`) y `EPOLL_INSTANCES` (IRQ1 → despertar de stdin contra el
+  `close` de un fd epoll) no cumplían la convención.
+- **Un lock por espacio de direcciones** (`AddressSpace::vmas`, ahora
+  `IrqMutex`): toda búsqueda de VMA y todo cambio de PTE de ese espacio
+  ocurren dentro. Ver la entrada COW abajo.
+
+Entrada por entrada:
+
+| Inventario | Resolución |
+|---|---|
+| `SYSCALL_USER_RFLAGS`, `KERNEL_RSP0` | Etapa 2: `PerCpu` (`user_rsp`, `kernel_rsp`); ya no existen |
+| `TSS`, pilas IST, `GDT` | Etapa 3: una GDT, un slot de TSS por CPU (`0x28+16n`), TSS e IST por CPU sin `static mut` |
+| MSRs de `syscall`, `IA32_PAT`, SSE, `lidt`, `GS`, CR0/CR4/EFER, APIC base | Etapa 3: pasos de `cpu::init_this_cpu`, cada uno con su `verify_*` |
+| EOI por puerto `0x20`, PIT como reloj | Etapa 1: `interrupts::eoi`, LAPIC timer |
+| Trabajo global en el tick | Se queda en la BSP: el timer de los APs está enmascarado (`apic::runs_timer`). Al darles tick en la etapa 7, `tick_cursor_blink`, `usb::poll`, `hrtimer::tick` y el flush del log siguen solo en la CPU 0 (decisión 3) |
+| `keyboard::DECODER` | Etapa 0: `IrqMutex` |
+| `mouse::DECODER` | `IrqMutex`. Su `UnsafeCell` se justificaba en "una línea IRQ nunca llega a dos CPUs a la vez", que es una decisión de rutado del I/O APIC tomada en otro sitio |
+| Colas de entrada (`KEYBOARD_BUFFER`, `RAW_KEY_EVENTS`, `MOUSE_EVENTS`) | **No estaban en el inventario y debían.** Eran anillos SPSC sin lock con tres productores (IRQ1, IRQ4, el sondeo USB — que corre en la CPU que esté drenando el anillo de eventos del xHCI) y N lectores. Ahora `hal::ring::Ring` (puro, 3 tests) detrás de `IrqMutex`; `mouse::PUSH` sobra |
+| `klog::SCRATCH` | Ya era exclusivo: `SCRATCH_BUSY.swap` es un try-lock. Sin cambios |
+| `logpart::SCRATCH` | Ya era exclusivo: solo se toca con `STATE` tomado. Sin cambios |
+| `cow::FRAME_REFCOUNTS` | `AtomicU8` con `fetch_update` saturado; puntero y tamaño de la tabla en atómicos (publicados antes de los APs). Se retiran los cuatro `COW_IF_*` de `/proc/kdebug`: medían la regla de IF=0, que ya no existe. Las *decisiones* ("refcount 1 → soy el último dueño") se toman con el lock del espacio de direcciones: la cuenta solo sube por un `fork()` de un espacio que mapea el marco, y ese `fork` tiene el mismo lock |
+| USB "con IF=0 y `CONTROLLERS`" | El lock excluye igual en SMP. Lo que faltaba: sus esperas de transferencia giran con IF=0 hasta segundos; ahora atienden shootdowns (`xhci.rs` ×3, `msc.rs`). `CONTROLLERS` es un `sync::Mutex` y el sondeo del tick usa `try_lock` |
+| Cada `static Mutex` | Tabla de orden de locks abajo. Todos los que toma un ISR son `IrqLock`/`IrqMutex`, o el ISR usa `try_lock` (`FB_STATE`, `FRAMEBUFFER`, `CONTROLLERS`) |
+| `SERIAL` | Lo toman ISRs (la ruta de muerte por fallo, la acción por defecto de una señal en el tick) mientras el código interrumpido puede tenerlo con IF=1: un bloqueo con una CPU. `_print` con IF=0 hace `try_lock` y, si está ocupado, usa `RawSerialWriter` (la línea puede entrelazarse). No `IrqLock`: dejaría IF=0 toda la transmisión, ~87 µs por carácter en un 16550 real |
+| Flags atómicos de `framebuffer_console` | Se tocan con `FB_STATE` tomado, salvo un `CURSOR_DRAWN.store(false)` sin lock en el tick que a lo sumo deja un cursor mal dibujado |
+| `SCHEDULERS`/`local_scheduler()`, idle único, `on_cpu` | Etapa 7, por diseño (decisión 1) |
+| Liberación diferida de kstacks, `sys_exit` con IF=0 hasta el `iretq` | El invariante sigue valiendo **por CPU**: IF=0 impide que *esta* CPU se libere la pila bajo sus pies. Lo que no cubre en SMP es otra CPU: `tick(interrupted_rsp)` compara con el RSP interrumpido de la CPU que hace el tick, y una kstack encolada puede estar en uso en otra. Requisito de la etapa 7: liberar una kstack solo cuando ninguna CPU esté en ella (el `on_cpu` de esa etapa, o un RSP por CPU en `PerCpu`) |
+| COW `unmap_and_remap` (de la etapa 5) | `replace_frame`: un solo store de PTE; `unmap_and_remap` borrado. Y todo el fallo — búsqueda de VMA, decisión de refcount, cambio de PTE — dentro del lock del espacio de direcciones |
+| Cambios de PTE de un espacio compartido por hilos | `fork` (el lado padre), fallo no presente, fallo COW, `mmap`/`munmap`, `try_free_huge_vma` (con `try_with`, desde el tick) y las copias del kernel a otro proceso: todos dentro de `AddressSpace::vmas`. Un fallo sobre una página que otro hilo ya resolvió es éxito (fallo espurio), no un `map_to` fallido que mataba al proceso. `vmas` ya era un `spin::Mutex` que el manejador de fallos (IF=0) tomaba y los syscalls tomaban con IF=1: un hermano que fallaba mientras el poseedor estaba expropiado giraba para siempre, también con una CPU |
+| Esperas con IF=0 que no atienden shootdowns (de la etapa 5) | Cerrado: `sync::Mutex`, `IrqMutex`, el gancho de `vfs` y las esperas USB. Las esperas de arranque (`smp::start_aps`, calibración del APIC, traspaso BIOS→OS del xHCI) corren antes de que haya otra CPU en `READY` |
+
+**Orden de locks** (A → B: B se toma con A tomado; nunca al revés):
+
+- `SCHEDULERS` → `AddressSpace::vmas` → `BUDDY`/`SLAB_ALLOCATOR`
+  (`sys_fork`, `sys_munmap`, las copias de `pipe.rs`/`stdin_wakeup`, la
+  traducción de `poll`).
+- `SCHEDULERS` → `FUTEX_WAITERS` → `vmas` (`FUTEX_WAIT`, ver abajo).
+- `SCHEDULERS` → `POLL_WAITERS`, `EPOLL_FD_MAP`, `FUTEX_WAITERS`,
+  `unix::WAITERS` (`cancel_all_waiters` en la ruta de muerte por señal).
+- `SCHEDULERS` → `hrtimer::QUEUE` (`nanosleep`). El tick toma `QUEUE`, lo
+  suelta y luego toma el scheduler: sin anidar.
+- `POLL_WAITERS` → `EPOLL_INSTANCES` → `SOCKETS`; `SOCKETS` → (suelta) →
+  `SCHEDULERS`, nunca anidados.
+- `SCHEDULERS` → `SERIAL`, y el fd table de un proceso.
+- `FB_STATE` → `FRAMEBUFFER`.
+- `EXT2_LOCK` → el dispositivo de bloques (`ATA_LOCK` o `CONTROLLERS`).
+- Sin anidamiento con otros: `AC97`, `CLAIMS`, `FIRST_ERROR`,
+  `logpart::STATE` (→ `CONTROLLERS`), `IOAPICS`.
+
+**Bugs reales encontrados en la auditoría** (todos alcanzables ya con una
+CPU salvo el último, y ninguno en el inventario):
+
+1. **`pipe.rs` escribía en el marco cero global y en marcos COW
+   compartidos.** Quien completa el `read()` de un lector bloqueado
+   traducía su buffer y escribía por el physmap: si la página era el marco
+   cero (solo leída), *toda página anónima sin tocar del sistema* pasaba a
+   contener esos bytes; si seguía compartida con el padre del `fork`, la
+   copia del padre cambiaba. Y mapeaba las páginas ausentes en el CR3
+   *actual* (el del escritor), no en el del lector. `userspace/c/pipe_cow_test.c`
+   lo reproduce en la línea base (A: una página anónima nunca escrita lee
+   `72` = `'H'`; B: `parent page='BBBBBBBB'`) y pasa ahora.
+   `AddressSpace::copy_to_user`/`copy_from_user` hacen la copia con la
+   semántica de una escritura de usuario, bajo el lock del espacio.
+2. **`stdin_wakeup`** (desde IRQ1) tenía la misma escritura por el
+   physmap; ahora `copy_to_user`. **`poll`/`epoll_wait`** guardan una
+   dirección física para que otro contexto escriba después: ahora la
+   página se hace privada y escribible antes de traducirla
+   (`prepare_user_write`). Queda un hueco: que un hermano la vuelva a
+   compartir con un `fork()` mientras el llamador duerme.
+3. **Bloqueos ISR↔syscall con una CPU:** `TERMIOS`, `EPOLL_INSTANCES`,
+   `SERIAL` y `AddressSpace::vmas` (arriba).
+4. **ABBA en `RamFileHandle`:** `read`/`write` tomaban `data` → `offset`
+   y `seek` `offset` → `data`, sobre locks compartidos por cada dup del fd.
+5. **`FUTEX_WAIT` perdía despertares en SMP:** comprobar `*uaddr`,
+   registrarse y bloquear eran tres pasos que solo IF=0 mantenía juntos.
+   Ahora los tres con el scheduler y `FUTEX_WAITERS` tomados, y el valor se
+   lee a través del espacio de direcciones (un fallo ahí llegaría a la ruta
+   de muerte, que toma el scheduler lock).
+
+**Para la etapa 7** (lo que esta auditoría deja escrito y no resuelve):
+
+- **Despertares perdidos del resto de esperas.** `poll`, `read` de stdin,
+  tuberías y sockets comprueban y luego se registran/bloquean; con otra
+  CPU entre medias, el despertar se pierde igual que en el futex. Lo
+  general es una marca "despertar pendiente" en el scheduler: `wake(pid)`
+  de un proceso que aún corre la pone, y `block_current` la consume en vez
+  de bloquear. Eso cierra el hueco registro→bloqueo de todos a la vez; el
+  hueco comprobación→registro requiere comprobar con el lock del registro
+  tomado, caso por caso.
+- La liberación diferida de kstacks por CPU (arriba).
+- `fork` no comparte páginas de 2 MiB (`Huge2M`): el hijo las recibe
+  vacías. No es de SMP, pero la auditoría lo vio (el bucle de `fork`
+  recorre páginas de 4 KiB y `translate_page` no ve las grandes).
 
 ### Etapa 7 — los APs ejecutan procesos
 
