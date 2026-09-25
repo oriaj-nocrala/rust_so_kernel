@@ -86,6 +86,11 @@ pub mod icr {
     pub const fn init_deassert() -> u32 {
         TRIGGER_LEVEL | DELIVERY_INIT
     }
+    /// Fixed delivery, edge, physical destination: an ordinary interrupt
+    /// on `vector` (the TLB-shootdown and wake-up IPIs).
+    pub const fn fixed(vector: u8) -> u32 {
+        vector as u32
+    }
     /// STARTUP: begin at `vector << 12` in real mode.
     pub const fn startup(vector: u8) -> u32 {
         DELIVERY_STARTUP | vector as u32
@@ -206,6 +211,9 @@ mod tests {
         assert_eq!(icr::init_assert(), 0xC500);
         assert_eq!(icr::init_deassert(), 0x8500);
         assert_eq!(icr::startup(0x9C), 0x069C);
+        // Linux: APIC_DM_FIXED | vector — delivery mode 000, edge, assert
+        // ignored for fixed, physical destination.
+        assert_eq!(icr::fixed(0xF0), 0x00F0);
         assert_eq!(icr::xapic_dest(27), 27 << 24);
         assert_eq!(icr::x2apic(0x1B, 0x069C), 0x0000_001B_0000_069C);
     }

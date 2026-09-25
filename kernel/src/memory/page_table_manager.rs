@@ -212,17 +212,16 @@ impl OwnedPageTable {
     // ACTIVATE (change CR3)
     // ====================================================================
 
-    /// Switch the CPU to this page table.
+    /// Switch the CPU to this page table, through `memory::tlb::switch_to`
+    /// (which records it for the TLB shootdown).
     /// No-op if CR3 already matches (avoids TLB flush).
     pub unsafe fn activate(&self) {
-        use x86_64::registers::control::Cr3Flags;
-
         let (current_frame, _) = Cr3::read();
         if current_frame == self.pml4_frame {
             return;
         }
 
-        Cr3::write(self.pml4_frame, Cr3Flags::empty());
+        crate::memory::tlb::switch_to(self.pml4_frame);
     }
 
     // ====================================================================
@@ -264,7 +263,7 @@ impl OwnedPageTable {
         mapper
             .map_to(page, frame, flags, &mut buddy_alloc)?
             .ignore();
-        crate::memory::tlb::invalidate_page(page.start_address());
+        crate::memory::tlb::invalidate_page(self.pml4_phys(), page.start_address());
 
         Ok(frame)
     }
@@ -294,7 +293,7 @@ impl OwnedPageTable {
             .map_to_with_table_flags(page, frame, flags, parent_flags, &mut buddy_alloc)
             .map_err(|_| "map_existing_frame: map_to failed")?
             .ignore();
-        crate::memory::tlb::invalidate_page(page.start_address());
+        crate::memory::tlb::invalidate_page(self.pml4_phys(), page.start_address());
         Ok(())
     }
 
@@ -311,7 +310,7 @@ impl OwnedPageTable {
             .update_flags(page, flags)
             .map_err(|_| "update_page_flags: failed")?
             .ignore();
-        crate::memory::tlb::invalidate_page(page.start_address());
+        crate::memory::tlb::invalidate_page(self.pml4_phys(), page.start_address());
         Ok(())
     }
 
@@ -332,7 +331,7 @@ impl OwnedPageTable {
             .unmap(page)
             .map_err(|_| "unmap_and_remap: unmap failed")?;
         flush.ignore();
-        crate::memory::tlb::invalidate_page(page.start_address());
+        crate::memory::tlb::invalidate_page(self.pml4_phys(), page.start_address());
 
         // Remap with new frame; intermediate tables are reused.
         let mut buddy_alloc = BuddyFrameAllocator;
@@ -340,7 +339,7 @@ impl OwnedPageTable {
             .map_to(page, new_frame, flags, &mut buddy_alloc)
             .map_err(|_| "unmap_and_remap: map_to failed")?
             .ignore();
-        crate::memory::tlb::invalidate_page(page.start_address());
+        crate::memory::tlb::invalidate_page(self.pml4_phys(), page.start_address());
 
         Ok(())
     }
@@ -364,7 +363,7 @@ impl OwnedPageTable {
             .unmap(page)
             .map_err(|_| "unmap_page_and_free: unmap failed")?;
         flush.ignore();
-        crate::memory::tlb::invalidate_page(page.start_address());
+        crate::memory::tlb::invalidate_page(self.pml4_phys(), page.start_address());
 
         // Zero-frame is permanent — it has no refcount entry, never free it.
         if !crate::memory::cow::is_zero_frame(frame) {
@@ -409,7 +408,7 @@ impl OwnedPageTable {
             Err(_) => return Ok(()),  // not mapped — nothing to free
         };
         flush.ignore();
-        crate::memory::tlb::invalidate_page(page.start_address());
+        crate::memory::tlb::invalidate_page(self.pml4_phys(), page.start_address());
         let event = buddy.deallocate(&crate::allocator::KernelPhysMap, frame.start_address(), 21);
         crate::allocator::log_phantom_event(event);
         Ok(())
@@ -578,6 +577,41 @@ impl OwnedPageTable {
     /// Convenience wrapper: return only the leaf PTE.
     pub unsafe fn get_pte_raw(&self, page: Page<Size4KiB>) -> u64 {
         self.get_pte_all_levels(page)[3]
+    }
+
+    /// Point an already-present 4 KiB leaf at `frame` with `flags`, in one
+    /// store, then invalidate. Unlike `unmap_and_remap`, the entry is never
+    /// not-present in between: a CPU running this table that walks it
+    /// mid-change sees the old frame or the new one, never a fault. (That
+    /// window in `unmap_and_remap` is harmless on one CPU and a bug once a
+    /// thread of the same process runs on another — see stage 6 of
+    /// `docs/smp/smp-plan.md`.) Refcounts are the caller's business.
+    pub unsafe fn replace_frame(
+        &self,
+        page: Page<Size4KiB>,
+        frame: PhysFrame,
+        flags: PageTableFlags,
+    ) -> Result<(), &'static str> {
+        let phys_offset = crate::memory::physical_memory_offset();
+        let virt = page.start_address().as_u64();
+        let mut table = self.pml4_phys().as_u64();
+        for shift in [39u64, 30, 21] {
+            let e = *((phys_offset + table).as_ptr::<u64>().add(((virt >> shift) & 0x1FF) as usize));
+            if e & PageTableFlags::PRESENT.bits() == 0 {
+                return Err("replace_frame: page not mapped");
+            }
+            if e & PageTableFlags::HUGE_PAGE.bits() != 0 {
+                return Err("replace_frame: inside a huge page");
+            }
+            table = e & 0x000F_FFFF_FFFF_F000;
+        }
+        let leaf = (phys_offset + table).as_mut_ptr::<u64>().add(((virt >> 12) & 0x1FF) as usize);
+        if *leaf & PageTableFlags::PRESENT.bits() == 0 {
+            return Err("replace_frame: page not mapped");
+        }
+        core::ptr::write_volatile(leaf, frame.start_address().as_u64() | (flags | PageTableFlags::PRESENT).bits());
+        crate::memory::tlb::invalidate_page(self.pml4_phys(), page.start_address());
+        Ok(())
     }
 }
 

@@ -66,6 +66,9 @@ pub fn init_idt() {
         idt.add_handler(47, irq15_handler);
         // The LAPIC's own spurious vector (see `apic::SPURIOUS_VECTOR`).
         idt.add_handler(crate::interrupts::apic::SPURIOUS_VECTOR, lapic_spurious_handler);
+        // Inter-processor interrupts (stage 5 of `docs/smp/smp-plan.md`).
+        idt.add_handler(crate::memory::tlb::SHOOTDOWN_VECTOR, tlb_shootdown_handler);
+        idt.add_handler(crate::smp::WAKE_VECTOR, wake_ipi_handler);
         // Syscalls are now handled via the `syscall` instruction (LSTAR MSR),
         // not via int 0x80.  No IDT entry needed.
         idt
@@ -203,6 +206,19 @@ unhandled_irq_handlers! {
 /// A LAPIC spurious interrupt: no ISR bit is set for it, so no EOI.
 extern "x86-interrupt" fn lapic_spurious_handler(_: ExceptionStackFrame) {
     crate::debug::inc_spurious_irqs();
+}
+
+/// Another CPU changed a mapping this one may cache (`memory::tlb`). The
+/// request may already have been answered by a spin loop here with IF=0,
+/// in which case this finds nothing to do.
+extern "x86-interrupt" fn tlb_shootdown_handler(_: ExceptionStackFrame) {
+    crate::memory::tlb::service_pending();
+    crate::interrupts::apic::eoi();
+}
+
+/// Only wakes a CPU from `hlt` so it looks at its mailbox (`smp::run_on`).
+extern "x86-interrupt" fn wake_ipi_handler(_: ExceptionStackFrame) {
+    crate::interrupts::apic::eoi();
 }
 
 extern "x86-interrupt" fn divide_by_zero_handler(sf: ExceptionStackFrame) {

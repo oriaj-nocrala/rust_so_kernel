@@ -875,3 +875,24 @@ fn init_this_cpu_restores_what_an_ap_lacks() {
     assert_eq!([IA32_EFER, IA32_STAR, IA32_LSTAR, IA32_FMASK, IA32_KERNEL_GS_BASE, IA32_PAT].map(msr), good);
     assert_eq!(read_cr(), good_cr);
 }
+
+/// Stage 5 of `docs/smp/smp-plan.md`, "done when": a CPU reading a page in
+/// a loop never sees the old translation once another CPU has changed the
+/// mapping — for a user mapping (the COW remap path, only the CPUs running
+/// that table are told), for a kernel mapping (every CPU), and with two
+/// CPUs shooting each other down with IF=0 at once. The runner starts QEMU
+/// with `-smp 4`; `tlb_selftest` has the design, this only runs it.
+///
+/// Verified by sabotage, not assumed: with `memory::tlb::invalidate`
+/// sending nothing to other CPUs, QEMU's own TLB model keeps the old
+/// entry and this fails on `stale`.
+#[test_case]
+fn tlb_shootdown_leaves_no_stale_translation() {
+    assert!(crate::smp::online() >= 2, "test boot has no AP (runner lost -smp?)");
+    let r = crate::tlb_selftest::run(200, crate::cpu::MAX_CPUS)
+        .unwrap_or_else(|e| panic!("tlb_selftest harness: {}", e));
+    assert_eq!(r.aps as usize, crate::smp::online() - 1, "not every AP was tested");
+    assert!(r.user_reads > 0 && r.kernel_reads > 0, "the reader never read");
+    assert_eq!(r.stale, 0, "{}", r);
+    crate::serial_println!("{}", crate::memory::tlb::render());
+}

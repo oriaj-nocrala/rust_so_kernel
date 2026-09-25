@@ -77,6 +77,16 @@ pub trait IrqControl {
     /// from a context that already has interrupts disabled (the timer ISR
     /// itself), which a hand-rolled `cli; ...; sti` is not.
     fn without_interrupts<R>(f: impl FnOnce() -> R) -> R;
+
+    /// Called on every failed attempt while [`IrqMutex::with`] spins for the
+    /// lock — with interrupts disabled, so this is the only thing the
+    /// spinning CPU does. The kernel answers pending TLB-shootdown requests
+    /// here: a CPU spinning with IF=0 on a lock whose holder is waiting for
+    /// that CPU's shootdown acknowledgement would otherwise wait forever
+    /// (stage 5 of `docs/smp/smp-plan.md`). Must not take any lock.
+    fn relax() {
+        core::hint::spin_loop();
+    }
 }
 
 /// A `spin::Mutex` reachable only through a path that disables interrupts
@@ -114,7 +124,12 @@ impl<T, C: IrqControl> IrqMutex<T, C> {
     /// holding interrupts disabled for as long as it does.
     pub fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         C::without_interrupts(|| {
-            let mut guard = self.inner.lock();
+            let mut guard = loop {
+                if let Some(g) = self.inner.try_lock() {
+                    break g;
+                }
+                C::relax();
+            };
             f(&mut guard)
         })
     }
@@ -249,6 +264,46 @@ mod tests {
             RESTORE_COUNT.with(|c| c.set(c.get() + 1));
             r
         }
+
+        fn relax() {
+            RELAX_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::yield_now();
+        }
+    }
+
+    /// Process-wide, not thread-local: the spinning thread is not the one
+    /// that asserts. Only `with_calls_relax_while_it_spins` reads it.
+    static RELAX_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// (A) The kernel's shootdown servicing depends on `relax` actually
+    /// running while `with` waits for a held lock — with interrupts off,
+    /// it is the waiting CPU's only chance to answer an IPI it cannot take.
+    /// Sabotage check: `with` back on `self.inner.lock()` never calls
+    /// `relax`, and this fails at the watchdog.
+    #[test]
+    fn with_calls_relax_while_it_spins() {
+        use std::sync::atomic::Ordering::SeqCst;
+        FakeIrq::reset();
+        let m = leaked_mutex();
+        let raw_guard = m.inner.lock();
+        let before = RELAX_CALLS.load(SeqCst);
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        std::thread::spawn(move || {
+            FakeIrq::set_enabled(true);
+            m.with(|v| *v += 1);
+            // The body ran with interrupts off even though it spun first.
+            tx.send(IF_ENABLED.with(|c| c.get())).unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while RELAX_CALLS.load(SeqCst) == before {
+            assert!(std::time::Instant::now() < deadline, "watchdog: `with` spun without calling relax");
+            std::thread::yield_now();
+        }
+        drop(raw_guard);
+        let enabled_after = rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("watchdog: `with` never got the lock after it was released");
+        assert!(enabled_after, "interrupt state not restored after a contended `with`");
+        assert_eq!(m.try_with(|v| *v), Some(1));
     }
 
     fn leaked_mutex() -> &'static IrqMutex<u32, FakeIrq> {

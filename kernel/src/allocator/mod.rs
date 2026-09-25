@@ -78,6 +78,13 @@ impl IrqControl for KernelIrq {
     fn without_interrupts<R>(f: impl FnOnce() -> R) -> R {
         x86_64::instructions::interrupts::without_interrupts(f)
     }
+
+    /// The holder may be a TLB-shootdown sender waiting for this CPU, which
+    /// spins here with IF=0 and can't take the IPI (see `memory::tlb`).
+    fn relax() {
+        crate::memory::tlb::service_pending();
+        core::hint::spin_loop();
+    }
 }
 
 /// Print a [`mm::buddy::PhantomEvent`] the exact way the pre-extraction

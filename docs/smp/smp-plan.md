@@ -7,9 +7,10 @@
 > (`cpu::percpu`, `swapgs` solo en la entrada de `syscall`); etapa 3 hecha
 > y verificada en QEMU y en la Ryzen (`cpu::init_this_cpu`, una GDT con un slot de TSS por
 > CPU); etapa 4 hecha y verificada en QEMU y en la Ryzen (`kernel/src/smp.rs`,
-> `hal::smp`): los APs arrancan, pasan `init_this_cpu` y se quedan en `hlt`.
-> Los procesos siguen corriendo en una sola CPU; no hay IPIs más allá del
-> arranque.
+> `hal::smp`): los APs arrancan, pasan `init_this_cpu` y se quedan en `hlt`;
+> etapa 5 hecha y verificada en QEMU (TLB shootdown por IPI, `memory::tlb`,
+> `hal::tlb`, `tlb_selftest`), pendiente de la Ryzen. Los procesos siguen
+> corriendo en una sola CPU.
 
 ## Por qué ahora
 
@@ -115,6 +116,7 @@ esperar es legítimo siempre que el holder no esté en la propia CPU).
 
 ### TLB
 
+*(Inventario previo a la etapa 5; hoy hay shootdown, ver la etapa 5.)*
 Invalidación local, sin shootdown. **Desde la etapa 0 toda pasa por
 `memory::tlb`** (`invalidate_page`, `invalidate_kernel_page`,
 `invalidate_all_this_cpu`); la etapa 5 cambia esos cuerpos. El inventario
@@ -461,6 +463,85 @@ bucle una página, el otro la desmapea o fuerza COW) no ve nunca la
 traducción vieja. Todavía no hay procesos en los APs, así que el test
 dispara el shootdown a mano desde los APs inertes.
 
+**Estado:** hecha en QEMU el 2026-09-24. Referencias: el comentario de módulo
+de `kernel/src/memory/tlb.rs` (protocolo) y el de `kernel/src/tlb_selftest.rs`
+(la prueba).
+
+- **A quién se avisa** (`hal::tlb`, 6 tests, `hal` = 299): un mapeo de
+  usuario, a las CPUs que tienen *ahora* ese PML4 en CR3 — sin PCID, escribir
+  CR3 tira toda entrada no global —; uno del kernel, a todas las CPUs
+  `READY`. La API cambió de forma, no solo de cuerpo, contra lo que decía el
+  plan: `invalidate_page(pml4, addr)` necesita saber *qué* tabla cambió, y
+  ahora lo aporta quien llama (decisión 4). `OwnedPageTable` pasa la suya,
+  `demand_paging` el CR3 actual. Los tres módulos que no podían decirlo
+  (`paging.rs`, `user_code.rs`, `user_pages.rs`) eran código muerto, sin un
+  solo uso, y se borraron.
+- **Quién tiene qué cargado:** `LOADED[cpu]`, publicado *antes* de escribir
+  CR3; todo cambio de CR3 pasa por `tlb::switch_to` (`activate` y el lector
+  de la prueba). El emisor lo lee tras un `fence(SeqCst)` posterior a su
+  escritura de la PTE: si no ve el valor nuevo de una CPU, la escritura de
+  CR3 de esa CPU es posterior y ya ve la PTE nueva. La única excepción es
+  el `mov cr3` de `ap_entry`, anterior a cargar TR (`cpu_id()` diría 0);
+  `this_cpu_ready` publica ese CR3 después.
+- **Entrar en `READY`** (`this_cpu_ready`): la BSP justo antes de arrancar
+  los APs, cada AP tras un `init_this_cpu` correcto. Luego vacía su TLB
+  entera, globales incluidas (conmutar `CR4.PGE`): lo que cacheó antes de
+  entrar pudo perderse un shootdown. Un AP que falla la inicialización nunca
+  entra, así que nunca se le espera.
+- **Protocolo:** una petición a la vez en una ranura global (`SENDER`), un
+  bit por destino en `PENDING`, IPI fijo en el vector `0xF0` (`icr::fixed`,
+  con `mfence; lfence` antes: la escritura del ICR en x2APIC no serializa),
+  espera acotada a 1 s y pánico nombrando las CPUs que no contestaron. El
+  manejador y todas las esperas con IF=0 llaman a `service_pending`: la
+  espera por `SENDER` (dos CPUs que se disparan a la vez) y, vía el nuevo
+  `diag::IrqControl::relax`, cada espera de un `IrqMutex` (el emisor puede
+  tener `BUDDY`: `unmap_page_and_free_2m_with_buddy`).
+- **Un segundo IPI, `0xF1`** (`smp::WAKE_VECTOR`): despierta a un AP para que
+  mire su buzón (`smp::run_on`). Es cómo la prueba llega a un AP inerte, y la
+  forma que tendrá el IPI de reschedule de la etapa 7.
+- `/proc/kdebug`: `tlb: ready 0xf, N shootdowns (M IPIs), K serviced ..., wait avg X us max Y us`.
+- **La prueba** (`tlb_selftest::run`, compartida por
+  `hw_tests::tlb_shootdown_leaves_no_stale_translation` y `kdebug tlbtest`,
+  syscall 403 cmd 3): un lector en cada AP lee en bucle una página que la
+  BSP mueve entre tres marcos, 200 rondas; la lectura del marco de la ronda
+  anterior cuenta como obsoleta. Tres partes: ámbito de usuario (un espacio
+  de direcciones de prueba cargado en el AP), ámbito del kernel (una hoja de
+  `mmio::map`) y mutua (BSP y AP se disparan 2000 shootdowns cada uno con
+  IF=0). `run-kernel-tests.sh` pasa ahora `-smp 4` y el arranque de tests
+  hace los pasos de APIC y APs del arranque real.
+
+Verificado: `run-kernel-tests` PASS (10 tests; `3 APs x 200 rounds, stale 0`);
+`boot-matrix 4 5` con `-smp 4` 20/20 y con `-smp 1` 20/20; `-smp 24 -m 8G`
+4/4 y `kdebug tlbtest` PASS contra 23 APs (13 272 shootdowns, 204 056 IPIs,
+espera media 9 µs, máxima 369 µs); con `-smp 4`, `fpu_test`, `socket_test`,
+`pthread_test` y `producer_consumer` PASS. **Probado por sabotaje:** sin
+enviar el IPI, `stale 34354` y el test falla (el TLB de QEMU TCG sí conserva
+la traducción vieja); sin `service_pending` en la espera por `SENDER`, la
+parte mutua acaba en `cpus 0x2 never acknowledged`. El `relax` de `IrqMutex`
+tiene su propio test de host (`diag` = 39), también probado quitándolo.
+
+Encontrado por el camino:
+
+- **`unmap_and_remap` deja la PTE a cero entre el `unmap` y el `map`.** La
+  primera versión de la prueba lo usaba, y el lector del AP murió con un
+  fallo de página "no presente" en esa ventana. En una CPU es inofensivo; con
+  dos hilos del mismo proceso en dos CPUs, el otro hilo tomaría un fallo de
+  página en mitad de una resolución COW y el manejador podría mapearle una
+  página nueva encima. Es la ruta COW del kernel: queda para la etapa 6
+  (cada resolución de fallo bajo un lock del espacio de direcciones, y
+  cambiar el marco de una sola escritura, como ya hace
+  `OwnedPageTable::replace_frame`, que la prueba usa).
+- **Toda espera con IF=0 sobre un `spin::Mutex` normal** (el del scheduler,
+  entre otros) no atiende shootdowns: si el emisor tiene ese lock, bloqueo.
+  Inalcanzable mientras los APs no toman locks; es un requisito de la etapa 7.
+- **`rflags = 0x200` en todo `TrapFrame` nuevo** (`process/mod.rs` ×3, `exec`):
+  el bit 1 está reservado y siempre a 1, y el validador de marcos de
+  `timer_preempt` (2026-08-06) lo rechaza. `pthread_test` entraba en pánico
+  en cuanto un hilo nuevo se reanudaba por primera vez desde el tick. No es
+  de esta etapa (arreglado aparte: `0x202`).
+- **Coste:** cada página guarda de una kstack (fork, exit) es un shootdown
+  del kernel a todas las CPUs: 24 al arrancar al shell con `-smp 4`.
+
 ### Etapa 6 — auditoría del estado global
 
 El inventario de arriba, entrada por entrada:
@@ -472,6 +553,14 @@ El inventario de arriba, entrada por entrada:
   `SCHEDULERS` y a los demás, y revisar cada uso desde un ISR.
 - Los invariantes de IF=0 del CLAUDE.md (`sys_exit` hasta el `iretq`,
   la kstack diferida, las transferencias USB), reescritos para SMP.
+- (De la etapa 5.) La resolución de un fallo COW (`unmap_and_remap`, con su
+  ventana de PTE a cero) y cualquier otro cambio de PTE de un espacio de
+  direcciones compartido por hilos, bajo un lock de ese espacio, que el
+  manejador de fallos también tome.
+- (De la etapa 5.) Toda espera con IF=0 que pueda tener al otro lado a un
+  emisor de shootdown atiende `memory::tlb::service_pending` — los
+  `IrqMutex` ya lo hacen (`relax`); el lock del scheduler y los demás
+  `spin::Mutex` tomados con IF=0, no.
 
 **Hecho cuando:** cada entrada del inventario tiene una resolución
 escrita en este documento, y el CLAUDE.md está actualizado.

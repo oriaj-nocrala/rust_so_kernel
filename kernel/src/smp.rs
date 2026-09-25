@@ -6,8 +6,10 @@
 // to long mode through a trampoline in low memory, runs the same
 // `cpu::init_this_cpu` the BSP ran, and then sits in `sti; hlt` forever:
 // inert. Its LAPIC timer is masked (`interrupts::apic::runs_timer`) and the
-// I/O APIC routes nothing to it, so nothing ever wakes it yet. Stage 5 will
-// send it TLB-shootdown IPIs; stage 7 gives it processes.
+// I/O APIC routes nothing to it. Two IPIs wake it (stage 5): a TLB shootdown
+// (`memory::tlb`), and `WAKE_VECTOR`, after which it runs whatever
+// `run_on` left in its mailbox — the TLB self-test's way onto an AP.
+// Stage 7 gives it processes.
 //
 // The pure half — where the trampoline goes, ICR encodings, the sequence
 // and its delays, CPU numbering — is `hal::smp`, host-tested.
@@ -37,7 +39,7 @@
 // Every wait is bounded by the TSC and by a spin count, like every boot-time
 // wait here: an AP that never answers is logged and left out, never a hang.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use hal::smp::{self as hsmp, Step};
 
@@ -192,6 +194,14 @@ pub fn set_trampoline(base: u64) {
 /// The kernel's CR3, loaded by each AP first thing in Rust.
 static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
 
+/// Wakes an AP from `hlt` to look at its mailbox (`run_on`). Next to the
+/// shootdown's 0xF0, in the same (highest) priority class.
+pub const WAKE_VECTOR: u8 = 0xF1;
+
+/// Per-CPU mailbox: a `fn(usize)` as `usize`, 0 when empty. The AP clears
+/// it after the call returns.
+static MAILBOX: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+
 /// Each AP's stack; they are never freed (an inert AP lives on it forever).
 const AP_STACK_SIZE: usize = 64 * 1024;
 
@@ -275,11 +285,17 @@ fn try_start_aps() -> Result<(), &'static str> {
         return Ok(());
     }
 
+    // From here on the BSP may be sent shootdowns by the APs, and waits for
+    // theirs.
+    crate::memory::tlb::this_cpu_ready(0);
     prepare_trampoline(base)?;
 
     for (cpu, &apic_id) in order.iter().enumerate().skip(1) {
         APIC_ID[cpu].store(apic_id, Ordering::Relaxed);
         start_one(cpu, apic_id, vector);
+    }
+    if online() > 1 {
+        crate::tlb_selftest::prepare();
     }
     Ok(())
 }
@@ -428,18 +444,33 @@ extern "sysv64" fn ap_entry(cpu: u64) -> ! {
     let cpu = cpu as usize;
     // SAFETY: the kernel's own PML4, which maps everything this code touches
     // (the trampoline's copy of its higher half is what got us here).
+    // Not `memory::tlb::switch_to`: TR is not loaded yet, so `cpu_id()`
+    // would say 0 and publish this CR3 as the BSP's. `this_cpu_ready`
+    // publishes it below, before this CPU can be told anything.
     unsafe {
         core::arch::asm!("mov cr3, {}", in(reg) KERNEL_CR3.load(Ordering::Relaxed), options(nostack));
     }
     match crate::cpu::init_this_cpu(cpu) {
         Ok(()) => {
+            crate::memory::tlb::this_cpu_ready(cpu);
             STATE[cpu].store(ApState::Online as u8, Ordering::Release);
-            // Inert: nothing is routed here and the timer is masked, so this
-            // sleeps until stage 5's IPIs exist.
+            // Inert: nothing is routed here and the timer is masked. IF=0
+            // while the mailbox is checked, so a `WAKE_VECTOR` sent after
+            // the check is still pending at the `hlt` and wakes it.
             loop {
+                let work = MAILBOX[cpu].load(Ordering::Acquire);
+                if work != 0 {
+                    // SAFETY: only `run_on` stores here, and only `fn(usize)`s.
+                    let f: fn(usize) = unsafe { core::mem::transmute(work) };
+                    x86_64::instructions::interrupts::enable();
+                    f(cpu);
+                    x86_64::instructions::interrupts::disable();
+                    MAILBOX[cpu].store(0, Ordering::Release);
+                    continue;
+                }
                 // SAFETY: `sti; hlt` as one sequence: no wakeup is lost
                 // between them (STI's one-instruction shadow).
-                unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)) };
+                unsafe { core::arch::asm!("sti; hlt; cli", options(nomem, nostack)) };
             }
         }
         Err(e) => {
@@ -451,6 +482,41 @@ extern "sysv64" fn ap_entry(cpu: u64) -> ! {
             }
         }
     }
+}
+
+/// The local APIC ID of kernel CPU `cpu` (what an IPI is addressed to).
+pub fn apic_id(cpu: usize) -> u32 {
+    APIC_ID[cpu].load(Ordering::Relaxed)
+}
+
+/// Is `cpu` an AP that came up (and so runs its mailbox)?
+pub fn is_online_ap(cpu: usize) -> bool {
+    cpu < MAX_CPUS && ApState::from_u8(STATE[cpu].load(Ordering::Acquire)) == ApState::Online
+}
+
+/// Runs `f(cpu)` on the online AP `cpu`, with IF=1, from its idle loop.
+/// Returns once it is posted; `ap_busy` says when it has returned. `false`
+/// if `cpu` is not an online AP or its mailbox is still busy. For
+/// self-tests (see `tlb_selftest`) — stage 7's scheduler is what gives APs
+/// real work.
+pub fn run_on(cpu: usize, f: fn(usize)) -> bool {
+    if !is_online_ap(cpu) {
+        return false;
+    }
+    if MAILBOX[cpu]
+        .compare_exchange(0, f as usize, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return false;
+    }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        crate::interrupts::apic::send_ipi(apic_id(cpu), hal::smp::icr::fixed(WAKE_VECTOR))
+    })
+}
+
+/// Is `cpu` still running what `run_on` gave it?
+pub fn ap_busy(cpu: usize) -> bool {
+    MAILBOX[cpu].load(Ordering::Acquire) != 0
 }
 
 /// How many CPUs are running (the BSP included).

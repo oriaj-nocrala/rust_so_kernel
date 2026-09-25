@@ -67,6 +67,19 @@ pub(super) fn sys_kdebug_ctl(cmd: u64, name_ptr: u64, enable: u64) -> SyscallRes
         // (`block::logpart::on_panic`), which is otherwise only reached by
         // a real bug. `kdebug panic`.
         2 => panic!("kdebug panic: deliberate panic requested from userspace"),
+        // The TLB-shootdown self-test (`tlb_selftest`) against every online
+        // AP: 0 = no stale read, 1 = stale reads, ENODEV = no AP, ETIMEDOUT
+        // = an AP stopped answering. The report goes to the kernel log.
+        // `kdebug tlbtest`.
+        3 => match crate::tlb_selftest::run(200, crate::cpu::MAX_CPUS) {
+            Ok(r) if r.stale == 0 => 0,
+            Ok(_) => 1,
+            Err("no online AP") => errno::ENODEV,
+            Err(e) => {
+                crate::serial_println!("tlb_selftest: ERROR {}", e);
+                errno::ETIMEDOUT
+            }
+        },
         _ => errno::EINVAL,
     }
 }

@@ -96,7 +96,7 @@ so addresses actually resolve to real function names instead of bare hex.
 ### QEMU integration tests
 
 Real hardware-path behavior (drivers that need actual QEMU devices, not just host-testable
-pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 293 tests, <1s, no QEMU) is
+pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 299 tests, <1s, no QEMU) is
 asserted by a `#![feature(custom_test_frameworks)]` harness that boots the real kernel in
 QEMU and reports PASS/FAIL as a process exit code:
 
@@ -137,7 +137,10 @@ the test can actually assert — see the framebuffer console section below. The 
 `framebuffer_shadow_mode_flushes_exactly_what_changed`, repeats that in RAM-shadow mode
 with a second buffer standing in for VRAM: nothing reaches "VRAM" inside a batch, the
 outermost `end_batch` leaves it identical to the shadow, padding is never written, an
-unbatched primitive flushes itself, and a flush copies only its own rectangle. See
+unbatched primitive flushes itself, and a flush copies only its own rectangle. The last,
+`tlb_shootdown_leaves_no_stale_translation`, is the TLB shootdown's (see TLB Shootdown
+below) — which is why the runner starts QEMU with **`-smp 4`** and `boot_for_tests` now
+runs the real boot's APIC and `smp::start_aps` steps. See
 `docs/drivers/architecture.md`'s
 Testing section and `docs/drivers/roadmap.md`'s Phase 2 for more.
 
@@ -264,7 +267,7 @@ Implemented syscalls (Linux-compatible numbers — see `SyscallNumber` enum for 
 | 400/401/402 | `uptime_ms`/`uptime_sec`/`meminfo_kb` | Custom, above the Linux syscall range — debug/introspection only |
 | 162 | `sync` | No write-back cache exists to flush (ext2 writes are synchronous), so this copies the kernel log ring to the USB stick's `constanos-log` partition — see the kernel-log-on-the-stick section. Reports failure, unlike Linux: `ENODEV` (no log partition), `EBUSY`, `EIO`. `kdebug sync` calls it |
 | 169 | `reboot` | Linux magic numbers + commands. `RESTART` flushes the kernel log to the USB stick (reason `reboot`), then resets: ACPI FADT `RESET_REG` → port `0xCF9` → 8042 `0xFE` (only if one answers) → triple fault (`kernel/src/reboot.rs`). `HALT`/`POWER_OFF` flush and stop (no S5 without AML). Backs the embedded `reboot` program. QEMU i440fx's FADT is ACPI 1.0 (no `RESET_REG`), so there `0xCF9` does the reset |
-| 403 | `kdebug_ctl` | Get/set `kernel::debug`'s runtime tracing mask (get: `cmd=0`; set: `cmd=1`, subsystem name + on/off) — backs the `kdebug` userspace program. `cmd=2` panics the kernel on purpose (`kdebug panic`, Linux's sysrq-c) to exercise the panic path on demand |
+| 403 | `kdebug_ctl` | Get/set `kernel::debug`'s runtime tracing mask (get: `cmd=0`; set: `cmd=1`, subsystem name + on/off) — backs the `kdebug` userspace program. `cmd=2` panics the kernel on purpose (`kdebug panic`, Linux's sysrq-c) to exercise the panic path on demand. `cmd=3` runs the TLB-shootdown self-test against every AP (`kdebug tlbtest`; report in `/proc/dmesg` as `tlb_selftest:`) |
 | 404 | `statvfs` | Custom (real `statvfs(2)` has no fixed Linux syscall number of its own — glibc/mlibc implement it over `statfs`, which this port doesn't wire). One physical-memory pool backs every mount, so every path reports the same Buddy-allocator-derived total/free block counts — enough for `df` to run and show live numbers, not a real per-mount breakdown |
 
 Helpers `with_current_process` and `with_scheduler` guarantee `cli` before lock and `sti` after lock is dropped to prevent deadlocks with the timer ISR. `sys_close`/`sys_dup2` deliberately avoid `with_current_process` (see their doc comments) — closing a handle can run a `Drop` impl that needs a fresh `SCHEDULER` lock, which would self-deadlock if the outer helper were still holding it.
@@ -516,7 +519,7 @@ arbitration, exactly where two PS/2 keyboards would merge.
 **Split across the usual seam.** `hal::xhci` (register/TRB/ring/context
 arithmetic), `hal::usb` (descriptor parsing + setup packets) and
 `hal::hid` (boot-report diffing + the Set-1 table) are pure and host-tested
-— most of `hal`'s 293 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
+— most of `hal`'s 299 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
 DMA pages, doorbells and waiting. That line is drawn hard here because an
 xHCI bring-up failure is nearly unobservable (a wrong bit in a device
 context yields no fault, no log, just a Transfer Event that never arrives)
@@ -910,7 +913,10 @@ trampoline below 640 KiB (code, then its own PML4/PDPT/PD), **reserved in
 must never be handed out. The trampoline's PML4 is a *copy* of the kernel's
 with entry 0 replaced by a 0–2 MiB identity map, so no live table changes; the
 AP loads the kernel's real CR3 first thing in Rust (`ap_entry`), runs
-`cpu::init_this_cpu(cpu)`, and loops on `sti; hlt`. **Its LAPIC timer is
+`cpu::init_this_cpu(cpu)`, joins the TLB shootdown (`memory::tlb::this_cpu_ready`),
+and loops on `sti; hlt`, woken only by IPIs: a shootdown (0xF0) or
+`smp::WAKE_VECTOR` (0xF1), after which it runs what `smp::run_on` left in its
+mailbox (the self-test's way onto an AP). **Its LAPIC timer is
 masked** (`interrupts::apic::runs_timer`: CPU 0 only until stage 7) — an AP
 with IF=1 that took vector 32 would run the scheduler. APs start one at a
 time; every wait is bounded, and an AP that does not answer is logged
@@ -920,6 +926,31 @@ The BSP is always CPU 0; the rest follow MADT order up to `MAX_CPUS` (32).
 `smp:` in `/proc/kdebug` has the per-CPU outcome and time to come up;
 `QEMU_DEBUG_SMP=N` gives QEMU N CPUs, and `boot-matrix.sh` records
 `cpus_online=M/N` per boot.
+
+## TLB Shootdown (`kernel/src/memory/tlb.rs`, `hal/src/tlb.rs`, `kernel/src/tlb_selftest.rs`)
+
+Stage 5 of `docs/smp/smp-plan.md`. After a page-table change, every *other*
+CPU that can hold the old entry is sent an IPI (vector 0xF0) and waited for:
+for a user mapping, the CPUs whose CR3 is that table right now
+(`tlb::invalidate_page(pml4, addr)` — callers pass the table: `OwnedPageTable`
+its own, `demand_paging` the current CR3); for a kernel mapping, every CPU in
+`READY` (`invalidate_kernel_page`). Who has what loaded is `LOADED[cpu]`,
+published before the CR3 write — so **every CR3 load goes through
+`tlb::switch_to`** (the one exception, `ap_entry`'s, runs before TR and is
+covered by `this_cpu_ready`). One request at a time; the wait is bounded
+(1 s, then a panic naming the CPUs). **A CPU spinning with IF=0 cannot take
+the IPI**, so such spins call `tlb::service_pending`: the wait for the
+sender slot, and every `diag::IrqMutex` spin (`IrqControl::relax`). A plain
+`spin::Mutex` taken with IF=0 (the scheduler's) does not — unreachable
+while the APs take no locks, a stage-7 requirement. `/proc/kdebug`'s `tlb:`
+line counts shootdowns, IPIs and wait times. Tested by
+`hw_tests::tlb_shootdown_leaves_no_stale_translation` and on demand by
+`kdebug tlbtest`, both `tlb_selftest::run`: an AP reads a page in a loop
+while the BSP moves it between frames; sabotaged (no IPI) it reports
+thousands of stale reads, so QEMU's TLB model does keep old entries.
+**`OwnedPageTable::unmap_and_remap` (the COW path) leaves the PTE zero
+between its two halves** — harmless on one CPU, a fault in another thread's
+face once threads span CPUs; `replace_frame` changes a leaf in one store.
 
 ## Interrupt Controllers (`kernel/src/interrupts/`, `hal/src/apic.rs`)
 
@@ -1056,7 +1087,7 @@ Sysdeps added beyond the original bootstrap set (all in `generic/generic.cpp` un
 - **SMP-ready rules** (stage 0 of `docs/smp/smp-plan.md`; processes still run on one CPU — the APs are up but parked in `hlt` — and these stop the debt growing before SMP pays it off):
   - **IF=0 is not mutual exclusion.** Shared state takes a real lock; `cli` only prevents reentry on the *same* CPU. `keyboard::DECODER` is the worked example: two ISRs (IRQ1 and the timer's USB poll) wrote it through an `UnsafeCell` justified as "only the keyboard ISR touches it" — never true once USB existed, safe only because `cli` serialized both on one CPU. It is an `IrqMutex` now.
   - **No new `static mut` or global `UnsafeCell` for shared state.** Per-CPU state gets indexed by `cpu::cpu_id()`; existing offenders are the plan's inventory, not precedent.
-  - **Every PTE change invalidates through `memory::tlb`** (`invalidate_page` for user mappings, `invalidate_kernel_page` for kernel ones) — never `x86_64::instructions::tlb::*` or `MapperFlush::flush()`; consume a `MapperFlush` with `.ignore()` and pass its page. Stage 5's shootdown then changes those bodies, not every call site. `Cr3::write` is a switch, not an invalidation. `grep -rn 'instructions::tlb\|\.flush()' kernel/src/memory` should find only `tlb.rs`.
+  - **Every PTE change invalidates through `memory::tlb`** (`invalidate_page(pml4, addr)` for user mappings, `invalidate_kernel_page` for kernel ones) — never `x86_64::instructions::tlb::*` or `MapperFlush::flush()`; consume a `MapperFlush` with `.ignore()` and pass its page. Since stage 5 these shoot down the other CPUs (see TLB Shootdown). **Every CR3 load goes through `tlb::switch_to`**, which records it — a bare `Cr3::write` makes this CPU invisible to user-mapping shootdowns. `grep -rn 'instructions::tlb\|\.flush()' kernel/src/memory` should find only `tlb.rs`.
   - **`gs` is used in exactly one place: `syscall_entry_fast`'s four-instruction `swapgs` window** (stage 2, `kernel/src/cpu/percpu.rs`). It loads this CPU's kernel stack from `PerCpu`, then swaps straight back, so every other path — the timer stub, rustc's `x86-interrupt` shims (which never `swapgs`), `jump_to_trapframe` — runs with user mode's GS_BASE and never reads it. Rust reaches per-CPU data through `cpu::cpu_id()`, which reads the task register (`str`), not `gs:`. **Do not add a `gs:` access anywhere else**; `percpu::check_gs_invariant` (every syscall + every tick) panics if `IA32_KERNEL_GS_BASE` stops pointing at `&PERCPU[cpu]`. Each CPU has its own TSS slot in one GDT at `FIRST_TSS_SELECTOR + 16·n` (stage 3, `process/tss.rs`) — one GDT per CPU with the TSS at the same index would make `cpu_id()` stop telling CPUs apart.
   - **Nothing new hangs off the timer tick** without saying whether it is global work (BSP only: `hrtimer`, the USB poll) or per-CPU work (scheduling).
 - **Nothing per-process may live in a per-CPU global across a preemption point.** The current syscall's frame is `syscall::current_tf_ptr()`, computed from the running process's own kernel stack top (this CPU's `PerCpu::kernel_rsp` `- sizeof(TrapFrame)`, where `syscall_entry_fast` always builds it — Linux's `task_pt_regs`). It used to be a global (`CURRENT_SYSCALL_TF`) stored at syscall entry, which went stale whenever a syscall was preempted with IF=1 and another process made syscalls before it resumed: the post-syscall signal check then delivered the parent's SIGCHLD into the dead child's frame and wrote the signal frame over the parent's live stack. Symptom: `ash` dying at its `exit` builtin (`rip` 0, 0x202, or an address in the child's binary) after a short-lived child, under host load only. Found 2026-09-24 by the first autorun job; the user-segfault stack dump (`init::devices::dump_user_stack`) and `ktrace!(PROC)` on signal delivery/`sigreturn` are what cornered it.

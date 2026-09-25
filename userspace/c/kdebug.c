@@ -31,6 +31,20 @@ static void usage(void) {
     printf("       kdebug <subsystem> <on|off>  (mm, sched, fs, proc)\n");
     printf("       kdebug sync               copy the kernel log to the USB stick\n");
     printf("       kdebug panic              panic the kernel on purpose (tests the panic path)\n");
+    printf("       kdebug tlbtest            TLB-shootdown self-test against every AP\n");
+}
+
+// The stage-5 TLB-shootdown self-test (kernel/src/tlb_selftest.rs). The
+// full report (APs, rounds, reads) is in the kernel log: `tlb_selftest:`.
+static int do_tlbtest(void) {
+    long r = raw_syscall(SYS_KDEBUG_CTL, 3, 0, 0);
+    switch (r) {
+    case 0:    printf("kdebug: tlbtest PASS (details: grep tlb_selftest /proc/dmesg)\n"); return 0;
+    case 1:    printf("kdebug: tlbtest FAIL: stale translations seen\n"); return 1;
+    case -19:  printf("kdebug: tlbtest: no AP online\n"); return 1;
+    case -110: printf("kdebug: tlbtest: an AP stopped answering (see /proc/dmesg)\n"); return 1;
+    default:   printf("kdebug: tlbtest failed (%ld)\n", r); return 1;
+    }
 }
 
 // sync(2) — in this kernel, the flush of the log ring to the pendrive's
@@ -56,6 +70,9 @@ int main(int argc, char **argv) {
 
     if (argc == 2 && strcmp(argv[1], "sync") == 0) {
         return do_sync();
+    }
+    if (argc == 2 && strcmp(argv[1], "tlbtest") == 0) {
+        return do_tlbtest();
     }
     if (argc == 2 && strcmp(argv[1], "panic") == 0) {
         raw_syscall(SYS_KDEBUG_CTL, 2, 0, 0);

@@ -94,6 +94,9 @@ fn main() {
         .arg("512M")
         .arg("-cpu")
         .arg("max")
+        // APs for the TLB-shootdown tests (`hw_tests::tlb_shootdown_*`).
+        .arg("-smp")
+        .arg("4")
         .arg("-display")
         .arg("none")
         .arg("-serial")

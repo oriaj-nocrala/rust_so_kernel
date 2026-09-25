@@ -74,4 +74,17 @@ pub fn boot_for_tests(boot_info: &'static mut BootInfo) {
     // `run_all([...])` list rather than inventing a second boot path.
     let mut acpi_driver = crate::acpi::AcpiDriver::new(boot_info.rsdp_addr.into_option());
     crate::hal::run_all(&mut [&mut acpi_driver]);
+
+    // The real boot's interrupt-controller and SMP steps, in its order, so
+    // the TLB-shootdown tests have APs to shoot down (the runner gives QEMU
+    // several CPUs). IF stays 0 on the BSP for the whole test boot, so the
+    // LAPIC timer this arms never fires; the APs run with IF=1 in their idle
+    // loop, which is what lets them take IPIs.
+    super::devices::init_hardware_interrupts();
+    crate::cpu::tsc::init();
+    crate::interrupts::apic::init();
+    if let Err((step, why)) = crate::cpu::init_this_cpu(0) {
+        panic!("BSP per-CPU init (APIC live): step `{}` failed: {}", step, why);
+    }
+    crate::smp::start_aps();
 }

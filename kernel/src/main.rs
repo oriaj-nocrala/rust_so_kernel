@@ -45,6 +45,7 @@ mod smp;
 #[cfg(test)]
 mod test_framework;
 mod time;
+mod tlb_selftest;
 mod tty;
 mod usb;
 mod watchdog;

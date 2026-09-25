@@ -146,7 +146,7 @@ pub fn map_demand_page(
                 .map_err(|_| "zero-page: map_to failed")?
                 .ignore();
         }
-        crate::memory::tlb::invalidate_page(page.start_address());
+        crate::memory::tlb::invalidate_page(Cr3::read().0.start_address(), page.start_address());
         return Ok(());
     }
 
@@ -171,7 +171,7 @@ pub fn map_demand_page(
             .map_err(|_| "Demand paging: map_to failed")?
             .ignore();
     }
-    crate::memory::tlb::invalidate_page(page.start_address());
+    crate::memory::tlb::invalidate_page(Cr3::read().0.start_address(), page.start_address());
 
     Ok(())
 }
@@ -202,7 +202,7 @@ fn map_demand_page_2m(fault_addr: u64, vma: &Vma, _pid: usize) -> Result<(), &'s
             .map_err(|_| "map_to 2M failed")?
             .ignore();
     }
-    crate::memory::tlb::invalidate_page(page.start_address());
+    crate::memory::tlb::invalidate_page(Cr3::read().0.start_address(), page.start_address());
 
     Ok(())
 }
