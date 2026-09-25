@@ -3,8 +3,8 @@
 > **Estado (2026-09-25):** fase 1 hecha y verificada en QEMU y en la Ryzen
 > (ver su registro al final). Fase 2: 2.1 hecho y verificado en QEMU y en la Ryzen;
 > 2.2 a 2.5 hechos y verificados en QEMU y en la Ryzen (2.2 en el boot #43,
-> 2.3 y 2.5 en el #45; 2.4 son tests de host). Fase 2 cerrada. Fase 3 sin
-> empezar.
+> 2.3 y 2.5 en el #45; 2.4 son tests de host). Fase 2 cerrada. Fase 3 planificada
+> (decisiones del 2026-09-25) y empezada por 3.1.
 
 ## Por qué ahora, y por qué así
 
@@ -372,13 +372,174 @@ ventana va después).
 
 ## Fase 3: primer cliente, un terminal con ventana
 
-Un emulador de terminal cliente del compositor que ejecuta `ash` sobre un
-pseudo-terminal. **Falta un pty** (`/dev/ptmx` + `/dev/pts/N`): hoy la
-"terminal" es la consola del kernel, y ash habla con ella a través de
-`/dev/console` y `/dev/fb`. El pty es un trabajo del kernel en sí mismo,
-y conviene hacerlo al empezar esta fase o antes. Reutiliza la fuente Noto
-y el parser ANSI de `framebuffer_console.rs`, extraído a un crate de host
-(`hal` o uno nuevo) para que lo usen el kernel y el terminal.
+Un emulador de terminal, cliente del compositor, que ejecuta `ash` sobre un
+pseudo-terminal. Hoy no hay pty: la "terminal" es la consola del kernel, y
+ash habla con ella por `/dev/console` y `/dev/fb`. Lo que hay del tty es
+poco y es global:
+
+- `tty::TERMIOS` y `FOREGROUND_PGID` son statics: hay un solo tty.
+  `sys_ioctl` decide si un fd es un tty mirando si su handle se llama
+  `"serial"` o `"fb"`, y `sys_read` tiene un camino aparte para la fd 0.
+- **No hay disciplina de línea.** `ICANON`/`ECHO` se guardan pero no se
+  aplican; solo `ISIG` funciona (`tty::feed_input`). La edición y el eco
+  los hace ash en modo crudo.
+- **No hay sesiones.** `setsid` es "hazte líder de grupo". No existen
+  `getsid`, tty de control, `SIGHUP` ni `SIGWINCH` (y `SIGWINCH`/`SIGURG`
+  terminan el proceso por defecto: en Linux se ignoran).
+- La consola no tiene rejilla de celdas: el parser ANSI de
+  `framebuffer_console.rs` dibuja directamente en el framebuffer y hace
+  scroll moviendo píxeles.
+
+### Decisiones (tomadas con el usuario, 2026-09-25)
+
+- **La disciplina de línea va en un crate de host nuevo, `tty/`**, como
+  `usock`: máquina de estados pura, sin bloqueos, con los efectos como
+  datos. La usa el pty ya; la consola podría migrar después.
+- **Sesiones reales:** `sid` por proceso, `setsid`/`getsid` reales, tty de
+  control, `termios` y grupo en primer plano por tty, `SIGHUP` al cerrar el
+  maestro y `SIGWINCH` con `TIOCSWINSZ`.
+- **El emulador va en un crate nuevo, `vt/`, y la consola del kernel se
+  queda como está.** Su rendimiento está medido en la Ryzen
+  (`docs/fb/console-perf.md`); pasarla a una rejilla obligaría a medirlo
+  todo otra vez. Migrarla es una opción para después, no parte de esta fase.
+
+### 3.1 El crate `tty/` (host, `cd tty && cargo test`)
+
+`no_std` + `alloc`. Los valores de `termios` son los de **este port**
+(`mlibc-port/.../abi-bits/termios.h`: `ISIG = 0x40`, `ICANON = 0x10`,
+`ECHO = 0x01`…), no los de Linux, y el struct ocupa 68 bytes, como
+`kernel::tty::Termios`, que pasa a ser un reexport.
+
+- **`LineDiscipline`**: `termios`, cola de entrada y línea en edición.
+  - `receive(bytes) -> Input`: lo que teclea el maestro. Aplica
+    `ISTRIP`/`INLCR`/`IGNCR`/`ICRNL`, `ISIG` (`VINTR`/`VQUIT`/`VSUSP` →
+    señal devuelta como dato, y vacía la cola salvo `NOFLSH`), `ICANON`
+    (`VERASE`/`VKILL`/`VEOF`/`VEOL`/`\n`) y el eco
+    (`ECHO`/`ECHOE`/`ECHOK`/`ECHONL`). El eco vuelve como bytes para la
+    salida del maestro. Este ABI no tiene `VWERASE` ni `ECHOCTL` (sus
+    `c_cc` son 11), así que no se implementan.
+  - `read(buf) -> Read`: en canónico, como mucho una línea, y `VEOF` en
+    una línea vacía es fin de fichero (0 bytes). En crudo, `VMIN`/`VTIME`:
+    `VMIN > 0` y `VTIME = 0` es lo habitual; `VMIN = 0` y `VTIME = 0`
+    devuelve lo que haya; con `VTIME > 0` devuelve el plazo, y lo arma el
+    kernel.
+  - `output(bytes) -> bytes`: `OPOST`/`ONLCR`/`OCRNL`/`ONLRET`.
+  - `readable()`, `set_termios` (con `TCSETSF` vacía la entrada) y `flush`.
+- **Las reglas de control de trabajos**, puras: con `(pgid y sid del que
+  llama, sid y grupo en primer plano del tty, si ignora o bloquea la
+  señal, si su grupo es huérfano)` deciden **permitir**, **mandar
+  `SIGTTIN`/`SIGTTOU` y reiniciar** o **`EIO`**. Una lectura desde segundo
+  plano da `SIGTTIN`; una escritura con `TOSTOP` y un `tcsetpgrp`/
+  `TCSETS` desde segundo plano dan `SIGTTOU`. Con la señal ignorada o
+  bloqueada, la escritura se permite y la lectura da `EIO`.
+- **`Winsize`**, y el tamaño que cambia devuelve "manda `SIGWINCH`".
+
+Tests como en `usock`: cada regla por separado, secuencias reales (ash en
+crudo, `cat` en canónico con retroceso y `^U`, `^D` a mitad de línea, un
+`^C` que vacía la cola) y propiedades (la cola nunca pasa de su capacidad;
+en canónico, `read` nunca devuelve media línea salvo que el búfer sea más
+pequeño).
+
+### 3.2 Kernel: sesiones y tty de control
+
+- `Process` gana `sid` y `ctty: Option<TtyRef>`, heredados en `fork` y
+  `clone`. `setsid` real: falla con `EPERM` si ya es líder de grupo y, si
+  no, crea sesión y grupo nuevos sin tty de control. `getsid` (124).
+  `setpgid` pasa a exigir la misma sesión.
+- **Tty de control:** `TIOCSCTTY` desde un líder de sesión sin tty, y el
+  primer `open` del esclavo sin `O_NOCTTY` por un líder sin tty, como en
+  Linux. `TIOCNOTTY` lo suelta. `/dev/tty` abre el tty de control del
+  proceso (`ENXIO` si no tiene).
+- **Estado por tty:** `termios`, grupo en primer plano, sesión y
+  `winsize` viven en el tty, no en statics. La consola sigue con su estado
+  global y su camino de siempre (`feed_input`, fd 0), y sus `ioctl`s no
+  cambian.
+- `SIGWINCH` (28) y `SIGURG` (23) se ignoran por defecto, como en Linux.
+- `TIOCGSID`.
+
+### 3.3 Kernel: el pty
+
+- **`/dev/ptmx`**: cada `open` crea un par (hasta 16) y devuelve el
+  maestro. `TIOCGPTN` da el número y `TIOCSPTLCK` lo desbloquea; el
+  esclavo, `/dev/pts/N`, no se puede abrir hasta entonces. `/dev/pts`
+  lista los pares vivos, igual que `InputDirInode`. Un par muere cuando
+  se cierran el maestro y todos los esclavos.
+- **Tabla global `PTYS`** (como `SOCKETS`), con los bloqueos de las
+  tuberías: colas FIFO de lectores y escritores con `WaitCell`,
+  `arm_wait`, `deliver_to_waiter`, y el pid consultado antes de tomar el
+  lock del par (el ABBA con `fork` de `pipe_multi_test`). Esclavo →
+  maestro es un anillo simple, porque `OPOST` se aplica al escribir.
+  Maestro → esclavo pasa por `LineDiscipline::receive`, y su eco vuelve
+  al anillo del maestro.
+- **Cierre**: al cerrar el maestro, `SIGHUP` + `SIGCONT` al grupo en
+  primer plano y al líder de sesión; el esclavo lee 0 y escribe `EIO`.
+  Con todos los esclavos cerrados, el maestro lee `EIO` (Linux) y
+  `poll` da `POLLHUP`.
+- **`poll`/`epoll` de verdad** sobre las dos puntas: un
+  `PollSource::Pty` en la instantánea de `poll.rs`, despertado desde el
+  lado que escribe. Sin esto, el terminal, que espera al socket del
+  compositor y al maestro con un `epoll`, giraría al 100 %.
+- `TIOCSWINSZ` en cualquiera de las dos puntas guarda el tamaño y manda
+  `SIGWINCH` al grupo en primer plano; `TIOCGWINSZ` lo devuelve.
+  `FIONREAD`.
+- **mlibc**: `posix_openpt`/`grantpt`/`unlockpt`/`ptsname`/`openpty`
+  sobre esos `ioctl`s; `ttyname` si hace falta. Borrar `busybox.elf` tras
+  cambiar cabeceras. `CONFIG_SCRIPT` de BusyBox da un cliente de pty
+  real para probar sin GUI (`script -c 'ls' /tmp/out`), y `stty`/`tty`/
+  `reset`, que no están activados.
+- **Test:** `userspace/c/pty_test.c` en el disco. Cubre ida y vuelta en
+  crudo y en canónico, eco, retroceso, `^C` → `SIGINT` al grupo en primer
+  plano y no a otro, `SIGTTIN` desde segundo plano, `SIGHUP` al cerrar el
+  maestro, `EIO`/`POLLHUP` al cerrar el esclavo, `SIGWINCH`, `poll`
+  despertado por la otra punta, y ash de verdad en el esclavo (escribir
+  `echo hola` y leer `hola` de vuelta).
+
+### 3.4 El crate `vt/` (host, `cd vt && cargo test`)
+
+`no_std` + `alloc`, sin syscalls.
+
+- **`Grid`**: celdas `{ch, fg, bg, attrs}`, cursor, región de scroll,
+  pantalla alternativa (`?1049`, para `vi`/`less`/`top`) y el daño en
+  filas.
+- **`Parser`**: el conjunto de la consola (CUP/CUU…/ED/EL/SGR con 16 y
+  256 colores, negrita, inversa) más lo que piden `vi`, `less` y `top`:
+  `DECSTBM`, IL/DL/ICH/DCH/ECH, guardar y restaurar el cursor, `?25`
+  (cursor visible), `?7` (autowrap) y `DSR 6n`, cuya respuesta vuelve como
+  dato para escribirla en el maestro. Lo desconocido se ignora sin
+  romper el estado. La paleta es la de la consola.
+- **`render(grid, damage, dst, stride)`** a un `&mut [u32]` con
+  `noto-sans-mono-bitmap` (el mismo crate y tamaños que la consola) y el
+  cursor. Los tests componen en un `Vec` y comprueban píxeles, igual que
+  en `gui`.
+- **`keymap`**: código `KEY_*` + modificadores → bytes (letras con
+  Mayús/Bloq Mayús, Ctrl-letra, flechas y `Home`/`End`/`Supr`/`RePág`
+  como las manda la consola, Alt → `ESC` delante). Es el mapa US de
+  `hal::keyboard::KeyDecoder`, desde códigos evdev en vez de Set-1.
+
+### 3.5 `term`: el terminal con ventana
+
+`userspace/src/bin/term.rs`, en Rust y embebido. Abre un pty, hace `fork`,
+y el hijo hace `setsid`, abre el esclavo (que así queda como tty de
+control), lo pone en 0/1/2, cierra el resto y hace `exec` de
+`busybox ash`. El padre crea una superficie de 80×25 celdas y espera con
+un `epoll` al socket del compositor y al maestro:
+
+- bytes del maestro → `Parser` → `render` del daño → `attach` + `damage`
+  + `commit`, como mucho uno por `frame`;
+- `key` del compositor → `keymap` → escritura en el maestro;
+- el hijo muere o el maestro da `EIO` → el terminal sale.
+
+`compositor term` es la forma de lanzarlo. Prueba de extremo a extremo:
+`scripts/gui-e2e.sh` gana un modo `term`, que teclea `echo hola` por
+`sendkey` y comprueba el `screendump`, más `^C` sobre un `sleep` y `vi`
+abriendo y cerrando.
+
+### Fuera de alcance (fase 3)
+
+Redimensionar la ventana (el protocolo no tiene `configure` desde el
+cliente), selección y portapapeles, historial de scroll, Unicode más allá
+del latín básico de la fuente, `TIOCSTI`, paquetes (`TIOCPKT`), y pasar la
+consola del kernel a `tty`/`vt`.
 
 Después, candidatos: DOOM en una ventana (su port ya dibuja en un búfer
 RGB), un reloj, `top` con ventana.
@@ -687,3 +848,35 @@ volcado). `fb_flush` durante las dos pruebas: 831 volcados, 3,19 GB, a
 ~5,6 GB/s, así que una ventana de 1900x1000 (7,6 MB por cuadro) cuesta
 ~1,4 ms de volcado por cuadro. `invariants=ok`. Los fallos de página del
 primer toque no se midieron aparte; no aparecen en el ritmo.
+
+### Fase 3.1 (2026-09-25)
+
+Crate `tty/` (`cd tty && cargo test`: 48 tests, 0,4 s), en cuatro módulos:
+`termios`, `ldisc`, `jobctl` y `pty`. Todavía no es dependencia del kernel;
+lo conectan 3.2 y 3.3.
+
+- **La semántica del par también está en el host**, no solo la
+  disciplina de línea. `pty::Pty` decide EOF y `EIO` tras el cuelgue,
+  `EIO`/`POLLHUP` en el maestro cuando se cierra el último esclavo (y no
+  antes de que se abra ninguno), el bloqueo `TIOCSPTLCK` y a quién va cada
+  señal. Así el adaptador del kernel queda como el de `usock`: bloquear,
+  despertar y mandar señales, sin reglas propias.
+- **Contrapresión en los dos sentidos.** `receive` deja sin consumir lo
+  que no cabe en la entrada (4096 bytes), así que el escritor del maestro
+  espera a un lector del esclavo. La salida del esclavo se procesa
+  (`ONLCR`) al escribir, nunca a medias (un `\n` que sería `\r\n` con
+  un solo hueco espera), así que el escritor del esclavo espera al lector
+  del maestro. En canónico, una línea llena descarta caracteres pero
+  sigue aceptando los que la editan o la terminan.
+- **`VEOL` a 0 está desactivado** (`_POSIX_VDISABLE`). Si no, todo NUL
+  terminaría una línea, porque `sane()` deja `VEOL = 0`.
+- **Cuelgue:** `SIGHUP` + `SIGCONT` al líder de sesión y al grupo en
+  primer plano, y `detach_session` para que el kernel quite el tty de
+  control a toda la sesión.
+- **Sin implementar, a propósito:** `IXON`/`IXOFF` (`^S`/`^Q` llegan como
+  bytes), paridad, y borrar un tabulador por columnas exactas.
+- **Probado por sabotaje:** 7 de 7 detectados (vaciar la cola con `ISIG`,
+  `VDISABLE`, `EIO` antes de abrir un esclavo, una línea leída que dejaba
+  una marca de EOF, el hueco del fin de línea, `SIGTTOU` ignorada y el
+  despertar del escritor del maestro).
+

@@ -1,0 +1,13 @@
+[package]
+name = "tty"
+version = "0.1.0"
+edition = "2021"
+
+# Detached from the parent workspace (empty `[workspace]` table below), same
+# shape as `usock/Cargo.toml`/`sched/Cargo.toml`: the parent root
+# `Cargo.toml` sets `panic = "abort"` for the bare-metal kernel, which would
+# break this crate's unwinding `cargo test` harness, and excludes this
+# directory from its members for the "multiple workspace roots" reason.
+[workspace]
+
+[dependencies]
