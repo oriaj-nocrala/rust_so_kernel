@@ -31,6 +31,7 @@
 use super::{Process, TrapFrame};
 use crate::memory::signal_trampoline::TRAMPOLINE_VA;
 
+pub const SIGHUP: u32 = 1;
 pub const SIGINT: u32 = 2;
 pub const SIGQUIT: u32 = 3;
 pub const SIGKILL: u32 = 9;
@@ -101,6 +102,15 @@ pub enum SignalOutcome {
 /// killed every foreground program that had not installed a handler.
 fn default_terminates(sig: u32) -> bool {
     !matches!(sig, SIGCHLD | SIGCONT | SIGURG | SIGWINCH)
+}
+
+/// Whether sending `sig` must resume a stopped target: `SIGCONT`, and
+/// `SIGKILL`, which cannot wait for a `SIGCONT` that may never come. Until
+/// 2026-09-25 only `SIGCONT` did, so `kill -9` of a stopped job queued a
+/// signal a process that never ran again could never act on, and a
+/// `waitpid` for it blocked forever (`pty_test` case E found it).
+pub fn resumes_stopped(sig: u32) -> bool {
+    sig == SIGCONT || sig == SIGKILL
 }
 
 /// Set `sig`'s pending bit. Pending state is independent of whether the

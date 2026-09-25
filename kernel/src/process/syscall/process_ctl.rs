@@ -266,6 +266,7 @@ pub(crate) fn cancel_all_waiters(pid: usize) {
     // A socket waiter left behind would later wake whatever process
     // inherits this pid number.
     crate::ipc::unix::cancel_waiters_for(pid);
+    crate::ipc::pty::cancel_waiters_for(pid);
 }
 
 pub(super) fn sys_fork() -> SyscallResult {
@@ -283,7 +284,7 @@ pub(super) fn sys_fork() -> SyscallResult {
     unsafe { crate::process::fpu::save(&mut parent_fpu_state); }
 
     // Collect what we need from the running process
-    let (child_as, parent_pid, parent_fs_base, files, child_tf, parent_cwd, (parent_pgid, parent_sid), parent_exe_name, parent_signals) = {
+    let (child_as, parent_pid, parent_fs_base, files, child_tf, parent_cwd, (parent_pgid, parent_sid, parent_ctty), parent_exe_name, parent_signals) = {
         let scheduler = crate::process::scheduler::local_scheduler();
         match scheduler.running_ref() {
             Some(proc) => {
@@ -296,7 +297,7 @@ pub(super) fn sys_fork() -> SyscallResult {
                     // only refreshed when the parent is switched out, so it is
                     // stale if `arch_prctl` ran since — same reasoning as the
                     // live `fpu::save` above.
-                    Ok(child_as) => (child_as, proc.pid, crate::process::scheduler::read_fs_base(), proc.files.lock().clone(), tf_copy, proc.cwd.clone(), (proc.pgid, proc.sid), proc.exe_name.clone(),
+                    Ok(child_as) => (child_as, proc.pid, crate::process::scheduler::read_fs_base(), proc.files.lock().clone(), tf_copy, proc.cwd.clone(), (proc.pgid, proc.sid, proc.ctty), proc.exe_name.clone(),
                         (proc.signal_handlers, proc.sig_restart, proc.blocked_signals)),
                     Err(e) => {
                         serial_println!("fork: address_space.fork() failed: {}", e);
@@ -322,6 +323,7 @@ pub(super) fn sys_fork() -> SyscallResult {
             )
         );
         child.fs_base = parent_fs_base; // inherit TLS base from parent
+        child.ctty = parent_ctty;
         // POSIX fork(): dispositions (with their SA_RESTART) and the signal
         // mask are inherited; pending signals are not. Every child used to
         // start with all-default handlers and an empty mask, so a signal
@@ -364,10 +366,10 @@ pub(super) fn sys_fork() -> SyscallResult {
 /// thread's `Process` immediately instead of waiting for a collector that
 /// will never come).
 pub(super) fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
-    let (parent_pid, address_space, files, parent_cwd, (parent_pgid, parent_sid), parent_exe_name, parent_signals) = {
+    let (parent_pid, address_space, files, parent_cwd, (parent_pgid, parent_sid, parent_ctty), parent_exe_name, parent_signals) = {
         let sched = crate::process::scheduler::local_scheduler();
         match sched.running_ref() {
-            Some(proc) => (proc.pid, proc.address_space.clone(), proc.files.clone(), proc.cwd.clone(), (proc.pgid, proc.sid), proc.exe_name.clone(),
+            Some(proc) => (proc.pid, proc.address_space.clone(), proc.files.clone(), proc.cwd.clone(), (proc.pgid, proc.sid, proc.ctty), proc.exe_name.clone(),
                 (proc.signal_handlers, proc.sig_restart, proc.blocked_signals)),
             None => return errno::ESRCH,
         }
@@ -404,6 +406,7 @@ pub(super) fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
     // signal landing on a new thread runs the handler its process
     // installed, rather than the default action.
     (thread.signal_handlers, thread.sig_restart, thread.blocked_signals) = parent_signals;
+    thread.ctty = parent_ctty;
     thread.set_name("thread");
     scheduler.add_process(thread);
     pid.0 as SyscallResult
@@ -943,16 +946,7 @@ pub(super) fn sys_kill(target_pid: i64, sig: u32) -> SyscallResult {
             } else {
                 (-target_pid) as u32
             };
-            if sig == crate::process::signal::SIGCONT {
-                let stopped: alloc::vec::Vec<usize> = sched.wait_queue().iter()
-                    .filter(|p| p.pgid == pgid && matches!(p.state, crate::process::ProcessState::Stopped))
-                    .map(|p| p.pid.0)
-                    .collect();
-                for pid in stopped {
-                    sched.wake_stopped(pid);
-                }
-            }
-            sched.queue_signal_to_group(pgid, sig);
+            sched.signal_group(pgid, sig);
             0
         } else {
             let target_pid = target_pid as usize;
@@ -971,7 +965,7 @@ pub(super) fn sys_kill(target_pid: i64, sig: u32) -> SyscallResult {
                 // so a SIGKILL to `sleep 100` waited out the 100 s. A
                 // wait's one-shot cell now decides which of the signal and
                 // the waker ends it (`process::wait`).
-                if sig == crate::process::signal::SIGCONT {
+                if crate::process::signal::resumes_stopped(sig) {
                     sched.wake_stopped(target_pid);
                 }
                 match sched.find_process_mut(target_pid) {
@@ -1082,6 +1076,7 @@ fn lookup_id(pid: i64, field: fn(&crate::process::Process) -> u32) -> SyscallRes
 /// with no controlling terminal. `EPERM` if a process group with the
 /// caller's pid already exists — the caller leads one, or one it led
 /// outlived it — since the new group could not be told apart from it.
+/// The caller loses its controlling terminal.
 /// Until 2026-09-25 this only made the caller a group leader, and no
 /// session id existed at all.
 pub(super) fn sys_setsid() -> SyscallResult {
@@ -1097,6 +1092,7 @@ pub(super) fn sys_setsid() -> SyscallResult {
             Some(proc) => {
                 proc.pgid = pid;
                 proc.sid = pid;
+                proc.ctty = None;
                 pid as SyscallResult
             }
             None => errno::ESRCH,

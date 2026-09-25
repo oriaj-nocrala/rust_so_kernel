@@ -41,7 +41,7 @@ mod misc;
 
 pub(crate) use fs::{send_to_group, stdin_wakeup};
 pub(crate) use process_ctl::cancel_all_waiters;
-pub(crate) use poll::{poll_wakeup_for_fd0, poll_wakeup_for_input, poll_clear_on_timeout, poll_wakeup_for_socket};
+pub(crate) use poll::{poll_wakeup_for_fd0, poll_wakeup_for_input, poll_clear_on_timeout, poll_wakeup_for_socket, poll_wakeup_for_pty};
 
 use core::arch::global_asm;
 use super::TrapFrame;

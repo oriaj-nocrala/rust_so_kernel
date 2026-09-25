@@ -318,6 +318,7 @@ dependencies = [
  "noto-sans-mono-bitmap",
  "sched",
  "spin 0.10.0",
+ "tty",
  "usock",
  "vfs",
  "x86_64",
@@ -664,6 +665,10 @@ dependencies = [
  "rustix",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "tty"
+version = "0.1.0"
 
 [[package]]
 name = "typenum"

@@ -798,6 +798,70 @@ impl Scheduler {
         self.interrupt_blocked();
     }
 
+    /// Send `sig` to every process in group `pgid` — `kill(-pgid)`, and a
+    /// terminal's signals (`crate::ipc::pty`). A `SIGCONT` or `SIGKILL`
+    /// resumes the stopped ones first (`signal::resumes_stopped`).
+    pub fn signal_group(&mut self, pgid: u32, sig: u32) {
+        if super::signal::resumes_stopped(sig) {
+            let stopped: Vec<usize> = self.core.wait_queue().iter()
+                .filter(|p| p.pgid == pgid && matches!(p.state, ProcessState::Stopped))
+                .map(|p| p.pid.0)
+                .collect();
+            for pid in stopped {
+                self.wake_stopped(pid);
+            }
+        }
+        self.queue_signal_to_group(pgid, sig);
+    }
+
+    /// Send `sig` to one process, `kill(pid)`'s way (see `signal_group`).
+    pub fn signal_pid(&mut self, pid: usize, sig: u32) {
+        if super::signal::resumes_stopped(sig) {
+            self.wake_stopped(pid);
+        }
+        if self.current_pid().map(|p| p.0) == Some(pid) {
+            if let Some(p) = self.running_mut() {
+                super::signal::queue_signal(p, sig);
+            }
+        } else if let Some(p) = self.find_process_mut(pid) {
+            super::signal::queue_signal(p, sig);
+        }
+        self.interrupt_blocked();
+    }
+
+    /// Every process whose controlling terminal is pty `index` loses it
+    /// (the master closed: `crate::pty`).
+    pub fn clear_ctty(&mut self, index: usize) {
+        for p in self.iter_running_mut() {
+            if p.ctty == Some(index) {
+                p.ctty = None;
+            }
+        }
+        for p in self.core.iter_queued_mut() {
+            if p.ctty == Some(index) {
+                p.ctty = None;
+            }
+        }
+    }
+
+    /// A process group `pgid` exists in session `sid`.
+    pub fn group_in_session(&self, pgid: u32, sid: u32) -> bool {
+        self.iter_all().any(|p| p.pgid == pgid && p.sid == sid && !matches!(p.state, ProcessState::Zombie))
+    }
+
+    /// POSIX's orphaned process group: no member has a parent in another
+    /// group of the same session — nobody left who could continue it if
+    /// it stopped, which is why a terminal answers `EIO` instead of
+    /// stopping it (`tty::jobctl`).
+    pub fn group_orphaned(&self, pgid: u32, sid: u32) -> bool {
+        !self.iter_all()
+            .filter(|p| p.pgid == pgid && !matches!(p.state, ProcessState::Zombie))
+            .any(|p| {
+                let Some(ppid) = p.parent_pid else { return false };
+                self.iter_all().any(|q| q.pid == ppid && q.pgid != pgid && q.sid == sid)
+            })
+    }
+
     /// Wake every Blocked process a newly queued signal should interrupt.
     /// Every place that queues a signal calls this afterwards, under the
     /// same lock hold; `block_current` checks under this lock too

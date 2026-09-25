@@ -86,6 +86,15 @@ pub struct EventSource {
     pub buffered: bool,
 }
 
+/// What `FileHandle::pty_end` reports — see there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PtyEnd {
+    /// The pair's number (`/dev/pts/<index>`).
+    pub index: usize,
+    /// The master (`/dev/ptmx`) rather than a slave.
+    pub master: bool,
+}
+
 /// Trait representing any "file" in the system.
 ///
 /// Implementations include device drivers (/dev/null, /dev/console, etc.),
@@ -150,6 +159,15 @@ pub trait FileHandle: Send {
     /// default-`None` method replaces it: the mapping now lives in the
     /// handle that actually owns it, and is inherited by `dup()` for free.
     fn socket_id(&self) -> Option<usize> {
+        None
+    }
+
+    /// Which end of which pseudo-terminal this handle is, if any —
+    /// `socket_id()`'s technique again, for the same reason: `poll`
+    /// snapshots an fd's source into its waiter, since a wakeup cannot
+    /// reach another process's fd table (phase 3.3 of
+    /// `docs/gui/gui-plan.md`).
+    fn pty_end(&self) -> Option<PtyEnd> {
         None
     }
 
@@ -366,6 +384,7 @@ mod tests {
     #[test]
     fn default_event_source_is_none() {
         assert_eq!(MinimalHandle.event_source(), None);
+        assert_eq!(MinimalHandle.pty_end(), None);
     }
 
     /// A handle that overrides `seek`/`dup`, to prove the defaults tested

@@ -4,7 +4,7 @@
 > (ver su registro al final). Fase 2: 2.1 hecho y verificado en QEMU y en la Ryzen;
 > 2.2 a 2.5 hechos y verificados en QEMU y en la Ryzen (2.2 en el boot #43,
 > 2.3 y 2.5 en el #45; 2.4 son tests de host). Fase 2 cerrada. Fase 3 planificada
-> (decisiones del 2026-09-25); 3.1 y 3.2 hechos.
+> (decisiones del 2026-09-25); 3.1, 3.2 y 3.3 hechos, en QEMU.
 
 ## Por qué ahora, y por qué así
 
@@ -920,4 +920,62 @@ el pid sea ≥ 0). En el host, la `busybox` 1.36.1 de Arch hace ese mismo
 último `wait4` = 0 y termina sin `rt_sigsuspend` (`strace`). Queda saber
 si esa `busybox` no es el mismo código que el submódulo o si hay una
 diferencia de kernel que falta.
+
+### Fase 3.3 (2026-09-25)
+
+El pty: `/dev/ptmx`, `/dev/pts/N` (se listan mientras el maestro esté
+abierto), `/dev/tty`, el tty de control (`Process::ctty`) y el control de
+trabajos sobre él. `kernel/src/ipc/pty.rs` es el adaptador del crate
+`tty`, con la forma de `ipc/unix.rs`: `PTYS`/`WAITERS` como
+`diag::IrqMutex`, bloqueo que **reinicia la syscall** (registrarse,
+`rip -= 2`, `WAKE_EPOCH`) y los `Effects` del crate aplicados sin `PTYS`
+tomado. Reiniciar en vez de completar desde quien despierta tiene aquí
+otra razón: una lectura del esclavo que se repite vuelve a pasar el
+control de trabajos, así que un trabajo que pasó a segundo plano mientras
+dormía se para con `SIGTTIN` en vez de quedarse la entrada del primer
+plano.
+
+- **`SIGTTIN`/`SIGTTOU` y reinicio.** Una lectura (o escritura con
+  `TOSTOP`) desde segundo plano manda la señal a su grupo y bloquea en una
+  espera que la señal pendiente interrumpe en el acto (`block_current` no
+  duerme con una señal que actúa); la entrega decide repetir la llamada.
+  Un `ioctl` no puede bloquear: rebobina `rip` y devuelve el número de la
+  syscall, que es lo que `rax` tiene que tener para que `syscall` vuelva a
+  ejecutarse.
+- **`poll`/`epoll` reales** en las dos puntas (`PollSource::Pty`, con
+  `FileHandle::pty_end` en `vfs`, la técnica de `socket_id`).
+- **mlibc:** `sys_ptsname`, `sys_unlockpt`, `sys_ttyname` (por el número
+  de inodo del esclavo, al no haber `/proc/self/fd`) y un `tcflush` real;
+  `FLUSHO` en `termios.h` (un bit libre, que `stty` necesitaba). **BusyBox:**
+  `FEATURE_DEVPTS`, `script`, `stty`, `tty`, `reset`, `ttysize`. `script`
+  necesita `SHELL=/tmp/bin/sh`, porque no hay `/bin/sh`.
+- **`O_NONBLOCK` en `open`** para los handles que lo admiten (sockets y
+  ptys); antes solo `fcntl` lo ponía.
+
+**Bug del kernel encontrado aquí** (anterior, arreglado): un `SIGKILL` no
+mataba a un proceso parado. Solo `SIGCONT` reanudaba a los parados, así que
+`kill -9` dejaba la señal pendiente en un proceso que no volvía a
+ejecutarse y el `waitpid` de su padre no volvía nunca. Ahora `SIGKILL`
+también lo reanuda (`signal::resumes_stopped`), en `kill` y en las señales
+del terminal. Lo encontró el caso E de `pty_test`, que mata al hijo parado
+por `SIGTTIN`.
+
+**Sin implementar, a propósito:** el plazo de `VTIME` (una lectura que lo
+esperaría devuelve lo que haya), y colgar el terminal cuando muere el
+líder de sesión (Linux manda `SIGHUP` a su grupo en primer plano; aquí el
+cuelgue es el cierre del maestro).
+
+**Verificado en QEMU** (`-smp 4`, 8 GiB): `pty_test` (11 casos: abrir y
+desbloquear, crudo, canónico con eco y borrado, `^C`, `SIGTTIN`, `SIGHUP`
+al cerrar el maestro, `EIO`/`POLLHUP` al cerrar el esclavo, `SIGWINCH`,
+`poll` despertado por la otra punta, `/dev/tty` y ash de verdad en un
+esclavo). A mano, `script` de BusyBox con ash dentro: `tty` da
+`/dev/pts/0`, `stty size` hereda el tamaño de la consola, y `^C`, `^Z`,
+`jobs` y `fg` funcionan dentro del pty; al salir, la consola recupera su
+`^C`. En 0 `session_test`, `jobctl_test`, `lifecycle_test`,
+`wait_intr_test`, `sigsuspend_test`, `mlibc_signal_test`,
+`pipe_multi_test`, `pipe_cow_test`, `socket_test`, `fork_exec_test`,
+`userlib_test`, `poll_test`, `input_poll_test`, `shm_test` y `fb0_test`;
+`boot-matrix.sh 4 5` 20/20; `run-kernel-tests.sh` PASS; `gui-e2e.sh`
+PASS; `vfs` 166 tests.
 

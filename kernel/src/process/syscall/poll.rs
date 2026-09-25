@@ -20,6 +20,8 @@ enum PollSource {
     /// An evdev device: which queue feeds it (`drivers::evdev::QUEUE_*`),
     /// and whether the handle held records of its own at snapshot time.
     Input { queue: usize, buffered: bool },
+    /// One end of a pseudo-terminal (`ipc::pty`).
+    Pty { index: usize, master: bool },
 }
 
 /// A process's fd → `PollSource` mapping, snapshotted at the moment it blocks.
@@ -62,6 +64,8 @@ fn snapshot_sockets() -> SocketMap {
                 PollSource::Socket(id)
             } else if let Some(src) = h.event_source() {
                 PollSource::Input { queue: src.queue, buffered: src.buffered }
+            } else if let Some(end) = h.pty_end() {
+                PollSource::Pty { index: end.index, master: end.master }
             } else {
                 PollSource::Other
             };
@@ -300,6 +304,15 @@ fn fd_check_ready(socks: &SocketMap, fd: i32, events: i16) -> i16 {
         return if events & POLLIN != 0 && ready { rev | POLLIN } else { rev };
     }
 
+    if let PollSource::Pty { index, master } = source {
+        let Some(mask) = crate::ipc::pty::poll_mask(index, master) else { return POLLNVAL };
+        let mut rev: i16 = 0;
+        if events & POLLIN != 0 && mask.readable { rev |= POLLIN; }
+        if events & POLLOUT != 0 && mask.writable { rev |= POLLOUT; }
+        if mask.hup { rev |= POLLHUP; }
+        return rev;
+    }
+
     // Socket?
     if let PollSource::Socket(sock) = source {
         let Some(mask) = unix::poll_mask(sock) else { return POLLNVAL };
@@ -518,6 +531,12 @@ pub(crate) fn poll_wakeup_for_socket(sock: SocketId) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         poll_wake_where(|w, fd| waiter_source(w, fd) == PollSource::Socket(sock))
     });
+}
+
+/// Called by `ipc::pty` after either end of pair `index` changed (with
+/// `PTYS` released, IF=0): wakes poll/epoll sleepers watching it.
+pub(crate) fn poll_wakeup_for_pty(index: usize) {
+    poll_wake_where(|w, fd| matches!(waiter_source(w, fd), PollSource::Pty { index: i, .. } if i == index));
 }
 
 /// Cancel a pending poll/epoll waiter for a process (called on exit).

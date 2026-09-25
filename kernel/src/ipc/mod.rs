@@ -15,6 +15,7 @@
 // `process/syscall/ipc.rs`, on top of this module.
 
 pub mod memfd;
+pub mod pty;
 pub mod unix;
 
 pub use unix::{UnixSocketHandle, SOCKETS};

@@ -153,6 +153,13 @@ pub struct Process {
     /// a group leader, and `setpgid()` could move a process into any group.
     pub sid: u32,
 
+    /// Controlling terminal: the pty number (`/dev/pts/<n>`), or `None`
+    /// (the console is nobody's — its job control stays global, see
+    /// `crate::tty`). Inherited by `fork()`/`clone()`, cleared by
+    /// `setsid()`, acquired with `TIOCSCTTY` or by a session leader's
+    /// first open of a slave (`crate::pty`).
+    pub ctty: Option<usize>,
+
     /// Set when this process is currently `ProcessState::Stopped`, to the
     /// signal that stopped it (SIGSTOP or SIGTSTP) — read by
     /// `stop_status_word()` for a `WUNTRACED` `waitpid()` report.
@@ -350,6 +357,7 @@ impl Process {
             killed_by_signal: None,
             pgid: pid.0 as u32,
             sid: pid.0 as u32,
+            ctty: None,
             stopped_by_signal: None,
             stop_reported: false,
             fs_base: 0,
@@ -431,6 +439,7 @@ impl Process {
             killed_by_signal: None,
             pgid: pid.0 as u32,
             sid: pid.0 as u32,
+            ctty: None,
             stopped_by_signal: None,
             stop_reported: false,
             fs_base: 0,
@@ -503,6 +512,7 @@ impl Process {
             killed_by_signal: None,
             pgid: parent_pgid,
             sid: parent_sid,
+            ctty: None,
             stopped_by_signal: None,
             stop_reported: false,
             fs_base: 0,
@@ -602,6 +612,7 @@ impl Process {
             killed_by_signal: None,
             pgid: parent_pgid,
             sid: parent_sid,
+            ctty: None,
             stopped_by_signal: None,
             stop_reported: false,
             fs_base: 0,

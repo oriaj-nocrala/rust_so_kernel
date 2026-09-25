@@ -47,6 +47,11 @@ static DEVICES: &[DeviceEntry] = &[
     DeviceEntry { path: "/dev/input/event0", open: || Ok(dev_input_event::open()) }, // keyboard
     DeviceEntry { path: "/dev/input/event1", open: || Ok(dev_mouse_event::open()) }, // mouse
     DeviceEntry { path: "/dev/dsp", open: || Ok(dev_dsp::open()) }, // AC97 PCM output, see ac97.rs
+    // Pseudo-terminals (ipc/pty.rs): each open of ptmx is a new pair; the
+    // slaves are /dev/pts/<n> (fs/devfs.rs's PtsDirInode). /dev/tty is the
+    // caller's controlling terminal (ENXIO without one).
+    DeviceEntry { path: "/dev/ptmx", open: crate::ipc::pty::open_master },
+    DeviceEntry { path: "/dev/tty",  open: crate::ipc::pty::open_controlling },
 ];
 
 /// Open a device by path.  Returns `None` if no driver matches.

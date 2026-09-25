@@ -105,6 +105,9 @@ typedef unsigned int tcflag_t;
 #define NOFLSH  0x0080
 #define TOSTOP  0x0100
 #define ECHOPRT 0x0200
+/* Not in the ABI this header came from; BusyBox's stty needs it defined.
+ * A free bit, stored and ignored by the kernel's line discipline. */
+#define FLUSHO  0x0400
 
 struct termios {
 	tcflag_t c_iflag;

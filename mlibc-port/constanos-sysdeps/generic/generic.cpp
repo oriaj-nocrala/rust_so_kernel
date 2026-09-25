@@ -23,6 +23,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <mntent.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -540,14 +541,54 @@ int sys_tcsetattr(int fd, int opts, const struct termios *attr) {
 	return ret < 0 ? (int)-ret : 0;
 }
 
-// No real output buffering or discardable input queue exists beyond
-// `keyboard_buffer::KEYBOARD_BUFFER` (which nothing here usefully
-// truncates) — these are all no-ops that report success, same spirit as
-// `sys_brk` telling mlibc "nothing to do here, you already got what you
-// need another way".
+// No output queue that could be drained or paused exists (a pty's output
+// belongs to its master's reader; the console writes straight through), so
+// these two are no-ops that report success, same spirit as `sys_brk`.
 int sys_tcdrain(int) { return 0; }
 int sys_tcflow(int, int) { return 0; }
-int sys_tcflush(int, int) { return 0; }
+
+// TCFLSH (0x540B): a pty really discards (its line discipline, the `tty`
+// crate); the console answers 0, having nothing worth discarding.
+int sys_tcflush(int fd, int queue) {
+	long ret = raw_syscall(SYS_ioctl, fd, 0x540B, queue);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+// Pseudo-terminals (phase 3.3 of docs/gui/gui-plan.md). mlibc's
+// `posix_openpt` opens /dev/ptmx itself and `grantpt` is a no-op; these
+// two are the ioctls behind `ptsname` and `unlockpt`.
+int sys_ptsname(int fd, char *buffer, size_t length) {
+	unsigned int n;
+	long ret = raw_syscall(SYS_ioctl, fd, 0x80045430 /* TIOCGPTN */, (long)&n);
+	if (ret < 0)
+		return (int)-ret;
+	if (snprintf(buffer, length, "/dev/pts/%u", n) >= (int)length)
+		return ERANGE;
+	return 0;
+}
+
+int sys_unlockpt(int fd) {
+	int unlock = 0;
+	long ret = raw_syscall(SYS_ioctl, fd, 0x40045431 /* TIOCSPTLCK */, (long)&unlock);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+// No /proc/self/fd to read a link from: a pty slave is recognised by the
+// inode number the kernel gives it (`ipc::pty::PTS_INO_BASE + n`), and any
+// other terminal is the console.
+int sys_ttyname(int fd, char *buf, size_t size) {
+	if (int e = sys_isatty(fd); e)
+		return e;
+	struct stat st;
+	if (int e = sys_stat(fsfd_target::fd, fd, "", 0, &st); e)
+		return e;
+	int n;
+	if (S_ISCHR(st.st_mode) && st.st_ino >= 200000 && st.st_ino < 200000 + 16)
+		n = snprintf(buf, size, "/dev/pts/%u", (unsigned)(st.st_ino - 200000));
+	else
+		n = snprintf(buf, size, "/dev/console");
+	return n >= (int)size ? ERANGE : 0;
+}
 
 int sys_setpgid(pid_t pid, pid_t pgid) {
 	long ret = raw_syscall(SYS_setpgid, pid, pgid);

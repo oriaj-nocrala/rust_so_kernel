@@ -330,6 +330,11 @@ pub(super) fn sys_open(path_ptr: usize, flags: i32) -> SyscallResult {
         Ok(h)  => h,
         Err(e) => { crate::ktrace!(crate::debug::FS, "sys_open: {} -> Err({:?})", path, e); return e.as_i64(); }
     };
+    // `O_NONBLOCK` at open, for the handles that honour it (sockets, ptys);
+    // the rest ignore it, as they ignore `F_SETFL` (see `sys_fcntl`).
+    if flags as i64 & O_NONBLOCK != 0 {
+        handle.set_nonblocking(true);
+    }
 
     // Only take scheduler lock for the FD table insertion
     with_current_process(|proc| {
@@ -1026,6 +1031,7 @@ pub(super) fn sys_ioctl(fd: i32, request: u64, argp: u64) -> SyscallResult {
     const TIOCGWINSZ: u64 = 0x5413;
     const TIOCGPGRP: u64 = 0x540F;
     const TIOCSPGRP: u64 = 0x5410;
+    const TCFLSH: u64 = 0x540B;
     // Custom, this-kernel-only request code (not a real Linux fbdev ioctl —
     // real fbdev exposes the framebuffer via mmap; we don't support
     // device-backed mmap, so a raw-pixel client instead hands us its own
@@ -1126,6 +1132,10 @@ pub(super) fn sys_ioctl(fd: i32, request: u64, argp: u64) -> SyscallResult {
             }
             0
         }
+        // The console's input is the shared keyboard ring, which nothing
+        // here usefully discards: accepted and ignored, as before
+        // `tcflush` reached the kernel at all (a pty really flushes).
+        TCFLSH => if is_tty { 0 } else { errno::ENOTTY },
         TIOCGPGRP => {
             if !is_tty { return errno::ENOTTY; }
             if let Err(e) = validate_user_buffer(argp, 4) { return e; }
