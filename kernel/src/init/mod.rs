@@ -142,8 +142,16 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     if let Err((step, why)) = crate::cpu::init_this_cpu(0) {
         panic!("BSP per-CPU init: step `{}` failed: {}", step, why);
     }
-    serial_println!("{}", crate::cpu::render_init());
     crate::cpu::percpu::measure_cpu_id_cost();
+
+    // ── Application processors ─────────────────────────────────────
+    // Stage 4 of `docs/smp/smp-plan.md`: every AP in the MADT is woken,
+    // runs `init_this_cpu` like the BSP just did, and parks in `hlt` —
+    // no timer, no processes, nothing routed to it. Bounded: an AP that
+    // does not answer is logged and left out. Needs the APIC (IPIs) and
+    // the BSP's per-CPU decisions (the APs copy them).
+    crate::smp::start_aps();
+    serial_println!("{}", crate::cpu::render_init());
 
     // ── Time subsystem ─────────────────────────────────────────────
     crate::time::init();

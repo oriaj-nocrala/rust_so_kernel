@@ -6,8 +6,10 @@
 > `hal::apic`); etapa 2 hecha y verificada en QEMU y en la Ryzen
 > (`cpu::percpu`, `swapgs` solo en la entrada de `syscall`); etapa 3 hecha
 > y verificada en QEMU y en la Ryzen (`cpu::init_this_cpu`, una GDT con un slot de TSS por
-> CPU). El kernel sigue siendo de una sola CPU: no hay IPIs ni arranque de
-> APs.
+> CPU); etapa 4 hecha y verificada en QEMU (`kernel/src/smp.rs`,
+> `hal::smp`): los APs arrancan, pasan `init_this_cpu` y se quedan en `hlt`.
+> Los procesos siguen corriendo en una sola CPU; no hay IPIs más allá del
+> arranque.
 
 ## Por qué ahora
 
@@ -383,6 +385,57 @@ CPU).
 **Hecho cuando:** con `-smp 4`, las cuatro CPUs arrancan y el sistema se
 comporta exactamente igual que con una. En la Ryzen (5900X) se leen las 24 CPUs
 lógicas en el log del pendrive.
+
+**Estado:** hecha en QEMU el 2026-09-24 (`kernel/src/smp.rs`, cuyo
+comentario de módulo es la referencia; `hal/src/smp.rs`, 11 tests, `hal` =
+293).
+
+- **Trampolín de cuatro páginas** por debajo de 640 KiB: el código y, detrás,
+  PML4/PDPT/PD propios. `hal::smp::pick_trampoline` elige la ventana más alta
+  dentro de una región usable y `init::memory::init_core` la recorta *antes*
+  de sembrar el buddy (en QEMU cae en `0x9c000`). El PML4 del trampolín es
+  una **copia** del del kernel con la entrada 0 sustituida por el mapeo
+  identidad de 0–2 MiB: ninguna tabla viva cambia, y el AP carga el CR3 real
+  del kernel lo primero en Rust. La entrada 0 del kernel no está vacía (el
+  bootloader deja ahí el mapeo identidad de su cambio de contexto, que nadie
+  vuelve a usar; `new_user` ya la salta), así que no se exige que lo esté.
+- **Real → protegido → largo** en `global_asm!` (AT&T): los datos van al
+  principio del blob para que las constantes `T_*` se resuelvan hacia atrás,
+  y la BSP parchea antes de cada SIPI las direcciones absolutas (base de la
+  GDTR, los dos saltos lejanos) y los campos (CR3, pila, entrada, CPU). El
+  trampolín pone `EFER.NXE` junto con `LME`: las PTE del kernel llevan el bit
+  63, que sin NXE es reservado. Deja un marcador de progreso (1 = protegido,
+  2 = largo) que la BSP lee si el AP no contesta.
+- **Un AP a la vez**, con INIT, 10 ms, SIPI, 200 µs, SIPI
+  (`hal::smp::startup_sequence`), y hasta 200 ms para que termine
+  `init_this_cpu`. Un AP que no contesta se registra con la etapa a la que
+  llegó y recibe otro INIT para aparcarlo: si despertara tarde leería los
+  campos del siguiente y correría en su pila.
+- **Numeración:** la BSP es la CPU 0 aunque no sea la primera de la MADT; el
+  resto en orden de MADT, sin duplicados, hasta `MAX_CPUS` (subido de 8 a
+  32: la Ryzen tiene 24).
+- **Inertes de verdad:** el paso `lapic` de `init_this_cpu` deja el timer
+  **enmascarado** en toda CPU que no sea la 0 (`apic::runs_timer`, lo que la
+  etapa 7 cambia), y su verificación lo comprueba. El AP hace `sti; hlt` en
+  bucle: con IF=1, un timer solo "sin programar" podría haber dejado el
+  vector 32 pendiente y meter al AP en el planificador.
+- `/proc/kdebug`: `smp: madt N cpus, M online: cpu0=apic0/bsp cpu1=apic1/10253us ...`
+  (o `NO-RESPONSE(stage n)`, `INIT-FAILED(paso: motivo)`, `IPI-STUCK`), y
+  `cpu_init:` con una entrada por CPU. `boot-matrix.sh` apunta
+  `cpus_online=M/N` por arranque y lo agrega; `QEMU_DEBUG_SMP=N` en
+  `qemu-debug.sh` (y por herencia en `boot-matrix.sh`).
+
+Verificado: `boot-matrix 4 5` con `QEMU_DEBUG_SMP=4` = 20/20, `4/4 x20`, y
+sin él = 20/20, `1/1 x20`; `run-kernel-tests` PASS; `-smp 24 -m 8G` (la forma
+de la Ryzen) con 24 online, `cpu0..23 ok (8)` y `fpu_test` ALL_OK; `-smp 4`
+con `fpu_test` ALL_OK y `socket_test` exit 0; `-smp 40` da 32 online y
+`8 beyond MAX_CPUS=32`; `-cpu max,-apic` no intenta nada y lo dice. Probado por
+sabotaje (un `hlt` tras llegar a modo largo): `NO-RESPONSE(stage 2)` en ambos
+APs y el arranque llega al shell igual. Cada AP tarda ~10,2 ms en QEMU, casi
+todo el retardo de INIT. Pendiente: la Ryzen (`target/metal/smp-stage4-job.sh`).
+
+Fuera, a propósito: las entradas x2APIC (tipo 9) de la MADT, que solo aparecen
+con IDs de APIC > 255 (la Ryzen llega a 27).
 
 ### Etapa 5 — TLB shootdown
 

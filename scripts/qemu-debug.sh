@@ -54,6 +54,9 @@
 #   QEMU_USB_STORAGE=<img>   attach <img> (raw, or .qcow2) as a USB mass-storage stick —
 #                            the boot pendrive's shape; pass a scratch copy,
 #                            the kernel mounts it read-write eventually
+#   QEMU_DEBUG_SMP=N         N CPUs (-smp N; default 1). The kernel starts
+#                            every AP and parks it (stage 4 of the SMP plan);
+#                            boot-matrix.sh inherits it from the environment
 #   QEMU_DEBUG_EXTRA_ARGS    extra raw qemu args, word-split
 #
 #   scripts/qemu-debug.sh gdb ["cmd" "cmd" ...]      # batch gdb against a running instance
@@ -254,6 +257,7 @@ cmd_start() {
         -drive "format=raw,file=$uefi_path,file.locking=off"
         -m "$mem"
         -cpu max
+        -smp "${QEMU_DEBUG_SMP:-1}"
         -serial "file:$SERIAL_LOG"
         -monitor "unix:$SOCK,server,nowait"
         -display none

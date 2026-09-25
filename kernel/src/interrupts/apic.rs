@@ -104,6 +104,32 @@ pub fn eoi() {
     lapic_write(lapic::EOI, 0);
 }
 
+/// This CPU's local APIC ID, read from the hardware.
+pub fn this_lapic_id() -> u32 {
+    apic::lapic_id(lapic_read(lapic::ID), X2APIC.load(Ordering::Relaxed))
+}
+
+/// Sends an IPI (`low` = ICR low dword, `hal::smp::icr`) to the local APIC
+/// `apic_id`, and waits for the xAPIC to report it sent. `false` if it was
+/// still pending after the bound — the target is then in an unknown state.
+pub fn send_ipi(apic_id: u32, low: u32) -> bool {
+    use hal::smp::icr;
+    if X2APIC.load(Ordering::Relaxed) {
+        // SAFETY: the x2APIC ICR MSR; one write sends (no pending bit).
+        unsafe { Msr::new(apic::x2apic_msr(lapic::ICR_LOW)).write(icr::x2apic(apic_id, low)) };
+        return true;
+    }
+    lapic_write(lapic::ICR_HIGH, icr::xapic_dest(apic_id));
+    lapic_write(lapic::ICR_LOW, low);
+    for _ in 0..1_000_000 {
+        if lapic_read(lapic::ICR_LOW) & icr::DELIVERY_PENDING == 0 {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
 /// Did the LAPIC deliver `vector` (its ISR bit is set)? Tells an I/O APIC
 /// interrupt, which needs a LAPIC EOI, from an 8259 leftover, which must
 /// not get one — an EOI with nothing of ours in service would end whatever
@@ -374,8 +400,22 @@ pub fn init_this_cpu() {
     lapic_write(lapic::ESR, 0);
 
     lapic_write(lapic::TIMER_DIVIDE, apic::divide_config(TIMER_DIVISOR).unwrap());
-    lapic_write(lapic::LVT_TIMER, apic::lvt_timer(TIMER_VECTOR, TimerMode::Periodic, false));
-    lapic_write(lapic::TIMER_INITIAL, status.timer_count);
+    if runs_timer() {
+        lapic_write(lapic::LVT_TIMER, apic::lvt_timer(TIMER_VECTOR, TimerMode::Periodic, false));
+        lapic_write(lapic::TIMER_INITIAL, status.timer_count);
+    } else {
+        lapic_write(lapic::LVT_TIMER, apic::lvt_timer(TIMER_VECTOR, TimerMode::Periodic, true));
+        lapic_write(lapic::TIMER_INITIAL, 0);
+    }
+}
+
+/// Does this CPU get the periodic tick? Stage 4 of `docs/smp/smp-plan.md`:
+/// only the BSP. The tick is what schedules (`timer_interrupt_entry`), and an
+/// AP has no process to schedule until stage 7 — whose job it is to make
+/// this every CPU. Masked, not merely unprogrammed: an AP runs with IF=1 in
+/// its `hlt` loop and must never take vector 32.
+fn runs_timer() -> bool {
+    crate::cpu::cpu_id() == 0
 }
 
 /// Reads back what `init_this_cpu` set.
@@ -408,6 +448,12 @@ pub fn verify_this_cpu() -> Result<(), &'static str> {
     }
     // Bit 12 is delivery status (read-only): compare everything else.
     let lvt = lapic_read(lapic::LVT_TIMER) & !(1 << 12);
+    if !runs_timer() {
+        if lvt & lapic::LVT_MASKED == 0 {
+            return Err("LAPIC timer unmasked on a CPU that does not schedule");
+        }
+        return Ok(());
+    }
     if lvt != apic::lvt_timer(TIMER_VECTOR, TimerMode::Periodic, false) {
         return Err("LAPIC timer LVT is not periodic on the timer vector");
     }

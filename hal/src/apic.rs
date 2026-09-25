@@ -31,6 +31,11 @@ pub mod lapic {
     /// In-Service Register: eight 32-bit registers, 0x10 apart.
     pub const ISR_BASE: u32 = 0x100;
     pub const ESR: u32 = 0x280;
+    /// Interrupt Command Register: the low dword sends when written; the
+    /// high dword holds the xAPIC destination. One 64-bit MSR in x2APIC
+    /// (`x2apic_msr(ICR_LOW)`), where the destination is the high half.
+    pub const ICR_LOW: u32 = 0x300;
+    pub const ICR_HIGH: u32 = 0x310;
     pub const LVT_TIMER: u32 = 0x320;
     pub const LVT_LINT0: u32 = 0x350;
     pub const LVT_LINT1: u32 = 0x360;

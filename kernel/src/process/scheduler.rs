@@ -280,16 +280,8 @@ impl sched::Clock for KernelClock {
     }
 }
 
-static SCHEDULERS: [Mutex<Scheduler>; crate::cpu::MAX_CPUS] = [
-    Mutex::new(Scheduler::new()),
-    Mutex::new(Scheduler::new()),
-    Mutex::new(Scheduler::new()),
-    Mutex::new(Scheduler::new()),
-    Mutex::new(Scheduler::new()),
-    Mutex::new(Scheduler::new()),
-    Mutex::new(Scheduler::new()),
-    Mutex::new(Scheduler::new()),
-];
+static SCHEDULERS: [Mutex<Scheduler>; crate::cpu::MAX_CPUS] =
+    [const { Mutex::new(Scheduler::new()) }; crate::cpu::MAX_CPUS];
 
 /// Acquires the current CPU's scheduler lock.
 /// CALLER must disable interrupts before calling (cli) and

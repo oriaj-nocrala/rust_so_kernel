@@ -157,7 +157,11 @@ run_instance() {
         fi
 
         iter="$(grep -o 'hunt: iter [0-9]* begin' "$sd/serial.log" 2>/dev/null | tail -1 | grep -o '[0-9]*' || true)"
-        echo "inst=$idx boot=$boot outcome=$outcome iter=$iter" >> "$results"
+        # CPUs up, from the kernel's own `smp:` line (stage 4 of the SMP
+        # plan): reaching the shell says nothing about whether every AP came
+        # up, so each boot records it and the aggregate shows the spread.
+        cpus="$(grep -a -oP 'smp: madt \K[0-9]+ cpus, [0-9]+(?= online)' "$sd/serial.log" 2>/dev/null | head -1 | sed 's/ cpus, /:/' || true)"
+        echo "inst=$idx boot=$boot outcome=$outcome iter=$iter cpus_online=${cpus#*:}/${cpus%%:*}" >> "$results"
 
         # Preserve the serial log of every non-OK boot (rare enough to be
         # cheap) before the next boot in this instance truncates it —
@@ -203,6 +207,7 @@ while IFS= read -r line; do
 done < <(cat "$WORK"/results-*.txt 2>/dev/null)
 
 echo "total=$total ok=$ok hang=$hang panic=$panic double_fault=$dfault other=$other"
+echo "cpus online/madt: $(cat "$WORK"/results-*.txt 2>/dev/null | grep -oP 'cpus_online=\K\S+' | sort | uniq -c | awk '{printf "%s x%s  ", $2, $1}')"
 failed=$((hang+panic+dfault+other))
 if [ "$total" -gt 0 ]; then
     rate=$(awk "BEGIN{printf \"%.1f\", 100.0*$failed/$total}")

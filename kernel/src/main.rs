@@ -41,6 +41,7 @@ mod reboot;
 mod pit;
 mod rtc;
 mod serial;
+mod smp;
 #[cfg(test)]
 mod test_framework;
 mod time;

@@ -96,7 +96,7 @@ so addresses actually resolve to real function names instead of bare hex.
 ### QEMU integration tests
 
 Real hardware-path behavior (drivers that need actual QEMU devices, not just host-testable
-pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 282 tests, <1s, no QEMU) is
+pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 293 tests, <1s, no QEMU) is
 asserted by a `#![feature(custom_test_frameworks)]` harness that boots the real kernel in
 QEMU and reports PASS/FAIL as a process exit code:
 
@@ -175,6 +175,7 @@ Kernel crate config in `kernel/.cargo/config.toml` enables `-Z build-std` to reb
 6c. `ac97::init()` — best-effort PCI AC97 audio codec enable; bounded polls, never hangs boot on hardware/QEMU configs with no AC97 device
 6d. `cpu::tsc::init()` (calibrated against the PIT), then `interrupts::apic::init()` — retires the 8259 + PIT in favour of the LAPIC timer + I/O APIC (see Interrupt Controllers below)
 6e. `cpu::init_this_cpu(0)` — everything the CPU holds for itself (GDT + its TSS slot, IDT, GS, syscall MSRs, PAT, SSE, LAPIC + timer), then read back; see Per-CPU Init below
+6f. `smp::start_aps()` — wakes every AP in the MADT (INIT-SIPI-SIPI through a low-memory trampoline), each runs `init_this_cpu` and parks in `hlt`; see Application Processors below
 7. REPL initial prompt
 8. `process::fpu::init()` — captures the FXSAVE template
 9. `processes::init_all()` — create idle, user, and shell processes
@@ -515,7 +516,7 @@ arbitration, exactly where two PS/2 keyboards would merge.
 **Split across the usual seam.** `hal::xhci` (register/TRB/ring/context
 arithmetic), `hal::usb` (descriptor parsing + setup packets) and
 `hal::hid` (boot-report diffing + the Set-1 table) are pure and host-tested
-— most of `hal`'s 282 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
+— most of `hal`'s 293 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
 DMA pages, doorbells and waiting. That line is drawn hard here because an
 xHCI bring-up failure is nearly unobservable (a wrong bit in a device
 context yields no fault, no log, just a Transfer Event that never arrives)
@@ -900,6 +901,26 @@ the firmware's value. `hw_tests::init_this_cpu_restores_what_an_ap_lacks`
 resets the BSP's registers to an AP's and checks every step brings its
 register back.
 
+## Application Processors (`kernel/src/smp.rs`, `hal/src/smp.rs`)
+
+Stage 4 of `docs/smp/smp-plan.md`: **the APs are started but inert** —
+processes still run only on CPU 0. Each AP comes up through a four-page
+trampoline below 640 KiB (code, then its own PML4/PDPT/PD), **reserved in
+`init::memory::init_core` before the Buddy allocator is seeded** — the pages
+must never be handed out. The trampoline's PML4 is a *copy* of the kernel's
+with entry 0 replaced by a 0–2 MiB identity map, so no live table changes; the
+AP loads the kernel's real CR3 first thing in Rust (`ap_entry`), runs
+`cpu::init_this_cpu(cpu)`, and loops on `sti; hlt`. **Its LAPIC timer is
+masked** (`interrupts::apic::runs_timer`: CPU 0 only until stage 7) — an AP
+with IF=1 that took vector 32 would run the scheduler. APs start one at a
+time; every wait is bounded, and an AP that does not answer is logged
+(`NO-RESPONSE(stage n)`, the stage the trampoline's progress marker reached),
+sent INIT again so it cannot wake late on the next AP's stack, and left out.
+The BSP is always CPU 0; the rest follow MADT order up to `MAX_CPUS` (32).
+`smp:` in `/proc/kdebug` has the per-CPU outcome and time to come up;
+`QEMU_DEBUG_SMP=N` gives QEMU N CPUs, and `boot-matrix.sh` records
+`cpus_online=M/N` per boot.
+
 ## Interrupt Controllers (`kernel/src/interrupts/`, `hal/src/apic.rs`)
 
 Stage 1 of `docs/smp/smp-plan.md`: the tick is the **LAPIC timer**
@@ -1032,7 +1053,7 @@ Sysdeps added beyond the original bootstrap set (all in `generic/generic.cpp` un
 - **Context switches restore all GPRs** via `jump_to_trapframe` (asm `pop` sequence + `iretq`). Never use partial restores that leave callee registers from the killed process.
 - **Every kernel entry must clear the direction flag (DF).** Interrupt delivery does not clear it, and `syscall` only clears the RFLAGS bits named in `IA32_FMASK`. `rep movsb` obeys DF, so an entry taken while the interrupted code sat between a `memmove`'s `std` and its `cld` runs the *whole* kernel path — including `*proc.trapframe = *current_tf`, which compiles to `rep movsb` — copying **backward**, writing the 160 bytes *before* the trapframe box instead of into it. That was the single root cause behind three separate long-standing symptoms (a stale-frame resume orphaning an in-flight syscall's locks, jumps into heap data as code, and a box that "ignored" its own memcpy); measured at ~4-8% of debug boots, 48/48 clean after the fix. Two mechanisms cover it, both required: `process/tss.rs` masks DF in `IA32_FMASK` (bit 10, exactly as Linux does), and both hand-written asm entry stubs (`timer_preempt.rs::timer_interrupt_entry`, `syscall/mod.rs::syscall_entry_fast`) emit `cld` as their first instruction. The rustc `x86-interrupt` shims already emit `cld`, so IDT handlers are covered for free — **any new hand-written entry stub is not**. `jump_to_trapframe` is a *resume*, not an entry, and must NOT clear DF (it restores the frame's own RFLAGS). See `docs/hang-hunt-bug2-findings.md`.
 - **`sys_exit` must keep IF=0 all the way to the `iretq`.** Its epilogue runs on the kernel stack of the process it just queued for deferred free; re-enabling interrupts before `jump_to_user`'s stack switch lets a timer tick free that stack out from under the running epilogue. `scheduler::tick(interrupted_rsp)` is the complementary half: a queued kstack containing the interrupted RSP stays queued for a later tick.
-- **SMP-ready rules** (stage 0 of `docs/smp/smp-plan.md`; the kernel still runs on one CPU, these stop the debt growing before SMP pays it off):
+- **SMP-ready rules** (stage 0 of `docs/smp/smp-plan.md`; processes still run on one CPU — the APs are up but parked in `hlt` — and these stop the debt growing before SMP pays it off):
   - **IF=0 is not mutual exclusion.** Shared state takes a real lock; `cli` only prevents reentry on the *same* CPU. `keyboard::DECODER` is the worked example: two ISRs (IRQ1 and the timer's USB poll) wrote it through an `UnsafeCell` justified as "only the keyboard ISR touches it" — never true once USB existed, safe only because `cli` serialized both on one CPU. It is an `IrqMutex` now.
   - **No new `static mut` or global `UnsafeCell` for shared state.** Per-CPU state gets indexed by `cpu::cpu_id()`; existing offenders are the plan's inventory, not precedent.
   - **Every PTE change invalidates through `memory::tlb`** (`invalidate_page` for user mappings, `invalidate_kernel_page` for kernel ones) — never `x86_64::instructions::tlb::*` or `MapperFlush::flush()`; consume a `MapperFlush` with `.ignore()` and pass its page. Stage 5's shootdown then changes those bodies, not every call site. `Cr3::write` is a switch, not an invalidation. `grep -rn 'instructions::tlb\|\.flush()' kernel/src/memory` should find only `tlb.rs`.

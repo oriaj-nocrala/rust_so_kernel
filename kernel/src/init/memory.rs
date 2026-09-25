@@ -26,17 +26,41 @@ pub fn init_core(phys_mem_offset: VirtAddr, memory_regions: &'static MemoryRegio
 
     memory::init(phys_mem_offset);
 
+    // The AP trampoline's pages (stage 4 of docs/smp/smp-plan.md) must sit
+    // below 640 KiB and must never be handed out: an AP runs from them while
+    // the rest of the kernel is already allocating. Carved out here, before
+    // the Buddy allocator ever sees them.
+    let usable = || memory_regions.iter()
+        .filter(|r| r.kind == MemoryRegionKind::Usable)
+        .map(|r| (r.start, r.end));
+    let trampoline = hal::smp::pick_trampoline(usable());
+    let reserved = trampoline.map(|b| (b, b + hal::smp::TRAMPOLINE_PAGES * hal::smp::PAGE));
+    match trampoline {
+        Some(base) => {
+            crate::smp::set_trampoline(base);
+            serial_println!("smp: AP trampoline reserved at {:#x}", base);
+        }
+        None => serial_println!("smp: no usable window below 640 KiB for the AP trampoline"),
+    }
+
     // Initialize Buddy allocator — sole owner of all usable physical memory.
     let mut max_usable_end: u64 = 0;
     allocator::BUDDY.with(|buddy| {
-        for region in memory_regions.iter() {
-            if region.kind == MemoryRegionKind::Usable {
-                if region.end > max_usable_end {
-                    max_usable_end = region.end;
+        for (start, end) in usable() {
+            if end > max_usable_end {
+                max_usable_end = end;
+            }
+            let add = |buddy: &mut mm::buddy::BuddyAllocator, s: u64, e: u64| {
+                if e > s {
+                    unsafe { buddy.add_region(&allocator::KernelPhysMap, s, e) };
                 }
-                unsafe {
-                    buddy.add_region(&allocator::KernelPhysMap, region.start, region.end);
+            };
+            match reserved {
+                Some((rs, re)) if rs >= start && re <= end => {
+                    add(buddy, start, rs);
+                    add(buddy, re, end);
                 }
+                _ => add(buddy, start, end),
             }
         }
     });

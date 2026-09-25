@@ -37,6 +37,7 @@ pub mod msc;
 pub mod pci;
 pub mod pit;
 pub mod rtc;
+pub mod smp;
 pub mod sp5100_tco;
 pub mod usb;
 pub mod xhci;
