@@ -178,11 +178,11 @@ Kernel crate config in `kernel/.cargo/config.toml` enables `-Z build-std` to reb
 6c. `ac97::init()` — best-effort PCI AC97 audio codec enable; bounded polls, never hangs boot on hardware/QEMU configs with no AC97 device
 6d. `cpu::tsc::init()` (calibrated against the PIT), then `interrupts::apic::init()` — retires the 8259 + PIT in favour of the LAPIC timer + I/O APIC (see Interrupt Controllers below)
 6e. `cpu::init_this_cpu(0)` — everything the CPU holds for itself (GDT + its TSS slot, IDT, GS, syscall MSRs, PAT, SSE, LAPIC + timer), then read back; see Per-CPU Init below
-6f. `smp::start_aps()` — wakes every AP in the MADT (INIT-SIPI-SIPI through a low-memory trampoline), each runs `init_this_cpu` and parks in `hlt`; see Application Processors below
+6f. `smp::start_aps()` — wakes every AP in the MADT (INIT-SIPI-SIPI through a low-memory trampoline), each runs `init_this_cpu` and parks in `hlt` until step 10; see Application Processors below
 7. REPL initial prompt
 8. `process::fpu::init()` — captures the FXSAVE template
-9. `processes::init_all()` — create idle, user, and shell processes
-10. `process::start_first_process()` — enable interrupts, jump to first trapframe
+9. `processes::init_all()` — create one idle process per scheduling CPU, then the shell
+10. `process::start_first_process()` — start the shell on the BSP, release the APs into the scheduler (`smp::release_aps`), enable interrupts, jump to first trapframe
 
 ## Memory Subsystem (`kernel/src/memory/`, `kernel/src/allocator/`)
 
@@ -215,7 +215,7 @@ Kernel crate config in `kernel/.cargo/config.toml` enables `-Z build-std` to reb
 
 **`Process`** struct: PID, state, privilege (Kernel/User), base+effective priority (0–10), 16-byte name, `Box<TrapFrame>`, kernel stack, `AddressSpace`, `FileDescriptorTable`.
 
-**Scheduler** (`process/scheduler.rs`): the accounting half — multi-level priority run queues (`run_queues[0..=10]`, only Ready processes), a `wait_queue` holding Blocked and Zombie processes, decay-on-preemption, periodic aging, and the quantum arithmetic (`BASE_QUANTUM + eff_pri * BONUS` ticks) — now lives in the standalone, host-testable `sched` crate as `sched::SchedCore<Process>` (`cd sched && cargo test`), following the exact `hal`/`ext2`/`mm`/`vfs` extraction precedent (see `docs/sched/sched-extraction-plan.md`). `kernel/src/process/scheduler.rs`'s `Scheduler` struct is now the thin adapter around it: `core: sched::SchedCore<Process>` plus everything that can't leave the kernel because it's entangled with real hardware or per-CPU state — the currently-`running: Option<Box<Process>>` process (tied to `activate()`/TSS/FPU/the per-CPU fast-path pointers), `static SCHEDULERS: [Mutex<Scheduler>; MAX_CPUS]` and `TrackedSchedulerGuard` (the lock plus its always-on IF=0 diagnostics), `TrapFrame`, and the `fxsave`/`fxrstor`/`fs_base`/CR3/TSS context-switch machinery. `impl sched::SchedEntity for Process` is the seam between the two: a pure field-accessor bridge (pid, base/effective priority, `is_idle`, `is_ready`) with no logic of its own. `sched`'s own doc comment (`sched/src/lib.rs`) has the full module-by-module breakdown of what moved, including a "Known limitations" section on measured, not-yet-fixed aging/starvation defects (`docs/sched/sched-bugs-plan.md`) — this refactor changed no scheduling behavior, so those defects are unchanged from before the extraction.
+**Scheduler** (`process/scheduler.rs`): **one scheduler for every CPU** (stage 7 of `docs/smp/smp-plan.md`, decision 1) — a single `SCHEDULER` lock, one `SchedCore`, `running[cpu]` and `idle[cpu]` slots; see SMP Scheduling below. The accounting half — multi-level priority run queues (`run_queues[0..=10]`, only Ready processes), a `wait_queue` holding Blocked and Zombie processes, decay-on-preemption, periodic aging, and the quantum arithmetic (`BASE_QUANTUM + eff_pri * BONUS` ticks) — now lives in the standalone, host-testable `sched` crate as `sched::SchedCore<Process>` (`cd sched && cargo test`), following the exact `hal`/`ext2`/`mm`/`vfs` extraction precedent (see `docs/sched/sched-extraction-plan.md`). `kernel/src/process/scheduler.rs`'s `Scheduler` struct is now the thin adapter around it: `core: sched::SchedCore<Process>` plus everything that can't leave the kernel because it's entangled with real hardware or per-CPU state — each CPU's `running` process (tied to `activate()`/TSS/FPU/the per-CPU fast-path pointers), `static SCHEDULER` and `TrackedSchedulerGuard` (the lock plus its always-on IF=0 diagnostics), `TrapFrame`, and the `fxsave`/`fxrstor`/`fs_base`/CR3/TSS context-switch machinery. `impl sched::SchedEntity for Process` is the seam between the two: a pure field-accessor bridge (pid, base/effective priority, `is_idle`, `is_ready`) with no logic of its own. `sched`'s own doc comment (`sched/src/lib.rs`) has the full module-by-module breakdown of what moved, including a "Known limitations" section on measured, not-yet-fixed aging/starvation defects (`docs/sched/sched-bugs-plan.md`) — this refactor changed no scheduling behavior, so those defects are unchanged from before the extraction.
 
 **Context switch** (`process/trapframe.rs`, `process/timer_preempt.rs`): The timer ISR (hand-written asm, pushes all GPRs) calls `timer_tick`. On preemption, `switch_to_next()` returns a `*const TrapFrame`; `jump_to_trapframe` restores all registers + `iretq`. The same path is used for process kill/switch.
 
@@ -908,19 +908,22 @@ register back.
 
 ## Application Processors (`kernel/src/smp.rs`, `hal/src/smp.rs`)
 
-Stage 4 of `docs/smp/smp-plan.md`: **the APs are started but inert** —
-processes still run only on CPU 0. Each AP comes up through a four-page
+Stage 4 of `docs/smp/smp-plan.md` starts them; since stage 7 they run
+processes (see SMP Scheduling below). Each AP comes up through a four-page
 trampoline below 640 KiB (code, then its own PML4/PDPT/PD), **reserved in
 `init::memory::init_core` before the Buddy allocator is seeded** — the pages
 must never be handed out. The trampoline's PML4 is a *copy* of the kernel's
 with entry 0 replaced by a 0–2 MiB identity map, so no live table changes; the
 AP loads the kernel's real CR3 first thing in Rust (`ap_entry`), runs
 `cpu::init_this_cpu(cpu)`, joins the TLB shootdown (`memory::tlb::this_cpu_ready`),
-and loops on `sti; hlt`, woken only by IPIs: a shootdown (0xF0) or
-`smp::WAKE_VECTOR` (0xF1), after which it runs what `smp::run_on` left in its
-mailbox (the self-test's way onto an AP). **Its LAPIC timer is
-masked** (`interrupts::apic::runs_timer`: CPU 0 only until stage 7) — an AP
-with IF=1 that took vector 32 would run the scheduler. APs start one at a
+and loops on `sti; hlt` until `smp::release_aps` (at the first process's
+start) sends it into the scheduler on its own idle process. **Its LAPIC
+timer stays masked until then** (`interrupts::apic::runs_timer`; unmasked by
+`start_timer_on_ap` as it enters) — an AP that took vector 32 with nothing to
+schedule would have no process to switch from. `smp::WAKE_VECTOR` (0xF1)
+makes the idle loop (`smp::idle_once`) run what `smp::run_on` left in its
+mailbox — the TLB self-test's way onto an AP; the scheduler leaves an idle
+process running such a job alone (`smp::ap_busy`). APs start one at a
 time; every wait is bounded, and an AP that does not answer is logged
 (`NO-RESPONSE(stage n)`, the stage the trampoline's progress marker reached),
 sent INIT again so it cannot wake late on the next AP's stack, and left out.
@@ -928,6 +931,61 @@ The BSP is always CPU 0; the rest follow MADT order up to `MAX_CPUS` (32).
 `smp:` in `/proc/kdebug` has the per-CPU outcome and time to come up;
 `QEMU_DEBUG_SMP=N` gives QEMU N CPUs, and `boot-matrix.sh` records
 `cpus_online=M/N` per boot.
+
+## SMP Scheduling (`kernel/src/process/scheduler.rs`, `kernel/src/process/timer_preempt.rs`, `sched/`)
+
+Stage 7 of `docs/smp/smp-plan.md` (its resolution section has the full
+record). Every online CPU runs processes; built with `CONSTANOS_NOSMP=1`
+(watched by `build.rs`) only CPU 0 does, the APs still starting for the TLB
+self-test.
+
+- **One lock, one core** (`SCHEDULER`), `running[cpu]` + `idle[cpu]`.
+  `running_ref`/`running_mut`/`current_pid` mean *this* CPU's. The idle
+  processes (one per CPU, all pid 0, as in Linux) are never queued: a CPU
+  runs its own when nothing it may take is Ready. `iter_all`/`/proc` skip
+  them. `find_process_mut` also finds a process running on another CPU.
+- **`LEAVING[cpu]` is `on_cpu`**: the kernel stack a CPU has switched away
+  from but still executes on. Set by every switch (`note_leaving`, by RSP),
+  cleared by the asm right after `mov rsp, <new frame>`
+  (`jump_to_trapframe_raw`, the timer/IPI stubs — which is why
+  `jump_to_trapframe` is now a Rust wrapper passing `leaving_slot()`, and the
+  stubs' handlers return a `Resume` in RAX:RDX). No other CPU picks that
+  process (`eligible`) or frees that stack (`tick`'s
+  `pending_stack_frees` drain). **Every kernel stack is freed through
+  `pending_stack_frees`** — `waitpid`'s reap too: the zombie's `sys_exit` may
+  still be unwinding on another CPU.
+- **Never drop the last `Arc<AddressSpace>` of a table some CPU has in CR3.**
+  Its PML4 goes back to the Buddy and another CPU can reuse it at once; this
+  one then fetches through garbage (a silent triple fault). `sys_exec` drops
+  the old space only after `activate()`, and `kill_current` parks a dying
+  thread's space in `retiring[cpu]` until `switch_in` has loaded the next.
+- **Tick on every scheduling CPU; global work on CPU 0 only**: cursor, USB
+  poll, `TICK_COUNT`, hrtimers, the aging clock. Slices are per CPU
+  (`SchedCore::start_slice_on`/`consume_quantum_on`). An idle CPU switches
+  at its next tick if there is eligible work, or at once on the **reschedule
+  IPI** (`RESCHED_VECTOR` 0xF2, `kick_idle`), sent whenever something becomes
+  Ready while a CPU idles — to this CPU first, so a keyboard IRQ that wakes
+  the shell doesn't wait for a tick.
+- **Wakeups across CPUs.** "Register as a waiter, then block" is two steps,
+  and another CPU can run a whole wakeup in between. `poll`/`epoll_wait` and
+  stdin register *and* block under the scheduler lock (the waker takes its
+  registry first, then that lock, so it finds them Blocked), and re-check
+  readiness once registered, restarting the syscall (`rip -= 2`) if
+  something slipped in. Pipes and sockets can't (they register inside
+  `FileHandle::read` with the fd table held): their wakers use
+  `wake_or_defer`/`deliver_to_waiter`, which leave `Process::wake_pending`
+  for `block_current` to consume instead of blocking — **only for waiters
+  that register on the way to blocking and are removed by the wakeup
+  itself**, or a stale one leaves a pending wakeup for some later block.
+  Sockets also close the check→register gap with `unix::WAKE_EPOCH` (read
+  before the operation, compared after registering). Counters:
+  `early_wakes`, and the `sched:` block of `/proc/kdebug` (per-CPU pid,
+  switches, busy/idle ticks, `max_concurrent`, `max_threads_parallel`,
+  reschedule IPIs, `leaving_skips`, and `invariants=` —
+  `sched::SchedCore::check_invariants_with_running` run on the live
+  scheduler).
+- Ash's `wait` builtin does not work (`sigsuspend` is missing from the mlibc
+  port): scripts that start background jobs wait on marker files instead.
 
 ## TLB Shootdown (`kernel/src/memory/tlb.rs`, `hal/src/tlb.rs`, `kernel/src/tlb_selftest.rs`)
 
@@ -1085,13 +1143,14 @@ Sysdeps added beyond the original bootstrap set (all in `generic/generic.cpp` un
 - **The same rule covers the allocators, and this one was learned the hard way.** `BUDDY` and `SLAB_ALLOCATOR` (`kernel/src/allocator/mod.rs`) are `diag::IrqMutex<_, KernelIrq>` — not plain `spin::Mutex`es — so the discipline is structural rather than a convention every call site has to remember: `IrqMutex` exposes no `lock()`/`try_lock()` and no public guard type at all, only `with`/`try_with`, which disable interrupts via `x86_64::instructions::interrupts::without_interrupts` *first* and take the real lock only inside that closure. `without_interrupts` (not a bare `cli`/`sti` pair) because it restores the *previous* state and is therefore safe to call from a context that already has interrupts off (the timer ISR itself). Why it matters: ordinary interruptible kernel code allocates all the time — `vfs::resolve_inner` allocates a `Vec<&str>` just to split a path — and if the timer fires while that code holds the allocator lock, `timer_preempt_handler` → `Scheduler::switch_to_next` can itself need to allocate (growing a run queue's `VecDeque`), reentering the same non-reentrant lock on the same CPU and spinning forever at 100% CPU. That was the real cause of a ~1-in-10 debug-boot hang that went unexplained for months while being blamed on `fork`/COW/the physical allocator; it needs no `fork` and no `exec` at all. A `try_lock()` canary for this (`kernel::debug`'s former `SLAB_LOCK_CONTENDED`, `/proc/kdebug`) was later retired — not because the bug is fixed, but because nothing that runs inside the critical section can allocate any more (`mm` links no `alloc`, and every seam it calls out through is either pure address arithmetic or an allocation-free print), so the reentrant acquisition it watched for can no longer happen; see `kernel/src/allocator/mod.rs`'s comment above `SlabGlobalAlloc`'s `GlobalAlloc` impl for the full argument. `IrqMutex` (`diag/src/irqmutex.rs`) is what makes the ordering itself impossible to get wrong now — there is exactly one path to the protected value, and it always disables interrupts before it ever touches the real lock. **Any new global taken on an allocating path needs the same treatment.**
 - **Context switches restore all GPRs** via `jump_to_trapframe` (asm `pop` sequence + `iretq`). Never use partial restores that leave callee registers from the killed process.
 - **Every kernel entry must clear the direction flag (DF).** Interrupt delivery does not clear it, and `syscall` only clears the RFLAGS bits named in `IA32_FMASK`. `rep movsb` obeys DF, so an entry taken while the interrupted code sat between a `memmove`'s `std` and its `cld` runs the *whole* kernel path — including `*proc.trapframe = *current_tf`, which compiles to `rep movsb` — copying **backward**, writing the 160 bytes *before* the trapframe box instead of into it. That was the single root cause behind three separate long-standing symptoms (a stale-frame resume orphaning an in-flight syscall's locks, jumps into heap data as code, and a box that "ignored" its own memcpy); measured at ~4-8% of debug boots, 48/48 clean after the fix. Two mechanisms cover it, both required: `process/tss.rs` masks DF in `IA32_FMASK` (bit 10, exactly as Linux does), and both hand-written asm entry stubs (`timer_preempt.rs::timer_interrupt_entry`, `syscall/mod.rs::syscall_entry_fast`) emit `cld` as their first instruction. The rustc `x86-interrupt` shims already emit `cld`, so IDT handlers are covered for free — **any new hand-written entry stub is not**. `jump_to_trapframe` is a *resume*, not an entry, and must NOT clear DF (it restores the frame's own RFLAGS). See `docs/hang-hunt-bug2-findings.md`.
-- **`sys_exit` must keep IF=0 all the way to the `iretq`.** Its epilogue runs on the kernel stack of the process it just queued for deferred free; re-enabling interrupts before `jump_to_user`'s stack switch lets a timer tick free that stack out from under the running epilogue. `scheduler::tick(interrupted_rsp)` is the complementary half: a queued kstack containing the interrupted RSP stays queued for a later tick.
-- **SMP-ready rules** (stage 0 of `docs/smp/smp-plan.md`; processes still run on one CPU — the APs are up but parked in `hlt` — and these stop the debt growing before SMP pays it off):
+- **`sys_exit` must keep IF=0 all the way to the `iretq`.** Its epilogue runs on the kernel stack of the process it just queued for deferred free; re-enabling interrupts before `jump_to_user`'s stack switch lets a timer tick free that stack out from under the running epilogue. `scheduler::tick(interrupted_rsp)` is the complementary half: a queued kstack containing the interrupted RSP stays queued for a later tick. Other CPUs are kept off it by `LEAVING` (SMP Scheduling above).
+- **SMP rules** (stage 0 of `docs/smp/smp-plan.md`, written before SMP existed to stop the debt growing; since stage 7 processes run on every CPU and they are simply the rules):
   - **IF=0 is not mutual exclusion.** Shared state takes a real lock; `cli` only prevents reentry on the *same* CPU. `keyboard::DECODER` is the worked example: two ISRs (IRQ1 and the timer's USB poll) wrote it through an `UnsafeCell` justified as "only the keyboard ISR touches it" — never true once USB existed, safe only because `cli` serialized both on one CPU. It is an `IrqMutex` now.
   - **No new `static mut` or global `UnsafeCell` for shared state.** Per-CPU state gets indexed by `cpu::cpu_id()`; existing offenders are the plan's inventory, not precedent.
   - **Every PTE change invalidates through `memory::tlb`** (`invalidate_page(pml4, addr)` for user mappings, `invalidate_kernel_page` for kernel ones) — never `x86_64::instructions::tlb::*` or `MapperFlush::flush()`; consume a `MapperFlush` with `.ignore()` and pass its page. Since stage 5 these shoot down the other CPUs (see TLB Shootdown). **Every CR3 load goes through `tlb::switch_to`**, which records it — a bare `Cr3::write` makes this CPU invisible to user-mapping shootdowns. `grep -rn 'instructions::tlb\|\.flush()' kernel/src/memory` should find only `tlb.rs`.
   - **`gs` is used in exactly one place: `syscall_entry_fast`'s four-instruction `swapgs` window** (stage 2, `kernel/src/cpu/percpu.rs`). It loads this CPU's kernel stack from `PerCpu`, then swaps straight back, so every other path — the timer stub, rustc's `x86-interrupt` shims (which never `swapgs`), `jump_to_trapframe` — runs with user mode's GS_BASE and never reads it. Rust reaches per-CPU data through `cpu::cpu_id()`, which reads the task register (`str`), not `gs:`. **Do not add a `gs:` access anywhere else**; `percpu::check_gs_invariant` (every syscall + every tick) panics if `IA32_KERNEL_GS_BASE` stops pointing at `&PERCPU[cpu]`. Each CPU has its own TSS slot in one GDT at `FIRST_TSS_SELECTOR + 16·n` (stage 3, `process/tss.rs`) — one GDT per CPU with the TSS at the same index would make `cpu_id()` stop telling CPUs apart.
   - **Nothing new hangs off the timer tick** without saying whether it is global work (BSP only: `hrtimer`, the USB poll) or per-CPU work (scheduling).
   - **Kernel locks are `crate::sync::Mutex`, never `spin::Mutex`** (stage 6, `kernel/src/sync.rs`): its relax strategy answers TLB shootdowns, so no CPU can spin on a lock with IF=0 while the holder waits for that CPU's acknowledgement. **A lock an ISR also takes is an `IrqLock` or `diag::IrqMutex`**, or the ISR uses `try_lock` (`FB_STATE`, `FRAMEBUFFER`, `CONTROLLERS`): a plain lock held by a syscall with IF=1 is a deadlock with *one* CPU the moment that ISR lands on it — syscalls enter with IF=0 but most re-enable it at their first guard, and `TERMIOS`, `EPOLL_INSTANCES` and `SERIAL` had exactly that bug. (`serial_println!` with IF=0 only *tries* the lock and falls back to the lock-free writer.) **Any other IF=0 busy-wait calls `memory::tlb::service_pending`** (the USB transfer waits do). Lock order and the full per-lock audit: the stage 6 resolution in `docs/smp/smp-plan.md`.
-  - **Check-then-sleep must be one step.** Checking a condition, registering as a waiter and blocking were kept together only by IF=0 on one CPU; with a waker on another CPU, a wakeup in between is lost. `FUTEX_WAIT` holds the scheduler lock and `FUTEX_WAITERS` across all three; `poll`, stdin, pipes and sockets still have the gap (stage 7).
+  - **Check-then-sleep must be one step.** Checking a condition, registering as a waiter and blocking were kept together only by IF=0 on one CPU; with a waker on another CPU, a wakeup in between is lost. `FUTEX_WAIT` holds the scheduler lock and `FUTEX_WAITERS` across all three; `poll`, stdin, pipes and sockets close it as SMP Scheduling above describes. **A new blocking path needs one of those mechanisms.**
+  - **A process can migrate at any preemption point.** Code running with IF=1 must not hold on to `cpu::cpu_id()` or anything indexed by it across a point where it can be preempted; the next instruction may run on another CPU.
 - **Nothing per-process may live in a per-CPU global across a preemption point.** The current syscall's frame is `syscall::current_tf_ptr()`, computed from the running process's own kernel stack top (this CPU's `PerCpu::kernel_rsp` `- sizeof(TrapFrame)`, where `syscall_entry_fast` always builds it — Linux's `task_pt_regs`). It used to be a global (`CURRENT_SYSCALL_TF`) stored at syscall entry, which went stale whenever a syscall was preempted with IF=1 and another process made syscalls before it resumed: the post-syscall signal check then delivered the parent's SIGCHLD into the dead child's frame and wrote the signal frame over the parent's live stack. Symptom: `ash` dying at its `exit` builtin (`rip` 0, 0x202, or an address in the child's binary) after a short-lived child, under host load only. Found 2026-09-24 by the first autorun job; the user-segfault stack dump (`init::devices::dump_user_stack`) and `ktrace!(PROC)` on signal delivery/`sigreturn` are what cornered it.

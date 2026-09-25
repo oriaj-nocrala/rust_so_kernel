@@ -12,7 +12,8 @@
 > `memory::tlb`, `hal::tlb`, `tlb_selftest`); etapa 6 hecha y verificada en
 > QEMU y en la Ryzen (2026-09-25; ver su resolución: cada entrada del inventario resuelta
 > o asignada a la etapa 7, y cinco bugs reales encontrados por el camino).
-> Los procesos siguen corriendo en una sola CPU.
+> Etapa 7 hecha y verificada en QEMU (2026-09-25; ver su resolución): los
+> APs ejecutan procesos. Falta verificarla en la Ryzen.
 
 ## Por qué ahora
 
@@ -724,6 +725,142 @@ calentamiento de 100 `exec`), no las mediciones.
 limpios con el mismo número de arranques; `pthread_test` y
 `producer_consumer` con hilos en CPUs distintas; DOOM y Quake jugables;
 y la Ryzen llega al shell con todas las CPUs.
+
+#### Resolución (2026-09-25)
+
+**El scheduler** (`kernel/src/process/scheduler.rs`): un `SCHEDULER` en vez
+de `SCHEDULERS[cpu]`, con `running[cpu]` e `idle[cpu]`. Los idle son uno por
+CPU, todos pid 0 (como en Linux), y **no están en ninguna cola**: una CPU
+corre el suyo cuando no hay nada Ready que pueda tomar, y ninguna otra puede
+elegirlo. Con idles en las colas, una CPU podía quedarse sin ninguno
+elegible (cada CPU puede tener uno corriendo y otro "saliendo"). `iter_all`
+ya no los lista (`/proc` tampoco lista los de Linux). `find_process_mut`
+encuentra también lo que corre en otra CPU: el padre al que llega el
+`SIGCHLD` de un hijo puede estar corriendo en ese instante.
+
+**`on_cpu`: `LEAVING[cpu]`**, no una bandera por proceso. Es la kstack de la
+que una CPU acaba de salir pero en la que todavía ejecuta: la pone, con el
+lock tomado, cada cambio de contexto cuyo proceso saliente es dueño de la
+pila actual (`note_leaving` compara RSP con su rango, así que un segundo
+cambio dentro de la misma ventana — una señal que mata al elegido — no la
+pisa), y la limpia el asm justo después de `mov rsp, <frame nuevo>`
+(`jump_to_trapframe_raw` y los stubs del timer y del IPI, que reciben la
+dirección del hueco en RDX). Por CPU y no por proceso porque tiene que
+sobrevivir al proceso: un hilo que sale se libera en `kill_current`, con
+la CPU todavía en su pila. Sirve a dos cosas:
+
+- **Elegir** (`eligible`, vía `sched::SchedCore::pop_next_ready_where`): un
+  proceso cuya pila otra CPU aún no ha dejado se salta. Reanudarlo haría
+  que su siguiente syscall usara esa misma pila bajo la otra CPU. El
+  `LEAVING` propio no cuenta: reanudar en esta CPU el proceso de cuya pila
+  sale es el caso de una CPU de siempre. `leaving_skips` en `/proc/kdebug`.
+- **Liberar kstacks** (`tick`): una pila encolada solo se libera si ninguna
+  CPU está en ella. Eso cubre el caso nuevo: `waitpid` en una CPU reapeando
+  un zombi cuyo `sys_exit` sigue desenrollándose en otra. Por eso el reap ya
+  no llama a `free_kernel_stack` (borrada): pasa por `pending_stack_frees`
+  como la de un hilo.
+
+**Tick por CPU**, trabajo global solo en la CPU 0 (decisión 3): cursor,
+`usb::poll`, `TICK_COUNT`, hrtimers y el reloj de envejecimiento. El
+cuanto es por CPU (`SchedCore::start_slice_on`/`consume_quantum_on`). Un AP
+arranca con el timer enmascarado (`init_this_cpu`, como en la etapa 4) y
+lo desenmascara al entrar al scheduler (`apic::start_timer_on_ap`), porque
+un tick antes de tener `running` no tiene nada que planificar. El flush
+periódico del log lo hace el idle de *cualquier* CPU (un `compare_exchange`
+deja pasar a uno por período): un proceso al 100% en la CPU 0 ya no lo
+detiene.
+
+**IPI de reschedule** (vector `0xF2`, entrada asm como la del timer):
+cuando algo pasa a Ready (`add_process`, cualquier `wake*`, o lo que un
+cambio de contexto devuelve a la cola) y hay una CPU en idle, se le manda
+uno (`kick_idle`), a esta misma CPU primero si está en idle — el caso de
+una IRQ de teclado que despierta al shell, que así no espera al tick. Un
+idle también cambia en su tick si hay trabajo elegible, sin esperar a que
+se le acabe el cuanto (antes, con una CPU, un proceso despertado esperaba
+al final del cuanto del idle). Mientras el idle ejecuta un trabajo de
+`smp::run_on` (el self-test de TLB, ahora desde el bucle idle), no se le
+quita la CPU.
+
+**Despertares perdidos** (lo que la etapa 6 dejó escrito). Dos huecos,
+cerrados por separado:
+
+- *Registro → bloqueo* (el proceso se registró como waiter y otra CPU lo
+  despierta antes de que llegue a `block_current`). Para `poll`/`epoll_wait`
+  y stdin, registrar y bloquear son ahora un paso bajo el lock del
+  scheduler: el que despierta toma el registro y *luego* ese lock, así que
+  lo encuentra ya bloqueado. Para tuberías y sockets, cuyo registro ocurre
+  dentro de `FileHandle::read` con la tabla de fds tomada (no se puede
+  tomar el scheduler ahí sin invertir el orden), el despertar se aplaza:
+  `wake_or_defer`/`deliver_to_waiter` dejan `Process::wake_pending`
+  (`Return(rax)` para una tubería, que ya copió los datos a través del
+  espacio del lector; `Restart` para un socket, cuyo frame ya está
+  rebobinado) y `block_current` lo consume sin bloquear. Solo para waiters
+  que se registran camino del bloqueo y que el propio despertar retira: uno
+  rancio dejaría un despertar pendiente para un bloqueo posterior ajeno.
+  `early_wakes` en `/proc/kdebug`.
+- *Comprobación → registro* (el evento llega entre "no hay nada" y el
+  registro, no encuentra waiter). `poll`/`epoll_wait` y stdin vuelven a
+  comprobar con el registro hecho (stdin con `STDIN_WAITER` tomado: el ISR
+  mete la tecla *antes* de tomarlo) y, si algo está listo, retiran el
+  waiter y reejecutan el syscall (`rip -= 2`). Sockets: `unix::WAKE_EPOCH`,
+  que `dispatch_wakes` incrementa antes de recorrer `WAITERS`; cada
+  operación que puede bloquear lo lee antes de intentarlo y `register_retry`
+  lo compara tras registrarse. Tuberías: comprobar y registrar ya eran un
+  paso bajo el lock de la tubería.
+- Del hrtimer: `poll_clear_on_timeout` corre ahora *antes* de despertar al
+  proceso y solo si el waiter sigue siendo el de ese temporizador: después,
+  el proceso ya puede estar en otra CPU con un `poll` nuevo bajo el mismo
+  pid, y se le borraba. Y `hrtimer::tick` ya no tira los despertares que no
+  caben en su buffer de 8 (el comentario decía que se reintentaban; no).
+
+**Bug real encontrado: un CR3 liberado mientras seguía cargado.**
+`sys_exec` soltaba el `Arc` del espacio viejo antes de activar el nuevo, y
+`kill_current` suelta el `Process` de un hilo — quizá el último dueño de su
+espacio — antes de que la CPU cargue el siguiente. Con una CPU nadie
+reutilizaba el marco de la PML4 en esa ventana; con varias, otra CPU lo
+asigna y lo pisa, y esta busca su siguiente instrucción a través de basura.
+Síntoma: triple fault silencioso (QEMU se reinicia) con 4 carriles de tests
+en paralelo con `-smp 8`; la traza `-d int` mostraba un fallo de página en
+el *fetch* de código del kernel con un CR3 sin las entradas del kernel.
+Ahora `sys_exec` suelta el viejo tras `activate()`, y `kill_current` lo deja
+en `retiring[cpu]`, que `switch_in` suelta tras cargar el siguiente.
+
+**`sched`** (host): `MAX_CPUS`, cuantos por CPU, `pop_next_ready_where`,
+`has_ready`, `check_invariants_with_running` (ningún pid en dos CPUs, ni en
+una y en cola; nada Ready en un `running`; los idle pid 0 se ignoran) y la
+propiedad B4 (4 CPUs, 4000 operaciones por semilla, eligiendo con una
+entidad "saliendo" al azar). 56 tests. `/proc/kdebug` corre el comprobador
+sobre el scheduler real (`sched: ... invariants=ok`).
+
+**`CONSTANOS_NOSMP=1`** al compilar (decisión 6; `build.rs` lo vigila): los
+APs arrancan igual — el self-test de TLB los necesita — pero nunca
+planifican. `sched: nosmp=true` en `/proc/kdebug`.
+
+**Verificada en QEMU:** `run-kernel-tests.sh` PASS; `boot-matrix 4 5` 20/20
+con `-smp 4` y 20/20 con `-smp 1`; con `-smp 4` los tests C de hilos,
+señales, FPU, sockets, `pipe_cow_test`, `ipc_ping`, `poll_test` con exit 0
+y `max_threads_parallel=3` (hilos de un proceso en tres CPUs a la vez);
+`-smp 8 -m 8G` con 4 carriles × 3 rondas × 5 tests en paralelo sin fallos
+(`max_concurrent=8`); DOOM y Quake con `-smp 4`; `CONSTANOS_NOSMP=1` con
+`-smp 4`: solo la CPU 0 planifica. El job de metal
+(`target/metal/smp-stage7-job.sh`) corrido en QEMU con `-smp 24 -m 8G`:
+`METAL-DONE exit=0`, todos los tests con exit 0, los 4 carriles sin fallos,
+`tlb_selftest` PASS contra 22 APs, stale 0, `early_wakes` 2–38 según la
+corrida (la ventana registro→bloqueo existe y se cubre). `socket_test` no
+se puede correr en paralelo consigo mismo: usa nombres fijos.
+
+**El self-test de TLB, adaptado:** `kdebug tlbtest` puede correr ahora en
+un AP y ser desalojado a mitad del test; su primera corrida con 24 CPUs
+mandó el lector a la CPU del propio escritor ("reader never started").
+Corre con IF=0 (fijo en su CPU; sus esperas atienden shootdowns) y usa como
+lectores solo APs en idle distintos del suyo (`scheduler::cpu_is_idle`).
+
+**Abierto:** la espera de un shootdown subió en QEMU bajo carga (media
+~0,2–0,7 ms, máx. 69 ms con 8 vCPUs, frente a 13 µs/611 µs en los tests):
+coincide con E/S PIO de ATA emulada, que en QEMU TCG serializa las vCPUs; la
+Ryzen no tiene ATA. Medir en metal antes de tocar nada (el límite es 1 s).
+Y `wait` de ash no funciona (`sigsuspend` falta en el port de mlibc): los
+jobs de metal esperan con ficheros-testigo.
 
 ## Qué queda fuera
 
