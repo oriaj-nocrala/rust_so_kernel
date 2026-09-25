@@ -117,8 +117,10 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_: ExceptionStackFrame) {
     keyboard::process_scancode(scancode);
     // Wake any process blocked on stdin read.
     crate::process::syscall::stdin_wakeup();
-    // Wake any process blocked in poll/epoll_wait watching stdin for POLLIN.
+    // Wake any process blocked in poll/epoll_wait watching stdin for POLLIN,
+    // or `/dev/input/event0`.
     crate::process::syscall::poll_wakeup_for_fd0();
+    crate::process::syscall::poll_wakeup_for_input(crate::drivers::evdev::QUEUE_KEYBOARD);
     crate::interrupts::eoi(crate::interrupts::pic::Irq::Keyboard.as_u8());
 }
 
@@ -163,7 +165,9 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_: ExceptionStackFrame) {
     let data = unsafe {
         x86_64::instructions::port::PortReadOnly::<u8>::new(0x60).read()
     };
-    crate::mouse::process_byte(data);
+    if crate::mouse::process_byte(data) {
+        crate::process::syscall::poll_wakeup_for_input(crate::drivers::evdev::QUEUE_MOUSE);
+    }
     crate::interrupts::eoi(crate::interrupts::pic::Irq::Mouse.as_u8());
 }
 

@@ -32,7 +32,7 @@ use alloc::boxed::Box;
 use crate::fs::types::Stat;
 use crate::process::file::{FileHandle, FileResult};
 use crate::keyboard_buffer::RawKeyEvent;
-use super::evdev::{InputEvent, EV_SYN, EV_KEY, SYN_REPORT, RECORD_SIZE};
+use super::evdev::{InputEvent, EV_SYN, EV_KEY, SYN_REPORT, RECORD_SIZE, QUEUE_KEYBOARD};
 
 /// E0-prefixed scancode (low 7 bits, i.e. `RawKeyEvent::keycode & 0x7F`
 /// with the `0x80` extended marker already stripped) → real Linux KEY_*
@@ -145,6 +145,10 @@ impl FileHandle for InputEventDevice {
 
     fn stat(&self) -> Option<Stat> {
         Some(Stat::chardev(0))
+    }
+
+    fn event_source(&self) -> Option<vfs::file::EventSource> {
+        Some(vfs::file::EventSource { queue: QUEUE_KEYBOARD, buffered: self.pending_syn })
     }
 
     fn dup(&self) -> Option<Box<dyn FileHandle>> {

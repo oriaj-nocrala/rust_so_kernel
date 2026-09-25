@@ -76,4 +76,9 @@ impl RawKeyBuffer {
     pub fn pop(&self) -> Option<RawKeyEvent> {
         self.0.with(|r| r.pop())
     }
+
+    /// Non-consuming readiness check, for `poll` on `/dev/input/event0`.
+    pub fn peek(&self) -> bool {
+        self.0.with(|r| !r.is_empty())
+    }
 }

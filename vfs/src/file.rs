@@ -77,6 +77,15 @@ pub fn compute_seek(current: i64, size: i64, offset: i64, whence: i32) -> FileRe
 // TRAIT: FileHandle
 // ============================================================================
 
+/// What `FileHandle::event_source` reports — see there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventSource {
+    /// Which kernel queue feeds the handle (the kernel assigns the ids).
+    pub queue: usize,
+    /// The handle holds records already taken off that queue.
+    pub buffered: bool,
+}
+
 /// Trait representing any "file" in the system.
 ///
 /// Implementations include device drivers (/dev/null, /dev/console, etc.),
@@ -178,6 +187,21 @@ pub trait FileHandle: Send {
     /// ext2) override this.
     fn seek(&mut self, _offset: i64, _whence: i32) -> FileResult<i64> {
         Err(FileError::NotSupported)
+    }
+
+    /// The kernel event queue that feeds this handle, for `poll(2)`.
+    ///
+    /// `poll` cannot ask a handle whether it is readable at wakeup time:
+    /// the waker (an ISR, another CPU) cannot reach the blocked process's
+    /// fd table. So the answer is split in two, like `socket_id()`: which
+    /// global queue this handle reads from (a kernel-assigned id, so a
+    /// producer can find the pollers it should wake and re-check the queue
+    /// itself), and whether the handle already holds records of its own
+    /// that no queue knows about (an evdev `SYN_REPORT` still owed, the
+    /// rest of a decoded mouse packet). Default `None`: `poll` treats the
+    /// handle as always ready, which is right for `/dev/null` and friends.
+    fn event_source(&self) -> Option<EventSource> {
+        None
     }
 
     /// Change this open file's permission bits — `fchmod(2)`. Default
@@ -337,6 +361,11 @@ mod tests {
     #[test]
     fn default_shm_object_is_none() {
         assert!(MinimalHandle.shm_object().is_none());
+    }
+
+    #[test]
+    fn default_event_source_is_none() {
+        assert_eq!(MinimalHandle.event_source(), None);
     }
 
     /// A handle that overrides `seek`/`dup`, to prove the defaults tested

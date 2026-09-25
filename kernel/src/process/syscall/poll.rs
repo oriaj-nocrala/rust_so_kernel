@@ -11,7 +11,18 @@ use crate::ipc::unix;
 /// Must match `FileDescriptorTable`'s own `MAX_FILES`.
 pub(super) const MAX_FILES_PER_PROC: usize = 16;
 
-/// A process's fd → socket mapping, snapshotted at the moment it blocks.
+/// What `poll` needs to know about one fd without its handle: what can make
+/// it ready. Anything else is always ready (`/dev/null`, regular files).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PollSource {
+    Other,
+    Socket(SocketId),
+    /// An evdev device: which queue feeds it (`drivers::evdev::QUEUE_*`),
+    /// and whether the handle held records of its own at snapshot time.
+    Input { queue: usize, buffered: bool },
+}
+
+/// A process's fd → `PollSource` mapping, snapshotted at the moment it blocks.
 ///
 /// Readiness for a blocked process has to be re-checked by whoever wakes it,
 /// from *their* context — and another process's fd table is not reachable
@@ -23,11 +34,18 @@ pub(super) const MAX_FILES_PER_PROC: usize = 16;
 /// hand-maintained at every fd-allocating call site and silently did nothing
 /// for pids past its bound. `FileHandle::socket_id()` is the source of truth
 /// now; this is only a cache of it, valid for the duration of one block.
-type SocketMap = [SocketId; MAX_FILES_PER_PROC];
+/// Input devices joined it for the same reason (`FileHandle::event_source`,
+/// phase 2.2 of `docs/gui/gui-plan.md`): before, every device fd but stdin
+/// was "always ready", and a compositor polling the mouse spun at 100 %.
+///
+/// A handle's `buffered` records cannot change while its process sleeps in
+/// `poll` (only a read takes them), so a snapshot saying "buffered" makes
+/// the fast path return and the process never blocks on a stale answer.
+type SocketMap = [PollSource; MAX_FILES_PER_PROC];
 
-const NO_SOCKETS: SocketMap = [0; MAX_FILES_PER_PROC];
+const NO_SOCKETS: SocketMap = [PollSource::Other; MAX_FILES_PER_PROC];
 
-/// Resolve every fd of the *running* process to a socket id (0 = not one).
+/// Resolve every fd of the *running* process to what can make it ready.
 fn snapshot_sockets() -> SocketMap {
     let mut map = NO_SOCKETS;
     let files = {
@@ -40,7 +58,13 @@ fn snapshot_sockets() -> SocketMap {
     let guard = files.lock();
     for (fd, slot) in map.iter_mut().enumerate() {
         if let Ok(h) = guard.get(fd) {
-            *slot = h.socket_id().unwrap_or(0);
+            *slot = if let Some(id) = h.socket_id() {
+                PollSource::Socket(id)
+            } else if let Some(src) = h.event_source() {
+                PollSource::Input { queue: src.queue, buffered: src.buffered }
+            } else {
+                PollSource::Other
+            };
         }
     }
     map
@@ -61,8 +85,9 @@ fn snapshot_sockets() -> SocketMap {
 //   silently skipped pid >= 32: a `poll()` with no timeout from such a pid
 //   blocked without registering and was never woken, and `epoll_*` said
 //   ESRCH.
-//   - Wakeup hooks: `poll_wakeup_for_fd0` (keyboard ISR) and
-//     `poll_wakeup_for_socket` (the socket layer).
+//   - Wakeup hooks: `poll_wakeup_for_fd0` (keyboard ISR),
+//     `poll_wakeup_for_input` (evdev producers) and
+//     `poll_wakeup_for_socket` (the socket layer), all `poll_wake_where`.
 //
 // LOCKING ORDER (cli must be held):
 //   POLL_WAITERS → EPOLL_INSTANCES → SOCKETS → (release) → SCHEDULER
@@ -259,15 +284,25 @@ static POLL_WAITERS: crate::sync::IrqLock<BTreeMap<usize, PollWaiter>> = crate::
 ///     reportable EOF is POLLIN, room to send is POLLOUT, a dead peer is
 ///     POLLHUP. A listening socket with a pending connection is POLLIN,
 ///     which is what makes `poll()`-before-`accept()` work.
+///   - evdev device: POLLIN if its handle holds records or its queue is
+///     non-empty; POLLOUT always (writes are accepted, as Linux's
+///     `evdev_poll` answers).
 ///   - stdin (fd=0): POLLIN if keyboard buffer has data.
 ///   - All other device fds: always ready for the requested events.
 fn fd_check_ready(socks: &SocketMap, fd: i32, events: i16) -> i16 {
     if fd < 0 { return POLLNVAL; }
     let fd_usize = fd as usize;
+    let source = socks.get(fd_usize).copied().unwrap_or(PollSource::Other);
+
+    if let PollSource::Input { queue, buffered } = source {
+        let ready = buffered || crate::drivers::evdev::queue_ready(queue);
+        let rev = events & POLLOUT;
+        return if events & POLLIN != 0 && ready { rev | POLLIN } else { rev };
+    }
 
     // Socket?
-    if fd_usize < MAX_FILES_PER_PROC && socks[fd_usize] != 0 {
-        let Some(mask) = unix::poll_mask(socks[fd_usize]) else { return POLLNVAL };
+    if let PollSource::Socket(sock) = source {
+        let Some(mask) = unix::poll_mask(sock) else { return POLLNVAL };
         let mut rev: i16 = 0;
         if events & POLLIN != 0 && mask.readable { rev |= POLLIN; }
         if events & POLLOUT != 0 && mask.writable { rev |= POLLOUT; }
@@ -357,131 +392,118 @@ fn deliver_poll_result_phys(waiter: &PollWaiter, phys_offset: u64, write: bool) 
 
 // ── Waiter-scan helpers ────────────────────────────────────────────────────
 
-/// Check if a poll waiter is watching fd=0 (stdin) for POLLIN.
-/// Called while POLL_WAITERS is held (poll_waiter is borrowed from it).
-fn poll_waiter_watches_stdin(waiter: &PollWaiter, phys_offset: u64) -> bool {
-    match waiter.kind {
-        PollWaiterKind::Poll { nfds } => {
-            let base = (phys_offset + waiter.phys_buf) as *const PollFd;
-            for i in 0..nfds as usize {
-                let pfd = unsafe { *base.add(i) };
-                if pfd.fd == 0 && (pfd.events & POLLIN) != 0 {
-                    return true;
-                }
-            }
-            false
-        }
-        PollWaiterKind::EpollWait { epoll_id, .. } => {
-            // POLL_WAITERS → EPOLL_INSTANCES is the allowed nesting
-            let instances = EPOLL_INSTANCES.lock();
-            if let Some(inst) = instances.get(epoll_id) {
-                for watch in inst.watches.iter().flatten() {
-                    if watch.fd == 0 && (watch.events & EPOLLIN) != 0 {
-                        return true;
-                    }
-                }
-            }
-            false
-        }
-    }
-}
-
-/// Check if a poll waiter is watching `sock` for POLLIN.
-/// Called while POLL_WAITERS is held.
-fn poll_waiter_watches_socket(
+/// Whether `waiter` asked for POLLIN on some fd `wanted` accepts.
+/// Called while POLL_WAITERS is held (the waiter is borrowed from it);
+/// POLL_WAITERS → EPOLL_INSTANCES is the allowed nesting.
+fn poll_waiter_watches(
     waiter: &PollWaiter,
-    sock: SocketId,
     phys_offset: u64,
+    wanted: &impl Fn(&PollWaiter, i32) -> bool,
 ) -> bool {
     match waiter.kind {
         PollWaiterKind::Poll { nfds } => {
             let base = (phys_offset + waiter.phys_buf) as *const PollFd;
-            for i in 0..nfds as usize {
+            (0..nfds as usize).any(|i| {
                 let pfd = unsafe { *base.add(i) };
-                if pfd.fd >= 0 && (pfd.fd as usize) < MAX_FILES_PER_PROC {
-                    if waiter.socks[pfd.fd as usize] == sock && (pfd.events & POLLIN) != 0 {
-                        return true;
-                    }
-                }
-            }
-            false
+                pfd.events & POLLIN != 0 && wanted(waiter, pfd.fd)
+            })
         }
         PollWaiterKind::EpollWait { epoll_id, .. } => {
-            // POLL_WAITERS → EPOLL_INSTANCES
             let instances = EPOLL_INSTANCES.lock();
-            if let Some(inst) = instances.get(epoll_id) {
-                for watch in inst.watches.iter().flatten() {
-                    if watch.fd >= 0 && (watch.fd as usize) < MAX_FILES_PER_PROC {
-                        if waiter.socks[watch.fd as usize] == sock
-                            && (watch.events & EPOLLIN) != 0
-                        {
-                            return true;
-                        }
-                    }
-                }
-            }
-            false
+            instances.get(epoll_id).is_some_and(|inst| {
+                inst.watches.iter().flatten()
+                    .any(|w| w.events & EPOLLIN != 0 && wanted(waiter, w.fd))
+            })
         }
     }
 }
 
+/// The fd's source in the waiter's snapshot (`Other` for an fd out of range).
+fn waiter_source(waiter: &PollWaiter, fd: i32) -> PollSource {
+    usize::try_from(fd).ok()
+        .and_then(|fd| waiter.socks.get(fd).copied())
+        .unwrap_or(PollSource::Other)
+}
+
 // ── Wakeup hooks ───────────────────────────────────────────────────────────
 
-/// Called by the keyboard ISR (after stdin_wakeup) with IF=0.
+/// How many waiters one wakeup can serve. More processes than this polling
+/// the same source at once leaves the rest for the next event — the
+/// scan used to stop at the first one, always.
+const MAX_WAKE_PER_EVENT: usize = 8;
+
+/// Wake every process blocked in poll/epoll_wait on an fd `wanted` accepts
+/// that now has something ready. Called with IF=0 (an ISR, or under
+/// `without_interrupts`); takes POLL_WAITERS, releases it, then takes the
+/// scheduler lock per wakeup — the documented order.
 ///
-/// Delivers POLLIN on fd=0 to any process blocked in poll/epoll_wait that
-/// is watching stdin.
+/// A waiter whose fds turn out *not* ready goes back untouched, so a real
+/// future event or its own timeout still wakes it. That matters: the PS/2
+/// keyboard ISR calls this on *every* raw scancode — key releases and
+/// modifier presses included, which push nothing into `KEYBOARD_BUFFER`
+/// (see `keyboard::process_scancode`) — and a process woken with a
+/// spurious "0 fds ready" reads it as a timeout (the confirmed cause of
+/// BusyBox ash's line editor exiting after ~2 keystrokes: `poll()`
+/// returning 0 is read as EOF by `libbb/read_key.c`).
 ///
-/// Unlike the serial ISR (which only calls this when `tty::feed_input` says
-/// a byte was really queued), the PS/2 keyboard ISR calls this on *every*
-/// raw scancode — including key-release codes and modifier presses, which
-/// push nothing into `KEYBOARD_BUFFER` (see `keyboard::process_scancode`).
-/// A real keypress is always followed by its release scancode shortly
-/// after; if that release lands while a process is already blocked in a
-/// *fresh* `poll()` call (e.g. waiting for the *next* keystroke), this must
-/// not wake it with a spurious "0 fds ready" — that's indistinguishable
-/// from a real timeout to the caller (confirmed root cause of BusyBox
-/// ash's line editor exiting after ~2 keystrokes: `poll()` returning 0 is
-/// read as EOF by `libbb/read_key.c`). So: only actually wake the process
-/// once `deliver_poll_result_phys` finds something genuinely ready; put an
-/// otherwise-untouched waiter back so a real future event or its own
-/// timeout still wakes it normally.
-pub(crate) fn poll_wakeup_for_fd0() {
+/// The same pid may meanwhile have been woken by its timeout and blocked in
+/// a *new* poll with a new waiter; putting the old one back must not
+/// replace that, hence `or_insert`.
+fn poll_wake_where(wanted: impl Fn(&PollWaiter, i32) -> bool) {
     let phys_offset = crate::memory::physical_memory_offset().as_u64();
 
-    // Take the waiter (if any) watching fd=0 for POLLIN.
-    let waiter = {
+    let mut taken: [Option<PollWaiter>; MAX_WAKE_PER_EVENT] = Default::default();
+    {
         let mut waiters = POLL_WAITERS.lock();
-        let found = waiters.iter()
-            .find(|(_, w)| poll_waiter_watches_stdin(w, phys_offset))
-            .map(|(&pid, _)| pid);
-        found.and_then(|pid| waiters.remove(&pid))
-    };
-
-    let Some(waiter) = waiter else { return; };
-
-    // Count first, claim second, write third: nothing may be written into
-    // a waiter's memory before its wait is won (a signal may have ended
-    // it), and a 0 count must leave the wait armed.
-    if deliver_poll_result_phys(&waiter, phys_offset, false) == 0 {
-        if waiter.cell.as_ref().is_some_and(|c| c.is_armed()) {
-            POLL_WAITERS.lock().insert(waiter.pid, waiter);
+        let mut pids = [0usize; MAX_WAKE_PER_EVENT];
+        let mut n = 0;
+        for (&pid, w) in waiters.iter() {
+            if n == MAX_WAKE_PER_EVENT { break; }
+            if poll_waiter_watches(w, phys_offset, &wanted) {
+                pids[n] = pid;
+                n += 1;
+            }
         }
-        return;
-    }
-    if !waiter.claim() {
-        return; // stale: a signal (or the timeout) ended that wait
-    }
-
-    // Cancel timeout timer (if any)
-    if let Some(tid) = waiter.timer_id {
-        crate::time::hrtimer::cancel(tid);
+        for (slot, pid) in taken.iter_mut().zip(&pids[..n]) {
+            *slot = waiters.remove(pid);
+        }
     }
 
-    let count = deliver_poll_result_phys(&waiter, phys_offset, true);
-    let mut sched = crate::process::scheduler::local_scheduler();
-    sched.wake_with_retval(waiter.pid, count as u64);
-    // sched guard dropped; caller (keyboard ISR) still holds IF=0
+    for waiter in taken.into_iter().flatten() {
+        // Count first, claim second, write third: nothing may be written
+        // into a waiter's memory before its wait is won (a signal may have
+        // ended it), and a 0 count must leave the wait armed.
+        if deliver_poll_result_phys(&waiter, phys_offset, false) == 0 {
+            if waiter.cell.as_ref().is_some_and(|c| c.is_armed()) {
+                POLL_WAITERS.lock().entry(waiter.pid).or_insert(waiter);
+            }
+            continue;
+        }
+        if !waiter.claim() {
+            continue; // stale: a signal (or the timeout) ended that wait
+        }
+        if let Some(tid) = waiter.timer_id {
+            crate::time::hrtimer::cancel(tid);
+        }
+        let count = deliver_poll_result_phys(&waiter, phys_offset, true);
+        let mut sched = crate::process::scheduler::local_scheduler();
+        sched.wake_with_retval(waiter.pid, count as u64);
+    }
+}
+
+/// Called by the keyboard ISR (after stdin_wakeup) with IF=0: POLLIN on
+/// fd=0 for any process polling stdin.
+pub(crate) fn poll_wakeup_for_fd0() {
+    poll_wake_where(|_, fd| fd == 0);
+}
+
+/// Called by an input producer after pushing to evdev queue `queue`
+/// (`drivers::evdev::QUEUE_*`): the keyboard ISR and the USB poll for the
+/// keyboard, the IRQ12 ISR and the USB poll for the mouse. IF=0.
+pub(crate) fn poll_wakeup_for_input(queue: usize) {
+    poll_wake_where(|w, fd| {
+        matches!(waiter_source(w, fd), PollSource::Input { queue: q, .. } if q == queue)
+    });
 }
 
 /// Called by the socket layer after a socket became readable (`SOCKETS`
@@ -493,36 +515,9 @@ pub(crate) fn poll_wakeup_for_socket(sock: SocketId) {
     // which can be reached from a socket's `Drop` inside `sys_exit`, where
     // re-enabling interrupts would let a timer tick free the kernel stack
     // this code is standing on. See `ipc/unix.rs::dispatch_wakes`.
-    x86_64::instructions::interrupts::without_interrupts(poll_wakeup_for_socket_inner_call(sock));
-}
-
-fn poll_wakeup_for_socket_inner_call(sock: SocketId) -> impl FnOnce() {
-    move || poll_wakeup_for_socket_inner(sock)
-}
-
-fn poll_wakeup_for_socket_inner(sock: SocketId) {
-    let phys_offset = crate::memory::physical_memory_offset().as_u64();
-
-    let waiter = {
-        let mut waiters = POLL_WAITERS.lock();
-        let found = waiters.iter()
-            .find(|(_, w)| poll_waiter_watches_socket(w, sock, phys_offset))
-            .map(|(&pid, _)| pid);
-        found.and_then(|pid| waiters.remove(&pid))
-    };
-
-    let Some(waiter) = waiter else { return; };
-    if !waiter.claim() {
-        return; // stale: a signal (or the timeout) ended that wait
-    }
-
-    if let Some(tid) = waiter.timer_id {
-        crate::time::hrtimer::cancel(tid);
-    }
-
-    let count = deliver_poll_result_phys(&waiter, phys_offset, true);
-    let mut sched = crate::process::scheduler::local_scheduler();
-    sched.wake_with_retval(waiter.pid, count as u64);
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        poll_wake_where(|w, fd| waiter_source(w, fd) == PollSource::Socket(sock))
+    });
 }
 
 /// Cancel a pending poll/epoll waiter for a process (called on exit).

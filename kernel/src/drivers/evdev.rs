@@ -12,6 +12,24 @@ pub const SYN_REPORT: u16 = 0;
 
 pub const RECORD_SIZE: usize = 24;
 
+/// `FileHandle::event_source` ids: the global queue behind each evdev
+/// device. `poll` matches a waiter's fds against these, and a producer
+/// names the one it just pushed to (`poll_wakeup_for_input`).
+pub const QUEUE_KEYBOARD: usize = 1;
+pub const QUEUE_MOUSE: usize = 2;
+
+/// Whether `queue` has anything a reader could take. Some of it may still
+/// decode to no record (an unmapped scancode, a mouse packet that changed
+/// nothing), so a `read` after a positive answer can return 0 — the same
+/// spurious-readiness `poll(2)` allows everywhere.
+pub fn queue_ready(queue: usize) -> bool {
+    match queue {
+        QUEUE_KEYBOARD => crate::keyboard_buffer::RAW_KEY_EVENTS.peek(),
+        QUEUE_MOUSE => crate::mouse::has_events(),
+        _ => false,
+    }
+}
+
 /// Wire-compatible with the real Linux `struct input_event` on x86_64:
 /// `struct timeval { long tv_sec; long tv_usec; }` (16 bytes) followed by
 /// `__u16 type; __u16 code; __s32 value;` — 24 bytes total, no padding.

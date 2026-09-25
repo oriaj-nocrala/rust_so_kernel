@@ -481,3 +481,45 @@ con 8,6 MB de pantalla mapeados y desmapeados. `sigsuspend_test` 6/6 (F:
 `fork_exec_test`, `socket_test` y `pthread_test` en 0, e
 `invariants=ok`. El anillo del log dio la vuelta, pero solo perdió el
 arranque: todas las líneas de resultados están.
+
+### Fase 2.2 (2026-09-25)
+
+Hecho como se planeó, con estas diferencias:
+
+- **Cómo sabe `poll` qué fd es de entrada: `FileHandle::event_source()`**
+  (`vfs`), la técnica de `socket_id()`. El despertador no llega a la
+  tabla de fds del proceso dormido, así que el handle publica dos cosas
+  que se copian al `PollWaiter`: qué cola global lo alimenta
+  (`drivers::evdev::QUEUE_KEYBOARD`/`QUEUE_MOUSE`) y si ya tiene
+  registros propios (el `SYN_REPORT` pendiente del teclado, el resto de
+  un paquete del ratón). El `SocketMap` de `poll.rs` pasa a ser un mapa
+  fd → `PollSource` (`Socket`, `Input`, `Other`).
+- **Un solo despertador, `poll_wake_where`**, para stdin, sockets y
+  entrada. Antes cada uno paraba en el primer proceso que encontraba; ahora
+  despierta hasta 8 por evento, y al devolver a la lista una espera que no
+  estaba lista usa `or_insert`, para no pisar una espera nueva del mismo
+  pid (el caso de un proceso que vence su timeout, y en otra CPU ya está
+  en otro `poll`).
+- **`POLLOUT` en un evdev siempre está listo**, como en `evdev_poll` de
+  Linux.
+- **El ratón USB se despierta desde `usb::poll`, no desde
+  `handle_hid_event`.** Ese código corre con `CONTROLLERS` tomado e IF=0,
+  a veces dentro de una transferencia de almacenamiento. El sondeo de
+  cada tick mira si la cola del ratón tiene algo y despierta ahí: como
+  mucho un tick (10 ms) de retraso.
+- **El test es un programa aparte, `input_poll_test`** (C, en el disco),
+  y no un caso de `poll_test`: el despertar necesita que el host mueva el
+  ratón o pulse teclas. Sin argumentos comprueba lo que no necesita
+  entrada: `poll`/`epoll_wait` con timeout 0 dan 0, un timeout de 150 ms
+  se duerme entero, `POLLOUT` está listo, `SIGUSR1` corta la espera con
+  `EINTR`. Con `wait [epoll]` espera hasta 10 s en `event0`+`event1` y
+  dice qué lo despertó y cuándo.
+
+**Verificado en QEMU con `-smp 4`:** `input_poll_test` PASS, 8 casos. Con
+`wait`, `poll` y `epoll`, ratón (`mouse-move`) y teclado (`key shift`),
+PS/2 y también USB (`QEMU_USB_KBD=1 QEMU_USB_MOUSE=1 QEMU_DEBUG_NO_PS2=1`).
+Los 8 despiertan a los ~2 s, que es el retraso con que el host manda el
+evento, y no a los 10 s del timeout. `poll_test`, `ipc_ping`,
+`socket_test`, `wait_intr_test`, `pipe_multi_test` y `sigsuspend_test`
+en 0, `invariants=ok`. `run-kernel-tests.sh` PASS, `boot-matrix.sh 4 4`
+(4 CPUs, 8 GiB) 16/16, `cd vfs && cargo test` 166/166.

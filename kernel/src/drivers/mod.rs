@@ -8,7 +8,7 @@
 // This replaces the hardcoded `match path` in sys_open.
 // Adding a new device driver = add a module + one line in DEVICES.
 
-mod evdev;
+pub(crate) mod evdev;
 pub mod dev_dsp;
 pub mod dev_fb0;
 pub mod dev_input_event;

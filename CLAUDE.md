@@ -238,7 +238,7 @@ Implemented syscalls (Linux-compatible numbers — see `SyscallNumber` enum for 
 | 2 | `open` | Open device/file by path |
 | 3 | `close` | Close fd |
 | 4/5/6 | `stat`/`fstat`/`lstat` | File metadata; `lstat` genuinely doesn't follow a symlink at the final path component (real symlink support, see below) |
-| 7 | `poll` | Wait for events on up to 16 fds |
+| 7 | `poll` | Wait for events on up to 16 fds. Real readiness for sockets, stdin and `/dev/input/event*` (`FileHandle::event_source`: the queue behind the handle, woken by its producers — keyboard ISR, IRQ12, the USB poll); every other device is always ready. `epoll_wait` shares it. `input_poll_test` |
 | 8 | `lseek` | Reposition file offset |
 | 9/11 | `mmap`/`munmap` | Private anonymous memory, or `MAP_SHARED` of a memfd / `MAP_SHARED\|MAP_ANONYMOUS` (see Shared memory above). A nonzero `addr` is taken as `MAP_FIXED`; `munmap` needs an exact VMA |
 | 77 | `ftruncate` | memfds only (`EINVAL` otherwise); shrinking a mapped object is `EBUSY` |
@@ -1130,7 +1130,7 @@ and `include_bytes!`'d from `kernel/embedded/`. Everything else runnable-
 but-not-boot-critical — `doom`, `quake`, and most of the old C test
 programs (`hello`, `pthread_test`, `producer_consumer`,
 `mlibc_signal_test`, `stat_test`, `argv_test`, `jobctl_test`,
-`ext2_robust_test`, `fpu_test`, `socket_test`, `pipe_cow_test`, `sigsuspend_test`, `lifecycle_test`, `shm_test`, `pipe_multi_test`, `fb0_test`, `wait_intr_test`) — is built straight to
+`ext2_robust_test`, `fpu_test`, `socket_test`, `pipe_cow_test`, `sigsuspend_test`, `lifecycle_test`, `shm_test`, `pipe_multi_test`, `fb0_test`, `wait_intr_test`, `input_poll_test`) — is built straight to
 `disk-image-root/bin/` instead and shipped on the ext2 disk image
 (`disk.img`, mounted at `/mnt`) rather than baked into the kernel ELF.
 This split exists because `kernel/embedded/`'s ELFs (mostly `doom.elf`/

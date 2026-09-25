@@ -89,7 +89,8 @@ static DECODER: IrqMutex<hal::mouse::PacketDecoder, KernelIrq> =
     IrqMutex::new(hal::mouse::PacketDecoder::new());
 
 /// Called from the IRQ12 ISR with each raw byte from the auxiliary device.
-pub fn process_byte(byte: u8) {
+/// True if the byte completed a packet and queued an event.
+pub fn process_byte(byte: u8) -> bool {
     // TSC uptime: calibrated long before IRQ12 is unmasked-and-live.
     let now = crate::cpu::tsc::uptime_ms();
     let (ev, resynced) = DECODER.with(|decoder| {
@@ -97,12 +98,14 @@ pub fn process_byte(byte: u8) {
         let ev = decoder.push_byte_at(byte, now);
         (ev, decoder.resyncs() != before)
     });
-    if let Some(ev) = ev {
-        push(ev);
-    }
     if resynced {
         RESYNCS.fetch_add(1, Ordering::Relaxed);
     }
+    if let Some(ev) = ev {
+        push(ev);
+        return true;
+    }
+    false
 }
 
 /// Partial packets the decoder discarded to get back into step (see
@@ -144,4 +147,9 @@ pub fn push_usb_event(ev: MouseEvent) {
 /// is empty.
 pub fn read_event() -> Option<MouseEvent> {
     MOUSE_EVENTS.with(|r| r.pop())
+}
+
+/// Non-consuming readiness check, for `poll` on `/dev/input/event1`.
+pub fn has_events() -> bool {
+    MOUSE_EVENTS.with(|r| !r.is_empty())
 }

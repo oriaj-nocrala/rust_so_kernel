@@ -19,7 +19,7 @@ use alloc::boxed::Box;
 use crate::fs::types::Stat;
 use crate::process::file::{FileHandle, FileResult};
 use crate::mouse::MouseEvent;
-use super::evdev::{InputEvent, EV_SYN, EV_KEY, EV_REL, SYN_REPORT, RECORD_SIZE};
+use super::evdev::{InputEvent, EV_SYN, EV_KEY, EV_REL, SYN_REPORT, RECORD_SIZE, QUEUE_MOUSE};
 
 const REL_X: u16 = 0x00;
 const REL_Y: u16 = 0x01;
@@ -115,6 +115,13 @@ impl FileHandle for MouseEventDevice {
 
     fn stat(&self) -> Option<Stat> {
         Some(Stat::chardev(0))
+    }
+
+    fn event_source(&self) -> Option<vfs::file::EventSource> {
+        Some(vfs::file::EventSource {
+            queue: QUEUE_MOUSE,
+            buffered: self.pending_pos < self.pending_len,
+        })
     }
 
     fn dup(&self) -> Option<Box<dyn FileHandle>> {

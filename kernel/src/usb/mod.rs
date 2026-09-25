@@ -251,6 +251,14 @@ pub fn poll() {
         }
     }
 
+    // A USB mouse report goes straight onto the mouse queue while the
+    // event ring is drained — here, or by a storage transfer, which cannot
+    // wake anyone under `CONTROLLERS` with IF=0. Either way its pollers are
+    // woken here, at the latest one tick later.
+    if crate::mouse::has_events() {
+        crate::process::syscall::poll_wakeup_for_input(crate::drivers::evdev::QUEUE_MOUSE);
+    }
+
     if count == 0 {
         return;
     }
@@ -265,6 +273,7 @@ pub fn poll() {
     // `init::devices::keyboard_interrupt_handler`.
     crate::process::syscall::stdin_wakeup();
     crate::process::syscall::poll_wakeup_for_fd0();
+    crate::process::syscall::poll_wakeup_for_input(crate::drivers::evdev::QUEUE_KEYBOARD);
 }
 
 /// The boot-time mass-storage device, if one was found.
