@@ -200,7 +200,10 @@ for i, m in enumerate(marks):
     end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
     boots.append((int(m.group(1)), m.group(2), text[m.start():end]))
 new = [b for b in boots if b[0] > prev]
-mine = [b for b in new if ("METAL-BEGIN " + nonce) in b[2]]
+# METAL-DONE carries the nonce too: a job chatty enough to wrap the kernel's
+# 64 KiB klog ring loses METAL-BEGIN but can still have finished.
+mine = [b for b in new
+        if ("METAL-BEGIN " + nonce) in b[2] or ("METAL-DONE " + nonce) in b[2]]
 detail = ""
 if mine:
     seq, reason, log = mine[-1]
@@ -208,6 +211,8 @@ if mine:
     if done:
         verdict = "OK" if done.group(1) == "exit=0" else "FAIL"
         detail = done.group(1)
+        if ("METAL-BEGIN " + nonce) not in log:
+            detail += " [log wrapped: the job's start and early output are lost]"
     elif reason == "PANIC" or "KERNEL PANIC" in log:
         verdict = "PANIC"
     else:
@@ -266,7 +271,11 @@ cmd_collect() {
         # Only what user programs wrote to the console ([fb] lines); the
         # kernel's own traces stay in boot.log.
         echo "---- job output (console only; kernel traces in boot.log) ----"
-        sed -n "/METAL-BEGIN $nonce/,\$p" "$run/boot.log" | grep -a '^\[fb\] ' | sed 's/^\[fb\] //' | tail -40
+        if grep -aq "METAL-BEGIN $nonce" "$run/boot.log"; then
+            sed -n "/METAL-BEGIN $nonce/,\$p" "$run/boot.log"
+        else
+            cat "$run/boot.log"   # wrapped: the start is gone, show what is left
+        fi | grep -a '^\[fb\] ' | sed 's/^\[fb\] //' | tail -40
     fi
     [[ "$verdict" == OK* ]]
 }
