@@ -96,6 +96,9 @@ impl Drop for TrackedSchedulerGuard {
 
 const IA32_FS_BASE: u32 = 0xC000_0100;
 
+/// `shell` (`init::processes`), which adopts orphans — see `reparent_children`.
+const INIT_PID: usize = 1;
+
 #[inline(always)]
 pub(crate) fn read_fs_base() -> u64 {
     let lo: u32;
@@ -669,6 +672,7 @@ impl Scheduler {
         if let Some(mut proc) = self.running[me].take() {
             assert!(proc.pid.0 != 0, "kill_current on an idle process");
             note_leaving(&proc);
+            self.reparent_children(proc.pid);
             crate::serial_println!(
                 "💀 Killed PID {} ({}): {}",
                 proc.pid.0,
@@ -996,7 +1000,61 @@ impl Scheduler {
             }
         }
         if let Some(pid) = waker_pid {
+            // The parent's `waitpid` returns this child's pid without running
+            // again, so it is reaped here — as the zombie branch of
+            // `sys_waitpid` would have. Left in the queue, it stayed a zombie
+            // until some later `waitpid` happened to find it, reporting the
+            // same pid twice; PID 1 never looked again, so `busybox
+            // --install`'s zombie lived for the whole uptime.
+            self.reap_zombie(dead_pid);
             self.wake(pid);
+        }
+    }
+
+    /// Remove zombie `pid` from the wait queue and free it. Its kernel stack
+    /// goes through `pending_stack_frees`: its `sys_exit` may still be
+    /// unwinding on it on another CPU. Its address space is in no CR3 —
+    /// every CPU switches away from a dying process under this lock.
+    pub fn reap_zombie(&mut self, pid: usize) -> bool {
+        let Some(pos) = self.core.wait_queue().iter()
+            .position(|p| p.pid.0 == pid && matches!(p.state, ProcessState::Zombie))
+        else {
+            return false;
+        };
+        let proc = self.core.wait_queue_mut().remove(pos).unwrap();
+        self.defer_stack_free(proc.kernel_stack);
+        crate::debug::inc_reaps();
+        true
+    }
+
+    /// Hand every child of `dead` to PID 1, as Linux does with orphans, and
+    /// tell PID 1 about the ones already dead (SIGCHLD, and a wakeup if it
+    /// is blocked in a `waitpid` they match). Without this a process that
+    /// forked and exited without reaping left its children's zombies — and
+    /// their kernel stacks — in the wait queue forever, since `waitpid`
+    /// only ever matches on `parent_pid`. Threads are skipped: they are
+    /// never waited for (`kill_current` frees them at once).
+    fn reparent_children(&mut self, dead: Pid) {
+        if dead.0 == INIT_PID {
+            return;
+        }
+        let mut zombies: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        let mut adopt = |p: &mut Process| {
+            if p.parent_pid == Some(dead) && !p.is_thread {
+                p.parent_pid = Some(Pid(INIT_PID));
+                if matches!(p.state, ProcessState::Zombie) {
+                    zombies.push(p.pid.0);
+                }
+            }
+        };
+        for p in self.running.iter_mut().filter_map(|r| r.as_deref_mut()) {
+            adopt(p);
+        }
+        for p in self.core.iter_queued_mut() {
+            adopt(p);
+        }
+        for z in zombies {
+            self.notify_child_death(z, Some(Pid(INIT_PID)));
         }
     }
 

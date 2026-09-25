@@ -553,6 +553,19 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
                 let comm_at = resolved_path.rfind('/').map_or(0, |i| i + 1);
                 proc.set_name(&resolved_path[comm_at..]);
                 proc.exe_name = resolved_path;
+                // POSIX `execve`: a caught signal goes back to SIG_DFL (its
+                // handler's address means nothing in the new image), an
+                // ignored one stays ignored, and the mask and pending set
+                // carry over. Keeping the handlers ran the old image's code
+                // at that address in the new one: ash's `sh -c 'true &
+                // sleep 1'` execs `sleep` in place, `true`'s SIGCHLD then
+                // jumped into ash's handler inside `sleep`, before ash's
+                // globals existed — SIGSEGV writing to 0x45, every time.
+                for action in proc.signal_handlers.iter_mut() {
+                    if let crate::process::SignalAction::Handler(_) = action {
+                        *action = crate::process::SignalAction::Default;
+                    }
+                }
                 crate::ktrace!(crate::debug::SCHED, "exec: dropping old AS");
                 // Replace address space with freshly loaded one. This drops
                 // this Process's Arc reference to whatever it had before —

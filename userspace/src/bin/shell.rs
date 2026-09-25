@@ -150,6 +150,19 @@ const ENVP: [&[u8]; 3] = [
     b"TERM=linux\0",
 ];
 
+/// Wait for `pid`, reaping every other child on the way: the kernel hands
+/// PID 1 the children of any process that exits without reaping them
+/// (`Scheduler::reparent_children`), and a zombie nobody waits for keeps
+/// its kernel stack forever.
+fn wait_reaping_orphans(pid: i64) {
+    loop {
+        let r = syscall::waitpid(-1);
+        if r == pid || r < 0 {
+            return;
+        }
+    }
+}
+
 #[no_mangle]
 extern "C" fn _start() -> ! {
     install_busybox_symlinks();
@@ -164,7 +177,7 @@ extern "C" fn _start() -> ! {
             println!("init: exec /bin/busybox failed");
             syscall::exit(1);
         } else if pid > 0 {
-            syscall::waitpid(pid);
+            wait_reaping_orphans(pid);
             println!("init: ash exited, respawning");
         } else {
             println!("init: fork failed ({}), retrying", pid);
