@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "draw"
+version = "0.1.0"
+
+[[package]]
 name = "gui"
 version = "0.1.0"
 
@@ -16,6 +20,7 @@ checksum = "f102c477fd4ec864c149803bf606ecc23bc9329602ec0f99073a728abf454abc"
 name = "userspace"
 version = "0.1.0"
 dependencies = [
+ "draw",
  "gui",
  "vt",
 ]

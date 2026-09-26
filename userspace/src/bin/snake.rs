@@ -1,7 +1,8 @@
 //! Snake, drawn in 32-bit colour: a neon tube that glides between cells,
 //! a glowing orb for food, particle bursts, and a pixel-font HUD.
 //!
-//! A 320x200 frame through `userspace::gfx` — a window under the
+//! A 320x200 frame drawn with the `draw` crate and shown through
+//! `userspace::gfx` — a window under the
 //! compositor, the whole screen (`FBIO_BLIT`) on the console. The game
 //! logic steps on a grid every `tick` ms (faster as the score grows); the
 //! picture is drawn at up to 60 fps with every segment interpolated
@@ -19,6 +20,9 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use draw::color::{add, hsv, mix, scale};
+use draw::font::digits;
+use draw::{wave, Canvas, Font, FONT_3X5, FONT_5X7, FP};
 use userspace::args::Args;
 use userspace::gfx::{Gfx, EV_KEY};
 use userspace::{entry, println, syscall};
@@ -33,8 +37,6 @@ const CELL: i32 = 10;
 const GW: i32 = 32;
 const GH: i32 = 18;
 const HUD: i32 = 20;
-/// Fixed point: 1/256 of a pixel.
-const FP: i32 = 256;
 
 const KEY_ESC: u16 = 1;
 const KEY_Q: u16 = 16;
@@ -53,296 +55,25 @@ const KEY_DOWN: u16 = 108;
 const FOOD: u32 = 0xFF3D7F;
 const BEST_FILE: &str = "/tmp/.snake_best";
 
-// ── Colour ───────────────────────────────────────────────────────────────
+// ── Text ─────────────────────────────────────────────────────────────────
 
-fn rgb(r: i32, g: i32, b: i32) -> u32 {
-    (r.clamp(0, 255) as u32) << 16 | (g.clamp(0, 255) as u32) << 8 | b.clamp(0, 255) as u32
+/// Scale 1 is the 3x5 font, anything larger the 5x7 one.
+fn font_for(sc: i32) -> Font {
+    if sc == 1 { FONT_3X5 } else { FONT_5X7 }
 }
 
-fn parts(c: u32) -> (i32, i32, i32) {
-    ((c >> 16 & 0xFF) as i32, (c >> 8 & 0xFF) as i32, (c & 0xFF) as i32)
-}
-
-/// `c` scaled by `k`/256.
-fn scale(c: u32, k: i32) -> u32 {
-    let (r, g, b) = parts(c);
-    rgb(r * k >> 8, g * k >> 8, b * k >> 8)
-}
-
-/// `a` → `b` by `t`/256.
-fn mix(a: u32, b: u32, t: i32) -> u32 {
-    let (ar, ag, ab) = parts(a);
-    let (br, bg, bb) = parts(b);
-    rgb(ar + ((br - ar) * t >> 8), ag + ((bg - ag) * t >> 8), ab + ((bb - ab) * t >> 8))
-}
-
-fn add(a: u32, b: u32) -> u32 {
-    let (ar, ag, ab) = parts(a);
-    let (br, bg, bb) = parts(b);
-    rgb(ar + br, ag + bg, ab + bb)
-}
-
-/// Hue 0..1536 (six 256-wide sextants), saturation and value 0..255.
-fn hsv(h: i32, s: i32, v: i32) -> u32 {
-    let h = h.rem_euclid(1536);
-    let f = h & 255;
-    let p = v * (255 - s) / 255;
-    let q = v * (255 - s * f / 255) / 255;
-    let t = v * (255 - s * (255 - f) / 255) / 255;
-    match h >> 8 {
-        0 => rgb(v, t, p),
-        1 => rgb(q, v, p),
-        2 => rgb(p, v, t),
-        3 => rgb(p, q, v),
-        4 => rgb(t, p, v),
-        _ => rgb(v, p, q),
-    }
-}
-
-/// A sine-shaped wave in -256..=256 with period `period` ms (parabolic
-/// approximation — no libm here).
-fn wave(t: i64, period: i64) -> i32 {
-    let p = (t.rem_euclid(period) * 1024 / period) as i32;
-    let (sign, q) = if p < 512 { (1, p) } else { (-1, p - 512) };
-    sign * q * (512 - q) / 256
-}
-
-// ── Canvas ───────────────────────────────────────────────────────────────
-
-struct Canvas {
-    px: Vec<u32>,
-}
-
-impl Canvas {
-    fn put(&mut self, x: i32, y: i32, c: u32) {
-        if x >= 0 && y >= 0 && (x as usize) < W && (y as usize) < H {
-            self.px[y as usize * W + x as usize] = c;
-        }
-    }
-
-    fn get(&self, x: i32, y: i32) -> u32 {
-        self.px[y as usize * W + x as usize]
-    }
-
-    fn add_px(&mut self, x: i32, y: i32, c: u32) {
-        if x >= 0 && y >= 0 && (x as usize) < W && (y as usize) < H {
-            let i = y as usize * W + x as usize;
-            self.px[i] = add(self.px[i], c);
-        }
-    }
-
-    fn rect(&mut self, x: i32, y: i32, w: i32, h: i32, c: u32) {
-        for yy in y.max(0)..(y + h).min(H as i32) {
-            for xx in x.max(0)..(x + w).min(W as i32) {
-                self.px[yy as usize * W + xx as usize] = c;
-            }
-        }
-    }
-
-    /// An antialiased disc at a fixed-point centre. With `shade`, darker
-    /// towards the rim and lit from the top left, so a row of them reads
-    /// as a tube.
-    fn disc(&mut self, cx: i32, cy: i32, r: i32, c: u32, shade: bool) {
-        let x0 = ((cx - r) / FP - 1).max(0);
-        let x1 = ((cx + r) / FP + 1).min(W as i32 - 1);
-        let y0 = ((cy - r) / FP - 1).max(0);
-        let y1 = ((cy + r) / FP + 1).min(H as i32 - 1);
-        let r2 = r as i64 * r as i64;
-        for y in y0..=y1 {
-            let dy = (y * FP + FP / 2 - cy) as i64;
-            for x in x0..=x1 {
-                let dx = (x * FP + FP / 2 - cx) as i64;
-                let d2 = dx * dx + dy * dy;
-                if d2 >= r2 {
-                    continue;
-                }
-                // r - d ≈ (r² - d²) / 2r: coverage of the rim pixel.
-                let cov = ((r2 - d2) / (2 * r as i64)).min(FP as i64) as i32;
-                let mut col = c;
-                if shade {
-                    let rim = (d2 * 110 / r2) as i32;
-                    let light = ((-dx - dy) * 60 / (2 * r as i64)) as i32;
-                    col = scale(c, 256 - rim + light.max(0));
-                }
-                let i = y as usize * W + x as usize;
-                self.px[i] = if cov >= FP { col } else { mix(self.px[i], col, cov) };
-            }
-        }
-    }
-
-    /// Additive light with a quadratic falloff out to `r`.
-    fn glow(&mut self, cx: i32, cy: i32, r: i32, c: u32, strength: i32) {
-        let x0 = ((cx - r) / FP).max(0);
-        let x1 = ((cx + r) / FP).min(W as i32 - 1);
-        let y0 = ((cy - r) / FP).max(0);
-        let y1 = ((cy + r) / FP).min(H as i32 - 1);
-        let r2 = r as i64 * r as i64;
-        for y in y0..=y1 {
-            let dy = (y * FP + FP / 2 - cy) as i64;
-            for x in x0..=x1 {
-                let dx = (x * FP + FP / 2 - cx) as i64;
-                let d2 = dx * dx + dy * dy;
-                if d2 >= r2 {
-                    continue;
-                }
-                let f = ((r2 - d2) * 256 / r2) as i32;
-                let k = f * f / 256 * strength / 256;
-                let i = y as usize * W + x as usize;
-                self.px[i] = add(self.px[i], scale(c, k));
-            }
-        }
-    }
-
-    fn dim(&mut self, k: i32) {
-        for p in self.px.iter_mut() {
-            *p = scale(*p, k);
-        }
-    }
-}
-
-// ── Pixel font (3x5) ─────────────────────────────────────────────────────
-
-/// The 3x5 font, for small print.
-fn glyph(ch: u8) -> [u8; 5] {
-    match ch {
-        b'0' => [7, 5, 5, 5, 7],
-        b'1' => [2, 6, 2, 2, 7],
-        b'2' => [7, 1, 7, 4, 7],
-        b'3' => [7, 1, 7, 1, 7],
-        b'4' => [5, 5, 7, 1, 1],
-        b'5' => [7, 4, 7, 1, 7],
-        b'6' => [7, 4, 7, 5, 7],
-        b'7' => [7, 1, 2, 2, 2],
-        b'8' => [7, 5, 7, 5, 7],
-        b'9' => [7, 5, 7, 1, 7],
-        b'A' => [2, 5, 7, 5, 5],
-        b'B' => [6, 5, 6, 5, 6],
-        b'C' => [3, 4, 4, 4, 3],
-        b'D' => [6, 5, 5, 5, 6],
-        b'E' => [7, 4, 6, 4, 7],
-        b'F' => [7, 4, 6, 4, 4],
-        b'G' => [3, 4, 5, 5, 3],
-        b'H' => [5, 5, 7, 5, 5],
-        b'I' => [7, 2, 2, 2, 7],
-        b'J' => [1, 1, 1, 5, 2],
-        b'K' => [5, 5, 6, 5, 5],
-        b'L' => [4, 4, 4, 4, 7],
-        b'M' => [5, 7, 7, 5, 5],
-        b'N' => [6, 5, 5, 5, 5],
-        b'O' => [2, 5, 5, 5, 2],
-        b'P' => [6, 5, 6, 4, 4],
-        b'Q' => [2, 5, 5, 6, 3],
-        b'R' => [6, 5, 6, 5, 5],
-        b'S' => [3, 4, 2, 1, 6],
-        b'T' => [7, 2, 2, 2, 2],
-        b'U' => [5, 5, 5, 5, 7],
-        b'V' => [5, 5, 5, 5, 2],
-        b'W' => [5, 5, 7, 7, 5],
-        b'X' => [5, 5, 2, 5, 5],
-        b'Y' => [5, 5, 2, 2, 2],
-        b'Z' => [7, 1, 2, 4, 7],
-        b':' => [0, 2, 0, 2, 0],
-        b'!' => [2, 2, 2, 0, 2],
-        b'-' => [0, 0, 7, 0, 0],
-        b'/' => [1, 1, 2, 4, 4],
-        _ => [0; 5],
-    }
-}
-
-/// The 5x7 font, for everything drawn at scale 2 and up.
-fn glyph7(ch: u8) -> [u8; 7] {
-    match ch {
-        b'0' => [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
-        b'1' => [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
-        b'2' => [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F],
-        b'3' => [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E],
-        b'4' => [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
-        b'5' => [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
-        b'6' => [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
-        b'7' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
-        b'8' => [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
-        b'9' => [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
-        b'A' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
-        b'B' => [0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E],
-        b'C' => [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E],
-        b'D' => [0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E],
-        b'E' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F],
-        b'F' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10],
-        b'G' => [0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F],
-        b'H' => [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
-        b'I' => [0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E],
-        b'J' => [0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C],
-        b'K' => [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11],
-        b'L' => [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F],
-        b'M' => [0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11],
-        b'N' => [0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11],
-        b'O' => [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
-        b'P' => [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10],
-        b'Q' => [0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D],
-        b'R' => [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11],
-        b'S' => [0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E],
-        b'T' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
-        b'U' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
-        b'V' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04],
-        b'W' => [0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A],
-        b'X' => [0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11],
-        b'Y' => [0x11, 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04],
-        b'Z' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F],
-        b'!' => [0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04],
-        b':' => [0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00],
-        b'-' => [0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00],
-        b'/' => [0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10],
-        _ => [0; 7],
-    }
-}
-
-/// Scale 1 is the 3x5 font; anything larger, the 5x7 one.
 fn text_width(s: &[u8], sc: i32) -> i32 {
-    if sc == 1 { s.len() as i32 * 4 - 1 } else { (s.len() as i32 * 6 - 1) * sc }
+    font_for(sc).width(s, sc)
 }
 
 /// Text with a drop shadow; `color` picks each glyph's colour by index.
 fn text(cv: &mut Canvas, x: i32, y: i32, sc: i32, s: &[u8], color: impl Fn(usize) -> u32) {
-    let (cols, adv) = if sc == 1 { (3, 4) } else { (5, 6) };
-    for (i, &ch) in s.iter().enumerate() {
-        let rows: [u8; 7] = if sc == 1 {
-            let g = glyph(ch);
-            [g[0], g[1], g[2], g[3], g[4], 0, 0]
-        } else {
-            glyph7(ch)
-        };
-        let gx = x + i as i32 * adv * sc;
-        let c = color(i);
-        for (row, bits) in rows.iter().enumerate() {
-            for col in 0..cols {
-                if bits & (1 << (cols - 1 - col)) != 0 {
-                    let px = gx + col * sc;
-                    let py = y + row as i32 * sc;
-                    cv.rect(px + sc.max(2) / 2, py + sc.max(2) / 2, sc, sc, 0x05050A);
-                    cv.rect(px, py, sc, sc, c);
-                }
-            }
-        }
-    }
+    cv.text_shadowed(font_for(sc), x, y, sc, s, 0x05050A, color);
 }
 
 fn text_center(cv: &mut Canvas, y: i32, sc: i32, s: &[u8], c: u32) {
-    text(cv, (W as i32 - text_width(s, sc)) / 2, y, sc, s, |_| c);
-}
-
-/// Decimal digits of `n` into `buf`.
-fn digits(n: u32, buf: &mut [u8; 10]) -> &[u8] {
-    let mut i = buf.len();
-    let mut v = n;
-    loop {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        if v == 0 {
-            break;
-        }
-    }
-    &buf[i..]
+    let x = cv.center_x(font_for(sc), s, sc);
+    text(cv, x, y, sc, s, |_| c);
 }
 
 // ── Randomness and particles ─────────────────────────────────────────────
@@ -743,7 +474,7 @@ fn main(args: Args) -> i32 {
     let (_, nsec) = syscall::clock_gettime();
     let mut rng = Rng((syscall::uptime_ms() as u32 ^ nsec as u32) | 1);
     let bg = backdrop();
-    let mut cv = Canvas { px: vec![0; W * H] };
+    let mut frame = vec![0u32; W * H];
     let mut shaken = vec![0u32; W * H];
     let mut parts = Particles(Vec::new());
     let mut g = Game::new(load_best());
@@ -824,7 +555,8 @@ fn main(args: Args) -> i32 {
         }
 
         // Picture.
-        cv.px.copy_from_slice(&bg);
+        let mut cv = Canvas::new(&mut frame, W, H, W);
+        cv.blit(&bg, W, H, 0, 0);
         match g.state {
             State::Title => draw_title(&mut cv, &g, now),
             State::Play | State::Paused => {
@@ -870,20 +602,16 @@ fn main(args: Args) -> i32 {
             _ => parts.draw(&mut cv),
         }
 
-        let frame: &[u32] = if g.shake > 0 {
+        let shown: &[u32] = if g.shake > 0 {
             let (sx, sy) = (rng.range(-g.shake, g.shake + 1), rng.range(-g.shake, g.shake + 1));
-            for y in 0..H as i32 {
-                for x in 0..W as i32 {
-                    let (ox, oy) = (x - sx, y - sy);
-                    shaken[y as usize * W + x as usize] =
-                        if ox >= 0 && oy >= 0 && ox < W as i32 && oy < H as i32 { cv.get(ox, oy) } else { 0 };
-                }
-            }
+            let mut out = Canvas::new(&mut shaken, W, H, W);
+            out.fill(0);
+            out.blit(&frame, W, H, sx, sy);
             &shaken
         } else {
-            &cv.px
+            &frame
         };
-        gfx.present(frame);
+        gfx.present(shown);
 
         // At most ~60 fps (in a window, present already waits for the
         // compositor).

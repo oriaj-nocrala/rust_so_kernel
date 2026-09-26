@@ -14,6 +14,9 @@ path = "src/lib.rs"
 gui = { path = "../gui" }
 # The terminal emulator behind `term` (phase 3.4/3.5 of docs/gui/gui-plan.md).
 vt = { path = "../vt" }
+# Software 2D drawing (canvas, primitives, pixel fonts) for graphical
+# programs; `userspace::gfx` puts the result on screen.
+draw = { path = "../draw" }
 
 [profile.release]
 panic = "abort"

@@ -513,6 +513,9 @@ fn build_kernel() -> PathBuf {
     // `vt` is `term`'s emulator (phase 3.4/3.5), a path dependency of
     // `userspace` exactly like `gui`.
     watch_dir_recursive(&manifest_dir.join("vt/src"));
+    // `draw` (2D drawing for graphical programs), a path dependency of
+    // `userspace` like `gui` and `vt`.
+    watch_dir_recursive(&manifest_dir.join("draw/src"));
     watch_dir_recursive(&manifest_dir.join("mlibc-port"));
     watch_dir_recursive(&manifest_dir.join("doom-port"));
     watch_dir_recursive(&manifest_dir.join("quake-port"));

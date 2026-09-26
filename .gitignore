@@ -15,6 +15,7 @@
 /gui/target/
 /tty/target/
 /vt/target/
+/draw/target/
 /qemu-test-runner/target/
 
 # Claude Code local state. `.claude/skills/` IS tracked (project tooling,
