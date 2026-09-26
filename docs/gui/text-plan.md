@@ -1,8 +1,8 @@
 # Plan: texto de verdad en las ventanas (`parley` + `swash`)
 
-> **Estado (2026-09-26):** planificado, con las librerías elegidas y probadas
-> en constanos. Fase 0 hecha (`d472a3e`: el userspace de Rust tiene SSE2).
-> Nada más empezado.
+> **Estado (2026-09-26):** fase 0 hecha (`d472a3e`: el userspace de Rust
+> tiene SSE2). Fase 1 hecha: crate `text/` con 18 tests en el host contra
+> las fuentes reales, y `scripts/fetch-fonts.sh`. Siguiente: fase 2.
 
 ## Por qué, y por qué antes que la librería GUI
 
@@ -194,3 +194,20 @@ syscalls: recibe los bytes de las fuentes y un `&mut [u32]`.
   `cosmic-text` compiladas para el target del userspace y ejecutadas en
   constanos (tabla de arriba). El plan anterior (rasterizador y layout
   propios sobre `ttf-parser`) quedó descartado.
+- **2026-09-26 — fase 1:** crate `text/` (`Fonts`, `Style`, `TextLayout`,
+  `GlyphCache`; `cache::ClockCache` genérica y testeada aparte) y
+  `scripts/fetch-fonts.sh` (Noto Sans v2.015 y Noto Sans Mono v2.014 de
+  notofonts/latin-greek-cyrillic, las `unhinted`, zip verificado por
+  sha256; 1,6 MB). `cd text && cargo test`: 6 unitarios + 12 contra las
+  fuentes, todos los del plan. Cada uno probado por sabotaje: quitar
+  `OverflowWrap::Anywhere`, medir con los espacios finales, una clave de
+  caché sin la fase subpíxel, una caché sin desalojo, la máscara desplazada
+  3 px y la negrita ignorada hacen fallar al menos un test cada uno.
+  Medido de paso: el GPOS de Noto acerca `AV` 1,6 px, `To` 2,8 y `Va` 0,8
+  a 40 px. Decisiones: posiciones horizontales a **cuarto de píxel** (4
+  máscaras por glifo y tamaño como mucho), verticales enteras (`parley`
+  cuantiza la línea base); una palabra más larga que la línea se corta
+  dentro (`OverflowWrap::Anywhere`); los espacios seguidos se conservan;
+  `ScaleContext::builder_with_id` con `Blob::id()` para que `swash` no
+  reanalice la fuente en cada ejecución. Compila `no_std` para
+  `x86_64-constanos.json`; en el userspace entra en la fase 2.

@@ -16,6 +16,7 @@
 /tty/target/
 /vt/target/
 /draw/target/
+/text/target/
 /qemu-test-runner/target/
 
 # Claude Code local state. `.claude/skills/` IS tracked (project tooling,
@@ -55,6 +56,10 @@
 # build artifact too, same rationale as freedoom1.wad above.
 /build-terminfo-host/
 /disk-image-root/usr/share/terminfo/
+
+# Noto fonts (~1.6 MB, fetched by scripts/fetch-fonts.sh, sha256-pinned) —
+# external data like freedoom1.wad; the `text` crate's tests read them here.
+/disk-image-root/usr/share/fonts/
 
 # Cross-compiled libtinfo/libncurses (scripts/build-libtinfo.sh) + the
 # generated cmatrix config.h (scripts/write-cmatrix-config.sh) — build

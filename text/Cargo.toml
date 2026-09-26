@@ -1,0 +1,22 @@
+[package]
+name = "text"
+version = "0.1.0"
+edition = "2021"
+
+# Proportional, any-size, antialiased text for userspace programs
+# (docs/gui/text-plan.md): a thin layer over `parley` (shaping, line
+# breaking, bidi) and `swash` (rasterisation), with our own glyph cache and
+# compositing onto a `draw::Canvas`. no_std + alloc, no syscalls: it gets
+# the fonts' bytes and a pixel buffer — `cd text && cargo test` (needs
+# `scripts/fetch-fonts.sh` once). Its own workspace root (empty table
+# below), like `draw`/`gui`/`vt`: the parent workspace's `panic = "abort"`
+# would break the test harness. `userspace` depends on it by path.
+[workspace]
+
+[dependencies]
+draw = { path = "../draw" }
+# Without default features neither looks for system fonts (`system` needs
+# std); `libm` supplies the float maths `core` lacks. Both share one
+# `skrifa`, so together they are smaller than the sum.
+parley = { version = "0.11", default-features = false, features = ["libm"] }
+swash = { version = "0.2", default-features = false, features = ["scale", "render", "libm"] }
