@@ -400,7 +400,7 @@ pub fn render_report() -> alloc::string::String {
         crate::interrupts::apic::render(),
         crate::process::timer_preempt::ticks_total(),
         crate::cpu::tsc::uptime_ms(),
-        alloc::format!("{}\n{}\n{}\n{}\n{}", crate::cpu::percpu::render(), crate::smp::render(), crate::cpu::render_init(), crate::memory::tlb::render(), crate::process::scheduler::render().trim_end()),
+        alloc::format!("{}\n{}\n{}\n{}\n{}\n{}", crate::cpu::percpu::render(), crate::smp::render(), crate::cpu::render_init(), crate::memory::tlb::render(), crate::process::scheduler::render().trim_end(), crate::cpu::idle::render()),
         alloc::format!(
             "{}\n{}",
             match crate::fs::ext2::cache_stats() {

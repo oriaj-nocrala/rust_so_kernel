@@ -32,6 +32,7 @@ static void usage(void) {
     printf("       kdebug sync               copy the kernel log to the USB stick\n");
     printf("       kdebug panic              panic the kernel on purpose (tests the panic path)\n");
     printf("       kdebug tlbtest            TLB-shootdown self-test against every AP\n");
+    printf("       kdebug idle <hlt|c2>      how idle CPUs wait (see idle: in /proc/kdebug)\n");
 }
 
 // The stage-5 TLB-shootdown self-test (kernel/src/tlb_selftest.rs). The
@@ -78,6 +79,21 @@ int main(int argc, char **argv) {
         raw_syscall(SYS_KDEBUG_CTL, 2, 0, 0);
         printf("kdebug: still alive?\n");
         return 1;
+    }
+
+    if (argc == 3 && strcmp(argv[1], "idle") == 0) {
+        int c2 = strcmp(argv[2], "c2") == 0;
+        if (!c2 && strcmp(argv[2], "hlt") != 0) {
+            usage();
+            return 1;
+        }
+        long r = raw_syscall(SYS_KDEBUG_CTL, 4, 0, c2);
+        if (r < 0) {
+            printf("kdebug: idle %s: not available here\n", argv[2]);
+            return 1;
+        }
+        printf("kdebug: idle -> %s\n", argv[2]);
+        return 0;
     }
 
     if (argc != 3) {

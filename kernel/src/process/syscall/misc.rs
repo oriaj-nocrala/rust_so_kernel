@@ -85,6 +85,11 @@ pub(super) fn sys_kdebug_ctl(cmd: u64, name_ptr: u64, enable: u64) -> SyscallRes
                 errno::ETIMEDOUT
             }
         },
+        // The idle wait: `enable` 0 = `hlt`, 1 = C2 (`cpu::idle`); ENODEV
+        // if this machine has no C2 port. `kdebug idle hlt|c2`.
+        4 => {
+            if crate::cpu::idle::set_c2(enable != 0) { 0 } else { errno::ENODEV }
+        }
         _ => errno::EINVAL,
     }
 }

@@ -133,6 +133,7 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     crate::cpu::tsc::init();
     crate::cpu::freq::init();
     crate::cpu::temp::init();
+    crate::cpu::idle::init();
     serial_println!("TSC: {} MHz", crate::cpu::tsc::freq_hz() / 1_000_000);
 
     // ── LAPIC + I/O APIC ───────────────────────────────────────────

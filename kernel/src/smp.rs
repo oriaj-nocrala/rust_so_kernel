@@ -236,7 +236,7 @@ pub fn scheduling_cpus() -> impl Iterator<Item = usize> {
 }
 
 /// One pass of an idle process's loop: run what `run_on` left in this CPU's
-/// mailbox, else `hlt` until the next interrupt. Entered and left with IF=1.
+/// mailbox, else wait for the next interrupt (`cpu::idle::wait`). Entered and left with IF=1.
 pub fn idle_once() {
     let cpu = crate::cpu::cpu_id();
     x86_64::instructions::interrupts::disable();
@@ -249,9 +249,9 @@ pub fn idle_once() {
         MAILBOX[cpu].store(0, Ordering::Release);
         return;
     }
-    // SAFETY: `sti; hlt` as one sequence: a `WAKE_VECTOR` sent after the
-    // check above is still pending at the `hlt` and wakes it.
-    unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)) };
+    // `hlt` or C2 (`cpu::idle`); either returns at once for a
+    // `WAKE_VECTOR` sent after the check above, still pending.
+    crate::cpu::idle::wait();
 }
 
 /// Each AP's stack; they are never freed (an inert AP lives on it forever).

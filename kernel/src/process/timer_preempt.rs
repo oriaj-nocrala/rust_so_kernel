@@ -196,6 +196,8 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> Resume 
 
     // Per-CPU work: this CPU's APERF/MPERF (`cpu/freq.rs`), two rdmsrs.
     crate::cpu::freq::tick();
+    // Per-CPU C0 residency; package energy on CPU 0 (`cpu/idle.rs`).
+    crate::cpu::idle::tick();
 
     // ── 2. Global work: CPU 0 only ────────────────────────────────────
     // Every CPU that schedules gets this tick (stage 7 of

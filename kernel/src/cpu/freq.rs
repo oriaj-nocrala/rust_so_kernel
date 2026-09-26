@@ -18,7 +18,7 @@ use hal::cpufreq::{self, Window};
 use super::MAX_CPUS;
 use crate::allocator::KernelIrq;
 
-const IA32_MPERF: u32 = 0xE7;
+pub(super) const IA32_MPERF: u32 = 0xE7;
 const IA32_APERF: u32 = 0xE8;
 
 const UNKNOWN: u8 = 0;
@@ -85,7 +85,7 @@ pub fn khz(cpu: usize) -> Option<u64> {
 }
 
 #[inline]
-unsafe fn rdmsr(msr: u32) -> u64 {
+pub(super) unsafe fn rdmsr(msr: u32) -> u64 {
     let lo: u32;
     let hi: u32;
     unsafe {

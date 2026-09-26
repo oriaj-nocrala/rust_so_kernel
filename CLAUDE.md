@@ -96,7 +96,7 @@ so addresses actually resolve to real function names instead of bare hex.
 ### QEMU integration tests
 
 Real hardware-path behavior (drivers that need actual QEMU devices, not just host-testable
-pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 335 tests, <1s, no QEMU) is
+pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 339 tests, <1s, no QEMU) is
 asserted by a `#![feature(custom_test_frameworks)]` harness that boots the real kernel in
 QEMU and reports PASS/FAIL as a process exit code:
 
@@ -286,7 +286,7 @@ Implemented syscalls (Linux-compatible numbers — see `SyscallNumber` enum for 
 | 400/401/402 | `uptime_ms`/`uptime_sec`/`meminfo_kb` | Custom, above the Linux syscall range — debug/introspection only |
 | 162 | `sync` | No write-back cache exists to flush (ext2 writes are synchronous), so this copies the kernel log ring to the USB stick's `constanos-log` partition — see the kernel-log-on-the-stick section. Reports failure, unlike Linux: `ENODEV` (no log partition), `EBUSY`, `EIO`. `kdebug sync` calls it |
 | 169 | `reboot` | Linux magic numbers + commands. `RESTART` flushes the kernel log to the USB stick (reason `reboot`), then resets: ACPI FADT `RESET_REG` → port `0xCF9` → 8042 `0xFE` (only if one answers) → triple fault (`kernel/src/reboot.rs`). `HALT`/`POWER_OFF` flush and stop (no S5 without AML). Backs the embedded `reboot` program. QEMU i440fx's FADT is ACPI 1.0 (no `RESET_REG`), so there `0xCF9` does the reset |
-| 403 | `kdebug_ctl` | Get/set `kernel::debug`'s runtime tracing mask (get: `cmd=0`; set: `cmd=1`, subsystem name + on/off) — backs the `kdebug` userspace program. `cmd=2` panics the kernel on purpose (`kdebug panic`, Linux's sysrq-c) to exercise the panic path on demand. `cmd=3` runs the TLB-shootdown self-test against every AP (`kdebug tlbtest`; report in `/proc/dmesg` as `tlb_selftest:`) |
+| 403 | `kdebug_ctl` | Get/set `kernel::debug`'s runtime tracing mask (get: `cmd=0`; set: `cmd=1`, subsystem name + on/off) — backs the `kdebug` userspace program. `cmd=2` panics the kernel on purpose (`kdebug panic`, Linux's sysrq-c) to exercise the panic path on demand. `cmd=3` runs the TLB-shootdown self-test against every AP (`kdebug tlbtest`; report in `/proc/dmesg` as `tlb_selftest:`). `cmd=4` sets the idle wait (`kdebug idle hlt|c2`, see Idle below) |
 | 280 | `utimensat` | Linux's `(dirfd, path, times[2], flags)`: `UTIME_NOW`/`UTIME_OMIT`, `times` NULL = now, `AT_SYMLINK_NOFOLLOW`; a NULL `path` is `futimens(dirfd)`. Real on ext2 and ramfs, `EROFS` elsewhere (`Inode::set_times`/`FileHandle::set_times`). A relative path against a real `dirfd` is `ENOSYS`. See File Timestamps |
 | 404 | `statvfs` | Custom (real `statvfs(2)` has no fixed Linux syscall number of its own — glibc/mlibc implement it over `statfs`, which this port doesn't wire). One physical-memory pool backs every mount, so every path reports the same Buddy-allocator-derived total/free block counts — enough for `df` to run and show live numbers, not a real per-mount breakdown |
 
@@ -581,7 +581,7 @@ arbitration, exactly where two PS/2 keyboards would merge.
 **Split across the usual seam.** `hal::xhci` (register/TRB/ring/context
 arithmetic), `hal::usb` (descriptor parsing + setup packets) and
 `hal::hid` (boot-report diffing + the Set-1 table) are pure and host-tested
-— most of `hal`'s 335 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
+— most of `hal`'s 339 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
 DMA pages, doorbells and waiting. That line is drawn hard here because an
 xHCI bring-up failure is nearly unobservable (a wrong bit in a device
 context yields no fault, no log, just a Transfer Event that never arrives)
@@ -1137,6 +1137,25 @@ mechanism #1 is two port accesses and the SMN pair two more, and with
 processes on every CPU a `cat /proc/pci` could retarget `0xCF8` under
 another CPU's access. `config_write8` (the ACPI reset, also on the panic
 path) only *tries* it for a bounded while and then resets regardless.
+
+## Idle, Package Power and C0 Residency (`hal::amd_power`, `kernel/src/cpu/idle.rs`)
+
+Idle CPUs `hlt` (C1). On AMD Zen the kernel also knows ACPI C2 without
+AML: a read of `CStateBaseAddr + 1` (MSR `C001_0073`; `0x413` → `0x414`
+on the Ryzen, the port its `_CST` gives Linux), switchable live with
+`kdebug idle hlt|c2`. Two instruments in `/proc/kdebug`: `rapl:` package
+energy since boot (MSR `C001_029B`, accumulated on CPU 0's tick,
+`package_uj`) and `c0_permille:` each CPU's C0 residency over the last
+second (ΔMPERF/ΔTSC, per-CPU tick work). Both need a Zen outside a
+hypervisor; QEMU shows `absent`/`-`.
+
+**Measured on the Ryzen (boot #56), and why `hlt` stays the default:**
+alternating 45 s phases, `hlt` 18.0/19.8 W and C2 17.5/21.4 W package —
+the difference is inside the phase-to-phase noise — with every CPU at
+0.2-1.4% C0 and Tctl 31 °C in both modes, the same as Linux idle on that
+machine. The "constanos idles hotter" reading that prompted this (53 °C)
+was taken seconds after boot; Linux reads ~47 °C at that point too.
+Read temperatures after the machine has settled, or read `rapl:`.
 
 ## Resident Set Size (`hal::paging`, `AddressSpace::mem_stats`, `fs::procfs`)
 
