@@ -484,6 +484,51 @@ impl Grid {
         }
     }
 
+    /// A new size, as xterm does it — no reflow. Narrower cuts every row
+    /// on the right, wider pads it with blanks; fewer rows drop the ones
+    /// at the top only as far as needed to keep the cursor's row on
+    /// screen, then the ones at the bottom. Both screens change together,
+    /// the saved cursors move with their rows, the scroll region becomes
+    /// the whole screen, a pending wrap is cancelled and everything is
+    /// damaged.
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        assert!(cols > 0 && rows > 0, "a grid needs at least one cell");
+        let drop = (self.row + 1).saturating_sub(rows);
+        let (old_cols, old_rows) = (self.cols, self.rows);
+        let refit = |old: &[Cell]| -> Vec<Cell> {
+            let mut new = vec![Cell::blank(DEFAULT_BG); cols * rows];
+            for r in 0..rows.min(old_rows - drop) {
+                let src = &old[(r + drop) * old_cols..][..old_cols.min(cols)];
+                new[r * cols..][..src.len()].copy_from_slice(src);
+            }
+            new
+        };
+        self.cells = refit(&self.cells);
+        if let Some(p) = self.primary.take() {
+            self.primary = Some(refit(&p));
+        }
+        self.cols = cols;
+        self.rows = rows;
+        self.row -= drop;
+        self.col = self.col.min(cols - 1);
+        self.wrap_pending = false;
+        for s in [&mut self.saved, &mut self.saved_1049] {
+            s.row = s.row.saturating_sub(drop).min(rows - 1);
+            s.col = s.col.min(cols - 1);
+            s.wrap_pending = false;
+        }
+        self.top = 0;
+        self.bottom = rows;
+        self.dirty = vec![true; rows];
+        self.drawn_cursor = None;
+    }
+
+    /// Marks every row for redrawing, as after [`Grid::resize`] — for a
+    /// renderer whose picture was lost (a new buffer).
+    pub fn mark_all(&mut self) {
+        self.mark(0, self.rows);
+    }
+
     /// `RIS` (`ESC c`): as new, same size.
     pub fn reset(&mut self) {
         *self = Grid::new(self.cols, self.rows);
@@ -704,6 +749,100 @@ mod tests {
         assert_eq!(d.rows().collect::<Vec<_>>(), [0, 3], "the row it left and the one it wrote");
         g.move_to(5, 0);
         assert_eq!(g.take_damage().rows().collect::<Vec<_>>(), [3, 5]);
+    }
+
+    fn filled(cols: usize, rows: usize) -> Grid {
+        let mut g = Grid::new(cols, rows);
+        for r in 0..rows {
+            g.move_to(r, 0);
+            for c in 0..cols {
+                g.print(char::from(b'a' + ((r * cols + c) % 26) as u8));
+            }
+        }
+        g
+    }
+
+    #[test]
+    fn resize_cuts_and_pads_columns_without_reflow() {
+        let mut g = filled(6, 3); // abcdef / ghijkl / mnopqr
+        g.resize(4, 3);
+        assert_eq!(g.row_text(1), "ghij");
+        g.resize(8, 3);
+        assert_eq!(g.row_text(1), "ghij", "what was cut does not come back");
+        assert_eq!(g.cell(1, 7).ch, ' ');
+        assert_eq!(g.cols(), 8);
+    }
+
+    #[test]
+    fn fewer_rows_keep_the_cursor_row() {
+        // The cursor on the last row, as at a shell prompt: the top goes.
+        let mut g = filled(4, 5);
+        g.move_to(4, 1);
+        g.resize(4, 2);
+        assert_eq!((g.row_text(0).as_str(), g.row_text(1).as_str()), ("mnop", "qrst"));
+        assert_eq!(g.cursor(), (1, 1));
+        // The cursor at the top, as after `clear`: the bottom goes.
+        let mut g = filled(4, 5);
+        g.move_to(0, 3);
+        g.resize(4, 2);
+        assert_eq!(g.row_text(0), "abcd");
+        assert_eq!(g.cursor(), (0, 3));
+        // More rows: blank ones below.
+        g.resize(4, 4);
+        assert_eq!(g.row_text(3), "");
+        assert_eq!(g.rows(), 4);
+    }
+
+    #[test]
+    fn resize_clamps_the_cursor_resets_the_region_and_damages_all() {
+        let mut g = Grid::new(10, 10);
+        g.set_scroll_region(2, 5);
+        g.move_to(3, 9);
+        g.print('x'); // wrap pending in the last column
+        g.save_cursor();
+        g.take_damage();
+        g.resize(5, 4);
+        assert_eq!(g.cursor(), (3, 4));
+        assert_eq!(g.scroll_region(), (0, 4));
+        let d = g.take_damage();
+        assert_eq!(d.rows().count(), 4);
+        g.print('y'); // no wrap left over: it lands in place
+        assert_eq!(g.cursor(), (3, 4));
+        assert_eq!(g.cell(3, 4).ch, 'y');
+        g.restore_cursor();
+        assert_eq!(g.cursor(), (3, 4), "saved cursor clamped too");
+    }
+
+    #[test]
+    fn a_saved_cursor_moves_with_its_row() {
+        let mut g = filled(4, 6);
+        g.move_to(3, 2);
+        g.save_cursor(); // on "mnop"
+        g.move_to(5, 0);
+        g.resize(4, 4); // drops "abcd" and "efgh"
+        g.restore_cursor();
+        assert_eq!(g.cursor(), (1, 2));
+        assert_eq!(g.row_text(1), "mnop");
+    }
+
+    #[test]
+    fn both_screens_change_size_together() {
+        let mut g = filled(6, 3);
+        g.move_to(2, 0);
+        g.enter_alt_screen(true);
+        g.print('Z');
+        g.resize(3, 2); // drops one row at the top of both
+        assert!(g.alt_screen());
+        assert_eq!(g.row_text(1), "Z");
+        g.leave_alt_screen(true);
+        assert_eq!(g.row_text(0), "ghi");
+        assert_eq!(g.row_text(1), "mno");
+        assert_eq!(g.cursor(), (1, 0), "1049's saved cursor moved with its row");
+        for r in 0..2 {
+            for c in 0..3 {
+                let _ = g.cell(r, c); // every index in range
+            }
+        }
     }
 
     #[test]

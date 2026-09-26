@@ -11,8 +11,11 @@
 //! queued — events, disconnects, fds to close, damage — is carried out
 //! here. At most one compose + `FBIO_FLUSH` every 16 ms.
 //!
-//! `compositor [prog...]` starts each `prog` (from `/bin` unless it has a
-//! `/`) once the socket is listening. **Ctrl+Alt+Backspace quits**: with
+//! `compositor [prog...]` starts each `prog` (from `/bin` or `/mnt/bin`
+//! unless it has a `/`) once the socket is listening; with no arguments it
+//! is a session and starts `panel` (phase 4), if there is one. Window
+//! titles are drawn here with the text engine (`userspace::text`), which
+//! is why this program lives on the disk. **Ctrl+Alt+Backspace quits**: with
 //! the keyboard grabbed it is the only way out without a second terminal.
 //! Quitting closes `/dev/fb0` and the console comes back.
 
@@ -21,9 +24,14 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use gui::compositor::{ClientId, Compositor, PoolMem};
+use alloc::string::String;
+use draw::Canvas;
+use gui::compositor::{scale_for, ClientId, Compositor, PoolMem, TitleText, TITLE_FOCUSED, TITLE_UNFOCUSED};
+use gui::region::Rect;
 use gui::wire::Encoder;
 use userspace::args::Args;
+use userspace::launch;
+use userspace::text::{Style, Text, SANS};
 use userspace::syscall::{self, EpollEvent, AF_UNIX, MAP_SHARED, PROT_READ, PROT_WRITE, SOCK_NONBLOCK, SOCK_STREAM};
 use userspace::{entry, println};
 
@@ -117,50 +125,56 @@ fn open_path(path: &str, flags: i32) -> i32 {
     syscall::with_cstr(path, |p| syscall::open(p, flags)) as i32
 }
 
-const GUI_DISPLAY_ENV: &[u8] = b"GUI_DISPLAY=/tmp/gui-0\0";
+/// A window title rasterised once, over its bar's colour: redrawn only
+/// when the title, the focus or the bar's width changes.
+struct TitleImg {
+    title: String,
+    focused: bool,
+    w: i32,
+    h: i32,
+    px: Vec<u32>,
+}
 
-/// Where a bare program name is looked for, in order — ash's `PATH` minus
-/// `/tmp/bin` (BusyBox applets are not graphical): the embedded programs,
-/// then the disk's, where everything linking `userspace::text` lives.
-const SEARCH: [&[u8]; 2] = [b"/bin/", b"/mnt/bin/"];
+/// Paints titles for `Compositor::compose_with` with the text engine
+/// (proportional Noto from `/mnt`, or the bitmap fallback without it).
+struct Titles {
+    text: Text,
+    cache: BTreeMap<u32, TitleImg>,
+    size: f32,
+}
 
-/// Starts `name`: as given if it contains a `/`, else the first of
-/// `SEARCH` that has it.
-fn spawn(name: &[u8]) {
-    let mut path = [0u8; 64];
-    let mut n = 0;
-    let prefixes: &[&[u8]] = if name.contains(&b'/') { &[b""] } else { &SEARCH };
-    for prefix in prefixes {
-        n = (prefix.len() + name.len()).min(63);
-        path[..prefix.len()].copy_from_slice(prefix);
-        path[prefix.len()..n].copy_from_slice(&name[..n - prefix.len()]);
-        path[n] = 0;
-        if syscall::stat(&path[..=n]).is_ok() {
-            break;
+impl Titles {
+    fn new(scale: i32) -> Titles {
+        Titles { text: Text::load(), cache: BTreeMap::new(), size: 13.0 * scale as f32 }
+    }
+
+    fn paint(&mut self, t: &TitleText, clip: Rect, dst: &mut [u32], stride: usize) {
+        let a = t.area;
+        let stale = self.cache.get(&t.id).is_none_or(|c| c.title != t.title || c.focused != t.focused || (c.w, c.h) != (a.w, a.h));
+        if stale {
+            let bg = if t.focused { TITLE_FOCUSED } else { TITLE_UNFOCUSED };
+            let fg = if t.focused { 0x00F0_F0F0 } else { 0x00B0_B0B8 };
+            let mut px = alloc::vec![bg; (a.w.max(0) * a.h.max(0)) as usize];
+            if a.w > 0 && a.h > 0 {
+                let mut cv = Canvas::new(&mut px, a.w as usize, a.h as usize, a.w as usize);
+                let st = Style::new(SANS, self.size).bold().color(fg);
+                let (_, lh) = self.text.measure("Hg", &st, None);
+                self.text.draw(&mut cv, t.title, &st, None, 0, (a.h - lh) / 2);
+            }
+            self.cache.insert(t.id, TitleImg { title: String::from(t.title), focused: t.focused, w: a.w, h: a.h, px });
+        }
+        let img = &self.cache[&t.id];
+        for y in clip.y..clip.bottom() {
+            let src = &img.px[((y - a.y) * a.w + (clip.x - a.x)) as usize..][..clip.w as usize];
+            dst[y as usize * stride + clip.x as usize..][..clip.w as usize].copy_from_slice(src);
         }
     }
-    let pid = syscall::fork();
-    if pid == 0 {
-        // A group of its own with the default ^C/^Z: the console's
-        // foreground group is ours, and a key typed into a terminal
-        // window would otherwise reach the client twice — once through
-        // the window and once as a console signal (see `main`).
-        syscall::setpgid(0, 0);
-        syscall::sigaction(syscall::SIGINT, 0);
-        syscall::sigaction(syscall::SIGTSTP, 0);
-        // Nothing past stdio goes to the client: the kernel does not act on
-        // close-on-exec, and a child holding our /dev/fb0 or grabbed
-        // event0 would keep graphics mode and the keyboard after we die.
-        for fd in 3..16 {
-            syscall::close(fd);
-        }
-        let p = &path[..=n];
-        // How a program finds us (read by constanos_gfx.h and handed on
-        // by `term` to its shell), as WAYLAND_DISPLAY is.
-        syscall::exec_argv(p, &[p], &[GUI_DISPLAY_ENV]);
-        syscall::exit(127);
+
+    /// Forgets the titles of windows that are gone.
+    fn prune(&mut self, comp: &Compositor<Mapping>) {
+        let live = comp.toplevels();
+        self.cache.retain(|id, _| live.iter().any(|(t, _)| t == id));
     }
-    println!("compositor: started {} (pid {})", core::str::from_utf8(&path[..n]).unwrap_or("?"), pid);
 }
 
 struct Io {
@@ -284,8 +298,27 @@ fn main(args: Args) -> i32 {
     let mut comp: Compositor<Mapping> = Compositor::new(info.width as i32, info.height as i32);
     let mut io = Io { ep, sockets: BTreeMap::new() };
 
-    for i in 1..args.len() {
-        spawn(args.get(i).unwrap());
+    let mut titles = Titles::new(scale_for(info.height as i32));
+    if titles.text.missing > 0 {
+        println!("compositor: {} font files missing, titles in the bitmap font", titles.text.missing);
+    }
+    let start = |cmd: &[u8]| {
+        let pid = launch::spawn(cmd);
+        let name = core::str::from_utf8(cmd).unwrap_or("?");
+        if pid > 0 {
+            println!("compositor: started {} (pid {})", name, pid);
+        } else {
+            println!("compositor: cannot start {} ({})", name, pid);
+        }
+    };
+    if args.len() > 1 {
+        for i in 1..args.len() {
+            start(args.get(i).unwrap());
+        }
+    } else if launch::find(b"panel").is_some() {
+        start(b"panel");
+    } else {
+        println!("compositor: no panel, an empty session (Ctrl+Alt+Backspace quits)");
     }
 
     let mut last_frame: i64 = -FRAME_MS;
@@ -299,6 +332,8 @@ fn main(args: Args) -> i32 {
         let busy = comp.has_damage() || comp.has_frame_callbacks();
         let timeout = if busy { (last_frame + FRAME_MS - syscall::uptime_ms()).clamp(0, FRAME_MS) as i32 } else { -1 };
         let n = syscall::epoll_wait(ep, &mut evs, timeout);
+        comp.set_time(syscall::uptime_ms() as u32);
+        while syscall::reap_any() > 0 {} // what we started and has exited
         for ev in evs.iter().take(n.max(0) as usize) {
             let tag = ev.data;
             match tag {
@@ -357,7 +392,8 @@ fn main(args: Args) -> i32 {
         let now = syscall::uptime_ms();
         if (comp.has_damage() || comp.has_frame_callbacks()) && now >= last_frame + FRAME_MS {
             let t0 = syscall::uptime_ms();
-            let rects = comp.compose(screen, info.stride as usize);
+            let rects = comp.compose_with(screen, info.stride as usize, &mut |t, clip, dst, stride| titles.paint(t, clip, dst, stride));
+            titles.prune(&comp);
             if !rects.is_empty() {
                 let mut fl = Fb0Flush { count: rects.len() as u32, _pad: 0, rects: [Fb0Rect::default(); 16] };
                 for (d, r) in fl.rects.iter_mut().zip(&rects) {

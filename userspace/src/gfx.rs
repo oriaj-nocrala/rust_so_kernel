@@ -35,6 +35,14 @@ pub const MOUSE: u32 = 1;
 /// right for a game's pixel art and blocky for antialiased text.
 pub const HIDPI: u32 = 2;
 
+/// Not evdev: window-management events a windowed program gets, with
+/// `code` [`GFX_RESIZE`] (the frame is now [`Gfx::size`], already applied)
+/// or [`GFX_CLOSE`] (the user pressed the close button). Never on the
+/// console.
+pub const EV_GFX: u16 = 0x100;
+pub const GFX_RESIZE: u16 = 1;
+pub const GFX_CLOSE: u16 = 2;
+
 #[derive(Clone, Copy, Debug)]
 pub struct GfxEvent {
     pub kind: u16,
@@ -72,6 +80,11 @@ struct Window {
     queue: VecDeque<GfxEvent>,
     /// Key/button codes < 512 held down, released on focus-out.
     held: [u8; 64],
+    /// The pool's mapping, for `munmap` when it is replaced.
+    map: (u64, u64),
+    /// The last `resize` the compositor asked for, in pool pixels, not yet
+    /// applied.
+    want: Option<(usize, usize)>,
 }
 
 pub struct Gfx {
@@ -168,8 +181,37 @@ impl Gfx {
                 if win.queue.is_empty() {
                     win.pump(false);
                 }
-                win.queue.pop_front()
+                let ev = win.queue.pop_front()?;
+                if ev.kind == EV_GFX && ev.code == GFX_RESIZE {
+                    // Only the latest request matters; older resize
+                    // events still queued find nothing to apply.
+                    let Some((pw, ph)) = win.want.take() else { return self.next_event() };
+                    // Even at the same size: a new buffer is what tells the
+                    // compositor this is the answer.
+                    let (w, h) = ((pw / win.scale).max(1), (ph / win.scale).max(1));
+                    if !win.new_pool(w * win.scale, h * win.scale) {
+                        syscall::exit(1);
+                    }
+                    self.w = w;
+                    self.h = h;
+                }
+                Some(ev)
             }
+        }
+    }
+
+    /// The frame's size in logical pixels (`present` takes `w*scale x
+    /// h*scale`); changes with a [`GFX_RESIZE`] event.
+    pub fn size(&self) -> (usize, usize) {
+        (self.w, self.h)
+    }
+
+    /// Lets the user resize the window, down to `min_w x min_h` logical
+    /// pixels; [`GFX_RESIZE`] events follow. Nothing on the console.
+    pub fn resizable(&mut self, min_w: usize, min_h: usize) {
+        if let Backend::Window(win) = &mut self.b {
+            let s = win.scale;
+            win.send(&[Request::SetResizable { surface: SURFACE, min_w: (min_w * s) as i32, min_h: (min_h * s) as i32 }]);
         }
     }
 }
@@ -213,6 +255,8 @@ impl Window {
             dec: Decoder::new(),
             queue: VecDeque::new(),
             held: [0; 64],
+            map: (0, 0),
+            want: None,
         };
         if !win.send(&[Request::CreateSurface { id: SURFACE }]) {
             syscall::close(sock);
@@ -247,7 +291,23 @@ impl Window {
             s -= 1;
         }
         win.scale = s;
-        let (pw, ph) = (w * s, h * s);
+        let mut reqs = alloc::vec![Request::SetTitle { surface: SURFACE, title: title.into() }];
+        if flags & MOUSE != 0 {
+            reqs.push(Request::LockPointer { surface: SURFACE, on: true });
+        }
+        if !win.send(&reqs) || !win.new_pool(w * s, h * s) {
+            syscall::close(sock);
+            return None;
+        }
+        Some(win)
+    }
+
+    /// A fresh `pw x ph` pool and buffer, replacing the old ones: a memfd
+    /// that is mapped cannot shrink in this kernel, and growing one in
+    /// place is not implemented, so a new size is a new memfd. The
+    /// compositor copied the last frame at its commit, so the old buffer
+    /// may go at once.
+    fn new_pool(&mut self, pw: usize, ph: usize) -> bool {
         let size = (pw * ph * 4) as u64;
         let mfd = syscall::memfd_create(b"gfx\0", 0) as i32;
         let base = if mfd >= 0 && syscall::ftruncate(mfd, size) == 0 {
@@ -256,33 +316,35 @@ impl Window {
             -1
         };
         if base <= 0 {
-            syscall::close(sock);
-            return None;
+            if mfd >= 0 {
+                syscall::close(mfd);
+            }
+            return false;
         }
-        win.pool = unsafe { core::slice::from_raw_parts_mut(base as *mut u32, pw * ph) };
-        let mut reqs = alloc::vec![
-            Request::CreatePool { id: POOL, fd: mfd, size: size as u32 },
-            Request::CreateBuffer {
-                pool: POOL,
-                id: BUFFER,
-                offset: 0,
-                width: pw as i32,
-                height: ph as i32,
-                stride: (pw * 4) as i32,
-                format: FORMAT_XRGB8888,
-            },
-            Request::SetTitle { surface: SURFACE, title: title.into() },
-        ];
-        if flags & MOUSE != 0 {
-            reqs.push(Request::LockPointer { surface: SURFACE, on: true });
+        let mut reqs = alloc::vec![];
+        if self.map.1 != 0 {
+            reqs.push(Request::DestroyBuffer { buffer: BUFFER });
+            reqs.push(Request::DestroyPool { pool: POOL });
         }
-        let ok = win.send(&reqs);
+        reqs.push(Request::CreatePool { id: POOL, fd: mfd, size: size as u32 });
+        reqs.push(Request::CreateBuffer {
+            pool: POOL,
+            id: BUFFER,
+            offset: 0,
+            width: pw as i32,
+            height: ph as i32,
+            stride: (pw * 4) as i32,
+            format: FORMAT_XRGB8888,
+        });
+        let ok = self.send(&reqs);
         syscall::close(mfd); // the compositor has its own now
-        if !ok {
-            syscall::close(sock);
-            return None;
+        if self.map.1 != 0 {
+            syscall::munmap(self.map.0, self.map.1);
         }
-        Some(win)
+        self.map = (base as u64, size);
+        self.pool = unsafe { core::slice::from_raw_parts_mut(base as *mut u32, pw * ph) };
+        self.busy = false;
+        ok
     }
 
     fn send(&self, reqs: &[Request]) -> bool {
@@ -354,6 +416,11 @@ impl Window {
                         }
                     }
                 }
+                Event::Resize { width, height, .. } => {
+                    self.want = Some((width.max(1) as usize, height.max(1) as usize));
+                    self.push(EV_GFX, GFX_RESIZE, 0);
+                }
+                Event::Close { .. } => self.push(EV_GFX, GFX_CLOSE, 0),
                 Event::Error { code, message, .. } => {
                     crate::eprintln!("gfx: compositor error {}: {}", code, message);
                     syscall::exit(1);

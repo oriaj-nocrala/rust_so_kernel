@@ -8,6 +8,7 @@ pub mod heap;
 pub mod args;
 pub mod gfx;
 pub mod text;
+pub mod launch;
 
 use core::panic::PanicInfo;
 

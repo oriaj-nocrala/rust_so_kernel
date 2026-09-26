@@ -375,6 +375,14 @@ pub fn waitpid_status(child_pid: i64) -> (i64, i32) {
     (r, status)
 }
 
+/// Reaps any one exited child without blocking: its pid, 0 if children
+/// are still running, negative (`ECHILD`) if there are none.
+pub fn reap_any() -> i64 {
+    // This port's value (mlibc-port abi-bits/wait.h), not Linux's 1.
+    const WNOHANG: u64 = 2;
+    unsafe { syscall3(SYS_WAITPID, -1i64 as u64, 0, WNOHANG) }
+}
+
 /// `setpgid(pid, pgid)`; `(0, 0)` makes the caller a group of its own.
 pub fn setpgid(pid: i64, pgid: i64) -> i64 {
     unsafe { syscall2(SYS_SETPGID, pid as u64, pgid as u64) }

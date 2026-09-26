@@ -11,7 +11,9 @@
 > 3.2: `wait` de ash con un trabajo parado (ver el registro de 3.2).
 >
 > **Fase 4 (gestión de ventanas) planificada el 2026-09-26**, con las
-> decisiones tomadas con el usuario: ver "Fase 4" más abajo.
+> decisiones tomadas con el usuario: ver "Fase 4" más abajo. 4.1 a 4.5
+> hechas el mismo día y verificadas en QEMU (`gui-e2e.sh wm`); falta la
+> Ryzen, a mano (ver su registro).
 
 ## Por qué ahora, y por qué así
 
@@ -1337,3 +1339,63 @@ cuando no; el programa no distingue entre los dos casos.
 
 **Verificado en la Ryzen** (el usuario, a mano): DOOM y Quake dentro del
 compositor funcionan. Host: `gui` 33 + 2 tests.
+
+### Fase 4 (2026-09-26)
+
+Hecha de 4.1 a 4.5 en un día. Lo que difiere del plan, y por qué:
+
+- **La respuesta a un `resize` es cualquier búfer creado después de él**,
+  no "un búfer de otro tamaño". El plan decía que el tamaño real es el del
+  próximo `commit`; con eso, un cuadro dibujado antes de leer el evento
+  (del tamaño viejo) deshacía el marco. La primera versión solo aceptaba
+  un tamaño *distinto* como respuesta, y `term` la rompe: un arrastre de
+  menos de una celda redondea al mismo número de celdas, así que su
+  respuesta tiene el tamaño viejo y el marco quedaba para siempre con
+  relleno. Ahora cada búfer lleva un número de creación
+  (`BufRef::serial`) y `resize_pending` guarda el del momento del
+  `resize`: responde el primer búfer más nuevo, sea del tamaño que sea.
+  Hace de `ack_configure` sin añadir ninguna petición. Los clientes
+  (`gfx`, `term`) crean un pool nuevo siempre que llega un `resize`, igual
+  que haría falta de todas formas para cambiar de tamaño.
+- **El menú del lanzador se abre dentro de la franja del panel**, en lugar
+  de la lista de ventanas, porque el protocolo no tiene superficies
+  emergentes. Con 7 aplicaciones cabe de sobra a 1280 px.
+- **El compositor pasa a `/mnt/bin`** (70 KB → 1,55 MB con `parley` +
+  `swash`), como decía la regla de `userspace::text`. Embebido habría
+  cabido (el kernel sin DWARF pasaría de 9,4 a ~11 MB), pero el panel y
+  las fuentes ya están en `/mnt`, así que sin disco la sesión no tendría
+  sentido de todos modos.
+- **`gfx::resizable(min_w, min_h)`** es un método y no un flag de `open`:
+  el mínimo es parte de la petición.
+- `TITLE_H` sigue siendo 20 a escala 1; `gui::compositor::scale_for(h)` =
+  `h / 540` entre 1 y 3 (1080p → 2, la de un programa `HIDPI` a esa
+  resolución), y `title_height_for` lo usa `term` para calcular cuánto
+  cabe.
+- **`userspace::launch`** (`find`, `spawn` con argumentos) sustituye al
+  `spawn` del compositor, y el panel lo comparte. Compositor y panel
+  recogen a sus hijos con `syscall::reap_any`. El primer intento usó
+  `WNOHANG = 1`, el valor de Linux; en este port vale 2 (`wait.h` sigue
+  siendo la cabecera heredada), el 1 es `WCONTINUED`, así que `waitpid`
+  bloqueaba y el compositor se quedaba colgado antes de pintar nada.
+
+**Tests de host:** `gui` 42 (+9: el arrastre de la esquina con un único
+`resize` recortado, el cuadro atrasado que no deshace el marco, la
+respuesta del mismo tamaño, sin `set_resizable` no hay bordes ni
+maximizar, maximizar y restaurar con y sin panel y con doble clic,
+`close` solo al dueño, el panel encima y fuera de la zona de trabajo y
+sin foco, la lista de ventanas con un cliente que muere a mitad de un
+arrastre, los títulos pintados por el cierre dentro de su área), 12/12
+sabotajes detectados. `vt` 63 (+5, `Grid::resize`), 6/6 sabotajes.
+
+**Verificado en QEMU:** a mano (capturas) y con `scripts/gui-e2e.sh wm`:
+panel en la última franja, lanzador → `term`, arrastre de la esquina →
+57x20 y `stty size` igual, maximizar → 37x142 sin tapar el panel y
+restaurar, `cpumon` redimensionado reparte las gráficas, activar desde la
+lista, cerrar `cpumon` y `term` (ash muere por el cuelgue), `fire` sin
+maximizar ni bordes. `goto` del script corrige el puntero con capturas:
+los desplazamientos grandes de `mouse_move` no llegan exactos. `gui-e2e.sh` en sus
+modos `demo`, `term` y `text` sigue en PASS.
+
+**Falta:** la Ryzen, a mano (ratón USB real arrastrando bordes, el panel y
+los títulos a 1080p con escala 2).
+

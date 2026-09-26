@@ -556,3 +556,334 @@ fn a_locked_client_that_goes_away_releases_the_pointer() {
     h.comp.pointer_motion(3, 3);
     assert!(h.comp.take_events().is_empty());
 }
+
+// ── window management (phase 4) ───────────────────────────────────────────
+
+/// A client whose surface 4 takes the panel role, `ph` pixels tall, with a
+/// `W x ph` buffer committed. Pool fd = 100 + client id.
+fn panel(h: &mut H_, ph: i32, color: u32) -> ClientId {
+    let c = h.comp.add_client();
+    let fd = 100 + c as i32;
+    let size = (W * ph * 4) as usize;
+    h.pool(fd, size);
+    h.draw(fd, 0, W as usize * 4, 0, 0, W as usize, ph as usize, color);
+    h.send(c, &[R::CreateSurface { id: 4 }, R::SetPanel { surface: 4, height: ph }]);
+    h.send(c, &[
+        R::CreatePool { id: 2, fd, size: size as u32 },
+        R::CreateBuffer { pool: 2, id: 3, offset: 0, width: W, height: ph, stride: W * 4, format: FORMAT_XRGB8888 },
+        R::Attach { surface: 4, buffer: 3 },
+        R::Damage { surface: 4, x: 0, y: 0, w: W, h: ph },
+        R::Commit { surface: 4 },
+    ]);
+    c
+}
+
+/// Commits a new `w x h` buffer (a fresh pool, fd 200 + client id) to
+/// client `c`'s surface 4, filled with `color` — a client answering
+/// `resize`.
+fn recommit(h: &mut H_, c: ClientId, w: i32, hh: i32, color: u32) {
+    let fd = 200 + c as i32;
+    let size = (w * hh * 4) as usize;
+    h.pool(fd, size);
+    h.draw(fd, 0, w as usize * 4, 0, 0, w as usize, hh as usize, color);
+    h.send(c, &[
+        R::CreatePool { id: 20, fd, size: size as u32 },
+        R::CreateBuffer { pool: 20, id: 21, offset: 0, width: w, height: hh, stride: w * 4, format: FORMAT_XRGB8888 },
+        R::Attach { surface: 4, buffer: 21 },
+        R::Damage { surface: 4, x: 0, y: 0, w, h: hh },
+        R::Commit { surface: 4 },
+    ]);
+}
+
+fn click(h: &mut H_, x: i32, y: i32) {
+    pointer_to(h, x, y);
+    h.comp.pointer_button(BTN_LEFT, true);
+    h.comp.pointer_button(BTN_LEFT, false);
+}
+
+fn resizes(evs: &[Event]) -> Vec<(i32, i32)> {
+    evs.iter().filter_map(|e| if let Event::Resize { width, height, .. } = e { Some((*width, *height)) } else { None }).collect()
+}
+
+// A: the chain set_resizable → drag of the border → one resize, clamped.
+#[test]
+fn dragging_a_resizable_corner_sends_one_clamped_resize_on_release() {
+    let mut h = H_::new();
+    let c = h.window(100, 50, 0x0012_3456); // frame (40, 40, 100, 70)
+    h.send(c, &[R::SetResizable { surface: 4, min_w: 60, min_h: 30 }]);
+    h.compose();
+    // Just outside the bottom-right corner: both edges.
+    pointer_to(&mut h, 141, 111);
+    assert_eq!(h.comp.hit(141, 111), Some(((c, 4), Zone::Edge(EDGE_RIGHT | EDGE_BOTTOM))));
+    h.comp.pointer_button(BTN_LEFT, true);
+    h.comp.pointer_motion(30, 20);
+    h.comp.pointer_motion(10, 0);
+    assert_eq!(h.comp.resize_outline(), Some(Rect::new(40, 40, 140, 90)));
+    assert!(resizes(&h.events_for(c)).is_empty(), "nothing is sent while dragging");
+    assert_eq!(h.comp.window_frame(c, 4), Some(Rect::new(40, 40, 100, 70)), "the window waits for the release");
+    h.compose();
+    assert_eq!(h.px(179, 100), OUTLINE, "the outline is drawn");
+    h.comp.pointer_button(BTN_LEFT, false);
+    assert_eq!(resizes(&h.events_for(c)), vec![(140, 70)], "exactly one resize");
+    assert_eq!(h.comp.resize_outline(), None);
+    assert_eq!(h.comp.window_content(c, 4), Some(Rect::new(40, 60, 140, 70)));
+    h.compose();
+    assert_eq!(h.px(139, 60), 0x0012_3456, "old content stays");
+    assert_eq!(h.px(150, 60), WINDOW_BG, "the rest waits for the client");
+    assert_ne!(h.px(179, 100), OUTLINE, "outline gone");
+
+    // Shrinking past the minimum stops at it, from the left edge too.
+    pointer_to(&mut h, 38, 90); // left border
+    assert_eq!(h.comp.hit(38, 90), Some(((c, 4), Zone::Edge(EDGE_LEFT))));
+    h.comp.pointer_button(BTN_LEFT, true);
+    h.comp.pointer_motion(500, 0);
+    h.comp.pointer_button(BTN_LEFT, false);
+    assert_eq!(resizes(&h.events_for(c)), vec![(60, 70)]);
+    assert_eq!(h.comp.window_content(c, 4), Some(Rect::new(120, 60, 60, 70)), "the right edge stayed");
+    // And growing, as far as the pointer goes (it stops at the screen's
+    // last column).
+    pointer_to(&mut h, 181, 100); // right border
+    h.comp.pointer_button(BTN_LEFT, true);
+    h.comp.pointer_motion(5000, 0);
+    h.comp.pointer_button(BTN_LEFT, false);
+    assert_eq!(resizes(&h.events_for(c)), vec![(60 + (W - 1 - 181), 70)]);
+    assert_eq!(h.comp.window_content(c, 4), Some(Rect::new(120, 60, 60 + (W - 1 - 181), 70)));
+    assert!(h.padding_untouched());
+}
+
+// A: the answer arrives; a commit at the old size in between does not undo.
+#[test]
+fn the_frame_follows_the_client_once_it_answers() {
+    let mut h = H_::new();
+    let c = h.window(100, 50, 0x0000_0011);
+    h.send(c, &[R::SetResizable { surface: 4, min_w: 1, min_h: 1 }]);
+    pointer_to(&mut h, 141, 111);
+    h.comp.pointer_button(BTN_LEFT, true);
+    h.comp.pointer_motion(40, 40);
+    h.comp.pointer_button(BTN_LEFT, false);
+    assert_eq!(resizes(&h.events_for(c)), vec![(140, 90)]);
+    // A frame drawn before the client saw the event.
+    h.send(c, &[R::Attach { surface: 4, buffer: 3 }, R::Damage { surface: 4, x: 0, y: 0, w: 100, h: 50 }, R::Commit { surface: 4 }]);
+    assert_eq!(h.comp.window_content(c, 4).unwrap().w, 140, "not snapped back");
+    // Its answer, rounded down as a terminal rounds to whole cells.
+    recommit(&mut h, c, 136, 88, 0x0000_0022);
+    assert_eq!(h.comp.window_content(c, 4), Some(Rect::new(40, 60, 136, 88)), "the buffer has the last word");
+    h.compose();
+    assert_eq!(h.px(175, 147), 0x0000_0022);
+    assert_eq!(h.px(176, 147), BACKGROUND);
+}
+
+// A: an answer that rounds back to the old size is still an answer.
+#[test]
+fn a_new_buffer_of_the_old_size_answers_too() {
+    let mut h = H_::new();
+    let c = h.window(100, 50, 0x0000_0011);
+    h.send(c, &[R::SetResizable { surface: 4, min_w: 1, min_h: 1 }]);
+    pointer_to(&mut h, 141, 111);
+    h.comp.pointer_button(BTN_LEFT, true);
+    h.comp.pointer_motion(5, 5); // less than a terminal cell
+    h.comp.pointer_button(BTN_LEFT, false);
+    assert_eq!(resizes(&h.events_for(c)), vec![(105, 55)]);
+    assert_eq!(h.comp.window_content(c, 4).unwrap().w, 105);
+    recommit(&mut h, c, 100, 50, 0x0000_0022);
+    assert_eq!(h.comp.window_content(c, 4), Some(Rect::new(40, 60, 100, 50)));
+}
+
+// B: without set_resizable there are no borders and no maximize button.
+#[test]
+fn a_window_that_did_not_ask_cannot_be_resized_or_maximized() {
+    let mut h = H_::new();
+    let c = h.window(100, 50, 0x0012_3456);
+    h.compose();
+    assert_eq!(h.comp.hit(141, 111), None, "no border");
+    assert_eq!(h.comp.hit(138, 108), Some(((c, 4), Zone::Content)), "no grip");
+    assert_eq!(h.comp.hit(140 - TITLE_H - 2, 45), Some(((c, 4), Zone::Title)), "no maximize button");
+    pointer_to(&mut h, 141, 111);
+    h.comp.pointer_button(BTN_LEFT, true);
+    h.comp.pointer_motion(40, 40);
+    h.comp.pointer_button(BTN_LEFT, false);
+    // Double click on the title: no maximize either.
+    h.comp.set_time(1000);
+    click(&mut h, 60, 45);
+    h.comp.set_time(1100);
+    click(&mut h, 60, 45);
+    assert!(resizes(&h.events_for(c)).is_empty());
+    assert_eq!(h.comp.window_frame(c, 4), Some(Rect::new(40, 40, 100, 70)));
+    assert!(!h.comp.is_maximized(c, 4));
+}
+
+// A: maximize and restore, by button and by double click, with a panel.
+#[test]
+fn maximize_fills_the_work_area_and_restore_goes_back() {
+    let mut h = H_::new();
+    let c = h.window(100, 50, 0x0012_3456);
+    h.send(c, &[R::SetResizable { surface: 4, min_w: 1, min_h: 1 }]);
+    let max_btn = (140 - TITLE_H - TITLE_H / 2, 50);
+    assert_eq!(h.comp.hit(max_btn.0, max_btn.1), Some(((c, 4), Zone::Maximize)));
+    click(&mut h, max_btn.0, max_btn.1);
+    assert!(h.comp.is_maximized(c, 4));
+    assert_eq!(h.comp.window_frame(c, 4), Some(Rect::new(0, 0, W, H)));
+    assert_eq!(resizes(&h.events_for(c)), vec![(W, H - TITLE_H)]);
+    // Restore: the maximize button is now at the screen's right.
+    click(&mut h, W - TITLE_H - TITLE_H / 2, 10);
+    assert!(!h.comp.is_maximized(c, 4));
+    assert_eq!(h.comp.window_frame(c, 4), Some(Rect::new(40, 40, 100, 70)));
+    assert_eq!(resizes(&h.events_for(c)), Vec::<(i32, i32)>::new(), "back to the buffer's own size: nothing to ask");
+
+    // With a panel, by double click.
+    let _p = panel(&mut h, 30, 0x0099_9999);
+    assert_eq!(h.comp.work_area(), Rect::new(0, 0, W, H - 30));
+    h.comp.take_events();
+    h.comp.set_time(5000);
+    click(&mut h, 60, 45);
+    h.comp.set_time(5300);
+    click(&mut h, 60, 45);
+    assert_eq!(h.comp.window_frame(c, 4), Some(Rect::new(0, 0, W, H - 30)), "the panel is not covered");
+    assert_eq!(resizes(&h.events_for(c)), vec![(W, H - 30 - TITLE_H)]);
+    h.comp.set_time(6000);
+    click(&mut h, 60, 10);
+    h.comp.set_time(6200);
+    click(&mut h, 60, 10);
+    assert_eq!(h.comp.window_frame(c, 4), Some(Rect::new(40, 40, 100, 70)));
+    // Two slow clicks are not a double click.
+    h.comp.set_time(7000);
+    click(&mut h, 60, 45);
+    h.comp.set_time(7000 + DOUBLE_CLICK_MS + 1);
+    click(&mut h, 60, 45);
+    assert!(!h.comp.is_maximized(c, 4));
+}
+
+// A: close reaches its owner only, on release over the button.
+#[test]
+fn close_goes_to_the_owner_only() {
+    let mut h = H_::new();
+    let a = h.window(100, 50, 0x00AA_0000); // (40, 40)
+    let b = h.window(100, 50, 0x0000_BB00); // (72, 72)
+    h.comp.take_events();
+    let close_a = (140 - TITLE_H / 2, 50);
+    assert_eq!(h.comp.hit(close_a.0, close_a.1), Some(((a, 4), Zone::Close)));
+    // Pressed, then released elsewhere: cancelled.
+    pointer_to(&mut h, close_a.0, close_a.1);
+    h.comp.pointer_button(BTN_LEFT, true);
+    h.compose();
+    assert_eq!(h.px(close_a.0 - TITLE_H / 2 + 1, 41), CLOSE_PRESSED);
+    pointer_to(&mut h, 60, 45);
+    h.comp.pointer_button(BTN_LEFT, false);
+    assert!(!h.comp.take_events().iter().any(|(_, e)| matches!(e, Event::Close { .. })));
+    click(&mut h, close_a.0, close_a.1);
+    let evs = h.comp.take_events();
+    let closes: Vec<_> = evs.iter().filter(|(_, e)| matches!(e, Event::Close { .. })).collect();
+    assert_eq!(closes, vec![&(a, Event::Close { surface: 4 })]);
+    assert_eq!(h.comp.stack().len(), 2, "closing is the client's decision");
+    let _ = b;
+}
+
+// A: the panel is above everything, outside the work area and never focused.
+#[test]
+fn the_panel_is_on_top_outside_the_work_area_and_never_focused() {
+    let mut h = H_::new();
+    let a = h.window(200, 200, 0x00AA_0000); // reaches y = 260 > H - 30
+    let p = panel(&mut h, 30, 0x0099_9999);
+    assert_eq!(h.comp.panel(), Some((p, 4)));
+    assert_eq!(h.comp.stack(), &[(a, 4)], "the panel is not a window");
+    assert_eq!(h.comp.focus(), Some((a, 4)), "mapping it took no focus");
+    h.compose();
+    assert_eq!(h.px(100, H - 1), 0x0099_9999, "above the window");
+    assert_eq!(h.px(100, H - 31), 0x00AA_0000);
+    // A click in it goes to it and leaves the focus alone.
+    h.comp.take_events();
+    click(&mut h, 100, H - 10);
+    let evs = h.comp.take_events();
+    assert!(evs.contains(&(p, Event::Button { surface: 4, code: BTN_LEFT, pressed: true })));
+    assert!(evs.contains(&(p, Event::Button { surface: 4, code: BTN_LEFT, pressed: false })));
+    assert_eq!(h.comp.focus(), Some((a, 4)));
+    h.comp.key(30, true);
+    assert!(h.events_for(p).is_empty(), "keys never go to the panel");
+    // A later window is placed in the work area.
+    let b = h.window(100, 150, 0x0000_BB00);
+    assert_eq!(h.comp.window_frame(b, 4).unwrap().bottom(), H - 30, "pushed up to fit");
+    // A second panel is a protocol error.
+    let q = h.comp.add_client();
+    h.send(q, &[R::CreateSurface { id: 4 }, R::SetPanel { surface: 4, height: 20 }]);
+    assert!(h.comp.take_disconnects().contains(&q));
+    // The panel gone, the work area is the screen again.
+    h.comp.remove_client(p);
+    assert_eq!(h.comp.work_area(), Rect::new(0, 0, W, H));
+    h.compose();
+    assert_eq!(h.px(300, H - 1), BACKGROUND);
+    assert_eq!(h.px(230, H - 5), 0x00AA_0000, "the window under it shows again");
+}
+
+// A: the window list, including a client that dies mid-resize.
+#[test]
+fn the_panel_hears_of_every_window_and_can_activate_one() {
+    let mut h = H_::new();
+    let a = h.window(100, 50, 0x00AA_0000);
+    h.send(a, &[R::SetTitle { surface: 4, title: "a".into() }]);
+    let p = panel(&mut h, 30, 0x0099_9999);
+    let evs = h.events_for(p);
+    assert!(evs.contains(&Event::Toplevel { surface: 4, id: 1, title: "a".into() }), "{evs:?}");
+    assert!(evs.contains(&Event::ToplevelFocus { surface: 4, id: 1 }));
+    let b = h.window(100, 50, 0x0000_BB00);
+    h.send(b, &[R::SetTitle { surface: 4, title: "b".into() }]);
+    let evs = h.events_for(p);
+    assert_eq!(evs, vec![
+        Event::Toplevel { surface: 4, id: 2, title: String::new() },
+        Event::ToplevelFocus { surface: 4, id: 2 },
+        Event::Toplevel { surface: 4, id: 2, title: "b".into() },
+    ]);
+    assert_eq!(h.comp.toplevels(), vec![(1, (a, 4)), (2, (b, 4))]);
+    // Activate a from the panel.
+    h.send(p, &[R::Activate { surface: 4, toplevel: 1 }]);
+    assert_eq!(h.comp.focus(), Some((a, 4)));
+    assert_eq!(h.comp.stack().last(), Some(&(a, 4)));
+    assert!(h.events_for(p).contains(&Event::ToplevelFocus { surface: 4, id: 1 }));
+    // Only the panel may: from b it does nothing.
+    h.send(b, &[R::Activate { surface: 4, toplevel: 2 }]);
+    assert_eq!(h.comp.focus(), Some((a, 4)));
+    // a dies in the middle of a resize.
+    h.send(a, &[R::SetResizable { surface: 4, min_w: 1, min_h: 1 }]);
+    let f = h.comp.window_frame(a, 4).unwrap();
+    pointer_to(&mut h, f.right() + 1, f.bottom() + 1);
+    h.comp.pointer_button(BTN_LEFT, true);
+    h.comp.pointer_motion(20, 20);
+    assert!(h.comp.resize_outline().is_some());
+    h.comp.remove_client(a);
+    assert_eq!(h.comp.resize_outline(), None, "the drag ended with its window");
+    h.comp.pointer_button(BTN_LEFT, false);
+    let evs = h.events_for(p);
+    assert!(evs.contains(&Event::ToplevelGone { surface: 4, id: 1 }), "{evs:?}");
+    assert!(evs.contains(&Event::ToplevelFocus { surface: 4, id: 2 }));
+    assert_eq!(h.comp.toplevels(), vec![(2, (b, 4))]);
+    h.compose();
+    assert!(h.padding_untouched());
+    // Unmapping b (null attach) is gone too, and focus none.
+    h.send(b, &[R::Attach { surface: 4, buffer: 0 }, R::Commit { surface: 4 }]);
+    let evs = h.events_for(p);
+    assert!(evs.contains(&Event::ToplevelGone { surface: 4, id: 2 }), "{evs:?}");
+    assert!(evs.contains(&Event::ToplevelFocus { surface: 4, id: 0 }));
+}
+
+// A: titles go through the caller's closure, clipped, before the buttons.
+#[test]
+fn titles_are_painted_by_the_caller_inside_their_area() {
+    let mut h = H_::new();
+    let c = h.window(100, 50, 0x0012_3456);
+    h.send(c, &[R::SetTitle { surface: 4, title: "hola".into() }]);
+    let mut seen = Vec::new();
+    h.comp.compose_with(&mut h.screen, STRIDE, &mut |t, clip, dst, stride| {
+        seen.push((t.id, String::from(t.title), t.focused, t.area));
+        for y in clip.y..clip.bottom() {
+            for x in clip.x..clip.right() {
+                dst[y as usize * stride + x as usize] = 0x00AB_CDEF;
+            }
+        }
+    });
+    assert_eq!(seen, vec![(1, String::from("hola"), true, Rect::new(46, 40, 140 - TITLE_H - 6 - 46, TITLE_H))]);
+    assert_eq!(h.px(46, 45), 0x00AB_CDEF);
+    assert_eq!(h.px(45, 45), TITLE_FOCUSED, "padding before the text");
+    assert_ne!(h.px(140 - TITLE_H / 2, 40 + TITLE_H / 2), 0x00AB_CDEF, "the close button is not text");
+    // A title change repaints the bar.
+    h.send(c, &[R::SetTitle { surface: 4, title: "adiós".into() }]);
+    assert!(h.comp.damage().contains(50, 45));
+}

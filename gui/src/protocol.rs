@@ -9,7 +9,7 @@
 //! | compositor | create_pool(id, fd, size) 0, create_surface(id) 1, sync(id) 2            | error(obj, code, msg) 0, delete_id(id) 1 |
 //! | pool       | create_buffer(id, offset, w, h, stride, format) 0, destroy 1             | — |
 //! | buffer     | destroy 0                                                                | release 0 |
-//! | surface    | attach(buffer) 0, damage(x, y, w, h) 1, frame(id) 2, commit 3, set_title(s) 4, destroy 5, lock_pointer(on) 6 | configure(w, h) 0, focus(in) 1, key(code, state) 2, motion(x, y) 3, button(code, state) 4, relative_motion(dx, dy) 5 |
+//! | surface    | attach(buffer) 0, damage(x, y, w, h) 1, frame(id) 2, commit 3, set_title(s) 4, destroy 5, lock_pointer(on) 6, set_resizable(min_w, min_h) 7, set_panel(height) 8, activate(toplevel) 9 | configure(w, h) 0, focus(in) 1, key(code, state) 2, motion(x, y) 3, button(code, state) 4, relative_motion(dx, dy) 5, resize(w, h) 6, close 7, toplevel(id, title) 8, toplevel_focus(id) 9, toplevel_gone(id) 10 |
 //! | callback   | —                                                                        | done(ms) 0 |
 //!
 //! It folds `wl_display`, `wl_compositor`, `wl_shm`, `wl_surface`,
@@ -18,6 +18,16 @@
 //! `relative_motion` are Wayland's pointer-constraints and relative-pointer
 //! extensions folded in the same way (see `Compositor`'s pointer lock). One pixel format:
 //! `XRGB8888` (value 1, as `wl_shm`'s).
+//!
+//! Window management (phase 4): `set_resizable` is `xdg_toplevel`'s
+//! `set_min_size` and the opt-in to `resize`, a *request* for a content of
+//! `w x h` (the real size stays that of the next committed buffer, so
+//! there is no `ack_configure`); `close` is `xdg_toplevel.close`.
+//! `set_panel` is a `wlr-layer-shell`-like role — a strip along the bottom,
+//! undecorated, above every window, out of the work area — and its surface
+//! alone gets the window list (`toplevel*`, with the compositor's own ids)
+//! and may `activate` one. Clients ignore events they do not know, so an
+//! old client never sees a difference.
 
 use alloc::string::String;
 
@@ -54,6 +64,9 @@ pub enum ErrorCode {
     InvalidBuffer = 5,
     /// The pool's memory could not be mapped.
     BadPool = 6,
+    /// `set_panel` while another surface has the role, or after the
+    /// surface was mapped as a window.
+    Role = 7,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +87,13 @@ pub enum Request {
     /// Ask for (or give up) the pointer: while locked, motion arrives as
     /// `relative_motion` and the pointer stays put. For games.
     LockPointer { surface: u32, on: bool },
+    /// The window may be resized, down to `min_w x min_h` of content; the
+    /// client answers `resize` events.
+    SetResizable { surface: u32, min_w: i32, min_h: i32 },
+    /// The panel role: `height` pixels along the bottom of the screen.
+    SetPanel { surface: u32, height: i32 },
+    /// From the panel: raise and focus the window with that toplevel id.
+    Activate { surface: u32, toplevel: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,6 +112,17 @@ pub enum Event {
     /// Pointer motion while locked to this surface; screen convention
     /// (`dy` positive is down).
     RelativeMotion { surface: u32, dx: i32, dy: i32 },
+    /// Please draw a content of `width x height` (only after
+    /// `set_resizable`).
+    Resize { surface: u32, width: i32, height: i32 },
+    /// The user asked the window to close; the client decides.
+    Close { surface: u32 },
+    /// To the panel: a window appeared or changed its title.
+    Toplevel { surface: u32, id: u32, title: String },
+    /// To the panel: the focused window (0: none).
+    ToplevelFocus { surface: u32, id: u32 },
+    /// To the panel: the window went away.
+    ToplevelGone { surface: u32, id: u32 },
     Done { callback: u32, ms: u32 },
 }
 
@@ -142,6 +173,9 @@ impl Request {
             (Interface::Surface, 4) => Request::SetTitle { surface: obj, title: a.string()? },
             (Interface::Surface, 5) => Request::DestroySurface { surface: obj },
             (Interface::Surface, 6) => Request::LockPointer { surface: obj, on: a.uint()? != 0 },
+            (Interface::Surface, 7) => Request::SetResizable { surface: obj, min_w: a.int()?, min_h: a.int()? },
+            (Interface::Surface, 8) => Request::SetPanel { surface: obj, height: a.int()? },
+            (Interface::Surface, 9) => Request::Activate { surface: obj, toplevel: a.uint()? },
             _ => return Err(DecodeError::UnknownOpcode),
         };
         a.finish()?;
@@ -170,6 +204,9 @@ impl Request {
             Request::SetTitle { surface, title } => e.begin(*surface, 4).string(title),
             Request::DestroySurface { surface } => e.begin(*surface, 5),
             Request::LockPointer { surface, on } => e.begin(*surface, 6).uint(*on as u32),
+            Request::SetResizable { surface, min_w, min_h } => e.begin(*surface, 7).int(*min_w).int(*min_h),
+            Request::SetPanel { surface, height } => e.begin(*surface, 8).int(*height),
+            Request::Activate { surface, toplevel } => e.begin(*surface, 9).uint(*toplevel),
         }
         .end();
     }
@@ -189,6 +226,11 @@ impl Event {
             (Interface::Surface, 3) => Event::Motion { surface: obj, x: a.int()?, y: a.int()? },
             (Interface::Surface, 4) => Event::Button { surface: obj, code: a.uint()?, pressed: a.uint()? != 0 },
             (Interface::Surface, 5) => Event::RelativeMotion { surface: obj, dx: a.int()?, dy: a.int()? },
+            (Interface::Surface, 6) => Event::Resize { surface: obj, width: a.int()?, height: a.int()? },
+            (Interface::Surface, 7) => Event::Close { surface: obj },
+            (Interface::Surface, 8) => Event::Toplevel { surface: obj, id: a.uint()?, title: a.string()? },
+            (Interface::Surface, 9) => Event::ToplevelFocus { surface: obj, id: a.uint()? },
+            (Interface::Surface, 10) => Event::ToplevelGone { surface: obj, id: a.uint()? },
             (Interface::Callback, 0) => Event::Done { callback: obj, ms: a.uint()? },
             _ => return Err(DecodeError::UnknownOpcode),
         };
@@ -207,6 +249,11 @@ impl Event {
             Event::Motion { surface, x, y } => e.begin(*surface, 3).int(*x).int(*y),
             Event::Button { surface, code, pressed } => e.begin(*surface, 4).uint(*code).uint(*pressed as u32),
             Event::RelativeMotion { surface, dx, dy } => e.begin(*surface, 5).int(*dx).int(*dy),
+            Event::Resize { surface, width, height } => e.begin(*surface, 6).int(*width).int(*height),
+            Event::Close { surface } => e.begin(*surface, 7),
+            Event::Toplevel { surface, id, title } => e.begin(*surface, 8).uint(*id).string(title),
+            Event::ToplevelFocus { surface, id } => e.begin(*surface, 9).uint(*id),
+            Event::ToplevelGone { surface, id } => e.begin(*surface, 10).uint(*id),
             Event::Done { callback, ms } => e.begin(*callback, 0).uint(*ms),
         }
         .end();
@@ -222,7 +269,12 @@ impl Event {
             | Event::Key { surface, .. }
             | Event::Motion { surface, .. }
             | Event::Button { surface, .. }
-            | Event::RelativeMotion { surface, .. } => *surface,
+            | Event::RelativeMotion { surface, .. }
+            | Event::Resize { surface, .. }
+            | Event::Close { surface }
+            | Event::Toplevel { surface, .. }
+            | Event::ToplevelFocus { surface, .. }
+            | Event::ToplevelGone { surface, .. } => *surface,
             Event::Done { callback, .. } => *callback,
         }
     }
@@ -251,6 +303,9 @@ mod tests {
             (Interface::Surface, Request::DestroySurface { surface: 3 }),
             (Interface::Surface, Request::LockPointer { surface: 3, on: true }),
             (Interface::Surface, Request::LockPointer { surface: 3, on: false }),
+            (Interface::Surface, Request::SetResizable { surface: 3, min_w: 100, min_h: 50 }),
+            (Interface::Surface, Request::SetPanel { surface: 3, height: 32 }),
+            (Interface::Surface, Request::Activate { surface: 3, toplevel: 7 }),
         ]
     }
 
@@ -284,6 +339,11 @@ mod tests {
             (Interface::Surface, Event::Motion { surface: 3, x: -2, y: 7 }),
             (Interface::Surface, Event::Button { surface: 3, code: 0x110, pressed: true }),
             (Interface::Surface, Event::RelativeMotion { surface: 3, dx: -5, dy: 12 }),
+            (Interface::Surface, Event::Resize { surface: 3, width: 800, height: 600 }),
+            (Interface::Surface, Event::Close { surface: 3 }),
+            (Interface::Surface, Event::Toplevel { surface: 3, id: 2, title: "term".into() }),
+            (Interface::Surface, Event::ToplevelFocus { surface: 3, id: 0 }),
+            (Interface::Surface, Event::ToplevelGone { surface: 3, id: 2 }),
             (Interface::Callback, Event::Done { callback: 8, ms: 1234 }),
         ];
         let mut e = Encoder::new();
@@ -304,7 +364,7 @@ mod tests {
     #[test]
     fn wrong_opcode_or_arguments() {
         let mut e = Encoder::new();
-        e.begin(3, 9).end(); // surface has no opcode 9
+        e.begin(3, 99).end(); // surface has no opcode 99
         e.begin(3, 3).uint(1).end(); // commit takes no arguments
         e.begin(1, 0).uint(2).uint(4096).end(); // create_pool without its fd
         let (bytes, _) = e.take();

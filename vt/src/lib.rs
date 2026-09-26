@@ -47,6 +47,12 @@ impl Terminal {
         Terminal { grid: Grid::new(cols, rows), parser: Parser::new() }
     }
 
+    /// A new size for the grid (see [`Grid::resize`]); the pty's own
+    /// `TIOCSWINSZ` is the caller's.
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        self.grid.resize(cols, rows);
+    }
+
     /// Bytes read from the pty master.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.feed(&mut self.grid, bytes);

@@ -17,7 +17,13 @@
 //!   repeated while held (the protocol has no key repeat of its own);
 //! - the master reads `EIO` or end of file (every slave closed: ash is
 //!   gone) or the compositor goes away → the terminal exits, and closing
-//!   the master hangs up whatever was still on the slave.
+//!   the master hangs up whatever was still on the slave;
+//! - `resize` (phase 4: the window is resizable) → as many whole cells as
+//!   fit, `Terminal::resize`, a new pool, and `TIOCSWINSZ` on the master,
+//!   whose `SIGWINCH` tells `vi`/`less`/`top` (the window then shrinks to
+//!   the whole cells: the buffer has the last word);
+//! - `close` (the title bar's button) → the terminal exits, which is the
+//!   hangup: ash gets `SIGHUP` and goes.
 //!
 //! The font is the one the kernel console would pick for this screen,
 //! which the compositor tells us indirectly: its `configure` suggests
@@ -39,10 +45,12 @@ const BUFFER: u32 = 3;
 const SURFACE: u32 = 4;
 const FIRST_CALLBACK: u32 = 16;
 
-/// The compositor's title bar and the cascade offset of a first window
-/// (`gui::compositor`), kept free so the window fits on screen.
-const TITLE_H: usize = gui::compositor::TITLE_H as usize;
+/// The cascade offset of a first window (`gui::compositor`), kept free
+/// so the window fits on screen, with the title bar.
 const PLACEMENT: usize = 40;
+/// The smallest window `set_resizable` allows, in cells.
+const MIN_COLS: usize = 20;
+const MIN_ROWS: usize = 4;
 
 const O_RDWR: i32 = 2;
 const O_NONBLOCK: i32 = 0o4000;
@@ -74,6 +82,42 @@ struct Winsize {
     cols: u16,
     xpixel: u16,
     ypixel: u16,
+}
+
+/// A `w x h` pixel pool: the memfd (for `create_pool`, then closed), its
+/// mapping and its pixels.
+struct Pool {
+    fd: i32,
+    base: u64,
+    size: u64,
+    px: &'static mut [u32],
+}
+
+fn new_pool(w: usize, h: usize) -> Option<Pool> {
+    let size = (w * h * 4) as u64;
+    let fd = syscall::memfd_create(b"term\0", 0) as i32;
+    let base = if fd >= 0 && syscall::ftruncate(fd, size) == 0 {
+        syscall::mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
+    } else {
+        -1
+    };
+    if base <= 0 {
+        if fd >= 0 {
+            syscall::close(fd);
+        }
+        return None;
+    }
+    let px = unsafe { core::slice::from_raw_parts_mut(base as *mut u32, w * h) };
+    Some(Pool { fd, base: base as u64, size, px })
+}
+
+/// The requests that make `pool` the surface's buffer (`w x h`).
+fn pool_requests(pool: &Pool, w: usize, h: usize) -> [Request; 2] {
+    let (wi, hi) = (w as i32, h as i32);
+    [
+        Request::CreatePool { id: POOL, fd: pool.fd, size: pool.size as u32 },
+        Request::CreateBuffer { pool: POOL, id: BUFFER, offset: 0, width: wi, height: hi, stride: wi * 4, format: FORMAT_XRGB8888 },
+    ]
 }
 
 fn parse(b: Option<&[u8]>, default: usize) -> usize {
@@ -219,21 +263,15 @@ fn main(args: Args) -> i32 {
     let font = Font::for_screen_height(screen_h);
     let (cw, ch) = font.cell();
     let cols = want_cols.min(screen_w.saturating_sub(PLACEMENT) / cw).max(2);
-    let rows = want_rows.min(screen_h.saturating_sub(PLACEMENT + TITLE_H) / ch).max(2);
-    let (w, h) = (cols * cw, rows * ch);
+    let title_h = gui::compositor::title_height_for(screen_h as i32) as usize;
+    let rows = want_rows.min(screen_h.saturating_sub(PLACEMENT + title_h) / ch).max(2);
+    let (mut cols, mut rows) = (cols, rows);
+    let (mut w, mut h) = (cols * cw, rows * ch);
 
-    let size = (w * h * 4) as u64;
-    let mfd = syscall::memfd_create(b"term\0", 0) as i32;
-    let base = if mfd >= 0 && syscall::ftruncate(mfd, size) == 0 {
-        syscall::mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0)
-    } else {
-        -1
-    };
-    if base <= 0 {
+    let Some(mut pool) = new_pool(w, h) else {
         println!("term: cannot create the pool");
         return 1;
-    }
-    let px = unsafe { core::slice::from_raw_parts_mut(base as *mut u32, w * h) };
+    };
 
     let ws = Winsize { rows: rows as u16, cols: cols as u16, xpixel: w as u16, ypixel: h as u16 };
     let Some((master, slave_path)) = open_pty(&ws) else {
@@ -256,18 +294,20 @@ fn main(args: Args) -> i32 {
     let mut cb = FIRST_CALLBACK;
 
     let damage = term.grid.take_damage();
-    render(&term.grid, &damage, &font, focused, px, w);
+    render(&term.grid, &damage, &font, focused, pool.px, w);
     let (wi, hi) = (w as i32, h as i32);
+    let [cp, cbuf] = pool_requests(&pool, w, h);
     let ok = send(sock, &[
-        Request::CreatePool { id: POOL, fd: mfd, size: size as u32 },
-        Request::CreateBuffer { pool: POOL, id: BUFFER, offset: 0, width: wi, height: hi, stride: wi * 4, format: FORMAT_XRGB8888 },
+        cp,
+        cbuf,
         Request::SetTitle { surface: SURFACE, title: "term".into() },
+        Request::SetResizable { surface: SURFACE, min_w: (MIN_COLS * cw) as i32, min_h: (MIN_ROWS * ch) as i32 },
         Request::Attach { surface: SURFACE, buffer: BUFFER },
         Request::Damage { surface: SURFACE, x: 0, y: 0, w: wi, h: hi },
         Request::Frame { surface: SURFACE, id: cb },
         Request::Commit { surface: SURFACE },
     ]);
-    syscall::close(mfd);
+    syscall::close(pool.fd);
     if !ok {
         return 1;
     }
@@ -359,6 +399,42 @@ fn main(args: Args) -> i32 {
                         }
                         dirty = true; // the cursor shows only when focused
                     }
+                    Event::Resize { width, height, .. } => {
+                        let nc = (width.max(1) as usize / cw).max(MIN_COLS.min(cols));
+                        let nr = (height.max(1) as usize / ch).max(MIN_ROWS.min(rows));
+                        // Even with the same cells a new buffer goes out:
+                        // it is what tells the compositor this is the
+                        // answer, and the window goes back to whole cells.
+                        let (nw, nh) = (nc * cw, nr * ch);
+                        let Some(np) = new_pool(nw, nh) else {
+                            println!("term: cannot create a {}x{} pool", nw, nh);
+                            continue;
+                        };
+                        let [cp, cbuf] = pool_requests(&np, nw, nh);
+                        let ok = send(sock, &[Request::DestroyBuffer { buffer: BUFFER }, Request::DestroyPool { pool: POOL }, cp, cbuf]);
+                        syscall::close(np.fd);
+                        syscall::munmap(pool.base, pool.size);
+                        pool = np;
+                        if !ok {
+                            println!("term: compositor gone, bye");
+                            return 0;
+                        }
+                        if (nc, nr) != (cols, rows) {
+                            term.resize(nc, nr);
+                        }
+                        (cols, rows, w, h) = (nc, nr, nw, nh);
+                        // The new pool is blank: every row is drawn again.
+                        term.grid.mark_all();
+                        println!("term: resized to {}x{} cells", cols, rows);
+                        let ws = Winsize { rows: rows as u16, cols: cols as u16, xpixel: w as u16, ypixel: h as u16 };
+                        syscall::ioctl(master, TIOCSWINSZ, &ws as *const Winsize as u64);
+                        released = true; // a fresh buffer
+                        dirty = true;
+                    }
+                    Event::Close { .. } => {
+                        println!("term: closed from the title bar, bye");
+                        return 0;
+                    }
                     Event::Error { object, code, message } => {
                         println!("term: error {} on {}: {}", code, object, message);
                         return 1;
@@ -378,7 +454,7 @@ fn main(args: Args) -> i32 {
 
         if dirty && released && frame_due {
             let damage = term.grid.take_damage();
-            if let Some(r) = render(&term.grid, &damage, &font, focused, px, w) {
+            if let Some(r) = render(&term.grid, &damage, &font, focused, pool.px, w) {
                 cb += 1;
                 let ok = send(sock, &[
                     Request::Attach { surface: SURFACE, buffer: BUFFER },

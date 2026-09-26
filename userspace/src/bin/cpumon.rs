@@ -7,7 +7,8 @@
 //! the same `sched::cputime` code the kernel renders it with),
 //! `/proc/<pid>/stat`, `/proc/meminfo`, `/proc/loadavg`, `/proc/uptime`,
 //! `/proc/cpuinfo` — so it is also a running check that they say something
-//! true. A sample every half second; the picture is a 640x460 layout drawn
+//! true. A sample every half second; the picture is a layout (640x460 to
+//! start with, resizable in a window: the tiles share the space) drawn
 //! with `draw`, its text proportional Noto Sans through `userspace::text`
 //! (parley + swash; `draw::smooth`'s bitmap Noto Mono without the fonts on
 //! `/mnt`) at the screen's scale (`gfx::HIDPI`: 1280x920 on 1080p, fonts
@@ -31,14 +32,18 @@ use draw::color::{hsv, mix, scale};
 use draw::Canvas;
 use sched::cputime::{parse_stat_line, permille, CpuTimes};
 use userspace::args::Args;
-use userspace::gfx::{Gfx, EV_KEY, HIDPI};
+use userspace::gfx::{Gfx, EV_GFX, EV_KEY, GFX_CLOSE, GFX_RESIZE, HIDPI};
 use userspace::text::{Style, Text, SANS};
 use userspace::{entry, println, syscall};
 
 entry!(main);
 
+/// The layout's size when it opens, and the smallest the window can be
+/// resized to, in logical pixels.
 const W: usize = 640;
 const H: usize = 460;
+const MIN_W: usize = 560;
+const MIN_H: usize = 380;
 /// Samples of history kept per graph (a minute at `PERIOD_MS`).
 const HIST: usize = 120;
 const PERIOD_MS: i64 = 500;
@@ -595,10 +600,12 @@ fn grid_shape(n: usize, w: i32, h: i32) -> (i32, i32) {
     (best.0, best.1)
 }
 
-fn draw(cv: &mut Canvas, ui: &mut Ui, st: &State) {
+/// The picture at `w x h` logical pixels: header and bottom panels keep
+/// their height, the CPU tiles share what is left (`grid_shape`).
+fn draw(cv: &mut Canvas, ui: &mut Ui, st: &State, w: usize, h: usize) {
     let k = ui.k;
     let d = |v: i32| v * k;
-    let (w, h) = (W as i32, H as i32);
+    let (w, h) = (w as i32, h as i32);
     cv.fill(BG);
 
     // Header.
@@ -705,8 +712,9 @@ fn main(args: Args) -> i32 {
         return 1;
     };
     let k = gfx.scale();
-    let (fw, fh) = (W * k, H * k);
-    let mut frame = vec![0u32; fw * fh];
+    gfx.resizable(MIN_W, MIN_H);
+    let (mut w, mut h) = gfx.size();
+    let mut frame = vec![0u32; w * k * h * k];
     let mut ui = Ui::new(k as i32);
     if !ui.t.fonts() {
         println!("cpumon: no fonts in {}, bitmap text", userspace::text::FONT_DIR);
@@ -721,6 +729,14 @@ fn main(args: Args) -> i32 {
             if ev.kind == EV_KEY && ev.value != 0 && (ev.code == KEY_ESC || ev.code == KEY_Q) {
                 return 0;
             }
+            if ev.kind == EV_GFX && ev.code == GFX_CLOSE {
+                return 0;
+            }
+            if ev.kind == EV_GFX && ev.code == GFX_RESIZE {
+                (w, h) = gfx.size();
+                frame = vec![0u32; w * k * h * k];
+                dirty = true;
+            }
         }
         let now = syscall::uptime_ms();
         if now >= next {
@@ -732,8 +748,9 @@ fn main(args: Args) -> i32 {
             dirty = true;
         }
         if dirty {
+            let (fw, fh) = (w * k, h * k);
             let mut cv = Canvas::new(&mut frame, fw, fh, fw);
-            draw(&mut cv, &mut ui, &st);
+            draw(&mut cv, &mut ui, &st, w, h);
             gfx.present(&frame);
             dirty = false;
         }

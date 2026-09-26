@@ -41,6 +41,8 @@ fn main() {
     sync_disk_tree(&disk_image, "usr/share/terminfo");
     ensure_fonts();
     sync_disk_tree(&disk_image, "usr/share/fonts");
+    // The panel's launcher list (phase 4 of docs/gui/gui-plan.md).
+    sync_disk_tree(&disk_image, "etc/gui");
 
     // pass the disk image paths as env variables to the `main.rs`
     println!("cargo:rustc-env=UEFI_PATH={}", uefi_path.display());
@@ -542,6 +544,7 @@ fn build_kernel() -> PathBuf {
     watch_dir_recursive(&manifest_dir.join("quake-port"));
     watch_dir_recursive(&manifest_dir.join("scripts"));
     watch_dir_recursive(&manifest_dir.join("busybox-config"));
+    watch_dir_recursive(&manifest_dir.join("disk-image-root/etc"));
     println!("cargo:rerun-if-changed={}", kernel_dir.join("Cargo.toml").display());
     println!("cargo:rerun-if-changed={}", kernel_dir.join(".cargo/config.toml").display());
     println!("cargo:rerun-if-changed={}", kernel_dir.join("build.rs").display());

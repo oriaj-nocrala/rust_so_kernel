@@ -171,6 +171,12 @@ fn main(args: Args) -> i32 {
                 Event::RelativeMotion { dx, dy, .. } => println!("gui_demo: relative {},{}", dx, dy),
                 Event::Focus { focused, .. } => println!("gui_demo: focus {}", if focused { "in" } else { "out" }),
                 Event::Configure { width, height, .. } => println!("gui_demo: configure {}x{}", width, height),
+                Event::Close { .. } => {
+                    println!("gui_demo: close, bye after {} frames", frames);
+                    return 0;
+                }
+                // Resize never comes (not resizable), toplevel* are the panel's.
+                Event::Resize { .. } | Event::Toplevel { .. } | Event::ToplevelFocus { .. } | Event::ToplevelGone { .. } => {}
                 Event::Error { object, code, message } => {
                     println!("gui_demo: error {} on {}: {}", code, object, message);
                     return 1;

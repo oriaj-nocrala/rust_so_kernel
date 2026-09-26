@@ -52,7 +52,6 @@ const RUST_PROGRAMS: &[(&str, &str)] = &[
     ("reboot",     "reboot.elf"),
     ("userlib_test", "userlib_test.elf"),
     ("sse_test",   "sse_test.elf"),
-    ("compositor", "compositor.elf"),
     ("gui_demo",   "gui_demo.elf"),
     ("term",       "term.elf"),
 ];
@@ -64,6 +63,9 @@ const RUST_PROGRAMS: &[(&str, &str)] = &[
 const DISK_RUST_PROGRAMS: &[&str] = &[
     "textdemo",
     "cpumon",
+    // Window titles through the text engine (phase 4 of docs/gui/gui-plan.md).
+    "compositor",
+    "panel",
 ];
 
 /// C binaries that stay embedded in the kernel: (source file stem, embedded

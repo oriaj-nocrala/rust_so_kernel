@@ -1,5 +1,5 @@
 //! The compositor's state: clients, their objects, surfaces, stacking,
-//! focus, the pointer, and [`Compositor::compose`].
+//! focus, the pointer, window management, and [`Compositor::compose`].
 //!
 //! **Driving it.** The program around it (phase 2.5) calls
 //! [`Compositor::add_client`] on `accept`, [`Compositor::client_data`] with
@@ -33,6 +33,34 @@
 //! in the window takes it back). While active the pointer does not move:
 //! motion goes to the surface as `relative_motion`, and every button to it
 //! too, with no title-bar dragging or focus changes.
+//!
+//! **Window management** (phase 4 of `docs/gui/gui-plan.md`).
+//!
+//! - *The frame has a size of its own.* A window's content box
+//!   (`fw x fh`) is normally its buffer's size, but the compositor sets it
+//!   when it maximizes or finishes a resize, sends `resize(fw, fh)`, and
+//!   keeps showing the old content — the rest filled with
+//!   [`WINDOW_BG`] — until the client answers. The answer is any buffer
+//!   *created after* the `resize` was sent: its size becomes the frame's,
+//!   whatever it is (a terminal rounds to whole cells), so the client has
+//!   the last word. A buffer from before — a frame drawn before the
+//!   client read the event — does not snap the frame back. This stands in
+//!   for Wayland's `ack_configure`, which the protocol does without.
+//! - *Decorations are drawn here*, not by clients: a title bar with the
+//!   title, a close button and, for a resizable window, maximize. This
+//!   crate decides the geometry and paints bars and buttons; the title's
+//!   text is painted by the caller's closure ([`Compositor::compose_with`]),
+//!   since this crate knows no fonts. Sizes scale with the screen
+//!   ([`scale_for`]).
+//! - *Only a window that sent `set_resizable` can be resized or
+//!   maximized*: it gets an invisible border and a grip in its bottom-right
+//!   corner. Dragging them draws an outline only; the release sends one
+//!   `resize`. Double-click on the title bar toggles maximize.
+//! - *Close* sends `close`; the client decides. Nothing here kills.
+//! - *The panel* (`set_panel`) is a strip along the bottom: undecorated,
+//!   above every window, outside the work area (maximize and placement
+//!   avoid it), never focused (a click in it leaves the focus where it
+//!   was). It alone gets the window list, with ids of the compositor's own.
 
 use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
@@ -52,15 +80,24 @@ pub trait PoolMem {
     fn len(&self) -> usize;
 }
 
+/// Title bar height at scale 1; see [`title_height_for`].
 pub const TITLE_H: i32 = 20;
 pub const BACKGROUND: u32 = 0x0020_3040;
 pub const TITLE_FOCUSED: u32 = 0x0050_78B0;
 pub const TITLE_UNFOCUSED: u32 = 0x0050_5058;
+/// Where a window's content is not covered by its buffer (between a
+/// `resize` and the client's answer).
+pub const WINDOW_BG: u32 = 0x0018_1818;
+pub const BUTTON_FG: u32 = 0x00E8_E8E8;
+pub const CLOSE_PRESSED: u32 = 0x00C0_3030;
+pub const OUTLINE: u32 = 0x00E0_E0E0;
 /// Largest surface side accepted.
 pub const MAX_SIDE: i32 = 8192;
 pub const MAX_OBJECTS: usize = 512;
 /// Most rectangles `compose` reports (`FBIO_FLUSH` takes 16 per call).
 pub const MAX_FLUSH_RECTS: usize = 16;
+/// Two presses on a title bar closer than this are a double click.
+pub const DOUBLE_CLICK_MS: u32 = 400;
 
 pub const BTN_LEFT: u32 = 0x110;
 const KEY_BACKSPACE: u32 = 14;
@@ -68,6 +105,18 @@ const KEY_LEFTCTRL: u32 = 29;
 const KEY_RIGHTCTRL: u32 = 97;
 const KEY_LEFTALT: u32 = 56;
 const KEY_RIGHTALT: u32 = 100;
+
+/// The factor decorations are drawn at on a screen `height` pixels tall —
+/// 1 up to 1079, 2 at 1080p, 3 at 1620 and above: the same steps as a
+/// `gfx::HIDPI` program's scale on that screen.
+pub fn scale_for(height: i32) -> i32 {
+    (height / 540).clamp(1, 3)
+}
+
+/// The title bar's height on a screen `height` pixels tall.
+pub fn title_height_for(height: i32) -> i32 {
+    TITLE_H * scale_for(height)
+}
 
 /// The software cursor: `X` black, `.` white, space transparent. Hotspot
 /// at its top-left corner.
@@ -92,10 +141,44 @@ const CURSOR: [&[u8; 11]; 16] = [
 pub const CURSOR_W: i32 = 11;
 pub const CURSOR_H: i32 = 16;
 
+/// Which sides of a window a resize drag moves.
+pub const EDGE_LEFT: u8 = 1;
+pub const EDGE_RIGHT: u8 = 2;
+pub const EDGE_TOP: u8 = 4;
+pub const EDGE_BOTTOM: u8 = 8;
+
+/// What a point on screen is, for the pointer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Zone {
+    Content,
+    Title,
+    Close,
+    Maximize,
+    /// A resize border or grip: `EDGE_*` bits.
+    Edge(u8),
+}
+
+/// What [`Compositor::compose_with`] asks the caller to paint: a window's
+/// title, left-aligned in `area` (screen coordinates, the bar's full
+/// height), over the bar's colour for `focused`. `id` is the window's
+/// toplevel id, stable while it is mapped — a cache key.
+/// The closure that paints a title: `(title, clip, dst, stride)`.
+pub type PaintTitle<'a> = dyn FnMut(&TitleText, Rect, &mut [u32], usize) + 'a;
+
+pub struct TitleText<'a> {
+    pub id: u32,
+    pub title: &'a str,
+    pub focused: bool,
+    pub area: Rect,
+}
+
 /// A buffer: a window into a pool. The pool's memory lives as long as any
 /// buffer of it, even after the pool is destroyed (Wayland's rule).
 struct BufRef<M> {
     id: u32,
+    /// Creation order, compositor-wide: tells an answer to a `resize`
+    /// from a buffer that predates it.
+    serial: u64,
     mem: Rc<M>,
     offset: usize,
     w: i32,
@@ -105,7 +188,7 @@ struct BufRef<M> {
 
 impl<M> Clone for BufRef<M> {
     fn clone(&self) -> Self {
-        BufRef { id: self.id, mem: self.mem.clone(), offset: self.offset, w: self.w, h: self.h, stride: self.stride }
+        BufRef { id: self.id, serial: self.serial, mem: self.mem.clone(), offset: self.offset, w: self.w, h: self.h, stride: self.stride }
     }
 }
 
@@ -120,23 +203,52 @@ struct Surface<M> {
     store: Vec<u32>,
     w: i32,
     h: i32,
+    /// The content box on screen, which a resize or maximize sets ahead of
+    /// the client's buffer.
+    fw: i32,
+    fh: i32,
+    /// A `resize` sent and not answered yet: the buffer serial at the time;
+    /// only a buffer created after it answers.
+    resize_pending: Option<u64>,
     mapped: bool,
     /// The client asked for the pointer (`lock_pointer`).
     wants_lock: bool,
+    /// `set_resizable`'s minimum content size.
+    resizable: Option<(i32, i32)>,
+    /// Geometry (`x, y, fw, fh`) to go back to when unmaximized.
+    maximized: Option<Rect>,
+    /// Has a title bar (every window but the panel).
+    decorated: bool,
+    /// Toplevel id while mapped as a window, 0 otherwise.
+    tid: u32,
     /// Top-left of the window's frame (title bar included).
     x: i32,
     y: i32,
 }
 
+/// Frame geometry, from a surface and the title bar's height.
 impl<M> Surface<M> {
-    fn frame(&self) -> Rect {
-        Rect::new(self.x, self.y, self.w, self.h + TITLE_H)
+    fn th(&self, th: i32) -> i32 {
+        if self.decorated { th } else { 0 }
     }
-    fn content(&self) -> Rect {
-        Rect::new(self.x, self.y + TITLE_H, self.w, self.h)
+    fn frame(&self, th: i32) -> Rect {
+        Rect::new(self.x, self.y, self.fw, self.fh + self.th(th))
     }
-    fn title_bar(&self) -> Rect {
-        Rect::new(self.x, self.y, self.w, TITLE_H)
+    fn content(&self, th: i32) -> Rect {
+        Rect::new(self.x, self.y + self.th(th), self.fw, self.fh)
+    }
+    fn title_bar(&self, th: i32) -> Rect {
+        Rect::new(self.x, self.y, self.fw, self.th(th))
+    }
+    /// The close button, then maximize (resizable only), from the right.
+    fn close_button(&self, th: i32) -> Rect {
+        Rect::new(self.x + self.fw - th, self.y, th.min(self.fw), self.th(th))
+    }
+    fn max_button(&self, th: i32) -> Option<Rect> {
+        self.resizable.map(|_| Rect::new(self.x + self.fw - 2 * th, self.y, th, self.th(th)))
+    }
+    fn buttons_left(&self, th: i32) -> i32 {
+        self.x + self.fw - if self.resizable.is_some() { 2 * th } else { th }
     }
 }
 
@@ -172,16 +284,47 @@ struct Drag {
     dy: i32,
 }
 
+struct ResizeDrag {
+    key: Key,
+    edges: u8,
+    /// Pointer where the drag began.
+    px: i32,
+    py: i32,
+    /// Content box (`x, y` of the frame, `fw x fh`) when it began.
+    start: Rect,
+    /// The frame the outline shows now.
+    outline: Rect,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ButtonKind {
+    Close,
+    Maximize,
+}
+
 pub struct Compositor<M> {
     width: i32,
     height: i32,
+    scale: i32,
+    th: i32,
     clients: BTreeMap<ClientId, Client<M>>,
     next_client: ClientId,
-    /// Mapped surfaces, bottom to top.
+    /// Mapped windows, bottom to top. The panel is not in it.
     stack: Vec<Key>,
+    /// The panel's surface and its height.
+    panel: Option<(Key, i32)>,
+    /// Mapped windows by toplevel id, in the order they appeared.
+    toplevels: Vec<(u32, Key)>,
+    next_tid: u32,
     focus: Option<Key>,
     pointer: (i32, i32),
     drag: Option<Drag>,
+    resize: Option<ResizeDrag>,
+    /// A title-bar button held down.
+    pressed: Option<(Key, ButtonKind)>,
+    /// The last press on a title bar, for double clicks.
+    last_title_press: Option<(Key, u32)>,
+    now_ms: u32,
     /// Where a content-area press went, so its release goes there too.
     button_target: Option<Key>,
     /// The surface the pointer is locked to, if the lock is active.
@@ -190,6 +333,7 @@ pub struct Compositor<M> {
     alt: u8,
     quit: bool,
     placed: i32,
+    buffers_created: u64,
     damage: Region,
     frame_waiting: Vec<(ClientId, u32)>,
     events: Vec<(ClientId, Event)>,
@@ -199,21 +343,32 @@ pub struct Compositor<M> {
 
 impl<M: PoolMem> Compositor<M> {
     pub fn new(width: i32, height: i32) -> Self {
+        let scale = scale_for(height);
         Compositor {
             width,
             height,
+            scale,
+            th: TITLE_H * scale,
             clients: BTreeMap::new(),
             next_client: 1,
             stack: Vec::new(),
+            panel: None,
+            toplevels: Vec::new(),
+            next_tid: 1,
             focus: None,
             pointer: (width / 2, height / 2),
             drag: None,
+            resize: None,
+            pressed: None,
+            last_title_press: None,
+            now_ms: 0,
             button_target: None,
             locked: None,
             ctrl: 0,
             alt: 0,
             quit: false,
             placed: 0,
+            buffers_created: 0,
             // The first compose paints everything.
             damage: Region::from_rect(Rect::new(0, 0, width, height)),
             frame_waiting: Vec::new(),
@@ -225,6 +380,31 @@ impl<M: PoolMem> Compositor<M> {
 
     fn screen(&self) -> Rect {
         Rect::new(0, 0, self.width, self.height)
+    }
+
+    /// The screen minus the panel: where windows are placed and maximized.
+    pub fn work_area(&self) -> Rect {
+        let ph = self.panel.map_or(0, |(_, h)| h);
+        Rect::new(0, 0, self.width, self.height - ph)
+    }
+
+    /// The title bar's height on this screen.
+    pub fn title_height(&self) -> i32 {
+        self.th
+    }
+
+    fn border(&self) -> i32 {
+        4 * self.scale
+    }
+
+    fn grip(&self) -> i32 {
+        12 * self.scale
+    }
+
+    /// The host's clock, in ms, for double clicks: call it before feeding
+    /// input.
+    pub fn set_time(&mut self, ms: u32) {
+        self.now_ms = ms;
     }
 
     // ── clients ───────────────────────────────────────────────────────────
@@ -245,10 +425,11 @@ impl<M: PoolMem> Compositor<M> {
     pub fn remove_client(&mut self, c: ClientId) {
         let Some(mut client) = self.clients.remove(&c) else { return };
         self.fds_to_close.extend(client.decoder.drain_fds());
+        let th = self.th;
         for (id, obj) in &client.objects {
             if let Object::Surface(s) = obj {
                 if s.mapped {
-                    self.damage.add(s.frame());
+                    self.damage.add(s.frame(th));
                 }
                 self.forget_surface((c, *id));
             }
@@ -329,6 +510,13 @@ impl<M: PoolMem> Compositor<M> {
         }
     }
 
+    /// An event for the panel's surface, if there is a panel.
+    fn tell_panel(&mut self, ev: impl FnOnce(u32) -> Event) {
+        if let Some(((c, sid), _)) = self.panel {
+            self.events.push((c, ev(sid)));
+        }
+    }
+
     fn handle(&mut self, c: ClientId, req: Request, map: &mut impl FnMut(i32, usize) -> Option<M>) {
         match req {
             Request::CreatePool { id, fd, size } => {
@@ -351,8 +539,15 @@ impl<M: PoolMem> Compositor<M> {
                     store: Vec::new(),
                     w: 0,
                     h: 0,
+                    fw: 0,
+                    fh: 0,
+                    resize_pending: None,
                     mapped: false,
                     wants_lock: false,
+                    resizable: None,
+                    maximized: None,
+                    decorated: true,
+                    tid: 0,
                     x: 0,
                     y: 0,
                 };
@@ -383,7 +578,8 @@ impl<M: PoolMem> Compositor<M> {
                 if !fits {
                     return self.fail(c, pool, ErrorCode::InvalidBuffer, "buffer outside its pool");
                 }
-                let b = BufRef { id, mem, offset: offset as usize, w: width, h: height, stride: stride as usize };
+                self.buffers_created += 1;
+                let b = BufRef { id, serial: self.buffers_created, mem, offset: offset as usize, w: width, h: height, stride: stride as usize };
                 self.new_object(c, id, Object::Buffer(b));
             }
             Request::DestroyPool { pool } | Request::DestroyBuffer { buffer: pool } => self.destroy_object(c, pool),
@@ -416,7 +612,16 @@ impl<M: PoolMem> Compositor<M> {
                     }
                     t.truncate(end);
                 }
-                self.surface_mut((c, surface)).unwrap().title = t;
+                let th = self.th;
+                let s = self.surface_mut((c, surface)).unwrap();
+                s.title = t.clone();
+                let (mapped, bar, tid) = (s.mapped, s.title_bar(th), s.tid);
+                if mapped {
+                    self.damage.add(bar);
+                }
+                if tid != 0 {
+                    self.tell_panel(|p| Event::Toplevel { surface: p, id: tid, title: t });
+                }
             }
             Request::LockPointer { surface, on } => {
                 let key = (c, surface);
@@ -427,11 +632,47 @@ impl<M: PoolMem> Compositor<M> {
                     self.locked = Some(key);
                 }
             }
+            Request::SetResizable { surface, min_w, min_h } => {
+                let th = self.th;
+                let s = self.surface_mut((c, surface)).unwrap();
+                s.resizable = Some((min_w.clamp(1, MAX_SIDE), min_h.clamp(1, MAX_SIDE)));
+                let (mapped, bar) = (s.mapped, s.title_bar(th));
+                if mapped {
+                    self.damage.add(bar); // a maximize button appears
+                }
+            }
+            Request::SetPanel { surface, height } => {
+                let key = (c, surface);
+                let taken = self.panel.is_some_and(|(k, _)| k != key);
+                if taken || self.surface(key).unwrap().mapped {
+                    return self.fail(c, surface, ErrorCode::Role, "panel role taken, or surface already a window");
+                }
+                let h = height.clamp(1, (self.height / 2).max(1));
+                let s = self.surface_mut(key).unwrap();
+                s.decorated = false;
+                s.resizable = None;
+                self.panel = Some((key, h));
+                self.events.push((c, Event::Configure { surface, width: self.width, height: h }));
+                for (tid, k) in self.toplevels.clone() {
+                    let title = self.surface(k).map(|s| s.title.clone()).unwrap_or_default();
+                    self.events.push((c, Event::Toplevel { surface, id: tid, title }));
+                }
+                let fid = self.focus.and_then(|k| self.surface(k)).map_or(0, |s| s.tid);
+                self.events.push((c, Event::ToplevelFocus { surface, id: fid }));
+            }
+            Request::Activate { surface, toplevel } => {
+                if self.panel.is_some_and(|(k, _)| k == (c, surface)) {
+                    if let Some(&(_, k)) = self.toplevels.iter().find(|(t, _)| *t == toplevel) {
+                        self.raise(k);
+                        self.set_focus(Some(k));
+                    }
+                }
+            }
             Request::DestroySurface { surface } => {
                 let key = (c, surface);
                 if let Some(s) = self.surface(key) {
                     if s.mapped {
-                        self.damage.add(s.frame());
+                        self.damage.add(s.frame(self.th));
                     }
                 }
                 self.forget_surface(key);
@@ -444,7 +685,10 @@ impl<M: PoolMem> Compositor<M> {
     fn commit(&mut self, key: Key) {
         let (c, _) = key;
         let placed = self.placed;
-        let (sw, sh) = (self.width, self.height);
+        let th = self.th;
+        let work = self.work_area();
+        let panel = self.panel.filter(|(k, _)| *k == key).map(|(_, h)| h);
+        let sh = self.height;
         let s = self.surface_mut(key).unwrap();
         let frames = core::mem::take(&mut s.pending_frames);
         let damage = core::mem::take(&mut s.pending_damage);
@@ -456,49 +700,73 @@ impl<M: PoolMem> Compositor<M> {
             None => {}
             Some(None) => {
                 if s.mapped {
-                    screen_damage.add(s.frame());
+                    screen_damage.add(s.frame(th));
                     s.mapped = false;
                     unmapped = true;
                 }
             }
             Some(Some(b)) => {
                 let mut dmg = damage;
-                if b.w != s.w || b.h != s.h {
-                    if s.mapped {
-                        screen_damage.add(s.frame()); // the old size
-                    }
+                let new_size = b.w != s.w || b.h != s.h;
+                if new_size {
                     s.w = b.w;
                     s.h = b.h;
                     s.store = alloc::vec![0; (b.w * b.h) as usize];
                     dmg = Region::from_rect(Rect::new(0, 0, b.w, b.h));
                 }
+                // The frame follows the buffer, except for one from before
+                // our `resize` (see the module doc).
+                let answers = s.resize_pending.is_none_or(|ser| b.serial > ser);
+                if answers {
+                    s.resize_pending = None;
+                    if (s.fw, s.fh) != (b.w, b.h) {
+                        if s.mapped {
+                            screen_damage.add(s.frame(th)); // the old frame
+                        }
+                        s.fw = b.w;
+                        s.fh = b.h;
+                        screen_damage.add(s.frame(th));
+                    }
+                }
                 if !s.mapped {
                     dmg = Region::from_rect(Rect::new(0, 0, b.w, b.h));
-                    // Cascade from the top-left, kept on screen.
-                    let step = 32 * (placed % 8);
-                    s.x = (40 + step).min((sw - b.w).max(0));
-                    s.y = (40 + step).min((sh - b.h - TITLE_H).max(0));
+                    if let Some(ph) = panel {
+                        s.x = 0;
+                        s.y = sh - ph;
+                    } else {
+                        // Cascade from the top-left, kept in the work area.
+                        let step = 32 * (placed % 8);
+                        s.x = (work.x + 40 + step).min((work.right() - b.w).max(work.x));
+                        s.y = (work.y + 40 + step).min((work.bottom() - b.h - th).max(work.y));
+                    }
                     s.mapped = true;
                     newly_mapped = true;
                 }
                 dmg.intersect(Rect::new(0, 0, b.w, b.h));
                 copy_damage(&b, &mut s.store, &dmg);
                 let mut on_screen = dmg.clone();
-                on_screen.translate(s.x, s.y + TITLE_H);
+                let content = s.content(th);
+                on_screen.translate(content.x, content.y);
                 screen_damage.add_region(&on_screen);
                 if newly_mapped {
-                    screen_damage.add(s.title_bar());
+                    screen_damage.add(s.frame(th));
                 }
                 released = Some(b.id);
             }
         }
+        let title = s.title.clone();
         self.damage.add_region(&screen_damage);
         if let Some(id) = released {
             self.events.push((c, Event::Release { buffer: id }));
         }
         self.frame_waiting.extend(frames.into_iter().map(|id| (c, id)));
-        if newly_mapped {
+        if newly_mapped && panel.is_none() {
             self.placed += 1;
+            let tid = self.next_tid;
+            self.next_tid += 1;
+            self.surface_mut(key).unwrap().tid = tid;
+            self.toplevels.push((tid, key));
+            self.tell_panel(|p| Event::Toplevel { surface: p, id: tid, title });
             self.stack.push(key);
             self.set_focus(Some(key));
         }
@@ -507,11 +775,31 @@ impl<M: PoolMem> Compositor<M> {
         }
     }
 
-    /// Takes `key` out of the stack and of every input role it had.
+    /// Takes `key` out of the stack, the window list and every input role
+    /// it had.
     fn forget_surface(&mut self, key: Key) {
         self.stack.retain(|k| *k != key);
+        if let Some(i) = self.toplevels.iter().position(|(_, k)| *k == key) {
+            let (tid, _) = self.toplevels.remove(i);
+            if let Some(s) = self.surface_mut(key) {
+                s.tid = 0;
+            }
+            self.tell_panel(|p| Event::ToplevelGone { surface: p, id: tid });
+        }
+        if self.panel.is_some_and(|(k, _)| k == key) {
+            self.panel = None;
+            if let Some(s) = self.surface_mut(key) {
+                s.decorated = true;
+            }
+        }
         if self.drag.as_ref().is_some_and(|d| d.key == key) {
             self.drag = None;
+        }
+        if let Some(r) = self.resize.take_if(|r| r.key == key) {
+            self.damage_outline(r.outline);
+        }
+        if self.pressed.is_some_and(|(k, _)| k == key) {
+            self.pressed = None;
         }
         if self.button_target == Some(key) {
             self.button_target = None;
@@ -523,6 +811,9 @@ impl<M: PoolMem> Compositor<M> {
             self.focus = None;
             let top = self.stack.last().copied();
             self.set_focus(top);
+            if top.is_none() {
+                self.tell_panel(|p| Event::ToplevelFocus { surface: p, id: 0 });
+            }
         }
     }
 
@@ -530,23 +821,27 @@ impl<M: PoolMem> Compositor<M> {
         if self.focus == key {
             return;
         }
+        let th = self.th;
         if let Some(old) = self.focus {
             if let Some(s) = self.surface(old) {
-                self.damage.add(s.title_bar());
+                self.damage.add(s.title_bar(th));
                 self.events.push((old.0, Event::Focus { surface: old.1, focused: false }));
             }
         }
         self.focus = key;
         self.locked = None;
+        let mut tid = 0;
         if let Some(new) = key {
-            if let Some((bar, wants)) = self.surface(new).map(|s| (s.title_bar(), s.wants_lock)) {
+            if let Some((bar, wants, t)) = self.surface(new).map(|s| (s.title_bar(th), s.wants_lock, s.tid)) {
                 self.damage.add(bar);
                 self.events.push((new.0, Event::Focus { surface: new.1, focused: true }));
                 if wants {
                     self.locked = Some(new);
                 }
+                tid = t;
             }
         }
+        self.tell_panel(|p| Event::ToplevelFocus { surface: p, id: tid });
     }
 
     fn raise(&mut self, key: Key) {
@@ -554,7 +849,7 @@ impl<M: PoolMem> Compositor<M> {
             self.stack.retain(|k| *k != key);
             self.stack.push(key);
             if let Some(s) = self.surface(key) {
-                self.damage.add(s.frame());
+                self.damage.add(s.frame(self.th));
             }
         }
     }
@@ -574,15 +869,165 @@ impl<M: PoolMem> Compositor<M> {
         !self.frame_waiting.is_empty()
     }
 
+    // ── window management ─────────────────────────────────────────────────
+
+    /// Moves and sizes a window's content box, repainting both places.
+    fn set_geometry(&mut self, key: Key, g: Rect) {
+        let th = self.th;
+        let s = self.surface_mut(key).unwrap();
+        let before = s.frame(th);
+        s.x = g.x;
+        s.y = g.y;
+        s.fw = g.w;
+        s.fh = g.h;
+        let after = s.frame(th);
+        self.damage.add(before);
+        self.damage.add(after);
+    }
+
+    /// Asks the client for a `w x h` content — unless that is exactly
+    /// what its buffer already is.
+    fn request_size(&mut self, key: Key, w: i32, h: i32) {
+        let serial = self.buffers_created;
+        let s = self.surface_mut(key).unwrap();
+        if (s.w, s.h) == (w, h) {
+            s.resize_pending = None;
+        } else {
+            s.resize_pending = Some(serial);
+            self.events.push((key.0, Event::Resize { surface: key.1, width: w, height: h }));
+        }
+    }
+
+    fn toggle_maximize(&mut self, key: Key) {
+        let th = self.th;
+        let work = self.work_area();
+        let s = self.surface_mut(key).unwrap();
+        if s.resizable.is_none() {
+            return;
+        }
+        let g = match s.maximized.take() {
+            Some(saved) => saved,
+            None => {
+                s.maximized = Some(Rect::new(s.x, s.y, s.fw, s.fh));
+                Rect::new(work.x, work.y, work.w, (work.h - th).max(1))
+            }
+        };
+        let maximized = s.maximized;
+        self.set_geometry(key, g);
+        self.surface_mut(key).unwrap().maximized = maximized;
+        self.request_size(key, g.w, g.h);
+    }
+
+    /// The content box a resize drag gives for the pointer at `(x, y)`,
+    /// kept between the client's minimum and the work area.
+    fn resize_geometry(&self, r: &ResizeDrag, x: i32, y: i32) -> Rect {
+        let (min_w, min_h) = self.surface(r.key).and_then(|s| s.resizable).unwrap_or((1, 1));
+        let work = self.work_area();
+        let (max_w, max_h) = (work.w.min(MAX_SIDE).max(min_w), (work.h - self.th).min(MAX_SIDE).max(min_h));
+        let (dx, dy) = (x - r.px, y - r.py);
+        let s = r.start;
+        let mut w = s.w;
+        let mut h = s.h;
+        if r.edges & EDGE_RIGHT != 0 {
+            w += dx;
+        } else if r.edges & EDGE_LEFT != 0 {
+            w -= dx;
+        }
+        if r.edges & EDGE_BOTTOM != 0 {
+            h += dy;
+        } else if r.edges & EDGE_TOP != 0 {
+            h -= dy;
+        }
+        let w = w.clamp(min_w, max_w);
+        let h = h.clamp(min_h, max_h);
+        let nx = if r.edges & EDGE_LEFT != 0 { s.x + s.w - w } else { s.x };
+        let ny = if r.edges & EDGE_TOP != 0 { s.y + s.h - h } else { s.y };
+        Rect::new(nx, ny, w, h)
+    }
+
+    fn outline_edges(&self, f: Rect) -> [Rect; 4] {
+        let t = 2 * self.scale;
+        [
+            Rect::new(f.x, f.y, f.w, t),
+            Rect::new(f.x, f.bottom() - t, f.w, t),
+            Rect::new(f.x, f.y, t, f.h),
+            Rect::new(f.right() - t, f.y, t, f.h),
+        ]
+    }
+
+    fn damage_outline(&mut self, f: Rect) {
+        for e in self.outline_edges(f) {
+            self.damage.add(e);
+        }
+    }
+
     // ── input ─────────────────────────────────────────────────────────────
 
     fn cursor_rect(&self) -> Rect {
         Rect::new(self.pointer.0, self.pointer.1, CURSOR_W, CURSOR_H)
     }
 
-    /// Topmost mapped surface whose frame holds the point.
-    fn window_at(&self, x: i32, y: i32) -> Option<Key> {
-        self.stack.iter().rev().copied().find(|k| self.surface(*k).is_some_and(|s| s.frame().contains(x, y)))
+    /// The window (or panel) under a point, and which part of it.
+    pub fn hit(&self, x: i32, y: i32) -> Option<((ClientId, u32), Zone)> {
+        let th = self.th;
+        if let Some((k, _)) = self.panel {
+            if self.surface(k).is_some_and(|s| s.mapped && s.content(th).contains(x, y)) {
+                return Some((k, Zone::Content));
+            }
+        }
+        let (b, g) = (self.border(), self.grip());
+        for &k in self.stack.iter().rev() {
+            let Some(s) = self.surface(k) else { continue };
+            let f = s.frame(th);
+            let resizable = s.resizable.is_some();
+            if f.contains(x, y) {
+                if resizable && s.content(th).contains(x, y) && x >= f.right() - g && y >= f.bottom() - g {
+                    return Some((k, Zone::Edge(EDGE_RIGHT | EDGE_BOTTOM)));
+                }
+                if !s.title_bar(th).contains(x, y) {
+                    return Some((k, Zone::Content));
+                }
+                if s.close_button(th).contains(x, y) {
+                    return Some((k, Zone::Close));
+                }
+                if s.max_button(th).is_some_and(|m| m.contains(x, y)) {
+                    return Some((k, Zone::Maximize));
+                }
+                return Some((k, Zone::Title));
+            }
+            let outer = Rect::new(f.x - b, f.y - b, f.w + 2 * b, f.h + 2 * b);
+            if resizable && outer.contains(x, y) {
+                // The side(s) the pointer is beyond, plus the neighbouring
+                // side when it is near that corner.
+                let mut e = 0;
+                if x < f.x {
+                    e |= EDGE_LEFT;
+                } else if x >= f.right() {
+                    e |= EDGE_RIGHT;
+                }
+                if y < f.y {
+                    e |= EDGE_TOP;
+                } else if y >= f.bottom() {
+                    e |= EDGE_BOTTOM;
+                }
+                if e & (EDGE_LEFT | EDGE_RIGHT) == 0 {
+                    if x < f.x + g {
+                        e |= EDGE_LEFT;
+                    } else if x >= f.right() - g {
+                        e |= EDGE_RIGHT;
+                    }
+                }
+                if e & (EDGE_TOP | EDGE_BOTTOM) == 0 {
+                    if y < f.y + g {
+                        e |= EDGE_TOP;
+                    } else if y >= f.bottom() - g {
+                        e |= EDGE_BOTTOM;
+                    }
+                }
+                return Some((k, Zone::Edge(e)));
+            }
+        }
+        None
     }
 
     pub fn pointer_motion(&mut self, dx: i32, dy: i32) {
@@ -602,32 +1047,62 @@ impl<M: PoolMem> Compositor<M> {
         self.damage.add(old);
         self.damage.add(self.cursor_rect());
 
+        if let Some(r) = &self.resize {
+            let g = self.resize_geometry(r, x, y);
+            let outline = Rect::new(g.x, g.y, g.w, g.h + self.th);
+            let before = r.outline;
+            if outline != before {
+                self.damage_outline(before);
+                self.damage_outline(outline);
+                self.resize.as_mut().unwrap().outline = outline;
+            }
+            return;
+        }
         if let Some(d) = &self.drag {
             let (key, nx, ny) = (d.key, x - d.dx, y - d.dy);
             let s = self.surface_mut(key).unwrap();
-            let before = s.frame();
-            s.x = nx;
-            s.y = ny;
-            let after = s.frame();
-            self.damage.add(before);
-            self.damage.add(after);
+            s.maximized = None; // moved: no longer the work area
+            let g = Rect::new(nx, ny, s.fw, s.fh);
+            self.set_geometry(key, g);
             return;
         }
-        let target = self.button_target.or_else(|| {
-            self.window_at(x, y).filter(|k| self.surface(*k).is_some_and(|s| s.content().contains(x, y)))
-        });
+        let target = self.button_target.or_else(|| self.hit(x, y).filter(|(_, z)| *z == Zone::Content).map(|(k, _)| k));
         if let Some(k) = target {
-            let s = self.surface(k).unwrap();
-            let (lx, ly) = (x - s.x, y - s.y - TITLE_H);
-            self.events.push((k.0, Event::Motion { surface: k.1, x: lx, y: ly }));
+            let c = self.surface(k).unwrap().content(self.th);
+            self.events.push((k.0, Event::Motion { surface: k.1, x: x - c.x, y: y - c.y }));
         }
     }
 
     pub fn pointer_button(&mut self, code: u32, pressed: bool) {
         let (x, y) = self.pointer;
         if !pressed {
-            if code == BTN_LEFT && self.drag.take().is_some() {
-                return;
+            if code == BTN_LEFT {
+                if self.drag.take().is_some() {
+                    return;
+                }
+                if let Some(r) = self.resize.take() {
+                    self.damage_outline(r.outline);
+                    let g = self.resize_geometry(&r, x, y);
+                    if g != r.start {
+                        self.surface_mut(r.key).unwrap().maximized = None;
+                        self.set_geometry(r.key, g);
+                        self.request_size(r.key, g.w, g.h);
+                    }
+                    return;
+                }
+                if let Some((k, which)) = self.pressed.take() {
+                    let th = self.th;
+                    let bar = self.surface(k).unwrap().title_bar(th);
+                    self.damage.add(bar);
+                    let zone = if which == ButtonKind::Close { Zone::Close } else { Zone::Maximize };
+                    if self.hit(x, y) == Some((k, zone)) {
+                        match which {
+                            ButtonKind::Close => self.events.push((k.0, Event::Close { surface: k.1 })),
+                            ButtonKind::Maximize => self.toggle_maximize(k),
+                        }
+                    }
+                    return;
+                }
             }
             if let Some(k) = self.button_target.take() {
                 self.events.push((k.0, Event::Button { surface: k.1, code, pressed: false }));
@@ -639,20 +1114,50 @@ impl<M: PoolMem> Compositor<M> {
             self.events.push((k.0, Event::Button { surface: k.1, code, pressed: true }));
             return;
         }
-        let Some(k) = self.window_at(x, y) else { return };
-        self.raise(k);
-        self.set_focus(Some(k));
-        let s = self.surface(k).unwrap();
-        let wants_lock = s.wants_lock;
-        if s.title_bar().contains(x, y) {
-            if code == BTN_LEFT {
-                self.drag = Some(Drag { key: k, dx: x - s.x, dy: y - s.y });
-            }
-        } else {
+        if self.drag.is_some() || self.resize.is_some() || self.pressed.is_some() {
+            return; // another button during a left-button gesture
+        }
+        let Some((k, zone)) = self.hit(x, y) else { return };
+        if self.panel.is_some_and(|(p, _)| p == k) {
+            // The panel takes clicks, never the focus.
             self.button_target = Some(k);
             self.events.push((k.0, Event::Button { surface: k.1, code, pressed: true }));
-            if wants_lock {
-                self.locked = Some(k);
+            return;
+        }
+        self.raise(k);
+        self.set_focus(Some(k));
+        let th = self.th;
+        let s = self.surface(k).unwrap();
+        let (wants_lock, resizable, bar) = (s.wants_lock, s.resizable.is_some(), s.title_bar(th));
+        let (start, outline) = (Rect::new(s.x, s.y, s.fw, s.fh), s.frame(th));
+        match zone {
+            Zone::Content => {
+                self.button_target = Some(k);
+                self.events.push((k.0, Event::Button { surface: k.1, code, pressed: true }));
+                if wants_lock {
+                    self.locked = Some(k);
+                }
+            }
+            _ if code != BTN_LEFT => {}
+            Zone::Title => {
+                let now = self.now_ms;
+                let double = self.last_title_press.is_some_and(|(pk, t)| pk == k && now.wrapping_sub(t) <= DOUBLE_CLICK_MS);
+                if double && resizable {
+                    self.last_title_press = None;
+                    self.toggle_maximize(k);
+                } else {
+                    self.last_title_press = Some((k, now));
+                    self.drag = Some(Drag { key: k, dx: x - start.x, dy: y - start.y });
+                }
+            }
+            Zone::Close | Zone::Maximize => {
+                let which = if zone == Zone::Close { ButtonKind::Close } else { ButtonKind::Maximize };
+                self.pressed = Some((k, which));
+                self.damage.add(bar);
+            }
+            Zone::Edge(edges) => {
+                self.resize = Some(ResizeDrag { key: k, edges, px: x, py: y, start, outline });
+                self.damage_outline(outline);
             }
         }
     }
@@ -701,35 +1206,138 @@ impl<M: PoolMem> Compositor<M> {
         !self.damage.is_empty()
     }
 
+    /// [`Compositor::compose_with`] with no title text.
+    pub fn compose(&mut self, dst: &mut [u32], stride: usize) -> Vec<Rect> {
+        self.compose_with(dst, stride, &mut |_, _, _, _| {})
+    }
+
     /// Repaints everything damaged into `dst` (`stride` pixels per row, at
     /// least `width x height`) and returns the rectangles to flush — at
     /// most [`MAX_FLUSH_RECTS`], coarsened to a bounding box beyond that.
-    pub fn compose(&mut self, dst: &mut [u32], stride: usize) -> Vec<Rect> {
+    /// `paint_title(title, clip, dst, stride)` draws a title's text over
+    /// its bar, touching only `clip` (inside `title.area`).
+    pub fn compose_with(
+        &mut self,
+        dst: &mut [u32],
+        stride: usize,
+        paint_title: &mut PaintTitle,
+    ) -> Vec<Rect> {
         self.damage.intersect(self.screen());
         if self.damage.is_empty() || stride < self.width as usize || dst.len() < stride * self.height as usize {
             return Vec::new();
         }
         for r in self.damage.rects().to_vec() {
-            self.paint(r, dst, stride);
+            self.paint(r, dst, stride, paint_title);
         }
         let out = self.damage.coarsened(MAX_FLUSH_RECTS);
         self.damage.clear();
         out
     }
 
-    fn paint(&self, r: Rect, dst: &mut [u32], stride: usize) {
+    fn paint_surface(&self, key: Key, r: Rect, dst: &mut [u32], stride: usize, paint_title: &mut PaintTitle) {
+        let th = self.th;
+        let s = self.surface(key).unwrap();
+        if s.decorated {
+            let focused = self.focus == Some(key);
+            let bar_color = if focused { TITLE_FOCUSED } else { TITLE_UNFOCUSED };
+            if let Some(t) = s.title_bar(th).intersect(&r) {
+                fill(dst, stride, t, bar_color);
+                let pad = 6 * self.scale;
+                let left = s.x + pad;
+                let area = Rect::new(left, s.y, (s.buttons_left(th) - pad - left).max(0), th);
+                if let Some(clip) = area.intersect(&t) {
+                    paint_title(&TitleText { id: s.tid, title: &s.title, focused, area }, clip, dst, stride);
+                }
+                let pressed = self.pressed.filter(|(k, _)| *k == key).map(|(_, b)| b);
+                let close = s.close_button(th);
+                if pressed == Some(ButtonKind::Close) {
+                    if let Some(c) = close.intersect(&t) {
+                        fill(dst, stride, c, CLOSE_PRESSED);
+                    }
+                }
+                self.glyph_x(close, t, dst, stride);
+                if let Some(m) = s.max_button(th) {
+                    if pressed == Some(ButtonKind::Maximize) {
+                        if let Some(c) = m.intersect(&t) {
+                            fill(dst, stride, c, TITLE_UNFOCUSED);
+                        }
+                    }
+                    self.glyph_square(m, t, dst, stride);
+                }
+            }
+        }
+        let content = s.content(th);
+        if let Some(i) = content.intersect(&r) {
+            let shown = Rect::new(content.x, content.y, s.w.min(s.fw), s.h.min(s.fh));
+            let covered = shown.intersect(&i);
+            // Whatever the buffer does not cover yet.
+            let mut rest = Region::from_rect(i);
+            if let Some(cv) = covered {
+                rest.subtract(cv);
+            }
+            for f in rest.rects() {
+                fill(dst, stride, *f, WINDOW_BG);
+            }
+            if let Some(cv) = covered {
+                for py in cv.y..cv.bottom() {
+                    let sy = (py - content.y) as usize;
+                    let sx = (cv.x - content.x) as usize;
+                    let src = &s.store[sy * s.w as usize + sx..][..cv.w as usize];
+                    dst[py as usize * stride + cv.x as usize..][..cv.w as usize].copy_from_slice(src);
+                }
+            }
+        }
+    }
+
+    /// The side of a button glyph's box and its top-left, centred in `b`.
+    fn glyph_box(&self, b: Rect) -> (i32, i32, i32) {
+        let side = (self.th * 2 / 5).max(3);
+        (b.x + (b.w - side) / 2, b.y + (b.h - side) / 2, side)
+    }
+
+    /// A close button's ×, clipped to `clip`.
+    fn glyph_x(&self, b: Rect, clip: Rect, dst: &mut [u32], stride: usize) {
+        let (x0, y0, side) = self.glyph_box(b);
+        let t = self.scale;
+        for i in 0..side {
+            for (px, py) in [(x0 + i, y0 + i), (x0 + side - 1 - i, y0 + i)] {
+                if let Some(p) = Rect::new(px, py, t, t).intersect(&clip).and_then(|p| p.intersect(&b)) {
+                    fill(dst, stride, p, BUTTON_FG);
+                }
+            }
+        }
+    }
+
+    /// A maximize button's hollow square, clipped to `clip`.
+    fn glyph_square(&self, b: Rect, clip: Rect, dst: &mut [u32], stride: usize) {
+        let (x0, y0, side) = self.glyph_box(b);
+        let t = self.scale;
+        for e in [
+            Rect::new(x0, y0, side, t),
+            Rect::new(x0, y0 + side - t, side, t),
+            Rect::new(x0, y0, t, side),
+            Rect::new(x0 + side - t, y0, t, side),
+        ] {
+            if let Some(p) = e.intersect(&clip).and_then(|p| p.intersect(&b)) {
+                fill(dst, stride, p, BUTTON_FG);
+            }
+        }
+    }
+
+    fn paint(&self, r: Rect, dst: &mut [u32], stride: usize, paint_title: &mut PaintTitle) {
         fill(dst, stride, r, BACKGROUND);
         for key in &self.stack {
-            let s = self.surface(*key).unwrap();
-            if let Some(t) = s.title_bar().intersect(&r) {
-                fill(dst, stride, t, if self.focus == Some(*key) { TITLE_FOCUSED } else { TITLE_UNFOCUSED });
+            self.paint_surface(*key, r, dst, stride, paint_title);
+        }
+        if let Some((k, _)) = self.panel {
+            if self.surface(k).is_some_and(|s| s.mapped) {
+                self.paint_surface(k, r, dst, stride, paint_title);
             }
-            if let Some(i) = s.content().intersect(&r) {
-                for py in i.y..i.bottom() {
-                    let sy = (py - s.y - TITLE_H) as usize;
-                    let sx = (i.x - s.x) as usize;
-                    let src = &s.store[sy * s.w as usize + sx..][..i.w as usize];
-                    dst[py as usize * stride + i.x as usize..][..i.w as usize].copy_from_slice(src);
+        }
+        if let Some(rs) = &self.resize {
+            for e in self.outline_edges(rs.outline) {
+                if let Some(i) = e.intersect(&r) {
+                    fill(dst, stride, i, OUTLINE);
                 }
             }
         }
@@ -763,18 +1371,42 @@ impl<M: PoolMem> Compositor<M> {
         self.focus
     }
 
-    /// Mapped windows, bottom to top.
+    /// Mapped windows, bottom to top (not the panel).
     pub fn stack(&self) -> &[(ClientId, u32)] {
         &self.stack
     }
 
     /// A mapped window's frame (title bar included).
     pub fn window_frame(&self, c: ClientId, surface: u32) -> Option<Rect> {
-        self.surface((c, surface)).filter(|s| s.mapped).map(Surface::frame)
+        self.surface((c, surface)).filter(|s| s.mapped).map(|s| s.frame(self.th))
+    }
+
+    /// A mapped window's content box on screen.
+    pub fn window_content(&self, c: ClientId, surface: u32) -> Option<Rect> {
+        self.surface((c, surface)).filter(|s| s.mapped).map(|s| s.content(self.th))
     }
 
     pub fn window_title(&self, c: ClientId, surface: u32) -> Option<&str> {
         self.surface((c, surface)).map(|s| s.title.as_str())
+    }
+
+    pub fn is_maximized(&self, c: ClientId, surface: u32) -> bool {
+        self.surface((c, surface)).is_some_and(|s| s.maximized.is_some())
+    }
+
+    /// The frame a resize drag's outline shows, while one is under way.
+    pub fn resize_outline(&self) -> Option<Rect> {
+        self.resize.as_ref().map(|r| r.outline)
+    }
+
+    /// The panel's surface, if a client has the role.
+    pub fn panel(&self) -> Option<(ClientId, u32)> {
+        self.panel.map(|(k, _)| k)
+    }
+
+    /// Toplevel ids of the mapped windows, in the order they appeared.
+    pub fn toplevels(&self) -> Vec<(u32, (ClientId, u32))> {
+        self.toplevels.clone()
     }
 
     pub fn damage(&self) -> &Region {

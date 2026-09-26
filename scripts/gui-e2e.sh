@@ -46,6 +46,24 @@
 #   X3. Esc quits textdemo and its window goes; Ctrl+Alt+Backspace gives
 #       the console back.
 # Timings and the glyph cache's counters are printed from the log.
+#
+#   scripts/gui-e2e.sh wm       # window management (phase 4)
+#
+# `wm` mode runs `compositor` with no arguments (a session: it starts
+# `panel`), finds the panel's buttons from its log line, drives the mouse
+# with `goto` (moves, then corrects from the cursor it finds on a
+# screendump) and checks:
+#   W1. The panel takes the last strip of the screen and its launcher
+#       starts `term`, in the list and focused.
+#   W2. Dragging term's bottom-right corner by (-200,-100): one resize,
+#       whole cells, and `stty size` in the window says so.
+#   W3. Maximize: the frame fills the work area and the panel stays
+#       visible; `stty size` grows. Restore goes back.
+#   W5. With `cpumon` on top, term's button in the panel raises and
+#       focuses it.
+#   W4. cpumon's close button ends it; term's ends term (ash hangs up).
+#   W6. `fire` (constanos_gfx.h, fixed size) has no maximize button, and
+#       dragging just past its right edge does not change it.
 # Exit status: number of failed checks.
 set -u
 MODE=${1:-demo}
@@ -139,6 +157,132 @@ if [ "$MODE" = term ]; then
     grep -aq "KERNEL PANIC" "$STATE/serial.log" && bad "kernel panic in the log"
     $Q stop >/dev/null 2>&1
     echo "gui-e2e term: $([ $fails = 0 ] && echo PASS || echo "FAIL ($fails)")"
+    exit $fails
+fi
+
+if [ "$MODE" = wm ]; then
+    PANEL=21,26,34; UNFOCUSED=80,80,88; BLACK=0,0,0; WHITE=232,232,232
+    goto() { # goto x y: moves the pointer there, correcting from screendumps
+        local tx=$1 ty=$2 i c dx dy
+        for i in $(seq 20); do
+            c=$(cursor "$(shot goto)")
+            if [ "$c" = none ]; then $Q mouse-move 40 -40 >/dev/null; sleep 0.3; continue; fi
+            set -- $c
+            [ "$1" = "$tx" ] && [ "$2" = "$ty" ] && return 0
+            dx=$((tx - $1)); dy=$((ty - $2))
+            [ $dx -gt 120 ] && dx=120; [ $dx -lt -120 ] && dx=-120
+            [ $dy -gt 120 ] && dy=120; [ $dy -lt -120 ] && dy=-120
+            $Q mouse-move $dx $dy >/dev/null; sleep 0.3
+        done
+        echo "  (goto $tx $ty failed)"; return 1
+    }
+    press()   { $Q mouse-button 1 >/dev/null; sleep 0.3; }
+    release() { $Q mouse-button 0 >/dev/null; sleep 0.5; }
+    click()   { goto "$1" "$2" && press && release; }
+    button()  { # button <label>: x of the centre of the panel's button
+        grep -a "panel: buttons" "$STATE/serial.log" | tail -1 | python3 -c "
+import re, sys
+for label, x, w in re.findall(r' (.+?)@(\d+)\+(\d+)', sys.stdin.read().split('panel: buttons', 1)[1]):
+    if label == '$1': print(int(x) + int(w) // 2)"
+    }
+    PY_=784                   # the panel's middle row (800 - 32/2)
+    console() { # console <cmd>: runs it in the focused term, output to serial
+        $Q send "$1 > /dev/console" && $Q enter; sleep 1.5
+    }
+
+    $Q send "compositor" && $Q enter
+    $Q wait-for "panel: buttons" 60 >/dev/null || bad "W1 no panel"
+    sleep 1
+    s=$(shot w1)
+    [ "$(px "$s" 640 795)" = "$PANEL" ] && [ "$(px "$s" 640 760)" = "$BG" ] \
+        && ok "W1 panel on the last strip" || bad "W1 panel: $(px "$s" 640 795) above: $(px "$s" 640 760)"
+    click "$(button Apps)" $PY_
+    $Q wait-for "panel: buttons.*Terminal@" 10 >/dev/null || bad "W1 the launcher did not open"
+    click "$(button Terminal)" $PY_
+    $Q wait-for "term: 80x25 cells" 30 >/dev/null || bad "W1 term never started"
+    sleep 2
+    s=$(shot w1b)
+    [ "$(px "$s" 45 45)" = "$FOCUSED" ] && grep -a "panel: buttons" "$STATE/serial.log" | tail -1 | grep -q " term@" \
+        && ok "W1 launcher started term, focused and listed" || bad "W1 term: $(px "$s" 45 45)"
+
+    # term: content 720x500 at (40,60); the corner just outside it.
+    goto 761 561; press
+    $Q mouse-move -100 -50 >/dev/null; sleep 0.3; $Q mouse-move -100 -50 >/dev/null; sleep 0.3
+    s=$(shot w2a)
+    [ "$(has "$s" 224,224,224 555 355 565 365)" = yes ] && ok "W2 outline while dragging" || bad "W2 no outline at the new corner"
+    release; sleep 1
+    grep -a "term: resized to" "$STATE/serial.log" | tail -1 | grep -q "57x20 cells" \
+        && ok "W2 one resize, whole cells (57x20)" || bad "W2 $(grep -a 'term: resized' "$STATE/serial.log" | tail -1)"
+    [ "$(grep -ac 'term: resized to' "$STATE/serial.log")" = 1 ] || bad "W2 more than one resize"
+    console "stty size"
+    grep -aq "^20 57" "$STATE/serial.log" && ok "W2 stty size: 20 57" || bad "W2 stty size wrong"
+    s=$(shot w2b)
+    [ "$(px "$s" 700 300)" = "$BG" ] && [ "$(px "$s" 500 300)" = "$BLACK" ] \
+        && ok "W2 window smaller on screen" || bad "W2 screen: $(px "$s" 700 300) / $(px "$s" 500 300)"
+
+    click 523 50                                  # maximize (frame 40..553)
+    sleep 1
+    console "stty size"
+    s=$(shot w3a)
+    [ "$(px "$s" 5 5)" = "$FOCUSED" ] && [ "$(px "$s" 640 795)" = "$PANEL" ] \
+        && ok "W3 maximized over the work area, panel visible" || bad "W3 max: $(px "$s" 5 5) panel $(px "$s" 640 795)"
+    grep -aq "^37 142" "$STATE/serial.log" && ok "W3 stty size: 37 142" || bad "W3 stty size after maximize"
+    click 1250 10                                 # restore
+    sleep 1.5
+    s=$(shot w3b)
+    [ "$(px "$s" 5 5)" = "$BG" ] && [ "$(px "$s" 45 45)" = "$FOCUSED" ] \
+        && ok "W3 restored" || bad "W3 restore: $(px "$s" 5 5) / $(px "$s" 45 45)"
+
+    click "$(button Apps)" $PY_
+    $Q wait-for "panel: buttons.*CPU monitor@" 10 >/dev/null
+    click "$(button 'CPU monitor')" $PY_
+    $Q wait-for "panel: buttons.* cpumon@" 30 >/dev/null || bad "W5 cpumon never mapped"
+    sleep 4
+    s=$(shot w5a)
+    [ "$(px "$s" 45 45)" = "$UNFOCUSED" ] && [ "$(px "$s" 100 150)" != "$BLACK" ] \
+        && ok "W5 cpumon on top, term unfocused" || bad "W5 before: $(px "$s" 45 45) / $(px "$s" 100 150)"
+    click "$(button term)" $PY_
+    sleep 1
+    s=$(shot w5b)
+    [ "$(px "$s" 45 45)" = "$FOCUSED" ] && [ "$(px "$s" 100 150)" = "$BLACK" ] \
+        && ok "W5 the panel raised and focused term" || bad "W5 after: $(px "$s" 45 45) / $(px "$s" 100 150)"
+
+    click 702 82                                  # cpumon's close (frame 72..712)
+    $Q wait-for "Killed PID [0-9]* \\(cpumon\\): exit\\(0\\)" 10 >/dev/null && ok "W4 cpumon closed" || bad "W4 cpumon did not close"
+    click 543 50                                  # term's close (frame 40..553)
+    $Q wait-for "Killed PID [0-9]* \\(term\\): exit\\(0\\)" 10 >/dev/null && grep -aq "term: closed from the title bar" "$STATE/serial.log" \
+        && ok "W4 term closed" || bad "W4 term did not close"
+    sleep 1
+    s=$(shot w4)
+    [ "$(px "$s" 45 45)" = "$BG" ] && ok "W4 both windows gone" || bad "W4 window left: $(px "$s" 45 45)"
+
+    click "$(button Apps)" $PY_
+    $Q wait-for "panel: buttons.*Fire@" 10 >/dev/null
+    click "$(button Fire)" $PY_
+    $Q wait-for "panel: buttons.* fire@" 30 >/dev/null || bad "W6 fire never mapped"
+    sleep 3
+    edge() { # right end of the focused title bar on row 110, from x=110
+        python3 -c "
+from PIL import Image
+im = Image.open('$1').convert('RGB'); x = 110
+while x < im.size[0] - 1 and im.getpixel((x + 1, 110)) in ((80,120,176), (232,232,232)): x += 1
+print(x)"
+    }
+    s=$(shot w6a); r=$(edge "$s")
+    [ "$(has "$s" "$WHITE" $((r - 38)) 104 $((r - 20)) 124)" = no ] && ok "W6 fire: no maximize button" \
+        || bad "W6 a maximize button on fire"
+    goto $((r + 3)) 150; press; $Q mouse-move 100 0 >/dev/null; sleep 0.3; release
+    s=$(shot w6b)
+    [ "$(edge "$s")" = "$r" ] && ok "W6 fire's size did not change ($r)" || bad "W6 fire resized: $r -> $(edge "$s")"
+
+    $Q key ctrl-alt-backspace; sleep 2
+    $Q send "echo console-is-back" && $Q enter
+    $Q wait-for "^.fb. console-is-back" 10 >/dev/null && ok "console and keyboard back" || bad "typing does not reach ash"
+    # The kernel logs every exit as "Killed PID n (name): ...".
+    grep -a "Killed PID [0-9]* \(compositor\|panel\)" "$STATE/serial.log" | grep -vq "exit(0)" && bad "compositor or panel died"
+    grep -aq "KERNEL PANIC" "$STATE/serial.log" && bad "kernel panic in the log"
+    $Q stop >/dev/null 2>&1
+    echo "gui-e2e wm: $([ $fails = 0 ] && echo PASS || echo "FAIL ($fails)")"
     exit $fails
 fi
 
