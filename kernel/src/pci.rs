@@ -23,28 +23,75 @@ fn config_address(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
         | (offset as u32 & 0xFC)
 }
 
-fn config_read32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+/// Serialises every CONFIG_ADDRESS/CONFIG_DATA pair. Mechanism #1 is two
+/// port accesses, and with processes on every CPU a `cat /proc/pci` on one
+/// can retarget CONFIG_ADDRESS between another's write and its read. It
+/// also covers the SMN index/data pair ([`smn_read`]), itself two config
+/// accesses. `IrqLock`: held for a handful of port accesses, never across
+/// anything that sleeps.
+static CONFIG: crate::sync::IrqLock<()> = crate::sync::IrqLock::new(());
+
+fn raw_read32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     unsafe {
         Port::<u32>::new(CONFIG_ADDRESS).write(config_address(bus, device, function, offset));
         Port::<u32>::new(CONFIG_DATA).read()
     }
 }
 
-fn config_write32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
+fn raw_write32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
     unsafe {
         Port::<u32>::new(CONFIG_ADDRESS).write(config_address(bus, device, function, offset));
         Port::<u32>::new(CONFIG_DATA).write(value);
     }
 }
 
+fn config_read32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+    let _g = CONFIG.lock();
+    raw_read32(bus, device, function, offset)
+}
+
+fn config_write32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
+    let _g = CONFIG.lock();
+    raw_write32(bus, device, function, offset, value);
+}
+
 /// Writes one byte of bus 0 configuration space — read-modify-write of
 /// the containing dword, the only width mechanism #1 guarantees. Used for
 /// an ACPI reset register that lives in PCI config space (`crate::reboot`).
+///
+/// That caller includes the panic handler's reset, where the panicking CPU
+/// may be the one holding [`CONFIG`]: so the lock is only *tried* for a
+/// bounded while, and the reset goes ahead without it — a torn config
+/// cycle on the way to a reset costs nothing.
 pub fn config_write8(device: u8, function: u8, offset: u8, value: u8) {
+    let mut guard = None;
+    for _ in 0..100_000 {
+        guard = CONFIG.try_lock();
+        if guard.is_some() {
+            break;
+        }
+        core::hint::spin_loop();
+    }
     let shift = (offset as u32 & 3) * 8;
-    let dword = config_read32(0, device, function, offset & 0xFC);
+    let dword = raw_read32(0, device, function, offset & 0xFC);
     let dword = (dword & !(0xFF << shift)) | ((value as u32) << shift);
-    config_write32(0, device, function, offset & 0xFC, dword);
+    raw_write32(0, device, function, offset & 0xFC, dword);
+    drop(guard);
+}
+
+/// Vendor ID of a function; `0xFFFF` when nothing answers there.
+pub fn vendor_id(bus: u8, device: u8, function: u8) -> u16 {
+    config_read16(bus, device, function, 0x00)
+}
+
+/// Reads an AMD System Management Network register through the root
+/// complex's index/data pair (Linux's `amd_smn_read`; see `hal::k10temp`).
+/// Only meaningful when 00:00.0 is AMD's — the caller checks.
+pub fn smn_read(addr: u32) -> u32 {
+    use hal::k10temp::{SMN_DATA, SMN_INDEX};
+    let _g = CONFIG.lock();
+    raw_write32(0, 0, 0, SMN_INDEX, addr);
+    raw_read32(0, 0, 0, SMN_DATA)
 }
 
 fn config_read16(bus: u8, device: u8, function: u8, offset: u8) -> u16 {

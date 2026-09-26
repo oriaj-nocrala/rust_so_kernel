@@ -31,6 +31,7 @@ pub mod fbdirty;
 pub mod gpt;
 pub mod hid;
 pub mod i8042;
+pub mod k10temp;
 pub mod keyboard;
 pub mod logpart;
 pub mod memtype;

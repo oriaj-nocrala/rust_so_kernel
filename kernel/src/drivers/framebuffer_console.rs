@@ -683,6 +683,13 @@ fn render_bytes_inner(state: &mut FbState, fb: &mut Framebuffer, buf: &[u8]) {
                     b'\r' => {
                         state.col = 0;
                     }
+                    // Next tab stop (every 8 columns), as a VT does: moves
+                    // the cursor, draws nothing, never wraps. It used to be
+                    // dropped, gluing `/proc/cpuinfo`'s and
+                    // `/proc/sensors`' fields together.
+                    b'\t' => {
+                        state.col = ((state.col / 8 + 1) * 8).min(cols.saturating_sub(1));
+                    }
                     0x08 | 0x7f => {
                         if state.col > 0 {
                             state.col -= 1;

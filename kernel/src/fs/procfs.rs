@@ -12,6 +12,7 @@
 //   /proc/           (ProcDirInode)
 //   ├── meminfo, kdebug, acpi, dmesg, fbinfo, pci
 //   ├── stat, uptime, loadavg, cpuinfo   (Linux formats, `RenderedInode`)
+//   ├── sensors                          (k10temp temperatures, `crate::cpu::temp`)
 //   ├── self         → symlink to /proc/<own pid>
 //   └── <pid>/       (ProcPidDirInode, for every live pid — listed too)
 //       ├── exe      → symlink to whatever ELF path that process is running
@@ -522,6 +523,7 @@ impl Inode for ProcDirInode {
             "uptime" => Ok(Arc::new(RenderedInode { ino: 209, render: render_uptime })),
             "cpuinfo" => Ok(Arc::new(RenderedInode { ino: 210, render: render_cpuinfo })),
             "loadavg" => Ok(Arc::new(RenderedInode { ino: 211, render: render_loadavg })),
+            "sensors" => Ok(Arc::new(RenderedInode { ino: 212, render: crate::cpu::temp::render })),
             _ => {
                 let pid: usize = name.parse().map_err(|_| Errno::ENOENT)?;
                 if crate::process::scheduler::exe_name_for_pid(pid).is_some() {
@@ -548,13 +550,14 @@ impl Inode for ProcDirInode {
             10 => Ok(Some(DirEntry::new(209, FileType::Regular, b"uptime"))),
             11 => Ok(Some(DirEntry::new(210, FileType::Regular, b"cpuinfo"))),
             12 => Ok(Some(DirEntry::new(211, FileType::Regular, b"loadavg"))),
+            13 => Ok(Some(DirEntry::new(212, FileType::Regular, b"sensors"))),
             n => {
                 // Live pids, appended after the always-present entries above
                 // — this is what makes `ls /proc` / BusyBox `ps`'s
                 // `opendir("/proc")` scan see every process (previously
                 // direct lookup like `cat /proc/3/exe` worked but nothing
                 // enumerated them, see this module's top doc comment).
-                let idx = (n - 13) as usize;
+                let idx = (n - 14) as usize;
                 let pids = crate::process::scheduler::all_pids();
                 let Some(&pid) = pids.get(idx) else { return Ok(None); };
                 let name = format!("{}", pid);

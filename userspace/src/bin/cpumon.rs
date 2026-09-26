@@ -157,6 +157,24 @@ fn parse_cpu_mhz(text: &str) -> Vec<(usize, u32)> {
     out
 }
 
+/// Tctl in millidegrees from a `/proc/sensors` (`chip<TAB>label<TAB>
+/// millidegrees` per line, see `hal::k10temp::render`): the temperature
+/// the CPU's own cooling control goes by, what `sensors` headlines. `None`
+/// on a machine without the sensor (the file is empty).
+fn parse_tctl(text: &str) -> Option<i32> {
+    text.lines().find_map(|l| {
+        let mut f = l.split('\t');
+        let (_chip, label, v) = (f.next()?, f.next()?, f.next()?);
+        if label == "Tctl" { v.trim().parse().ok() } else { None }
+    })
+}
+
+/// `45.3 C` for millidegrees (the console font has no degree sign).
+fn celsius(mdeg: i32) -> String {
+    let t = (mdeg + if mdeg < 0 { -50 } else { 50 }) / 100;
+    format!("{}{}.{} C", if t < 0 { "-" } else { "" }, t.abs() / 10, t.abs() % 10)
+}
+
 /// `4.62 GHz` / `4.62` for a frequency in MHz.
 fn ghz(mhz: u32, unit: bool) -> String {
     let s = format!("{}.{:02}", mhz / 1000, mhz % 1000 / 10);
@@ -242,6 +260,8 @@ struct State {
     mem_free_kb: u64,
     loadavg: String,
     tasks: String,
+    /// Tctl, millidegrees, where `/proc/sensors` has it.
+    tctl: Option<i32>,
     uptime_s: u64,
     procs: Vec<Proc>,
     samples: u64,
@@ -278,6 +298,7 @@ impl State {
             mem_free_kb: 0,
             loadavg: String::new(),
             tasks: String::new(),
+            tctl: None,
             uptime_s: 0,
             procs: Vec::new(),
             samples: 0,
@@ -326,6 +347,9 @@ impl State {
                 }
             }
         }
+
+        // Temperature.
+        self.tctl = if read_file("/proc/sensors", &mut self.buf) { parse_tctl(text_of(&self.buf)) } else { None };
 
         // Memory, load, uptime.
         if read_file("/proc/meminfo", &mut self.buf) {
@@ -461,15 +485,20 @@ fn draw(cv: &mut Canvas, st: &State) {
     cv.rect(0, 0, W as i32, 34, PANEL);
     cv.hline(0, 34, W as i32, EDGE);
     let x = cv.smooth_text(TITLE, 12, 6, "CPU", ACCENT);
-    let x = cv.smooth_text(SMALL, x + 12, 9, &st.model, TEXT);
+    let mut x = cv.smooth_text(SMALL, x + 12, 9, &st.model, TEXT);
     if st.measured {
         // The range the cores span right now.
         let m = st.cpus.iter().map(|c| c.mhz).filter(|&m| m > 0);
         if let (Some(lo), Some(hi)) = (m.clone().min(), m.max()) {
-            cv.smooth_text(SMALL, x + 10, 9, &format!("{} - {}", ghz(lo, false), ghz(hi, true)), DIM);
+            x = cv.smooth_text(SMALL, x + 10, 9, &format!("{} - {}", ghz(lo, false), ghz(hi, true)), DIM);
         }
     } else if !st.mhz.is_empty() {
-        cv.smooth_text(SMALL, x + 10, 9, &st.mhz, DIM);
+        x = cv.smooth_text(SMALL, x + 10, 9, &st.mhz, DIM);
+    }
+    if let Some(t) = st.tctl {
+        // Coloured like a load: 30 C cool, 90 C (a 5900X throttles at 90) red.
+        let pm = ((t - 30_000).clamp(0, 60_000) / 60) as u32;
+        cv.smooth_text(SMALL_BOLD, x + 16, 9, &celsius(t), load_color(pm));
     }
     let up = st.uptime_s;
     let uptime = format!("up {}:{:02}:{:02}", up / 3600, up / 60 % 60, up % 60);

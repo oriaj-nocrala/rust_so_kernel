@@ -2,6 +2,7 @@
 // CPU topology — today single-CPU, tomorrow SMP.
 
 pub mod freq;
+pub mod temp;
 mod init;
 pub mod percpu;
 pub mod tsc;

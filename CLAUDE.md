@@ -96,7 +96,7 @@ so addresses actually resolve to real function names instead of bare hex.
 ### QEMU integration tests
 
 Real hardware-path behavior (drivers that need actual QEMU devices, not just host-testable
-pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 326 tests, <1s, no QEMU) is
+pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 335 tests, <1s, no QEMU) is
 asserted by a `#![feature(custom_test_frameworks)]` harness that boots the real kernel in
 QEMU and reports PASS/FAIL as a process exit code:
 
@@ -150,7 +150,7 @@ Testing section and `docs/drivers/roadmap.md`'s Phase 2 for more.
 |-------|------|---------|
 | `so2` | `/` (host) | Build script + QEMU launcher |
 | `kernel` | `kernel/` | Bare-metal kernel (`#![no_std]`, `x86_64-unknown-none`) |
-| `hal` | `hal/` | Host-testable hardware-access seams (`PortIo`/`PhysMem`) + pure driver logic, including the xHCI/USB/HID logic behind the USB keyboard, the MTRR/PAT memory-type decoding behind `/proc/fbinfo` and the `cpuid` decoding behind `/proc/cpuinfo` (`cd hal && cargo test`) |
+| `hal` | `hal/` | Host-testable hardware-access seams (`PortIo`/`PhysMem`) + pure driver logic, including the xHCI/USB/HID logic behind the USB keyboard, the MTRR/PAT memory-type decoding behind `/proc/fbinfo`, the `cpuid` decoding behind `/proc/cpuinfo` and the k10temp arithmetic behind `/proc/sensors` (`cd hal && cargo test`) |
 | `ext2` | `ext2/` | Host-testable ext2 filesystem core (`cd ext2 && cargo test` — known intermittent failure, see `docs/fs/ext2-test-flake.md`) |
 | `mm` | `mm/` | Host-testable buddy (physical) + slab (heap) allocators (`cd mm && cargo test`; the optional `slab-debug` feature adds a redzone + free-object quarantine, off by default so the default slot layout stays the reference one) |
 | `vfs` | `vfs/` | Host-testable VFS core: `Inode`/`Filesystem`/`FileHandle` traits, mount table + path resolution, and ramfs (`cd vfs && cargo test`) |
@@ -548,7 +548,7 @@ Current devices: `/dev/ptmx` + `/dev/pts/N` + `/dev/tty` (pseudo-terminals, see 
 
 **PCI + AC97 audio** (`pci.rs`, `ac97.rs`): this kernel's only PCI-aware code — `pci.rs` does raw 0xCF8/0xCFC config-space access and a bus-0 device scan (nothing else in this kernel enumerates PCI; every other driver targets a fixed legacy ISA port). `ac97.rs` finds the Intel 82801AA AC'97 codec (`-device AC97` in QEMU), does the cold-reset + PCM-out-stream-reset + mixer-unmute sequence, and runs a **polling**, not interrupt-driven, bus-master DMA ring: the IDT is a `spin::Once`, populated once as literally the first line of `boot()` before `memory::init_core` — wiring up a PCI IRQ whose vector is only known after enumeration doesn't fit that without either an early pre-memory PCI scan or a bigger IDT refactor, so `write_pcm()` instead polls the hardware's CIV register directly and blocks (spinning, no lock held across the spin, so the timer ISR/scheduler still preempts normally) until a buffer-descriptor slot frees. The 32-entry hardware BDL aliases only 8 real physical ring buffers (`entry[i].addr = slot_phys[i % 8]`) so the hardware's native mod-32 index wraparound still works correctly without needing all 32 to be distinct allocations. Fixed format only (48000 Hz stereo s16le, AC97's native non-VRA operating point) — no `ioctl` negotiation, matching the same "one client, one format, document it" simplification `/dev/input/event0`+`event1` already use.
 
-VFS mounts (`kernel/src/fs/mod.rs`): `/dev` (devfs), `/` (initramfs, embedded ELFs — a real two-level tree: root contains a real `bin` subdirectory and an `etc` one (`ETC_FILES`, data compiled in: `localtime`, a 54-byte UTC TZif — mlibc's `localtime()` ignores `TZ` and *panics* without `/etc/localtime`, which killed `uptime` and `date`; `passwd` and `group` with `root` (uid/gid 0, home `/tmp`, shell `/tmp/bin/sh` — PID 1 exports `HOME=/tmp` to match), so `id`, `ps`, `ls -l` and `find -user` print names), `/bin/<name>` is a genuine directory lookup, not a second mount aliasing the same flat namespace, see `fs::initramfs`), `/tmp` (ramfs, writable — the filesystem itself is `vfs::ramfs::RamFs`, host-testable; `kernel/src/fs/ramfs.rs` only supplies the `DirLockObserver` that wires its lock diagnostic into `/proc/kdebug`, see below), `/mnt` (ext2, read-write, best-effort — see the ext2 section below), `/proc` (procfs, read-only, synthetic — `/proc/meminfo` generated fresh on every `open()` from the live Buddy allocator stats; `/proc/self` and `/proc/<pid>/exe` are real symlinks, `/proc/dmesg` is the kernel log ring, `/proc/fbinfo` is the framebuffer console's instrument panel, `/proc/pci` lists every PCI function with the driver that claimed it, and `/proc/stat`, `/proc/uptime`, `/proc/loadavg`, `/proc/cpuinfo`, `/proc/<pid>/stat` (all 52 fields, real times and `rss`), `/proc/<pid>/statm` and `/proc/<pid>/cmdline` are in Linux's formats (see CPU Time Accounting and Resident Set Size) — see `fs::procfs`, the kernel-log section below, the framebuffer-performance note above, and the PCI note in the Device Driver Framework section). `ls /` also shows every other mount (`dev`, `tmp`, `mnt`, `proc`) as an entry — `fs::vfs::direct_children` (a thin delegate onto `vfs::mount::MountTable::direct_children`, see below) lets initramfs's root directory list them dynamically, same idea as a real Linux rootfs pre-creating empty `/proc`, `/dev`, etc. that mounts later overlay; actual traversal into them is still redirected by the mount table before ever reaching initramfs, so they only need to look like directories, not serve one.
+VFS mounts (`kernel/src/fs/mod.rs`): `/dev` (devfs), `/` (initramfs, embedded ELFs — a real two-level tree: root contains a real `bin` subdirectory and an `etc` one (`ETC_FILES`, data compiled in: `localtime`, a 54-byte UTC TZif — mlibc's `localtime()` ignores `TZ` and *panics* without `/etc/localtime`, which killed `uptime` and `date`; `passwd` and `group` with `root` (uid/gid 0, home `/tmp`, shell `/tmp/bin/sh` — PID 1 exports `HOME=/tmp` to match), so `id`, `ps`, `ls -l` and `find -user` print names), `/bin/<name>` is a genuine directory lookup, not a second mount aliasing the same flat namespace, see `fs::initramfs`), `/tmp` (ramfs, writable — the filesystem itself is `vfs::ramfs::RamFs`, host-testable; `kernel/src/fs/ramfs.rs` only supplies the `DirLockObserver` that wires its lock diagnostic into `/proc/kdebug`, see below), `/mnt` (ext2, read-write, best-effort — see the ext2 section below), `/proc` (procfs, read-only, synthetic — `/proc/meminfo` generated fresh on every `open()` from the live Buddy allocator stats; `/proc/self` and `/proc/<pid>/exe` are real symlinks, `/proc/dmesg` is the kernel log ring, `/proc/fbinfo` is the framebuffer console's instrument panel, `/proc/pci` lists every PCI function with the driver that claimed it, `/proc/sensors` the CPU temperatures (see CPU Temperature), and `/proc/stat`, `/proc/uptime`, `/proc/loadavg`, `/proc/cpuinfo`, `/proc/<pid>/stat` (all 52 fields, real times and `rss`), `/proc/<pid>/statm` and `/proc/<pid>/cmdline` are in Linux's formats (see CPU Time Accounting and Resident Set Size) — see `fs::procfs`, the kernel-log section below, the framebuffer-performance note above, and the PCI note in the Device Driver Framework section). `ls /` also shows every other mount (`dev`, `tmp`, `mnt`, `proc`) as an entry — `fs::vfs::direct_children` (a thin delegate onto `vfs::mount::MountTable::direct_children`, see below) lets initramfs's root directory list them dynamically, same idea as a real Linux rootfs pre-creating empty `/proc`, `/dev`, etc. that mounts later overlay; actual traversal into them is still redirected by the mount table before ever reaching initramfs, so they only need to look like directories, not serve one.
 
 **Storage stack seam** (`hal::block::BlockDevice`, `hal/src/block.rs`; `kernel::block::AtaBlockDevice`, `kernel/src/block/mod.rs`): `fs::ext2` no longer calls `block::ata::{read_sectors,write_sectors,present}` directly — it goes through `Ext2Fs::core.device: Box<dyn BlockDevice>` instead (`Ext2Core`, from the standalone `ext2` crate — see below), the same seam shape as `hal::PortIo`/`hal::PhysMem` (see `docs/drivers/architecture.md`'s storage-stack section), sector-granular (512 bytes) rather than filesystem-block-granular. `AtaBlockDevice` (zero-sized, wraps `block::ata`'s existing free functions) is what `fs::ext2::init()` mounts against at real boot; `hal::block::MemDisk` (`Vec<u8>`-backed, host-tested in `hal`) is what both the `ext2` crate's own host tests and the QEMU integration tests (`kernel/src/hw_tests.rs::ext2_memdisk_roundtrip` and `ext2_reclaim_orphans_clears_injected_disk_img_shape`) mount instead, exercising ext2's full read-write path with zero risk to the real `disk.img`. Explicitly a *partial* migration: `block::ata.rs` itself is still not seamed onto `PortIo` the way the six drivers in `docs/drivers/architecture.md`'s "Current status" are — only the layer above it (`fs::ext2`) moved.
 
@@ -581,7 +581,7 @@ arbitration, exactly where two PS/2 keyboards would merge.
 **Split across the usual seam.** `hal::xhci` (register/TRB/ring/context
 arithmetic), `hal::usb` (descriptor parsing + setup packets) and
 `hal::hid` (boot-report diffing + the Set-1 table) are pure and host-tested
-— most of `hal`'s 326 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
+— most of `hal`'s 335 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
 DMA pages, doorbells and waiting. That line is drawn hard here because an
 xHCI bring-up failure is nearly unobservable (a wrong bit in a device
 context yields no fault, no log, just a Transfer Event that never arrives)
@@ -1113,6 +1113,30 @@ counter. Gated on CPUID 6.ECX[0], decided once by the BSP after
 numbers are measured and draws one per tile plus the range in its header.
 **QEMU has none of it**, TCG or KVM (`-cpu host` too): only the fallback
 runs there, the measurement only on metal.
+
+## CPU Temperature (`hal::k10temp`, `kernel/src/cpu/temp.rs`, `/proc/sensors`)
+
+AMD family 17h/19h, read as Linux's `k10temp` reads it: SMN registers
+through the root complex's index/data pair (00:00.0, config `0x60`/`0x64`,
+`pci::smn_read`) — Tctl at `0x59800` (bits 31:21, 1/8 °C, minus 49 °C when
+the range bits say so) and one `Tccd` per populated CCD (`0x59800 +
+ccd_offset + 4n`, valid bit 11). The model table (CCD offset and count),
+the Tctl offset table (`Tdie` only on the early parts that have one) and
+the arithmetic are Linux's, pure and host-tested against the values
+Linux's k10temp reported on the target machine. Decided once at boot
+(`[k10temp] present|absent` in the log): AMD vendor, a covered family,
+**and** an AMD root complex (under a hypervisor CPUID can say Zen while
+00:00.0 is an emulated Intel bridge); claims 00:18.3 like Linux does.
+Read on every open. `/proc/sensors` is one `chip<TAB>label<TAB>
+millidegrees` line per sensor (hwmon's name/`tempN_label`/`tempN_input`),
+**empty** without the sensor — QEMU always, so only the Ryzen exercises
+it. `cpumon` shows Tctl in its header. Family 1Ah (Zen 5) is left out.
+
+**PCI config access is locked** (`pci::CONFIG`, an `IrqLock`) since this:
+mechanism #1 is two port accesses and the SMN pair two more, and with
+processes on every CPU a `cat /proc/pci` could retarget `0xCF8` under
+another CPU's access. `config_write8` (the ACPI reset, also on the panic
+path) only *tries* it for a bounded while and then resets regardless.
 
 ## Resident Set Size (`hal::paging`, `AddressSpace::mem_stats`, `fs::procfs`)
 
