@@ -41,6 +41,7 @@ const RUST_PROGRAMS: &[(&str, &str)] = &[
     ("uname",      "uname.elf"),
     ("shell",      "shell.elf"),
     ("snake",      "snake.elf"),
+    ("cpumon",     "cpumon.elf"),
     ("uptime",     "uptime.elf"),
     ("tsc",        "tsc.elf"),
     ("ipc_ping",   "ipc_ping.elf"),

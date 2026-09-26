@@ -16,7 +16,10 @@ gui = { path = "../gui" }
 vt = { path = "../vt" }
 # Software 2D drawing (canvas, primitives, pixel fonts) for graphical
 # programs; `userspace::gfx` puts the result on screen.
-draw = { path = "../draw" }
+draw = { path = "../draw", features = ["noto"] }
+# `sched::cputime`: the `/proc/stat` line format, shared with the kernel
+# that renders it (`cpumon` parses it).
+sched = { path = "../sched" }
 
 [profile.release]
 panic = "abort"

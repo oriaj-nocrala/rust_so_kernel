@@ -16,12 +16,16 @@
 //!   stride, so it can be a framebuffer row pitch) and its primitives.
 //! - [`font`]: two pixel fonts (3x5 and 5x7) and text drawing.
 //! - [`wave`]: a sine-shaped wave without libm, for animation.
+//! - `smooth` (feature `noto`): antialiased Noto Sans Mono text, blended
+//!   over whatever is already drawn.
 
 #![no_std]
 
 pub mod canvas;
 pub mod color;
 pub mod font;
+#[cfg(feature = "noto")]
+pub mod smooth;
 
 pub use canvas::Canvas;
 pub use font::{Font, FONT_3X5, FONT_5X7};

@@ -13,3 +13,10 @@ edition = "2021"
 [workspace]
 
 [dependencies]
+# Antialiased text (`smooth`), behind the `noto` feature so the crate stays
+# dependency-free by default. Same crate, version and sizes as `vt` and the
+# kernel console, so all three draw identical glyphs.
+noto-sans-mono-bitmap = { version = "0.3.2", default-features = false, features = ["regular", "bold", "size_16", "size_20", "size_24", "size_32", "unicode-basic-latin"], optional = true }
+
+[features]
+noto = ["dep:noto-sans-mono-bitmap"]
