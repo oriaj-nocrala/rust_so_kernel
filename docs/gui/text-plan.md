@@ -3,8 +3,8 @@
 > **Estado (2026-09-26):** fase 0 hecha (`d472a3e`: el userspace de Rust
 > tiene SSE2). Fases 1-3 hechas: crate `text/` (18 tests en el host),
 > fuentes en `disk.img`, `userspace::text` con respaldo bitmap, y
-> `textdemo` verificado en QEMU por `scripts/gui-e2e.sh text`. Siguiente:
-> fase 4 (metal).
+> `textdemo` verificado en QEMU por `scripts/gui-e2e.sh text`. Fase 4:
+> job en la Ryzen OK (boot #59); falta solo mirar `textdemo` a mano.
 
 ## Por qué, y por qué antes que la librería GUI
 
@@ -238,3 +238,15 @@ syscalls: recibe los bytes de las fuentes y un `&mut [u32]`.
   Latin-1 completo a 24 px 10-11 ms en frío y 2 ms en caliente.
   `gui-e2e.sh term` sigue en PASS con el terminfo sincronizado por la
   función nueva.
+- **2026-09-26 — fase 4 (job):** `target/metal/text-job.sh` en la Ryzen,
+  boot #59, veredicto OK (`target/metal/runs/20260926-154801-1ecb2a/`).
+  Las cuatro fuentes llegaron al pendrive con el md5 del host.
+  `compositor /mnt/bin/textdemo` a 1920x1080, dos veces: fuentes en 4-5 ms
+  (QEMU: 276), primer cuadro 3 ms (QEMU: 77), Latin-1 a 24 px por debajo
+  de 1 ms frío y caliente (QEMU: 10/2) — el reloj del programa tiene
+  resolución de ms, demasiado grueso para estos números; hacen falta µs si
+  se quieren comparar. Las 18 cajas de `measure` son idénticas a las de
+  QEMU (mismas x, y, w, h): el layout no depende de la máquina. Caché de
+  bloques ext2: 80 lecturas del dispositivo para todo el job. El SIGKILL
+  del compositor devolvió `/dev/fb0` las dos veces. Pendiente: ver
+  `textdemo` en pantalla a mano y fotografiarlo.

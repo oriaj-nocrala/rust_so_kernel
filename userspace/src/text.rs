@@ -6,10 +6,10 @@
 //! share them yet). Without fonts — no `/mnt`, or a disk synced before
 //! they existed — the program still runs: [`Text::draw`] and
 //! [`Text::measure`] fall back to `draw`'s bitmap Noto Sans Mono at the
-//! nearest of its four sizes, one line per `\n`, no wrapping, Basic Latin
+//! nearest of its four sizes, wrapped greedily by cells, Basic Latin
 //! only. [`Text::fonts`] says which one is live.
 //!
-//! Linking this pulls in `parley` + `swash` (~1.2 MB), so programs that use
+//! Linking this pulls in `parley` + `swash` (`textdemo` is 1.66 MB), so programs that use
 //! it belong on the disk (`/mnt/bin`), not embedded in the kernel.
 
 use alloc::vec::Vec;
