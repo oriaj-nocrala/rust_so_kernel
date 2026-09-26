@@ -52,6 +52,7 @@ const RUST_PROGRAMS: &[(&str, &str)] = &[
     ("demo",       "demo.elf"),
     ("reboot",     "reboot.elf"),
     ("userlib_test", "userlib_test.elf"),
+    ("sse_test",   "sse_test.elf"),
     ("compositor", "compositor.elf"),
     ("gui_demo",   "gui_demo.elf"),
     ("term",       "term.elf"),
@@ -210,6 +211,8 @@ fn main() {
     for entry in &[
         userspace_dir.join("Cargo.toml"),
         userspace_dir.join("linker.ld"),
+        userspace_dir.join("x86_64-constanos.json"),
+        userspace_dir.join(".cargo/config.toml"),
         sysroot_dir.join("usr/lib/libc.a"),
         sysroot_dir.join("usr/lib/crt1.o"),
         workspace_root.join("mlibc-cross.ini"),
@@ -273,7 +276,9 @@ fn main() {
 
     assert!(status.success(), "Userspace Rust build failed");
 
-    let release_dir = userspace_dir.join("target/x86_64-unknown-none/release");
+    // Named after userspace's own target spec (x86_64-constanos.json:
+    // hardware SSE2, not x86_64-unknown-none's soft-float).
+    let release_dir = userspace_dir.join("target/x86_64-constanos/release");
 
     for (bin, elf_name) in RUST_PROGRAMS {
         let src = release_dir.join(bin);

@@ -173,8 +173,9 @@ fn wait_reaping_orphans(pid: i64) {
     }
 }
 
-#[no_mangle]
-extern "C" fn _start() -> ! {
+userspace::entry!(main);
+
+fn main(_args: userspace::args::Args) -> i32 {
     install_busybox_symlinks();
     run_autorun_job();
 

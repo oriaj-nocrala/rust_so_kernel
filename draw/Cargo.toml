@@ -6,7 +6,8 @@ edition = "2021"
 # Software 2D drawing into a plain `&mut [u32]` of 0x00RRGGBB pixels:
 # colour arithmetic, clipped primitives, antialiased discs, additive glow,
 # blits and two pixel fonts. no_std, no alloc, no syscalls, integer only
-# (the userspace target is soft-float) — `cd draw && cargo test`. Its own
+# (written when the userspace target was soft-float; it has SSE2 now) —
+# `cd draw && cargo test`. Its own
 # workspace root (empty table below), like `gui`/`vt`: the parent
 # workspace's `panic = "abort"` would break the test harness. `userspace`
 # depends on it by path; `userspace::gfx` is what puts the pixels on screen.

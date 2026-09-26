@@ -3,8 +3,9 @@
 
 use userspace::{println, syscall};
 
-#[no_mangle]
-extern "C" fn _start() -> ! {
+userspace::entry!(main);
+
+fn main(_args: userspace::args::Args) -> i32 {
     let (sec0, nsec0) = syscall::clock_gettime();
     let start_ms = syscall::uptime_ms();
 

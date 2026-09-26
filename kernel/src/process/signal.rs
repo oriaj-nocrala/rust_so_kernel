@@ -28,6 +28,7 @@
 // space by `elf_loader.rs`), and the live TrapFrame is redirected to the
 // handler. `rt_sigreturn` (`syscall.rs`) reverses this exactly.
 
+use super::fpu::FpuState;
 use super::{Process, TrapFrame};
 use crate::memory::signal_trampoline::TRAMPOLINE_VA;
 
@@ -285,8 +286,16 @@ fn deliver_one(proc: &mut Process, tf: *mut TrapFrame) -> SignalOutcome {
 
 /// Saved onto the user stack so `rt_sigreturn` can restore everything
 /// exactly, including the signal mask in effect before delivery.
+///
+/// `fpu` is the interrupted code's FXSAVE image, as Linux keeps it in its
+/// `rt_sigframe`: the handler is ordinary code free to use XMM registers
+/// (mlibc's `memcpy`/`printf` do, and so does every Rust program since the
+/// userspace target gained SSE), and without it the interrupted code would
+/// resume with the handler's values in them. `FpuState` is 16-byte aligned,
+/// so the whole frame is, and `frame_base` below is 16-aligned too.
 #[repr(C)]
 struct SignalFrame {
+    fpu: FpuState,
     saved_mask: u64,
     saved_tf: TrapFrame,
 }
@@ -309,7 +318,15 @@ unsafe fn push_signal_frame(proc: &mut Process, tf: *mut TrapFrame, sig: u32, ha
     let frame_base = (base - frame_size) & !0xF;
     let tramp_slot = frame_base - 8;
 
+    // The interrupted code's FPU/SSE state is the live one: every caller
+    // runs for the process `resolve_signals` is about to return to, after
+    // any switch into it has already `fxrstor`ed its state, and the
+    // kernel itself is soft-float.
+    let mut fpu = FpuState([0u8; 512]);
+    unsafe { super::fpu::save(&mut fpu) };
+
     let frame = SignalFrame {
+        fpu,
         // After `rt_sigsuspend`, the handler's `sigreturn` must restore the
         // caller's mask, not sigsuspend's temporary one.
         saved_mask: proc.saved_sigmask.take().unwrap_or(proc.blocked_signals),
@@ -354,7 +371,9 @@ unsafe fn push_signal_frame(proc: &mut Process, tf: *mut TrapFrame, sig: u32, ha
 /// call computed — true whenever this is reached via the trampoline, which
 /// is the only place that sets rsp to that value.
 pub unsafe fn pop_signal_frame(proc: &mut Process, tf: *mut TrapFrame, user_rsp: u64) {
-    let frame = unsafe { core::ptr::read(user_rsp as *const SignalFrame) };
+    // Unaligned: `user_rsp` is whatever the process had in rsp when it made
+    // the call, and `SignalFrame` now demands 16.
+    let frame = unsafe { core::ptr::read_unaligned(user_rsp as *const SignalFrame) };
     crate::ktrace!(
         crate::debug::PROC,
         "sigreturn: PID {} frame at {:#x} -> rip={:#x} rsp={:#x} cs={:#x}",
@@ -362,4 +381,10 @@ pub unsafe fn pop_signal_frame(proc: &mut Process, tf: *mut TrapFrame, user_rsp:
     );
     proc.blocked_signals = frame.saved_mask;
     unsafe { core::ptr::write(tf, frame.saved_tf) };
+    // Straight into the live registers, as `sys_exec` does: this process
+    // returns to user mode on this CPU without another switch, and a
+    // preemption before that saves what this loads.
+    let mut fpu = frame.fpu;
+    super::fpu::sanitize(&mut fpu);
+    unsafe { super::fpu::restore(&fpu) };
 }

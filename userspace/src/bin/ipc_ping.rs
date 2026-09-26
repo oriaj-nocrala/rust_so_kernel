@@ -54,8 +54,9 @@ fn client() -> ! {
     syscall::exit(0);
 }
 
-#[no_mangle]
-extern "C" fn _start() -> ! {
+userspace::entry!(main);
+
+fn main(_args: userspace::args::Args) -> i32 {
     let fd = syscall::socket(AF_UNIX as i32, SOCK_STREAM, 0);
     if fd < 0 {
         println!("ipc_ping: server socket failed ({})", fd);

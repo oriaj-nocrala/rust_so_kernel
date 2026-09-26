@@ -5,8 +5,9 @@ use userspace::{eprintln, syscall};
 
 const MESSAGE: &str = "the quick brown fox jumps over the lazy dog";
 
-#[no_mangle]
-extern "C" fn _start() -> ! {
+userspace::entry!(main);
+
+fn main(_args: userspace::args::Args) -> i32 {
     let (rfd, wfd) = match syscall::pipe() {
         Ok(fds) => fds,
         Err(e) => {

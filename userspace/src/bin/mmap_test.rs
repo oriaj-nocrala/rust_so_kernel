@@ -8,8 +8,9 @@ const PAGE_SIZE: u64 = 4096;
 const NUM_PAGES: u64 = 3;
 const LEN: u64 = PAGE_SIZE * NUM_PAGES;
 
-#[no_mangle]
-extern "C" fn _start() -> ! {
+userspace::entry!(main);
+
+fn main(_args: userspace::args::Args) -> i32 {
     let addr = syscall::mmap_anon(0, LEN, PROT_READ | PROT_WRITE);
     if addr < 0 {
         println!("mmap_test: mmap failed ({})", addr);

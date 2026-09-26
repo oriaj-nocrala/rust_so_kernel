@@ -17,8 +17,9 @@ extern "C" fn on_chld(_sig: i32) {
     CHLD_RECEIVED.store(true, Ordering::SeqCst);
 }
 
-#[no_mangle]
-extern "C" fn _start() -> ! {
+userspace::entry!(main);
+
+fn main(_args: userspace::args::Args) -> i32 {
     if syscall::sigaction(syscall::SIGUSR1, on_usr1 as usize as u64) < 0 {
         eprintln!("signal_test: sigaction(SIGUSR1) failed");
         syscall::exit(1);

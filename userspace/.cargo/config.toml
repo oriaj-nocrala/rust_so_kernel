@@ -1,11 +1,15 @@
 [build]
-target = "x86_64-unknown-none"
+# Our own target (x86_64-constanos.json): x86_64-unknown-none with SSE2
+# instead of soft-float. The kernel saves and restores each process's
+# FXSAVE state at every switch and in every signal frame.
+target = "x86_64-constanos.json"
 
 [unstable]
 build-std = ["core", "alloc", "compiler_builtins"]
 build-std-features = ["compiler-builtins-mem"]
+json-target-spec = true
 
-[target.x86_64-unknown-none]
+[target.x86_64-constanos]
 rustflags = [
     "-C", "link-arg=-Tlinker.ld",
     "-C", "relocation-model=static",

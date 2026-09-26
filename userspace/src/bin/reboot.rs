@@ -7,8 +7,9 @@
 
 use userspace::{println, syscall};
 
-#[no_mangle]
-extern "C" fn _start() -> ! {
+userspace::entry!(main);
+
+fn main(_args: userspace::args::Args) -> i32 {
     println!("Reiniciando...");
     let r = syscall::reboot();
     println!("reboot: failed ({})", r);

@@ -119,3 +119,28 @@ pub unsafe fn restore(area: &FpuState) {
         asm!("fxrstor [{}]", in(reg) area.0.as_ptr(), options(nostack));
     }
 }
+
+/// Byte offsets of MXCSR and MXCSR_MASK in an FXSAVE image (SDM vol. 1,
+/// table 10-2).
+const MXCSR_OFFSET: usize = 24;
+const MXCSR_MASK_OFFSET: usize = 28;
+/// What MXCSR_MASK means when the processor stores 0 there (SDM 11.6.6).
+const MXCSR_MASK_DEFAULT: u32 = 0xFFBF;
+
+/// Clear the MXCSR bits this processor reserves, so `restore` of an image
+/// that came from user memory — a signal frame the handler may have
+/// scribbled on — cannot #GP inside the kernel. The mask comes from the
+/// boot-captured template, never from `area` itself: that copy is user
+/// data too. Linux does the same in `fpu__restore_sig`.
+pub fn sanitize(area: &mut FpuState) {
+    let template = TEMPLATE
+        .get()
+        .expect("fpu::init() must run before any process is created");
+    let word = |a: &[u8; 512], at: usize| u32::from_le_bytes(a[at..at + 4].try_into().unwrap());
+    let mask = match word(&template.0, MXCSR_MASK_OFFSET) {
+        0 => MXCSR_MASK_DEFAULT,
+        m => m,
+    };
+    let mxcsr = word(&area.0, MXCSR_OFFSET) & mask;
+    area.0[MXCSR_OFFSET..MXCSR_OFFSET + 4].copy_from_slice(&mxcsr.to_le_bytes());
+}

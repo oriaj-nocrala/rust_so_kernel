@@ -33,8 +33,9 @@ fn client() -> ! {
     syscall::exit(0);
 }
 
-#[no_mangle]
-extern "C" fn _start() -> ! {
+userspace::entry!(main);
+
+fn main(_args: userspace::args::Args) -> i32 {
     // A leftover node from an earlier run would make bind() fail with
     // EADDRINUSE — which is correct behavior, so clean up first.
     syscall::with_cstr("/tmp/poll_test.sock", |p| syscall::unlink(p));

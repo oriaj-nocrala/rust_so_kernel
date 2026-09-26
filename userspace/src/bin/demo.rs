@@ -106,8 +106,9 @@ fn meminfo_line(label: &str) {
     reset();
 }
 
-#[no_mangle]
-extern "C" fn _start() -> ! {
+userspace::entry!(main);
+
+fn main(_args: userspace::args::Args) -> i32 {
     color("1;35");
     println!("================================================");
     println!("  ConstanOS -- kernel x86_64 escrito desde cero");

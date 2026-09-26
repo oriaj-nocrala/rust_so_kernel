@@ -7,9 +7,10 @@
 //! (window, events, present), `draw` the SDL_gfx/SDL_ttf-like part. There
 //! is no GPU driver, so every pixel is the CPU's.
 //!
-//! `no_std`, no `alloc`, no floating point: the userspace target
-//! (`x86_64-unknown-none`) is soft-float, so sub-pixel positions are fixed
-//! point ([`FP`] units per pixel) and colours are integer arithmetic.
+//! `no_std`, no `alloc`, no floating point: written when the userspace
+//! target was soft-float, so sub-pixel positions are fixed point ([`FP`]
+//! units per pixel) and colours are integer arithmetic. The target has
+//! SSE2 now (`userspace/x86_64-constanos.json`); nothing here needed it.
 //!
 //! - [`color`]: packing, scaling, mixing, additive light, HSV.
 //! - [`canvas`]: [`Canvas`], a clipped view of a pixel buffer (with a

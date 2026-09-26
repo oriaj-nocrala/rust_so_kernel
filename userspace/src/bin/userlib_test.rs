@@ -259,8 +259,9 @@ fn ioctl_winsz() {
     check("ioctl(TIOCGWINSZ)", r == 0 && ws[0] > 0 && ws[1] > 0);
 }
 
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
+userspace::entry!(main);
+
+fn main(_args: userspace::args::Args) -> i32 {
     println!("userlib_test: heap");
     heap_basics();
     heap_alignment();
