@@ -24,6 +24,7 @@ pub mod acpi;
 pub mod apic;
 pub mod ac97;
 pub mod block;
+pub mod cpufreq;
 pub mod cpuid;
 pub mod blockcache;
 pub mod fbdirty;

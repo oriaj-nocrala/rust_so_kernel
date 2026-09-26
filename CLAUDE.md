@@ -96,7 +96,7 @@ so addresses actually resolve to real function names instead of bare hex.
 ### QEMU integration tests
 
 Real hardware-path behavior (drivers that need actual QEMU devices, not just host-testable
-pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 317 tests, <1s, no QEMU) is
+pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 326 tests, <1s, no QEMU) is
 asserted by a `#![feature(custom_test_frameworks)]` harness that boots the real kernel in
 QEMU and reports PASS/FAIL as a process exit code:
 
@@ -581,7 +581,7 @@ arbitration, exactly where two PS/2 keyboards would merge.
 **Split across the usual seam.** `hal::xhci` (register/TRB/ring/context
 arithmetic), `hal::usb` (descriptor parsing + setup packets) and
 `hal::hid` (boot-report diffing + the Set-1 table) are pure and host-tested
-— most of `hal`'s 317 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
+— most of `hal`'s 326 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
 DMA pages, doorbells and waiting. That line is drawn hard here because an
 xHCI bring-up failure is nearly unobservable (a wrong bit in a device
 context yields no fault, no log, just a Transfer Event that never arrives)
@@ -1095,6 +1095,24 @@ sysinfo/loadavg consistent); and **`cpumon`** (`userspace/src/bin/
 cpumon.rs`, embedded): a graph per CPU with user and system stacked, total
 load, memory, load averages and the busiest processes, from those files
 alone — `compositor cpumon`, or on the console.
+
+## Per-Core Frequency (`hal::cpufreq`, `kernel/src/cpu/freq.rs`)
+
+`/proc/cpuinfo`'s `cpu MHz` is each core's real running frequency since
+2026-09-26, as on Linux: `base × ΔAPERF / ΔMPERF`, where MPERF ticks at the
+TSC's rate and APERF at the core's, both only in C0. **Per-CPU tick work**:
+every scheduling CPU reads its own pair in `timer_preempt_handler` (a CPU's
+MSRs are only readable by it), before the scheduler lock, into a per-CPU
+`hal::cpufreq::Window` (`try_with`, never waits); a result needs 10 ms of
+accumulated C0 time (`MIN_ACTIVE_US`), so an idle core keeps reporting the
+frequency it last ran at. A result above 4x base is discarded as a reset
+counter. Gated on CPUID 6.ECX[0], decided once by the BSP after
+`tsc::init` (`cpu::freq::init`, `[cpufreq]` in the boot log) — without it
+`rdmsr` would #GP, and `cpu MHz` stays the TSC's. `flags` lists
+`aperfmperf` when present (Linux's name), which is how `cpumon` knows the
+numbers are measured and draws one per tile plus the range in its header.
+**QEMU has none of it**, TCG or KVM (`-cpu host` too): only the fallback
+runs there, the measurement only on metal.
 
 ## Resident Set Size (`hal::paging`, `AddressSpace::mem_stats`, `fs::procfs`)
 

@@ -213,8 +213,11 @@ fn render_loadavg() -> String {
 /// Renders `/proc/cpuinfo` in Linux's x86 layout, one block per CPU that
 /// runs processes. Identification and flags are this CPU's `cpuid`
 /// (decoded by `hal::cpuid`) — every core of one package reports the same;
-/// `apicid` is each CPU's own. `cpu MHz` is the calibrated TSC frequency
-/// and `bogomips` twice it, which is what Linux derives from the TSC too.
+/// `apicid` is each CPU's own. `cpu MHz` is the frequency the core last
+/// ran at, measured from its APERF/MPERF (`cpu::freq`), as Linux reports
+/// it — or the calibrated TSC frequency where there are no such counters
+/// (QEMU's TCG) or the core has not run long enough yet. `bogomips` is
+/// twice the TSC frequency, which is what Linux derives from the TSC too.
 fn render_cpuinfo() -> String {
     use core::arch::x86_64::{__cpuid, __cpuid_count};
     use core::fmt::Write;
@@ -233,6 +236,7 @@ fn render_cpuinfo() -> String {
     } else {
         Regs::default()
     };
+    let l6 = if leaf0.eax >= 6 { r(6) } else { Regs::default() };
     let e1 = if max_ext >= 0x8000_0001 { r(0x8000_0001) } else { Regs::default() };
     let brand = (max_ext >= 0x8000_0004)
         .then(|| cpuid::brand([r(0x8000_0002), r(0x8000_0003), r(0x8000_0004)]));
@@ -243,7 +247,7 @@ fn render_cpuinfo() -> String {
     let model_name = brand.as_ref().and_then(|b| cpuid::trimmed(b)).unwrap_or("unknown");
     let sig = cpuid::signature(l1.eax);
     let feats = FeatureRegs {
-        l1_edx: l1.edx, l1_ecx: l1.ecx, l7_ebx: l7.ebx, l7_ecx: l7.ecx,
+        l1_edx: l1.edx, l1_ecx: l1.ecx, l7_ebx: l7.ebx, l7_ecx: l7.ecx, l6_ecx: l6.ecx,
         e1_edx: e1.edx, e1_ecx: e1.ecx,
     };
     let mut flags = String::new();
@@ -260,6 +264,7 @@ fn render_cpuinfo() -> String {
     let mut out = String::new();
     for &c in &cpus {
         let apic = crate::smp::apic_id(c);
+        let mhz_khz = crate::cpu::freq::khz(c).unwrap_or(khz);
         let _ = write!(
             out,
             "processor\t: {c}\nvendor_id\t: {vendor}\ncpu family\t: {fam}\nmodel\t\t: {model}\n\
@@ -269,7 +274,7 @@ fn render_cpuinfo() -> String {
              flags\t\t: {flags}\nbogomips\t: {bogo}.{bogo_frac:02}\nclflush size\t: {clflush}\n\
              cache_alignment\t: {clflush}\n",
             fam = sig.family, model = sig.model, step = sig.stepping,
-            mhz = khz / 1000, mhz_frac = khz % 1000, n = cpus.len(),
+            mhz = mhz_khz / 1000, mhz_frac = mhz_khz % 1000, n = cpus.len(),
             level = leaf0.eax, bogo = khz * 2 / 1000, bogo_frac = (khz * 2 % 1000) / 10,
         );
         if let Some(a) = addr {

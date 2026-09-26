@@ -70,14 +70,16 @@ pub fn trimmed(bytes: &[u8]) -> Option<&str> {
 }
 
 /// The registers flags are read from. Leaves that the CPU does not have
-/// (max leaf below 7, max extended leaf below 0x8000_0001) are passed as
-/// zero.
+/// (max leaf below 6 or 7, max extended leaf below 0x8000_0001) are passed
+/// as zero.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FeatureRegs {
     pub l1_edx: u32,
     pub l1_ecx: u32,
     pub l7_ebx: u32,
     pub l7_ecx: u32,
+    /// Leaf 6 (thermal and power management): only `aperfmperf`, bit 0.
+    pub l6_ecx: u32,
     pub e1_edx: u32,
     pub e1_ecx: u32,
 }
@@ -88,12 +90,14 @@ enum Word {
     E1Edx,
     L1Ecx,
     E1Ecx,
+    L6Ecx,
     L7Ebx,
     L7Ecx,
 }
 
 /// (register, bit, Linux name), in Linux's word order: 1.EDX, 8000_0001.EDX,
-/// 1.ECX, 8000_0001.ECX, 7.EBX, 7.ECX. A subset: the flags programs
+/// 1.ECX, 8000_0001.ECX, then Linux's word 7 (bits it gathers from other
+/// leaves — here 6.ECX's `aperfmperf`), 7.EBX, 7.ECX. A subset: the flags programs
 /// actually test for, not every bit either manual defines.
 const FLAGS: &[(Word, u8, &str)] = &[
     (Word::L1Edx, 0, "fpu"), (Word::L1Edx, 1, "vme"), (Word::L1Edx, 2, "de"),
@@ -115,6 +119,7 @@ const FLAGS: &[(Word, u8, &str)] = &[
     (Word::L1Ecx, 30, "rdrand"), (Word::L1Ecx, 31, "hypervisor"),
     (Word::E1Ecx, 0, "lahf_lm"), (Word::E1Ecx, 2, "svm"), (Word::E1Ecx, 5, "abm"),
     (Word::E1Ecx, 6, "sse4a"), (Word::E1Ecx, 8, "3dnowprefetch"),
+    (Word::L6Ecx, 0, "aperfmperf"),
     (Word::L7Ebx, 0, "fsgsbase"), (Word::L7Ebx, 3, "bmi1"), (Word::L7Ebx, 5, "avx2"),
     (Word::L7Ebx, 7, "smep"), (Word::L7Ebx, 8, "bmi2"), (Word::L7Ebx, 9, "erms"),
     (Word::L7Ebx, 16, "avx512f"), (Word::L7Ebx, 18, "rdseed"), (Word::L7Ebx, 19, "adx"),
@@ -131,6 +136,7 @@ pub fn flags(r: &FeatureRegs) -> impl Iterator<Item = &'static str> + '_ {
             Word::E1Edx => r.e1_edx,
             Word::L1Ecx => r.l1_ecx,
             Word::E1Ecx => r.e1_ecx,
+            Word::L6Ecx => r.l6_ecx,
             Word::L7Ebx => r.l7_ebx,
             Word::L7Ecx => r.l7_ecx,
         };
@@ -190,11 +196,12 @@ mod tests {
             l1_edx: 1 << 0 | 1 << 26,
             l1_ecx: 1 << 20 | 1 << 31,
             l7_ebx: 1 << 5,
+            l6_ecx: 1 << 0 | 1 << 3,
             e1_edx: 1 << 29,
             ..Default::default()
         };
         let got: std::vec::Vec<&str> = flags(&r).collect();
-        assert_eq!(got, ["fpu", "sse2", "lm", "sse4_2", "hypervisor", "avx2"]);
+        assert_eq!(got, ["fpu", "sse2", "lm", "sse4_2", "hypervisor", "aperfmperf", "avx2"]);
         assert_eq!(flags(&FeatureRegs::default()).count(), 0);
     }
 

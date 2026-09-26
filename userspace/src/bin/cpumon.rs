@@ -33,7 +33,7 @@ use userspace::{entry, println, syscall};
 entry!(main);
 
 const W: usize = 640;
-const H: usize = 400;
+const H: usize = 460;
 /// Samples of history kept per graph (a minute at `PERIOD_MS`).
 const HIST: usize = 120;
 const PERIOD_MS: i64 = 500;
@@ -136,6 +136,33 @@ fn parse_pid_stat(line: &str) -> Option<(String, u64, usize, u64)> {
     Some((comm, num(14)? + num(15)?, num(39).unwrap_or(0) as usize, num(24).unwrap_or(0)))
 }
 
+/// `(processor, MHz)` for every block of a `/proc/cpuinfo`: the frequency
+/// each core last ran at, where the kernel measures it (see `cpu MHz` in
+/// `fs::procfs::render_cpuinfo`).
+fn parse_cpu_mhz(text: &str) -> Vec<(usize, u32)> {
+    let mut out = Vec::new();
+    let mut cpu = None;
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once(':') else { continue };
+        match k.trim() {
+            "processor" => cpu = v.trim().parse().ok(),
+            "cpu MHz" => {
+                if let (Some(c), Some(m)) = (cpu, v.trim().split('.').next().and_then(|m| m.parse().ok())) {
+                    out.push((c, m));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// `4.62 GHz` / `4.62` for a frequency in MHz.
+fn ghz(mhz: u32, unit: bool) -> String {
+    let s = format!("{}.{:02}", mhz / 1000, mhz % 1000 / 10);
+    if unit { format!("{} GHz", s) } else { s }
+}
+
 /// What to call a process, as `ps` does: its command line (arguments
 /// NUL-separated in `/proc/<pid>/cmdline`, the program by its basename),
 /// or `[comm]` when there is none.
@@ -184,6 +211,8 @@ impl History {
 
 struct Cpu {
     id: usize,
+    /// The frequency it last ran at, MHz; 0 where it is not measured.
+    mhz: u32,
     prev: CpuTimes,
     hist: History,
 }
@@ -201,7 +230,11 @@ struct Proc {
 
 struct State {
     model: String,
+    /// The TSC's frequency, shown only where cores are not measured.
     mhz: String,
+    /// `/proc/cpuinfo` lists `aperfmperf`: `cpu MHz` is each core's
+    /// measured frequency, not the TSC's.
+    measured: bool,
     cpus: Vec<Cpu>,
     total_prev: CpuTimes,
     total: History,
@@ -220,6 +253,7 @@ impl State {
     fn new() -> State {
         let mut buf = Vec::new();
         let (mut model, mut mhz) = (String::from("unknown CPU"), String::new());
+        let mut measured = false;
         if read_file("/proc/cpuinfo", &mut buf) {
             let t = text_of(&buf);
             let value = |key: &str| {
@@ -231,10 +265,12 @@ impl State {
             if let Some(m) = value("cpu MHz") {
                 mhz = format!("{} MHz", m.split('.').next().unwrap_or(""));
             }
+            measured = value("flags").is_some_and(|f| f.split(' ').any(|x| x == "aperfmperf"));
         }
         State {
             model,
             mhz,
+            measured,
             cpus: Vec::new(),
             total_prev: CpuTimes::default(),
             total: History::new(),
@@ -262,7 +298,7 @@ impl State {
                         let i = match self.cpus.iter().position(|c| c.id == id) {
                             Some(i) => i,
                             None => {
-                                self.cpus.push(Cpu { id, prev: now, hist: History::new() });
+                                self.cpus.push(Cpu { id, mhz: 0, prev: now, hist: History::new() });
                                 self.cpus.len() - 1
                             }
                         };
@@ -278,6 +314,15 @@ impl State {
                 if self.samples > 0 {
                     let t = d.total();
                     hist.push(permille(d.user + d.nice, t), permille(d.system + d.irq + d.softirq, t));
+                }
+            }
+        }
+
+        // Each core's frequency.
+        if self.measured && read_file("/proc/cpuinfo", &mut self.buf) {
+            for (id, mhz) in parse_cpu_mhz(text_of(&self.buf)) {
+                if let Some(c) = self.cpus.iter_mut().find(|c| c.id == id) {
+                    c.mhz = mhz;
                 }
             }
         }
@@ -417,7 +462,13 @@ fn draw(cv: &mut Canvas, st: &State) {
     cv.hline(0, 34, W as i32, EDGE);
     let x = cv.smooth_text(TITLE, 12, 6, "CPU", ACCENT);
     let x = cv.smooth_text(SMALL, x + 12, 9, &st.model, TEXT);
-    if !st.mhz.is_empty() {
+    if st.measured {
+        // The range the cores span right now.
+        let m = st.cpus.iter().map(|c| c.mhz).filter(|&m| m > 0);
+        if let (Some(lo), Some(hi)) = (m.clone().min(), m.max()) {
+            cv.smooth_text(SMALL, x + 10, 9, &format!("{} - {}", ghz(lo, false), ghz(hi, true)), DIM);
+        }
+    } else if !st.mhz.is_empty() {
         cv.smooth_text(SMALL, x + 10, 9, &st.mhz, DIM);
     }
     let up = st.uptime_s;
@@ -425,7 +476,9 @@ fn draw(cv: &mut Canvas, st: &State) {
     cv.smooth_text_right(SMALL, W as i32 - 12, 9, &uptime, DIM);
 
     // One tile per CPU.
-    let (gx, gy, gw, gh) = (8, 42, W as i32 - 16, 222);
+    // The bottom panels take the last 130 rows; the tiles get the rest.
+    let bottom = H as i32 - 130;
+    let (gx, gy, gw, gh) = (8, 42, W as i32 - 16, bottom - 6 - 42);
     let (cols, rows) = grid_shape(st.cpus.len(), gw, gh);
     let (tw, th) = (gw / cols, gh / rows);
     for (i, c) in st.cpus.iter().enumerate() {
@@ -436,10 +489,17 @@ fn draw(cv: &mut Canvas, st: &State) {
         cv.smooth_text_right(SMALL_BOLD, tx + tw - 8, ty + 4, &pct(u + s), load_color(u + s));
         let top = ty + 22;
         graph(cv, tx + 7, top, tw - 14, ty + th - 7 - top, &c.hist);
+        if c.mhz > 0 && ty + th - 7 - top >= SMALL.cell().1 + 4 {
+            // Over the graph's bottom left, where the graph is tall enough
+            // to hold a line; the unit only where it fits.
+            let full = ghz(c.mhz, true);
+            let s = if SMALL.width(&full) <= tw - 20 { full } else { ghz(c.mhz, false) };
+            cv.smooth_text(SMALL, tx + 10, ty + th - 9 - SMALL.cell().1, &s, TEXT);
+        }
     }
 
     // Bottom left: all CPUs, memory, load.
-    let (bx, by, bw, bh) = (8, 270, 312, 122);
+    let (bx, by, bw, bh) = (8, bottom, 312, 122);
     panel(cv, bx + 2, by + 2, bw - 4, bh - 4);
     let (u, s) = st.total.last();
     cv.smooth_text(SMALL_BOLD, bx + 10, by + 6, "All CPUs", TEXT);
@@ -464,7 +524,7 @@ fn draw(cv: &mut Canvas, st: &State) {
     cv.smooth_text_right(SMALL, bx + bw - 10, by + 92, &st.tasks, DIM);
 
     // Bottom right: the busiest processes.
-    let (px, py, pw, ph) = (320, 270, W as i32 - 8 - 320, 122);
+    let (px, py, pw, ph) = (320, bottom, W as i32 - 8 - 320, 122);
     panel(cv, px + 2, py + 2, pw - 4, ph - 4);
     let (c_pid, c_name, c_cpu, c_rss, c_pct) =
         (px + 10, px + 62, px + pw - 170, px + pw - 80, px + pw - 10);

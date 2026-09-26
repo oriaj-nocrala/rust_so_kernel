@@ -194,6 +194,9 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> Resume 
     // Per-CPU GS invariant (`cpu/percpu.rs`): two rdmsrs, 100 Hz.
     crate::cpu::percpu::check_gs_invariant();
 
+    // Per-CPU work: this CPU's APERF/MPERF (`cpu/freq.rs`), two rdmsrs.
+    crate::cpu::freq::tick();
+
     // ── 2. Global work: CPU 0 only ────────────────────────────────────
     // Every CPU that schedules gets this tick (stage 7 of
     // docs/smp/smp-plan.md); what is not per-CPU runs once per period, on
