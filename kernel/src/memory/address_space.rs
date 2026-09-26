@@ -189,6 +189,10 @@ impl AddressSpace {
                     return Err("fork: shared object mapped too many times");
                 }
                 let orig_flags = vma.page_table_flags();
+                if vma.kind == VmaKind::Huge2M {
+                    Self::fork_copy_huge(&self.page_table, &child.page_table, vma)?;
+                    continue;
+                }
                 // A `Shared` VMA keeps its flags: both sides write the
                 // object's frames. Every other kind is read-only until the
                 // COW fault copies it.
@@ -232,6 +236,49 @@ impl AddressSpace {
         })?;
 
         Ok(child)
+    }
+
+    /// `fork` for a `Huge2M` VMA: every 2 MiB page the parent has is
+    /// **copied** into a fresh frame the child owns outright. Huge pages
+    /// are never shared — they are freed without a refcount
+    /// (`unmap_page_and_free_2m`, `release_user_pages`), the COW fault path
+    /// is 4 KiB only, and `prepare_user_write` relies on it — so a copy is
+    /// the one way to fork them that keeps all of that true.
+    ///
+    /// The per-page loop above used to handle these too, through a 4 KiB
+    /// `translate_page` that reports a 2 MiB leaf as absent: every huge
+    /// page was skipped, and a child read zeros wherever its parent had
+    /// data in an `mmap` of 2 MiB or more — any large `malloc` included.
+    /// Found by `rss_test` case E (the child's resident set was exactly one
+    /// such mapping short).
+    ///
+    /// Cost: 2 MiB of copying per present huge page, with the parent's
+    /// lock held (and the scheduler's, from `sys_fork`). Sharing them COW
+    /// would avoid it, at the price of changing every path above.
+    unsafe fn fork_copy_huge(parent: &OwnedPageTable, child: &OwnedPageTable, vma: &Vma) -> Result<(), &'static str> {
+        use x86_64::structures::paging::{FrameAllocator, Mapper};
+        const PAGE_2M: u64 = 0x200_000;
+        let phys_offset = crate::memory::physical_memory_offset();
+        for i in 0..(vma.size_pages / 512) as u64 {
+            let page = Page::<Size2MiB>::containing_address(VirtAddr::new(vma.start + i * PAGE_2M));
+            let Ok(src) = parent.create_mapper().translate_page(page) else { continue };
+            let mut buddy = super::page_table_manager::BuddyFrameAllocator;
+            let dst: PhysFrame<Size2MiB> = buddy.allocate_frame().ok_or("fork: OOM copying a huge page")?;
+            core::ptr::copy_nonoverlapping(
+                (phys_offset + src.start_address().as_u64()).as_ptr::<u8>(),
+                (phys_offset + dst.start_address().as_u64()).as_mut_ptr::<u8>(),
+                PAGE_2M as usize,
+            );
+            match child.create_mapper().map_to(page, dst, vma.page_table_flags(), &mut buddy) {
+                // The child is in no CPU's CR3 yet: nothing to invalidate.
+                Ok(flush) => flush.ignore(),
+                Err(_) => {
+                    crate::allocator::phys_free(dst.start_address(), 21);
+                    return Err("fork: map_to of a huge page copy failed");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// A not-present fault at `fault_addr`, from the page fault handler:
@@ -389,7 +436,7 @@ impl AddressSpace {
                     if !self.page_table.is_mapped(VirtAddr::new(page_addr)) {
                         super::demand_paging::map_demand_page(&self.page_table, page_addr, &vma, true).is_ok()
                     } else if vma.kind == VmaKind::Huge2M {
-                        true // never COW-shared: fork does not share huge pages
+                        true // never COW-shared: fork copies huge pages
                     } else {
                         self.make_writable_locked(page, &vma).is_ok()
                     }
