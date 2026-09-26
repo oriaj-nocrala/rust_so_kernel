@@ -48,6 +48,27 @@ impl Args {
     pub fn get(&self, i: usize) -> Option<&'static [u8]> {
         self.get_cstr(i).map(|s| &s[..s.len() - 1])
     }
+
+    /// The value of environment variable `name` (without the NUL). envp
+    /// follows argv's terminating null pointer on the initial stack.
+    pub fn env(&self, name: &[u8]) -> Option<&'static [u8]> {
+        unsafe {
+            let mut p = self.argv.add(self.argc + 1);
+            while !(*p).is_null() {
+                let s = *p;
+                let mut n = 0;
+                while *s.add(n) != 0 {
+                    n += 1;
+                }
+                let var = core::slice::from_raw_parts(s, n);
+                if var.len() > name.len() && var.starts_with(name) && var[name.len()] == b'=' {
+                    return Some(&var[name.len() + 1..]);
+                }
+                p = p.add(1);
+            }
+        }
+        None
+    }
 }
 
 /// Defines `_start` for a program whose entry point is

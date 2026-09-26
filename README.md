@@ -142,7 +142,7 @@ foto.
 | `demo` | Recorrido guiado por varias capacidades en una corrida: VFS (initramfs/devfs/ramfs/**ext2 real**), threads con `meminfo` antes/después, IPC, mmap, condvars — la captura de arriba |
 | `uname` | Info del sistema |
 | `uptime` / `tsc` | Demos de tiempo (hrtimer, TSC) — `sleep` real ahora lo da BusyBox |
-| `snake` | El clásico, dibujado con ANSI sobre `/dev/fb`, input no bloqueante por `/dev/kbd` |
+| `snake` | El clásico en color de 32 bits (320x200, serpiente de neón que se desliza entre celdas, partículas, HUD en fuente de píxeles); en ventana bajo el compositor y a pantalla completa en la consola, vía `userspace::gfx` |
 | `ipc_ping` | Demo de IPC: fork + servidor + cliente, 100 round-trips por canal |
 | `mmap_test` / `poll_test` | Ejercitan `mmap`/`munmap` y `poll` end-to-end |
 | `hello` | Programa en **C real**, compilado y linkeado contra mlibc — `printf("Hello from user!\n")` pasando por todo el stack de stdio de libc |
