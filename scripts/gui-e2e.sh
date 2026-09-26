@@ -32,6 +32,20 @@
 #       brings the primary one back.
 #   T5. `exit` in the window: ash exits, term exits, the window goes away.
 #   T6. Ctrl+Alt+Backspace; the console comes back and typing works.
+#
+#   scripts/gui-e2e.sh text     # proportional text (docs/gui/text-plan.md)
+#
+# `text` mode runs `compositor /mnt/bin/textdemo`, which logs the box
+# `measure` gave every piece of text it drew (window coordinates), and
+# checks those boxes against the ink on a screendump:
+#   X1. The window is up and textdemo loaded the TrueType fonts (not the
+#       bitmap fallback).
+#   X2. For every box: ink at its left edge and at its right edge (within
+#       a side bearing), none in the 10 px right of it — measure is where the text
+#       starts and ends. And mono wider than sans, bold wider than regular.
+#   X3. Esc quits textdemo and its window goes; Ctrl+Alt+Backspace gives
+#       the console back.
+# Timings and the glyph cache's counters are printed from the log.
 # Exit status: number of failed checks.
 set -u
 MODE=${1:-demo}
@@ -125,6 +139,70 @@ if [ "$MODE" = term ]; then
     grep -aq "KERNEL PANIC" "$STATE/serial.log" && bad "kernel panic in the log"
     $Q stop >/dev/null 2>&1
     echo "gui-e2e term: $([ $fails = 0 ] && echo PASS || echo "FAIL ($fails)")"
+    exit $fails
+fi
+
+if [ "$MODE" = text ]; then
+    X0=40; Y0=60           # content origin of the first window
+    TBG=30,33,39           # textdemo's background
+    $Q send "compositor /mnt/bin/textdemo" && $Q enter
+    $Q wait-for "textdemo: ready" 120 >/dev/null || bad "X1 textdemo never got ready"
+    sleep 2
+    s=$(shot x1)
+    [ "$(px "$s" 45 45)" = "$FOCUSED" ] && ok "X1 focused textdemo window at (40,40)" || bad "X1 title bar: $(px "$s" 45 45)"
+    grep -aq "textdemo: fonts loaded" "$STATE/serial.log" && ok "X1 TrueType fonts loaded" \
+        || bad "X1 $(grep -a 'textdemo: no fonts' "$STATE/serial.log" | tail -1)"
+
+    grep -a "textdemo: box " "$STATE/serial.log" | sed 's/.*textdemo: box //' > "$OUT/boxes"
+    r=$(python3 - "$s" "$OUT/boxes" $X0 $Y0 $TBG <<'PY'
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1]).convert('RGB')
+x0, y0 = int(sys.argv[3]), int(sys.argv[4])
+bg = tuple(int(v) for v in sys.argv[5].split(','))
+def ink(xa, xb, ya, yb):
+    return any(im.getpixel((x, y)) != bg for y in range(ya, yb) for x in range(xa, xb))
+boxes, fails = {}, 0
+for line in open(sys.argv[2]):
+    name, x, y, w, h = line.split()
+    x, y, w, h = int(x) + x0, int(y) + y0, int(w), int(h)
+    boxes[name] = w
+    errs = []
+    # A glyph's side bearing leaves a gap between the advance box and its
+    # ink that grows with the size (a 72 px 'l' ends ~7 px short): allow a
+    # tenth of the line height.
+    sb = max(3, h // 10)
+    if not ink(x - 1, x + sb, y, y + h): errs.append('no ink at the left edge')
+    if not ink(x + w - sb, x + w + 2, y, y + h): errs.append('no ink at the right edge')
+    if ink(x + w + 2, x + w + 12, y, y + h): errs.append('ink right of the box')
+    if errs:
+        fails += 1
+        print('FAIL X2 %s (%d,%d %dx%d): %s' % (name, x, y, w, h, ', '.join(errs)))
+if len(boxes) < 15:
+    fails += 1; print('FAIL X2 only %d boxes logged' % len(boxes))
+if not (boxes.get('mono', 0) > boxes.get('sans', 0) and boxes.get('sansbold', 0) > boxes.get('sans', 0)):
+    fails += 1; print('FAIL X2 widths sans/sansbold/mono: %s' % [boxes.get(k) for k in ('sans', 'sansbold', 'mono')])
+print('checked %d boxes' % len(boxes))
+sys.exit(fails)
+PY
+)
+    n=$?
+    echo "$r" | grep FAIL | sed 's/^/  /'
+    fails=$((fails + n))
+    [ $n = 0 ] && ok "X2 ink matches measure ($(echo "$r" | tail -1))"
+    grep -a "textdemo: \(fonts\|first\|latin\)" "$STATE/serial.log" | sed 's/^.fb. /       /'
+
+    $Q key esc
+    $Q wait-for "textdemo: bye" 15 >/dev/null && ok "X3 Esc quits" || bad "X3 textdemo did not quit"
+    sleep 1
+    s=$(shot x3)
+    [ "$(px "$s" 45 45)" = "$BG" ] && ok "X3 window gone" || bad "X3 window still there: $(px "$s" 45 45)"
+    $Q key ctrl-alt-backspace; sleep 2
+    $Q send "echo console-is-back" && $Q enter
+    $Q wait-for "^.fb. console-is-back" 10 >/dev/null && ok "X3 console and keyboard back" || bad "X3 typing does not reach ash"
+    grep -aq "KERNEL PANIC" "$STATE/serial.log" && bad "kernel panic in the log"
+    $Q stop >/dev/null 2>&1
+    echo "gui-e2e text: $([ $fails = 0 ] && echo PASS || echo "FAIL ($fails)")"
     exit $fails
 fi
 

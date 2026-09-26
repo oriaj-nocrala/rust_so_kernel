@@ -38,7 +38,9 @@ fn main() {
 
     let disk_image = ensure_ext2_disk_image();
     sync_disk_bin_dir(&disk_image);
-    sync_disk_terminfo_dir(&disk_image);
+    sync_disk_tree(&disk_image, "usr/share/terminfo");
+    ensure_fonts();
+    sync_disk_tree(&disk_image, "usr/share/fonts");
 
     // pass the disk image paths as env variables to the `main.rs`
     println!("cargo:rustc-env=UEFI_PATH={}", uefi_path.display());
@@ -322,26 +324,47 @@ fn sync_disk_bin_dir(disk_path: &std::path::Path) {
         entries.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>().join(", "),
     );
 }
-
-/// Sync `disk-image-root/usr/share/terminfo/` (built by
-/// `scripts/build-terminfo.sh`, see its header comment) onto `disk.img`'s
-/// `/usr/share/terminfo`. Same reason `sync_disk_bin_dir` exists above:
-/// `disk.img` is create-once, so on a checkout that already has one this
-/// tree needs pushing in after the fact, same `debugfs -w` mechanism.
-///
-/// The one real difference from `sync_disk_bin_dir` is depth: terminfo's
-/// on-disk layout is `<first-letter>/<name>` two levels under
-/// `usr/share/terminfo`, so this walks `usr`, `usr/share`,
-/// `usr/share/terminfo`, and each first-letter subdirectory and creates
-/// only the ones genuinely missing — an unconditional `mkdir` on a
-/// directory that already exists hits the same e2fsprogs orphan-inode bug
-/// `sync_disk_bin_dir`'s doc comment describes for `/bin`, so every level
-/// gets the same existence probe that guard uses.
-fn sync_disk_terminfo_dir(disk_path: &std::path::Path) {
+/// Fetch the Noto fonts (`scripts/fetch-fonts.sh`, ~1.6 MB) into
+/// `disk-image-root/usr/share/fonts/` if they are not there, for
+/// `sync_disk_tree` to put on `disk.img`. Unlike Freedoom/Quake this runs
+/// on every build, not only when the image is created, since the fonts
+/// arrived after most checkouts' images did. Best-effort: offline, the
+/// build goes on and programs fall back to `draw`'s bitmap font.
+fn ensure_fonts() {
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let terminfo_seed_dir = manifest_dir.join("disk-image-root/usr/share/terminfo");
+    if manifest_dir.join("disk-image-root/usr/share/fonts/NotoSans-Regular.ttf").exists() {
+        return;
+    }
+    println!("cargo:warning=fonts missing — running scripts/fetch-fonts.sh...");
+    let ok = Command::new("bash")
+        .arg(manifest_dir.join("scripts/fetch-fonts.sh"))
+        .current_dir(&manifest_dir)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        println!("cargo:warning=scripts/fetch-fonts.sh failed; disk.img gets no fonts");
+    }
+}
 
-    if !terminfo_seed_dir.is_dir() || !disk_path.exists() {
+/// Sync the tree `disk-image-root/<rel>` onto `disk.img:/<rel>`, at any
+/// depth. Same reason `sync_disk_bin_dir` exists above: `disk.img` is
+/// create-once, so on a checkout that already has one, data added later
+/// needs pushing in after the fact, same `debugfs -w` mechanism. Used for
+/// the terminfo database (`scripts/build-terminfo.sh`, `<letter>/<name>`
+/// two levels down) and the fonts (`scripts/fetch-fonts.sh`).
+///
+/// Every ancestor and subdirectory is created only if genuinely missing —
+/// an unconditional `mkdir` on a directory that already exists hits the
+/// same e2fsprogs orphan-inode bug `sync_disk_bin_dir`'s doc comment
+/// describes for `/bin`, so every level gets that guard's existence probe.
+/// Afterwards every directory is re-listed and every file's size checked,
+/// since `debugfs -f` exits 0 whatever its commands did.
+fn sync_disk_tree(disk_path: &std::path::Path, rel: &str) {
+    let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let seed_dir = manifest_dir.join("disk-image-root").join(rel);
+
+    if !seed_dir.is_dir() || !disk_path.exists() {
         return;
     }
 
@@ -359,58 +382,57 @@ fn sync_disk_terminfo_dir(disk_path: &std::path::Path) {
             .unwrap_or(false)
     };
 
-    // First-letter subdirectories actually present on the host side
-    // (e.g. "a", "d", "l", "s", "v", "x" for the entry set
-    // scripts/build-terminfo.sh compiles), discovered rather than
-    // hardcoded so a different ENTRIES list there needs no change here.
-    let mut letter_dirs: Vec<(String, Vec<(String, PathBuf, u64)>)> = Vec::new();
-    let Ok(read_dir) = std::fs::read_dir(&terminfo_seed_dir) else { return; };
-    for entry in read_dir {
-        let entry = entry.expect("reading disk-image-root/usr/share/terminfo/ entry");
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let letter = entry.file_name().into_string()
-            .expect("non-UTF8 dirname in disk-image-root/usr/share/terminfo/");
+    // (ext2 directory, its files as (name, host path, size)), parents first.
+    type Dir = (String, Vec<(String, PathBuf, u64)>);
+    fn collect(host: &std::path::Path, ext2: String, out: &mut Vec<Dir>) {
         let mut files = Vec::new();
-        for file_entry in std::fs::read_dir(entry.path()).expect("reading terminfo letter dir") {
-            let file_entry = file_entry.expect("reading terminfo letter dir entry");
-            if !file_entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                continue;
+        let mut subdirs = Vec::new();
+        for entry in std::fs::read_dir(host).expect("reading a disk-image-root/ directory") {
+            let entry = entry.expect("reading a disk-image-root/ entry");
+            let name = entry.file_name().into_string().expect("non-UTF8 name under disk-image-root/");
+            let ty = entry.file_type().expect("stat under disk-image-root/");
+            if ty.is_dir() {
+                subdirs.push((entry.path(), format!("{ext2}/{name}")));
+            } else if ty.is_file() {
+                let size = entry.metadata().expect("stat under disk-image-root/").len();
+                files.push((name, entry.path(), size));
             }
-            let name = file_entry.file_name().into_string()
-                .expect("non-UTF8 filename in terminfo letter dir");
-            let size = file_entry.metadata().expect("stat terminfo entry").len();
-            files.push((name, file_entry.path(), size));
         }
-        letter_dirs.push((letter, files));
+        out.push((ext2, files));
+        for (host, ext2) in subdirs {
+            collect(&host, ext2, out);
+        }
     }
-    if letter_dirs.is_empty() {
+    let mut dirs = Vec::new();
+    collect(&seed_dir, format!("/{rel}"), &mut dirs);
+    let total_files: usize = dirs.iter().map(|(_, f)| f.len()).sum();
+    if total_files == 0 {
         return;
     }
 
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
-    let script_path = out_dir.join("sync_disk_terminfo.debugfs");
+    let script_path = out_dir.join(format!("sync_disk_{}.debugfs", rel.replace('/', "_")));
     let mut script = String::new();
 
-    for path in ["/usr", "/usr/share", "/usr/share/terminfo"] {
-        if !ext2_dir_exists(path) {
-            script.push_str(&format!("mkdir {path}\n"));
+    // Ancestors of the tree's root (`/usr`, `/usr/share` for `usr/share/x`).
+    let mut ancestor = String::new();
+    for part in rel.split('/').take(rel.split('/').count() - 1) {
+        ancestor.push('/');
+        ancestor.push_str(part);
+        if !ext2_dir_exists(&ancestor) {
+            script.push_str(&format!("mkdir {ancestor}\n"));
         }
     }
-    let mut total_files = 0usize;
-    for (letter, files) in &letter_dirs {
-        let dir_path = format!("/usr/share/terminfo/{letter}");
-        if !ext2_dir_exists(&dir_path) {
+    for (dir_path, files) in &dirs {
+        if !ext2_dir_exists(dir_path) {
             script.push_str(&format!("mkdir {dir_path}\n"));
         }
         script.push_str(&format!("cd {dir_path}\n"));
         for (name, host_path, _) in files {
             script.push_str(&format!("rm {name}\nwrite {} {name}\n", host_path.display()));
-            total_files += 1;
         }
     }
-    std::fs::write(&script_path, &script).expect("writing debugfs terminfo sync script");
+    std::fs::write(&script_path, &script).expect("writing debugfs tree sync script");
 
     Command::new("debugfs")
         .arg("-w")
@@ -419,13 +441,9 @@ fn sync_disk_terminfo_dir(disk_path: &std::path::Path) {
         .output()
         .expect("Failed to spawn debugfs");
 
-    // Verify the last-populated letter dir landed correctly (a full
-    // per-file check across every subdirectory isn't worth the extra
-    // debugfs round-trips this data doesn't get rewritten often); a
-    // missing/short file there means the whole script aborted partway.
-    if let Some((letter, files)) = letter_dirs.last() {
+    for (dir_path, files) in &dirs {
         let relist = Command::new("debugfs")
-            .arg("-R").arg(format!("ls -l /usr/share/terminfo/{letter}"))
+            .arg("-R").arg(format!("ls -l {dir_path}"))
             .arg(disk_path)
             .output()
             .expect("Failed to spawn debugfs for verification");
@@ -444,15 +462,15 @@ fn sync_disk_terminfo_dir(disk_path: &std::path::Path) {
             .collect();
         if !missing.is_empty() {
             panic!(
-                "sync_disk_terminfo_dir: failed to sync {:?} onto {}:/usr/share/terminfo/{} (debugfs `ls -l` follows)\n{}",
-                missing, disk_path.display(), letter, relisting,
+                "sync_disk_tree: failed to sync {:?} onto {}:{} (debugfs `ls -l` follows)\n{}",
+                missing, disk_path.display(), dir_path, relisting,
             );
         }
     }
 
     println!(
-        "cargo:warning=synced {} terminfo entries into disk.img:/usr/share/terminfo ({} letter dirs)",
-        total_files, letter_dirs.len(),
+        "cargo:warning=synced {} file(s) into disk.img:/{} ({} dir(s))",
+        total_files, rel, dirs.len(),
     );
 }
 
@@ -516,6 +534,9 @@ fn build_kernel() -> PathBuf {
     // `draw` (2D drawing for graphical programs), a path dependency of
     // `userspace` like `gui` and `vt`.
     watch_dir_recursive(&manifest_dir.join("draw/src"));
+    // `text` (proportional fonts, docs/gui/text-plan.md), behind
+    // `userspace::text`, likewise.
+    watch_dir_recursive(&manifest_dir.join("text/src"));
     watch_dir_recursive(&manifest_dir.join("mlibc-port"));
     watch_dir_recursive(&manifest_dir.join("doom-port"));
     watch_dir_recursive(&manifest_dir.join("quake-port"));

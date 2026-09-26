@@ -58,6 +58,14 @@ const RUST_PROGRAMS: &[(&str, &str)] = &[
     ("term",       "term.elf"),
 ];
 
+/// Rust binaries built straight to `disk-image-root/bin/<name>`, like
+/// `DISK_C_PROGRAMS`: the ones that link `userspace::text` (parley +
+/// swash, ~1.2 MB each, docs/gui/text-plan.md) and so don't belong in the
+/// kernel image.
+const DISK_RUST_PROGRAMS: &[&str] = &[
+    "textdemo",
+];
+
 /// C binaries that stay embedded in the kernel: (source file stem, embedded
 /// filename). Just `kdebug` — the live tracing-control tool used alongside
 /// busybox in an ongoing debugging investigation (see CLAUDE.md); cheap
@@ -290,6 +298,15 @@ fn main() {
         // profile) — this is a cheap no-op safety net, not the real win.
         strip_elf(strip, &dst);
         println!("cargo:warning=userspace(rust): {} -> {}", bin, elf_name);
+    }
+    for bin in DISK_RUST_PROGRAMS {
+        let src = release_dir.join(bin);
+        let dst = disk_bin_dir.join(bin);
+        std::fs::copy(&src, &dst).unwrap_or_else(|e| {
+            panic!("Failed to copy {} -> {}: {}", src.display(), dst.display(), e)
+        });
+        strip_elf(strip, &dst);
+        println!("cargo:warning=userspace(rust, disk): {} -> {}", bin, dst.display());
     }
 
     // ── Build C userspace ─────────────────────────────────────────────────

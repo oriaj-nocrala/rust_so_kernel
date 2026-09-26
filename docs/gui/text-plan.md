@@ -1,8 +1,10 @@
 # Plan: texto de verdad en las ventanas (`parley` + `swash`)
 
 > **Estado (2026-09-26):** fase 0 hecha (`d472a3e`: el userspace de Rust
-> tiene SSE2). Fase 1 hecha: crate `text/` con 18 tests en el host contra
-> las fuentes reales, y `scripts/fetch-fonts.sh`. Siguiente: fase 2.
+> tiene SSE2). Fases 1-3 hechas: crate `text/` (18 tests en el host),
+> fuentes en `disk.img`, `userspace::text` con respaldo bitmap, y
+> `textdemo` verificado en QEMU por `scripts/gui-e2e.sh text`. Siguiente:
+> fase 4 (metal).
 
 ## Por qué, y por qué antes que la librería GUI
 
@@ -211,3 +213,28 @@ syscalls: recibe los bytes de las fuentes y un `&mut [u32]`.
   `ScaleContext::builder_with_id` con `Blob::id()` para que `swash` no
   reanalice la fuente en cada ejecución. Compila `no_std` para
   `x86_64-constanos.json`; en el userspace entra en la fase 2.
+- **2026-09-26 — fase 2:** el `sync_disk_terminfo_dir` del `build.rs` raíz
+  pasó a ser `sync_disk_tree(disk, rel)`, recursivo y verificando el tamaño
+  de **cada** archivo (el de terminfo solo miraba el último directorio);
+  lo usan terminfo y `usr/share/fonts`. `ensure_fonts()` ejecuta
+  `fetch-fonts.sh` en cada build si faltan (sin red, avisa y sigue).
+  `sync-usb-data.sh` hace `rsync` de todo `disk-image-root/`: las fuentes
+  van al pendrive sin tocarlo. `userspace::text::Text::load()` lee las
+  cuatro al heap; sin ninguna, `draw`/`measure` usan la Noto Mono bitmap de
+  `draw::smooth` al tamaño más cercano, con el mismo corte de línea (voraz,
+  por celdas) — verificado en QEMU con una copia de `disk.img` sin fuentes.
+  Los binarios que no usan `text` no cambian de tamaño (LTO).
+- **2026-09-26 — fase 3:** `textdemo` (`DISK_RUST_PROGRAMS`, nuevo en
+  `kernel/build.rs`: programas Rust que van a `/mnt/bin`); **1,66 MB**,
+  no los ~1,2 MB previstos. Se lanza con `compositor /mnt/bin/textdemo`
+  (el compositor solo busca en `/bin`). `scripts/gui-e2e.sh text`: 18 cajas
+  de `measure` contra la tinta del screendump — tinta en el borde izquierdo
+  y derecho de cada caja y ninguna en los 10 px a su derecha; el margen de
+  los bordes es un décimo del alto de línea, porque el *side bearing* del
+  último glifo crece con el tamaño (la primera versión, con 3 px fijos,
+  falló en `!`, `ñ` y `l` a 32-72 px). Probado por sabotaje: `measure`
+  12 px corto hace fallar las 18. Tiempos en QEMU (TCG, 4 CPUs): fuentes
+  276 ms, primer cuadro 77 ms (532 glifos rasterizados, 96 KiB de caché),
+  Latin-1 completo a 24 px 10-11 ms en frío y 2 ms en caliente.
+  `gui-e2e.sh term` sigue en PASS con el terminfo sincronizado por la
+  función nueva.
