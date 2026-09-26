@@ -6,7 +6,9 @@
 > 2.3 y 2.5 en el #45; 2.4 son tests de host). Fase 2 cerrada. Fase 3 planificada
 > (decisiones del 2026-09-25); 3.1 a 3.3 hechos, 3.2 y 3.3 verificados en la
 > Ryzen (boot #46). 3.4 (`vt/`) y 3.5 (`term`) hechos y verificados en
-> QEMU; falta la Ryzen.
+> QEMU y en la Ryzen (a mano). Fase 3 cerrada, y también DOOM, Quake y
+> `fire` en ventana. **Plan completo.** Queda abierto un bug anterior a
+> 3.2: `wait` de ash con un trabajo parado (ver el registro de 3.2).
 
 ## Por qué ahora, y por qué así
 
