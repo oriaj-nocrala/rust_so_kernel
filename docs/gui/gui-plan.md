@@ -1083,6 +1083,10 @@ PS/2, con teclado y ratón USB sin 8042 y con 8 GiB; `gui-e2e.sh` (modo
 `pipe_multi_test`, `poll_test` e `ipc_ping`; `boot-matrix.sh 4 5` 20/20;
 `run-kernel-tests.sh` PASS; `vt` 58 tests.
 
+**Verificado en la Ryzen** (2026-09-25, el usuario, a mano): `term` bajo el
+compositor, usado también para lanzar DOOM y Quake en ventana. Con esto
+queda cerrada la fase 3.
+
 ### DOOM, Quake y fire en ventana (2026-09-25)
 
 El candidato de después de la fase 3. Los tres programas a pantalla
