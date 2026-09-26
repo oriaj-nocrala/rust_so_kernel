@@ -131,6 +131,56 @@ PYEOF
     echo "setup-mlibc: declared memfd_create outside the Linux option"
 fi
 
+# ── 1b'. Patch a real upstream mlibc bug: asctime_r drops a ':' ──────────
+#
+# `asctime_r` (options/ansi/generic/time.cpp, "taken from sortix") formats
+# "%.2d:%.2d%.2d" — no colon between minutes and seconds — so every
+# `asctime`/`ctime` string is one character short of the 26 POSIX fixes
+# ("Thu Jan  1 00:00:00 1970\n"). Code that slices it by position reads
+# garbage: BusyBox `ls -l` takes the year from offset 20 and printed " 970".
+if grep -q '"%.3s %.3s%3d %.2d:%.2d%.2d %d\\n"' mlibc/options/ansi/generic/time.cpp; then
+    python3 - "$REPO_ROOT/mlibc/options/ansi/generic/time.cpp" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+
+old = '"%.3s %.3s%3d %.2d:%.2d%.2d %d\\n"'
+new = '"%.3s %.3s%3d %.2d:%.2d:%.2d %d\\n"'
+if content.count(old) != 1:
+    print("error: mlibc's asctime_r format doesn't match the expected text "
+          "(upstream mlibc changed) -- setup-mlibc.sh's asctime patch needs updating",
+          file=sys.stderr)
+    sys.exit(1)
+with open(path, "w") as f:
+    f.write(content.replace(old, new, 1))
+PYEOF
+    echo "setup-mlibc: patched asctime_r's missing ':'"
+fi
+
+# ── 1b''. Apply mlibc-port/patches/*.patch (idempotent) ──────────────────
+#
+# Fixes too big for a one-line string replace live as unified diffs
+# against the checkout *after* the patches above, applied in name order.
+# A patch that reverses cleanly is already applied and is skipped; one
+# that neither reverses nor applies means upstream moved, and stops here.
+#   scanf-int-width.patch: %d/%u/%x/%o/%i ignored the field width, so
+#     "%4u%2u" read every digit into the first field (`touch -t` said
+#     "invalid date" to 201501010000); and %x read a lone "0" as a
+#     prefix with no digits after it, a mismatch.
+for p in mlibc-port/patches/*.patch; do
+    [ -e "$p" ] || continue
+    if patch -d mlibc -p1 -R --dry-run -s -f < "$p" >/dev/null 2>&1; then
+        continue
+    fi
+    if ! patch -d mlibc -p1 --forward -s < "$p"; then
+        echo "error: $p no longer applies to mlibc/ (upstream changed) -- regenerate it" >&2
+        exit 1
+    fi
+    echo "setup-mlibc: applied $(basename "$p")"
+done
+
 # ── 1c. Declare sched_getaffinity outside the Linux option (idempotent) ──
 #
 # Same shape as 1b: <sched.h> declares sched_getaffinity (and cpu_set_t)

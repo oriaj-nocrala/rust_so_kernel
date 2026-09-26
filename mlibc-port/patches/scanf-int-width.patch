@@ -1,0 +1,122 @@
+--- a/options/ansi/generic/stdio.cpp	2026-09-26 02:34:23.995396893 -0300
++++ b/options/ansi/generic/stdio.cpp	2026-09-26 02:34:24.002483010 -0300
+@@ -493,18 +493,27 @@
+ 			case 'i': {
+ 				bool is_negative = false;
+ 				unsigned long long res = 0;
++				// The field width bounds everything this conversion consumes
++				// -- sign, "0"/"0x" prefix and digits (C11 7.21.6.2p9).
++				// Ignoring it made "%4u%2u" read every digit into the first
++				// field (constanos patch, mlibc-port/patches/).
++				int used = 0;
++				auto room = [&] { return !width || used < width; };
+ 				char c = handler.look_ahead();
+ 				EOF_CHECK(c == '\0');
+ 
+-				if((*fmt == 'i' || *fmt == 'd') && c == '-') {
++				if((*fmt == 'i' || *fmt == 'd') && c == '-' && room()) {
+ 					handler.consume();
++					used++;
+ 					is_negative = true;
+ 				}
+ 
+-				if(*fmt == 'i' && handler.look_ahead() == '0') {
++				if(*fmt == 'i' && room() && handler.look_ahead() == '0') {
+ 					handler.consume();
+-					if(handler.look_ahead() == 'x') {
++					used++;
++					if(room() && handler.look_ahead() == 'x') {
+ 						handler.consume();
++						used++;
+ 						base = 16;
+ 					} else {
+ 						base = 8;
+@@ -515,15 +524,16 @@
+ 				int count = 0;
+ 				switch (base) {
+ 					case 10:
+-						NOMATCH_CHECK(!isdigit(c));
+-						while (c >= '0' && c <= '9') {
++						NOMATCH_CHECK(!isdigit(c) || !room());
++						while (room() && c >= '0' && c <= '9') {
+ 							handler.consume();
++							used++;
+ 							res = res * 10 + (c - '0');
+ 							c = handler.look_ahead();
+ 						}
+ 						break;
+ 					case 16:
+-						while (true) {
++						while (room()) {
+ 							if (c >= '0' && c <= '9') {
+ 								handler.consume();
+ 								res = res * 16 + (c - '0');
+@@ -536,14 +546,16 @@
+ 							} else {
+ 								break;
+ 							}
++							used++;
+ 							count++;
+ 							c = handler.look_ahead();
+ 						}
+ 						NOMATCH_CHECK(count == 0);
+ 						break;
+ 					case 8:
+-						while (c >= '0' && c <= '7') {
++						while (room() && c >= '0' && c <= '7') {
+ 							handler.consume();
++							used++;
+ 							res = res * 8 + (c - '0');
+ 							c = handler.look_ahead();
+ 						}
+@@ -560,11 +572,13 @@
+ 			}
+ 			case 'o': {
+ 				unsigned long long res = 0;
++				int used = 0;
+ 				char c = handler.look_ahead();
+ 				EOF_CHECK(c == '\0');
+ 				NOMATCH_CHECK(!(c >= '0' && c <= '7'));
+-				while (c >= '0' && c <= '7') {
++				while ((!width || used < width) && c >= '0' && c <= '7') {
+ 					handler.consume();
++					used++;
+ 					res = res * 8 + (c - '0');
+ 					c = handler.look_ahead();
+ 				}
+@@ -577,16 +591,25 @@
+ 				unsigned long long res = 0;
+ 				char c = handler.look_ahead();
+ 				int count = 0;
++				// Width bounds the "0x" prefix and the digits alike; a lone
++				// "0" is a digit, not a failed prefix (sscanf("0", "%x")
++				// used to be a mismatch).
++				int used = 0;
++				auto room = [&] { return !width || used < width; };
+ 				EOF_CHECK(c == '\0');
+ 				if (c == '0') {
+ 					handler.consume();
++					used++;
++					count++;
+ 					c = handler.look_ahead();
+-					if (c == 'x') {
++					if (room() && (c == 'x' || c == 'X')) {
+ 						handler.consume();
++						used++;
++						count = 0;
+ 						c = handler.look_ahead();
+ 					}
+ 				}
+-				while (true) {
++				while (room()) {
+ 					if (c >= '0' && c <= '9') {
+ 						handler.consume();
+ 						res = res * 16 + (c - '0');
+@@ -599,6 +622,7 @@
+ 					} else {
+ 						break;
+ 					}
++					used++;
+ 					count++;
+ 					c = handler.look_ahead();
+ 				}
