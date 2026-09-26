@@ -28,6 +28,12 @@ pub const REL_Y: u16 = 1;
 
 /// Lock the pointer to the window and report its motion (games).
 pub const MOUSE: u32 = 1;
+/// The program draws at full resolution: `w x h` is its size in logical
+/// pixels, [`Gfx::scale`] the factor it multiplies them by, and
+/// [`Gfx::present`] takes a `w*scale x h*scale` frame, shown pixel for
+/// pixel. Without it the frame is replicated by that factor, which is
+/// right for a game's pixel art and blocky for antialiased text.
+pub const HIDPI: u32 = 2;
 
 #[derive(Clone, Copy, Debug)]
 pub struct GfxEvent {
@@ -42,6 +48,7 @@ const SURFACE: u32 = 4;
 const FBIO_BLIT: u64 = 0x4642_0001;
 const EVIOCGRAB: u64 = 0x4004_4590;
 const EBUSY: i64 = -16;
+const TIOCGWINSZ: u64 = 0x5413;
 
 #[repr(C)]
 struct BlitArgs {
@@ -70,6 +77,8 @@ struct Window {
 pub struct Gfx {
     w: usize,
     h: usize,
+    /// `HIDPI`: the factor the program draws at; 1 otherwise.
+    scale: usize,
     b: Backend,
 }
 
@@ -80,7 +89,8 @@ impl Gfx {
     pub fn open(display: Option<&[u8]>, title: &str, w: usize, h: usize, flags: u32) -> Option<Gfx> {
         if let Some(d) = display.filter(|d| !d.is_empty()) {
             if let Some(win) = Window::open(d, title, w, h, flags) {
-                return Some(Gfx { w, h, b: Backend::Window(win) });
+                let scale = if flags & HIDPI != 0 { win.scale } else { 1 };
+                return Some(Gfx { w, h, scale, b: Backend::Window(win) });
             }
             crate::eprintln!("gfx: no compositor at {}, using the console", core::str::from_utf8(d).unwrap_or("?"));
         }
@@ -99,7 +109,16 @@ impl Gfx {
         for fd in [kbd, mouse] {
             while fd >= 0 && syscall::read(fd, &mut rec) == 24 {}
         }
-        Some(Gfx { w, h, b: Backend::Console { fb, kbd, mouse, blits: 0 } })
+        // The kernel's blit scales by the largest integer that fits the
+        // screen; a HIDPI program draws at that factor itself.
+        let scale = if flags & HIDPI != 0 { console_scale(fb, w, h) } else { 1 };
+        Some(Gfx { w, h, scale, b: Backend::Console { fb, kbd, mouse, blits: 0 } })
+    }
+
+    /// The factor a `HIDPI` program draws at (1 without the flag): its
+    /// frame is `w*scale x h*scale`.
+    pub fn scale(&self) -> usize {
+        self.scale
     }
 
     pub fn windowed(&self) -> bool {
@@ -109,7 +128,7 @@ impl Gfx {
     /// Shows a frame. In a window, first waits for the compositor to have
     /// taken the previous one — which paces the caller to the screen.
     pub fn present(&mut self, px: &[u32]) {
-        let (w, h) = (self.w, self.h);
+        let (w, h) = (self.w * self.scale, self.h * self.scale);
         match &mut self.b {
             Backend::Console { fb, blits, .. } => {
                 let args = BlitArgs { ptr: px.as_ptr() as u64, width: w as u32, height: h as u32 };
@@ -120,7 +139,10 @@ impl Gfx {
                 }
                 *blits += 1;
             }
-            Backend::Window(win) => win.present(px, w, h),
+            Backend::Window(win) => {
+                let s = win.scale / self.scale;
+                win.present(px, w, h, s)
+            }
         }
     }
 
@@ -341,11 +363,11 @@ impl Window {
         }
     }
 
-    fn present(&mut self, px: &[u32], w: usize, h: usize) {
+    /// Shows a `w x h` frame replicated `s` times each way into the pool.
+    fn present(&mut self, px: &[u32], w: usize, h: usize, s: usize) {
         while self.busy {
             self.pump(true);
         }
-        let s = self.scale;
         let pw = w * s;
         for y in 0..h {
             let row = y * s * pw;
@@ -366,4 +388,19 @@ impl Window {
         }
         self.busy = true;
     }
+}
+
+/// The factor `FBIO_BLIT` would scale a `w x h` frame by: the largest
+/// integer that fits the screen, whose size in pixels `TIOCGWINSZ` gives.
+/// 1 if the kernel does not say.
+fn console_scale(fb: i32, w: usize, h: usize) -> usize {
+    let mut ws = [0u16; 4];
+    if syscall::ioctl(fb, TIOCGWINSZ, ws.as_mut_ptr() as u64) != 0 {
+        return 1;
+    }
+    let (sw, sh) = (ws[2] as usize, ws[3] as usize);
+    if w == 0 || h == 0 {
+        return 1;
+    }
+    (sw / w).min(sh / h).max(1)
 }

@@ -973,6 +973,13 @@ pub fn text_dimensions() -> (usize, usize) {
     (cols.max(1), rows.max(1))
 }
 
+/// The screen's size in pixels, `TIOCGWINSZ`'s `ws_xpixel`/`ws_ypixel`
+/// (0x0 without a framebuffer, the "unknown" Linux reports). Graphical
+/// programs size their frame from it (`userspace::gfx::HIDPI`).
+pub fn pixel_dimensions() -> (usize, usize) {
+    FRAMEBUFFER.lock().as_ref().map(|fb| fb.dimensions()).unwrap_or((0, 0))
+}
+
 pub fn open() -> Box<dyn FileHandle> {
     Box::new(FramebufferConsole::new())
 }

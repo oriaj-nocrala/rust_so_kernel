@@ -1219,12 +1219,13 @@ pub(super) fn sys_ioctl(fd: i32, request: u64, argp: u64) -> SyscallResult {
                 // this, so a hardcoded value left it unable to use more
                 // than a corner of an actual (usually much bigger) screen.
                 let (cols, rows) = crate::drivers::framebuffer_console::text_dimensions();
+                let (xpix, ypix) = crate::drivers::framebuffer_console::pixel_dimensions();
                 let ws = argp as *mut u16;
                 unsafe {
                     *ws.add(0) = rows as u16;
                     *ws.add(1) = cols as u16;
-                    *ws.add(2) = 0;
-                    *ws.add(3) = 0;
+                    *ws.add(2) = xpix.min(u16::MAX as usize) as u16;
+                    *ws.add(3) = ypix.min(u16::MAX as usize) as u16;
                 }
             }
             0

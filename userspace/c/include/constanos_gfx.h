@@ -17,6 +17,13 @@
 // GFX_MOUSE the pointer is locked to it (Ctrl+Alt lets go; a click takes
 // it back).
 //
+// With GFX_HIDPI the program draws at full resolution instead: w x h is
+// its size in logical pixels, gfx_scale() the factor it multiplies them
+// by, and gfx_present() takes a (w * scale) x (h * scale) frame, shown
+// pixel for pixel. Without it the frame is replicated by that factor —
+// right for pixel art, blocky for antialiased text. Same as
+// userspace::gfx::HIDPI.
+//
 // Header-only, like constanos_gui_wire.h. One window per process.
 
 #ifndef CONSTANOS_GFX_H
@@ -37,6 +44,7 @@
 #include "constanos_gui_wire.h"
 
 #define GFX_MOUSE 1 // lock the pointer to the window and report motion
+#define GFX_HIDPI 2 // the program draws at gfx_scale() itself
 
 #define GFX_EV_KEY 1
 #define GFX_EV_REL 2
@@ -55,7 +63,8 @@ struct gfx_event {
 
 static struct {
     int windowed;
-    int w, h;              // the program's frame
+    int w, h;              // the program's frame, in logical pixels
+    int dscale;            // GFX_HIDPI: the factor it draws at; 1 otherwise
     // console
     int fb, kbd, mouse;
     int blits;
@@ -83,6 +92,7 @@ struct gfx_blit_args {
 };
 #define GFX_FBIO_BLIT 0x46420001UL
 #define GFX_EVIOCGRAB 0x40044590UL
+#define GFX_TIOCGWINSZ 0x5413UL
 
 struct gfx_input_event { // the kernel's evdev record
     long tv_sec;
@@ -238,18 +248,24 @@ static int gfx_open_window(const char *path, const char *title, int flags) {
 
 static void gfx_present_window(const uint32_t *px) {
     while (gfx.busy) gfx_pump(1, NULL, NULL);
-    int s = gfx.scale, pw = gfx.w * s;
-    for (int y = 0; y < gfx.h; y++) {
+    // The frame is (w * dscale) x (h * dscale), replicated s times.
+    int fw = gfx.w * gfx.dscale, fh = gfx.h * gfx.dscale;
+    int s = gfx.scale / gfx.dscale, pw = fw * s;
+    for (int y = 0; y < fh; y++) {
         uint32_t *row = gfx.pool + (size_t)y * s * pw;
-        const uint32_t *src = px + (size_t)y * gfx.w;
-        for (int x = 0; x < gfx.w; x++)
+        const uint32_t *src = px + (size_t)y * fw;
+        if (s == 1) {
+            memcpy(row, src, (size_t)fw * 4);
+            continue;
+        }
+        for (int x = 0; x < fw; x++)
             for (int k = 0; k < s; k++) row[x * s + k] = src[x];
         for (int k = 1; k < s; k++) memcpy(row + (size_t)k * pw, row, (size_t)pw * 4);
     }
     struct guiw_out o;
     memset(&o, 0, sizeof(o));
     guiw_attach(&o, GFX_SURFACE, GFX_BUFFER);
-    guiw_damage(&o, GFX_SURFACE, 0, 0, pw, gfx.h * s);
+    guiw_damage(&o, GFX_SURFACE, 0, 0, pw, fh * s);
     guiw_commit(&o, GFX_SURFACE);
     if (gfx_send(&o) < 0) gfx_gone();
     gfx.busy = 1;
@@ -275,8 +291,19 @@ static int gfx_open_console(void) {
     return 0;
 }
 
+// The factor FBIO_BLIT would scale a w x h frame by: the largest integer
+// that fits the screen, whose size in pixels TIOCGWINSZ gives. 1 if the
+// kernel does not say.
+static int gfx_console_scale(void) {
+    unsigned short ws[4] = { 0, 0, 0, 0 }; // row, col, xpixel, ypixel
+    if (ioctl(gfx.fb, GFX_TIOCGWINSZ, ws) != 0 || gfx.w <= 0 || gfx.h <= 0) return 1;
+    int sx = ws[2] / gfx.w, sy = ws[3] / gfx.h;
+    int s = sx < sy ? sx : sy;
+    return s < 1 ? 1 : s;
+}
+
 static void gfx_present_console(const uint32_t *px) {
-    struct gfx_blit_args args = { (unsigned long)px, (unsigned)gfx.w, (unsigned)gfx.h };
+    struct gfx_blit_args args = { (unsigned long)px, (unsigned)(gfx.w * gfx.dscale), (unsigned)(gfx.h * gfx.dscale) };
     if (ioctl(gfx.fb, GFX_FBIO_BLIT, &args) < 0 && errno == EBUSY && gfx.blits == 0) {
         fprintf(stderr, "gfx: the screen belongs to a compositor, and GUI_DISPLAY is not set\n");
         exit(1);
@@ -292,23 +319,34 @@ static int gfx_open(const char *title, int w, int h, int flags) {
     memset(&gfx, 0, sizeof(gfx));
     gfx.w = w;
     gfx.h = h;
+    gfx.dscale = 1;
     gfx.fb = gfx.kbd = gfx.mouse = gfx.sock = -1;
     const char *d = getenv("GUI_DISPLAY");
     if (d && *d) {
         if (gfx_open_window(d, title, flags) == 0) {
             gfx.windowed = 1;
+            if (flags & GFX_HIDPI) gfx.dscale = gfx.scale;
             return 0;
         }
         fprintf(stderr, "gfx: no compositor at %s, using the console\n", d);
     }
-    return gfx_open_console();
+    if (gfx_open_console() < 0) return -1;
+    if (flags & GFX_HIDPI) gfx.dscale = gfx_console_scale();
+    return 0;
+}
+
+// The factor a GFX_HIDPI program draws at (1 without the flag): its frame
+// is (w * gfx_scale()) x (h * gfx_scale()).
+static int gfx_scale(void) {
+    return gfx.dscale;
 }
 
 static int gfx_windowed(void) {
     return gfx.windowed;
 }
 
-// Shows a w x h frame of 0x00RRGGBB pixels. In a window, waits for the
+// Shows a w x h frame of 0x00RRGGBB pixels ((w * gfx_scale()) x
+// (h * gfx_scale()) with GFX_HIDPI). In a window, waits for the
 // compositor to have taken the previous one.
 static void gfx_present(const uint32_t *px) {
     if (gfx.windowed) gfx_present_window(px);

@@ -6,6 +6,10 @@
 //! against monospaced, regular against bold, and a paragraph wrapped at a
 //! width with a ruler under it as long as `measure` says it is.
 //!
+//! The layout is 960x640 logical pixels drawn at the screen's scale `k`
+//! (`gfx::HIDPI`): coordinates and font sizes are multiplied by `k`, so
+//! the glyphs are rasterised at the size they are shown at.
+//!
 //! For `scripts/gui-e2e.sh text` it prints, in window coordinates, the box
 //! `measure` gave every checked piece of text (`textdemo: box <name> x y w
 //! h`), which the script compares with the ink on a screendump; and the
@@ -25,7 +29,7 @@ use core::fmt::Write;
 
 use draw::Canvas;
 use userspace::args::Args;
-use userspace::gfx::{Gfx, EV_KEY};
+use userspace::gfx::{Gfx, EV_KEY, HIDPI};
 use userspace::text::{Align, GlyphCache, Style, Text, MONO, SANS};
 use userspace::{entry, println, syscall};
 
@@ -62,67 +66,73 @@ fn item(t: &mut Text, cv: &mut Canvas, name: &str, s: &str, st: &Style, max: Opt
     (w, h)
 }
 
-fn picture(t: &mut Text, cv: &mut Canvas) {
+/// `Style::new` at `k` times `size`.
+fn style(family: &'static str, size: f32, k: i32) -> Style<'static> {
+    Style::new(family, size * k as f32)
+}
+
+fn picture(t: &mut Text, cv: &mut Canvas, k: i32) {
+    let d = |v: i32| v * k;
     cv.fill(BG);
 
-    let title = Style::new(SANS, 26.0).bold().color(FG);
-    item(t, cv, "title", "textdemo — Noto Sans con parley + swash", &title, None, 24, 14);
+    let title = style(SANS, 26.0, k).bold().color(FG);
+    item(t, cv, "title", "textdemo — Noto Sans con parley + swash", &title, None, d(24), d(14));
 
     // Left column: one line per size.
-    let mut y = 64;
+    let mut y = d(64);
     for size in [10, 12, 14, 16, 18, 20, 24, 28, 32] {
-        let st = Style::new(SANS, size as f32).color(if size % 4 == 0 { FG } else { DIM });
+        let st = style(SANS, size as f32, k).color(if size % 4 == 0 { FG } else { DIM });
         let mut s = String::new();
         let _ = write!(s, "{size} px  {PHRASE}");
         let mut name = String::new();
         let _ = write!(name, "size{size}");
-        let (_, h) = item(t, cv, &name, &s, &st, None, 24, y);
+        let (_, h) = item(t, cv, &name, &s, &st, None, d(24), y);
         y += h;
     }
 
     // Right column: big sizes, centred on one axis.
-    let mut y = 64;
+    let mut y = d(64);
     for (size, s) in [(40, "Aa Ññ"), (56, "¿Qué?"), (72, "Ágil")] {
-        let st = Style::new(SANS, size as f32).bold().color(WARM).align(Align::Center);
+        let st = style(SANS, size as f32, k).bold().color(WARM).align(Align::Center);
         let (w, _) = t.measure(s, &st, None);
         let mut name = String::new();
         let _ = write!(name, "big{size}");
-        let (_, h) = item(t, cv, &name, s, &st, None, 800 - w / 2, y);
+        let (_, h) = item(t, cv, &name, s, &st, None, d(800) - w / 2, y);
         y += h;
     }
 
     // Proportional against monospaced, regular against bold.
     let sample = "illimitado WWW 0123";
-    let mut y = 370;
+    let mut y = d(370);
     for (name, family, bold) in [("sans", SANS, false), ("sansbold", SANS, true), ("mono", MONO, false), ("monobold", MONO, true)] {
-        let mut st = Style::new(family, 20.0).color(ACCENT);
+        let mut st = style(family, 20.0, k).color(ACCENT);
         if bold {
             st = st.bold();
         }
-        let label = Style::new(SANS, 14.0).color(DIM);
-        t.draw(cv, name, &label, None, 24, y + 4);
-        let (_, h) = item(t, cv, name, sample, &st, None, 120, y);
-        y += h + 2;
+        let label = style(SANS, 14.0, k).color(DIM);
+        t.draw(cv, name, &label, None, d(24), y + d(4));
+        let (_, h) = item(t, cv, name, sample, &st, None, d(120), y);
+        y += h + d(2);
     }
 
     // A paragraph wrapped at PARA_WIDTH, the width `measure` reports as a
     // ruler under it, and ticks above it where the limit is.
-    let (px, py) = (24, 510);
-    let st = Style::new(SANS, 15.0).color(FG);
-    let (w, h) = item(t, cv, "para", PARAGRAPH, &st, Some(PARA_WIDTH), px, py);
-    cv.rect(px, py + h + 3, w, 2, RULER);
-    cv.rect(px, py - 6, 1, 4, RULER);
-    cv.rect(px + PARA_WIDTH as i32 - 1, py - 6, 1, 4, RULER);
-    let note = Style::new(SANS, 13.0).color(RULER);
+    let (px, py, limit) = (d(24), d(510), PARA_WIDTH * k as f32);
+    let st = style(SANS, 15.0, k).color(FG);
+    let (w, h) = item(t, cv, "para", PARAGRAPH, &st, Some(limit), px, py);
+    cv.rect(px, py + h + d(3), w, d(2), RULER);
+    cv.rect(px, py - d(6), k, d(4), RULER);
+    cv.rect(px + limit as i32 - k, py - d(6), k, d(4), RULER);
+    let note = style(SANS, 13.0, k).color(RULER);
     let mut s = String::new();
-    let _ = write!(s, "measure: {w} × {h} px (límite {} px)", PARA_WIDTH as i32);
-    t.draw(cv, &s, &note, None, px, py + h + 9);
+    let _ = write!(s, "measure: {w} × {h} px (límite {} px)", limit as i32);
+    t.draw(cv, &s, &note, None, px, py + h + d(9));
 
     // The same paragraph centred in a narrower column. Not an `item`: a
     // centred line starts `(300 - its width) / 2` in, so the measured box
     // is not where its ink begins.
-    let st = Style::new(SANS, 15.0).color(DIM).align(Align::Center);
-    t.draw(cv, PARAGRAPH, &st, Some(300.0), 560, 510);
+    let st = style(SANS, 15.0, k).color(DIM).align(Align::Center);
+    t.draw(cv, PARAGRAPH, &st, Some(300.0 * k as f32), d(560), d(510));
 }
 
 /// All of Latin-1's printable characters at 24 px, laid out and drawn into
@@ -151,14 +161,17 @@ fn main(args: Args) -> i32 {
         println!("textdemo: no fonts in {} — bitmap fallback", userspace::text::FONT_DIR);
     }
 
-    let Some(mut gfx) = Gfx::open(args.env(b"GUI_DISPLAY"), "textdemo", W, H, 0) else {
+    let Some(mut gfx) = Gfx::open(args.env(b"GUI_DISPLAY"), "textdemo", W, H, HIDPI) else {
         println!("textdemo: nothing to draw on (no /dev/fb, no compositor)");
         return 1;
     };
 
-    let mut frame = vec![BG; W * H];
+    let k = gfx.scale();
+    let (fw, fh) = (W * k, H * k);
+    println!("textdemo: scale {}", k);
+    let mut frame = vec![BG; fw * fh];
     let t1 = now_us();
-    picture(&mut t, &mut Canvas::new(&mut frame, W, H, W));
+    picture(&mut t, &mut Canvas::new(&mut frame, fw, fh, fw), k as i32);
     let t_draw = now_us() - t1;
     gfx.present(&frame);
     let s = t.stats();
