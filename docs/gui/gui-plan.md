@@ -7,8 +7,11 @@
 > (decisiones del 2026-09-25); 3.1 a 3.3 hechos, 3.2 y 3.3 verificados en la
 > Ryzen (boot #46). 3.4 (`vt/`) y 3.5 (`term`) hechos y verificados en
 > QEMU y en la Ryzen (a mano). Fase 3 cerrada, y también DOOM, Quake y
-> `fire` en ventana. **Plan completo.** Queda abierto un bug anterior a
+> `fire` en ventana. Fases 1 a 3 completas. Queda abierto un bug anterior a
 > 3.2: `wait` de ash con un trabajo parado (ver el registro de 3.2).
+>
+> **Fase 4 (gestión de ventanas) planificada el 2026-09-26**, con las
+> decisiones tomadas con el usuario: ver "Fase 4" más abajo.
 
 ## Por qué ahora, y por qué así
 
@@ -553,6 +556,217 @@ consola del kernel a `tty`/`vt`.
 
 Después, candidatos: DOOM en una ventana (hecho, ver el registro; su port ya dibuja en un búfer
 RGB), un reloj, `top` con ventana.
+
+## Fase 4: gestión de ventanas (redimensionar, cerrar, panel)
+
+Con las fases 1 a 3 el compositor ya muestra varias ventanas a la vez, pero
+todavía no se puede *vivir* dentro de él. Estado medido en el código
+(2026-09-26):
+
+- **El tamaño de una ventana lo fija su búfer**, y solo el cliente lo
+  cambia. `create_surface` recibe un único `configure(w, h)` con la mitad
+  de la pantalla (`gui/src/compositor.rs`, `Request::CreateSurface`), que
+  es una sugerencia. Después, `commit` acepta un búfer de cualquier tamaño
+  y la ventana crece o encoge con él. No hay forma de que el compositor le
+  pida a un cliente otro tamaño. Es lo que las fases 2 y 3 dejaron fuera de
+  alcance.
+- **No hay cerrar ni maximizar.** Una ventana se va cuando su cliente sale.
+  Para cerrar `term` hay que escribir `exit`; DOOM se cierra desde su menú.
+- **La barra de título es un rectángulo de color, sin texto** (`paint`
+  rellena `title_bar()` con `TITLE_FOCUSED`/`TITLE_UNFOCUSED`). `set_title`
+  se guarda y solo lo leen los tests (`window_title`).
+- **Los programas solo se lanzan desde los argumentos del compositor**
+  (`spawn(name)`, sin argv) o desde un `term`. `compositor` sin argumentos
+  deja una pantalla vacía sin salida, salvo Ctrl+Alt+Retroceso.
+- **Los clientes suponen un tamaño fijo.** `term` calcula `cols x rows` una
+  vez a partir del `configure` y `vt::Terminal` no tiene `resize`.
+  `cpumon` dibuja una maqueta de 640x460 (ahora multiplicada por la escala
+  de `gfx::HIDPI`). `gfx` y `constanos_gfx.h` reservan el pool una sola
+  vez, con el tamaño exacto del marco.
+- **Lo que ya hay y se aprovecha:** el pty ya sabe cambiar de tamaño
+  (`TIOCSWINSZ` → `SIGWINCH` al grupo en primer plano, crate `tty`), y
+  BusyBox `vi`/`less`/`top` ya reaccionan a `SIGWINCH`. `grid_shape` de
+  `cpumon` ya reparte las gráficas en cualquier rectángulo. El texto
+  proporcional (`userspace::text`) está hecho.
+
+### Decisiones (tomadas con el usuario, 2026-09-26)
+
+1. **Las decoraciones las dibuja el compositor** (en el servidor), no cada
+   cliente. Los clientes no cambian, DOOM y Quake tampoco, y un cliente
+   colgado sigue teniendo un botón de cerrar que funciona.
+2. **Los títulos van con el motor de texto** (`userspace::text`,
+   proporcionales), no con el mapa de bits de `draw::smooth`.
+   Consecuencias:
+   - El compositor enlaza `parley` + `swash` y pasa de 70 KB a ~1,7 MB,
+     como `cpumon`, y se mueve a `/mnt/bin` (`DISK_RUST_PROGRAMS`). Sin
+     `/mnt` no hay compositor. La alternativa es dejarlo embebido
+     (+1,6 MB en el kernel; hoy ocupa 9,4 MB sin DWARF en una partición
+     `boot` de 17 MiB): así funcionaría sin `/mnt`, con el mapa de bits de
+     reserva que `Text` ya trae. Se decide al implementarlo, midiendo el
+     tamaño.
+   - El crate `gui` no puede dibujar el texto: no depende de `text` ni debe
+     hacerlo. `gui` decide la geometría (barra, texto recortado, botones,
+     zonas de arrastre) y `compose` deja que el programa pinte el
+     contenido de cada barra mediante un cierre (`paint_title`). En los
+     tests de host el cierre es un stub que pinta un color, así que la
+     geometría y el daño se siguen probando sin fuentes.
+3. **Redimensionar es al soltar:** mientras se arrastra, solo un contorno;
+   al soltar, un único `resize`. En vivo se puede añadir después con el
+   mismo protocolo.
+4. **El panel es un cliente aparte**, `panel`, con un rol especial en el
+   protocolo (tipo `wlr-layer-shell`), en `/mnt/bin`. Si falta o muere, el
+   compositor sigue igual.
+5. **El panel lleva lista de ventanas mínima** (traer al frente y enfocar,
+   sin minimizar), además del lanzador y el reloj.
+6. **El lanzador lee `/mnt/etc/gui/apps`**, una línea por programa con
+   `nombre<TAB>orden`, desde `disk-image-root/etc/gui/` y sincronizado por
+   `build.rs` como las fuentes. Así se elige qué es una aplicación
+   (`term`, `cpumon`, `textdemo`, `doom`, `quake`, `snake`, `fire`) y qué
+   es un test.
+
+Además, salvo que el usuario diga otra cosa: **nada
+arranca la GUI al iniciar** (PID 1 sigue abriendo `ash` en la consola), y
+`compositor` sin argumentos pasa a significar "sesión": arranca `panel` si
+existe.
+
+### 4.1 Protocolo y máquina de estados (`gui/`, host)
+
+Todo en `gui/src/{protocol,compositor}.rs`, probado con `cd gui && cargo
+test`, como en 2.4. Nada bloquea; los efectos siguen saliendo como datos.
+
+- **Qué clientes pueden cambiar de tamaño lo declaran ellos.** Una petición
+  nueva, `surface.set_resizable(min_w, min_h)`, como
+  `xdg_toplevel.set_min_size`. Sin ella, la ventana no tiene bordes
+  arrastrables ni botón de maximizar. Así DOOM, Quake, `fire`, `snake` y
+  `gui_demo` no cambian, y un cliente antiguo que no la envía nunca recibe
+  un evento que no sepa manejar.
+- **`resize(w, h)`**, un evento nuevo (no se reutiliza `configure`): el
+  compositor pide un contenido de `w x h`. Es una petición, no una orden.
+  El tamaño real sigue siendo el del próximo búfer que llegue con `commit`,
+  como hoy. Por eso **no hay `ack_configure`**: en Wayland existe para que
+  estados como "maximizado" coincidan con el búfer. Aquí el compositor
+  coloca el marco en cuanto decide (por ejemplo, al maximizar) y sigue
+  mostrando el contenido anterior hasta que llegue el nuevo, rellenando el
+  resto con el fondo de la ventana.
+- **`close`**, un evento nuevo (`xdg_toplevel.close`): se envía al pulsar
+  el botón de cerrar. Cerrar lo decide el cliente. El compositor no mata
+  procesos; si el cliente lo ignora, queda `^\` o `kill`.
+- **Decoración** (decisiones 1 y 2): la barra de título con el texto y
+  los botones de cerrar y, si la ventana es redimensionable, maximizar.
+  `gui` coloca el título (a la izquierda, recortado antes de los
+  botones) y los botones; `compositor.rs` rasteriza cada título una vez con
+  `userspace::text` cuando cambia (el título o el foco) y lo copia en
+  `paint_title`. Doble clic en la barra alterna maximizado.
+  `TITLE_H` (hoy 20 px fijos) pasa a depender de la pantalla, con el
+  mismo factor que `gfx::HIDPI`, para que a 1080p la barra y su texto no
+  queden diminutos. Se recuerda la geometría
+  anterior para restaurarla. Un borde invisible de unos píxeles alrededor
+  del marco, más la esquina inferior derecha, sirven para redimensionar;
+  el cursor no cambia de forma, porque no hay cursores de cliente.
+- **Arrastre de redimensionado** (decisión 3): un estado `Resize`
+  junto al `Drag` actual. Recorta el tamaño a `min_w`/`min_h`, a
+  `MAX_SIDE` y a la pantalla, y al soltar genera un único `resize`.
+- **Rol de panel** (decisión 4): `surface.set_panel(height)`. Solo
+  un cliente puede tenerlo; un segundo recibe un error. La superficie va
+  abajo, a lo ancho, siempre encima de las ventanas y sin decoración. Su
+  altura se descuenta de la zona de trabajo: maximizar, colocar en cascada
+  y el `configure` inicial no la pisan. Un clic en el panel no quita el
+  foco a la ventana activa.
+- **Lista de ventanas** (decisión 5): al cliente con rol de panel
+  se le envían `toplevel(id, title)`, `toplevel_focus(id)` y
+  `toplevel_gone(id)`, con ids propios del compositor (no los `ClientId`).
+  Con `activate(id)` el panel sube y enfoca una ventana.
+- **Compatibilidad hacia abajo:** los decodificadores de Rust ignoran los
+  opcodes desconocidos (hoy son un `Err` que los clientes descartan), y
+  `constanos_gfx.h` ya solo mira los eventos que conoce. `gui/tests/
+  c_wire.rs` sigue siendo el test de que el C y el Rust dicen lo mismo.
+
+Tests, en la familia A/B/C de `diag`: la cadena `set_resizable` →
+arrastre del borde → un solo `resize` con el tamaño recortado; que no hay
+`resize` sin `set_resizable`; maximizar y restaurar con y sin panel; que
+`close` llega solo al dueño; el panel siempre encima y fuera de la zona de
+trabajo; el ciclo `toplevel`/`gone` al cerrar un cliente a mitad de
+arrastre. Cada uno, comprobado con un sabotaje.
+
+### 4.2 `vt/`: cambiar el tamaño de la rejilla (host)
+
+`Grid::resize(cols, rows)` y `Terminal::resize`, con la semántica de xterm
+(sin reflujo): al estrechar se recortan las columnas; al ensanchar se
+rellenan con celdas vacías. Al perder filas se van las de arriba, para que
+el cursor siga viendo su línea. El cursor se recorta a la rejilla, la
+región de scroll se reinicia a la pantalla entera, las dos pantallas
+(normal y alternativa) cambian a la vez, se cancela el ajuste diferido
+pendiente y todo queda dañado. Tests de host y sabotajes, como en 3.4.
+
+### 4.3 Clientes que responden a `resize`
+
+- **`userspace::gfx`:** un flag `RESIZABLE` que envía `set_resizable`; un
+  evento `Resize { w, h }` en `next_event`; `Gfx::size()`. El pool se
+  vuelve a crear al cambiar de tamaño (memfd nuevo, `create_pool` +
+  `create_buffer`, y se destruyen los antiguos), porque el kernel no
+  permite encoger un memfd mapeado y crecerlo en su sitio no está
+  implementado. Con `HIDPI`, `w`/`h` son lógicos y el marco es
+  `w*scale x h*scale`. Además, un evento `Close`.
+- **`term`:** con `resize`, calcula las columnas y filas que caben, llama a
+  `Terminal::resize`, rehace el búfer y hace `TIOCSWINSZ` sobre el maestro;
+  el crate `tty` ya envía `SIGWINCH` al grupo en primer plano. Con `close`,
+  cierra el maestro: es el cuelgue de la sesión, y ash sale.
+- **`cpumon`:** la maqueta deja de ser fija. El tamaño lógico sale de
+  `Gfx::size()`, la cabecera y los paneles de abajo mantienen su altura, y
+  las gráficas se reparten con `grid_shape`, que ya existe. Con `close`,
+  sale.
+- **`constanos_gfx.h` no cambia en esta fase**: DOOM, Quake y `fire` son de
+  tamaño fijo. Un `close` que les llegue se ignora (su decodificador
+  descarta lo desconocido); para cerrarlos siguen su menú o `^\`.
+
+### 4.4 `panel` y la sesión
+
+`userspace/src/bin/panel.rs`, en disco (`DISK_RUST_PROGRAMS`, porque usa
+`userspace::text`). Una franja abajo de unos 32 px lógicos (con `HIDPI`),
+que contiene:
+
+- **Lanzador:** un botón que abre un menú con las entradas de
+  `/mnt/etc/gui/apps`. Al elegir una, `fork` + `exec` con `GUI_DISPLAY`,
+  en su propio grupo y con los fds de más de 2 cerrados, como `spawn` del
+  compositor (que se reparte a un módulo compartido de `userspace` para
+  no copiarlo).
+- **Lista de ventanas:** un botón por ventana, el de la
+  enfocada resaltado.
+- **Reloj** (`CLOCK_REALTIME`, UTC, como `/etc/localtime`), actualizado
+  una vez por minuto.
+
+`compositor` sin argumentos arranca `panel` si está en `/bin` o `/mnt/bin`;
+con argumentos, como hoy, arranca solo lo que se le pide. Si `panel` muere,
+el compositor sigue funcionando sin él (una sesión sin panel es la de hoy).
+
+### 4.5 Pruebas de extremo a extremo y metal
+
+`scripts/gui-e2e.sh wm`, sobre capturas y el log serie como los otros
+modos:
+
+- W1: `compositor` sin argumentos muestra el panel en la última franja de
+  la pantalla, y el lanzador abre `term`.
+- W2: arrastrar la esquina de `term` → la ventana tiene el tamaño nuevo en
+  la captura, y un `stty size` en ella imprime las filas y columnas
+  nuevas.
+- W3: maximizar `term` → el marco ocupa la zona de trabajo sin tapar el
+  panel; restaurar → vuelve a la geometría anterior.
+- W4: el botón de cerrar de `term` → ash sale y la ventana desaparece. El
+  de `cpumon` → sale.
+- W5: con dos ventanas, una tapada: su botón en la lista la trae al frente.
+- W6: DOOM (`fire` en QEMU, que es más ligero) no tiene bordes para
+  redimensionar, y su tamaño no cambia al arrastrar el borde.
+
+Metal: a mano en la Ryzen, como la 3.5. Allí no hay monitor de QEMU con
+el que mover el ratón, así que `gui-e2e` no sirve y un job de
+`metal-run.sh` no puede arrastrar nada; lo que se comprueba es el ratón
+USB real arrastrando bordes, y `HIDPI` con el panel a 1080p.
+
+### Fuera de alcance (fase 4)
+
+Minimizar y escritorios virtuales, redimensionar en vivo, mover y redimensionar con el teclado, cursores con forma, tamaños
+de `constanos_gfx.h` variables, portapapeles, arrastrar y soltar,
+transparencia y sombras, varios monitores, y arrancar la GUI al inicio.
 
 ## Registro
 
