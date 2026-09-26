@@ -138,6 +138,11 @@ pub fn tick() {
     }
 }
 
+/// Package energy since boot in µJ, where RAPL exists.
+pub fn package_uj() -> Option<u64> {
+    (RAPL.load(Ordering::Relaxed) != 0).then(|| PKG_UJ.load(Ordering::Relaxed))
+}
+
 /// The `/proc/kdebug` lines.
 pub fn render() -> alloc::string::String {
     use core::fmt::Write;

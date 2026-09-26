@@ -3,7 +3,8 @@
 // CPU temperatures on AMD Zen, the way Linux's k10temp reads them: SMN
 // registers through the root complex's index/data pair (`pci::smn_read`;
 // the register layout, the per-model table and the arithmetic are
-// `hal::k10temp`). What `/proc/sensors` reports and `cpumon` draws.
+// `hal::k10temp`). What `/proc/sensors` reports (with `cpu::idle`'s package
+// energy) and `cpumon` draws.
 //
 // Read on demand — every open of `/proc/sensors` — rather than sampled:
 // a reading is three or four config-space round trips, and nothing needs
@@ -79,12 +80,16 @@ pub fn read() -> Option<Reading> {
     SENSOR.get()?.as_ref().map(read_with)
 }
 
-/// `/proc/sensors`: one `chip<TAB>label<TAB>millidegrees` line per sensor,
-/// empty without any.
+/// `/proc/sensors`: one `chip<TAB>type<TAB>label<TAB>value` line per
+/// sensor — k10temp's temperatures in millidegrees, then the package
+/// energy in µJ (`cpu::idle`'s RAPL counter) — empty without any.
 pub fn render() -> alloc::string::String {
     let mut out = alloc::string::String::new();
     if let Some(r) = read() {
         let _ = k10temp::render(&r, &mut out);
+    }
+    if let Some(uj) = super::idle::package_uj() {
+        let _ = hal::amd_power::render_energy(uj, &mut out);
     }
     out
 }

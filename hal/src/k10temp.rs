@@ -159,16 +159,17 @@ pub fn read(m: &Model, ccds: u16, mut smn_read: impl FnMut(u32) -> u32) -> Readi
 /// The chip name every line of `/proc/sensors` starts with.
 pub const CHIP: &str = "k10temp";
 
-/// `/proc/sensors`' lines for one reading: `chip<TAB>label<TAB>millidegrees`,
-/// hwmon's name, `tempN_label` and `tempN_input`, one sensor per line.
+/// `/proc/sensors`' lines for one reading: `chip<TAB>temp<TAB>label<TAB>
+/// millidegrees` — hwmon's name, attribute type, `tempN_label` and
+/// `tempN_input` — one sensor per line.
 pub fn render(r: &Reading, out: &mut impl Write) -> fmt::Result {
-    writeln!(out, "{CHIP}\tTctl\t{}", r.tctl)?;
+    writeln!(out, "{CHIP}\ttemp\tTctl\t{}", r.tctl)?;
     if let Some(t) = r.tdie {
-        writeln!(out, "{CHIP}\tTdie\t{t}")?;
+        writeln!(out, "{CHIP}\ttemp\tTdie\t{t}")?;
     }
     for (i, t) in r.ccd.iter().enumerate() {
         if let Some(t) = t {
-            writeln!(out, "{CHIP}\tTccd{}\t{t}", i + 1)?;
+            writeln!(out, "{CHIP}\ttemp\tTccd{}\t{t}", i + 1)?;
         }
     }
     Ok(())
@@ -214,7 +215,7 @@ mod tests {
         assert_eq!(&r.ccd[..3], &[Some(40_250), Some(30_750), None]);
         let mut s = String::new();
         render(&r, &mut s).unwrap();
-        assert_eq!(s, "k10temp\tTctl\t32875\nk10temp\tTccd1\t40250\nk10temp\tTccd2\t30750\n");
+        assert_eq!(s, "k10temp\ttemp\tTctl\t32875\nk10temp\ttemp\tTccd1\t40250\nk10temp\ttemp\tTccd2\t30750\n");
     }
 
     #[test]
@@ -272,7 +273,7 @@ mod tests {
         assert_eq!((r.tctl, r.tdie), (70_000, Some(50_000)));
         let mut s = String::new();
         render(&r, &mut s).unwrap();
-        assert_eq!(s, "k10temp\tTctl\t70000\nk10temp\tTdie\t50000\n");
+        assert_eq!(s, "k10temp\ttemp\tTctl\t70000\nk10temp\ttemp\tTdie\t50000\n");
         assert_eq!(model(AMD, 0x17, 0x01, "AMD Ryzen 7 1700 Eight-Core Processor").unwrap().tctl_offset, 0);
         assert_eq!(model(AMD, 0x17, 0x08, "AMD Ryzen Threadripper 2990WX").unwrap().tctl_offset, 27_000);
     }

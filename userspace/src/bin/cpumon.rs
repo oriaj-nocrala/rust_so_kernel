@@ -157,15 +157,14 @@ fn parse_cpu_mhz(text: &str) -> Vec<(usize, u32)> {
     out
 }
 
-/// Tctl in millidegrees from a `/proc/sensors` (`chip<TAB>label<TAB>
-/// millidegrees` per line, see `hal::k10temp::render`): the temperature
-/// the CPU's own cooling control goes by, what `sensors` headlines. `None`
-/// on a machine without the sensor (the file is empty).
-fn parse_tctl(text: &str) -> Option<i32> {
+/// One value from a `/proc/sensors` (`chip<TAB>type<TAB>label<TAB>value`
+/// per line, see `hal::k10temp::render` and `hal::amd_power::
+/// render_energy`). `None` where the machine has no such sensor.
+fn sensor(text: &str, kind: &str, label: &str) -> Option<i64> {
     text.lines().find_map(|l| {
         let mut f = l.split('\t');
-        let (_chip, label, v) = (f.next()?, f.next()?, f.next()?);
-        if label == "Tctl" { v.trim().parse().ok() } else { None }
+        let (_chip, k, name, v) = (f.next()?, f.next()?, f.next()?, f.next()?);
+        if k == kind && name == label { v.trim().parse().ok() } else { None }
     })
 }
 
@@ -260,8 +259,14 @@ struct State {
     mem_free_kb: u64,
     loadavg: String,
     tasks: String,
-    /// Tctl, millidegrees, where `/proc/sensors` has it.
+    /// Tctl, millidegrees, where `/proc/sensors` has it: the temperature
+    /// the CPU's own cooling control goes by, what `sensors` headlines.
     tctl: Option<i32>,
+    /// The package energy counter (µJ) and when it was read (ms), for the
+    /// next sample's difference.
+    energy_prev: Option<(i64, i64)>,
+    /// Package power over the last period, milliwatts.
+    power_mw: Option<i64>,
     uptime_s: u64,
     procs: Vec<Proc>,
     samples: u64,
@@ -299,6 +304,8 @@ impl State {
             loadavg: String::new(),
             tasks: String::new(),
             tctl: None,
+            energy_prev: None,
+            power_mw: None,
             uptime_s: 0,
             procs: Vec::new(),
             samples: 0,
@@ -348,8 +355,20 @@ impl State {
             }
         }
 
-        // Temperature.
-        self.tctl = if read_file("/proc/sensors", &mut self.buf) { parse_tctl(text_of(&self.buf)) } else { None };
+        // Temperature and package power.
+        let now_ms = syscall::uptime_ms();
+        let (tctl, energy) = if read_file("/proc/sensors", &mut self.buf) {
+            let t = text_of(&self.buf);
+            (sensor(t, "temp", "Tctl").map(|v| v as i32), sensor(t, "energy", "Esocket0"))
+        } else {
+            (None, None)
+        };
+        self.tctl = tctl;
+        self.power_mw = match (self.energy_prev, energy) {
+            (Some((e0, t0)), Some(e1)) if now_ms > t0 && e1 >= e0 => Some((e1 - e0) / (now_ms - t0)),
+            _ => None,
+        };
+        self.energy_prev = energy.map(|e| (e, now_ms));
 
         // Memory, load, uptime.
         if read_file("/proc/meminfo", &mut self.buf) {
@@ -498,7 +517,11 @@ fn draw(cv: &mut Canvas, st: &State) {
     if let Some(t) = st.tctl {
         // Coloured like a load: 30 C cool, 90 C (a 5900X throttles at 90) red.
         let pm = ((t - 30_000).clamp(0, 60_000) / 60) as u32;
-        cv.smooth_text(SMALL_BOLD, x + 16, 9, &celsius(t), load_color(pm));
+        x = cv.smooth_text(SMALL_BOLD, x + 16, 9, &celsius(t), load_color(pm));
+    }
+    if let Some(mw) = st.power_mw {
+        // Package power, from the energy counter's last difference.
+        cv.smooth_text(SMALL, x + 12, 9, &format!("{}.{} W", mw / 1000, mw % 1000 / 100), DIM);
     }
     let up = st.uptime_s;
     let uptime = format!("up {}:{:02}:{:02}", up / 3600, up / 60 % 60, up % 60);

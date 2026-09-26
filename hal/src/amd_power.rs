@@ -53,6 +53,13 @@ pub fn energy_uj(prev: u32, now: u32, esu: u32) -> u64 {
     (counts * 1_000_000) >> esu
 }
 
+/// `/proc/sensors`' energy line, as Linux's `amd_energy` hwmon driver
+/// names it: `amd_energy<TAB>energy<TAB>Esocket0<TAB>microjoules`, the
+/// package's energy since boot. A reader turns two of them into watts.
+pub fn render_energy(package_uj: u64, out: &mut impl core::fmt::Write) -> core::fmt::Result {
+    writeln!(out, "amd_energy\tenergy\tEsocket0\t{package_uj}")
+}
+
 /// C0 residency in permille over an interval: MPERF counts at the TSC's
 /// rate but only while the core is in C0.
 pub fn c0_permille(d_mperf: u64, d_tsc: u64) -> u32 {
@@ -92,6 +99,13 @@ mod tests {
         assert_eq!(energy_uj(0, 65_536, esu), 1_000_000); // 1 J
         assert_eq!(energy_uj(u32::MAX - 65_535, 0, esu), 1_000_000); // across the wrap
         assert_eq!(energy_uj(5, 5, esu), 0);
+    }
+
+    #[test]
+    fn energy_line() {
+        let mut s = alloc::string::String::new();
+        render_energy(18_000_000, &mut s).unwrap();
+        assert_eq!(s, "amd_energy\tenergy\tEsocket0\t18000000\n");
     }
 
     #[test]

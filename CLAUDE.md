@@ -96,7 +96,7 @@ so addresses actually resolve to real function names instead of bare hex.
 ### QEMU integration tests
 
 Real hardware-path behavior (drivers that need actual QEMU devices, not just host-testable
-pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 339 tests, <1s, no QEMU) is
+pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 340 tests, <1s, no QEMU) is
 asserted by a `#![feature(custom_test_frameworks)]` harness that boots the real kernel in
 QEMU and reports PASS/FAIL as a process exit code:
 
@@ -581,7 +581,7 @@ arbitration, exactly where two PS/2 keyboards would merge.
 **Split across the usual seam.** `hal::xhci` (register/TRB/ring/context
 arithmetic), `hal::usb` (descriptor parsing + setup packets) and
 `hal::hid` (boot-report diffing + the Set-1 table) are pure and host-tested
-— most of `hal`'s 339 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
+— most of `hal`'s 340 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
 DMA pages, doorbells and waiting. That line is drawn hard here because an
 xHCI bring-up failure is nearly unobservable (a wrong bit in a device
 context yields no fault, no log, just a Transfer Event that never arrives)
@@ -1127,10 +1127,13 @@ Linux's k10temp reported on the target machine. Decided once at boot
 (`[k10temp] present|absent` in the log): AMD vendor, a covered family,
 **and** an AMD root complex (under a hypervisor CPUID can say Zen while
 00:00.0 is an emulated Intel bridge); claims 00:18.3 like Linux does.
-Read on every open. `/proc/sensors` is one `chip<TAB>label<TAB>
-millidegrees` line per sensor (hwmon's name/`tempN_label`/`tempN_input`),
-**empty** without the sensor — QEMU always, so only the Ryzen exercises
-it. `cpumon` shows Tctl in its header. Family 1Ah (Zen 5) is left out.
+Read on every open. `/proc/sensors` is one `chip<TAB>type<TAB>label<TAB>
+value` line per sensor — hwmon's name, attribute type, `…_label` and
+`…_input`: `k10temp temp Tctl 32875` (millidegrees) and, where RAPL exists
+(see Idle below), `amd_energy energy Esocket0 <µJ since boot>` as Linux's
+`amd_energy` names it — **empty** without either, QEMU always, so only the
+Ryzen exercises it. `cpumon` shows Tctl and the package power (the energy
+line's difference between two samples) in its header. Family 1Ah (Zen 5) is left out.
 
 **PCI config access is locked** (`pci::CONFIG`, an `IrqLock`) since this:
 mechanism #1 is two port accesses and the SMN pair two more, and with
@@ -1145,7 +1148,7 @@ AML: a read of `CStateBaseAddr + 1` (MSR `C001_0073`; `0x413` → `0x414`
 on the Ryzen, the port its `_CST` gives Linux), switchable live with
 `kdebug idle hlt|c2`. Two instruments in `/proc/kdebug`: `rapl:` package
 energy since boot (MSR `C001_029B`, accumulated on CPU 0's tick,
-`package_uj`) and `c0_permille:` each CPU's C0 residency over the last
+`package_uj`, also in `/proc/sensors` for `cpumon`) and `c0_permille:` each CPU's C0 residency over the last
 second (ΔMPERF/ΔTSC, per-CPU tick work). Both need a Zen outside a
 hypervisor; QEMU shows `absent`/`-`.
 
