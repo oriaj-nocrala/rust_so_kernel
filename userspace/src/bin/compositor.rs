@@ -119,13 +119,26 @@ fn open_path(path: &str, flags: i32) -> i32 {
 
 const GUI_DISPLAY_ENV: &[u8] = b"GUI_DISPLAY=/tmp/gui-0\0";
 
-/// Starts `name` (from `/bin` unless it contains a `/`).
+/// Where a bare program name is looked for, in order — ash's `PATH` minus
+/// `/tmp/bin` (BusyBox applets are not graphical): the embedded programs,
+/// then the disk's, where everything linking `userspace::text` lives.
+const SEARCH: [&[u8]; 2] = [b"/bin/", b"/mnt/bin/"];
+
+/// Starts `name`: as given if it contains a `/`, else the first of
+/// `SEARCH` that has it.
 fn spawn(name: &[u8]) {
     let mut path = [0u8; 64];
-    let prefix: &[u8] = if name.contains(&b'/') { b"" } else { b"/bin/" };
-    let n = (prefix.len() + name.len()).min(63);
-    path[..prefix.len()].copy_from_slice(prefix);
-    path[prefix.len()..n].copy_from_slice(&name[..n - prefix.len()]);
+    let mut n = 0;
+    let prefixes: &[&[u8]] = if name.contains(&b'/') { &[b""] } else { &SEARCH };
+    for prefix in prefixes {
+        n = (prefix.len() + name.len()).min(63);
+        path[..prefix.len()].copy_from_slice(prefix);
+        path[prefix.len()..n].copy_from_slice(&name[..n - prefix.len()]);
+        path[n] = 0;
+        if syscall::stat(&path[..=n]).is_ok() {
+            break;
+        }
+    }
     let pid = syscall::fork();
     if pid == 0 {
         // A group of its own with the default ^C/^Z: the console's

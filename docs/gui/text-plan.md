@@ -4,7 +4,8 @@
 > tiene SSE2). Fases 1-3 hechas: crate `text/` (18 tests en el host),
 > fuentes en `disk.img`, `userspace::text` con respaldo bitmap, y
 > `textdemo` verificado en QEMU por `scripts/gui-e2e.sh text`. Fase 4:
-> job en la Ryzen OK (boot #59); falta solo mirar `textdemo` a mano.
+> job en la Ryzen OK (boot #59) y `textdemo` visto a mano. **Plan
+> cerrado.** Primer consumidor: `cpumon` (hecho, ver el registro).
 
 ## Por qué, y por qué antes que la librería GUI
 
@@ -248,5 +249,16 @@ syscalls: recibe los bytes de las fuentes y un `&mut [u32]`.
   se quieren comparar. Las 18 cajas de `measure` son idénticas a las de
   QEMU (mismas x, y, w, h): el layout no depende de la máquina. Caché de
   bloques ext2: 80 lecturas del dispositivo para todo el job. El SIGKILL
-  del compositor devolvió `/dev/fb0` las dos veces. Pendiente: ver
-  `textdemo` en pantalla a mano y fotografiarlo.
+  del compositor devolvió `/dev/fb0` las dos veces. `textdemo` visto en
+  pantalla a mano en la Ryzen: "se ve excelente". Plan cerrado.
+- **2026-09-26 — `cpumon` con el motor nuevo:** todo su texto pasa por
+  `userspace::text` (Noto Sans 14/18 px, regular y negrita) mediante una
+  capa `Ui` con las mismas operaciones que usaba de `draw::smooth`; cada
+  cadena se centra en la celda que ocupaba antes (desplazamiento medido,
+  0 con el respaldo bitmap), así que la maquetación no cambió. Los nombres
+  de proceso se recortan por píxeles con `…` (`...` sin fuentes). La
+  columna `CPU` se movió 20 px: `COMMAND` en negrita proporcional la
+  pisaba. `cpumon` pasa a `DISK_RUST_PROGRAMS` (1,69 MB) y el compositor
+  busca un nombre suelto en `/bin` y luego en `/mnt/bin`, así que
+  `compositor cpumon` sigue funcionando. Verificado en QEMU con y sin
+  fuentes; `gui-e2e.sh` (demo) en PASS.

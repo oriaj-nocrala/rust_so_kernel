@@ -7,10 +7,13 @@
 //! the same `sched::cputime` code the kernel renders it with),
 //! `/proc/<pid>/stat`, `/proc/meminfo`, `/proc/loadavg`, `/proc/uptime`,
 //! `/proc/cpuinfo` — so it is also a running check that they say something
-//! true. A sample every half second; the picture is a 640x400 frame drawn
-//! with `draw` (antialiased Noto text, `draw::smooth`) and shown through
-//! `userspace::gfx`: a window under the compositor, the whole screen on
-//! the console. Esc or Q quits.
+//! true. A sample every half second; the picture is a 640x460 frame drawn
+//! with `draw`, its text proportional Noto Sans through `userspace::text`
+//! (parley + swash; `draw::smooth`'s bitmap Noto Mono without the fonts on
+//! `/mnt`), and shown through `userspace::gfx`: a window under the
+//! compositor, the whole screen on the console. Esc or Q quits.
+//!
+//! Disk-resident (`DISK_RUST_PROGRAMS`): the text engine makes it ~1.7 MB.
 
 #![no_std]
 #![no_main]
@@ -23,11 +26,11 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use draw::color::{hsv, mix, scale};
-use draw::smooth::{FontWeight, RasterHeight, Smooth};
 use draw::Canvas;
 use sched::cputime::{parse_stat_line, permille, CpuTimes};
 use userspace::args::Args;
 use userspace::gfx::{Gfx, EV_KEY};
+use userspace::text::{Style, Text, SANS};
 use userspace::{entry, println, syscall};
 
 entry!(main);
@@ -54,9 +57,88 @@ const DIM: u32 = 0x8B949E;
 const ACCENT: u32 = 0x58A6FF;
 const SYS: u32 = 0xB48CFF;
 
-const SMALL: Smooth = Smooth::new(RasterHeight::Size16, FontWeight::Regular);
-const SMALL_BOLD: Smooth = Smooth::new(RasterHeight::Size16, FontWeight::Bold);
-const TITLE: Smooth = Smooth::new(RasterHeight::Size20, FontWeight::Bold);
+const SMALL: Font = Font::Small;
+const SMALL_BOLD: Font = Font::SmallBold;
+const TITLE: Font = Font::Title;
+
+// ── Text ─────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+enum Font {
+    Small,
+    SmallBold,
+    Title,
+}
+
+/// Text through `userspace::text`. The layout below was drawn for
+/// `draw::smooth`'s cells (16 and 20 px tall, `y` their top), so every
+/// string is centred on the cell it used to fill: `dy` shifts the line
+/// box up by half of what it is taller — 0 with the bitmap fallback,
+/// whose line box *is* the cell.
+struct Ui {
+    t: Text,
+    /// Per font: line height, and the shift from cell top to line top.
+    line: [(i32, i32); 3],
+}
+
+impl Ui {
+    fn new() -> Ui {
+        let mut ui = Ui { t: Text::load(), line: [(0, 0); 3] };
+        for (f, cell) in [(Font::Small, 16), (Font::SmallBold, 16), (Font::Title, 20)] {
+            let (_, h) = ui.t.measure("Hg", &Self::style(f, 0), None);
+            ui.line[f as usize] = (h, (cell - h) / 2);
+        }
+        ui
+    }
+
+    fn style(f: Font, color: u32) -> Style<'static> {
+        let st = match f {
+            Font::Small => Style::new(SANS, 14.0),
+            Font::SmallBold => Style::new(SANS, 14.0).bold(),
+            Font::Title => Style::new(SANS, 18.0).bold(),
+        };
+        st.color(color)
+    }
+
+    /// Draws `s` at `(x, y)` (the top of its old cell); returns the x just
+    /// past it, for continuing on the same line.
+    fn text(&mut self, cv: &mut Canvas, f: Font, x: i32, y: i32, s: &str, c: u32) -> i32 {
+        let (w, _) = self.t.draw(cv, s, &Self::style(f, c), None, x, y + self.line[f as usize].1);
+        x + w
+    }
+
+    /// `text` right-aligned: it ends at `right`.
+    fn right(&mut self, cv: &mut Canvas, f: Font, right: i32, y: i32, s: &str, c: u32) -> i32 {
+        let w = self.width(f, s);
+        self.text(cv, f, right - w, y, s, c)
+    }
+
+    fn width(&mut self, f: Font, s: &str) -> i32 {
+        self.t.measure(s, &Self::style(f, 0), None).0
+    }
+
+    fn height(&self, f: Font) -> i32 {
+        self.line[f as usize].0
+    }
+
+    /// `s` cut to fit `max` pixels, with an ellipsis if it was cut (three
+    /// dots with the bitmap fallback, which has no `…`).
+    fn fit(&mut self, f: Font, s: &str, max: i32) -> String {
+        if self.width(f, s) <= max {
+            return String::from(s);
+        }
+        let dots = if self.t.fonts() { "…" } else { "..." };
+        let mut cut: String = s.into();
+        while !cut.is_empty() {
+            cut.pop();
+            let t = format!("{}{}", cut.trim_end(), dots);
+            if self.width(f, &t) <= max {
+                return t;
+            }
+        }
+        String::new()
+    }
+}
 
 /// User time's colour: green when light, through yellow, to orange-red at
 /// 100% (hue 512 down to 64; system time is violet, so the two never meet).
@@ -497,35 +579,35 @@ fn grid_shape(n: usize, w: i32, h: i32) -> (i32, i32) {
     (best.0, best.1)
 }
 
-fn draw(cv: &mut Canvas, st: &State) {
+fn draw(cv: &mut Canvas, ui: &mut Ui, st: &State) {
     cv.fill(BG);
 
     // Header.
     cv.rect(0, 0, W as i32, 34, PANEL);
     cv.hline(0, 34, W as i32, EDGE);
-    let x = cv.smooth_text(TITLE, 12, 6, "CPU", ACCENT);
-    let mut x = cv.smooth_text(SMALL, x + 12, 9, &st.model, TEXT);
+    let x = ui.text(cv, TITLE, 12, 6, "CPU", ACCENT);
+    let mut x = ui.text(cv, SMALL, x + 12, 9, &st.model, TEXT);
     if st.measured {
         // The range the cores span right now.
         let m = st.cpus.iter().map(|c| c.mhz).filter(|&m| m > 0);
         if let (Some(lo), Some(hi)) = (m.clone().min(), m.max()) {
-            x = cv.smooth_text(SMALL, x + 10, 9, &format!("{} - {}", ghz(lo, false), ghz(hi, true)), DIM);
+            x = ui.text(cv, SMALL, x + 10, 9, &format!("{} - {}", ghz(lo, false), ghz(hi, true)), DIM);
         }
     } else if !st.mhz.is_empty() {
-        x = cv.smooth_text(SMALL, x + 10, 9, &st.mhz, DIM);
+        x = ui.text(cv, SMALL, x + 10, 9, &st.mhz, DIM);
     }
     if let Some(t) = st.tctl {
         // Coloured like a load: 30 C cool, 90 C (a 5900X throttles at 90) red.
         let pm = ((t - 30_000).clamp(0, 60_000) / 60) as u32;
-        x = cv.smooth_text(SMALL_BOLD, x + 16, 9, &celsius(t), load_color(pm));
+        x = ui.text(cv, SMALL_BOLD, x + 16, 9, &celsius(t), load_color(pm));
     }
     if let Some(mw) = st.power_mw {
         // Package power, from the energy counter's last difference.
-        cv.smooth_text(SMALL, x + 12, 9, &format!("{}.{} W", mw / 1000, mw % 1000 / 100), DIM);
+        ui.text(cv, SMALL, x + 12, 9, &format!("{}.{} W", mw / 1000, mw % 1000 / 100), DIM);
     }
     let up = st.uptime_s;
     let uptime = format!("up {}:{:02}:{:02}", up / 3600, up / 60 % 60, up % 60);
-    cv.smooth_text_right(SMALL, W as i32 - 12, 9, &uptime, DIM);
+    ui.right(cv, SMALL, W as i32 - 12, 9, &uptime, DIM);
 
     // One tile per CPU.
     // The bottom panels take the last 130 rows; the tiles get the rest.
@@ -537,16 +619,16 @@ fn draw(cv: &mut Canvas, st: &State) {
         let (tx, ty) = (gx + (i as i32 % cols) * tw, gy + (i as i32 / cols) * th);
         panel(cv, tx + 2, ty + 2, tw - 4, th - 4);
         let (u, s) = c.hist.last();
-        cv.smooth_text(SMALL, tx + 8, ty + 4, &format!("cpu{}", c.id), DIM);
-        cv.smooth_text_right(SMALL_BOLD, tx + tw - 8, ty + 4, &pct(u + s), load_color(u + s));
+        ui.text(cv, SMALL, tx + 8, ty + 4, &format!("cpu{}", c.id), DIM);
+        ui.right(cv, SMALL_BOLD, tx + tw - 8, ty + 4, &pct(u + s), load_color(u + s));
         let top = ty + 22;
         graph(cv, tx + 7, top, tw - 14, ty + th - 7 - top, &c.hist);
-        if c.mhz > 0 && ty + th - 7 - top >= SMALL.cell().1 + 4 {
+        if c.mhz > 0 && ty + th - 7 - top >= ui.height(SMALL) + 4 {
             // Over the graph's bottom left, where the graph is tall enough
             // to hold a line; the unit only where it fits.
             let full = ghz(c.mhz, true);
-            let s = if SMALL.width(&full) <= tw - 20 { full } else { ghz(c.mhz, false) };
-            cv.smooth_text(SMALL, tx + 10, ty + th - 9 - SMALL.cell().1, &s, TEXT);
+            let s = if ui.width(SMALL, &full) <= tw - 20 { full } else { ghz(c.mhz, false) };
+            ui.text(cv, SMALL, tx + 10, ty + th - 9 - ui.height(SMALL), &s, TEXT);
         }
     }
 
@@ -554,46 +636,46 @@ fn draw(cv: &mut Canvas, st: &State) {
     let (bx, by, bw, bh) = (8, bottom, 312, 122);
     panel(cv, bx + 2, by + 2, bw - 4, bh - 4);
     let (u, s) = st.total.last();
-    cv.smooth_text(SMALL_BOLD, bx + 10, by + 6, "All CPUs", TEXT);
-    let x = cv.smooth_text(SMALL, bx + 110, by + 6, &format!("usr {}", pct(u)), load_color(u + s));
-    cv.smooth_text(SMALL, x + 12, by + 6, &format!("sys {}", pct(s)), SYS);
+    ui.text(cv, SMALL_BOLD, bx + 10, by + 6, "All CPUs", TEXT);
+    let x = ui.text(cv, SMALL, bx + 110, by + 6, &format!("usr {}", pct(u)), load_color(u + s));
+    ui.text(cv, SMALL, x + 12, by + 6, &format!("sys {}", pct(s)), SYS);
     graph(cv, bx + 10, by + 26, bw - 20, 36, &st.total);
 
     let used = st.mem_total_kb.saturating_sub(st.mem_free_kb);
     let mem_pm = permille(used, st.mem_total_kb);
-    cv.smooth_text(SMALL_BOLD, bx + 10, by + 68, "Memory", TEXT);
+    ui.text(cv, SMALL_BOLD, bx + 10, by + 68, "Memory", TEXT);
     let mem = format!("{} / {} MiB", used / 1024, st.mem_total_kb / 1024);
-    cv.smooth_text_right(SMALL, bx + bw - 10, by + 68, &mem, DIM);
-    let (mx, my, mw) = (bx + 90, by + 73, bw - 90 - 10 - SMALL.width(&mem) - 8);
+    ui.right(cv, SMALL, bx + bw - 10, by + 68, &mem, DIM);
+    let (mx, my, mw) = (bx + 90, by + 73, bw - 90 - 10 - ui.width(SMALL, &mem) - 8);
     cv.rect(mx, my, mw, 8, GRID);
     let filled = mw * mem_pm as i32 / 1000;
     for dx in 0..filled {
         cv.vline(mx + dx, my, 8, mix(ACCENT, 0xBC8CFF, dx * 256 / mw.max(1)));
     }
 
-    cv.smooth_text(SMALL_BOLD, bx + 10, by + 92, "Load", TEXT);
-    cv.smooth_text(SMALL, bx + 90, by + 92, &st.loadavg, TEXT);
-    cv.smooth_text_right(SMALL, bx + bw - 10, by + 92, &st.tasks, DIM);
+    ui.text(cv, SMALL_BOLD, bx + 10, by + 92, "Load", TEXT);
+    ui.text(cv, SMALL, bx + 90, by + 92, &st.loadavg, TEXT);
+    ui.right(cv, SMALL, bx + bw - 10, by + 92, &st.tasks, DIM);
 
     // Bottom right: the busiest processes.
     let (px, py, pw, ph) = (320, bottom, W as i32 - 8 - 320, 122);
     panel(cv, px + 2, py + 2, pw - 4, ph - 4);
     let (c_pid, c_name, c_cpu, c_rss, c_pct) =
-        (px + 10, px + 62, px + pw - 170, px + pw - 80, px + pw - 10);
-    cv.smooth_text(SMALL_BOLD, c_pid, py + 6, "PID", DIM);
-    cv.smooth_text(SMALL_BOLD, c_name, py + 6, "COMMAND", DIM);
-    cv.smooth_text(SMALL_BOLD, c_cpu, py + 6, "CPU", DIM);
-    cv.smooth_text_right(SMALL_BOLD, c_rss, py + 6, "RSS", DIM);
-    cv.smooth_text_right(SMALL_BOLD, c_pct, py + 6, "%CPU", DIM);
+        (px + 10, px + 62, px + pw - 150, px + pw - 80, px + pw - 10);
+    ui.text(cv, SMALL_BOLD, c_pid, py + 6, "PID", DIM);
+    ui.text(cv, SMALL_BOLD, c_name, py + 6, "COMMAND", DIM);
+    ui.text(cv, SMALL_BOLD, c_cpu, py + 6, "CPU", DIM);
+    ui.right(cv, SMALL_BOLD, c_rss, py + 6, "RSS", DIM);
+    ui.right(cv, SMALL_BOLD, c_pct, py + 6, "%CPU", DIM);
     for (i, p) in st.top().iter().enumerate() {
         let y = py + 26 + i as i32 * 18;
         let c = if p.pm >= 10 { TEXT } else { DIM };
-        cv.smooth_text(SMALL, c_pid, y, &format!("{}", p.pid), c);
-        let name: String = p.name.chars().take(((c_cpu - c_name - 8) / SMALL.cell().0) as usize).collect();
-        cv.smooth_text(SMALL, c_name, y, &name, c);
-        cv.smooth_text(SMALL, c_cpu, y, &format!("{}", p.cpu), DIM);
-        cv.smooth_text_right(SMALL, c_rss, y, &size_kb(p.rss_kb), DIM);
-        cv.smooth_text_right(SMALL, c_pct, y, &pct(p.pm), if p.pm >= 10 { load_color(p.pm) } else { DIM });
+        ui.text(cv, SMALL, c_pid, y, &format!("{}", p.pid), c);
+        let name = ui.fit(SMALL, &p.name, c_cpu - c_name - 8);
+        ui.text(cv, SMALL, c_name, y, &name, c);
+        ui.text(cv, SMALL, c_cpu, y, &format!("{}", p.cpu), DIM);
+        ui.right(cv, SMALL, c_rss, y, &size_kb(p.rss_kb), DIM);
+        ui.right(cv, SMALL, c_pct, y, &pct(p.pm), if p.pm >= 10 { load_color(p.pm) } else { DIM });
     }
 }
 
@@ -603,6 +685,10 @@ fn main(args: Args) -> i32 {
         return 1;
     };
     let mut frame = vec![0u32; W * H];
+    let mut ui = Ui::new();
+    if !ui.t.fonts() {
+        println!("cpumon: no fonts in {}, bitmap text", userspace::text::FONT_DIR);
+    }
     let mut st = State::new();
     st.sample();
     let mut next = syscall::uptime_ms() + PERIOD_MS;
@@ -625,7 +711,7 @@ fn main(args: Args) -> i32 {
         }
         if dirty {
             let mut cv = Canvas::new(&mut frame, W, H, W);
-            draw(&mut cv, &st);
+            draw(&mut cv, &mut ui, &st);
             gfx.present(&frame);
             dirty = false;
         }

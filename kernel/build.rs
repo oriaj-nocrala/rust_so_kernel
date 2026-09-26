@@ -41,7 +41,6 @@ const RUST_PROGRAMS: &[(&str, &str)] = &[
     ("uname",      "uname.elf"),
     ("shell",      "shell.elf"),
     ("snake",      "snake.elf"),
-    ("cpumon",     "cpumon.elf"),
     ("uptime",     "uptime.elf"),
     ("tsc",        "tsc.elf"),
     ("ipc_ping",   "ipc_ping.elf"),
@@ -64,6 +63,7 @@ const RUST_PROGRAMS: &[(&str, &str)] = &[
 /// kernel image.
 const DISK_RUST_PROGRAMS: &[&str] = &[
     "textdemo",
+    "cpumon",
 ];
 
 /// C binaries that stay embedded in the kernel: (source file stem, embedded
