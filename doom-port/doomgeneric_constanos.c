@@ -7,7 +7,15 @@
 // of a whole-engine multi-file build by scripts/build-doom.sh instead, the
 // same "bespoke build script" shape as scripts/build-busybox.sh).
 //
-// Three kernel-specific primitives back this port:
+// The picture and input go through userspace/c/include/constanos_gfx.h:
+// a window of the compositor when $GUI_DISPLAY names one (started from
+// `term`, say), the console otherwise. On the console that is the first
+// two primitives below; in a window, a shared-memory buffer scaled by an
+// integer factor and the compositor's key/button/relative-motion events,
+// with the pointer locked to the window for mouse-look (Ctrl+Alt lets go,
+// a click takes it back). Either way input arrives evdev-shaped.
+//
+// Kernel-specific primitives behind this port:
 //   - /dev/fb's FBIO_BLIT ioctl (kernel/src/process/syscall.rs) — hands the
 //     kernel our own offscreen pixel buffer once a frame; it scales/blits
 //     it into the real framebuffer itself (see Framebuffer::blit_scaled).
@@ -62,21 +70,7 @@
 #include <stdint.h>
 #include <string.h>
 
-// Custom, this-kernel-only ioctl request code — see sys_ioctl's FBIO_BLIT
-// (not a real Linux fbdev ioctl; real fbdev exposes the framebuffer via
-// mmap, which this kernel doesn't support for device memory).
-#define FBIO_BLIT 0x46420001UL
-// Linux's EVIOCGRAB (_IOW('E', 0x90, int)): while held, keys go to us only,
-// not to the tty -- otherwise everything typed in the game (arrows, the
-// `y` of "quit?") is replayed by the shell afterwards. The kernel drops the
-// grab when the fd closes, so a crash cannot leave the keyboard grabbed.
-#define EVIOCGRAB 0x40044590UL
-
-struct fb_blit_args {
-    unsigned long ptr;
-    unsigned int width;
-    unsigned int height;
-};
+#include "constanos_gfx.h"
 
 // This kernel-specific syscall (above the Linux syscall range, see
 // CLAUDE.md's syscall table) has no mlibc wrapper, so call it directly —
@@ -96,9 +90,6 @@ static long raw_syscall0(long nr)
     return ret;
 }
 
-static int s_fbFd = -1;
-static int s_kbdFd = -1;
-static int s_mouseFd = -1;
 static int s_mouseButtons = 0; // persistent held-button bitmask (bit0=L,1=R,2=M)
 
 #define KEYQUEUE_SIZE 16
@@ -121,15 +112,6 @@ static unsigned int s_KeyQueueReadIndex = 0;
 #define BTN_RIGHT  0x111
 #define BTN_MIDDLE 0x112
 
-// Wire-compatible with the real Linux `struct input_event` on x86_64 —
-// see kernel/src/drivers/dev_input_event.rs's matching Rust definition.
-struct input_event {
-    long tv_sec;
-    long tv_usec;
-    unsigned short type;
-    unsigned short code;
-    int value;
-};
 
 // Unshifted base-key table indexed by Linux KEY_* code for the "base"
 // (non-extended) keyboard block. No translation needed here: Linux's
@@ -198,84 +180,55 @@ static void addKeyToQueue(int pressed, unsigned short code)
 
 void DG_Init(void)
 {
-    s_fbFd = open("/dev/fb", O_WRONLY);
-    s_kbdFd = open("/dev/input/event0", O_RDONLY);
-    if (s_kbdFd >= 0) ioctl(s_kbdFd, EVIOCGRAB, 1);
-    s_mouseFd = open("/dev/input/event1", O_RDONLY);
-
-    // Drain events queued before we started: the kernel's raw-event ring
-    // buffer fills from every keypress since boot and nothing else reads
-    // it, so the shell commands that launched us (and anything typed
-    // earlier) are still queued — without this, DOOM replays that backlog
-    // into the title screen (observed: stray Enters walking the menu into
-    // episode select on their own).
-    struct input_event ev;
-    while (s_kbdFd >= 0 && read(s_kbdFd, &ev, sizeof(ev)) == (long)sizeof(ev)) { }
-    while (s_mouseFd >= 0 && read(s_mouseFd, &ev, sizeof(ev)) == (long)sizeof(ev)) { }
+    // gfx_open drops the console's input backlog (the ring fills from
+    // every keypress since boot, and the Enter that started us is still
+    // in it — DOOM used to replay it into the title screen, walking the
+    // menu into episode select on its own).
+    if (gfx_open("doom", DOOMGENERIC_RESX, DOOMGENERIC_RESY, GFX_MOUSE) < 0) {
+        fprintf(stderr, "doom: nothing to draw on (no /dev/fb, no compositor)\n");
+        exit(1);
+    }
 }
 
 void DG_DrawFrame(void)
 {
-    struct input_event ev;
-    while (s_kbdFd >= 0 && read(s_kbdFd, &ev, sizeof(ev)) == (long)sizeof(ev)) {
-        if (ev.type == EV_KEY) {
-            addKeyToQueue(ev.value != 0, ev.code);
-        }
-        // EV_SYN/SYN_REPORT and anything else this device doesn't emit:
-        // nothing to do, just consume it.
-    }
-
-    // Accumulate every mouse packet since the last frame into one
-    // ev_mouse event — matches how a real port (e.g. SDL relative mouse
-    // mode) coalesces motion between ticks instead of posting one event
-    // per PS/2 packet. data2/data3 are raw evdev REL_X/REL_Y deltas,
-    // unnegated: PS/2's own sign convention (X+ = right, Y+ = up/away
-    // from the user) already matches what g_game.c's mouse handling
-    // expects (angleturn -= mousex*0x8 turns right on X+; forward +=
-    // mousey advances on Y+) — this is the same raw convention the
-    // original DOS mouse driver reported through, which is what that
-    // formula was written against.
-    if (s_mouseFd >= 0) {
-        int mdx = 0, mdy = 0;
-        int haveMouseEvent = 0;
-        while (read(s_mouseFd, &ev, sizeof(ev)) == (long)sizeof(ev)) {
+    // Keys go to the key queue; mouse buttons and motion since the last
+    // frame are coalesced into one ev_mouse event, as a real port (SDL's
+    // relative mouse mode) does between ticks. data2/data3 are REL_X/REL_Y
+    // unnegated: the PS/2 sign convention (X+ right, Y+ up/away), which
+    // constanos_gfx.h keeps for a window too, is what g_game.c's mouse
+    // handling was written against (angleturn -= mousex*0x8 turns right on
+    // X+; forward += mousey advances on Y+) — the original DOS driver's.
+    struct gfx_event ev;
+    int mdx = 0, mdy = 0;
+    int haveMouseEvent = 0;
+    while (gfx_next_event(&ev)) {
+        if (ev.type == EV_KEY && ev.code >= BTN_LEFT && ev.code <= BTN_MIDDLE) {
+            // Persistent held-button state, not per frame: a button held
+            // across frames with no new transition still reads as held.
+            int bit = (ev.code == BTN_LEFT) ? 1 : (ev.code == BTN_RIGHT) ? 2 : 4;
+            if (ev.value) s_mouseButtons |= bit;
+            else s_mouseButtons &= ~bit;
             haveMouseEvent = 1;
-            if (ev.type == EV_REL) {
-                if (ev.code == REL_X) mdx += ev.value;
-                else if (ev.code == REL_Y) mdy += ev.value;
-            } else if (ev.type == EV_KEY) {
-                // Update persistent held-button state (s_mouseButtons),
-                // not a per-frame-local one — a button held across
-                // several frames with no new transition must still read
-                // as held every frame, not just the frame it was pressed.
-                int bit = (ev.code == BTN_LEFT) ? 1
-                        : (ev.code == BTN_RIGHT) ? 2
-                        : (ev.code == BTN_MIDDLE) ? 4 : 0;
-                if (bit) {
-                    if (ev.value) s_mouseButtons |= bit;
-                    else s_mouseButtons &= ~bit;
-                }
-            }
-            // EV_SYN/SYN_REPORT: nothing to do, just consumed by the loop.
+        } else if (ev.type == EV_KEY) {
+            addKeyToQueue(ev.value != 0, ev.code);
+        } else if (ev.type == EV_REL) {
+            if (ev.code == REL_X) mdx += ev.value;
+            else if (ev.code == REL_Y) mdy += ev.value;
+            haveMouseEvent = 1;
         }
-        if (haveMouseEvent) {
-            event_t doomEv;
-            doomEv.type = ev_mouse;
-            doomEv.data1 = s_mouseButtons;
-            doomEv.data2 = mdx;
-            doomEv.data3 = mdy;
-            doomEv.data4 = 0;
-            D_PostEvent(&doomEv);
-        }
+    }
+    if (haveMouseEvent) {
+        event_t doomEv;
+        doomEv.type = ev_mouse;
+        doomEv.data1 = s_mouseButtons;
+        doomEv.data2 = mdx;
+        doomEv.data3 = mdy;
+        doomEv.data4 = 0;
+        D_PostEvent(&doomEv);
     }
 
-    if (s_fbFd >= 0) {
-        struct fb_blit_args args;
-        args.ptr = (unsigned long)DG_ScreenBuffer;
-        args.width = DOOMGENERIC_RESX;
-        args.height = DOOMGENERIC_RESY;
-        ioctl(s_fbFd, FBIO_BLIT, &args);
-    }
+    gfx_present((const uint32_t *)DG_ScreenBuffer);
 }
 
 void DG_SleepMs(uint32_t ms)

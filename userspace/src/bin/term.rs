@@ -56,13 +56,16 @@ const SIG_IGN: u64 = 1;
 const REPEAT_DELAY_MS: i64 = 500;
 const REPEAT_EVERY_MS: i64 = 33;
 
-/// What ash gets: the shell's own (`shell.rs`), but `TERM` says what this
-/// emulator is — xterm-like (deferred wrap, `?1049`, `DECCKM`, 256
-/// colours), not the kernel console.
-const ENVP: [&[u8]; 3] = [
+/// What ash gets: the shell's own (`shell.rs`) plus `GUI_DISPLAY`, but
+/// `TERM` says what this emulator is — xterm-like (deferred wrap,
+/// `?1049`, `DECCKM`, 256 colours), not the kernel console.
+const ENVP: [&[u8]; 4] = [
     b"PATH=/tmp/bin:/bin:/mnt/bin\0",
     b"HISTFILE=/mnt/.ash_history\0",
     b"TERM=xterm-256color\0",
+    // So fire, doom and quake started here open a window of their own
+    // (constanos_gfx.h) instead of the console the compositor holds.
+    b"GUI_DISPLAY=/tmp/gui-0\0",
 ];
 
 #[repr(C)]

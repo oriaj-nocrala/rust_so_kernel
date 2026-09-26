@@ -9,12 +9,14 @@
 //! | compositor | create_pool(id, fd, size) 0, create_surface(id) 1, sync(id) 2            | error(obj, code, msg) 0, delete_id(id) 1 |
 //! | pool       | create_buffer(id, offset, w, h, stride, format) 0, destroy 1             | — |
 //! | buffer     | destroy 0                                                                | release 0 |
-//! | surface    | attach(buffer) 0, damage(x, y, w, h) 1, frame(id) 2, commit 3, set_title(s) 4, destroy 5 | configure(w, h) 0, focus(in) 1, key(code, state) 2, motion(x, y) 3, button(code, state) 4 |
+//! | surface    | attach(buffer) 0, damage(x, y, w, h) 1, frame(id) 2, commit 3, set_title(s) 4, destroy 5, lock_pointer(on) 6 | configure(w, h) 0, focus(in) 1, key(code, state) 2, motion(x, y) 3, button(code, state) 4, relative_motion(dx, dy) 5 |
 //! | callback   | —                                                                        | done(ms) 0 |
 //!
 //! It folds `wl_display`, `wl_compositor`, `wl_shm`, `wl_surface`,
 //! `xdg_toplevel` and `wl_seat` into five interfaces; porting libwayland
-//! later would split them, not change the model. One pixel format:
+//! later would split them, not change the model. `lock_pointer` and
+//! `relative_motion` are Wayland's pointer-constraints and relative-pointer
+//! extensions folded in the same way (see `Compositor`'s pointer lock). One pixel format:
 //! `XRGB8888` (value 1, as `wl_shm`'s).
 
 use alloc::string::String;
@@ -69,6 +71,9 @@ pub enum Request {
     Commit { surface: u32 },
     SetTitle { surface: u32, title: String },
     DestroySurface { surface: u32 },
+    /// Ask for (or give up) the pointer: while locked, motion arrives as
+    /// `relative_motion` and the pointer stays put. For games.
+    LockPointer { surface: u32, on: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,6 +89,9 @@ pub enum Event {
     Motion { surface: u32, x: i32, y: i32 },
     /// `code` is a Linux `BTN_*`.
     Button { surface: u32, code: u32, pressed: bool },
+    /// Pointer motion while locked to this surface; screen convention
+    /// (`dy` positive is down).
+    RelativeMotion { surface: u32, dx: i32, dy: i32 },
     Done { callback: u32, ms: u32 },
 }
 
@@ -133,6 +141,7 @@ impl Request {
             (Interface::Surface, 3) => Request::Commit { surface: obj },
             (Interface::Surface, 4) => Request::SetTitle { surface: obj, title: a.string()? },
             (Interface::Surface, 5) => Request::DestroySurface { surface: obj },
+            (Interface::Surface, 6) => Request::LockPointer { surface: obj, on: a.uint()? != 0 },
             _ => return Err(DecodeError::UnknownOpcode),
         };
         a.finish()?;
@@ -160,6 +169,7 @@ impl Request {
             Request::Commit { surface } => e.begin(*surface, 3),
             Request::SetTitle { surface, title } => e.begin(*surface, 4).string(title),
             Request::DestroySurface { surface } => e.begin(*surface, 5),
+            Request::LockPointer { surface, on } => e.begin(*surface, 6).uint(*on as u32),
         }
         .end();
     }
@@ -178,6 +188,7 @@ impl Event {
             (Interface::Surface, 2) => Event::Key { surface: obj, code: a.uint()?, pressed: a.uint()? != 0 },
             (Interface::Surface, 3) => Event::Motion { surface: obj, x: a.int()?, y: a.int()? },
             (Interface::Surface, 4) => Event::Button { surface: obj, code: a.uint()?, pressed: a.uint()? != 0 },
+            (Interface::Surface, 5) => Event::RelativeMotion { surface: obj, dx: a.int()?, dy: a.int()? },
             (Interface::Callback, 0) => Event::Done { callback: obj, ms: a.uint()? },
             _ => return Err(DecodeError::UnknownOpcode),
         };
@@ -195,6 +206,7 @@ impl Event {
             Event::Key { surface, code, pressed } => e.begin(*surface, 2).uint(*code).uint(*pressed as u32),
             Event::Motion { surface, x, y } => e.begin(*surface, 3).int(*x).int(*y),
             Event::Button { surface, code, pressed } => e.begin(*surface, 4).uint(*code).uint(*pressed as u32),
+            Event::RelativeMotion { surface, dx, dy } => e.begin(*surface, 5).int(*dx).int(*dy),
             Event::Done { callback, ms } => e.begin(*callback, 0).uint(*ms),
         }
         .end();
@@ -209,7 +221,8 @@ impl Event {
             | Event::Focus { surface, .. }
             | Event::Key { surface, .. }
             | Event::Motion { surface, .. }
-            | Event::Button { surface, .. } => *surface,
+            | Event::Button { surface, .. }
+            | Event::RelativeMotion { surface, .. } => *surface,
             Event::Done { callback, .. } => *callback,
         }
     }
@@ -236,6 +249,8 @@ mod tests {
             (Interface::Surface, Request::Commit { surface: 3 }),
             (Interface::Surface, Request::SetTitle { surface: 3, title: "ventana".into() }),
             (Interface::Surface, Request::DestroySurface { surface: 3 }),
+            (Interface::Surface, Request::LockPointer { surface: 3, on: true }),
+            (Interface::Surface, Request::LockPointer { surface: 3, on: false }),
         ]
     }
 
@@ -268,6 +283,7 @@ mod tests {
             (Interface::Surface, Event::Key { surface: 3, code: 30, pressed: false }),
             (Interface::Surface, Event::Motion { surface: 3, x: -2, y: 7 }),
             (Interface::Surface, Event::Button { surface: 3, code: 0x110, pressed: true }),
+            (Interface::Surface, Event::RelativeMotion { surface: 3, dx: -5, dy: 12 }),
             (Interface::Callback, Event::Done { callback: 8, ms: 1234 }),
         ];
         let mut e = Encoder::new();

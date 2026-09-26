@@ -1,37 +1,20 @@
-// fire — the PSX DOOM fire effect, drawn through /dev/fb's FBIO_BLIT.
+// fire — the PSX DOOM fire effect.
 //
-// A demo that doubles as a bare-metal check of the framebuffer path:
-// every frame is one full FBIO_BLIT (scaled by the kernel to the whole
-// screen), and the frame rate is printed on exit. Any key quits;
-// EVIOCGRAB keeps that key out of the shell afterwards, same as doom.
+// A demo that doubles as a check of the picture path: on the console every
+// frame is one full FBIO_BLIT (scaled by the kernel to the whole screen);
+// under the compositor ($GUI_DISPLAY) it is a window — both through
+// constanos_gfx.h. The frame rate is printed on exit. Any key (or click)
+// quits; on the console EVIOCGRAB keeps that key out of the shell
+// afterwards, same as doom.
 
-#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <sys/ioctl.h>
 #include <time.h>
-#include <unistd.h>
 
-#define FBIO_BLIT 0x46420001UL
-#define EVIOCGRAB 0x40044590UL
-#define EV_KEY 1
+#include "constanos_gfx.h"
 
 #define W 320
 #define H 200
-
-struct fb_blit_args {
-    unsigned long ptr;
-    unsigned int width;
-    unsigned int height;
-};
-
-struct input_event {
-    long tv_sec;
-    long tv_usec;
-    unsigned short type;
-    unsigned short code;
-    int value;
-};
 
 // The 37-entry palette from the original effect, black -> white.
 static const uint32_t PALETTE[37] = {
@@ -76,22 +59,13 @@ static void spread(void) {
 }
 
 int main(void) {
-    int fb = open("/dev/fb", O_WRONLY);
-    if (fb < 0) {
-        printf("fire: cannot open /dev/fb\n");
+    if (gfx_open("fire", W, H, 0) < 0) {
+        printf("fire: nothing to draw on (no /dev/fb, no compositor)\n");
         return 1;
-    }
-    int kbd = open("/dev/input/event0", O_RDONLY);
-    if (kbd >= 0) {
-        ioctl(kbd, EVIOCGRAB, 1);
-        // Drop the backlog, including the Enter that launched us.
-        struct input_event ev;
-        while (read(kbd, &ev, sizeof(ev)) == (long)sizeof(ev)) { }
     }
 
     for (int x = 0; x < W; x++) heat[(H - 1) * W + x] = 36;
 
-    struct fb_blit_args args = { (unsigned long)pixels, W, H };
     unsigned long frames = 0;
     double start = now_s();
     double blit_total = 0;
@@ -102,13 +76,13 @@ int main(void) {
         for (int i = 0; i < W * H; i++) pixels[i] = PALETTE[heat[i]];
 
         double t0 = now_s();
-        ioctl(fb, FBIO_BLIT, &args);
+        gfx_present(pixels);
         blit_total += now_s() - t0;
         frames++;
 
-        struct input_event ev;
-        while (kbd >= 0 && read(kbd, &ev, sizeof(ev)) == (long)sizeof(ev)) {
-            if (ev.type == EV_KEY && ev.value == 1) running = 0;
+        struct gfx_event ev;
+        while (gfx_next_event(&ev)) {
+            if (ev.type == GFX_EV_KEY && ev.value == 1) running = 0;
         }
 
         // Cap at ~60 fps so the flames move at the speed they were tuned for.
@@ -120,7 +94,7 @@ int main(void) {
     }
 
     double total = now_s() - start;
-    if (kbd >= 0) ioctl(kbd, EVIOCGRAB, 0);
+    gfx_close();
     printf("fire: %lu frames in %.2f s = %.1f fps, blit %.2f ms/frame\n",
            frames, total, frames / total, blit_total * 1000 / frames);
     return 0;

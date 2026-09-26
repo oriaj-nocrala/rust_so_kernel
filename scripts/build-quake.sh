@@ -238,6 +238,6 @@ chmod +x "$CC_WRAPPER"
 # ── Build ────────────────────────────────────────────────────────────────
 
 mkdir -p "$(dirname "$OUT")"
-"$CC_WRAPPER" -I"$QG_SRC" -O2 "${SOURCES[@]}" -o "$OUT"
+"$CC_WRAPPER" -I"$QG_SRC" -I"$REPO_ROOT/userspace/c/include" -O2 "${SOURCES[@]}" -o "$OUT"
 
 echo "build-quake: $OUT ready"

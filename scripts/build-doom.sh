@@ -119,6 +119,6 @@ chmod +x "$CC_WRAPPER"
 # ── Build ────────────────────────────────────────────────────────────────
 
 mkdir -p "$(dirname "$OUT")"
-"$CC_WRAPPER" -I"$DG_SRC" -I"$REPO_ROOT/doom-port/stub-include" -O2 "${SOURCES[@]}" -o "$OUT"
+"$CC_WRAPPER" -I"$DG_SRC" -I"$REPO_ROOT/doom-port/stub-include" -I"$REPO_ROOT/userspace/c/include" -O2 "${SOURCES[@]}" -o "$OUT"
 
 echo "build-doom: $OUT ready"

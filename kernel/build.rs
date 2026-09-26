@@ -290,6 +290,10 @@ fn main() {
     let crt1 = sysroot_lib.join("crt1.o");
     let libc_a = sysroot_lib.join("libc.a");
 
+    // Header-only helpers shared with the DOOM and Quake ports
+    // (constanos_gfx.h: a window under the compositor, the console
+    // otherwise).
+    let c_include = c_dir.join("include");
     let build_c_program = |stem: &str, dst: &Path| {
         let src = c_dir.join(format!("{}.c", stem));
         let status = Command::new("clang")
@@ -303,6 +307,7 @@ fn main() {
                 "-static",
                 "-nostdlib",
                 "-isystem", sysroot_inc.to_str().unwrap(),
+                "-I", c_include.to_str().unwrap(),
                 crt1.to_str().unwrap(),
                 src.to_str().unwrap(),
                 libc_a.to_str().unwrap(),
@@ -379,9 +384,17 @@ fn main() {
     // embedded — so the staleness check and the script's output path both
     // point there now instead of kernel/embedded/doom.elf.
     let doom_elf = disk_bin_dir.join(DOOM_NAME);
+    // The shared window-or-console headers (userspace/c/include) are
+    // inputs of both ports too.
+    let gfx_headers = [
+        c_dir.join("include/constanos_gfx.h"),
+        c_dir.join("include/constanos_gui_wire.h"),
+    ];
     let port_srcs = [
         workspace_root.join("doom-port/doomgeneric_constanos.c"),
         workspace_root.join("doom-port/doomgeneric_sound_constanos.c"),
+        gfx_headers[0].clone(),
+        gfx_headers[1].clone(),
     ];
     let doom_stale = !doom_elf.exists()
         || port_srcs.iter().any(|port_src| {
@@ -413,13 +426,19 @@ fn main() {
     // that changes in practice — compare its mtime against the output.
     // Also built straight to disk-image-root/bin/quake — not embedded.
     let quake_elf = disk_bin_dir.join(QUAKE_NAME);
-    let quake_port_src = workspace_root.join("quake-port/quakegeneric_constanos.c");
+    let quake_srcs = [
+        workspace_root.join("quake-port/quakegeneric_constanos.c"),
+        gfx_headers[0].clone(),
+        gfx_headers[1].clone(),
+    ];
     let quake_stale = !quake_elf.exists()
-        || match (quake_elf.metadata().and_then(|m| m.modified()),
-                  quake_port_src.metadata().and_then(|m| m.modified())) {
-            (Ok(elf), Ok(src)) => src > elf,
-            _ => true,
-        };
+        || quake_srcs.iter().any(|src| {
+            match (quake_elf.metadata().and_then(|m| m.modified()),
+                   src.metadata().and_then(|m| m.modified())) {
+                (Ok(elf), Ok(src)) => src > elf,
+                _ => true,
+            }
+        });
     if quake_stale {
         println!("cargo:warning=quake missing/stale — building quakegeneric...");
         let status = Command::new("bash")

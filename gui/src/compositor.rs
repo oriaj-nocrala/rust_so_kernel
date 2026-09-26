@@ -23,6 +23,16 @@
 //! (A pool cannot shrink under us: `ftruncate` of a mapped memfd is
 //! `EBUSY` in this kernel.) Every protocol error sends `error` and
 //! disconnects the client, as Wayland does.
+//!
+//! **Pointer lock** (Wayland's pointer-constraints, for games). A surface
+//! asks with `lock_pointer`; the lock is *active* only while that surface
+//! has the focus — it engages when the surface gets the focus or when a
+//! click lands in its content, and ends when the focus goes elsewhere, the
+//! surface goes away, the client gives it up, or the user presses
+//! Ctrl+Alt (the way out, as in a virtual machine's window; the next click
+//! in the window takes it back). While active the pointer does not move:
+//! motion goes to the surface as `relative_motion`, and every button to it
+//! too, with no title-bar dragging or focus changes.
 
 use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
@@ -111,6 +121,8 @@ struct Surface<M> {
     w: i32,
     h: i32,
     mapped: bool,
+    /// The client asked for the pointer (`lock_pointer`).
+    wants_lock: bool,
     /// Top-left of the window's frame (title bar included).
     x: i32,
     y: i32,
@@ -172,6 +184,8 @@ pub struct Compositor<M> {
     drag: Option<Drag>,
     /// Where a content-area press went, so its release goes there too.
     button_target: Option<Key>,
+    /// The surface the pointer is locked to, if the lock is active.
+    locked: Option<Key>,
     ctrl: u8,
     alt: u8,
     quit: bool,
@@ -195,6 +209,7 @@ impl<M: PoolMem> Compositor<M> {
             pointer: (width / 2, height / 2),
             drag: None,
             button_target: None,
+            locked: None,
             ctrl: 0,
             alt: 0,
             quit: false,
@@ -337,6 +352,7 @@ impl<M: PoolMem> Compositor<M> {
                     w: 0,
                     h: 0,
                     mapped: false,
+                    wants_lock: false,
                     x: 0,
                     y: 0,
                 };
@@ -401,6 +417,15 @@ impl<M: PoolMem> Compositor<M> {
                     t.truncate(end);
                 }
                 self.surface_mut((c, surface)).unwrap().title = t;
+            }
+            Request::LockPointer { surface, on } => {
+                let key = (c, surface);
+                self.surface_mut(key).unwrap().wants_lock = on;
+                if !on && self.locked == Some(key) {
+                    self.locked = None;
+                } else if on && self.focus == Some(key) {
+                    self.locked = Some(key);
+                }
             }
             Request::DestroySurface { surface } => {
                 let key = (c, surface);
@@ -491,6 +516,9 @@ impl<M: PoolMem> Compositor<M> {
         if self.button_target == Some(key) {
             self.button_target = None;
         }
+        if self.locked == Some(key) {
+            self.locked = None;
+        }
         if self.focus == Some(key) {
             self.focus = None;
             let top = self.stack.last().copied();
@@ -509,10 +537,14 @@ impl<M: PoolMem> Compositor<M> {
             }
         }
         self.focus = key;
+        self.locked = None;
         if let Some(new) = key {
-            if let Some(s) = self.surface(new) {
-                self.damage.add(s.title_bar());
+            if let Some((bar, wants)) = self.surface(new).map(|s| (s.title_bar(), s.wants_lock)) {
+                self.damage.add(bar);
                 self.events.push((new.0, Event::Focus { surface: new.1, focused: true }));
+                if wants {
+                    self.locked = Some(new);
+                }
             }
         }
     }
@@ -554,6 +586,12 @@ impl<M: PoolMem> Compositor<M> {
     }
 
     pub fn pointer_motion(&mut self, dx: i32, dy: i32) {
+        if let Some(k) = self.locked {
+            if dx != 0 || dy != 0 {
+                self.events.push((k.0, Event::RelativeMotion { surface: k.1, dx, dy }));
+            }
+            return;
+        }
         let old = self.cursor_rect();
         let x = (self.pointer.0 + dx).clamp(0, self.width - 1);
         let y = (self.pointer.1 + dy).clamp(0, self.height - 1);
@@ -596,10 +634,16 @@ impl<M: PoolMem> Compositor<M> {
             }
             return;
         }
+        if let Some(k) = self.locked {
+            self.button_target = Some(k);
+            self.events.push((k.0, Event::Button { surface: k.1, code, pressed: true }));
+            return;
+        }
         let Some(k) = self.window_at(x, y) else { return };
         self.raise(k);
         self.set_focus(Some(k));
         let s = self.surface(k).unwrap();
+        let wants_lock = s.wants_lock;
         if s.title_bar().contains(x, y) {
             if code == BTN_LEFT {
                 self.drag = Some(Drag { key: k, dx: x - s.x, dy: y - s.y });
@@ -607,6 +651,9 @@ impl<M: PoolMem> Compositor<M> {
         } else {
             self.button_target = Some(k);
             self.events.push((k.0, Event::Button { surface: k.1, code, pressed: true }));
+            if wants_lock {
+                self.locked = Some(k);
+            }
         }
     }
 
@@ -622,6 +669,10 @@ impl<M: PoolMem> Compositor<M> {
         if pressed && code == KEY_BACKSPACE && self.ctrl > 0 && self.alt > 0 {
             self.quit = true;
             return;
+        }
+        let modifier = matches!(code, KEY_LEFTCTRL | KEY_RIGHTCTRL | KEY_LEFTALT | KEY_RIGHTALT);
+        if pressed && modifier && self.ctrl > 0 && self.alt > 0 {
+            self.locked = None; // the way out of a pointer lock
         }
         if let Some(k) = self.focus {
             self.events.push((k.0, Event::Key { surface: k.1, code, pressed }));
@@ -701,6 +752,11 @@ impl<M: PoolMem> Compositor<M> {
 
     pub fn pointer(&self) -> (i32, i32) {
         self.pointer
+    }
+
+    /// The surface the pointer is locked to, while the lock is active.
+    pub fn pointer_locked(&self) -> Option<(ClientId, u32)> {
+        self.locked
     }
 
     pub fn focus(&self) -> Option<(ClientId, u32)> {

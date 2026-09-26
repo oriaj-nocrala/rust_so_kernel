@@ -168,6 +168,7 @@ fn main(args: Args) -> i32 {
                     println!("gui_demo: button {:#x} {}", code, if pressed { "down" } else { "up" })
                 }
                 Event::Motion { x, y, .. } => println!("gui_demo: motion {},{}", x, y),
+                Event::RelativeMotion { dx, dy, .. } => println!("gui_demo: relative {},{}", dx, dy),
                 Event::Focus { focused, .. } => println!("gui_demo: focus {}", if focused { "in" } else { "out" }),
                 Event::Configure { width, height, .. } => println!("gui_demo: configure {}x{}", width, height),
                 Event::Error { object, code, message } => {

@@ -29,6 +29,11 @@
 //     actually exercises — see kernel/src/process/fpu.rs and
 //     kernel/src/rtc.rs).
 //
+// Picture and input go through userspace/c/include/constanos_gfx.h, as
+// in the DOOM port: a window of the compositor when $GUI_DISPLAY names
+// one (pointer locked for mouse-look; Ctrl+Alt lets go), the console
+// otherwise — where it is these primitives:
+//
 // Same three kernel-specific primitives the DOOM port already uses:
 //   - /dev/fb's FBIO_BLIT ioctl — hands the kernel a 0x00RRGGBB buffer;
 //     it scales/blits into the real framebuffer (Framebuffer::blit_scaled).
@@ -60,24 +65,8 @@
 #include <string.h>
 #include <stdio.h>
 
-// Same custom, this-kernel-only ioctl request code as the DOOM port (see
-// sys_ioctl's FBIO_BLIT handling, kernel/src/process/syscall/fs.rs).
-#define FBIO_BLIT 0x46420001UL
-// Linux's EVIOCGRAB (_IOW('E', 0x90, int)): while held, keys go to us only,
-// not to the tty -- otherwise everything typed in the game (arrows, the
-// `y` of "quit?") is replayed by the shell afterwards. The kernel drops the
-// grab when the fd closes, so a crash cannot leave the keyboard grabbed.
-#define EVIOCGRAB 0x40044590UL
+#include "constanos_gfx.h"
 
-struct fb_blit_args {
-    unsigned long ptr;
-    unsigned int width;
-    unsigned int height;
-};
-
-static int s_fbFd = -1;
-static int s_kbdFd = -1;
-static int s_mouseFd = -1;
 
 static unsigned char s_palette[768];
 static uint32_t *s_rgbBuffer;
@@ -93,15 +82,6 @@ static uint32_t *s_rgbBuffer;
 #define BTN_RIGHT  0x111
 #define BTN_MIDDLE 0x112
 
-// Wire-compatible with the real Linux `struct input_event` on x86_64 —
-// see kernel/src/drivers/dev_input_event.rs's matching Rust definition.
-struct input_event {
-    long tv_sec;
-    long tv_usec;
-    unsigned short type;
-    unsigned short code;
-    int value;
-};
 
 // Unshifted base-key table indexed by evdev/Set-1 scancode, same shape
 // (and same source scancodes) as doom-port/doomgeneric_constanos.c's
@@ -181,78 +161,71 @@ static int s_mouseDx = 0, s_mouseDy = 0;
 
 static void pump_input(void)
 {
-    struct input_event ev;
-
-    while (s_kbdFd >= 0 && read(s_kbdFd, &ev, sizeof(ev)) == (long)sizeof(ev)) {
-        if (ev.type == EV_KEY) {
-            pushKey(ev.value != 0, convertToQuakeKey(ev.code));
-        }
-    }
-
-    while (s_mouseFd >= 0 && read(s_mouseFd, &ev, sizeof(ev)) == (long)sizeof(ev)) {
+    struct gfx_event ev;
+    while (gfx_next_event(&ev)) {
         if (ev.type == EV_REL) {
             // PS/2's sign convention (X+ = right, Y+ = up/away from the
-            // user) already matches what the DOOM port validated works
-            // unnegated against id-software mouse-look math; Quake's own
+            // user), which constanos_gfx.h keeps in a window too, already
+            // matches what the DOOM port validated works unnegated against
+            // id-software mouse-look math; Quake's own
             // in_null.c::IN_MouseMove expects the same raw convention a
             // real DOS mouse driver reported through.
             if (ev.code == REL_X) s_mouseDx += ev.value;
             else if (ev.code == REL_Y) s_mouseDy += ev.value;
-        } else if (ev.type == EV_KEY) {
+        } else if (ev.type == EV_KEY && ev.code >= BTN_LEFT && ev.code <= BTN_MIDDLE) {
             int key = (ev.code == BTN_LEFT) ? K_MOUSE1
-                    : (ev.code == BTN_RIGHT) ? K_MOUSE2
-                    : (ev.code == BTN_MIDDLE) ? K_MOUSE3 : 0;
-            if (key) {
-                pushKey(ev.value != 0, key);
-            }
+                    : (ev.code == BTN_RIGHT) ? K_MOUSE2 : K_MOUSE3;
+            pushKey(ev.value != 0, key);
+        } else if (ev.type == EV_KEY) {
+            pushKey(ev.value != 0, convertToQuakeKey(ev.code));
         }
     }
 }
 
 void QG_Init(void)
 {
-    s_fbFd = open("/dev/fb", O_WRONLY);
+    // A window of the compositor if $GUI_DISPLAY names one, the console
+    // otherwise (constanos_gfx.h). Either drops the input queued before
+    // we started — the "ring fills from every keypress since boot" reason
+    // of the DOOM port (the shell command that launched us would replay
+    // into the title screen).
+    if (gfx_open("quake", QUAKEGENERIC_RES_X, QUAKEGENERIC_RES_Y, GFX_MOUSE) < 0) {
+        fprintf(stderr, "quake: nothing to draw on (no /dev/fb, no compositor)\n");
+        exit(1);
+    }
 
-    // From here on the screen is Quake's. Its console chatter (Sys_Printf:
-    // "PackFile: ...", "You got the shells", ...) goes to stdout, which is
-    // /dev/fb's text console — and the kernel console answers the first
-    // text write after an FBIO_BLIT with a full-screen clear (FB_RAW_DIRTY,
+    // On the console the screen is Quake's from here on. Its console
+    // chatter (Sys_Printf: "PackFile: ...", "You got the shells", ...)
+    // goes to stdout, which is /dev/fb's text console — and the kernel
+    // console answers the first text write after an FBIO_BLIT with a
+    // full-screen clear (FB_RAW_DIRTY,
     // kernel/src/drivers/framebuffer_console.rs), so every message was a
     // black flash plus text over the game. Send stdout to /dev/console
     // instead: serial and the kernel log (/proc/dmesg, the USB log
     // partition), not the screen. stderr stays on the screen, and
     // scripts/build-quake.sh makes Sys_Error write there, so a fatal error
-    // is still visible.
-    // Clear the text console once while stdout still points at it, so the
-    // letterbox around the game isn't left showing the shell and boot log.
-    fputs("\033[2J", stdout);
-    int con = open("/dev/console", O_WRONLY);
-    if (con >= 0) {
-        fflush(stdout);
-        dup2(con, 1);
-        close(con);
-        setvbuf(stdout, NULL, _IOLBF, 0);
+    // is still visible. In a window stdout is the terminal we were started
+    // from, and the chatter belongs there.
+    if (!gfx_windowed()) {
+        // Clear the text console once while stdout still points at it, so
+        // the letterbox around the game isn't left showing the shell and
+        // boot log.
+        fputs("\033[2J", stdout);
+        int con = open("/dev/console", O_WRONLY);
+        if (con >= 0) {
+            fflush(stdout);
+            dup2(con, 1);
+            close(con);
+            setvbuf(stdout, NULL, _IOLBF, 0);
+        }
     }
-    s_kbdFd = open("/dev/input/event0", O_RDONLY);
-    if (s_kbdFd >= 0) ioctl(s_kbdFd, EVIOCGRAB, 1);
-    s_mouseFd = open("/dev/input/event1", O_RDONLY);
-
-    // Drain events queued before we started — same "ring buffer fills
-    // from every keypress since boot" reason as the DOOM port (otherwise
-    // whatever launched us, e.g. the shell command itself, replays into
-    // the title screen).
-    struct input_event ev;
-    while (s_kbdFd >= 0 && read(s_kbdFd, &ev, sizeof(ev)) == (long)sizeof(ev)) { }
-    while (s_mouseFd >= 0 && read(s_mouseFd, &ev, sizeof(ev)) == (long)sizeof(ev)) { }
 
     s_rgbBuffer = malloc(QUAKEGENERIC_RES_X * QUAKEGENERIC_RES_Y * sizeof(uint32_t));
 }
 
 void QG_Quit(void)
 {
-    if (s_fbFd >= 0) close(s_fbFd);
-    if (s_kbdFd >= 0) close(s_kbdFd);
-    if (s_mouseFd >= 0) close(s_mouseFd);
+    gfx_close();
     free(s_rgbBuffer);
 }
 
@@ -273,13 +246,7 @@ void QG_DrawFrame(void *pixels)
         s_rgbBuffer[i] = ((uint32_t)rgb[0] << 16) | ((uint32_t)rgb[1] << 8) | (uint32_t)rgb[2];
     }
 
-    if (s_fbFd >= 0) {
-        struct fb_blit_args args;
-        args.ptr = (unsigned long)s_rgbBuffer;
-        args.width = QUAKEGENERIC_RES_X;
-        args.height = QUAKEGENERIC_RES_Y;
-        ioctl(s_fbFd, FBIO_BLIT, &args);
-    }
+    gfx_present(s_rgbBuffer);
 }
 
 int QG_GetKey(int *down, int *key)

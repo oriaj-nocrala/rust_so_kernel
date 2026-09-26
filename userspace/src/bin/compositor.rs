@@ -117,6 +117,8 @@ fn open_path(path: &str, flags: i32) -> i32 {
     syscall::with_cstr(path, |p| syscall::open(p, flags)) as i32
 }
 
+const GUI_DISPLAY_ENV: &[u8] = b"GUI_DISPLAY=/tmp/gui-0\0";
+
 /// Starts `name` (from `/bin` unless it contains a `/`).
 fn spawn(name: &[u8]) {
     let mut path = [0u8; 64];
@@ -140,7 +142,9 @@ fn spawn(name: &[u8]) {
             syscall::close(fd);
         }
         let p = &path[..=n];
-        syscall::exec_argv(p, &[p], &[]);
+        // How a program finds us (read by constanos_gfx.h and handed on
+        // by `term` to its shell), as WAYLAND_DISPLAY is.
+        syscall::exec_argv(p, &[p], &[GUI_DISPLAY_ENV]);
         syscall::exit(127);
     }
     println!("compositor: started {} (pid {})", core::str::from_utf8(&path[..n]).unwrap_or("?"), pid);

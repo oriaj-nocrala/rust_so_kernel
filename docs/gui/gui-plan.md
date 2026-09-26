@@ -549,7 +549,7 @@ cliente), selección y portapapeles, historial de scroll, Unicode más allá
 del latín básico de la fuente, `TIOCSTI`, paquetes (`TIOCPKT`), y pasar la
 consola del kernel a `tty`/`vt`.
 
-Después, candidatos: DOOM en una ventana (su port ya dibuja en un búfer
+Después, candidatos: DOOM en una ventana (hecho, ver el registro; su port ya dibuja en un búfer
 RGB), un reloj, `top` con ventana.
 
 ## Registro
@@ -1082,3 +1082,38 @@ PS/2, con teclado y ratón USB sin 8042 y con 8 GiB; `gui-e2e.sh` (modo
 `session_test`, `jobctl_test`, `wait_intr_test`, `lifecycle_test`,
 `pipe_multi_test`, `poll_test` e `ipc_ping`; `boot-matrix.sh 4 5` 20/20;
 `run-kernel-tests.sh` PASS; `vt` 58 tests.
+
+### DOOM, Quake y fire en ventana (2026-09-25)
+
+El candidato de después de la fase 3. Los tres programas a pantalla
+completa dibujan en una ventana cuando hay compositor y en la consola
+cuando no; el programa no distingue entre los dos casos.
+
+- **`userspace/c/include/constanos_gfx.h`** (solo cabecera): `gfx_present()`
+  de un cuadro `0x00RRGGBB` y `gfx_next_event()` con eventos con forma de
+  evdev (`EV_KEY` con `KEY_*`/`BTN_*`, `EV_REL` con la convención de signos
+  de PS/2, Y positiva hacia arriba). En consola hace `FBIO_BLIT` sobre
+  `/dev/fb` y lee `event0`/`event1`, como antes. En ventana escala el cuadro
+  por un factor entero a un búfer de memoria compartida y traduce los
+  eventos del protocolo. `constanos_gui_wire.h` es el formato de mensajes
+  en C.
+- **`GUI_DISPLAY`**: el compositor la pasa a lo que lanza y `term` a su
+  shell (como `WAYLAND_DISPLAY`). Si está definida, `gfx` abre una ventana.
+- **Bloqueo del puntero** (pointer-constraints + relative-pointer de
+  Wayland, integrados en `surface`): `lock_pointer(on)` (petición 6) y
+  `relative_motion(dx, dy)` (evento 5). Solo está activo mientras la
+  superficie tiene el foco. Se engancha al ganar el foco o al hacer clic en
+  el contenido. Se suelta al perder el foco, al destruir la superficie, a
+  petición del cliente o con Ctrl+Alt (la salida, como en la ventana de una
+  máquina virtual; el siguiente clic lo recupera). Mientras está activo, el
+  puntero no se mueve y todos los botones van a la superficie. Tiene tests
+  en `gui/src/compositor/tests.rs`.
+- **El código C del protocolo se prueba contra el crate**:
+  `gui/tests/c_wire.rs` compila un driver C con el `cc` del host y comprueba
+  que lo que codifica C lo decodifica `gui::protocol` y al revés.
+- Ports: `doomgeneric_constanos.c`, `quakegeneric_constanos.c` y `fire.c`
+  pasan a usar `gfx` en vez de su propio `FBIO_BLIT` y evdev. El kernel no
+  cambió.
+
+**Verificado en la Ryzen** (el usuario, a mano): DOOM y Quake dentro del
+compositor funcionan. Host: `gui` 33 + 2 tests.

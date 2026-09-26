@@ -447,3 +447,112 @@ fn titles_are_kept_and_capped() {
     let t = h.comp.window_title(c, 4).unwrap();
     assert!(t.len() <= crate::protocol::MAX_TITLE && t.chars().all(|ch| ch == 'ñ'));
 }
+
+// ── pointer lock ──────────────────────────────────────────────────────────
+
+/// Moves the pointer to (x, y) and drops the events that caused.
+fn pointer_to(h: &mut H_, x: i32, y: i32) {
+    let (px, py) = h.comp.pointer();
+    h.comp.pointer_motion(x - px, y - py);
+    h.comp.take_events();
+}
+
+#[test]
+fn a_lock_on_the_focused_window_turns_motion_relative() {
+    let mut h = H_::new();
+    let c = h.window(100, 80, 0x0012_3456);
+    h.compose();
+    pointer_to(&mut h, 60, 70); // over its content
+    h.compose();
+    h.send(c, &[R::LockPointer { surface: 4, on: true }]);
+    assert_eq!(h.comp.pointer_locked(), Some((c, 4)));
+    h.comp.pointer_motion(5, -3);
+    h.comp.pointer_motion(0, 0);
+    assert_eq!(h.events_for(c), vec![Event::RelativeMotion { surface: 4, dx: 5, dy: -3 }]);
+    assert_eq!(h.comp.pointer(), (60, 70), "the pointer stays put");
+    assert!(h.compose().is_empty(), "nothing moved on screen");
+}
+
+#[test]
+fn a_locked_window_gets_every_button_and_no_drag_starts() {
+    let mut h = H_::new();
+    let c = h.window(100, 80, 0x0012_3456);
+    h.compose();
+    pointer_to(&mut h, 45, 45); // on the title bar
+    h.send(c, &[R::LockPointer { surface: 4, on: true }]);
+    h.comp.pointer_button(BTN_LEFT, true);
+    h.comp.pointer_motion(30, 30);
+    h.comp.pointer_button(BTN_LEFT, false);
+    assert_eq!(
+        h.events_for(c),
+        vec![
+            Event::Button { surface: 4, code: BTN_LEFT, pressed: true },
+            Event::RelativeMotion { surface: 4, dx: 30, dy: 30 },
+            Event::Button { surface: 4, code: BTN_LEFT, pressed: false },
+        ]
+    );
+    assert_eq!(h.comp.window_frame(c, 4), Some(Rect::new(40, 40, 100, 100)), "not dragged");
+}
+
+#[test]
+fn ctrl_alt_is_the_way_out_and_a_click_takes_the_lock_back() {
+    let mut h = H_::new();
+    let c = h.window(100, 80, 0x0012_3456);
+    h.compose();
+    pointer_to(&mut h, 60, 70);
+    h.send(c, &[R::LockPointer { surface: 4, on: true }]);
+    h.comp.key(29, true); // Ctrl
+    assert!(h.comp.pointer_locked().is_some(), "Ctrl alone keeps it");
+    h.comp.key(56, true); // Alt
+    assert_eq!(h.comp.pointer_locked(), None);
+    h.comp.key(56, false);
+    h.comp.key(29, false);
+    let evs = h.events_for(c);
+    assert_eq!(evs.len(), 4, "the keys still reach the window: {evs:?}");
+    h.comp.pointer_motion(10, 0);
+    assert_eq!(h.comp.pointer(), (70, 70), "the pointer moves again");
+    assert_eq!(h.events_for(c), vec![Event::Motion { surface: 4, x: 30, y: 10 }]);
+    h.comp.pointer_button(BTN_LEFT, true);
+    assert_eq!(h.comp.pointer_locked(), Some((c, 4)), "a click in the content takes it back");
+}
+
+#[test]
+fn the_lock_follows_the_focus() {
+    let mut h = H_::new();
+    let a = h.window(100, 80, 0x00AA_0000);
+    h.send(a, &[R::LockPointer { surface: 4, on: true }]);
+    assert_eq!(h.comp.pointer_locked(), Some((a, 4)));
+    let b = h.window(60, 40, 0x0000_BB00); // mapped on top, takes the focus
+    assert_eq!(h.comp.focus(), Some((b, 4)));
+    assert_eq!(h.comp.pointer_locked(), None, "the focus left, so did the lock");
+    h.send(b, &[R::DestroySurface { surface: 4 }]);
+    assert_eq!(h.comp.focus(), Some((a, 4)));
+    assert_eq!(h.comp.pointer_locked(), Some((a, 4)), "focus back on a surface that wants it");
+}
+
+#[test]
+fn a_lock_asked_without_focus_waits_and_can_be_given_up() {
+    let mut h = H_::new();
+    let a = h.window(100, 80, 0x00AA_0000);
+    let b = h.window(60, 40, 0x0000_BB00);
+    h.send(a, &[R::LockPointer { surface: 4, on: true }]);
+    assert_eq!(h.comp.pointer_locked(), None, "a has no focus");
+    h.send(b, &[R::LockPointer { surface: 4, on: true }]);
+    assert_eq!(h.comp.pointer_locked(), Some((b, 4)));
+    h.send(b, &[R::LockPointer { surface: 4, on: false }]);
+    assert_eq!(h.comp.pointer_locked(), None);
+    h.comp.pointer_motion(1, 1);
+    assert!(!h.events_for(b).iter().any(|e| matches!(e, Event::RelativeMotion { .. })));
+}
+
+#[test]
+fn a_locked_client_that_goes_away_releases_the_pointer() {
+    let mut h = H_::new();
+    let a = h.window(100, 80, 0x00AA_0000);
+    h.send(a, &[R::LockPointer { surface: 4, on: true }]);
+    h.comp.remove_client(a);
+    assert_eq!(h.comp.pointer_locked(), None);
+    h.comp.take_events();
+    h.comp.pointer_motion(3, 3);
+    assert!(h.comp.take_events().is_empty());
+}
