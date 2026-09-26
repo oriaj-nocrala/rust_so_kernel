@@ -183,10 +183,15 @@ pub(super) fn sys_clock_gettime(clk_id: u64, tp_ptr: u64) -> SyscallResult {
             let up = crate::time::ktime_get();
             (up / 1_000_000_000, up % 1_000_000_000)
         }
-        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
-            let Some(t) = super::current_cpu_times() else { return errno::ESRCH };
-            let ns = if clk_id == CLOCK_PROCESS_CPUTIME_ID { t.group_exec_ns } else { t.own_exec_ns };
+        CLOCK_THREAD_CPUTIME_ID => {
+            // Lock-free: the per-CPU copy `switch_in` keeps.
+            let ns = crate::process::scheduler::thread_exec_ns();
             (ns / 1_000_000_000, ns % 1_000_000_000)
+        }
+        CLOCK_PROCESS_CPUTIME_ID => {
+            // The group's sum needs every member: the scheduler lock.
+            let Some(t) = super::current_cpu_times() else { return errno::ESRCH };
+            (t.group_exec_ns / 1_000_000_000, t.group_exec_ns % 1_000_000_000)
         }
         _ => return errno::EINVAL,
     };

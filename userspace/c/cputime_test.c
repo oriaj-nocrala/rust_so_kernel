@@ -125,16 +125,23 @@ static void case_counts(void) {
     int aff = affinity_count();
     struct cpu all, cpus[MAX_CPUS];
     int lines = read_stat(&all, cpus);
-    char buf[16384];
-    int procs = 0;
-    if (read_file("/proc/cpuinfo", buf, sizeof buf) > 0)
-        for (char *p = buf; (p = strstr(p, "processor\t:")); p++) procs++;
+    // Line by line: the file is ~740 bytes per CPU on a Zen 3 (the flags
+    // line), so 24 CPUs overflow any small fixed buffer — a 16 KiB one
+    // counted 22 on the Ryzen.
+    int procs = 0, model = 0;
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    char line[1024];
+    while (f && fgets(line, sizeof line, f)) {
+        if (strncmp(line, "processor\t:", 11) == 0) procs++;
+        if (strncmp(line, "model name\t: ", 13) == 0) model = 1;
+    }
+    if (f) fclose(f);
     printf("    onln=%ld affinity=%d stat_lines=%d cpuinfo=%d\n", onln, aff, lines, procs);
     check("_SC_NPROCESSORS_ONLN >= 1", onln >= 1);
     check("sched_getaffinity agrees", aff == onln);
     check("/proc/stat has one cpuN line per CPU", lines == onln);
     check("/proc/cpuinfo has one block per CPU", procs == onln);
-    check("/proc/cpuinfo names the model", strstr(buf, "model name\t: ") != NULL);
+    check("/proc/cpuinfo names the model", model);
 }
 
 static void case_stat_sum(void) {
@@ -226,8 +233,11 @@ static void case_children(void) {
     printf("    cutime before wait +%ld, after +%ld ticks; rusage children %ld.%06ld s\n",
            before, after, (long)rc.ru_utime.tv_sec, (long)rc.ru_utime.tv_usec);
     check("nothing before waitpid", before == 0);
-    check("child + grandchild after waitpid (>= 35 ticks)", after >= 35);
-    check("getrusage(CHILDREN) >= 350 ms", rc.ru_utime.tv_sec * 1000000L + rc.ru_utime.tv_usec >= 350000);
+    // 40 ticks of user time if every sample lands in user mode; 30 still
+    // tells the grandchild's 20 apart from the child's alone, and leaves
+    // room for the ticks an emulator delivers late, inside a syscall.
+    check("child + grandchild after waitpid (>= 30 ticks)", after >= 30);
+    check("getrusage(CHILDREN) >= 300 ms", rc.ru_utime.tv_sec * 1000000L + rc.ru_utime.tv_usec >= 300000);
 }
 
 static void *thread_spin(void *arg) {
@@ -277,7 +287,12 @@ static void case_smp(void) {
         if (du >= 20) busy++;
     }
     check("at least two CPUs gained >= 20 user ticks", busy >= 2);
-    check("aggregate user grew by >= kids*40 ticks", a1.f[0] - a0.f[0] >= (unsigned long long)kids * 40);
+    // Half of the ~50 ticks each child should get. The ticks are samples,
+    // and an emulator that cannot run every vCPU when due drops timer
+    // ticks while the TSC (and so the child's measured CPU time) runs on:
+    // QEMU with 24 vCPUs gave 31-39 per child, the Ryzen 48-50. How much
+    // is case C's business; this case is about *where*.
+    check("aggregate user grew by >= kids*25 ticks", a1.f[0] - a0.f[0] >= (unsigned long long)kids * 25);
 }
 
 static void case_clocks(void) {

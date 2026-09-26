@@ -360,6 +360,26 @@ fn note_leaving(proc: &mut Process) {
 
 // ── Per-CPU scheduling counters (`sched:` in /proc/kdebug) ──────────────
 static CPU_SWITCHES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+// The running process's run clock, per CPU, for `thread_exec_ns` — so
+// `CLOCK_THREAD_CPUTIME_ID` (what `clock()`-style timing loops read over
+// and over) needs no scheduler lock. `switch_in` writes both with IF=0 on
+// this CPU, and a reader on this CPU with IF=0 cannot interleave with it.
+static RUN_BASE_NS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static RUN_SINCE_NS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// The calling process's own run time, in nanoseconds, without the
+/// scheduler lock: its `exec_ns` as of `switch_in` plus the run in
+/// progress. Taking `SCHEDULER` here serialised every CPU's clock reads —
+/// a timing loop on 24 CPUs spent a quarter of its time in the kernel.
+pub fn thread_exec_ns() -> u64 {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let me = crate::cpu::cpu_id();
+        let base = RUN_BASE_NS[me].load(Ordering::Relaxed);
+        let since = RUN_SINCE_NS[me].load(Ordering::Relaxed);
+        base + crate::time::ktime_get().saturating_sub(since)
+    })
+}
+
 // Where each CPU's ticks went (`sched::cputime::classify`): the source of
 // `/proc/stat`'s `cpuN` lines.
 static CPU_USER_TICKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
@@ -1557,6 +1577,8 @@ impl Scheduler {
         proc.state = ProcessState::Running;
         proc.run_since_ns = crate::time::ktime_get();
         proc.last_cpu = me;
+        RUN_BASE_NS[me].store(proc.exec_ns, Ordering::Relaxed);
+        RUN_SINCE_NS[me].store(proc.run_since_ns, Ordering::Relaxed);
         unsafe { proc.address_space.activate(); }
         // The table this CPU had loaded is not its CR3 any more.
         drop(self.retiring[me].take());
