@@ -25,6 +25,21 @@ pub enum FaultError {
     Failed(&'static str),
 }
 
+/// An address space's memory, in 4 KiB pages — `AddressSpace::mem_stats`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemStats {
+    /// Every VMA whole (`vsize` / 4096).
+    pub size: u64,
+    /// Present in the page table: the resident set.
+    pub resident: u64,
+    /// Resident pages of shared-memory mappings.
+    pub shared: u64,
+    /// Virtual size of the program's loaded segments.
+    pub text: u64,
+    /// Virtual size of heap, anonymous mappings and stack.
+    pub data: u64,
+}
+
 /// `AddressSpace` is shared via `Arc` between the `Process`es of a thread
 /// group (`clone()`), so everything here takes `&self`.
 ///
@@ -100,14 +115,43 @@ impl AddressSpace {
         self.vmas.with(|v| v.add(vma))
     }
 
-    /// Find the VMA containing `addr`, if any. Returns a clone (for a
-    /// `Shared` VMA, one more short-lived hold on its object).
-    /// Bytes of address space mapped, every VMA counted whole whether or
-    /// not its pages are present — `/proc/<pid>/stat`'s `vsize`.
-    pub fn vsize_bytes(&self) -> u64 {
-        self.vmas.with(|v| v.iter().map(|vma| vma.size_pages as u64 * 4096).sum())
+    /// What `/proc/<pid>/statm` and `stat`'s `rss` report, in pages:
+    /// every VMA's own range walked in the page table under the
+    /// address-space lock (so no PTE changes mid-walk), counting present
+    /// user pages but not the shared zero frame (`hal::paging` for why a
+    /// walk and not a counter). `shared` is the resident part of `Shared`
+    /// VMAs; `text` and `data` are virtual sizes, as in Linux's `statm`
+    /// (`Code` VMAs, and the anonymous, huge and stack ones).
+    pub fn mem_stats(&self) -> MemStats {
+        let pml4 = self.page_table.pml4_phys().as_u64();
+        let zero = crate::memory::cow::zero_frame_phys();
+        let phys_offset = crate::memory::physical_memory_offset();
+        // SAFETY: every table this reaches is one this address space's
+        // PML4 points at, and none can change or be freed while `vmas` is
+        // held; the physical-memory window maps all of them.
+        let mut read = |pa: u64| unsafe { *(phys_offset + pa).as_ptr::<u64>() };
+        self.vmas.with(|v| {
+            let mut m = MemStats::default();
+            for vma in v.iter() {
+                let pages = vma.size_pages as u64;
+                let end = vma.start + pages * 4096;
+                let res = hal::paging::count_resident(pml4, vma.start, end, zero, &mut read);
+                m.size += pages;
+                m.resident += res;
+                match vma.kind {
+                    VmaKind::Code => m.text += pages,
+                    VmaKind::Shared => m.shared += res,
+                    VmaKind::Anonymous | VmaKind::Huge2M | VmaKind::GrowableStack => {
+                        m.data += pages
+                    }
+                }
+            }
+            m
+        })
     }
 
+    /// Find the VMA containing `addr`, if any. Returns a clone (for a
+    /// `Shared` VMA, one more short-lived hold on its object).
     pub fn find_vma(&self, addr: u64) -> Option<Vma> {
         self.vmas.with(|v| v.find(addr).cloned())
     }

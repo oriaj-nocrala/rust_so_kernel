@@ -34,6 +34,7 @@ pub mod keyboard;
 pub mod logpart;
 pub mod memtype;
 pub mod mouse;
+pub mod paging;
 pub mod msc;
 pub mod pci;
 pub mod pit;

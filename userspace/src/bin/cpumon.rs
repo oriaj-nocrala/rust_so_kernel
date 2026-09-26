@@ -1,5 +1,6 @@
 //! A CPU monitor: one live graph per CPU, split into user and system time,
-//! plus total load, memory, the load averages and the busiest processes.
+//! plus total load, memory, the load averages and the busiest processes
+//! (with their resident set).
 //!
 //! Everything it shows comes from the files a Linux monitor reads, in the
 //! formats Linux writes them — `/proc/stat` (per-CPU ticks, parsed with
@@ -122,16 +123,17 @@ fn pids(buf: &mut [u8]) -> Vec<usize> {
     out
 }
 
-/// `(comm, utime + stime, last CPU)` from a `/proc/<pid>/stat` line.
-fn parse_pid_stat(line: &str) -> Option<(String, u64, usize)> {
+/// `(comm, utime + stime, last CPU, rss in pages)` from a
+/// `/proc/<pid>/stat` line.
+fn parse_pid_stat(line: &str) -> Option<(String, u64, usize, u64)> {
     let open = line.find('(')?;
     let close = line.rfind(')')?;
     let comm = String::from(&line[open + 1..close]);
     // Field 3 (state) is the first after ") "; utime is 14, stime 15,
-    // processor 39.
+    // rss 24, processor 39.
     let f: Vec<&str> = line[close + 2..].split_ascii_whitespace().collect();
     let num = |k: usize| f.get(k - 3).and_then(|v| v.parse::<u64>().ok());
-    Some((comm, num(14)? + num(15)?, num(39).unwrap_or(0) as usize))
+    Some((comm, num(14)? + num(15)?, num(39).unwrap_or(0) as usize, num(24).unwrap_or(0)))
 }
 
 /// What to call a process, as `ps` does: its command line (arguments
@@ -193,6 +195,8 @@ struct Proc {
     /// Thousandths of one CPU over the last period.
     pm: u32,
     cpu: usize,
+    /// Resident set, KiB.
+    rss_kb: u64,
 }
 
 struct State {
@@ -303,7 +307,7 @@ impl State {
             if !read_file(&format!("/proc/{}/stat", pid), &mut self.buf) {
                 continue;
             }
-            let Some((comm, ticks, cpu)) = parse_pid_stat(text_of(&self.buf)) else { continue };
+            let Some((comm, ticks, cpu, rss)) = parse_pid_stat(text_of(&self.buf)) else { continue };
             let name = if read_file(&format!("/proc/{}/cmdline", pid), &mut self.buf) {
                 command_of(&self.buf, &comm)
             } else {
@@ -314,7 +318,7 @@ impl State {
                 Some(b) if self.samples > 0 => permille(ticks.saturating_sub(b), ticks_per_cpu),
                 _ => 0,
             };
-            now_procs.push(Proc { pid, name, ticks, pm, cpu });
+            now_procs.push(Proc { pid, name, ticks, pm, cpu, rss_kb: rss * 4 });
         }
         self.procs = now_procs;
         self.samples += 1;
@@ -329,6 +333,17 @@ impl State {
 }
 
 // ── Drawing ──────────────────────────────────────────────────────────────
+
+/// A size in KiB the way `top` prints one: `824K`, `3.4M`, `1.2G`.
+fn size_kb(kb: u64) -> String {
+    if kb < 1024 {
+        format!("{}K", kb)
+    } else if kb < 1024 * 1024 {
+        format!("{}.{}M", kb / 1024, kb % 1024 * 10 / 1024)
+    } else {
+        format!("{}.{}G", kb >> 20, (kb & 0xFFFFF) * 10 >> 20)
+    }
+}
 
 fn pct(pm: u32) -> String {
     format!("{}.{}%", pm / 10, pm % 10)
@@ -451,10 +466,12 @@ fn draw(cv: &mut Canvas, st: &State) {
     // Bottom right: the busiest processes.
     let (px, py, pw, ph) = (320, 270, W as i32 - 8 - 320, 122);
     panel(cv, px + 2, py + 2, pw - 4, ph - 4);
-    let (c_pid, c_name, c_cpu, c_pct) = (px + 10, px + 62, px + pw - 110, px + pw - 10);
+    let (c_pid, c_name, c_cpu, c_rss, c_pct) =
+        (px + 10, px + 62, px + pw - 170, px + pw - 80, px + pw - 10);
     cv.smooth_text(SMALL_BOLD, c_pid, py + 6, "PID", DIM);
     cv.smooth_text(SMALL_BOLD, c_name, py + 6, "COMMAND", DIM);
     cv.smooth_text(SMALL_BOLD, c_cpu, py + 6, "CPU", DIM);
+    cv.smooth_text_right(SMALL_BOLD, c_rss, py + 6, "RSS", DIM);
     cv.smooth_text_right(SMALL_BOLD, c_pct, py + 6, "%CPU", DIM);
     for (i, p) in st.top().iter().enumerate() {
         let y = py + 26 + i as i32 * 18;
@@ -463,6 +480,7 @@ fn draw(cv: &mut Canvas, st: &State) {
         let name: String = p.name.chars().take(((c_cpu - c_name - 8) / SMALL.cell().0) as usize).collect();
         cv.smooth_text(SMALL, c_name, y, &name, c);
         cv.smooth_text(SMALL, c_cpu, y, &format!("{}", p.cpu), DIM);
+        cv.smooth_text_right(SMALL, c_rss, y, &size_kb(p.rss_kb), DIM);
         cv.smooth_text_right(SMALL, c_pct, y, &pct(p.pm), if p.pm >= 10 { load_color(p.pm) } else { DIM });
     }
 }

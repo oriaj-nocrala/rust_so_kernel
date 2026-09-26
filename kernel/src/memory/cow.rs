@@ -204,6 +204,14 @@ pub fn zero_frame() -> PhysFrame {
     ))
 }
 
+/// The zero frame's physical address, or `None` before `init_zero_frame`.
+pub fn zero_frame_phys() -> Option<u64> {
+    match ZERO_FRAME_PHYS.load(Ordering::Relaxed) {
+        0 => None,
+        a => Some(a),
+    }
+}
+
 /// Returns `true` if `frame` is the permanent shared zero frame.
 pub fn is_zero_frame(frame: PhysFrame) -> bool {
     let addr = ZERO_FRAME_PHYS.load(Ordering::Relaxed);

@@ -31,10 +31,12 @@ use crate::fs::{
 };
 use crate::process::file::{FileError, FileHandle, FileResult};
 
-fn pid_dir_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 4 }
-fn pid_exe_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 4 + 1 }
-fn pid_stat_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 4 + 2 }
-fn pid_cmdline_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 4 + 3 }
+// Eight inode numbers per pid: the directory and its files, with room to add.
+fn pid_dir_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 8 }
+fn pid_exe_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 8 + 1 }
+fn pid_stat_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 8 + 2 }
+fn pid_cmdline_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 8 + 3 }
+fn pid_statm_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 8 + 4 }
 
 // ── Filesystem ───────────────────────────────────────────────────────────────
 
@@ -106,11 +108,12 @@ fn render_acpi() -> String {
 /// Real: state, ppid, pgid, sid, `tty_nr` (a pty slave's `136:n`),
 /// `utime`/`stime`/`cutime`/`cstime` and `starttime` (ticks,
 /// `sched::cputime`), `vsize` (every VMA whole), pending and blocked
-/// signals (field 31/32, Linux's bit layout: bit N-1 = signal N), and the
-/// CPU it last ran on (field 39). `priority` is the scheduler's effective
-/// priority, not Linux's `20 + nice`. Zero where this kernel keeps nothing
-/// to report: fault counts, `rss` (resident pages are not counted), the
-/// code/stack/argument addresses.
+/// signals (field 31/32, Linux's bit layout: bit N-1 = signal N), `rss`
+/// (resident pages, `AddressSpace::mem_stats`) and the CPU it last ran on
+/// (field 39). `priority` is the scheduler's effective priority, not
+/// Linux's `20 + nice`. Zero where this kernel keeps nothing to report:
+/// fault counts, the code/stack/argument addresses. `rsslim` is
+/// `RLIM_INFINITY`, there being no rlimits.
 fn render_proc_stat(pid: usize, snap: &crate::process::scheduler::ProcStatSnapshot) -> String {
     let end = snap.name.iter().position(|&b| b == 0).unwrap_or(snap.name.len());
     let comm = String::from_utf8_lossy(&snap.name[..end]);
@@ -127,15 +130,24 @@ fn render_proc_stat(pid: usize, snap: &crate::process::scheduler::ProcStatSnapsh
     let t = &snap.times;
     format!(
         "{pid} ({comm}) {state} {ppid} {pgid} {sid} {tty_nr} -1 0 0 0 0 0 \
-         {utime} {stime} {cutime} {cstime} {priority} 0 1 0 {start} {vsize} 0 \
+         {utime} {stime} {cutime} {cstime} {priority} 0 1 0 {start} {vsize} {rss} \
          18446744073709551615 0 0 0 0 0 {pending} {blocked} 0 0 0 0 0 17 {cpu} \
          0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         pid = pid, comm = comm, state = state,
         ppid = snap.ppid, pgid = snap.pgid, sid = snap.sid, tty_nr = tty_nr,
         utime = t.utime, stime = t.stime, cutime = t.cutime, cstime = t.cstime,
-        priority = snap.priority, start = snap.start_ticks, vsize = snap.vsize,
+        priority = snap.priority, start = snap.start_ticks,
+        vsize = snap.mem.size * 4096, rss = snap.mem.resident,
         pending = snap.pending >> 1, blocked = snap.blocked >> 1, cpu = snap.last_cpu,
     )
+}
+
+/// Renders `/proc/<pid>/statm`: `size resident shared text lib data dt`,
+/// in pages, as Linux's `fs/proc/array.c::proc_pid_statm` — see
+/// `AddressSpace::mem_stats` for what each counts here. `lib` and `dt`
+/// are 0 on Linux too.
+fn render_proc_statm(m: &crate::memory::address_space::MemStats) -> String {
+    format!("{} {} {} {} 0 {} 0\n", m.size, m.resident, m.shared, m.text, m.data)
 }
 
 /// Renders `/proc/stat` in Linux's format: the aggregate `cpu` line, one
@@ -737,6 +749,7 @@ impl Inode for ProcPidDirInode {
             "exe" => Ok(Arc::new(ProcExeInode { pid: self.pid })),
             "stat" => Ok(Arc::new(ProcStatInode { pid: self.pid })),
             "cmdline" => Ok(Arc::new(ProcCmdlineInode { pid: self.pid })),
+            "statm" => Ok(Arc::new(ProcStatmInode { pid: self.pid })),
             _ => Err(Errno::ENOENT),
         }
     }
@@ -749,6 +762,7 @@ impl Inode for ProcPidDirInode {
             2 => Ok(Some(DirEntry::new(pid_exe_ino(self.pid), FileType::Symlink, b"exe"))),
             3 => Ok(Some(DirEntry::new(pid_stat_ino(self.pid), FileType::Regular, b"stat"))),
             4 => Ok(Some(DirEntry::new(pid_cmdline_ino(self.pid), FileType::Regular, b"cmdline"))),
+            5 => Ok(Some(DirEntry::new(pid_statm_ino(self.pid), FileType::Regular, b"statm"))),
             _ => Ok(None),
         }
     }
@@ -779,6 +793,31 @@ impl Inode for ProcStatInode {
             .ok_or(Errno::ENOENT)?;
         let data = render_proc_stat(self.pid, &snap).into_bytes();
         Ok(Box::new(ProcFile { data, offset: 0 }))
+    }
+}
+
+/// `/proc/<pid>/statm`, see `render_proc_statm`.
+struct ProcStatmInode {
+    pid: usize,
+}
+
+impl Inode for ProcStatmInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
+    fn stat(&self) -> Stat {
+        let len = crate::process::scheduler::proc_stat_snapshot(self.pid)
+            .map(|s| render_proc_statm(&s.mem).len())
+            .unwrap_or(0);
+        Stat::regular(pid_statm_ino(self.pid), len as i64)
+    }
+
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+        if flags.is_write() {
+            return Err(Errno::EROFS);
+        }
+        let snap = crate::process::scheduler::proc_stat_snapshot(self.pid)
+            .ok_or(Errno::ENOENT)?;
+        Ok(Box::new(ProcFile { data: render_proc_statm(&snap.mem).into_bytes(), offset: 0 }))
     }
 }
 

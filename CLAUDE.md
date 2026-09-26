@@ -96,7 +96,7 @@ so addresses actually resolve to real function names instead of bare hex.
 ### QEMU integration tests
 
 Real hardware-path behavior (drivers that need actual QEMU devices, not just host-testable
-pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 308 tests, <1s, no QEMU) is
+pure logic — see `hal/`'s host tests via `cd hal && cargo test`, 317 tests, <1s, no QEMU) is
 asserted by a `#![feature(custom_test_frameworks)]` harness that boots the real kernel in
 QEMU and reports PASS/FAIL as a process exit code:
 
@@ -548,7 +548,7 @@ Current devices: `/dev/ptmx` + `/dev/pts/N` + `/dev/tty` (pseudo-terminals, see 
 
 **PCI + AC97 audio** (`pci.rs`, `ac97.rs`): this kernel's only PCI-aware code — `pci.rs` does raw 0xCF8/0xCFC config-space access and a bus-0 device scan (nothing else in this kernel enumerates PCI; every other driver targets a fixed legacy ISA port). `ac97.rs` finds the Intel 82801AA AC'97 codec (`-device AC97` in QEMU), does the cold-reset + PCM-out-stream-reset + mixer-unmute sequence, and runs a **polling**, not interrupt-driven, bus-master DMA ring: the IDT is a `spin::Once`, populated once as literally the first line of `boot()` before `memory::init_core` — wiring up a PCI IRQ whose vector is only known after enumeration doesn't fit that without either an early pre-memory PCI scan or a bigger IDT refactor, so `write_pcm()` instead polls the hardware's CIV register directly and blocks (spinning, no lock held across the spin, so the timer ISR/scheduler still preempts normally) until a buffer-descriptor slot frees. The 32-entry hardware BDL aliases only 8 real physical ring buffers (`entry[i].addr = slot_phys[i % 8]`) so the hardware's native mod-32 index wraparound still works correctly without needing all 32 to be distinct allocations. Fixed format only (48000 Hz stereo s16le, AC97's native non-VRA operating point) — no `ioctl` negotiation, matching the same "one client, one format, document it" simplification `/dev/input/event0`+`event1` already use.
 
-VFS mounts (`kernel/src/fs/mod.rs`): `/dev` (devfs), `/` (initramfs, embedded ELFs — a real two-level tree: root contains a real `bin` subdirectory and an `etc` one (`ETC_FILES`, data compiled in: `localtime`, a 54-byte UTC TZif — mlibc's `localtime()` ignores `TZ` and *panics* without `/etc/localtime`, which killed `uptime` and `date`; `passwd` and `group` with `root` (uid/gid 0, home `/tmp`, shell `/tmp/bin/sh` — PID 1 exports `HOME=/tmp` to match), so `id`, `ps`, `ls -l` and `find -user` print names), `/bin/<name>` is a genuine directory lookup, not a second mount aliasing the same flat namespace, see `fs::initramfs`), `/tmp` (ramfs, writable — the filesystem itself is `vfs::ramfs::RamFs`, host-testable; `kernel/src/fs/ramfs.rs` only supplies the `DirLockObserver` that wires its lock diagnostic into `/proc/kdebug`, see below), `/mnt` (ext2, read-write, best-effort — see the ext2 section below), `/proc` (procfs, read-only, synthetic — `/proc/meminfo` generated fresh on every `open()` from the live Buddy allocator stats; `/proc/self` and `/proc/<pid>/exe` are real symlinks, `/proc/dmesg` is the kernel log ring, `/proc/fbinfo` is the framebuffer console's instrument panel, `/proc/pci` lists every PCI function with the driver that claimed it, and `/proc/stat`, `/proc/uptime`, `/proc/loadavg`, `/proc/cpuinfo`, `/proc/<pid>/stat` (all 52 fields, real times) and `/proc/<pid>/cmdline` are in Linux's formats (see CPU Time Accounting) — see `fs::procfs`, the kernel-log section below, the framebuffer-performance note above, and the PCI note in the Device Driver Framework section). `ls /` also shows every other mount (`dev`, `tmp`, `mnt`, `proc`) as an entry — `fs::vfs::direct_children` (a thin delegate onto `vfs::mount::MountTable::direct_children`, see below) lets initramfs's root directory list them dynamically, same idea as a real Linux rootfs pre-creating empty `/proc`, `/dev`, etc. that mounts later overlay; actual traversal into them is still redirected by the mount table before ever reaching initramfs, so they only need to look like directories, not serve one.
+VFS mounts (`kernel/src/fs/mod.rs`): `/dev` (devfs), `/` (initramfs, embedded ELFs — a real two-level tree: root contains a real `bin` subdirectory and an `etc` one (`ETC_FILES`, data compiled in: `localtime`, a 54-byte UTC TZif — mlibc's `localtime()` ignores `TZ` and *panics* without `/etc/localtime`, which killed `uptime` and `date`; `passwd` and `group` with `root` (uid/gid 0, home `/tmp`, shell `/tmp/bin/sh` — PID 1 exports `HOME=/tmp` to match), so `id`, `ps`, `ls -l` and `find -user` print names), `/bin/<name>` is a genuine directory lookup, not a second mount aliasing the same flat namespace, see `fs::initramfs`), `/tmp` (ramfs, writable — the filesystem itself is `vfs::ramfs::RamFs`, host-testable; `kernel/src/fs/ramfs.rs` only supplies the `DirLockObserver` that wires its lock diagnostic into `/proc/kdebug`, see below), `/mnt` (ext2, read-write, best-effort — see the ext2 section below), `/proc` (procfs, read-only, synthetic — `/proc/meminfo` generated fresh on every `open()` from the live Buddy allocator stats; `/proc/self` and `/proc/<pid>/exe` are real symlinks, `/proc/dmesg` is the kernel log ring, `/proc/fbinfo` is the framebuffer console's instrument panel, `/proc/pci` lists every PCI function with the driver that claimed it, and `/proc/stat`, `/proc/uptime`, `/proc/loadavg`, `/proc/cpuinfo`, `/proc/<pid>/stat` (all 52 fields, real times and `rss`), `/proc/<pid>/statm` and `/proc/<pid>/cmdline` are in Linux's formats (see CPU Time Accounting and Resident Set Size) — see `fs::procfs`, the kernel-log section below, the framebuffer-performance note above, and the PCI note in the Device Driver Framework section). `ls /` also shows every other mount (`dev`, `tmp`, `mnt`, `proc`) as an entry — `fs::vfs::direct_children` (a thin delegate onto `vfs::mount::MountTable::direct_children`, see below) lets initramfs's root directory list them dynamically, same idea as a real Linux rootfs pre-creating empty `/proc`, `/dev`, etc. that mounts later overlay; actual traversal into them is still redirected by the mount table before ever reaching initramfs, so they only need to look like directories, not serve one.
 
 **Storage stack seam** (`hal::block::BlockDevice`, `hal/src/block.rs`; `kernel::block::AtaBlockDevice`, `kernel/src/block/mod.rs`): `fs::ext2` no longer calls `block::ata::{read_sectors,write_sectors,present}` directly — it goes through `Ext2Fs::core.device: Box<dyn BlockDevice>` instead (`Ext2Core`, from the standalone `ext2` crate — see below), the same seam shape as `hal::PortIo`/`hal::PhysMem` (see `docs/drivers/architecture.md`'s storage-stack section), sector-granular (512 bytes) rather than filesystem-block-granular. `AtaBlockDevice` (zero-sized, wraps `block::ata`'s existing free functions) is what `fs::ext2::init()` mounts against at real boot; `hal::block::MemDisk` (`Vec<u8>`-backed, host-tested in `hal`) is what both the `ext2` crate's own host tests and the QEMU integration tests (`kernel/src/hw_tests.rs::ext2_memdisk_roundtrip` and `ext2_reclaim_orphans_clears_injected_disk_img_shape`) mount instead, exercising ext2's full read-write path with zero risk to the real `disk.img`. Explicitly a *partial* migration: `block::ata.rs` itself is still not seamed onto `PortIo` the way the six drivers in `docs/drivers/architecture.md`'s "Current status" are — only the layer above it (`fs::ext2`) moved.
 
@@ -581,7 +581,7 @@ arbitration, exactly where two PS/2 keyboards would merge.
 **Split across the usual seam.** `hal::xhci` (register/TRB/ring/context
 arithmetic), `hal::usb` (descriptor parsing + setup packets) and
 `hal::hid` (boot-report diffing + the Set-1 table) are pure and host-tested
-— most of `hal`'s 308 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
+— most of `hal`'s 317 tests (with `hal::msc`/`hal::gpt`, below). `kernel/src/usb/xhci.rs` owns the MMIO window,
 DMA pages, doorbells and waiting. That line is drawn hard here because an
 xHCI bring-up failure is nearly unobservable (a wrong bit in a device
 context yields no fault, no log, just a Transfer Event that never arrives)
@@ -1096,6 +1096,31 @@ cpumon.rs`, embedded): a graph per CPU with user and system stacked, total
 load, memory, load averages and the busiest processes, from those files
 alone — `compositor cpumon`, or on the console.
 
+## Resident Set Size (`hal::paging`, `AddressSpace::mem_stats`, `fs::procfs`)
+
+`/proc/<pid>/stat`'s `rss` and `/proc/<pid>/statm` (`size resident shared
+text lib data dt`, pages) are real since 2026-09-26; before, `rss` was 0.
+**Walked, not counted:** `mem_stats` runs `hal::paging::count_resident`
+(pure, host-tested) over each VMA's range under the address-space lock —
+present user leaves, 2 MiB leaves as 512, the shared zero frame excluded, as
+Linux excludes its zero page. A counter would need every PTE-changing path
+(demand paging, COW, `fork`, `munmap`, `exec`, ELF loader, stack growth,
+shm) to remember it; the walk skips absent tables, so its cost is the page
+tables that exist. `proc_stat_snapshot` clones the `Arc<AddressSpace>`
+under the scheduler lock and walks after releasing it. `shared` is the
+resident part of `Shared` VMAs; `text`/`data` are virtual sizes
+(`Code` VMAs / the rest), as Linux's. Consumers: `ps -o rss`, `top`,
+`cpumon`'s RSS column. Test: `userspace/c/rss_test.c`.
+
+**An anonymous `mmap` of 2 MiB or more is a `Huge2M` VMA** (`sys_mmap_anon`),
+backed by whole 2 MiB pages: a one-byte touch, read or write, makes 512 pages
+resident — there is no huge zero page. Huge pages are never shared, so
+**`fork` copies them** (`AddressSpace::fork_copy_huge`). Until 2026-09-26 it
+skipped them — its per-page loop's 4 KiB `translate_page` reports a 2 MiB
+leaf as absent — and a child read zeros in every large mapping of its
+parent (any big `malloc` included); `rss_test` case F found it. The copy is
+2 MiB per present huge page, under the parent's and the scheduler's locks.
+
 ## File Timestamps (`vfs::clock`, `vfs/src/ramfs.rs`, `ext2/src/inode.rs`, `kernel/src/fs/ext2.rs`)
 
 `stat()` reports real times since 2026-09-26; before, every file was 1970.
@@ -1246,7 +1271,7 @@ and `include_bytes!`'d from `kernel/embedded/`. Everything else runnable-
 but-not-boot-critical — `doom`, `quake`, and most of the old C test
 programs (`hello`, `pthread_test`, `producer_consumer`,
 `mlibc_signal_test`, `stat_test`, `argv_test`, `jobctl_test`,
-`ext2_robust_test`, `fpu_test`, `socket_test`, `cputime_test`, `fstime_test`, `pipe_cow_test`, `sigsuspend_test`, `lifecycle_test`, `shm_test`, `pipe_multi_test`, `fb0_test`, `wait_intr_test`, `input_poll_test`, `session_test`, `pty_test`) — is built straight to
+`ext2_robust_test`, `fpu_test`, `socket_test`, `cputime_test`, `fstime_test`, `pipe_cow_test`, `sigsuspend_test`, `lifecycle_test`, `shm_test`, `pipe_multi_test`, `fb0_test`, `wait_intr_test`, `input_poll_test`, `session_test`, `pty_test`, `rss_test`) — is built straight to
 `disk-image-root/bin/` instead and shipped on the ext2 disk image
 (`disk.img`, mounted at `/mnt`) rather than baked into the kernel ELF.
 This split exists because `kernel/embedded/`'s ELFs (mostly `doom.elf`/

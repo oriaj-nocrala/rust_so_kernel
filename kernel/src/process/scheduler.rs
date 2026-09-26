@@ -1913,18 +1913,31 @@ pub struct ProcStatSnapshot {
     pub times: sched::cputime::ProcTimes,
     pub start_ticks: u64,
     pub last_cpu: usize,
-    pub vsize: u64,
+    /// In pages; `vsize` is `mem.size * 4096`.
+    pub mem: crate::memory::address_space::MemStats,
     /// Kernel layout: bit N = signal N.
     pub pending: u64,
     pub blocked: u64,
     pub ctty: Option<usize>,
 }
 
+/// The page-table walk behind `mem` runs after the scheduler lock is
+/// released, on a clone of the process's `Arc<AddressSpace>`: it is short,
+/// but every CPU's scheduling waits on that lock and `top` reads every
+/// process. If the process is reaped meanwhile this clone may be the last
+/// reference, and dropping it frees the space here — safe, since no CPU
+/// can have a dead process's table in CR3 (`retiring` holds its own
+/// reference until one does not).
 pub fn proc_stat_snapshot(pid: usize) -> Option<ProcStatSnapshot> {
+    let (snap, space) = proc_stat_snapshot_locked(pid)?;
+    Some(ProcStatSnapshot { mem: space.mem_stats(), ..snap })
+}
+
+fn proc_stat_snapshot_locked(pid: usize) -> Option<(ProcStatSnapshot, Arc<AddressSpace>)> {
     unsafe { core::arch::asm!("cli"); }
     let snap = local_scheduler().iter_all()
         .find(|p| p.pid.0 == pid)
-        .map(|p| ProcStatSnapshot {
+        .map(|p| (ProcStatSnapshot {
             ppid: p.parent_pid.map(|pp| pp.0).unwrap_or(0),
             pgid: p.pgid,
             sid: p.sid,
@@ -1938,11 +1951,11 @@ pub fn proc_stat_snapshot(pid: usize) -> Option<ProcStatSnapshot> {
             },
             start_ticks: p.start_ticks,
             last_cpu: p.last_cpu,
-            vsize: p.address_space.vsize_bytes(),
+            mem: Default::default(),
             pending: p.pending_signals,
             blocked: p.blocked_signals,
             ctty: p.ctty,
-        });
+        }, p.address_space.clone()));
     unsafe { core::arch::asm!("sti"); }
     snap
 }

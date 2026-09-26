@@ -96,6 +96,7 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "input_poll_test",
     "session_test",
     "pty_test",
+    "rss_test",
 ];
 
 /// Not built here at all — see the busybox.elf handling below, which
