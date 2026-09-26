@@ -151,6 +151,14 @@ pub trait Inode: Send + Sync {
         Ok(())
     }
 
+    /// `utimensat(2)`: set the access and/or modification time (Unix
+    /// seconds; `None` leaves that one as it is), and with it the change
+    /// time to now. A filesystem that keeps no times is read-only here:
+    /// `EROFS`, the same default as `create()`/`mkdir()`.
+    fn set_times(&self, _atime: Option<u64>, _mtime: Option<u64>) -> Result<(), Errno> {
+        Err(Errno::EROFS)
+    }
+
     /// Type-erased downcast handle. Lets a filesystem whose directory
     /// entries can only reference its own inodes (ext2: a dirent is
     /// literally an inode *number*, meaningless outside that filesystem)

@@ -145,6 +145,7 @@ constexpr long SYS_times = 100;
 constexpr long SYS_getrusage = 98;
 constexpr long SYS_sysinfo = 99;
 constexpr long SYS_sched_getaffinity = 204;
+constexpr long SYS_utimensat = 280;
 
 constexpr long ARCH_SET_FS = 0x1002;
 constexpr long FUTEX_WAIT = 0;
@@ -242,6 +243,12 @@ int sys_times(struct tms *tms, clock_t *out) {
 		return (int)-ret;
 	*out = (clock_t)ret;
 	return 0;
+}
+
+// Linux's utimensat(2) as is; a NULL pathname is futimens(dirfd).
+int sys_utimensat(int dirfd, const char *pathname, const struct timespec times[2], int flags) {
+	long ret = raw_syscall(SYS_utimensat, dirfd, (long)pathname, (long)times, flags);
+	return ret < 0 ? (int)-ret : 0;
 }
 
 // Only ru_utime/ru_stime are filled by the kernel; it zeroes the rest.

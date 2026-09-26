@@ -88,6 +88,53 @@ impl RawInode {
         u32::from_le_bytes(self.buf[20..24].try_into().unwrap())
     }
 
+    /// `i_atime`, `i_ctime`, `i_mtime`: Unix seconds (offsets 8, 12, 16).
+    /// This driver never updates `i_atime` on a read — Linux's `noatime`,
+    /// which is what a read-mostly volume on a USB stick wants — so it is
+    /// whatever creation (or another system) left there.
+    pub fn atime(&self) -> u32 {
+        u32::from_le_bytes(self.buf[8..12].try_into().unwrap())
+    }
+
+    pub fn ctime(&self) -> u32 {
+        u32::from_le_bytes(self.buf[12..16].try_into().unwrap())
+    }
+
+    pub fn mtime(&self) -> u32 {
+        u32::from_le_bytes(self.buf[16..20].try_into().unwrap())
+    }
+
+    /// `utimensat`: the times asked for (`None` keeps that one), and
+    /// `ctime` to `now` — POSIX's rule for any explicit time change.
+    pub fn set_times(&mut self, atime: Option<u32>, mtime: Option<u32>, now: u32) {
+        if let Some(a) = atime {
+            self.buf[8..12].copy_from_slice(&a.to_le_bytes());
+        }
+        if let Some(m) = mtime {
+            self.buf[16..20].copy_from_slice(&m.to_le_bytes());
+        }
+        self.stamp_changed(now);
+    }
+
+    /// A new inode: all three times are its birth.
+    pub fn stamp_new(&mut self, now: u32) {
+        for off in [8, 12, 16] {
+            self.buf[off..off + 4].copy_from_slice(&now.to_le_bytes());
+        }
+    }
+
+    /// Its content changed (a write, a truncate, a directory entry added
+    /// or removed): `mtime` and `ctime`, as POSIX requires.
+    pub fn stamp_modified(&mut self, now: u32) {
+        self.buf[12..16].copy_from_slice(&now.to_le_bytes());
+        self.buf[16..20].copy_from_slice(&now.to_le_bytes());
+    }
+
+    /// Only its metadata changed (mode, link count): `ctime`.
+    pub fn stamp_changed(&mut self, now: u32) {
+        self.buf[12..16].copy_from_slice(&now.to_le_bytes());
+    }
+
     /// `size_hi` (`i_dir_acl`/`i_size_high`) only means "upper size bits"
     /// for regular files under the large_file feature; for directories
     /// it's genuinely the (unused, by us) ACL block pointer, so it's only
@@ -251,6 +298,28 @@ mod tests {
         let mut dir = RawInode::zeroed(128);
         dir.set_i_mode(0x4000 | 0o755);
         assert!(dir.has_block_pointers());
+    }
+
+    #[test]
+    fn times_are_read_where_ext2_keeps_them_and_stamped_as_posix_says() {
+        let mut raw = RawInode::zeroed(128);
+        raw.buf[8..12].copy_from_slice(&111u32.to_le_bytes());
+        raw.buf[12..16].copy_from_slice(&222u32.to_le_bytes());
+        raw.buf[16..20].copy_from_slice(&333u32.to_le_bytes());
+        assert_eq!((raw.atime(), raw.ctime(), raw.mtime()), (111, 222, 333));
+
+        raw.stamp_changed(400);
+        assert_eq!((raw.atime(), raw.ctime(), raw.mtime()), (111, 400, 333));
+        raw.stamp_modified(500);
+        assert_eq!((raw.atime(), raw.ctime(), raw.mtime()), (111, 500, 500));
+        raw.stamp_new(600);
+        assert_eq!((raw.atime(), raw.ctime(), raw.mtime()), (600, 600, 600));
+        raw.set_times(Some(1), None, 700);
+        assert_eq!((raw.atime(), raw.ctime(), raw.mtime()), (1, 700, 600));
+        raw.set_times(None, Some(2), 800);
+        assert_eq!((raw.atime(), raw.ctime(), raw.mtime()), (1, 800, 2));
+        // dtime (20..24) is its own field, untouched by any of these.
+        assert_eq!(raw.dtime(), 0);
     }
 
     #[test]

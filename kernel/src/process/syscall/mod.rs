@@ -316,6 +316,7 @@ pub enum SyscallNumber {
     ClockGetres = 229,
     EpollWait = 232,
     EpollCtl = 233,
+    Utimensat = 280,
     Accept4 = 288,
     // Custom kernel syscalls (above Linux range)
     UptimeMs = 400,
@@ -408,6 +409,7 @@ impl SyscallNumber {
             229 => Some(Self::ClockGetres),
             232 => Some(Self::EpollWait),
             233 => Some(Self::EpollCtl),
+            280 => Some(Self::Utimensat),
             288 => Some(Self::Accept4),
             400 => Some(Self::UptimeMs),
             401 => Some(Self::UptimeSec),
@@ -441,6 +443,7 @@ pub mod errno {
     pub const EEXIST: i64 = -17;
     pub const ENOTDIR: i64 = -20;
     pub const EINVAL: i64 = -22;
+    pub const EROFS: i64 = -30;
     pub const ENOTTY: i64 = -25;
     pub const ESPIPE: i64 = -29;
     pub const ENOSPC: i64 = -28;
@@ -657,6 +660,7 @@ pub fn syscall_handler(
         SyscallNumber::MemInfoKb => misc::sys_meminfo_kb(),
         SyscallNumber::KdebugCtl => misc::sys_kdebug_ctl(arg1, arg2, arg3),
         SyscallNumber::Statvfs => fs::sys_statvfs(arg1 as usize, arg2 as usize),
+        SyscallNumber::Utimensat => fs::sys_utimensat(arg1 as i64, arg2, arg3, arg4),
         SyscallNumber::Sync => misc::sys_sync(),
         SyscallNumber::Reboot => misc::sys_reboot(arg1 as u32, arg2 as u32, arg3 as u32),
     }

@@ -10,7 +10,7 @@
 //   │   ├── uname
 //   │   └── …                (one entry per PROGRAMS registry entry)
 //   ├── etc/                (static configuration files, `ETC_FILES`)
-//   │   └── localtime
+//   │   ├── localtime, passwd, group
 //   ├── dev/                 (empty placeholder — real content lives behind
 //   ├── tmp/                  the /dev, /tmp, /mnt, /proc mounts; traversal
 //   ├── mnt/                  into them is redirected there by the VFS
@@ -63,6 +63,14 @@ const ETC_FILES: &[(&str, &[u8])] = &[
     // UTC and nothing here has a zone), so this is the zone file for UTC:
     // TZif version 1, no transitions, one type (offset 0, not DST, "UTC").
     ("localtime", &UTC_TZIF),
+    // The one user and group there are: every process runs as uid/gid 0
+    // (no permission model). With them, `getpwuid`/`getgrgid` answer, so
+    // `id`, `ps`, `ls -l` and `find -user` say `root` instead of `0` or
+    // nothing. Home is `/tmp` — the root filesystem is read-only and there
+    // is no `/root`; `/` would make ash's prompt call every path `~/...` —
+    // and the shell `/tmp/bin/sh`, BusyBox's, which is what exists.
+    ("passwd", b"root:x:0:0:root:/tmp:/tmp/bin/sh\n"),
+    ("group", b"root:x:0:\n"),
 ];
 
 const UTC_TZIF: [u8; 54] = {

@@ -152,10 +152,12 @@ fn read_nonce(buf: &mut [u8; 64]) -> &str {
 /// unknown." — exported here so every program launched from
 /// ash gets it for free instead of needing `TERM=linux` typed
 /// by hand every time.
-const ENVP: [&[u8]; 3] = [
+const ENVP: [&[u8]; 4] = [
     b"PATH=/tmp/bin:/bin:/mnt/bin\0",
     b"HISTFILE=/mnt/.ash_history\0",
     b"TERM=linux\0",
+    // root's home in /etc/passwd (`fs::initramfs`'s `ETC_FILES`).
+    b"HOME=/tmp\0",
 ];
 
 /// Wait for `pid`, reaping every other child on the way: the kernel hands

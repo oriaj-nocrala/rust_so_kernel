@@ -183,6 +183,16 @@ impl Stat {
         self
     }
 
+    /// Set the three timestamps (Unix seconds). Every constructor leaves
+    /// them 0; a filesystem that keeps times (ext2, ramfs) reports them
+    /// through this.
+    pub fn with_times(mut self, atime: u64, mtime: u64, ctime: u64) -> Self {
+        self.st_atime = atime;
+        self.st_mtime = mtime;
+        self.st_ctime = ctime;
+        self
+    }
+
     /// Construct a directory stat.
     pub fn dir(ino: u64) -> Self {
         Self::base(ino, FileType::Directory.as_mode_bits() | 0o755, 2, 0, 0)

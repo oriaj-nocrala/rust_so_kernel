@@ -25,6 +25,9 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     vfs::lock::set_relax_hook(|| {
         crate::memory::tlb::service_pending();
     });
+    // ...and stamp `ramfs`'s file times with the wall clock (the boot-time
+    // RTC reading plus uptime; uptime alone until `time::init` has run).
+    vfs::clock::set_clock(|| crate::time::now_unix_secs());
 
     // ── Framebuffer setup ──────────────────────────────────────────
     // Stays here because buffer_mut() requires the &'static mut

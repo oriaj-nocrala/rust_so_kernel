@@ -231,6 +231,12 @@ pub trait FileHandle: Send {
         Ok(())
     }
 
+    /// `futimens(2)`: [`Inode::set_times`](crate::inode::Inode::set_times)
+    /// through an open file. `NotSupported` where nothing keeps times.
+    fn set_times(&mut self, _atime: Option<u64>, _mtime: Option<u64>) -> FileResult<()> {
+        Err(FileError::NotSupported)
+    }
+
     /// The shared-memory object behind this handle, for `mmap(MAP_SHARED)`
     /// — `socket_id()`'s technique again: `dyn FileHandle` cannot be
     /// downcast in `no_std`, and this crate cannot name the kernel's

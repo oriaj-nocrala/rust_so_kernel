@@ -120,6 +120,7 @@ extern crate alloc;
 // `cargo test` enlaza std en el host aunque el crate sea `#![no_std]`.
 #[cfg(test)] extern crate std;
 
+pub mod clock;
 pub mod dirent;
 pub mod file;
 pub mod inode;

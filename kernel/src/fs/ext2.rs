@@ -473,7 +473,18 @@ impl Ext2Fs {
     /// persists the now-empty inode. Backs `O_TRUNC`.
     fn truncate_to_zero(&self, ino: u32, raw: &mut RawInode) -> Result<(), Errno> {
         self.free_all_blocks(raw)?;
+        raw.stamp_modified(now());
         self.write_inode(ino, raw)
+    }
+
+    /// Directory `ino` gained or lost an entry: stamp its `mtime`/`ctime`.
+    /// Read fresh and written back as the *last* step of each operation, so
+    /// no later write of an older copy of the directory's record (the link
+    /// count updates below work on `self.raw` clones) can undo it.
+    fn touch_dir(&self, ino: u32) -> Result<(), Errno> {
+        let mut raw = self.read_inode(ino)?;
+        raw.stamp_modified(now());
+        self.write_inode(ino, &raw)
     }
 
     /// Read a symlink inode's target string.
@@ -637,6 +648,29 @@ struct Ext2Inode {
     raw: RawInode,
 }
 
+/// What `stat` reports for inode `ino`: its real on-disk permission bits
+/// (not a hardcoded per-filesystem constant — see module doc comment),
+/// link count and times, overlaid onto whichever constructor sets the
+/// type bits and size shape. Shared by the inode and its open handles, so
+/// `stat` and `fstat` agree.
+fn stat_of(ino: u32, raw: &RawInode) -> Stat {
+    let perm = (raw.i_mode() & 0o7777) as u32;
+    let nlink = raw.links_count() as u64;
+    let st = if raw.is_dir() {
+        Stat::dir(ino as u64).with_perm_bits(perm).with_nlink(nlink)
+    } else if raw.is_symlink() {
+        Stat::symlink(ino as u64, raw.size() as i64)
+    } else {
+        Stat::regular_writable(ino as u64, raw.size() as i64).with_perm_bits(perm).with_nlink(nlink)
+    };
+    st.with_times(raw.atime() as u64, raw.mtime() as u64, raw.ctime() as u64)
+}
+
+/// Unix seconds for an on-disk timestamp (ext2's are 32-bit).
+fn now() -> u32 {
+    crate::time::now_unix_secs() as u32
+}
+
 impl Ext2Inode {
     fn new(ino: u32) -> Result<Self, Errno> {
         let raw = fs().read_inode(ino)?;
@@ -648,18 +682,7 @@ impl Inode for Ext2Inode {
     fn as_any(&self) -> &dyn core::any::Any { self }
 
     fn stat(&self) -> Stat {
-        // Real on-disk permission bits, not a hardcoded per-filesystem
-        // constant (see module doc comment) — overlaid onto whichever
-        // constructor already set the right type bits/size shape.
-        let perm = (self.raw.i_mode() & 0o7777) as u32;
-        let nlink = self.raw.links_count() as u64;
-        if self.raw.is_dir() {
-            Stat::dir(self.ino as u64).with_perm_bits(perm).with_nlink(nlink)
-        } else if self.raw.is_symlink() {
-            Stat::symlink(self.ino as u64, self.raw.size() as i64)
-        } else {
-            Stat::regular_writable(self.ino as u64, self.raw.size() as i64).with_perm_bits(perm).with_nlink(nlink)
-        }
+        stat_of(self.ino, &self.raw)
     }
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
@@ -685,7 +708,7 @@ impl Inode for Ext2Inode {
             for e in raw_entries {
                 snapshot.push(DirEntry::new(e.ino as u64, e.kind, e.name.as_bytes()));
             }
-            Ok(Box::new(Ext2DirHandle { ino: self.ino, snapshot, offset: 0 }))
+            Ok(Box::new(Ext2DirHandle { ino: self.ino, raw: self.raw.clone(), snapshot, offset: 0 }))
         } else {
             // Refused at open, as Linux does on a read-only mount, rather
             // than handing out a handle whose every write fails —
@@ -753,6 +776,7 @@ impl Inode for Ext2Inode {
         let mut new_raw = RawInode::zeroed(f.core.sb.inode_size as usize);
         new_raw.set_i_mode(0x8000 | 0o644);
         new_raw.set_links_count(1);
+        new_raw.stamp_new(now());
         f.write_inode(new_ino, &new_raw)?;
 
         let mut dir_raw = self.raw.clone();
@@ -760,6 +784,7 @@ impl Inode for Ext2Inode {
             let _ = f.core.free_inode(new_ino, false); // best-effort cleanup — original error wins either way
             return Err(e);
         }
+        f.touch_dir(self.ino)?;
         Ok(Arc::new(Ext2Inode::new(new_ino)?))
     }
 
@@ -785,6 +810,7 @@ impl Inode for Ext2Inode {
         new_raw.set_i_block(0, new_block);
         new_raw.set_size(f.core.sb.block_size as u64);
         new_raw.set_blocks_512(f.core.sb.block_size / 512);
+        new_raw.stamp_new(now());
 
         let bs = f.core.sb.block_size as usize;
         let mut buf = alloc::vec![0u8; bs];
@@ -805,6 +831,7 @@ impl Inode for Ext2Inode {
         let mut parent_raw = dir_raw;
         parent_raw.set_links_count(parent_raw.links_count() + 1);
         f.write_inode(self.ino, &parent_raw)?;
+        f.touch_dir(self.ino)?;
 
         Ok(Arc::new(Ext2Inode::new(new_ino)?))
     }
@@ -841,8 +868,11 @@ impl Inode for Ext2Inode {
             f.write_inode(child_ino, &child_raw)?;
             f.core.free_inode(child_ino, false).map_err(ExtErr)?;
         } else {
+            // Still linked elsewhere: one link fewer is a metadata change.
+            child_raw.stamp_changed(now());
             f.write_inode(child_ino, &child_raw)?;
         }
+        f.touch_dir(self.ino)?;
         Ok(())
     }
 
@@ -877,6 +907,7 @@ impl Inode for Ext2Inode {
         let mut parent_raw = self.raw.clone();
         parent_raw.set_links_count(parent_raw.links_count().saturating_sub(1));
         f.write_inode(self.ino, &parent_raw)?;
+        f.touch_dir(self.ino)?;
         Ok(())
     }
 
@@ -894,6 +925,7 @@ impl Inode for Ext2Inode {
             parent_raw.set_links_count(parent_raw.links_count().saturating_sub(1));
             f.write_inode(self.ino, &parent_raw)?;
         }
+        f.touch_dir(self.ino)?;
         Ok(child)
     }
 
@@ -924,6 +956,7 @@ impl Inode for Ext2Inode {
             parent_raw.set_links_count(parent_raw.links_count() + 1);
             f.write_inode(self.ino, &parent_raw)?;
         }
+        f.touch_dir(self.ino)?;
         Ok(())
     }
 
@@ -948,6 +981,7 @@ impl Inode for Ext2Inode {
         let mut new_raw = RawInode::zeroed(f.core.sb.inode_size as usize);
         new_raw.set_i_mode(0xA000 | 0o777);
         new_raw.set_links_count(1);
+        new_raw.stamp_new(now());
 
         // Fast (target inline in `i_block`, no data block allocated) vs
         // slow (ordinary file content) representation — whichever fits —
@@ -977,6 +1011,7 @@ impl Inode for Ext2Inode {
             let _ = f.core.free_inode(new_ino, false);
             return Err(e);
         }
+        f.touch_dir(self.ino)?;
         Ok(Arc::new(Ext2Inode::new(new_ino)?))
     }
 
@@ -986,6 +1021,15 @@ impl Inode for Ext2Inode {
         let mut raw = f.read_inode(self.ino)?; // fresh, not `self.raw` — don't clobber a concurrent write's size/blocks
         let new_mode = (raw.i_mode() & 0xF000) | (mode as u16 & 0o7777);
         raw.set_i_mode(new_mode);
+        raw.stamp_changed(now());
+        f.write_inode(self.ino, &raw)
+    }
+
+    fn set_times(&self, atime: Option<u64>, mtime: Option<u64>) -> Result<(), Errno> {
+        let _guard = write_lock()?;
+        let f = fs();
+        let mut raw = f.read_inode(self.ino)?; // fresh, like `chmod`
+        raw.set_times(atime.map(|t| t as u32), mtime.map(|t| t as u32), now());
         f.write_inode(self.ino, &raw)
     }
 }
@@ -1020,6 +1064,11 @@ impl FileHandle for Ext2FileHandle {
         let _guard = write_lock().map_err(|_| FileError::IOError)?;
         let mut raw = self.raw.lock();
         let mut offset = self.offset.lock();
+        // `write_file_range` persists the record, times included; an empty
+        // write is a no-op there (`access(W_OK)`'s probe) and stamps nothing.
+        if !buf.is_empty() {
+            raw.stamp_modified(now());
+        }
         match fs().write_file_range(self.ino, &mut raw, *offset, buf) {
             Ok(n) => { *offset += n; Ok(n) }
             Err(Errno::ENOSPC) => Err(FileError::NoSpace),
@@ -1028,7 +1077,7 @@ impl FileHandle for Ext2FileHandle {
     }
 
     fn stat(&self) -> Option<Stat> {
-        Some(Stat::regular_writable(self.ino as u64, self.raw.lock().size() as i64))
+        Some(stat_of(self.ino, &self.raw.lock()))
     }
 
     fn dup(&self) -> Option<Box<dyn FileHandle>> {
@@ -1052,6 +1101,14 @@ impl FileHandle for Ext2FileHandle {
         let mut raw = self.raw.lock();
         let new_mode = (raw.i_mode() & 0xF000) | (mode as u16 & 0o7777);
         raw.set_i_mode(new_mode);
+        raw.stamp_changed(now());
+        fs().write_inode(self.ino, &raw).map_err(|_| FileError::IOError)
+    }
+
+    fn set_times(&mut self, atime: Option<u64>, mtime: Option<u64>) -> FileResult<()> {
+        let _guard = write_lock().map_err(|_| FileError::NotSupported)?;
+        let mut raw = self.raw.lock();
+        raw.set_times(atime.map(|t| t as u32), mtime.map(|t| t as u32), now());
         fs().write_inode(self.ino, &raw).map_err(|_| FileError::IOError)
     }
 
@@ -1060,6 +1117,10 @@ impl FileHandle for Ext2FileHandle {
 
 struct Ext2DirHandle {
     ino: u32,
+    /// The directory's record at `open`, for `fstat` — which runs under the
+    /// scheduler lock, where reading the disk (a USB transfer) is not an
+    /// option.
+    raw: RawInode,
     snapshot: Vec<DirEntry>,
     offset: usize,
 }
@@ -1078,7 +1139,7 @@ impl FileHandle for Ext2DirHandle {
     }
 
     fn stat(&self) -> Option<Stat> {
-        Some(Stat::dir(self.ino as u64))
+        Some(stat_of(self.ino, &self.raw))
     }
 
     fn name(&self) -> &str { "ext2/dir" }

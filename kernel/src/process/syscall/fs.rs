@@ -358,6 +358,19 @@ pub(super) fn sys_lstat(path_ptr: usize, stat_ptr: usize) -> SyscallResult {
     stat_impl(path_ptr, stat_ptr, false)
 }
 
+/// A filesystem that keeps no times (initramfs, devfs, procfs) reports 0
+/// for all three; hand those out as the boot time instead of the epoch —
+/// they did come into being at boot — so `ls -l` and `find -newer` see
+/// something true-ish rather than 1970. ext2 and ramfs report their own.
+fn fill_missing_times(stat: &mut crate::fs::types::Stat) {
+    if stat.st_atime == 0 && stat.st_mtime == 0 && stat.st_ctime == 0 {
+        let boot = crate::time::boot_unix_secs();
+        stat.st_atime = boot;
+        stat.st_mtime = boot;
+        stat.st_ctime = boot;
+    }
+}
+
 fn stat_impl(path_ptr: usize, stat_ptr: usize, follow: bool) -> SyscallResult {
     use crate::fs::types::Stat;
     if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
@@ -368,7 +381,8 @@ fn stat_impl(path_ptr: usize, stat_ptr: usize, follow: bool) -> SyscallResult {
     let result = if follow { crate::fs::stat(&path) } else { crate::fs::lstat(&path) };
     match result {
         Err(e)   => e.as_i64(),
-        Ok(stat) => {
+        Ok(mut stat) => {
+            fill_missing_times(&mut stat);
             unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
             0
         }
@@ -390,7 +404,8 @@ pub(super) fn sys_fstat(fd: i32, stat_ptr: usize) -> SyscallResult {
 
     match stat_result {
         None       => errno::EBADF,
-        Some(stat) => {
+        Some(mut stat) => {
+            fill_missing_times(&mut stat);
             unsafe { core::ptr::write(stat_ptr as *mut Stat, stat); }
             0
         }
@@ -601,6 +616,88 @@ pub(super) fn sys_chdir(path_ptr: usize) -> SyscallResult {
 /// release it, then call into the file outside any scheduler lock (cli
 /// stays engaged throughout for the usual preemption-safety reasons, just
 /// not the SCHEDULER mutex itself).
+// utimensat(2) constants (Linux, `<fcntl.h>`/`<sys/stat.h>`).
+const AT_FDCWD: i64 = -100;
+const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+const UTIME_NOW: i64 = (1 << 30) - 1;
+const UTIME_OMIT: i64 = (1 << 30) - 2;
+
+/// utimensat(280): `(dirfd, path, times[2], flags)`, Linux's signature.
+/// `times` NULL means both now; a `tv_nsec` of `UTIME_NOW`/`UTIME_OMIT`
+/// means now / leave alone; the change time becomes now either way. A NULL
+/// `path` makes `dirfd` the file itself — that is how libc implements
+/// `futimens(fd)`. `AT_SYMLINK_NOFOLLOW` sets a symlink's own times
+/// (`lutimes`). Seconds only: no filesystem here keeps nanoseconds. A
+/// relative path against a real `dirfd` is `ENOSYS` — an fd does not know
+/// its path here, and nothing this system runs asks for it.
+pub(super) fn sys_utimensat(dirfd: i64, path_ptr: u64, times_ptr: u64, flags: u64) -> SyscallResult {
+    if flags & !AT_SYMLINK_NOFOLLOW != 0 {
+        return errno::EINVAL;
+    }
+    let now = crate::time::now_unix_secs();
+    let (atime, mtime) = if times_ptr == 0 {
+        (Some(now), Some(now))
+    } else {
+        if let Err(e) = validate_user_buffer(times_ptr, 32) { return e; }
+        // Two `struct timespec`s: {tv_sec, tv_nsec} x {atime, mtime}.
+        let t = unsafe { core::ptr::read_unaligned(times_ptr as *const [i64; 4]) };
+        let pick = |sec: i64, nsec: i64| -> Result<Option<u64>, i64> {
+            match nsec {
+                UTIME_OMIT => Ok(None),
+                UTIME_NOW => Ok(Some(now)),
+                0..=999_999_999 if sec >= 0 => Ok(Some(sec as u64)),
+                _ => Err(errno::EINVAL),
+            }
+        };
+        match (pick(t[0], t[1]), pick(t[2], t[3])) {
+            (Ok(a), Ok(m)) => (a, m),
+            (Err(e), _) | (_, Err(e)) => return e,
+        }
+    };
+
+    if path_ptr == 0 {
+        // futimens: the fd's own file. The table is cloned out under the
+        // scheduler lock and used after it is dropped — ext2 writes the
+        // inode, and that is a disk (USB) transfer.
+        let files = {
+            let _irq = crate::process::irq_guard::InterruptGuard::new();
+            let scheduler = crate::process::scheduler::local_scheduler();
+            match scheduler.running_ref() {
+                Some(proc) => proc.files.clone(),
+                None => return errno::ESRCH,
+            }
+        };
+        let mut table = files.lock();
+        return match table.get_mut(dirfd as usize) {
+            Err(_) => errno::EBADF,
+            Ok(f) => match f.set_times(atime, mtime) {
+                Ok(()) => 0,
+                // Nothing behind the fd keeps times, or it is on a
+                // read-only mount.
+                Err(crate::process::file::FileError::NotSupported) => errno::EROFS,
+                Err(_) => errno::EIO,
+            },
+        };
+    }
+
+    if let Err(e) = validate_user_buffer(path_ptr, 1) { return e; }
+    let path = read_user_str(path_ptr as usize);
+    if path.is_empty() { return errno::ENOENT; }
+    if !path.starts_with('/') && dirfd != AT_FDCWD {
+        return errno::ENOSYS;
+    }
+    let path = resolve_path(path);
+    let inode = if flags & AT_SYMLINK_NOFOLLOW != 0 {
+        crate::fs::vfs::resolve_no_follow(&path)
+    } else {
+        crate::fs::vfs::resolve(&path)
+    };
+    match inode.and_then(|i| i.set_times(atime, mtime)) {
+        Ok(()) => 0,
+        Err(e) => e.as_i64(),
+    }
+}
+
 pub(super) fn sys_getdents64(fd: i32, buf_ptr: usize, count: usize) -> SyscallResult {
     if let Err(e) = validate_user_buffer(buf_ptr as u64, count) { return e; }
     crate::ktrace!(crate::debug::FS, "sys_getdents64: fd={} count={}", fd, count);

@@ -108,6 +108,57 @@ impl Filesystem for RamFs {
     }
 }
 
+// ── Timestamps ───────────────────────────────────────────────────────────────
+
+/// A node's times, from [`clock::now`](crate::clock::now). Reads never
+/// update `atime` (Linux's `noatime`): it moves only at creation and
+/// through `utimensat`. Atomics, so a node's times can be read and stamped
+/// without its locks; files share theirs with every open handle (`Arc`),
+/// as they share `data` and `mode`.
+struct Times {
+    atime: AtomicU64,
+    mtime: AtomicU64,
+    ctime: AtomicU64,
+}
+
+impl Times {
+    fn now() -> Self {
+        let t = crate::clock::now();
+        Times { atime: AtomicU64::new(t), mtime: AtomicU64::new(t), ctime: AtomicU64::new(t) }
+    }
+
+    /// `utimensat`: the given times, and `ctime` now.
+    fn set(&self, atime: Option<u64>, mtime: Option<u64>) {
+        if let Some(a) = atime {
+            self.atime.store(a, Ordering::Relaxed);
+        }
+        if let Some(m) = mtime {
+            self.mtime.store(m, Ordering::Relaxed);
+        }
+        self.changed();
+    }
+
+    /// Content changed: `mtime` and `ctime`.
+    fn modified(&self) {
+        let t = crate::clock::now();
+        self.mtime.store(t, Ordering::Relaxed);
+        self.ctime.store(t, Ordering::Relaxed);
+    }
+
+    /// Metadata changed (`chmod`): `ctime`.
+    fn changed(&self) {
+        self.ctime.store(crate::clock::now(), Ordering::Relaxed);
+    }
+
+    fn apply(&self, st: Stat) -> Stat {
+        st.with_times(
+            self.atime.load(Ordering::Relaxed),
+            self.mtime.load(Ordering::Relaxed),
+            self.ctime.load(Ordering::Relaxed),
+        )
+    }
+}
+
 // ── Directory inode ──────────────────────────────────────────────────────────
 
 struct RamDirNode {
@@ -124,6 +175,8 @@ struct RamDirNode {
     // instance already shared through the parent's `entries` map, so no
     // extra sharing mechanism is needed.
     mode: AtomicU32,
+    /// Stamped whenever an entry is added or removed.
+    times: Times,
     // See `DirLockObserver`. A `&'static dyn` fat pointer (`Copy`), not an
     // `Arc`, so wiring it through costs nothing per node.
     observer: &'static dyn DirLockObserver,
@@ -135,6 +188,7 @@ impl RamDirNode {
             ino,
             entries: Mutex::new(BTreeMap::new()),
             mode: AtomicU32::new(0o755),
+            times: Times::now(),
             observer,
         }
     }
@@ -203,7 +257,7 @@ impl Inode for RamDirNode {
         let nlink = 2 + self.lock_entries("stat").values()
             .filter(|v| v.file_type() == FileType::Directory)
             .count() as u64;
-        Stat::dir(self.ino).with_perm_bits(self.mode.load(Ordering::Relaxed)).with_nlink(nlink)
+        self.times.apply(Stat::dir(self.ino).with_perm_bits(self.mode.load(Ordering::Relaxed)).with_nlink(nlink))
     }
 
     fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
@@ -250,8 +304,10 @@ impl Inode for RamDirNode {
             ino: alloc_ino(),
             data: Arc::new(Mutex::new(Vec::new())),
             mode: Arc::new(AtomicU32::new(0o644)),
+            times: Arc::new(Times::now()),
         });
         entries.insert(name.to_string(), node.clone() as Arc<dyn Inode>);
+        self.times.modified();
         Ok(node as Arc<dyn Inode>)
     }
 
@@ -262,6 +318,7 @@ impl Inode for RamDirNode {
         }
         let node = Arc::new(RamDirNode::new(alloc_ino(), self.observer));
         entries.insert(name.to_string(), node.clone() as Arc<dyn Inode>);
+        self.times.modified();
         Ok(node as Arc<dyn Inode>)
     }
 
@@ -270,7 +327,11 @@ impl Inode for RamDirNode {
         match entries.get(name) {
             None => Err(Errno::ENOENT),
             Some(node) if node.file_type() == FileType::Directory => Err(Errno::EISDIR),
-            Some(_) => { entries.remove(name); Ok(()) }
+            Some(_) => {
+                entries.remove(name);
+                self.times.modified();
+                Ok(())
+            }
         }
     }
 
@@ -289,11 +350,14 @@ impl Inode for RamDirNode {
             return Err(Errno::ENOTEMPTY);
         }
         entries.remove(name);
+        self.times.modified();
         Ok(())
     }
 
     fn take_child(&self, name: &str) -> Result<Arc<dyn Inode>, Errno> {
-        self.lock_entries("take_child").remove(name).ok_or(Errno::ENOENT)
+        let node = self.lock_entries("take_child").remove(name).ok_or(Errno::ENOENT)?;
+        self.times.modified();
+        Ok(node)
     }
 
     fn insert_child(&self, name: &str, node: Arc<dyn Inode>) -> Result<(), Errno> {
@@ -302,6 +366,7 @@ impl Inode for RamDirNode {
             return Err(Errno::EEXIST);
         }
         entries.insert(name.to_string(), node);
+        self.times.modified();
         Ok(())
     }
 
@@ -310,8 +375,9 @@ impl Inode for RamDirNode {
         if entries.contains_key(name) {
             return Err(Errno::EEXIST);
         }
-        let node = Arc::new(RamSymlinkNode { ino: alloc_ino(), target: target.to_string() });
+        let node = Arc::new(RamSymlinkNode { ino: alloc_ino(), target: target.to_string(), times: Times::now() });
         entries.insert(name.to_string(), node.clone() as Arc<dyn Inode>);
+        self.times.modified();
         Ok(node as Arc<dyn Inode>)
     }
 
@@ -320,13 +386,20 @@ impl Inode for RamDirNode {
         if entries.contains_key(name) {
             return Err(Errno::EEXIST);
         }
-        let node = Arc::new(RamSocketNode { ino: alloc_ino() });
+        let node = Arc::new(RamSocketNode { ino: alloc_ino(), times: Times::now() });
         entries.insert(name.to_string(), node.clone() as Arc<dyn Inode>);
+        self.times.modified();
         Ok(node as Arc<dyn Inode>)
     }
 
     fn chmod(&self, mode: u32) -> Result<(), Errno> {
         self.mode.store(mode & 0o7777, Ordering::Relaxed);
+        self.times.changed();
+        Ok(())
+    }
+
+    fn set_times(&self, atime: Option<u64>, mtime: Option<u64>) -> Result<(), Errno> {
+        self.times.set(atime, mtime);
         Ok(())
     }
 }
@@ -369,19 +442,21 @@ struct RamFileNode {
     // handle) agree on one true value — same reasoning as `data` itself
     // being `Arc`-shared below.
     mode: Arc<AtomicU32>,
+    times: Arc<Times>,
 }
 
 impl Inode for RamFileNode {
     fn as_any(&self) -> &dyn core::any::Any { self }
 
     fn stat(&self) -> Stat {
-        Stat::regular_writable(self.ino, self.data.lock().len() as i64)
-            .with_perm_bits(self.mode.load(Ordering::Relaxed))
+        self.times.apply(Stat::regular_writable(self.ino, self.data.lock().len() as i64)
+            .with_perm_bits(self.mode.load(Ordering::Relaxed)))
     }
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
         if flags.0 & OpenFlags::TRUNC.0 != 0 {
             self.data.lock().clear();
+            self.times.modified();
         }
         let offset = if flags.0 & OpenFlags::APPEND.0 != 0 {
             self.data.lock().len()
@@ -393,11 +468,18 @@ impl Inode for RamFileNode {
             data: self.data.clone(),
             offset: Arc::new(Mutex::new(offset)),
             mode: self.mode.clone(),
+            times: self.times.clone(),
         }))
     }
 
     fn chmod(&self, mode: u32) -> Result<(), Errno> {
         self.mode.store(mode & 0o7777, Ordering::Relaxed);
+        self.times.changed();
+        Ok(())
+    }
+
+    fn set_times(&self, atime: Option<u64>, mtime: Option<u64>) -> Result<(), Errno> {
+        self.times.set(atime, mtime);
         Ok(())
     }
 }
@@ -413,13 +495,14 @@ impl Inode for RamFileNode {
 struct RamSymlinkNode {
     ino:    u64,
     target: String,
+    times:  Times,
 }
 
 impl Inode for RamSymlinkNode {
     fn as_any(&self) -> &dyn core::any::Any { self }
 
     fn stat(&self) -> Stat {
-        Stat::symlink(self.ino, self.target.len() as i64)
+        self.times.apply(Stat::symlink(self.ino, self.target.len() as i64))
     }
 
     fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
@@ -432,6 +515,11 @@ impl Inode for RamSymlinkNode {
     fn readlink(&self) -> Result<String, Errno> {
         Ok(self.target.clone())
     }
+
+    fn set_times(&self, atime: Option<u64>, mtime: Option<u64>) -> Result<(), Errno> {
+        self.times.set(atime, mtime);
+        Ok(())
+    }
 }
 
 /// A bound AF_UNIX socket's name in the filesystem.
@@ -442,13 +530,19 @@ impl Inode for RamSymlinkNode {
 /// can remove the name — exactly the role the same node plays in Linux.
 struct RamSocketNode {
     ino: u64,
+    times: Times,
 }
 
 impl Inode for RamSocketNode {
     fn as_any(&self) -> &dyn core::any::Any { self }
 
     fn stat(&self) -> Stat {
-        Stat::socket(self.ino)
+        self.times.apply(Stat::socket(self.ino))
+    }
+
+    fn set_times(&self, atime: Option<u64>, mtime: Option<u64>) -> Result<(), Errno> {
+        self.times.set(atime, mtime);
+        Ok(())
     }
 
     fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
@@ -470,6 +564,7 @@ struct RamFileHandle {
     // Shared with the owning `RamFileNode` (and every other open handle on
     // it) — see that struct's doc comment on this same field.
     mode: Arc<AtomicU32>,
+    times: Arc<Times>,
 }
 
 impl FileHandle for RamFileHandle {
@@ -494,12 +589,16 @@ impl FileHandle for RamFileHandle {
         }
         data[*offset..end].copy_from_slice(buf);
         *offset = end;
+        // A zero-length write changes nothing (it is `access(W_OK)`'s probe).
+        if !buf.is_empty() {
+            self.times.modified();
+        }
         Ok(buf.len())
     }
 
     fn stat(&self) -> Option<Stat> {
-        Some(Stat::regular_writable(self.ino, self.data.lock().len() as i64)
-            .with_perm_bits(self.mode.load(Ordering::Relaxed)))
+        Some(self.times.apply(Stat::regular_writable(self.ino, self.data.lock().len() as i64)
+            .with_perm_bits(self.mode.load(Ordering::Relaxed))))
     }
 
     fn dup(&self) -> Option<Box<dyn FileHandle>> {
@@ -508,6 +607,7 @@ impl FileHandle for RamFileHandle {
             data: self.data.clone(),
             offset: self.offset.clone(),
             mode: self.mode.clone(),
+            times: self.times.clone(),
         }))
     }
 
@@ -525,6 +625,12 @@ impl FileHandle for RamFileHandle {
 
     fn chmod(&mut self, mode: u32) -> FileResult<()> {
         self.mode.store(mode & 0o7777, Ordering::Relaxed);
+        self.times.changed();
+        Ok(())
+    }
+
+    fn set_times(&mut self, atime: Option<u64>, mtime: Option<u64>) -> FileResult<()> {
+        self.times.set(atime, mtime);
         Ok(())
     }
 
@@ -825,6 +931,70 @@ mod tests {
         assert_eq!(r.stat().st_nlink, 3);
         r.mkdir("sub2").unwrap();
         assert_eq!(r.stat().st_nlink, 4);
+    }
+
+    // ── timestamps ───────────────────────────────────────────────────────
+
+    // The clock is global to the crate, so this is the one test that sets
+    // it: a counter, every reading one second later than the last, which
+    // makes "was it stamped again?" a strict comparison whatever other
+    // tests run meanwhile.
+    static TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1_000);
+    fn counter_clock() -> u64 {
+        TICK.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[test]
+    fn timestamps_follow_posix() {
+        crate::clock::set_clock(counter_clock);
+        let fs = new_fs();
+        let r = root(&fs);
+
+        let f = r.create("f").unwrap();
+        let born = f.stat();
+        assert!(born.st_mtime >= 1_000);
+        assert_eq!((born.st_atime, born.st_ctime), (born.st_mtime, born.st_mtime));
+
+        // Creating an entry modified the directory.
+        assert!(r.stat().st_mtime >= born.st_mtime);
+
+        // A write moves mtime and ctime; an empty write moves nothing.
+        let mut h = f.open(OpenFlags(0)).unwrap();
+        h.write(b"").unwrap();
+        assert_eq!(f.stat().st_mtime, born.st_mtime);
+        h.write(b"x").unwrap();
+        let written = f.stat();
+        assert!(written.st_mtime > born.st_mtime);
+        assert_eq!(written.st_ctime, written.st_mtime);
+        // Seen the same through the handle.
+        assert_eq!(h.stat().unwrap().st_mtime, written.st_mtime);
+
+        // chmod moves ctime only — by path or by fd.
+        f.chmod(0o600).unwrap();
+        let ch = f.stat();
+        assert_eq!(ch.st_mtime, written.st_mtime);
+        assert!(ch.st_ctime > written.st_ctime);
+        h.chmod(0o644).unwrap();
+        assert!(f.stat().st_ctime > ch.st_ctime);
+
+        // utimensat: exactly the times asked for, either one alone, and
+        // ctime to now; by path or by fd; on a directory too.
+        f.set_times(Some(10), Some(20)).unwrap();
+        let set = f.stat();
+        assert_eq!((set.st_atime, set.st_mtime), (10, 20));
+        assert!(set.st_ctime > ch.st_ctime);
+        f.set_times(None, Some(30)).unwrap();
+        assert_eq!((f.stat().st_atime, f.stat().st_mtime), (10, 30));
+        h.set_times(Some(40), None).unwrap();
+        assert_eq!((f.stat().st_atime, f.stat().st_mtime), (40, 30));
+        r.mkdir("d").unwrap().set_times(Some(5), Some(6)).unwrap();
+        let d = r.lookup("d").unwrap().stat();
+        assert_eq!((d.st_atime, d.st_mtime), (5, 6));
+
+        // Removing an entry modifies the directory again.
+        let before = r.stat().st_mtime;
+        r.unlink("f").unwrap();
+        assert!(r.stat().st_mtime > before);
     }
 
     // ── chmod ────────────────────────────────────────────────────────────

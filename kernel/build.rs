@@ -82,6 +82,7 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "fpu_test",
     "socket_test",
     "cputime_test",
+    "fstime_test",
     "fbbench",
     "fire",
     "fork_exec_test",
