@@ -73,6 +73,12 @@ COMMON=(
     -fomit-frame-pointer
     -mno-red-zone
     -D_GNU_SOURCE
+    # struct sysinfo for free/uptime/nmeter/init: they include
+    # <sys/sysinfo.h> only under \`#ifdef __linux__\`, which this target
+    # does not define (and must not: BusyBox has hundreds of other
+    # __linux__ branches). The port's header declares that one struct and
+    # function, backed by the kernel's sysinfo(2).
+    -include sys/sysinfo.h
     -nostdinc
     -isystem "\$SYSROOT/usr/include"
     -isystem "\$RESOURCE_INC"

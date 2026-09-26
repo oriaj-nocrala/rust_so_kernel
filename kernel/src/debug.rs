@@ -246,6 +246,9 @@ pub fn note_unexpected_irq(line: u8) {
 }
 
 pub fn inc_forks()         { FORKS_TOTAL.fetch_add(1, Ordering::Relaxed); }
+/// For `/proc/stat`'s `processes` and `ctxt` lines.
+pub fn forks_total() -> u64 { FORKS_TOTAL.load(Ordering::Relaxed) }
+pub fn switches_total() -> u64 { SWITCHES_TOTAL.load(Ordering::Relaxed) }
 pub fn inc_execs()         { EXECS_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_reaps()         { REAPS_TOTAL.fetch_add(1, Ordering::Relaxed); }
 pub fn inc_cow_resolved()  { COW_FAULTS_RESOLVED.fetch_add(1, Ordering::Relaxed); }

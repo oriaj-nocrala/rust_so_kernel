@@ -28,7 +28,8 @@
 //                  getsockname/getpeername/get-setsockopt.
 //   sync         — futex.
 //   poll         — poll/epoll_create/epoll_ctl/epoll_wait.
-//   misc         — uptime/meminfo/kdebug_ctl/clock_gettime.
+//   misc         — uptime/meminfo/kdebug_ctl/clock_gettime/clock_getres,
+//                  times/getrusage/sysinfo/sched_getaffinity.
 // Everything below is dispatch plumbing + helpers shared by all of them.
 
 mod fs;
@@ -307,7 +308,12 @@ pub enum SyscallNumber {
     EpollCreate = 213,
     GetDents64 = 217,
     SetTidAddress = 218,
+    Getrusage = 98,
+    Sysinfo = 99,
+    Times = 100,
+    SchedGetaffinity = 204,
     ClockGettime = 228,
+    ClockGetres = 229,
     EpollWait = 232,
     EpollCtl = 233,
     Accept4 = 288,
@@ -394,7 +400,12 @@ impl SyscallNumber {
             213 => Some(Self::EpollCreate),
             217 => Some(Self::GetDents64),
             218 => Some(Self::SetTidAddress),
+            98 => Some(Self::Getrusage),
+            99 => Some(Self::Sysinfo),
+            100 => Some(Self::Times),
+            204 => Some(Self::SchedGetaffinity),
             228 => Some(Self::ClockGettime),
+            229 => Some(Self::ClockGetres),
             232 => Some(Self::EpollWait),
             233 => Some(Self::EpollCtl),
             288 => Some(Self::Accept4),
@@ -462,7 +473,15 @@ where
     }
 }
 
-fn with_scheduler<F>(f: F) -> SyscallResult
+/// The running process's CPU time (`Scheduler::current_cpu_times`), read
+/// under the scheduler lock and returned by value so the caller writes it
+/// to user memory with the lock released.
+pub(super) fn current_cpu_times() -> Option<super::scheduler::CpuTimesOf> {
+    let guard = super::irq_guard::SchedGuard::lock();
+    guard.current_cpu_times()
+}
+
+pub(super) fn with_scheduler<F>(f: F) -> SyscallResult
 where
     F: FnOnce(&mut super::scheduler::Scheduler) -> SyscallResult,
 {
@@ -626,6 +645,11 @@ pub fn syscall_handler(
         SyscallNumber::EpollCreate => poll::sys_epoll_create(arg1 as i32),
         SyscallNumber::GetDents64 => fs::sys_getdents64(arg1 as i32, arg2 as usize, arg3 as usize),
         SyscallNumber::ClockGettime => misc::sys_clock_gettime(arg1, arg2),
+        SyscallNumber::ClockGetres => misc::sys_clock_getres(arg1, arg2),
+        SyscallNumber::Times => misc::sys_times(arg1),
+        SyscallNumber::Sysinfo => misc::sys_sysinfo(arg1),
+        SyscallNumber::Getrusage => misc::sys_getrusage(arg1 as i64, arg2),
+        SyscallNumber::SchedGetaffinity => misc::sys_sched_getaffinity(arg1 as i64, arg2 as usize, arg3),
         SyscallNumber::EpollWait => poll::sys_epoll_wait(arg1 as i32, arg2, arg3 as i32, arg4 as i32),
         SyscallNumber::EpollCtl => poll::sys_epoll_ctl(arg1 as i32, arg2 as i32, arg3 as i32, arg4),
         SyscallNumber::UptimeMs => misc::sys_uptime_ms(),

@@ -26,7 +26,9 @@
 #include <stdio.h>
 #include <mntent.h>
 #include <sys/mman.h>
+#include <sched.h>
 #include <sys/resource.h>
+#include <sys/times.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/sysinfo.h>
@@ -35,6 +37,7 @@
 #include <sys/un.h>
 #include <sys/utsname.h>
 #include <termios.h>
+#include <unistd.h>
 
 namespace {
 
@@ -137,6 +140,11 @@ constexpr long TCSETSW_REQ = 0x5403;
 constexpr long TCSETSF_REQ = 0x5404;
 constexpr long SYS_futex = 202;
 constexpr long SYS_clock_gettime = 228;
+constexpr long SYS_clock_getres = 229;
+constexpr long SYS_times = 100;
+constexpr long SYS_getrusage = 98;
+constexpr long SYS_sysinfo = 99;
+constexpr long SYS_sched_getaffinity = 204;
 
 constexpr long ARCH_SET_FS = 0x1002;
 constexpr long FUTEX_WAIT = 0;
@@ -213,6 +221,82 @@ int sys_clock_get(int clock, time_t *secs, long *nanos) {
 	*secs = (time_t)ts[0];
 	*nanos = ts[1];
 	return 0;
+}
+#endif
+
+#ifndef MLIBC_BUILDING_RTLD
+int sys_clock_getres(int clock, time_t *secs, long *nanos) {
+	long ts[2] = {0, 0};
+	long ret = raw_syscall(SYS_clock_getres, clock, (long)ts);
+	if (ret < 0)
+		return (int)-ret;
+	*secs = (time_t)ts[0];
+	*nanos = ts[1];
+	return 0;
+}
+
+// struct tms is four clock_t (long) — the kernel's layout exactly.
+int sys_times(struct tms *tms, clock_t *out) {
+	long ret = raw_syscall(SYS_times, (long)tms);
+	if (ret < 0)
+		return (int)-ret;
+	*out = (clock_t)ret;
+	return 0;
+}
+
+// Only ru_utime/ru_stime are filled by the kernel; it zeroes the rest.
+int sys_getrusage(int scope, struct rusage *usage) {
+	long ret = raw_syscall(SYS_getrusage, scope, (long)usage);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+namespace {
+
+// CPUs the kernel will run this process on (sched_getaffinity), or 1 if it
+// cannot say.
+long online_cpus() {
+	unsigned long mask[16] = {};
+	long ret = raw_syscall(SYS_sched_getaffinity, 0, (long)sizeof(mask), (long)mask);
+	if (ret <= 0)
+		return 1;
+	long n = 0;
+	for (long i = 0; i < ret / (long)sizeof(unsigned long); i++)
+		n += __builtin_popcountl(mask[i]);
+	return n > 0 ? n : 1;
+}
+
+} // namespace
+
+// What mlibc's generic sysconf() would otherwise answer with a red warning
+// and a made-up number: _SC_CLK_TCK was 1000000 (so `ps` TIME and every
+// times()-based measurement were off by 10^4) and both processor counts
+// were 1. EINVAL hands everything else back to mlibc's defaults.
+int sys_sysconf(int num, long *ret) {
+	switch (num) {
+	case _SC_CLK_TCK:
+		*ret = 100; // the kernel's tick, sched::cputime::USER_HZ
+		return 0;
+	case _SC_NPROCESSORS_ONLN:
+	case _SC_NPROCESSORS_CONF:
+		// CONF counts CPUs that could come online; every CPU this kernel
+		// found either runs processes or never will, so both agree.
+		*ret = online_cpus();
+		return 0;
+	case _SC_OPEN_MAX:
+		*ret = 16; // FileDescriptorTable's MAX_FILES
+		return 0;
+	case _SC_PHYS_PAGES:
+	case _SC_AVPHYS_PAGES: {
+		struct statvfs sv{};
+		if (raw_syscall(SYS_statvfs, (long)"/", (long)&sv) < 0)
+			return EINVAL;
+		unsigned long blocks = num == _SC_PHYS_PAGES ? sv.f_blocks : sv.f_bfree;
+		*ret = (long)(blocks * sv.f_bsize / 4096);
+		return 0;
+	}
+	default:
+		return EINVAL;
+	}
 }
 #endif
 
@@ -1010,13 +1094,12 @@ int sys_fstatvfs(int, struct statvfs *out) {
 // sysinfo(): not an mlibc sysdep hook — mlibc only declares this under its
 // "linux" option (disabled for this port, see sys/sysinfo.h), so there's no
 // public wrapper function elsewhere to call into a hook. BusyBox `free`
-// calls it unconditionally though (procps/free.c has no /proc/meminfo-only
-// fallback), so this port just defines the public symbol directly (`extern
-// "C"` gives it global linkage regardless of this enclosing namespace),
-// reassembling it from two syscalls this port already has: SYS_statvfs
-// (for total/free bytes — same live Buddy-allocator numbers `df` sees) and
-// SYS_uptime_sec. `mem_unit = 1` sidesteps unit conversion entirely by
-// reporting totalram/freeram as raw bytes instead of block counts.
+// and `uptime` call it unconditionally, so this port defines the public
+// symbol directly (`extern "C"` gives it global linkage regardless of this
+// enclosing namespace). The kernel's sysinfo (#99) fills the Linux struct
+// itself: uptime, load averages, total/free RAM in bytes (mem_unit 1) and
+// the process count. It used to be reassembled here from statvfs and
+// uptime_sec, with the loads and procs left at 0.
 // setmntent()/getmntent()/endmntent(): this kernel's mount table is fixed
 // at compile time (see kernel/src/fs/mod.rs's MOUNT LAYOUT), so rather than
 // parse a real /etc/mtab (which doesn't exist — nothing here writes one),
@@ -1061,17 +1144,26 @@ extern "C" int endmntent(FILE *) {
 	return 1;
 }
 
+// sched_getaffinity(): <sched.h> declares it for every port, but mlibc
+// defines it only under the Linux option (off here, see sys/sysinfo.h).
+// Like glibc, clear the part of the caller's mask the kernel didn't write.
+extern "C" int sched_getaffinity(pid_t pid, size_t size, cpu_set_t *mask) {
+	long ret = raw_syscall(SYS_sched_getaffinity, pid, (long)size, (long)mask);
+	if (ret < 0) {
+		errno = (int)-ret;
+		return -1;
+	}
+	if ((size_t)ret < size)
+		__builtin_memset((char *)mask + ret, 0, size - (size_t)ret);
+	return 0;
+}
+
 extern "C" int sysinfo(struct sysinfo *info) {
-	__builtin_memset(info, 0, sizeof(*info));
-
-	long up = raw_syscall(SYS_uptime_sec);
-	info->uptime = up > 0 ? up : 0;
-
-	struct statvfs sv{};
-	raw_syscall(SYS_statvfs, (long)"/", (long)&sv);
-	info->totalram = (unsigned long)(sv.f_blocks * sv.f_bsize);
-	info->freeram = (unsigned long)(sv.f_bfree * sv.f_bsize);
-	info->mem_unit = 1;
+	long ret = raw_syscall(SYS_sysinfo, (long)info);
+	if (ret < 0) {
+		errno = (int)-ret;
+		return -1;
+	}
 	return 0;
 }
 

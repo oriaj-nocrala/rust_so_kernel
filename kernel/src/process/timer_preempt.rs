@@ -249,7 +249,9 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> Resume 
         return Resume::to(current_tf);
     }
 
-    if !scheduler.tick(unsafe { (*current_tf).rsp }) {
+    // RPL 3 in the saved CS: the tick interrupted user mode.
+    let user_mode = unsafe { (*current_tf).cs } & 3 == 3;
+    if !scheduler.tick(unsafe { (*current_tf).rsp }, user_mode) {
         // Slice still has ticks remaining — continue current process,
         // but it may have just been sent a signal (e.g. by another
         // process's kill() while this one was running) — check before

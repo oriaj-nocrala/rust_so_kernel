@@ -102,6 +102,12 @@ impl AddressSpace {
 
     /// Find the VMA containing `addr`, if any. Returns a clone (for a
     /// `Shared` VMA, one more short-lived hold on its object).
+    /// Bytes of address space mapped, every VMA counted whole whether or
+    /// not its pages are present — `/proc/<pid>/stat`'s `vsize`.
+    pub fn vsize_bytes(&self) -> u64 {
+        self.vmas.with(|v| v.iter().map(|vma| vma.size_pages as u64 * 4096).sum())
+    }
+
     pub fn find_vma(&self, addr: u64) -> Option<Vma> {
         self.vmas.with(|v| v.find(addr).cloned())
     }

@@ -9,6 +9,8 @@
 //   │   ├── shell
 //   │   ├── uname
 //   │   └── …                (one entry per PROGRAMS registry entry)
+//   ├── etc/                (static configuration files, `ETC_FILES`)
+//   │   └── localtime
 //   ├── dev/                 (empty placeholder — real content lives behind
 //   ├── tmp/                  the /dev, /tmp, /mnt, /proc mounts; traversal
 //   ├── mnt/                  into them is redirected there by the VFS
@@ -31,7 +33,8 @@
 //
 // All files are read-only.  Writes return EROFS.
 // Inode numbers: 1 = root dir, 2 = /bin dir, 3+ = files (registry index + 3),
-// 100+ = mount placeholder dirs (index into `direct_children`, cosmetic only).
+// 50 = /etc, 60+ = its files, 100+ = mount placeholder dirs (index into
+// `direct_children`, cosmetic only).
 
 use alloc::{boxed::Box, sync::Arc};
 use crate::sync::Mutex;
@@ -47,7 +50,33 @@ use crate::process::{
 
 const ROOT_INO: u64 = 1;
 const BIN_INO: u64 = 2;
+const ETC_INO: u64 = 50;
+const ETC_FILE_INO_BASE: u64 = 60;
 const MOUNT_PLACEHOLDER_INO_BASE: u64 = 100;
+
+/// The files of `/etc`: what a libc or a portable program expects to find
+/// there, as data compiled into the kernel.
+const ETC_FILES: &[(&str, &[u8])] = &[
+    // mlibc's `localtime`/`tzset` read the zone from `/etc/localtime` and
+    // ignore `TZ`; without the file they panic (`uptime`, `date`, anything
+    // formatting local time died). The clock is UTC (`rtc` reads it as
+    // UTC and nothing here has a zone), so this is the zone file for UTC:
+    // TZif version 1, no transitions, one type (offset 0, not DST, "UTC").
+    ("localtime", &UTC_TZIF),
+];
+
+const UTC_TZIF: [u8; 54] = {
+    let mut b = [0u8; 54];
+    // Magic; version 0 (v1); 15 reserved bytes.
+    b[0] = b'T'; b[1] = b'Z'; b[2] = b'i'; b[3] = b'f';
+    // Six big-endian counts at 20..44: isutcnt, isstdcnt, leapcnt, timecnt
+    // (all 0), typecnt = 1, charcnt = 4.
+    b[39] = 1;
+    b[43] = 4;
+    // ttinfo at 44: utoff 0 (4 bytes), isdst 0, desigidx 0. Then "UTC\0".
+    b[50] = b'U'; b[51] = b'T'; b[52] = b'C';
+    b
+};
 const BUSYBOX_APPLET_INO_BASE: u64 = 1000;
 
 // ── Filesystem ───────────────────────────────────────────────────────────────
@@ -62,7 +91,7 @@ impl Filesystem for InitramfsFs {
     }
 }
 
-// ── Root directory: contains only "bin" ─────────────────────────────────────
+// ── Root directory: "bin", "etc" and the other mounts ─────────────────────
 
 struct RootDirInode;
 
@@ -81,6 +110,9 @@ impl Inode for RootDirInode {
         if name == "bin" {
             return Ok(Arc::new(BinDirInode));
         }
+        if name == "etc" {
+            return Ok(Arc::new(EtcDirInode));
+        }
         let children = crate::fs::vfs::direct_children("/");
         match children.iter().position(|&n| n == name) {
             Some(idx) => Ok(Arc::new(MountPointDirInode {
@@ -95,8 +127,9 @@ impl Inode for RootDirInode {
             0 => Ok(Some(DirEntry::new(ROOT_INO, FileType::Directory, b"."))),
             1 => Ok(Some(DirEntry::new(ROOT_INO, FileType::Directory, b".."))),
             2 => Ok(Some(DirEntry::new(BIN_INO, FileType::Directory, b"bin"))),
+            3 => Ok(Some(DirEntry::new(ETC_INO, FileType::Directory, b"etc"))),
             n => {
-                let idx = (n - 3) as usize;
+                let idx = (n - 4) as usize;
                 let children = crate::fs::vfs::direct_children("/");
                 if idx >= children.len() {
                     return Ok(None);
@@ -163,7 +196,7 @@ impl Inode for BinDirInode {
             if *prog_name == name {
                 if let ProgramSource::Elf(data) = source {
                     let ino = (i as u64) + 3;
-                    return Ok(Arc::new(InitramfsFileInode { ino, data }));
+                    return Ok(Arc::new(InitramfsFileInode { ino, data, executable: true }));
                 }
             }
         }
@@ -188,25 +221,69 @@ impl Inode for BinDirInode {
     }
 }
 
+// ── /etc directory: `ETC_FILES` ──────────────────────────────────────────────
+
+struct EtcDirInode;
+
+impl Inode for EtcDirInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
+    fn stat(&self) -> Stat {
+        Stat::dir(ETC_INO)
+    }
+
+    fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+        Ok(Box::new(DirHandle { kind: DirKind::Etc, offset: 0 }))
+    }
+
+    fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, Errno> {
+        ETC_FILES.iter().position(|(n, _)| *n == name)
+            .map(|i| Arc::new(InitramfsFileInode {
+                ino: ETC_FILE_INO_BASE + i as u64,
+                data: ETC_FILES[i].1,
+                executable: false,
+            }) as Arc<dyn Inode>)
+            .ok_or(Errno::ENOENT)
+    }
+
+    fn readdir(&self, offset: u64) -> Result<Option<DirEntry>, Errno> {
+        match offset {
+            0 => Ok(Some(DirEntry::new(ETC_INO, FileType::Directory, b"."))),
+            1 => Ok(Some(DirEntry::new(ROOT_INO, FileType::Directory, b".."))),
+            n => Ok(ETC_FILES.get((n - 2) as usize).map(|(name, _)| {
+                DirEntry::new(ETC_FILE_INO_BASE + n - 2, FileType::Regular, name.as_bytes())
+            })),
+        }
+    }
+}
+
 // ── File inode ───────────────────────────────────────────────────────────────
 
 struct InitramfsFileInode {
     ino:  u64,
     data: &'static [u8],
+    /// A program (`/bin`, mode 0555) or data (`/etc`, 0444).
+    executable: bool,
+}
+
+impl InitramfsFileInode {
+    fn stat_of(ino: u64, len: usize, executable: bool) -> Stat {
+        if executable { Stat::executable(ino, len as i64) } else { Stat::regular(ino, len as i64) }
+    }
 }
 
 impl Inode for InitramfsFileInode {
     fn as_any(&self) -> &dyn core::any::Any { self }
 
     fn stat(&self) -> Stat {
-        Stat::executable(self.ino, self.data.len() as i64)
+        InitramfsFileInode::stat_of(self.ino, self.data.len(), self.executable)
     }
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
         if flags.is_write() {
             return Err(Errno::EROFS);
         }
-        Ok(Box::new(RamFile::new(self.data)))
+        Ok(Box::new(RamFile::new(self.data, self.ino, self.executable)))
     }
 }
 
@@ -215,6 +292,9 @@ impl Inode for InitramfsFileInode {
 /// Seekable read-only file handle over a static byte slice.
 struct RamFile {
     data:   &'static [u8],
+    /// What `fstat` reports: its inode's number and kind.
+    ino:        u64,
+    executable: bool,
     // Arc'd so dup()/dup2() can share one true "open file description"
     // position between two fds (POSIX dup() semantics) — see ramfs.rs's
     // RamFileHandle, which has the exact same reasoning.
@@ -222,8 +302,8 @@ struct RamFile {
 }
 
 impl RamFile {
-    fn new(data: &'static [u8]) -> Self {
-        Self { data, offset: Arc::new(Mutex::new(0)) }
+    fn new(data: &'static [u8], ino: u64, executable: bool) -> Self {
+        Self { data, ino, executable, offset: Arc::new(Mutex::new(0)) }
     }
 }
 
@@ -245,11 +325,16 @@ impl FileHandle for RamFile {
     }
 
     fn stat(&self) -> Option<crate::fs::types::Stat> {
-        Some(Stat::executable(0, self.data.len() as i64))
+        Some(InitramfsFileInode::stat_of(self.ino, self.data.len(), self.executable))
     }
 
     fn dup(&self) -> Option<Box<dyn FileHandle>> {
-        Some(Box::new(RamFile { data: self.data, offset: self.offset.clone() }))
+        Some(Box::new(RamFile {
+            data: self.data,
+            ino: self.ino,
+            executable: self.executable,
+            offset: self.offset.clone(),
+        }))
     }
 
     fn seek(&mut self, offset: i64, whence: i32) -> FileResult<i64> {
@@ -263,11 +348,12 @@ impl FileHandle for RamFile {
 }
 
 /// Directory handle: keeps a readdir cursor and serves `getdents64`, shared
-/// by `RootDirInode`, `BinDirInode` and every `MountPointDirInode` (only
-/// their `readdir` differs).
+/// by `RootDirInode`, `BinDirInode`, `EtcDirInode` and every
+/// `MountPointDirInode` (only their `readdir` differs).
 enum DirKind {
     Root,
     Bin,
+    Etc,
     MountPoint(u64),
 }
 
@@ -289,6 +375,7 @@ impl FileHandle for DirHandle {
         match self.kind {
             DirKind::Root => crate::fs::vfs::getdents64_via_readdir(&RootDirInode, &mut self.offset, buf),
             DirKind::Bin => crate::fs::vfs::getdents64_via_readdir(&BinDirInode, &mut self.offset, buf),
+            DirKind::Etc => crate::fs::vfs::getdents64_via_readdir(&EtcDirInode, &mut self.offset, buf),
             DirKind::MountPoint(ino) => crate::fs::vfs::getdents64_via_readdir(&MountPointDirInode { ino }, &mut self.offset, buf),
         }
     }
@@ -297,6 +384,7 @@ impl FileHandle for DirHandle {
         match self.kind {
             DirKind::Root => Some(Stat::dir(ROOT_INO)),
             DirKind::Bin => Some(Stat::dir(BIN_INO)),
+            DirKind::Etc => Some(Stat::dir(ETC_INO)),
             DirKind::MountPoint(ino) => Some(Stat::dir(ino)),
         }
     }
@@ -305,6 +393,7 @@ impl FileHandle for DirHandle {
         match self.kind {
             DirKind::Root => "initramfs/root",
             DirKind::Bin => "initramfs/bin",
+            DirKind::Etc => "initramfs/etc",
             DirKind::MountPoint(_) => "initramfs/mountpoint",
         }
     }

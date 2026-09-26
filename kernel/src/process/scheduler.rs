@@ -31,7 +31,7 @@
 //     The old approach only overwrote the 5-field exception stack frame,
 //     leaking RAX..R15 from the killed process into the next one.
 
-use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Thin wrapper around `spin::MutexGuard<Scheduler>` that (1) reports every
@@ -341,8 +341,14 @@ fn stack_in_use(top: u64) -> bool {
 }
 
 /// Record that this CPU is switching away from `proc`, if the stack it is
-/// executing on is `proc`'s (see `LEAVING`).
-fn note_leaving(proc: &Process) {
+/// executing on is `proc`'s (see `LEAVING`), and stop its run clock
+/// (`Process::exec_ns`). Every switch away from a process passes here, as
+/// every switch to one passes through `switch_in`, which starts the clock.
+fn note_leaving(proc: &mut Process) {
+    let now = crate::time::ktime_get();
+    proc.exec_ns += now.saturating_sub(proc.run_since_ns);
+    proc.run_since_ns = now;
+
     let rsp: u64;
     unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)) };
     let top = proc.kernel_stack.as_u64();
@@ -354,8 +360,14 @@ fn note_leaving(proc: &Process) {
 
 // ── Per-CPU scheduling counters (`sched:` in /proc/kdebug) ──────────────
 static CPU_SWITCHES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
-static CPU_BUSY_TICKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+// Where each CPU's ticks went (`sched::cputime::classify`): the source of
+// `/proc/stat`'s `cpuN` lines.
+static CPU_USER_TICKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static CPU_SYSTEM_TICKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static CPU_IDLE_TICKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// The 1/5/15-minute load averages, `sched::loadavg` fixed point, written
+/// by CPU 0's tick under the scheduler lock.
+static LOADAVG: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static RESCHED_IPIS: AtomicU64 = AtomicU64::new(0);
 /// The most CPUs ever running non-idle processes at once.
 static MAX_CONCURRENT: AtomicU64 = AtomicU64::new(0);
@@ -546,6 +558,78 @@ impl Scheduler {
         self.iter_running().chain(self.core.iter_queued())
     }
 
+    // ====================================================================
+    // CPU time (`sched::cputime`)
+    // ====================================================================
+
+    /// Any non-idle process, wherever it is: running on some CPU or queued.
+    fn process_anywhere_mut(&mut self, pid: Pid) -> Option<&mut Process> {
+        self.running.iter_mut()
+            .filter_map(|r| r.as_deref_mut())
+            .filter(|p| p.pid.0 != 0)
+            .chain(self.core.iter_queued_mut())
+            .find(|p| p.pid == pid)
+    }
+
+    /// `child` has just been reaped: its time, and what it had collected
+    /// from its own children, becomes its parent's `cutime`/`cstime`
+    /// (`ProcTimes::reap`). Every reap path calls this — `waitpid`'s and
+    /// `reap_zombie`.
+    pub fn credit_reaped(&mut self, child: &Process) {
+        let Some(ppid) = child.parent_pid else { return };
+        let times = child.times;
+        if let Some(parent) = self.process_anywhere_mut(ppid) {
+            parent.times.reap(&times);
+        }
+    }
+
+    /// A thread has exited: its time (and what its own dead threads had
+    /// left it) goes to its thread group's leader — the process that
+    /// shares its address space and is not a thread — as
+    /// `dead_threads`, so the group's clocks keep it without the leader's
+    /// own thread clock gaining it (Linux keeps it in `signal->utime`).
+    /// Lost if the leader is gone or has exec'd, as the thread's own record
+    /// is about to be.
+    fn fold_into_leader(&mut self, thread: &Process) {
+        let mut times = thread.times;
+        times.absorb_thread(&thread.dead_threads);
+        let ns = thread.exec_ns + thread.dead_threads_ns;
+        let space = &thread.address_space;
+        let leader = self.running.iter_mut()
+            .filter_map(|r| r.as_deref_mut())
+            .filter(|p| p.pid.0 != 0)
+            .chain(self.core.iter_queued_mut())
+            .find(|p| !p.is_thread && Arc::ptr_eq(&p.address_space, space));
+        if let Some(leader) = leader {
+            leader.dead_threads.absorb_thread(&times);
+            leader.dead_threads_ns += ns;
+        }
+    }
+
+    /// The running process's CPU time, its own and its thread group's
+    /// (every process sharing its address space — this kernel has no
+    /// thread-group id; threads are processes that share one). IF=0.
+    pub fn current_cpu_times(&self) -> Option<CpuTimesOf> {
+        let me = self.running_ref()?;
+        let now = crate::time::ktime_get();
+        let exec_now = |p: &Process| {
+            let running = self.running.iter().any(|r| r.as_deref().map_or(false, |r| r.pid == p.pid));
+            p.exec_ns + if running { now.saturating_sub(p.run_since_ns) } else { 0 }
+        };
+        let mut out = CpuTimesOf {
+            own: me.times,
+            own_exec_ns: exec_now(me),
+            group: sched::cputime::ProcTimes::default(),
+            group_exec_ns: 0,
+        };
+        for p in self.iter_all().filter(|p| Arc::ptr_eq(&p.address_space, &me.address_space)) {
+            out.group.absorb_thread(&p.times);
+            out.group.absorb_thread(&p.dead_threads);
+            out.group_exec_ns += exec_now(p) + p.dead_threads_ns;
+        }
+        Some(out)
+    }
+
     /// Check the currently-`running` process's pending signals against `tf`
     /// (must point at that same process's live TrapFrame — see callers)
     /// and act on the outcome: a caught signal redirects `tf` in place and
@@ -671,7 +755,7 @@ impl Scheduler {
         let me = crate::cpu::cpu_id();
         if let Some(mut proc) = self.running[me].take() {
             assert!(proc.pid.0 != 0, "kill_current on an idle process");
-            note_leaving(&proc);
+            note_leaving(&mut proc);
             self.reparent_children(proc.pid);
             // Its files close now, as Linux's `do_exit` does — but not
             // here, under this lock: see `dead_files`. (`sys_exit` has
@@ -693,6 +777,7 @@ impl Scheduler {
             );
             if proc.is_thread {
                 crate::serial_println!("  → thread, reaped immediately (no waitpid() will ever collect it)");
+                self.fold_into_leader(&proc);
                 // Defer the kernel stack's phys_free — see pending_stack_frees'
                 // doc comment for why it can't happen right here.
                 self.pending_stack_frees.push(proc.kernel_stack);
@@ -767,7 +852,7 @@ impl Scheduler {
                 core::str::from_utf8(&proc.name).unwrap_or("<?>").trim_end_matches('\0'),
             );
             proc.state = ProcessState::Stopped;
-            note_leaving(&proc);
+            note_leaving(&mut proc);
             self.core.park(proc);
         }
         clear_current_fast();
@@ -984,7 +1069,7 @@ impl Scheduler {
                 }
             };
             proc.state = ProcessState::Blocked;
-            note_leaving(&proc);
+            note_leaving(&mut proc);
             self.core.park(proc);
         }
         // No process running on this CPU until we schedule the next one.
@@ -1179,6 +1264,7 @@ impl Scheduler {
             return false;
         };
         let proc = self.core.wait_queue_mut().remove(pos).unwrap();
+        self.credit_reaped(&proc);
         self.defer_stack_free(proc.kernel_stack);
         crate::debug::inc_reaps();
         true
@@ -1307,8 +1393,9 @@ impl Scheduler {
     ///
     /// `interrupted_rsp` is the interrupted frame's saved RSP — the deepest
     /// address the preempted code had pushed to. It guards the deferred
-    /// kernel-stack frees below.
-    pub fn tick(&mut self, interrupted_rsp: u64) -> bool {
+    /// kernel-stack frees below. `user_mode`: the tick interrupted ring 3,
+    /// which is what charges it as user rather than system time.
+    pub fn tick(&mut self, interrupted_rsp: u64, user_mode: bool) -> bool {
         let me = crate::cpu::cpu_id();
         // Aging is global work (decision 3 of docs/smp/smp-plan.md): one
         // core, one aging clock, advanced by CPU 0's tick only — every
@@ -1350,12 +1437,33 @@ impl Scheduler {
             self.core.age_processes();
         }
 
+        // The load average (global work, CPU 0): runnable = running on
+        // some CPU or waiting in a run queue, sampled every 5 s.
+        if me == 0 && TICKS[0].load(Ordering::Relaxed) % sched::loadavg::LOAD_FREQ == 0 {
+            let runnable = self.iter_running().count() + self.core.iter_ready_desc().count();
+            let mut l = sched::loadavg::LoadAvg {
+                avg: core::array::from_fn(|i| LOADAVG[i].load(Ordering::Relaxed)),
+            };
+            l.sample(runnable as u64);
+            for (slot, v) in LOADAVG.iter().zip(l.avg) {
+                slot.store(v, Ordering::Relaxed);
+            }
+        }
+
         let idle = self.running[me].as_ref().map_or(true, |p| p.pid.0 == 0);
+        let kind = sched::cputime::classify(user_mode, idle);
+        match kind {
+            sched::cputime::TickKind::User => &CPU_USER_TICKS[me],
+            sched::cputime::TickKind::System => &CPU_SYSTEM_TICKS[me],
+            sched::cputime::TickKind::Idle => &CPU_IDLE_TICKS[me],
+        }
+        .fetch_add(1, Ordering::Relaxed);
         if idle {
-            CPU_IDLE_TICKS[me].fetch_add(1, Ordering::Relaxed);
             return self.idle_should_switch(me);
         }
-        CPU_BUSY_TICKS[me].fetch_add(1, Ordering::Relaxed);
+        if let Some(p) = self.running[me].as_mut() {
+            p.times.charge(kind);
+        }
         self.core.consume_quantum_on(me)
     }
 
@@ -1387,7 +1495,7 @@ impl Scheduler {
             unsafe { *proc.trapframe = *current_tf; }
             proc.fs_base = read_fs_base();
             unsafe { super::fpu::save(&mut proc.fpu_state); }
-            note_leaving(&proc);
+            note_leaving(&mut proc);
 
             if proc.pid.0 == 0 {
                 // Idle goes back to its CPU's slot, never to a queue.
@@ -1447,6 +1555,8 @@ impl Scheduler {
     fn switch_in(&mut self, mut proc: Box<Process>, site: &'static str) -> *const TrapFrame {
         let me = crate::cpu::cpu_id();
         proc.state = ProcessState::Running;
+        proc.run_since_ns = crate::time::ktime_get();
+        proc.last_cpu = me;
         unsafe { proc.address_space.activate(); }
         // The table this CPU had loaded is not its CR3 any more.
         drop(self.retiring[me].take());
@@ -1560,6 +1670,53 @@ impl Scheduler {
     }
 }
 
+/// See `Scheduler::current_cpu_times`.
+#[derive(Clone, Copy, Debug)]
+pub struct CpuTimesOf {
+    pub own: sched::cputime::ProcTimes,
+    pub own_exec_ns: u64,
+    pub group: sched::cputime::ProcTimes,
+    pub group_exec_ns: u64,
+}
+
+/// `/proc/stat`'s `procs_running`: processes Running or Ready (idle not
+/// counted), and every process there is.
+pub fn process_counts() -> (usize, usize) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let s = local_scheduler();
+        let running = s.iter_all()
+            .filter(|p| matches!(p.state, ProcessState::Running | ProcessState::Ready))
+            .count();
+        (running, s.iter_all().count())
+    })
+}
+
+/// The load averages (`sched::loadavg` fixed point) and the last pid
+/// allocated, for `/proc/loadavg` and `sysinfo`.
+pub fn loadavg() -> ([u64; 3], usize) {
+    let avg = core::array::from_fn(|i| LOADAVG[i].load(Ordering::Relaxed));
+    let last = x86_64::instructions::interrupts::without_interrupts(|| local_scheduler().core.last_pid());
+    (avg, last)
+}
+
+/// The CPUs that run processes, in order — what `/proc/stat` lists and
+/// `sched_getaffinity` reports. With `CONSTANOS_NOSMP=1` only CPU 0; the
+/// APs are online there but never run a process, so for userspace they
+/// are not there.
+pub fn scheduling_cpus() -> impl Iterator<Item = usize> {
+    (0..MAX_CPUS).filter(|&c| is_scheduling(c))
+}
+
+/// Where `cpu`'s ticks have gone since it started scheduling.
+pub fn cpu_times(cpu: usize) -> sched::cputime::CpuTimes {
+    sched::cputime::CpuTimes {
+        user: CPU_USER_TICKS[cpu].load(Ordering::Relaxed),
+        system: CPU_SYSTEM_TICKS[cpu].load(Ordering::Relaxed),
+        idle: CPU_IDLE_TICKS[cpu].load(Ordering::Relaxed),
+        ..Default::default()
+    }
+}
+
 /// `sched:` line of `/proc/kdebug`: what each scheduling CPU runs, its
 /// switches and busy/idle ticks, and the concurrency actually reached.
 pub fn render() -> alloc::string::String {
@@ -1581,7 +1738,7 @@ pub fn render() -> alloc::string::String {
         match invariants { Ok(()) => alloc::string::String::from("ok"), Err(v) => alloc::format!("{:?}", v) },
     );
     for c in (0..MAX_CPUS).filter(|&c| is_scheduling(c)) {
-        let busy = CPU_BUSY_TICKS[c].load(Ordering::Relaxed);
+        let busy = CPU_USER_TICKS[c].load(Ordering::Relaxed) + CPU_SYSTEM_TICKS[c].load(Ordering::Relaxed);
         let idle = CPU_IDLE_TICKS[c].load(Ordering::Relaxed);
         let _ = writeln!(
             out,
@@ -1690,6 +1847,13 @@ pub fn current_pid_safe() -> Option<usize> {
 /// Look up an arbitrary process's `exe_name` by pid — checked against
 /// `running` plus every run queue and the wait queue (see `iter_all`).
 /// Self-contained `cli`/`sti`, same reasoning as `current_pid_safe`.
+/// Backs `/proc/<pid>/cmdline` (`fs::procfs`): `Process::cmdline`.
+pub fn cmdline_for_pid(pid: usize) -> Option<Arc<[u8]>> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        local_scheduler().iter_all().find(|p| p.pid.0 == pid).map(|p| p.cmdline.clone())
+    })
+}
+
 /// Backs `/proc/<pid>/exe`'s `readlink()` (`fs::procfs`).
 pub fn exe_name_for_pid(pid: usize) -> Option<alloc::string::String> {
     unsafe { core::arch::asm!("cli"); }
@@ -1724,6 +1888,14 @@ pub struct ProcStatSnapshot {
     pub name: [u8; 16],
     pub state: crate::process::ProcessState,
     pub priority: u8,
+    pub times: sched::cputime::ProcTimes,
+    pub start_ticks: u64,
+    pub last_cpu: usize,
+    pub vsize: u64,
+    /// Kernel layout: bit N = signal N.
+    pub pending: u64,
+    pub blocked: u64,
+    pub ctty: Option<usize>,
 }
 
 pub fn proc_stat_snapshot(pid: usize) -> Option<ProcStatSnapshot> {
@@ -1737,6 +1909,17 @@ pub fn proc_stat_snapshot(pid: usize) -> Option<ProcStatSnapshot> {
             name: p.name,
             state: p.state,
             priority: p.effective_priority,
+            times: {
+                let mut t = p.times;
+                t.absorb_thread(&p.dead_threads);
+                t
+            },
+            start_ticks: p.start_ticks,
+            last_cpu: p.last_cpu,
+            vsize: p.address_space.vsize_bytes(),
+            pending: p.pending_signals,
+            blocked: p.blocked_signals,
+            ctty: p.ctty,
         });
     unsafe { core::arch::asm!("sti"); }
     snap

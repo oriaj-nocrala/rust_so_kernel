@@ -10,21 +10,18 @@
 // LAYOUT
 // ──────
 //   /proc/           (ProcDirInode)
-//   ├── meminfo
+//   ├── meminfo, kdebug, acpi, dmesg, fbinfo, pci
+//   ├── stat, uptime, loadavg, cpuinfo   (Linux formats, `RenderedInode`)
 //   ├── self         → symlink to /proc/<own pid>
-//   └── <pid>/       (ProcPidDirInode, only for a pid that actually exists)
-//       └── exe      → symlink to whatever ELF path that process is running
+//   └── <pid>/       (ProcPidDirInode, for every live pid — listed too)
+//       ├── exe      → symlink to whatever ELF path that process is running
+//       ├── stat     (all 52 fields of Linux's, see `render_proc_stat`)
+//       └── cmdline  (argv, NUL-separated)
 //
-// Real Linux's /proc/<pid> has dozens of entries (cmdline, status, fd/,
-// maps, ...) — only `exe` exists here, since that's the one thing
-// anything in this kernel actually consumes (`ash`'s FEATURE_SH_STANDALONE
-// re-exec). `readdir` on the root only lists the always-present entries
-// (meminfo, self) — it does not enumerate live pids, so `ls /proc` won't
-// show every process; direct lookup (`cat /proc/3/exe`, `cd /proc/3`)
-// still works for any pid that's actually alive.
+// Every file is regenerated on `open()`.
 //
-// Inode numbers: 200 = /proc directory, 201 = meminfo, 202 = self.
-// Per-pid inodes are derived from the pid (see `pid_dir_ino`/`pid_exe_ino`).
+// Inode numbers: 200 = /proc directory, 201.. = the fixed files (see
+// `readdir`). Per-pid inodes are derived from the pid (`pid_*_ino`).
 
 use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
 
@@ -34,9 +31,10 @@ use crate::fs::{
 };
 use crate::process::file::{FileError, FileHandle, FileResult};
 
-fn pid_dir_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 3 }
-fn pid_exe_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 3 + 1 }
-fn pid_stat_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 3 + 2 }
+fn pid_dir_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 4 }
+fn pid_exe_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 4 + 1 }
+fn pid_stat_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 4 + 2 }
+fn pid_cmdline_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 4 + 3 }
 
 // ── Filesystem ───────────────────────────────────────────────────────────────
 
@@ -99,17 +97,20 @@ fn render_acpi() -> String {
     out
 }
 
-/// Renders `/proc/<pid>/stat` in the classic Linux `"pid (comm) state
-/// ppid pgid sid tty tpgid flags minflt cminflt majflt cmajflt utime stime
-/// cutime cstime priority nice ..."` shape — this is what BusyBox
-/// `ps`/`top` (`libbb/procps.c::procps_scan`) actually parses: split on the
-/// last `)` to pull `comm` out (so it's safe even if `comm` itself
-/// contained spaces, though ours never does), then a fixed-position
-/// `sscanf` over everything after. Fields this kernel has no real data for
-/// (page fault counts, per-process cpu ticks, start time, memory size) are
-/// reported as `0` — enough for `ps`/`top` to run and show real pid/name/
-/// state/ppid/pgid/priority without crashing on a short field list, not
-/// enough for their CPU%/MEM%/VSZ/RSS columns to mean anything yet.
+/// Renders `/proc/<pid>/stat`: all 52 fields of Linux's
+/// `fs/proc/array.c::do_task_stat`, in order — what BusyBox `ps`/`top`
+/// (`libbb/procps.c::procps_scan`) and anything else written against
+/// Linux parse: split on the last `)` to pull `comm` out, then fixed
+/// positions after it.
+///
+/// Real: state, ppid, pgid, sid, `tty_nr` (a pty slave's `136:n`),
+/// `utime`/`stime`/`cutime`/`cstime` and `starttime` (ticks,
+/// `sched::cputime`), `vsize` (every VMA whole), pending and blocked
+/// signals (field 31/32, Linux's bit layout: bit N-1 = signal N), and the
+/// CPU it last ran on (field 39). `priority` is the scheduler's effective
+/// priority, not Linux's `20 + nice`. Zero where this kernel keeps nothing
+/// to report: fault counts, `rss` (resident pages are not counted), the
+/// code/stack/argument addresses.
 fn render_proc_stat(pid: usize, snap: &crate::process::scheduler::ProcStatSnapshot) -> String {
     let end = snap.name.iter().position(|&b| b == 0).unwrap_or(snap.name.len());
     let comm = String::from_utf8_lossy(&snap.name[..end]);
@@ -120,11 +121,173 @@ fn render_proc_stat(pid: usize, snap: &crate::process::scheduler::ProcStatSnapsh
         crate::process::ProcessState::Zombie => 'Z',
         crate::process::ProcessState::Stopped => 'T',
     };
+    // Unix98 pty slaves are character major 136; `new_encode_dev` for a
+    // minor below 256 is just `major << 8 | minor`.
+    let tty_nr = snap.ctty.map_or(0, |n| (136 << 8) | n as u64);
+    let t = &snap.times;
     format!(
-        "{pid} ({comm}) {state} {ppid} {pgid} {sid} 0 -1 0 0 0 0 0 0 0 0 0 {priority} 0 0 0 0 0 0\n",
+        "{pid} ({comm}) {state} {ppid} {pgid} {sid} {tty_nr} -1 0 0 0 0 0 \
+         {utime} {stime} {cutime} {cstime} {priority} 0 1 0 {start} {vsize} 0 \
+         18446744073709551615 0 0 0 0 0 {pending} {blocked} 0 0 0 0 0 17 {cpu} \
+         0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         pid = pid, comm = comm, state = state,
-        ppid = snap.ppid, pgid = snap.pgid, sid = snap.sid, priority = snap.priority,
+        ppid = snap.ppid, pgid = snap.pgid, sid = snap.sid, tty_nr = tty_nr,
+        utime = t.utime, stime = t.stime, cutime = t.cutime, cstime = t.cstime,
+        priority = snap.priority, start = snap.start_ticks, vsize = snap.vsize,
+        pending = snap.pending >> 1, blocked = snap.blocked >> 1, cpu = snap.last_cpu,
     )
+}
+
+/// Renders `/proc/stat` in Linux's format: the aggregate `cpu` line, one
+/// `cpuN` line per CPU that runs processes (`sched::cputime` for the
+/// columns and why most of them are 0), then `ctxt`, `btime`,
+/// `processes`, `procs_running` and `procs_blocked`. There is no `intr`
+/// line — nothing counts interrupts per source yet, and an invented one
+/// would be read as real. `procs_blocked` is Linux's uninterruptible
+/// (`D`) sleepers: every sleep here is interruptible, so 0.
+fn render_stat() -> String {
+    use core::fmt::Write;
+    // One read per CPU, so the aggregate is exactly the sum of the lines.
+    let cpus: Vec<(usize, sched::cputime::CpuTimes)> = crate::process::scheduler::scheduling_cpus()
+        .map(|c| (c, crate::process::scheduler::cpu_times(c)))
+        .collect();
+    let mut all = sched::cputime::CpuTimes::default();
+    for (_, t) in &cpus {
+        all.add(t);
+    }
+    let mut out = String::new();
+    let _ = sched::cputime::write_stat_line(&mut out, None, &all);
+    for (c, t) in &cpus {
+        let _ = sched::cputime::write_stat_line(&mut out, Some(*c), t);
+    }
+    let (running, _) = crate::process::scheduler::process_counts();
+    let _ = write!(
+        out,
+        "ctxt {}\nbtime {}\nprocesses {}\nprocs_running {}\nprocs_blocked 0\n",
+        crate::debug::switches_total(),
+        crate::time::boot_unix_secs(),
+        crate::debug::forks_total(),
+        running,
+    );
+    out
+}
+
+/// Renders `/proc/uptime`: seconds since boot, then seconds all CPUs
+/// together have spent idle (so it can exceed the first number on a
+/// multi-CPU machine, as on Linux), both with two decimals.
+fn render_uptime() -> String {
+    let up_cs = crate::time::ktime_get() / 10_000_000;
+    let idle_cs: u64 = crate::process::scheduler::scheduling_cpus()
+        .map(|c| crate::process::scheduler::cpu_times(c).idle)
+        .sum::<u64>()
+        * (100 / sched::cputime::USER_HZ);
+    format!("{}.{:02} {}.{:02}\n", up_cs / 100, up_cs % 100, idle_cs / 100, idle_cs % 100)
+}
+
+/// Renders `/proc/loadavg` as Linux does: the 1/5/15-minute averages
+/// (`sched::loadavg`), runnable/total processes, the last pid allocated.
+fn render_loadavg() -> String {
+    let (avg, last_pid) = crate::process::scheduler::loadavg();
+    let (running, total) = crate::process::scheduler::process_counts();
+    let mut out = String::new();
+    for a in avg {
+        let (i, f) = sched::loadavg::split(a);
+        out.push_str(&format!("{}.{:02} ", i, f));
+    }
+    out.push_str(&format!("{}/{} {}\n", running, total, last_pid));
+    out
+}
+
+/// Renders `/proc/cpuinfo` in Linux's x86 layout, one block per CPU that
+/// runs processes. Identification and flags are this CPU's `cpuid`
+/// (decoded by `hal::cpuid`) — every core of one package reports the same;
+/// `apicid` is each CPU's own. `cpu MHz` is the calibrated TSC frequency
+/// and `bogomips` twice it, which is what Linux derives from the TSC too.
+fn render_cpuinfo() -> String {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    use core::fmt::Write;
+    use hal::cpuid::{self, FeatureRegs, Regs};
+
+    let r = |l: u32| {
+        let c = __cpuid(l);
+        Regs { eax: c.eax, ebx: c.ebx, ecx: c.ecx, edx: c.edx }
+    };
+    let leaf0 = r(0);
+    let max_ext = r(0x8000_0000).eax;
+    let l1 = r(1);
+    let l7 = if leaf0.eax >= 7 {
+        let c = __cpuid_count(7, 0);
+        Regs { eax: c.eax, ebx: c.ebx, ecx: c.ecx, edx: c.edx }
+    } else {
+        Regs::default()
+    };
+    let e1 = if max_ext >= 0x8000_0001 { r(0x8000_0001) } else { Regs::default() };
+    let brand = (max_ext >= 0x8000_0004)
+        .then(|| cpuid::brand([r(0x8000_0002), r(0x8000_0003), r(0x8000_0004)]));
+    let addr = (max_ext >= 0x8000_0008).then(|| r(0x8000_0008).eax);
+
+    let vendor = cpuid::vendor(leaf0);
+    let vendor = cpuid::trimmed(&vendor).unwrap_or("unknown");
+    let model_name = brand.as_ref().and_then(|b| cpuid::trimmed(b)).unwrap_or("unknown");
+    let sig = cpuid::signature(l1.eax);
+    let feats = FeatureRegs {
+        l1_edx: l1.edx, l1_ecx: l1.ecx, l7_ebx: l7.ebx, l7_ecx: l7.ecx,
+        e1_edx: e1.edx, e1_ecx: e1.ecx,
+    };
+    let mut flags = String::new();
+    for f in cpuid::flags(&feats) {
+        if !flags.is_empty() {
+            flags.push(' ');
+        }
+        flags.push_str(f);
+    }
+    let khz = crate::cpu::tsc::freq_hz() / 1000;
+    let clflush = ((l1.ebx >> 8) & 0xFF) * 8;
+    let cpus: Vec<usize> = crate::process::scheduler::scheduling_cpus().collect();
+
+    let mut out = String::new();
+    for &c in &cpus {
+        let apic = crate::smp::apic_id(c);
+        let _ = write!(
+            out,
+            "processor\t: {c}\nvendor_id\t: {vendor}\ncpu family\t: {fam}\nmodel\t\t: {model}\n\
+             model name\t: {model_name}\nstepping\t: {step}\ncpu MHz\t\t: {mhz}.{mhz_frac:03}\n\
+             physical id\t: 0\nsiblings\t: {n}\napicid\t\t: {apic}\ninitial apicid\t: {apic}\n\
+             fpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: {level}\nwp\t\t: yes\n\
+             flags\t\t: {flags}\nbogomips\t: {bogo}.{bogo_frac:02}\nclflush size\t: {clflush}\n\
+             cache_alignment\t: {clflush}\n",
+            fam = sig.family, model = sig.model, step = sig.stepping,
+            mhz = khz / 1000, mhz_frac = khz % 1000, n = cpus.len(),
+            level = leaf0.eax, bogo = khz * 2 / 1000, bogo_frac = (khz * 2 % 1000) / 10,
+        );
+        if let Some(a) = addr {
+            let _ = writeln!(out, "address sizes\t: {} bits physical, {} bits virtual", a & 0xFF, (a >> 8) & 0xFF);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// A read-only `/proc` file regenerated on every `open()` by `render`
+/// (the same convention as `meminfo`/`kdebug`, without a struct each).
+struct RenderedInode {
+    ino: u64,
+    render: fn() -> String,
+}
+
+impl Inode for RenderedInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
+    fn stat(&self) -> Stat {
+        Stat::regular(self.ino, (self.render)().len() as i64)
+    }
+
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+        if flags.is_write() {
+            return Err(Errno::EROFS);
+        }
+        Ok(Box::new(ProcFile { data: (self.render)().into_bytes(), offset: 0 }))
+    }
 }
 
 /// Renders `/proc/fbinfo` — the framebuffer console's instrument panel:
@@ -338,6 +501,10 @@ impl Inode for ProcDirInode {
             "pci" => Ok(Arc::new(PciInode)),
             "dmesg" => Ok(Arc::new(DmesgInode)),
             "self" => Ok(Arc::new(SelfInode)),
+            "stat" => Ok(Arc::new(RenderedInode { ino: 208, render: render_stat })),
+            "uptime" => Ok(Arc::new(RenderedInode { ino: 209, render: render_uptime })),
+            "cpuinfo" => Ok(Arc::new(RenderedInode { ino: 210, render: render_cpuinfo })),
+            "loadavg" => Ok(Arc::new(RenderedInode { ino: 211, render: render_loadavg })),
             _ => {
                 let pid: usize = name.parse().map_err(|_| Errno::ENOENT)?;
                 if crate::process::scheduler::exe_name_for_pid(pid).is_some() {
@@ -360,13 +527,17 @@ impl Inode for ProcDirInode {
             6 => Ok(Some(DirEntry::new(205, FileType::Regular, b"dmesg"))),
             7 => Ok(Some(DirEntry::new(206, FileType::Regular, b"fbinfo"))),
             8 => Ok(Some(DirEntry::new(207, FileType::Regular, b"pci"))),
+            9 => Ok(Some(DirEntry::new(208, FileType::Regular, b"stat"))),
+            10 => Ok(Some(DirEntry::new(209, FileType::Regular, b"uptime"))),
+            11 => Ok(Some(DirEntry::new(210, FileType::Regular, b"cpuinfo"))),
+            12 => Ok(Some(DirEntry::new(211, FileType::Regular, b"loadavg"))),
             n => {
                 // Live pids, appended after the always-present entries above
                 // — this is what makes `ls /proc` / BusyBox `ps`'s
                 // `opendir("/proc")` scan see every process (previously
                 // direct lookup like `cat /proc/3/exe` worked but nothing
                 // enumerated them, see this module's top doc comment).
-                let idx = (n - 9) as usize;
+                let idx = (n - 13) as usize;
                 let pids = crate::process::scheduler::all_pids();
                 let Some(&pid) = pids.get(idx) else { return Ok(None); };
                 let name = format!("{}", pid);
@@ -565,6 +736,7 @@ impl Inode for ProcPidDirInode {
         match name {
             "exe" => Ok(Arc::new(ProcExeInode { pid: self.pid })),
             "stat" => Ok(Arc::new(ProcStatInode { pid: self.pid })),
+            "cmdline" => Ok(Arc::new(ProcCmdlineInode { pid: self.pid })),
             _ => Err(Errno::ENOENT),
         }
     }
@@ -576,6 +748,7 @@ impl Inode for ProcPidDirInode {
             1 => Ok(Some(DirEntry::new(ino, FileType::Directory, b".."))),
             2 => Ok(Some(DirEntry::new(pid_exe_ino(self.pid), FileType::Symlink, b"exe"))),
             3 => Ok(Some(DirEntry::new(pid_stat_ino(self.pid), FileType::Regular, b"stat"))),
+            4 => Ok(Some(DirEntry::new(pid_cmdline_ino(self.pid), FileType::Regular, b"cmdline"))),
             _ => Ok(None),
         }
     }
@@ -606,6 +779,32 @@ impl Inode for ProcStatInode {
             .ok_or(Errno::ENOENT)?;
         let data = render_proc_stat(self.pid, &snap).into_bytes();
         Ok(Box::new(ProcFile { data, offset: 0 }))
+    }
+}
+
+/// `/proc/<pid>/cmdline`: the arguments the process was exec'd with, each
+/// followed by a NUL (`Process::cmdline`) — what `ps`/`top` print as the
+/// command. Empty for a process that never exec'd a program (PID 1's
+/// kernel-built image, the idle processes): BusyBox then shows `[comm]`,
+/// as Linux tools do for kernel threads.
+struct ProcCmdlineInode {
+    pid: usize,
+}
+
+impl Inode for ProcCmdlineInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
+    fn stat(&self) -> Stat {
+        let len = crate::process::scheduler::cmdline_for_pid(self.pid).map_or(0, |c| c.len());
+        Stat::regular(pid_cmdline_ino(self.pid), len as i64)
+    }
+
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+        if flags.is_write() {
+            return Err(Errno::EROFS);
+        }
+        let c = crate::process::scheduler::cmdline_for_pid(self.pid).ok_or(Errno::ENOENT)?;
+        Ok(Box::new(ProcFile { data: c.to_vec(), offset: 0 }))
     }
 }
 

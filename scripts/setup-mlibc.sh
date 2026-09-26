@@ -131,6 +131,43 @@ PYEOF
     echo "setup-mlibc: declared memfd_create outside the Linux option"
 fi
 
+# ── 1c. Declare sched_getaffinity outside the Linux option (idempotent) ──
+#
+# Same shape as 1b: <sched.h> declares sched_getaffinity (and cpu_set_t)
+# only through <bits/linux/linux_sched.h>, under __MLIBC_LINUX_OPTION. The
+# kernel has the syscall (#204) and generic.cpp defines the function, so
+# the declaration moves out where BusyBox `nproc` and portable code look.
+if ! grep -q "sched_getaffinity: declared for every port" mlibc/options/posix/include/sched.h; then
+    python3 - "$REPO_ROOT/mlibc/options/posix/include/sched.h" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+
+anchor = "#if __MLIBC_LINUX_OPTION\n#include <bits/linux/linux_sched.h>\n#include <bits/linux/cpu_set.h>\n#endif\n"
+if content.count(anchor) != 1:
+    print("error: mlibc's sched.h Linux-option include block doesn't match "
+          "the expected text (upstream mlibc changed) -- setup-mlibc.sh's "
+          "sched_getaffinity patch needs updating", file=sys.stderr)
+    sys.exit(1)
+
+content = content.replace(
+    anchor,
+    anchor +
+    "\n#if !__MLIBC_LINUX_OPTION && !defined(__MLIBC_ABI_ONLY)\n"
+    "/* sched_getaffinity: declared for every port; constanos defines it in\n"
+    " * its sysdeps (generic.cpp) since the Linux option is off. */\n"
+    "#include <bits/cpu_set.h>\n"
+    "int sched_getaffinity(pid_t __pid, size_t __cpusetsize, cpu_set_t *__mask);\n"
+    "#endif\n",
+    1)
+with open(path, "w") as f:
+    f.write(content)
+PYEOF
+    echo "setup-mlibc: declared sched_getaffinity outside the Linux option"
+fi
+
 # ── 2. Register 'constanos' in mlibc/meson.build (idempotent) ─────────────
 
 if ! grep -q "host_machine.system() == 'constanos'" mlibc/meson.build; then

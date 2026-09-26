@@ -331,6 +331,12 @@ impl<E: SchedEntity> SchedCore<E> {
     /// `(0..NUM_PRIORITIES).rev()` — starting at 0, unlike
     /// [`Self::take_first_startable`]'s scan just above, because this is
     /// only logging, not picking a candidate to start.
+    /// The most recently allocated pid (0 before the first) —
+    /// `/proc/loadavg`'s last field.
+    pub fn last_pid(&self) -> usize {
+        self.next_pid - 1
+    }
+
     pub fn iter_ready_desc(&self) -> impl Iterator<Item = &E> + '_ {
         self.run_queues.iter().rev().flat_map(|q| q.iter()).map(|b| b.as_ref())
     }

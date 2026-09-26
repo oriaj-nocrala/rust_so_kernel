@@ -167,6 +167,9 @@ pub use clock::{Clock, FakeClock};
 pub mod core;
 pub use core::SchedCore;
 
+pub mod cputime;
+pub mod loadavg;
+
 pub mod invariants;
 
 pub mod wait;

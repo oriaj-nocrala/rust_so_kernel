@@ -42,6 +42,12 @@ pub fn init() {
 /// captured once at boot, plus monotonic uptime since then. Never reads
 /// the RTC hardware again after boot — there's no periodic RTC IRQ wired
 /// up, and none is needed for this.
+/// Unix time at uptime 0 (`/proc/stat`'s `btime`), from the boot-time RTC
+/// reading; 0 if the RTC never answered.
+pub fn boot_unix_secs() -> u64 {
+    BOOT_UNIX_SECS.load(Ordering::Relaxed)
+}
+
 pub fn now_unix_secs() -> u64 {
     BOOT_UNIX_SECS.load(Ordering::Relaxed) + ktime_get() / 1_000_000_000
 }

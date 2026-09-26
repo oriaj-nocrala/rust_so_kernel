@@ -148,39 +148,47 @@ pub(super) fn sys_uptime_sec() -> SyscallResult {
     (crate::time::ktime_get() / 1_000_000_000) as SyscallResult
 }
 
-/// sys_clock_gettime (Linux #228) — write a `struct timespec` to user memory.
-///
-/// Supported clock IDs:
-///   0 = CLOCK_REALTIME   — real wall-clock time (CMOS RTC read once at
-///                          boot, see `crate::rtc`, plus uptime since)
-///   1 = CLOCK_MONOTONIC  — uptime since boot, unaffected by wall-clock
-///   7 = CLOCK_BOOTTIME   — same as MONOTONIC; included for glibc compat
-///
-/// `struct timespec { i64 tv_sec; i64 tv_nsec; }` (16 bytes, 8-byte aligned).
-///
-/// The process's own page table is active during the syscall, so we can
-/// write directly to the user virtual address without physical translation.
+// Linux clock ids (`<time.h>`).
+const CLOCK_REALTIME: u64 = 0;
+const CLOCK_MONOTONIC: u64 = 1;
+const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
+const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
+const CLOCK_MONOTONIC_RAW: u64 = 4;
+const CLOCK_REALTIME_COARSE: u64 = 5;
+const CLOCK_MONOTONIC_COARSE: u64 = 6;
+const CLOCK_BOOTTIME: u64 = 7;
+
+/// sys_clock_gettime (Linux #228). `CLOCK_REALTIME` is wall-clock (the
+/// boot-time RTC reading plus uptime); the monotonic family and
+/// `CLOCK_BOOTTIME` are uptime (nothing here suspends, so they agree);
+/// `CLOCK_PROCESS_CPUTIME_ID` is the time the calling process's whole
+/// thread group has run and `CLOCK_THREAD_CPUTIME_ID` the caller's own,
+/// measured at every context switch (`Process::exec_ns`), not sampled.
+/// Other ids (a `clockid_t` for another process's CPU clock, the alarm
+/// clocks) are `EINVAL`.
 pub(super) fn sys_clock_gettime(clk_id: u64, tp_ptr: u64) -> SyscallResult {
-    // Validate the user pointer (16 bytes = 2 × i64)
     if let Err(e) = validate_user_buffer(tp_ptr, 16) {
         return e;
     }
 
-    // Accept only the clock IDs we can serve meaningfully.
-    match clk_id {
-        0 | 1 | 7 => {}
+    let (tv_sec, tv_nsec) = match clk_id {
+        CLOCK_REALTIME | CLOCK_REALTIME_COARSE => {
+            // `tv_nsec` is uptime's sub-second fraction: the RTC reading
+            // only ever contributes whole seconds, so it is also real
+            // time's fraction of its current second.
+            let up = crate::time::ktime_get();
+            (crate::time::now_unix_secs(), up % 1_000_000_000)
+        }
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => {
+            let up = crate::time::ktime_get();
+            (up / 1_000_000_000, up % 1_000_000_000)
+        }
+        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
+            let Some(t) = super::current_cpu_times() else { return errno::ESRCH };
+            let ns = if clk_id == CLOCK_PROCESS_CPUTIME_ID { t.group_exec_ns } else { t.own_exec_ns };
+            (ns / 1_000_000_000, ns % 1_000_000_000)
+        }
         _ => return errno::EINVAL,
-    }
-
-    let uptime_ns = crate::time::ktime_get();
-    // `tv_nsec` is uptime's own sub-second fraction either way — for
-    // CLOCK_REALTIME that's also real time's fraction of its current
-    // second, since the RTC reading only ever contributes whole seconds.
-    let tv_nsec = (uptime_ns % 1_000_000_000) as i64;
-    let tv_sec = if clk_id == 0 {
-        crate::time::now_unix_secs() as i64
-    } else {
-        (uptime_ns / 1_000_000_000) as i64
     };
 
     // Direct write into user VA — safe because:
@@ -189,12 +197,169 @@ pub(super) fn sys_clock_gettime(clk_id: u64, tp_ptr: u64) -> SyscallResult {
     //      but the user page tables haven't been switched away).
     //   3. If the page isn't mapped yet, the write faults and the page-fault
     //      handler demand-pages it (same as any user store instruction).
+    // No lock is held here (`current_cpu_times` released the scheduler's).
     unsafe {
         let ptr = tp_ptr as *mut i64;
-        ptr.write(tv_sec);
-        ptr.add(1).write(tv_nsec);
+        ptr.write(tv_sec as i64);
+        ptr.add(1).write(tv_nsec as i64);
     }
 
     0
+}
+
+/// sys_clock_getres (Linux #229): 1 ns for every clock `clock_gettime`
+/// serves — each is a TSC reading converted to nanoseconds (or the jiffies
+/// fallback, which is coarser than it claims; Linux reports the hrtimer
+/// resolution the same way). A null `res` only validates the id.
+pub(super) fn sys_clock_getres(clk_id: u64, res_ptr: u64) -> SyscallResult {
+    if clk_id > CLOCK_BOOTTIME {
+        return errno::EINVAL;
+    }
+    if res_ptr != 0 {
+        if let Err(e) = validate_user_buffer(res_ptr, 16) {
+            return e;
+        }
+        unsafe {
+            let ptr = res_ptr as *mut i64;
+            ptr.write(0);
+            ptr.add(1).write(1);
+        }
+    }
+    0
+}
+
+/// sys_times (Linux #100): `struct tms` (four `clock_t`s, in ticks of
+/// `sched::cputime::USER_HZ`) for the calling process's thread group —
+/// user, system, and its waited-for children's — and the uptime in the
+/// same ticks as the return value (POSIX: "elapsed real time … since an
+/// arbitrary point in the past"; Linux's is boot-relative too). A null
+/// `buf` just returns the clock, as Linux allows.
+pub(super) fn sys_times(buf: u64) -> SyscallResult {
+    let now = (crate::time::ktime_get() / (1_000_000_000 / sched::cputime::USER_HZ)) as i64;
+    if buf == 0 {
+        return now;
+    }
+    if let Err(e) = validate_user_buffer(buf, 32) {
+        return e;
+    }
+    let Some(t) = super::current_cpu_times() else { return errno::ESRCH };
+    let g = t.group;
+    unsafe {
+        let p = buf as *mut i64;
+        p.write(g.utime as i64);
+        p.add(1).write(g.stime as i64);
+        p.add(2).write(g.cutime as i64);
+        p.add(3).write(g.cstime as i64);
+    }
+    now
+}
+
+/// `sizeof(struct sysinfo)` on x86-64.
+const SYSINFO_SIZE: usize = 112;
+
+/// sys_sysinfo (Linux #99): uptime in seconds, the load averages (scaled
+/// to `1 << 16`, Linux's `SI_LOAD_SHIFT`), total and free RAM in bytes
+/// (`mem_unit` 1; the Buddy allocator's view, as `/proc/meminfo`), and the
+/// number of processes. No swap, no shared or buffer memory, no highmem.
+pub(super) fn sys_sysinfo(buf: u64) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(buf, SYSINFO_SIZE) {
+        return e;
+    }
+    let (avg, _) = crate::process::scheduler::loadavg();
+    let (_, procs) = crate::process::scheduler::process_counts();
+    let (total, free) = crate::allocator::mem_stats();
+    let uptime = crate::time::ktime_get() / 1_000_000_000;
+    let shift = 16 - sched::loadavg::FSHIFT;
+    unsafe {
+        let p = buf as *mut u8;
+        core::ptr::write_bytes(p, 0, SYSINFO_SIZE);
+        let q = p as *mut u64;
+        q.write(uptime);
+        for (i, a) in avg.iter().enumerate() {
+            q.add(1 + i).write(a << shift);
+        }
+        q.add(4).write(total as u64);
+        q.add(5).write(free as u64);
+        (p.add(80) as *mut u16).write(procs.min(u16::MAX as usize) as u16);
+        (p.add(104) as *mut u32).write(1);
+    }
+    0
+}
+
+const RUSAGE_SELF: i64 = 0;
+const RUSAGE_CHILDREN: i64 = -1;
+const RUSAGE_THREAD: i64 = 1;
+/// `sizeof(struct rusage)` on x86-64: two `timeval`s and fourteen `long`s.
+const RUSAGE_SIZE: usize = 144;
+
+/// sys_getrusage (Linux #98). `ru_utime`/`ru_stime` for `RUSAGE_SELF` (the
+/// thread group), `RUSAGE_CHILDREN` (waited-for descendants) or
+/// `RUSAGE_THREAD` (the caller alone), from the same tick counts as
+/// `times()`, so a tick's granularity (10 ms). Every other field is 0:
+/// page faults, context switches and the rest are not counted per process.
+pub(super) fn sys_getrusage(who: i64, buf: u64) -> SyscallResult {
+    if !matches!(who, RUSAGE_SELF | RUSAGE_CHILDREN | RUSAGE_THREAD) {
+        return errno::EINVAL;
+    }
+    if let Err(e) = validate_user_buffer(buf, RUSAGE_SIZE) {
+        return e;
+    }
+    let Some(t) = super::current_cpu_times() else { return errno::ESRCH };
+    let (user, sys) = match who {
+        RUSAGE_SELF => (t.group.utime, t.group.stime),
+        RUSAGE_CHILDREN => (t.group.cutime, t.group.cstime),
+        _ => (t.own.utime, t.own.stime),
+    };
+    let usec_per_tick = 1_000_000 / sched::cputime::USER_HZ;
+    let (user, sys) = (user * usec_per_tick, sys * usec_per_tick);
+    unsafe {
+        let p = buf as *mut i64;
+        for i in 0..RUSAGE_SIZE / 8 {
+            p.add(i).write(0);
+        }
+        p.write((user / 1_000_000) as i64);
+        p.add(1).write((user % 1_000_000) as i64);
+        p.add(2).write((sys / 1_000_000) as i64);
+        p.add(3).write((sys % 1_000_000) as i64);
+    }
+    0
+}
+
+/// sys_sched_getaffinity (Linux #204): the CPUs the process may run on —
+/// every CPU that runs processes, for every process, since there is no
+/// `sched_setaffinity`. Linux's rules for the buffer: `len` must hold a
+/// bit per possible CPU and be a multiple of `sizeof(long)` (else
+/// `EINVAL`); the return value is the bytes written — the kernel's
+/// cpumask size, here 8 (`MAX_CPUS` = 32 rounded up to a `long`) — and the
+/// caller's libc clears the rest. `pid` 0 is the caller; any other must
+/// exist (`ESRCH`).
+pub(super) fn sys_sched_getaffinity(pid: i64, len: usize, mask_ptr: u64) -> SyscallResult {
+    const MASK_BYTES: usize = (crate::cpu::MAX_CPUS + 63) / 64 * 8;
+    if len * 8 < crate::cpu::MAX_CPUS || len % 8 != 0 {
+        return errno::EINVAL;
+    }
+    if pid < 0 {
+        return errno::ESRCH;
+    }
+    if pid > 0 {
+        let exists = super::with_scheduler(|s| s.iter_all().any(|p| p.pid.0 == pid as usize) as SyscallResult);
+        if exists == 0 {
+            return errno::ESRCH;
+        }
+    }
+    if let Err(e) = validate_user_buffer(mask_ptr, MASK_BYTES) {
+        return e;
+    }
+    let mut mask = [0u64; MASK_BYTES / 8];
+    for c in crate::process::scheduler::scheduling_cpus() {
+        mask[c / 64] |= 1 << (c % 64);
+    }
+    unsafe {
+        let p = mask_ptr as *mut u64;
+        for (i, w) in mask.iter().enumerate() {
+            p.add(i).write(*w);
+        }
+    }
+    MASK_BYTES as SyscallResult
 }
 

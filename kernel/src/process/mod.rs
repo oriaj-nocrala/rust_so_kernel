@@ -298,6 +298,38 @@ pub struct Process {
     /// `SA_RESTART`, one bit per signal (bit N = signal N), from
     /// `sigaction`. Reset with the handlers on `exec`.
     pub sig_restart: u64,
+
+    /// CPU time in ticks (`sched::cputime`): user/system sampled by the
+    /// timer, one tick at a time, to whatever each CPU interrupted; plus
+    /// the children this process has waited for. Fields 14-17 of `/proc/<pid>/stat`,
+    /// `times(2)`, `getrusage(2)`.
+    pub times: sched::cputime::ProcTimes,
+    /// The time of this process's threads that have exited — part of the
+    /// thread group's time (`times`, `CLOCK_PROCESS_CPUTIME_ID`,
+    /// `/proc/<pid>/stat`), never of this thread's own
+    /// (`CLOCK_THREAD_CPUTIME_ID`, `RUSAGE_THREAD`). Only ever nonzero on a
+    /// group's leader.
+    pub dead_threads: sched::cputime::ProcTimes,
+    pub dead_threads_ns: u64,
+    /// Time actually run, in nanoseconds, measured at every switch rather
+    /// than sampled (Linux's `sum_exec_runtime`): what
+    /// `CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID` report. Does
+    /// not include the current run until the process is switched out —
+    /// `Scheduler::exec_ns_now` adds it.
+    pub exec_ns: u64,
+    /// `ktime_get()` when this process last started running (`switch_in`).
+    pub run_since_ns: u64,
+    /// When it was created, in ticks since boot (field 22 of
+    /// `/proc/<pid>/stat`, `ps`'s elapsed time).
+    pub start_ticks: u64,
+    /// The CPU it last ran on (field 39 of `/proc/<pid>/stat`).
+    pub last_cpu: usize,
+    /// argv as `exec` received it, each argument NUL-terminated —
+    /// `/proc/<pid>/cmdline`. A copy taken at exec (Linux reads the live
+    /// argument area of the process's memory, so a program rewriting its
+    /// own argv is not reflected here). Shared with `fork` children and
+    /// threads until they exec; empty for kernel processes.
+    pub cmdline: alloc::sync::Arc<[u8]>,
 }
 
 impl Process {
@@ -379,6 +411,14 @@ impl Process {
             wait: None,
             interrupted: None,
             sig_restart: 0,
+            times: sched::cputime::ProcTimes::default(),
+            dead_threads: sched::cputime::ProcTimes::default(),
+            dead_threads_ns: 0,
+            exec_ns: 0,
+            last_cpu: 0,
+            cmdline: alloc::sync::Arc::from(&[][..]),
+            run_since_ns: 0,
+            start_ticks: crate::time::ktime_get() / (1_000_000_000 / sched::cputime::USER_HZ),
         }
     }
 
@@ -461,6 +501,14 @@ impl Process {
             wait: None,
             interrupted: None,
             sig_restart: 0,
+            times: sched::cputime::ProcTimes::default(),
+            dead_threads: sched::cputime::ProcTimes::default(),
+            dead_threads_ns: 0,
+            exec_ns: 0,
+            last_cpu: 0,
+            cmdline: alloc::sync::Arc::from(&[][..]),
+            run_since_ns: 0,
+            start_ticks: crate::time::ktime_get() / (1_000_000_000 / sched::cputime::USER_HZ),
         }
     }
 
@@ -534,6 +582,14 @@ impl Process {
             wait: None,
             interrupted: None,
             sig_restart: 0,
+            times: sched::cputime::ProcTimes::default(),
+            dead_threads: sched::cputime::ProcTimes::default(),
+            dead_threads_ns: 0,
+            exec_ns: 0,
+            last_cpu: 0,
+            cmdline: alloc::sync::Arc::from(&[][..]),
+            run_since_ns: 0,
+            start_ticks: crate::time::ktime_get() / (1_000_000_000 / sched::cputime::USER_HZ),
         }
     }
 
@@ -634,6 +690,14 @@ impl Process {
             wait: None,
             interrupted: None,
             sig_restart: 0,
+            times: sched::cputime::ProcTimes::default(),
+            dead_threads: sched::cputime::ProcTimes::default(),
+            dead_threads_ns: 0,
+            exec_ns: 0,
+            last_cpu: 0,
+            cmdline: alloc::sync::Arc::from(&[][..]),
+            run_since_ns: 0,
+            start_ticks: crate::time::ktime_get() / (1_000_000_000 / sched::cputime::USER_HZ),
         }
     }
 

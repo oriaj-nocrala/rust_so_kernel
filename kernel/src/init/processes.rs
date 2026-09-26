@@ -218,7 +218,11 @@ fn create_user_processes() {
 
             user_proc.set_name(name);
             user_proc.set_priority(5);
-            user_proc.exe_name = alloc::format!("/{}", name);
+            // Where it lives (`fs::initramfs`'s /bin), for `/proc/1/exe`,
+            // and its name as its command line: nothing exec'd it, so there
+            // is no argv to copy.
+            user_proc.exe_name = alloc::format!("/bin/{}", name);
+            user_proc.cmdline = alloc::format!("{}\0", name).into_bytes().into();
 
             // The shell is the only process spawned at boot (everything
             // else is exec'd on demand from it) — it becomes the tty's

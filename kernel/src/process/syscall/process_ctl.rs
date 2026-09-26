@@ -284,7 +284,7 @@ pub(super) fn sys_fork() -> SyscallResult {
     unsafe { crate::process::fpu::save(&mut parent_fpu_state); }
 
     // Collect what we need from the running process
-    let (child_as, parent_pid, parent_fs_base, files, child_tf, parent_cwd, (parent_pgid, parent_sid, parent_ctty), parent_exe_name, parent_signals) = {
+    let (child_as, parent_pid, parent_fs_base, files, child_tf, parent_cwd, (parent_pgid, parent_sid, parent_ctty), parent_exe_name, parent_signals, (parent_comm, parent_cmdline)) = {
         let scheduler = crate::process::scheduler::local_scheduler();
         match scheduler.running_ref() {
             Some(proc) => {
@@ -298,7 +298,7 @@ pub(super) fn sys_fork() -> SyscallResult {
                     // stale if `arch_prctl` ran since — same reasoning as the
                     // live `fpu::save` above.
                     Ok(child_as) => (child_as, proc.pid, crate::process::scheduler::read_fs_base(), proc.files.lock().clone(), tf_copy, proc.cwd.clone(), (proc.pgid, proc.sid, proc.ctty), proc.exe_name.clone(),
-                        (proc.signal_handlers, proc.sig_restart, proc.blocked_signals)),
+                        (proc.signal_handlers, proc.sig_restart, proc.blocked_signals), (proc.name, proc.cmdline.clone())),
                     Err(e) => {
                         serial_println!("fork: address_space.fork() failed: {}", e);
                         return errno::ENOMEM;
@@ -331,7 +331,12 @@ pub(super) fn sys_fork() -> SyscallResult {
         // (SIGINT killed a child its shell had set to ignore it) and one
         // the parent had blocked around fork arrived in the child anyway.
         (child.signal_handlers, child.sig_restart, child.blocked_signals) = parent_signals;
-        child.set_name("child");
+        // Linux: a child keeps its parent's `comm` and command line until
+        // it execs. Every child used to be named "child", so `ps` showed a
+        // shell's subshells, and any program that forks without exec'ing,
+        // as `[child]`.
+        child.name = parent_comm;
+        child.cmdline = parent_cmdline;
         scheduler.add_process(child);
         pid.0 as SyscallResult
     };
@@ -366,11 +371,11 @@ pub(super) fn sys_fork() -> SyscallResult {
 /// thread's `Process` immediately instead of waiting for a collector that
 /// will never come).
 pub(super) fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
-    let (parent_pid, address_space, files, parent_cwd, (parent_pgid, parent_sid, parent_ctty), parent_exe_name, parent_signals) = {
+    let (parent_pid, address_space, files, parent_cwd, (parent_pgid, parent_sid, parent_ctty), parent_exe_name, parent_signals, (parent_comm, parent_cmdline)) = {
         let sched = crate::process::scheduler::local_scheduler();
         match sched.running_ref() {
             Some(proc) => (proc.pid, proc.address_space.clone(), proc.files.clone(), proc.cwd.clone(), (proc.pgid, proc.sid, proc.ctty), proc.exe_name.clone(),
-                (proc.signal_handlers, proc.sig_restart, proc.blocked_signals)),
+                (proc.signal_handlers, proc.sig_restart, proc.blocked_signals), (proc.name, proc.cmdline.clone())),
             None => return errno::ESRCH,
         }
     };
@@ -407,7 +412,9 @@ pub(super) fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
     // installed, rather than the default action.
     (thread.signal_handlers, thread.sig_restart, thread.blocked_signals) = parent_signals;
     thread.ctty = parent_ctty;
-    thread.set_name("thread");
+    // A thread starts with its creator's name and command line, as on Linux.
+    thread.name = parent_comm;
+    thread.cmdline = parent_cmdline;
     scheduler.add_process(thread);
     pid.0 as SyscallResult
 }
@@ -497,6 +504,26 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
 
     serial_println!("sys_exec: loading '{}' (argc={}, envc={})", name, argv.len(), envp.len());
 
+    // `comm` is the basename of the path as the caller named it, before
+    // symlinks are followed — Linux's `kbasename(bprm->filename)`. BusyBox
+    // applets are symlinks to one binary: `/tmp/bin/cat` must show as
+    // `cat`, not `busybox`. (`/proc/<pid>/exe` is the resolved path.)
+    let comm = alloc::string::String::from(&name[name.rfind('/').map_or(0, |i| i + 1)..]);
+    // `/proc/<pid>/cmdline`: every argument followed by its NUL, as Linux
+    // lays out the argument area. A call without argv (the legacy
+    // `exec(name)`) gets the name as its only argument.
+    let cmdline: alloc::sync::Arc<[u8]> = {
+        let mut c = alloc::vec::Vec::new();
+        if argv.is_empty() {
+            c.extend_from_slice(name.as_bytes());
+            c.push(0);
+        }
+        for a in &argv {
+            c.extend_from_slice(a.strip_suffix(&[0]).unwrap_or(a));
+            c.push(0);
+        }
+        c.into()
+    };
     let resolved_path = match resolve_exec_path(name) {
         Ok(p) => p,
         Err(e) => {
@@ -578,13 +605,14 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
                 // names every child "child", that meant *every* program
                 // this kernel ever ran showed up as "child" in `ps`, in
                 // `top`, in the scheduler's traces and in the on-screen
-                // kill notice. Taken from `resolved_path` before it is
+                // kill notice. Set before `resolved_path` is
                 // moved into `exe_name` just below (a borrow of
                 // `proc.exe_name` afterwards would collide with
-                // `set_name`'s `&mut self`).
-                let comm_at = resolved_path.rfind('/').map_or(0, |i| i + 1);
-                proc.set_name(&resolved_path[comm_at..]);
+                // `set_name`'s `&mut self`). From the name as given, not
+                // `resolved_path`: see `comm` above.
+                proc.set_name(&comm);
                 proc.exe_name = resolved_path;
+                proc.cmdline = cmdline;
                 // POSIX `execve`: a caught signal goes back to SIG_DFL (its
                 // handler's address means nothing in the new image), an
                 // ignored one stays ignored, and the mask and pending set
@@ -817,6 +845,7 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
             let proc = scheduler.wait_queue_mut().remove(pos).unwrap();
             let status = proc.wait_status_word();
             let pid = proc.pid.0;
+            scheduler.credit_reaped(&proc);
             scheduler.defer_stack_free(proc.kernel_stack);
             crate::debug::inc_reaps();
             if status_ptr != 0 {
