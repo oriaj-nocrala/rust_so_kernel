@@ -104,7 +104,7 @@ fase 0) en una etiqueta concreta, anotada aquí al fijarla.
 |---|---|---|
 | Linux `drivers/gpu/drm/nouveau/` (etiqueta = kernel del host) | Todo: VBIOS/DCB, I2C/AUX, display, falcon, arranque GSP (`nvkm/subdev/gsp/`), RPC, clases de display | MIT: se puede portar |
 | `NVIDIA/open-gpu-kernel-modules` (etiqueta = versión GSP fijada) | **Fuente de verdad de la ABI de RM**: estructuras de control, clases, RPC (`src/common/sdk/nvidia/inc/`) | MIT/GPL: usar como MIT |
-| Linux `drivers/gpu/nova-core/` | Arranque GSP en Rust (FWSEC, booter, radix3). Ver cómo lo estructuran | GPL-2.0: **leer, no copiar** |
+| Linux `drivers/gpu/nova-core/` | **Referencia estructural principal de la fase 4.** En v7.2.2 arranca el GSP en GA106 exactamente hasta el hito de la fase 4: `wait_gsp_init_done` y `GET_GSP_STATIC_INFO` → nombre de la GPU (`gsp/boot.rs:154-159`), más el descargado. Unas 13 000 líneas de Rust. **No tiene display.** No está compilado en el kernel del host (`CONFIG_NOVA_CORE` sin activar), así que no hay traza suya | GPL-2.0: **leer, no copiar** |
 | `envytools` / `rnndb` | Nombres de registros para leer trazas mmiotrace (`demmio`) | MIT |
 | Mesa `src/nouveau/` (NVK) | Solo para la fase 7 | MIT |
 
@@ -186,7 +186,9 @@ Hechos medidos:
 Pendiente para cerrar la fase 0:
 1. Segmentar las trazas: anotar aquí los rangos de tiempo de cada paso
    (lectura de VBIOS, AUX/EDID, vblank, FWSEC, booter, RPC de init, modeset).
-2. Medir D6: nouveau con GSP sin mmiotrace (un reinicio, solo el dmesg).
+2. Medir D6: nouveau con GSP sin mmiotrace (`gpu-oracle.sh`, modo
+   `gspnotrace`: un reinicio, solo el dmesg y con el mismo `debug=`, para
+   que la única diferencia con `trace-gsp` sea mmiotrace).
 
 ## Fases
 

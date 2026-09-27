@@ -4,7 +4,8 @@
 #
 #   sudo scripts/gpu-oracle.sh static        any boot: VBIOS, EDIDs, lspci, versions
 #   sudo scripts/gpu-oracle.sh entry MODE    add a one-shot systemd-boot entry to trace MODE
-#   sudo scripts/gpu-oracle.sh trace MODE    in the trace boot: mmiotrace nouveau (MODE nogsp|gsp)
+#   sudo scripts/gpu-oracle.sh trace MODE    in the trace boot: mmiotrace nouveau (MODE nogsp|gsp),
+#                                            or gspnotrace: GSP, no mmiotrace, dmesg only (D6)
 #   sudo scripts/gpu-oracle.sh install       unattended: a service that runs `auto` in the trace boot
 #   sudo scripts/gpu-oracle.sh auto          (the service) trace the boot's MODE, then reboot:
 #                                            nogsp → arms gsp; gsp → back to the normal entry
@@ -84,7 +85,7 @@ cmd_static() {
 cmd_entry() {
     need_root
     local mode="${1:-}"
-    [[ $mode == nogsp || $mode == gsp ]] || die "entry nogsp|gsp"
+    [[ $mode =~ ^(nogsp|gsp|gspnotrace)$ ]] || die "entry nogsp|gsp|gspnotrace"
     local cur; cur="$(bootctl status 2>/dev/null | sed -n 's/^ *Current Entry: *//p')"
     [[ -n $cur ]] || die "bootctl did not report the current entry"
     [[ $cur == "$ENTRY_ID" ]] && cur="$(cat "$ESP/loader/entries/.constanos-gpu-trace-base")"
@@ -163,8 +164,14 @@ cmd_auto() {
 
 cmd_trace() {
     need_root
-    local mode="${1:-}" gsprm
-    case "$mode" in nogsp) gsprm=0 ;; gsp) gsprm=1 ;; *) die "trace nogsp|gsp" ;; esac
+    local mode="${1:-}" gsprm mmio=1
+    case "$mode" in
+        nogsp) gsprm=0 ;;
+        gsp) gsprm=1 ;;
+        # D6: is the GSP display failure nouveau's, or mmiotrace's (one CPU, slow MMIO)?
+        gspnotrace) gsprm=1; mmio=0 ;;
+        *) die "trace nogsp|gsp|gspnotrace" ;;
+    esac
     grep -q "module_blacklist=nvidia" /proc/cmdline || die "not in the trace boot (run 'entry' and reboot)"
     lsmod | grep -qE '^(nvidia|nouveau) ' && die "nvidia or nouveau already loaded: reboot into the trace entry"
     [[ -d $TRACEFS ]] || mount -t tracefs nodev "$TRACEFS"
@@ -178,14 +185,17 @@ cmd_trace() {
     dmesg > "$out/dmesg-before.txt"
     dmesg -C
 
-    echo nop > "$TRACEFS/current_tracer"
-    # Per CPU (all possible CPUs, even the ones mmiotrace offlines); trace_pipe
-    # drains it continuously, so 32 MiB each is plenty.
-    echo 32768 > "$TRACEFS/buffer_size_kb"
-    echo mmiotrace > "$TRACEFS/current_tracer"
-    cat "$TRACEFS/trace_pipe" > "$out/mmiotrace.txt" &
-    local reader=$!
-    sleep 1
+    local reader=
+    if (( mmio )); then
+        echo nop > "$TRACEFS/current_tracer"
+        # Per CPU (all possible CPUs, even the ones mmiotrace offlines); trace_pipe
+        # drains it continuously, so 32 MiB each is plenty.
+        echo 32768 > "$TRACEFS/buffer_size_kb"
+        echo mmiotrace > "$TRACEFS/current_tracer"
+        cat "$TRACEFS/trace_pipe" > "$out/mmiotrace.txt" &
+        reader=$!
+        sleep 1
+    fi
 
     echo "  modprobe nouveau config=NvGspRm=$gsprm (settling ${SETTLE_SECS}s)"
     # modeset=1 overrides the host's /etc/modprobe.d/blacklist.conf
@@ -202,13 +212,15 @@ cmd_trace() {
         echo "  NOUVEAU DID NOT BIND $GPU_BDF: the trace is empty"
     fi
 
-    echo "marker: settled" > "$TRACEFS/trace_marker" 2>/dev/null || true
-    # The tracer can't be changed while trace_pipe is open (EBUSY): stop
-    # recording, let the reader drain, close it, then switch to nop.
-    echo 0 > "$TRACEFS/tracing_on"
-    sleep 3; kill "$reader" 2>/dev/null || true; wait "$reader" 2>/dev/null || true
-    echo nop > "$TRACEFS/current_tracer"
-    echo 1 > "$TRACEFS/tracing_on"
+    if (( mmio )); then
+        echo "marker: settled" > "$TRACEFS/trace_marker" 2>/dev/null || true
+        # The tracer can't be changed while trace_pipe is open (EBUSY): stop
+        # recording, let the reader drain, close it, then switch to nop.
+        echo 0 > "$TRACEFS/tracing_on"
+        sleep 3; kill "$reader" 2>/dev/null || true; wait "$reader" 2>/dev/null || true
+        echo nop > "$TRACEFS/current_tracer"
+        echo 1 > "$TRACEFS/tracing_on"
+    fi
 
     dmesg > "$out/dmesg.txt"
     for c in /sys/class/drm/card*-*; do
@@ -221,7 +233,7 @@ cmd_trace() {
     # from the PCI ROM BAR.
     local dbg; dbg="$(ls -d /sys/kernel/debug/dri/*/vbios.rom 2>/dev/null | head -1 || true)"
     [[ -n $dbg ]] && cp "$dbg" "$out/vbios-nouveau.bin"
-    echo "  $(wc -l < "$out/mmiotrace.txt") trace lines, $(wc -l < "$out/dmesg.txt") dmesg lines"
+    echo "  $(wc -l < "$out/mmiotrace.txt" 2>/dev/null || echo 0) trace lines, $(wc -l < "$out/dmesg.txt") dmesg lines"
     grep -m3 -iE "gsp.*(570|535)|firmware" "$out/dmesg.txt" || true
     finish
     echo "Done. Next: run 'entry' + reboot for the other mode, or reboot normally."
@@ -231,7 +243,7 @@ cmd_summary() {
     [[ -d $ORACLE ]] || die "nothing captured in $ORACLE"
     echo "$ORACLE:"
     du -sh "$ORACLE"/* 2>/dev/null
-    for m in nogsp gsp; do
+    for m in nogsp gsp gspnotrace; do
         local d="$ORACLE/trace-$m"
         [[ -d $d ]] || { echo "trace-$m: missing"; continue; }
         echo "== trace-$m"
