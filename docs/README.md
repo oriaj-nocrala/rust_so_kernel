@@ -5,11 +5,13 @@ of documentation. It complements two other layers already in the repo:
 
 | Layer | Location | Audience | Purpose |
 |-------|----------|----------|---------|
-| Quick reference | `CLAUDE.md` (repo root) | Agents + contributors | Dense, always-loaded map of every subsystem as it exists *today*. |
-| Task playbooks | `.claude/skills/*/SKILL.md` | The coding agent | Step-by-step *how to do* a recurring task (e.g. `kernel-drivers`: how to write/port a driver). |
+| Quick reference | `CLAUDE.md` (repo root) | Agents + contributors | Small, always-loaded: build/test commands, crate map, boot sequence, design invariants, and an index into `docs/reference/`. |
+| Subsystem reference | `docs/reference/*.md` | Agents + contributors | Dense map of each subsystem as it exists *today* (moved out of `CLAUDE.md` 2026-09-26); read on demand. |
+| Task playbooks | `.claude/skills/*/SKILL.md` | The coding agent | Step-by-step *how to do* a recurring task: `kernel-drivers`, `kernel-testing`, `qemu-debug`, `metal-run`, `userspace-programs`. |
 | **Design docs** | **`docs/` (here)** | **Humans** | **The *what*, the *why*, and the *where we're going*** — architecture rationale and roadmaps that outlive any single change. |
 
-Rule of thumb: if it's "how the system is wired right now," it belongs in `CLAUDE.md`.
+Rule of thumb: if it's "how the system is wired right now," it belongs in `docs/reference/`
+(and only in `CLAUDE.md` if it's a rule every change must respect).
 If it's "how to perform task X," it's a skill. If it's "why it's shaped this way" or
 "the plan for where this is heading," it's a `docs/` design doc.
 
@@ -28,6 +30,7 @@ Docs are grouped by subsystem, one subfolder each, each with its own `README.md`
 ```
 docs/
 ├── README.md                 ← you are here
+├── reference/                ← current-state subsystem notes (the index lives in CLAUDE.md)
 ├── drivers/                  ← the device-driver subsystem (current focus)
 │   ├── README.md             ← driver-docs index
 │   ├── architecture.md       ← where we are: the trait/seam design, today
