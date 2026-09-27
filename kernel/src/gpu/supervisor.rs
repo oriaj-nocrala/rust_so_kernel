@@ -19,8 +19,15 @@
 //   on. With `gpu=vpll` (phase 5.5) also `clock <kHz>`:
 //   `HEAD_SET_PIXEL_CLOCK_FREQUENCY(_MAX)(head)`, then UPDATE; supervisor
 //   2.1 programs the VPLL. Bounded to the raster at >= 48 Hz (the ASUS's
-//   floor) and to what the GOP's DP link carries: nothing retrains it. Refused (EAGAIN) while the core channel has not finished the last
-//   one. Under `PUSH_AT`, the only user of the core push buffer after boot.
+//   floor) and to what the DP link carries (the GOP's, or the last one
+//   `dplink.rs` trained). Refused (EAGAIN) while the core channel has not
+//   finished the last one or a link training runs. Under `PUSH_AT`, the
+//   only user of the core push buffer after boot.
+// - Link training (`gpu=dplink`, `dplink.rs`) needs the SOR detached: the
+//   ISR records at each supervisor 3 whether the head's SOR drives nothing
+//   (`LINK_FREE`); a request that can attach it clears that, and both
+//   checks happen under `PUSH_AT`, so no attach is pushed while a training
+//   runs (`TRAINING`) and no training starts while one is pending.
 // - The display then raises supervisors 1, 2, 3, each by MSI to CPU 0:
 //   `vblank::on_msi` acknowledges it (`nvgpu::vblank::service`) and calls
 //   `on_pending`, which does the work and releases the display. Global
@@ -34,7 +41,7 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use diag::IrqMutex;
 use nvgpu::evo::{self, Push};
@@ -64,19 +71,36 @@ const MIN_REFRESH_HZ: u64 = 48;
 
 /// What `setup` found: the head and SOR `/dev/dispctl` detaches and
 /// re-attaches, and the SOR control value the GOP left.
-struct Disp {
-    regs: Bar0,
-    head: u32,
-    sor: u8,
+pub(super) struct Disp {
+    pub(super) regs: Bar0,
+    pub(super) head: u32,
+    pub(super) sor: u8,
+    /// The sublink the SOR runs (1 = A, 2 = B) and the DP output routed
+    /// to it.
+    pub(super) sublink: u8,
+    pub(super) outp: Outp,
+    /// The DCB's limits for that output (`dpconf`: lanes, rate).
+    pub(super) board_nr: u8,
+    pub(super) board_bw: u8,
     ctrl: u32,
     /// `gpu=vpll`: 2.1 programs VPLLs and `clock` is accepted.
     clocks: bool,
-    /// The pixel clock the GOP set (Hz) and the bounds `clock` accepts
-    /// (kHz): the raster at 48 Hz, the GOP's DP link's payload.
+    /// `gpu=dplink`: `train` is accepted.
+    pub(super) train: bool,
+    /// The pixel clock the GOP set (Hz) and the lower bound `clock`
+    /// accepts (kHz, the raster at 48 Hz); the upper bound is `MAX_KHZ`.
     gop_hz: u32,
     min_khz: u32,
-    max_khz: u32,
 }
+
+/// What the DP link carries (kHz of pixel clock): the GOP's link at boot,
+/// then the last one `dplink.rs` trained.
+static MAX_KHZ: AtomicU32 = AtomicU32::new(0);
+/// Set by the ISR at each supervisor 3: the primary head's SOR drives no
+/// head any more (a detach completed). Cleared by requests that may attach.
+static LINK_FREE: AtomicBool = AtomicBool::new(false);
+/// A link training runs: dispctl pushes are refused.
+static TRAINING: AtomicBool = AtomicBool::new(false);
 
 static DISP: spin::Once<Disp> = spin::Once::new();
 /// The supervisor state (kept from supervisor 1 to 3). Taken by the MSI
@@ -123,8 +147,46 @@ pub fn ready() -> bool {
     enabled() && super::vblank::armed()
 }
 
+pub(super) fn disp() -> Option<&'static Disp> {
+    DISP.get().filter(|_| ready())
+}
+
+/// The pixel rate (kHz) a DP link's payload carries at `depth` bits per
+/// pixel: lanes x rate x 8 bits per symbol / bpp (the units of nouveau's
+/// `link_kbps`, `nv50.c:1177`).
+pub(super) fn link_max_khz(l: &sup::DpLink, depth: u32) -> u32 {
+    (l.nr as u64 * l.bw as u64 * 27_000 * 8 / depth.max(1) as u64) as u32
+}
+
+/// `clock`'s upper bound follows a newly trained link.
+pub(super) fn set_max_khz(khz: u32) {
+    MAX_KHZ.store(khz, Ordering::Relaxed);
+}
+
+/// Starts a link training if the SOR is detached and nothing is pending:
+/// then no dispctl push happens until [`end_training`].
+pub(super) fn begin_training() -> Result<(), RequestError> {
+    let d = disp().ok_or(RequestError::NotReady)?;
+    PUSH_AT.with(|at| {
+        let idle = d.regs.rd32(evo::CORE.get()) == *at && evo::CORE.idle(&d.regs);
+        if TRAINING.load(Ordering::Acquire) || !LINK_FREE.load(Ordering::Acquire) || !idle {
+            return Err(RequestError::Busy);
+        }
+        TRAINING.store(true, Ordering::Release);
+        Ok(())
+    })
+}
+
+pub(super) fn end_training() {
+    TRAINING.store(false, Ordering::Release);
+}
+
+pub(super) fn log_line(line: String) {
+    log(line);
+}
+
 /// Boot, `gpu=super`, once `evo::bring_up` ended OK.
-pub fn setup(r: &mut String, regs: &Bar0, clocks: bool) {
+pub fn setup(r: &mut String, regs: &Bar0, clocks: bool, train: bool) {
     let Some((bios, dcb)) = super::VBIOS.get() else {
         let _ = writeln!(r, "super: STOP: no VBIOS/DCB (see vbios:/dcb:)");
         return;
@@ -215,7 +277,7 @@ pub fn setup(r: &mut String, regs: &Bar0, clocks: bool) {
     // link's payload carries (lanes x rate x 8 bits per symbol / bpp; the
     // units of nouveau's `link_kbps`, `nv50.c:1177`).
     let min_khz = ((t.htotal as u64 * t.vtotal as u64 * MIN_REFRESH_HZ).div_ceil(1000)) as u32;
-    let max_khz = link.map_or(0, |l| (l.nr as u64 * l.bw as u64 * 27_000 * 8 / t.depth_bits() as u64) as u32);
+    let max_khz = link.map_or(0, |l| link_max_khz(&l, t.depth_bits()));
     if clocks {
         match nvgpu::pll::parse(bios, nvgpu::pll::PLL_VPLL0 + head as u8) {
             Ok(l) => {
@@ -245,7 +307,25 @@ pub fn setup(r: &mut String, regs: &Bar0, clocks: bool) {
 
     SUPER.with(|s| *s = Some(Supervisor::new(Config { heads, sors, owned: 1 << head, routes, clocks })));
     PUSH_AT.with(|p| *p = put);
-    DISP.call_once(|| Disp { regs: Bar0 { base: regs.base, len: regs.len }, head, sor, ctrl, clocks, gop_hz: t.hz, min_khz, max_khz });
+    let (board_nr, board_bw) = dcb.outputs.iter().find(|o| o.index == outp.dcb).map_or((0, 0), |o| (o.dp_link_nr, o.dp_link_bw));
+    if train {
+        super::dplink::setup(r, regs, bios, &outp, sor, st.link, board_nr, board_bw);
+    }
+    MAX_KHZ.store(max_khz, Ordering::Relaxed);
+    DISP.call_once(|| Disp {
+        regs: Bar0 { base: regs.base, len: regs.len },
+        head,
+        sor,
+        sublink: st.link,
+        outp,
+        board_nr,
+        board_bw,
+        ctrl,
+        clocks,
+        train,
+        gop_hz: t.hz,
+        min_khz,
+    });
     sup::arm(regs);
     ENABLED.store(true, Ordering::Release);
     let _ = writeln!(
@@ -272,6 +352,12 @@ pub fn on_pending(regs: &Bar0, pending: u32) {
     MAX_US.fetch_max(us, Ordering::Relaxed);
     if (1..=3).contains(&rep.stage) {
         SERVICED[rep.stage as usize - 1].fetch_add(1, Ordering::Relaxed);
+    }
+    if rep.stage == 3 {
+        if let Some(d) = DISP.get() {
+            let free = SUPER.with(|s| s.as_ref().map_or(false, |s| s.sor_state(d.sor).1.head == 0));
+            LINK_FREE.store(free, Ordering::Release);
+        }
     }
     for e in &rep.events {
         match e {
@@ -336,9 +422,10 @@ pub fn request(cmd: Cmd) -> Result<u32, RequestError> {
         Cmd::Attach => ([sor_set_control(d.sor), 0], 1, d.ctrl),
         Cmd::Clock(khz) => {
             let khz = if khz == 0 { d.gop_hz / 1000 } else { khz };
-            if !d.clocks || khz < d.min_khz || khz > d.max_khz {
+            let max_khz = MAX_KHZ.load(Ordering::Relaxed);
+            if !d.clocks || khz < d.min_khz || khz > max_khz {
                 REFUSED.fetch_add(1, Ordering::Relaxed);
-                log(alloc::format!("dispctl: {:?} refused: needs gpu=vpll and {}..={} kHz", cmd, d.min_khz, d.max_khz));
+                log(alloc::format!("dispctl: {:?} refused: needs gpu=vpll and {}..={} kHz", cmd, d.min_khz, max_khz));
                 return Err(RequestError::Invalid);
             }
             let (f, max) = head_pixel_clock(d.head);
@@ -350,8 +437,11 @@ pub fn request(cmd: Cmd) -> Result<u32, RequestError> {
     let res = PUSH_AT.with(|at| {
         let regs = &d.regs;
         let get = regs.rd32(evo::CORE.get());
-        if get != *at || !evo::CORE.idle(regs) {
+        if get != *at || !evo::CORE.idle(regs) || TRAINING.load(Ordering::Acquire) {
             return Err(RequestError::Busy);
+        }
+        if cmd != Cmd::Detach {
+            LINK_FREE.store(false, Ordering::Release);
         }
         let before = *at;
         let mut p = Push::new(buf, *at);
@@ -391,13 +481,16 @@ pub fn status() -> String {
     let Some(d) = DISP.get() else { return String::from("dispctl: not set up (needs gpu=super)\n") };
     let r = &d.regs;
     alloc::format!(
-        "dispctl: head {} SOR-{} armed control {:#x} (GOP {:#x}) armed pixclk {} (GOP {}) vpll {:#x} {:#x} core put {:#x} get {:#x} idle {} vblank seq {}\n",
+        "dispctl: head {} SOR-{} armed control {:#x} (GOP {:#x}) link {} free {} armed pixclk {} (GOP {}) max {} vpll {:#x} {:#x} core put {:#x} get {:#x} idle {} vblank seq {}\n",
         d.head,
         d.sor,
         r.rd32(evo::CORE.armed_base() + sor_set_control(d.sor)),
         d.ctrl,
+        sup::DpLink::read(r, d.sor as u32, d.sublink).map_or(String::from("?"), |l| alloc::format!("{}x{:#x}{}", l.nr, l.bw, if l.ef { "ef" } else { "" })),
+        LINK_FREE.load(Ordering::Relaxed) as u8,
         r.rd32(evo::CORE.armed_base() + head_pixel_clock(d.head).0),
         d.gop_hz,
+        MAX_KHZ.load(Ordering::Relaxed),
         r.rd32(0xef18 + d.head * 0x40),
         r.rd32(0xef04 + d.head * 0x40),
         r.rd32(evo::CORE.put()),

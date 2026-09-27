@@ -20,7 +20,7 @@
 > (VPLL en el supervisor 2.1, `gpu=vpll`; host y QEMU verdes). Ryzen #78:
 > **Fase 5.5 cerrada** (Ryzen #80: 50 Hz y vuelta a 60 Hz reprogramando el
 > VPLL; la codificación de `fN` de nouveau está mal en GA106, medido y
-> corregido; ver "Resultados de la fase 5.5"). Siguiente: 5.6 (enlace DP). Ninguna fase se da por hecha sin su
+> corregido; ver "Resultados de la fase 5.5"). **Fase 5.6 cerrada** (Ryzen #82: reentrenado a 4×HBR2 y de vuelta a 2×HBR al mismo modo, 60 Hz, visto a mano; ver "Resultados de la fase 5.6"). Siguiente: 5.7 (modos, 180 Hz). Ninguna fase se da por hecha sin su
 > criterio medido en la Ryzen.
 
 ## Objetivo
@@ -709,6 +709,50 @@ CTRL_DISP; fire 507 flips, 0 rechazados. El usuario vio en el menú del ASUS
 **Fase 5.5 cerrada.**
 - El usuario miró el menú del ASUS: 50 Hz y luego 60 Hz (el menú redondea
   a entero: no distingue 59,44 de 60).
+
+## Resultados de la fase 5.6 (2026-09-27)
+
+Código: `nvgpu::dp` (tabla DP del VBIOS, tabla de drive, `nvkm_dp_train`
+sin LTTPR), opcodes nuevos en `nvgpu::init`, reintentos de nvkm en
+`nvgpu::aux`, `kernel/src/gpu/dplink.rs`, `train` en `/dev/dispctl`, nivel
+`gpu=dplink`. Job: `scripts/metal-jobs/gpu-dplink.sh`.
+
+Hechos (del VBIOS y la traza, sin metal):
+- **El tramo "Enlace DP" de la traza es casi entero scripts del VBIOS**:
+  DisableLT `0x734d` (la liberación del SOR), EnableSpread `0x733c`
+  (**la escritura `0x00e86c = 2` que la 5.0 no identificó** + DPCD `0x107`),
+  BeforeLinkTraining `0x6f99` y lnkcmp `0x7292` para HBR2 (búsqueda del PLL
+  en `0x612488` bit a bit con la condición 4, dos esperas de 20 ms por las
+  condiciones 8 y 7), AfterLinkTraining `0x67c6`. Solo `links`, `power`,
+  `pattern` y `drive` son código de nouveau.
+- Las escrituras de `0x612408/0x612488` (`0x1900`/`0x1912`), HDA y
+  `0x616dc0` a las 11,87888 son del HDMI (SOR-0, cabeza 1), intercaladas.
+- DRM lee DPCD `0x102` antes de cada lectura DPCD (`drm_dp_dpcd_probe`); las
+  escrituras no.
+- El test `dp::tests::training_replays_the_trace` reproduce las 448
+  escrituras de nouveau en orden (DisableLT → AfterLT) con todas las
+  lecturas consumidas: CR en 2 vueltas (swing 0 → 2), EQ con TPS3 en 2
+  (swing 3, máximo), estado final `77 77 81`. Probado por sabotaje (15
+  mutaciones, todas detectadas).
+
+**Ryzen boot #82 (veredicto OK; el log envolvió al principio, el resumen
+sobrevivió):**
+- `train 4 0x14` con el SOR enganchado: rechazado (`Busy`); `train 4 0x1e`
+  ya desenganchado: rechazado sin tocar el SOR (HBR3 > HBR2 del ASUS).
+- **4×HBR2 en 122 ms**, igual que nouveau en la traza: CR 2 vueltas, EQ 2
+  con TPS3, estado `77 77 81`, petición `33 33`, carriles `07` (swing
+  máximo); el SOR relee `4×0x14 ef`. Sumidero ya en D0 (no hubo que
+  despertarlo), potencia de carriles a la 2.ª lectura, 0 errores de script
+  ni de AUX. El `attach` empaquetó para ese enlace (`h 986 v 3823 wm 16`).
+- **De vuelta a 2×HBR (el enlace del GOP) en 118 ms**: CR 2, EQ 1, swing 2;
+  empaquetado `h 487 v 1896 wm 15` (el `h 0x1e7` y el watermark del GOP).
+- Tras cada `attach`, vblank a 59,9907 Hz (el GOP: 59,9728 en el mismo
+  arranque); 4+4+4 supervisores, sin errores de script, nada sin hacer, 0
+  errores de CTRL_DISP; `clock` acota a 720 MHz con 4×HBR2 y 180 MHz con
+  2×HBR. `compositor fire` 10 s: 520 flips, 0 rechazados.
+- El usuario vio dos apagones breves, la misma imagen después y fire bien.
+
+**Fase 5.6 cerrada.**
 
 ## Fases
 

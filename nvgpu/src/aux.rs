@@ -18,6 +18,7 @@ use crate::Mmio;
 pub const I2C_WRITE: u8 = 0x0;
 pub const I2C_READ: u8 = 0x1;
 pub const I2C_MOT: u8 = 0x4;
+pub const NATIVE_WRITE: u8 = 0x8;
 pub const NATIVE_READ: u8 = 0x9;
 
 /// Reply codes (`drm_dp.h:94-101`): native in bits 0-1, I2C in bits 2-3.
@@ -40,6 +41,8 @@ pub const DPCD_REV: u32 = 0x000;
 pub const DP13_DPCD_REV: u32 = 0x2200;
 pub const RECEIVER_CAP_SIZE: usize = 0xf;
 const TRAINING_AUX_RD_INTERVAL: usize = 0x00e;
+/// `drm_dp.h:594`.
+const DP_TRAINING_PATTERN_SET: u32 = 0x102;
 const EXTENDED_RECEIVER_CAP_FIELD_PRESENT: u8 = 1 << 7;
 
 /// The EDID's I2C address and block size (`include/drm/drm_edid.h:38-39`).
@@ -76,7 +79,7 @@ pub struct Reply {
 }
 
 /// One AUX channel.
-pub struct Aux<'a, M: Mmio> {
+pub struct Aux<'a, M: Mmio + ?Sized> {
     m: &'a M,
     base: u32,
     /// The auto-DPCD register as the first transaction found it, so the
@@ -84,7 +87,7 @@ pub struct Aux<'a, M: Mmio> {
     autodpcd: core::cell::Cell<Option<u32>>,
 }
 
-impl<'a, M: Mmio> Aux<'a, M> {
+impl<'a, M: Mmio + ?Sized> Aux<'a, M> {
     pub fn new(m: &'a M, ch: u8) -> Self {
         Aux { m, base: ch as u32 * 0x50, autodpcd: core::cell::Cell::new(None) }
     }
@@ -171,6 +174,15 @@ impl<'a, M: Mmio> Aux<'a, M> {
     /// attempt). `buf` is the payload (≤ 16 bytes; empty = address only):
     /// sent for writes, filled for reads.
     pub fn xfer(&self, request: u8, addr: u32, buf: &mut [u8]) -> Result<Reply, AuxError> {
+        self.xfer_retry(request, addr, buf, false)
+    }
+
+    /// `gm200_i2c_aux_xfer` with its `retry` flag: when set, a DEFER reply
+    /// (native or I2C), a reply timeout or an error is retried up to 32 more
+    /// times, 400 µs apart, reusing the loaded payload (`auxgm200.c:115-145`).
+    /// nvkm's own accesses (`nvkm_rdaux`/`nvkm_wraux`: link training, VBIOS
+    /// scripts) set it; DRM's never do.
+    pub fn xfer_retry(&self, request: u8, addr: u32, buf: &mut [u8], retry: bool) -> Result<Reply, AuxError> {
         assert!(buf.len() <= 16);
         let size = buf.len() as u32;
         if let Err(e) = self.init() {
@@ -205,33 +217,47 @@ impl<'a, M: Mmio> Aux<'a, M> {
         ctrl |= if size > 0 { size - 1 } else { 0x0000_0100 };
         self.m.wr32(self.addr_reg(), addr);
 
-        // Reset, then request (`auxgm200.c:118-125`).
-        self.m.wr32(self.ctrl_reg(), 0x8000_0000 | ctrl);
-        self.m.wr32(self.ctrl_reg(), ctrl);
-        self.m.wr32(self.ctrl_reg(), 0x0001_0000 | ctrl);
-        // "wait up to 2ms for it to complete".
-        for i in 0..=2000 {
-            ctrl = self.m.rd32(self.ctrl_reg());
-            self.m.udelay(1);
-            if ctrl & 0x0001_0000 == 0 {
-                break;
+        let mut retries = 0;
+        let (stat, err) = loop {
+            // Reset, delay if a retry, then request (`auxgm200.c:118-125`).
+            self.m.wr32(self.ctrl_reg(), 0x8000_0000 | ctrl);
+            self.m.wr32(self.ctrl_reg(), ctrl);
+            if retries > 0 {
+                self.m.udelay(400);
             }
-            if i == 2000 {
-                self.m.mask(self.autodpcd_reg(), 0x0001_0000, 0);
-                self.fini();
-                return Err(AuxError::Timeout(ctrl));
+            self.m.wr32(self.ctrl_reg(), 0x0001_0000 | ctrl);
+            // "wait up to 2ms for it to complete".
+            for i in 0..=2000 {
+                ctrl = self.m.rd32(self.ctrl_reg());
+                self.m.udelay(1);
+                if ctrl & 0x0001_0000 == 0 {
+                    break;
+                }
+                if i == 2000 {
+                    self.m.mask(self.autodpcd_reg(), 0x0001_0000, 0);
+                    self.fini();
+                    return Err(AuxError::Timeout(ctrl));
+                }
             }
-        }
 
-        // Read and acknowledge the status (`nvkm_mask(.., 0, 0)`).
-        let stat = self.m.mask(self.stat_reg(), 0, 0);
-        let mut err = None;
-        if stat & 0x0000_0100 != 0 {
-            err = Some(AuxError::ReplyTimeout(stat));
-        }
-        if stat & 0x0000_0e00 != 0 {
-            err = Some(AuxError::Io(stat));
-        }
+            // Read and acknowledge the status (`nvkm_mask(.., 0, 0)`).
+            let stat = self.m.mask(self.stat_reg(), 0, 0);
+            let mut err = None;
+            let mut again = matches!(stat & 0x000f_0000, 0x0008_0000 | 0x0002_0000);
+            if stat & 0x0000_0100 != 0 {
+                err = Some(AuxError::ReplyTimeout(stat));
+                again = true;
+            }
+            if stat & 0x0000_0e00 != 0 {
+                err = Some(AuxError::Io(stat));
+                again = true;
+            }
+            // `while (ret && retry && retries++ < 32)`.
+            if !(again && retry && retries < 32) {
+                break (stat, err);
+            }
+            retries += 1;
+        };
         let mut len = buf.len();
         if request & 1 != 0 {
             let mut x = [0u8; 16];
@@ -249,17 +275,64 @@ impl<'a, M: Mmio> Aux<'a, M> {
         }
     }
 
+    /// `nvkm_rdaux` / `nvkm_wraux` (`include/nvkm/subdev/i2c.h:157-179`):
+    /// one native transaction with the hardware retry on, no DRM policy on
+    /// top. nvkm takes any reply code but ACK (0) as a failure; a short
+    /// read is only a `WARN_ON` there, an error here.
+    pub fn nvkm_read(&self, addr: u32, buf: &mut [u8]) -> Result<(), AuxError> {
+        let r = self.xfer_retry(NATIVE_READ, addr, buf, true)?;
+        match r.code {
+            0 if r.len == buf.len() => Ok(()),
+            0 => Err(AuxError::Short(r.len as u8)),
+            2 | 8 => Err(AuxError::Defer),
+            c => Err(AuxError::Nack(c)),
+        }
+    }
+
+    pub fn nvkm_write(&self, addr: u32, data: &[u8]) -> Result<(), AuxError> {
+        let mut buf = [0u8; 16];
+        buf[..data.len()].copy_from_slice(data);
+        let r = self.xfer_retry(NATIVE_WRITE, addr, &mut buf[..data.len()], true)?;
+        match r.code {
+            0 => Ok(()),
+            2 | 8 => Err(AuxError::Defer),
+            c => Err(AuxError::Nack(c)),
+        }
+    }
+
     /// `drm_dp_dpcd_access` for a read (`drm_dp_helper.c:590-647`): up to
     /// 32 attempts, 500 µs apart unless the last one timed out; the error
     /// returned is the first one.
     pub fn native_read(&self, addr: u32, buf: &mut [u8]) -> Result<(), AuxError> {
+        self.dpcd_access(NATIVE_READ, addr, buf)
+    }
+
+    /// `drm_dp_dpcd_read` (`drm_dp_helper.c:748-767`): DRM first probes
+    /// `DP_TRAINING_PATTERN_SET` with a 1-byte read (`drm_dp_dpcd_probe`,
+    /// `:667-679`; some sinks wake up on it), then reads. [`Aux::native_read`]
+    /// is the access alone (what the phase 2 probe replays).
+    pub fn drm_read(&self, addr: u32, buf: &mut [u8]) -> Result<(), AuxError> {
+        let mut b = [0u8];
+        self.native_read(DP_TRAINING_PATTERN_SET, &mut b)?;
+        self.native_read(addr, buf)
+    }
+
+    /// `drm_dp_dpcd_access` for a write (same policy); `drm_dp_dpcd_write`
+    /// does not probe (`:786-805`).
+    pub fn native_write(&self, addr: u32, data: &[u8]) -> Result<(), AuxError> {
+        let mut buf = [0u8; 16];
+        buf[..data.len()].copy_from_slice(data);
+        self.dpcd_access(NATIVE_WRITE, addr, &mut buf[..data.len()])
+    }
+
+    fn dpcd_access(&self, request: u8, addr: u32, buf: &mut [u8]) -> Result<(), AuxError> {
         let mut first = None;
         let mut last: Option<AuxError> = None;
         for _ in 0..32 {
             if matches!(last, Some(e) if !matches!(e, AuxError::ReplyTimeout(_))) {
                 self.m.udelay(RETRY_INTERVAL_US);
             }
-            let e = match self.xfer(NATIVE_READ, addr, buf) {
+            let e = match self.xfer(request, addr, buf) {
                 Ok(r) if r.code & NATIVE_REPLY_MASK == NATIVE_REPLY_ACK => {
                     if r.len == buf.len() {
                         return Ok(());
@@ -523,5 +596,28 @@ mod tests {
         let last_req = m.writes.borrow().iter().rev().find(|(o, v)| *o == 0xd954 && v & 0x0001_0000 != 0).unwrap().1;
         assert_eq!((last_req >> 12) & 0xf, I2C_READ as u32);
         assert_eq!(last_req & 0x100, 0x100, "address only");
+    }
+
+    /// nvkm's accesses (`retry = true`): the hardware loop re-sends a
+    /// deferred transaction 32 more times without re-arming the channel;
+    /// DRM's (`retry = false`) send it once per call.
+    #[test]
+    fn nvkm_retry_resends_deferred_transactions() {
+        let m = AuxSim::new(0x1002_0000);
+        assert_eq!(Aux::new(&m, 0).nvkm_read(0x202, &mut [0; 3]), Err(AuxError::Defer));
+        assert_eq!(m.tries(), 33);
+        // Each one reset first (bit 31), as in `auxgm200.c:118-119`.
+        assert_eq!(m.writes.borrow().iter().filter(|(o, v)| *o == 0xd954 && v & 0x8000_0000 != 0).count(), 33);
+        let m = AuxSim::new(0x1002_0000);
+        assert_eq!(Aux::new(&m, 0).xfer(NATIVE_READ, 0x202, &mut [0; 3]).map(|r| r.code), Ok(2));
+        assert_eq!(m.tries(), 1);
+        // A NACK is not retried by the hardware loop, and is a failure.
+        let m = AuxSim::new(0x1001_0000);
+        assert_eq!(Aux::new(&m, 0).nvkm_write(0x103, &[0; 4]), Err(AuxError::Nack(1)));
+        assert_eq!(m.tries(), 1);
+        // An ACK completes a write.
+        let m = AuxSim::new(0x1000_0000);
+        assert_eq!(Aux::new(&m, 0).nvkm_write(0x103, &[1, 2, 3, 4]), Ok(()));
+        assert_eq!(m.writes.borrow().iter().find(|(o, _)| *o == 0xd930), Some(&(0xd930, 0x0403_0201)));
     }
 }

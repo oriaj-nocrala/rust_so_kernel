@@ -89,6 +89,10 @@ pub enum GpuLevel {
     /// supervisor 2.1, and let `/dev/dispctl`'s `clock <kHz>` change the
     /// primary head's pixel clock on the same raster.
     Vpll,
+    /// Phase 5.6: also let `/dev/dispctl`'s `train <lanes> <rate>` retrain
+    /// the DP link of the primary head's output while its SOR is detached
+    /// (VBIOS DP scripts, SOR lane setup, training over AUX).
+    Dplink,
 }
 
 impl GpuLevel {
@@ -106,6 +110,7 @@ impl GpuLevel {
             "scanout" => Some(GpuLevel::Scanout),
             "super" => Some(GpuLevel::Super),
             "vpll" => Some(GpuLevel::Vpll),
+            "dplink" => Some(GpuLevel::Dplink),
             _ => None,
         }
     }
@@ -147,6 +152,8 @@ mod tests {
         assert_eq!(GpuLevel::parse("scanout"), Some(GpuLevel::Scanout));
         assert_eq!(GpuLevel::parse("super"), Some(GpuLevel::Super));
         assert_eq!(GpuLevel::parse("vpll"), Some(GpuLevel::Vpll));
+        assert_eq!(GpuLevel::parse("dplink"), Some(GpuLevel::Dplink));
+        assert!(GpuLevel::Dplink > GpuLevel::Vpll);
         assert!(GpuLevel::Vpll > GpuLevel::Super);
         assert!(GpuLevel::Super > GpuLevel::Scanout && GpuLevel::Scanout > GpuLevel::Chan);
         assert!(GpuLevel::Chan > GpuLevel::Dispstate && GpuLevel::Dispstate > GpuLevel::Vblank);

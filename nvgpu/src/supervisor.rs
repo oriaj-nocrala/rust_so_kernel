@@ -135,6 +135,11 @@ pub struct Outp {
     pub hashm: u16,
     /// Connector type (`GENERIC_CONDITION` 0 asks for eDP).
     pub conn: Option<u8>,
+    /// AUX channel and the pad it shares, from the CCB entry
+    /// (`dp.c:651-652`, `i2c/base.c:278-342`): DP link training and the
+    /// scripts' DPCD accesses.
+    pub aux: Option<u8>,
+    pub pad: Option<u8>,
 }
 
 impl Outp {
@@ -147,6 +152,8 @@ impl Outp {
             hasht: o.hasht(),
             hashm: o.hashm(),
             conn: dcb.connector(o.connector).map(|c| c.kind),
+            aux: dcb.ccb(o.i2c_index).and_then(|e| e.auxch),
+            pad: dcb.ccb(o.i2c_index).and_then(|e| e.share),
         }
     }
 
@@ -559,7 +566,7 @@ impl Supervisor {
             return;
         };
         let addr = iedt.script[id];
-        let t = Target { or: Some(sor), link: arm.link, head: Some(h), conn: o.conn };
+        let t = Target { or: Some(sor), link: arm.link, head: Some(h), conn: o.conn, aux: o.aux };
         r.events.push(Event::Script { head: h, stage, sor, addr, result: init::run(m, bios, t, addr as u32) });
     }
 
@@ -588,7 +595,7 @@ impl Supervisor {
             r.events.push(Event::NoScript { head: h, stage, sor });
             return;
         };
-        let t = Target { or: Some(sor), link: asy.link, head: Some(h), conn: o.conn };
+        let t = Target { or: Some(sor), link: asy.link, head: Some(h), conn: o.conn, aux: o.aux };
         r.events.push(Event::Script { head: h, stage, sor, addr, result: init::run(m, bios, t, addr as u32) });
     }
 
@@ -643,7 +650,7 @@ mod tests {
     /// "outp 04:0006:0f82: type 06 loc 0 or 2 link 2 con 2", "on SOR-1 link
     /// 2"; connector 2 is type 0x46, DP).
     fn dp3() -> Outp {
-        Outp { dcb: 4, kind: OUTPUT_DP, or: 2, link: 2, hasht: 0x0006, hashm: 0x0f82, conn: Some(0x46) }
+        Outp { dcb: 4, kind: OUTPUT_DP, or: 2, link: 2, hasht: 0x0006, hashm: 0x0f82, conn: Some(0x46), aux: Some(3), pad: None }
     }
 
     fn cfg() -> Config {
@@ -678,7 +685,7 @@ mod tests {
         let r1 = s.service(&m, &bios, 1);
         assert_eq!((r1.stage, r1.masks[0]), (1, 0x1100));
         // OffInt1 of DP-3 is an empty script (VBIOS 0x78f9: DONE).
-        assert_eq!(r1.events, vec![Event::Script { head: 0, stage: 10, sor: 1, addr: 0x78f9, result: Ok(init::Stats { opcodes: 1, writes: 0 }) }]);
+        assert_eq!(r1.events, vec![Event::Script { head: 0, stage: 10, sor: 1, addr: 0x78f9, result: Ok(init::Stats { opcodes: 1, writes: 0, ..Default::default() }) }]);
         assert_eq!(s.sor_state(1), (SorState::from_ctrl(0x901), SorState::from_ctrl(0)));
         let r2 = s.service(&m, &bios, 2);
         // OffInt2 (0x7355): clear 0x616540 bit 0, the 0x21234 no-op the
@@ -686,7 +693,7 @@ mod tests {
         assert_eq!(
             r2.events,
             vec![
-                Event::Script { head: 0, stage: 20, sor: 1, addr: 0x7355, result: Ok(init::Stats { opcodes: 8, writes: 3 }) },
+                Event::Script { head: 0, stage: 20, sor: 1, addr: 0x7355, result: Ok(init::Stats { opcodes: 8, writes: 3, ..Default::default() }) },
                 Event::NothingToAttach { head: 0, stage: 22 },
             ]
         );
@@ -716,7 +723,7 @@ mod tests {
             vec![
                 Event::Foreign { head: 1, mask: 0x11100 },
                 Event::NothingAttached { head: 0, stage: 20 },
-                Event::Script { head: 0, stage: 22, sor: 1, addr: 0x71b9, result: Ok(init::Stats { opcodes: 15, writes: 1 }) },
+                Event::Script { head: 0, stage: 22, sor: 1, addr: 0x71b9, result: Ok(init::Stats { opcodes: 15, writes: 1, ..Default::default() }) },
                 Event::Dp { head: 0, sor: 1, link, config: DpConfig { h: 0x3da, v: 0xeef, watermark: 0x10 } },
                 Event::Clocks { head: 0, sor: 1 },
             ]
@@ -726,7 +733,7 @@ mod tests {
             r3.events,
             vec![
                 Event::Foreign { head: 1, mask: 0x11100 },
-                Event::Script { head: 0, stage: 30, sor: 1, addr: 0x6821, result: Ok(init::Stats { opcodes: 1, writes: 0 }) },
+                Event::Script { head: 0, stage: 30, sor: 1, addr: 0x6821, result: Ok(init::Stats { opcodes: 1, writes: 0, ..Default::default() }) },
             ]
         );
         assert_eq!(fmt(&m.writes.borrow()), fmt(&owned_writes(&m)));
@@ -811,7 +818,7 @@ mod tests {
         // B → SOR-1, link bit set), the others unrouted ("no route").
         let m = TableMmio::new(&[(0x61_2408, 0x800), (0x61_2488, 0x1912), (0x61_2508, 0x800), (0x61_2588, 0x800)]);
         assert_eq!(route_get(&m, &dp3()), Some(1));
-        let hdmi = Outp { dcb: 7, kind: OUTPUT_TMDS, or: 2, link: 1, hasht: 0x0002, hashm: 0x0f42, conn: Some(0x61) };
+        let hdmi = Outp { dcb: 7, kind: OUTPUT_TMDS, or: 2, link: 1, hasht: 0x0002, hashm: 0x0f42, conn: Some(0x61), aux: None, pad: None };
         assert_eq!(route_get(&m, &Outp { or: 1, ..hdmi }), None);
     }
 

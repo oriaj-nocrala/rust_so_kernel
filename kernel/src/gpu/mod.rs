@@ -44,6 +44,10 @@
 //          supervisor 2.1 (`nvgpu::pll`), and let `/dev/dispctl`'s
 //          `clock <kHz>` change the primary head's pixel clock on the same
 //          raster (1080p at 50 Hz, and back). Same lines and counters.
+//   dplink (phase 5.6) — also let `/dev/dispctl`'s `train <lanes> <rate>`
+//          retrain the primary head's DP link while its SOR is detached
+//          (`dplink.rs`, `nvgpu::dp`). Result: `dplink:` lines in /proc/gpu,
+//          `gpu_dplink:` in /proc/kdebug.
 //
 // Runs once at boot, after `fs::init` (firmware is on `/mnt`) and before the
 // APs are released (BAR sizing turns decoding off for a few microseconds,
@@ -58,6 +62,7 @@ use nvgpu::id::ChipId;
 
 use crate::serial_println;
 
+pub mod dplink;
 pub mod evo;
 pub mod scanout;
 pub mod supervisor;
@@ -112,8 +117,10 @@ pub struct Bar0 {
 }
 
 // SAFETY: a register window. The boot uses it alone (before the APs run);
-// afterwards only the vblank MSI handler does, which never overlaps itself
-// (`vblank.rs`).
+// afterwards the vblank MSI handler (never overlapping itself, `vblank.rs`),
+// flips (window 0's registers), dispctl pushes (the core's PUT) and a link
+// training (SOR, AUX, VGA CR: only while nothing else touches them,
+// `dplink.rs`) use disjoint registers.
 unsafe impl Send for Bar0 {}
 unsafe impl Sync for Bar0 {}
 
@@ -127,6 +134,18 @@ impl nvgpu::Mmio for Bar0 {
         assert!((offset as u64) + 4 <= self.len && offset % 4 == 0);
         // SAFETY: as above.
         unsafe { core::ptr::write_volatile(self.base.add(offset as usize) as *mut u32, value) }
+    }
+    /// Byte accesses: the VGA ports at `0x601000` that VBIOS scripts use
+    /// (`nvgpu::init`, opcode CR).
+    fn rd08(&self, offset: u32) -> u8 {
+        assert!((offset as u64) < self.len);
+        // SAFETY: in range per the assert; the mapping is UC.
+        unsafe { core::ptr::read_volatile(self.base.add(offset as usize)) }
+    }
+    fn wr08(&self, offset: u32, value: u8) {
+        assert!((offset as u64) < self.len);
+        // SAFETY: as above.
+        unsafe { core::ptr::write_volatile(self.base.add(offset as usize), value) }
     }
     /// TSC busy-wait. Runs at boot before the APs are released, but still
     /// answers TLB shootdowns (CLAUDE.md: any busy-wait with IF=0).
@@ -366,7 +385,7 @@ fn probe_device(r: &mut String, level: GpuLevel) {
             }
             if level >= GpuLevel::Super {
                 match put {
-                    Some(_) => supervisor::setup(r, &regs, level >= GpuLevel::Vpll),
+                    Some(_) => supervisor::setup(r, &regs, level >= GpuLevel::Vpll, level >= GpuLevel::Dplink),
                     None => {
                         let _ = writeln!(r, "super: not attempted: the channels are not up (see chan:)");
                     }

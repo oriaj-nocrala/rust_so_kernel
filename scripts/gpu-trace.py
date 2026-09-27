@@ -34,6 +34,10 @@ A trace dir is what scripts/gpu-oracle.sh leaves: mmiotrace.txt + dmesg.txt.
                                             0x80000000), as a replay fixture ("R|W offset value");
                                             accesses of other contexts (interrupt handlers, timer,
                                             AUX polling) are left out, see SUPER_OTHER
+  gpu-trace.py train   DIR T0 T1 CH [OUT]   every BAR0 access between dmesg times T0..T1 as a
+                                            replay fixture ("R|W offset value"), for a DP link
+                                            training on AUX channel CH: PTIMER, other AUX
+                                            channels and TRAIN_OTHER left out
 
 Clock alignment. mmiotrace and printk stamp with different clocks. The
 anchor is the VBIOS PROM read (BAR0 0x300000..0x3fffff): nouveau prints
@@ -627,6 +631,52 @@ def supers(d, t0, t1, out=None):
         sys.stdout.write(text)
 
 
+# What nouveau interleaves with the DP link training of trace-nogsp that is
+# not the training: the HDMI encoder's enable (SOR-0, head 1: its HDA/ELD
+# block, infoframe control, and the 0x612408/0x612488 writes around them),
+# in one burst between the DP release and the training (dmesg time range),
+# and the core update that follows (interrupt enables, head state polls).
+TRAIN_OTHER_TIMES = [(11.878880, 11.878940, "HDMI encoder enable (SOR-0/head 1)")]
+TRAIN_OTHER = [
+    (0x000000, 0x000004, "PMC_BOOT_0"),
+    (0x009400, 0x009420, "PTIMER"),
+    (0x611d80, 0x611d88, "display interrupt enables (core update)"),
+]
+
+
+def train(d, t0, t1, ch, out=None):
+    """All BAR0 accesses between dmesg times t0..t1 but TRAIN_OTHER(_TIMES)
+    and the AUX/HPD registers of channels other than `ch`."""
+    off, base = align(d, quiet=True)
+    aux_lo, aux_hi = 0xd930 + ch * 0x50, 0xd930 + (ch + 1) * 0x50
+    lines = []
+    for k, t, a, v in iter_trace(d):
+        if t > t1 + off:
+            break
+        if t < t0 + off or not base <= a < base + 0x1000000:
+            continue
+        o = a - base
+        if 0xd900 <= o < 0xdc00 and not aux_lo <= o < aux_hi:
+            continue
+        if any(lo <= o < hi for lo, hi, _ in TRAIN_OTHER):
+            continue
+        if any(lo <= t - off < hi for lo, hi, _ in TRAIN_OTHER_TIMES):
+            continue
+        lines.append(f"{k} {o:#08x} {v:#010x}")
+    text = "\n".join(lines) + "\n"
+    if out:
+        name = d.rsplit('/', 1)[-1]
+        with open(out, "w") as f:
+            f.write(f"# {name}: DP link training on AUX channel {ch}, dmesg {t0}..{t1} "
+                    f"(scripts/gpu-trace.py train {name} {t0} {t1} {ch} OUT)\n")
+            f.write("# R|W BAR0-offset value; left out: AUX/HPD of other channels, "
+                    + ", ".join(w for _, _, w in TRAIN_OTHER + TRAIN_OTHER_TIMES) + "\n")
+            f.write(text)
+        print(f"{len(lines)} accesses -> {out}")
+    else:
+        sys.stdout.write(text)
+
+
 def main(argv):
     if len(argv) < 3:
         sys.exit(__doc__)
@@ -662,6 +712,8 @@ def main(argv):
             push(d, float(argv[3]), float(argv[4]), argv[5] if len(argv) > 5 else None)
         else:
             push(d)
+    elif cmd == "train":
+        train(d, float(argv[3]), float(argv[4]), int(argv[5], 0), argv[6] if len(argv) > 6 else None)
     elif cmd == "supers":
         supers(d, float(argv[3]), float(argv[4]), argv[5] if len(argv) > 5 else None)
     else:

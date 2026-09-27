@@ -12,6 +12,18 @@ pub trait Mmio {
     /// they end either way.
     fn udelay(&self, us: u32);
 
+    /// 8-bit access (`nvkm_rd08`/`nvkm_wr08`): only the VGA ports behind
+    /// `0x601000` (`engine/disp/vga.c:27-65`), which VBIOS scripts use. The
+    /// defaults are the test doubles' view (one 8-bit value per byte
+    /// offset, as mmiotrace records it); the kernel's BAR0 overrides them
+    /// with real byte accesses.
+    fn rd08(&self, offset: u32) -> u8 {
+        self.rd32(offset) as u8
+    }
+    fn wr08(&self, offset: u32, value: u8) {
+        self.wr32(offset, value as u32)
+    }
+
     /// `nvkm_mask`: read, clear `mask`, or in `value`, write; returns the
     /// value read. A read and a write even when nothing changes — the
     /// traces show both, and some registers (AUX status) are acknowledged by

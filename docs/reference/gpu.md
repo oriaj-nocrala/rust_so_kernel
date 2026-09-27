@@ -7,7 +7,7 @@ Plan and decisions: `docs/gpu/gpu-plan.md`. This page is the current state. Pure
 - UEFI gives no command line. `key=value` words are read once after `fs::init` from `/mnt/etc/kernel.conf`, then `/mnt/autorun/kernel.conf` (later wins; `#` comments). Before that, everything is at its default.
 - `/mnt/autorun/kernel.conf` is written by `scripts/metal-run.sh --kconf '...'` and removed with `autorun/`, so an option applies to one unattended run only.
 - `disk-image-root/etc/kernel.conf` is gitignored: a checkout's own options.
-- `gpu=` (`hal::bootopts::GpuLevel`): `off` (default: the GPU is not touched), `probe`, `disp`, `vblank`, `dispstate`, `chan`, `scanout`, `super`, `vpll`. Each level does everything the previous ones do. An unknown value is logged and read as `off`.
+- `gpu=` (`hal::bootopts::GpuLevel`): `off` (default: the GPU is not touched), `probe`, `disp`, `vblank`, `dispstate`, `chan`, `scanout`, `super`, `vpll`, `dplink`. Each level does everything the previous ones do. An unknown value is logged and read as `off`.
 - `disk-image-root/etc/` is not synced to `disk.img` (only `etc/gui` is). To try a level in QEMU, write the file into the image: `debugfs -w -R "write <file> /etc/kernel.conf" disk.img` (and `rm` it after).
 
 ## `gpu=probe` (phase 1)
@@ -101,6 +101,18 @@ Everything `super` does, with `Config::clocks`: supervisor 2.1 programs `VPLL<he
 - Report: `vpll:` lines at boot (limits, the GOP's clock's coefficients, bounds; the GOP's VPLL registers, read only); `dispctl` status adds ARMED pixel clock and VPLL0's `0xef18`/`0xef04`; `gpu_super: clocks_set=`.
 - Metal job: `touch build.rs`, then `scripts/metal-run.sh --kconf 'gpu=vpll' scripts/metal-jobs/gpu-vpll.sh` (50 Hz for ~20 s, then back to 60).
 
+## `gpu=dplink` (phase 5.6)
+
+Everything `vpll` does; `supervisor::setup` also finds the output's DP table entry (`dplink::setup`, `nvgpu::dp::dpout_match`: BIT 'd', version 0x42 on this board; DP-3 = entry `0x6e96`, scripts BeforeLT list `0x6ef1`, AfterLT `0x67c6`, EnableSpread `0x733c`, DisableSpread `0x732b`, DisableLT `0x734d`, lnkcmp list `0x6ec1`) and logs `dplink:` lines.
+- **`/dev/dispctl` `train <lanes> <rate>`** (rate in DPCD units, `train 4 0x14` = 4x HBR2): synchronous in the writer's syscall (~130 ms of busy-waits). Refused (EAGAIN) unless the SOR is detached: the ISR sets `LINK_FREE` at each supervisor 3 when the head's SOR drives nothing; any push but `detach` clears it; the check and `TRAINING` are under `PUSH_AT`, so no push happens during a training. EINVAL when refused before any SOR write (LTTPR present, config above sink/DCB, post-LT-adjust sink), EIO when the training ran and failed.
+- **Sequence** (`nvgpu::dp`, nouveau's order, replayed against `trace-nogsp` write for write, `fixtures/dp-train.txt`): pad to AUX, LTTPR probe (`0xf0000`), receiver caps, `check_config`, DisableLT (nouveau's release), sink `DP_SET_POWER` to D0 (DRM read with its `0x102` probe), EnableSpread (writes `0x00e86c = 2`: the "unidentified" write of phase 5.0), BeforeLT + lnkcmp for the rate (SOR PLL search on `0x612488`, two 20 ms condition polls), `ga102_sor_dp_links` (40 ms), lane power, TPS1 then TPS2/3/4 with the drive table (`dpcfg_match`, `gm200_sor_dp_drive`), pattern off, AfterLT; pad back, auto-DPCD bit restored.
+- `nvgpu::init` now also has `ANDN_REG`, `OR_REG`, `CR` (VGA CR at `0x6013d4/5`, byte accesses: `Mmio::rd08/wr08`), `CONDITION` / `CONDITION_TIME` (BIT 'I' condition table: 4 = `0x612488` PLL lock, 7 = SOR sequencer idle, 8 = `0x61c144` link ready), `ZM_MASK_ADD`, `AUXCH` and generic condition 5 (ASSR, DPCD `0x0d`); `Target::aux` is the output's AUX channel.
+- AUX: nvkm's own accesses use the hardware retry loop (`Aux::nvkm_read/nvkm_write`, up to 33 sends on DEFER); DRM's don't (`native_read/write`, `drm_read` = probe + read).
+- The next `attach` programs the DP packing for the new link (2.2 reads it back from the SOR); `clock`'s upper bound follows the trained link.
+- `dispctl` status adds `link NxRATE[ef]` and `free 0|1`; `/proc/kdebug` `gpu_dplink: trains ok failed refused last_ms`.
+- Not ported: LTTPRs, post-LT adjust, eDP rate tables, MST.
+- Metal job: `touch build.rs`, then `scripts/metal-run.sh --kconf 'gpu=dplink' scripts/metal-jobs/gpu-dplink.sh` (4x HBR2, then back to the GOP's 2x HBR, at 1080p60).
+
 ## Oracle tools (`scripts/gpu-trace.py`)
 
 - `aux DIR CH` lists AUX transactions on a channel; `aux DIR CH SEL OUT` writes them as a `ReplayMmio` fixture (`nvgpu/fixtures/aux-ch3-dpcd-edid.txt`).
@@ -109,6 +121,7 @@ Everything `super` does, with `Config::clocks`: supervisor 2.1 programs `VPLL<he
 - `disp DIR T0 T1` lists display writes labelled with the nouveau code that owns each range (`DISP_CLASSES`); `mem DIR LO HI T0 T1` lists non-zero writes into a mapped range (BAR3 instance memory).
 - The display push buffers are in host memory on Ampere, so a `nogsp` trace has only their PUTs. `scripts/gpu-oracle.sh` mode `nogsp-vrampush` (`kms_vram_pushbuf=1`) puts them in VRAM behind BAR1, where mmiotrace sees them.
 - `supers DIR T0 T1 [OUT]` extracts each supervisor service (from `R 0x6107a8` to the release) as a `ReplayMmio` fixture, minus other contexts' accesses (`SUPER_OTHER`): `nvgpu/fixtures/super-round1.txt`, `super-round2.txt`.
+- `train DIR T0 T1 CH [OUT]`: every BAR0 access of a DP link training as a `ReplayMmio` fixture, minus PTIMER, other AUX channels and `TRAIN_OTHER(_TIMES)` (the HDMI encoder enable nouveau interleaves): `nvgpu/fixtures/dp-train.txt`.
 - `push DIR [T0 T1 [OUT]]` decodes those push buffers (needs a `nogsp-vrampush` trace): one block per PUT write, each method named from `clc67d.h`/`clc67e.h`/`clc67b.h` (+ `EXTRA_METHODS`, the ones nouveau writes by number). Fixture: `nvgpu/fixtures/modeset-push.txt`.
 - `core` and `push` name methods through `method_names(cls)`: header indices have no bound, so offsets are claimed index 0 first across all methods, then 1, …
 
