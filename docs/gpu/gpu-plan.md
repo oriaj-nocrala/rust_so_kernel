@@ -6,7 +6,8 @@
 > (a6c221a, Ryzen boot #66; ver "Resultados de la fase 1"). **Fase 2
 > cerrada** (Ryzen boot #67; ver "Resultados de la fase 2"). **Fase 3
 > cerrada** (Ryzen boot #68: vblank por MSI a 59,995 Hz, sin tearing; ver
-> "Resultados de la fase 3"). Siguiente: fase 5 (orden de D6). Ninguna fase se da por hecha sin su
+> "Resultados de la fase 3"). Siguiente: fase 5, partida en subfases
+> 5.0–5.7 (ver su sección); se empieza por la 5.0. Ninguna fase se da por hecha sin su
 > criterio medido en la Ryzen.
 
 ## Objetivo
@@ -561,6 +562,23 @@ posterior arranca con imagen.
 > propio por AUX (portado de `nouveau/nvkm/engine/disp/` y
 > `dispnv50/`). Esta sección se reescribe entera al empezar la fase, después
 > de segmentar la traza. El criterio de "hecho" no cambia.
+
+**Subfases (2026-09-27).** Una por sesión con contexto en blanco, como las
+fases: cada una con su extracto de la traza `nogsp` como oráculo, su propio
+nivel `gpu=` (`off` por defecto, master siempre funcionando), un criterio
+medible en la Ryzen y su apartado de resultados aquí al cerrarla. La 5.0
+comprueba esta partición contra la traza y la corrige si hace falta.
+
+| Sub | Qué | Hecho cuando |
+|---|---|---|
+| **5.0** | Oráculo y plan, sin código de driver: segmentar el modeset de `trace-nogsp` (11,8215–11,8789 s y la ronda desde 11,9849 s), clasificar las escrituras (memoria de instancia, canal core, supervisores, relojes, entrenamiento DP, SOR) y reescribir esta sección con las subfases confirmadas | Sección reescrita; extractos por paso en `nvgpu/fixtures/`. Sin metal |
+| **5.1** | Interrupciones de supervisor (`0x611ec0` bit 12, `ctrl_disp`: supervisor 1/2/3, `engine/disp/gv100.c`) sobre el servicio de la fase 3. Lógica pura contra la traza | Tests de host; en metal, armadas sin romper el vblank |
+| **5.2** | **Tomar el display**: memoria de instancia en VRAM, canal core, y un modeset **al mismo modo del GOP** (1920×1080 a 60 Hz, mismo framebuffer). Es la puerta de riesgo; si no cabe en una sesión, se parte en "canal core arriba sin tocar el modo" y "modeset al mismo modo" | En metal la imagen no cambia, pero la programa constanos |
+| **5.3** | Relojes de píxel (VPLL desde las tablas del VBIOS). Lógica pura | Tests contra los 148,5 MHz de la traza; en metal, el mismo modo con el reloj reprogramado |
+| **5.4** | Entrenamiento DP por AUX (la AUX es la de la fase 2), HBR2 ×4, y asignación de SOR | Tests contra las transacciones AUX de la traza; en metal, enlace entrenado |
+| **5.5** | Scanout propio en VRAM (ventana WC de BAR1), canal de ventana, flip en vblank; `/dev/fb0` pasa a apuntar ahí | Imagen de constanos desde VRAM propia; el compositor hace flip en vblank |
+| **5.6** | Modos: los del EDID más CVT-RB2 (generador con tests de host), interfaz para pedir el modo (`/proc/displays` o ioctl de `/dev/fb0`), consola y compositor avisados del cambio | Foto del menú del ASUS a **180 Hz**; `/proc/kdebug` a 180 vblanks/s; volver a 60 Hz sin reiniciar |
+| **5.7** | El HP por HDMI (ruta TMDS, segunda cabeza) | El HP enciende a 1920×1080 a 60 Hz con su propio contenido |
 
 Ruta RM (descartada): con RM, el entrenamiento del enlace DP y los relojes de
 píxel los hace el GSP. El driver asigna los canales de display y les envía
