@@ -103,6 +103,11 @@ fn main() {
         .arg(format!("file:{}", serial_log.display()))
         .arg("-device")
         .arg("isa-debug-exit,iobase=0xf4,iosize=0x04")
+        // `hw_tests::edu_mmio_dma_msi` (GPU plan, phase 1). The 48-bit DMA
+        // mask is `kernel/src/edu.rs`'s `DMA_MASK`: the default 28 bits
+        // cannot be targeted by the buddy allocator.
+        .arg("-device")
+        .arg("edu,dma_mask=0xffffffffffff")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

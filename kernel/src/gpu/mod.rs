@@ -1,0 +1,281 @@
+// kernel/src/gpu/mod.rs
+//
+// The kernel adapter of the NVIDIA GA106 (RTX 3050) driver: docs/gpu/gpu-plan.md,
+// state in docs/reference/gpu.md. The logic lives in the `nvgpu` crate
+// (host-tested); this module maps BARs, reads configuration space, loads
+// firmware and logs.
+//
+// Everything is behind `gpu=` (`bootopts`, default `off`): the GPU is the
+// Ryzen's only video output and there is no serial port, so an ordinary
+// boot does not touch it. Levels so far:
+//
+//   probe  (phase 1) — report the firmware files, the IOMMU state (D4), the
+//          GPU's capabilities and BARs, map BAR0 (UC) and a BAR1 window
+//          (WC), read PMC_BOOT_0. The only writes are the BAR sizing
+//          protocol's, in configuration space; no GPU register is written.
+//
+// Runs once at boot, after `fs::init` (firmware is on `/mnt`) and before the
+// APs are released (BAR sizing turns decoding off for a few microseconds,
+// and nothing may draw on the GOP framebuffer meanwhile).
+
+use alloc::string::String;
+use core::fmt::Write;
+
+use hal::bootopts::GpuLevel;
+use hal::pcicfg::{BarKind, MsiCap, MsixCap};
+use nvgpu::id::ChipId;
+
+use crate::serial_println;
+
+/// `10de:2507`, the only GPU this driver is for (plan, "No-objetivos").
+const VENDOR_NVIDIA: u16 = 0x10de;
+const DEVICE_GA106: u16 = 0x2507;
+
+/// Firmware the later phases load, pinned to D1 (570.144). Phase 1 only
+/// proves the loader on the small ones; `gsp-570.144.bin` (63 MB) does not
+/// fit on `disk.img` yet and arrives with phase 4.
+const FIRMWARE: [&str; 3] = [
+    "nvidia/ga106/gsp/bootloader-570.144.bin",
+    "nvidia/ga106/gsp/booter_load-570.144.bin",
+    "nvidia/ga106/gsp/booter_unload-570.144.bin",
+];
+
+/// How much of BAR1 (VRAM, 8 GiB with ReBAR) gets a write-combining
+/// mapping. The plan asks for a window, not the whole BAR; 16 MiB covers a
+/// 1920×1080×4 scanout buffer with room for a second one.
+const BAR1_WINDOW: u64 = 16 << 20;
+
+static REPORT: spin::Once<String> = spin::Once::new();
+
+/// `/proc/gpu`.
+pub fn render() -> String {
+    REPORT.get().cloned().unwrap_or_else(|| String::from("gpu: off\n"))
+}
+
+/// BAR0 through the uncached mapping `memory::mmio` made.
+pub struct Bar0 {
+    base: *mut u8,
+    len: u64,
+}
+
+// SAFETY: a register window; concurrent use is serialised by whoever owns
+// the driver state (nothing yet: phase 1 reads one register at boot).
+unsafe impl Send for Bar0 {}
+unsafe impl Sync for Bar0 {}
+
+impl nvgpu::Mmio for Bar0 {
+    fn rd32(&self, offset: u32) -> u32 {
+        assert!((offset as u64) + 4 <= self.len && offset % 4 == 0);
+        // SAFETY: in range and aligned per the assert; the mapping is UC.
+        unsafe { core::ptr::read_volatile(self.base.add(offset as usize) as *const u32) }
+    }
+    fn wr32(&self, offset: u32, value: u32) {
+        assert!((offset as u64) + 4 <= self.len && offset % 4 == 0);
+        // SAFETY: as above.
+        unsafe { core::ptr::write_volatile(self.base.add(offset as usize) as *mut u32, value) }
+    }
+}
+
+pub fn probe() {
+    let level = crate::bootopts::gpu_level();
+    if level == GpuLevel::Off {
+        serial_println!("gpu: off (gpu= not set)");
+        return;
+    }
+    let mut r = String::new();
+    let _ = writeln!(r, "level: {:?}", level);
+    report_firmware(&mut r);
+    report_iommu(&mut r);
+    probe_device(&mut r);
+    for line in r.lines() {
+        serial_println!("gpu: {}", line);
+    }
+    REPORT.call_once(|| r);
+}
+
+fn report_firmware(r: &mut String) {
+    for rel in FIRMWARE {
+        match crate::firmware::load(rel) {
+            Ok(data) => {
+                let head: [u8; 4] = data.get(..4).and_then(|h| h.try_into().ok()).unwrap_or([0; 4]);
+                // FNV-1a 64: compared by hand (or by a metal job) with the
+                // host's copy, so the loader is checked byte for byte.
+                let fnv = data.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+                let _ = writeln!(
+                    r,
+                    "firmware: {} {} bytes, first word {:#010x}, fnv1a64 {:016x}",
+                    rel,
+                    data.len(),
+                    u32::from_le_bytes(head),
+                    fnv
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(r, "firmware: {} MISSING ({:?})", rel, e);
+            }
+        }
+    }
+}
+
+/// Decision D4: bus address = physical address only while no IOMMU
+/// translates. This kernel never enables one; this reads whether the
+/// firmware did.
+fn report_iommu(r: &mut String) {
+    let units = crate::acpi::iommus();
+    if units.is_empty() {
+        let _ = writeln!(r, "iommu: no IVRS (no AMD IOMMU described)");
+        return;
+    }
+    let mut seen: [u64; 8] = [0; 8];
+    for (i, unit) in units.iter().enumerate() {
+        if seen[..i].contains(&unit.mmio_phys) {
+            continue;
+        }
+        seen[i] = unit.mmio_phys;
+        // SAFETY: the IVRS names this as the IOMMU's register block.
+        let Some(v) = (unsafe { crate::memory::mmio::map(x86_64::PhysAddr::new(unit.mmio_phys), 0x1000) }) else {
+            let _ = writeln!(r, "iommu: {:#x}: cannot map", unit.mmio_phys);
+            continue;
+        };
+        // SAFETY: freshly mapped UC page; the control register is 8 bytes
+        // at `IOMMU_MMIO_CONTROL`.
+        let ctrl = unsafe {
+            core::ptr::read_volatile((v.as_u64() + hal::acpi::IOMMU_MMIO_CONTROL) as *const u64)
+        };
+        let en = ctrl >> hal::acpi::IOMMU_CONTROL_EN_BIT & 1;
+        let _ = writeln!(
+            r,
+            "iommu: devid {:#06x} mmio {:#x} control {:#018x} IommuEn={} ({})",
+            unit.devid,
+            unit.mmio_phys,
+            ctrl,
+            en,
+            if en == 0 { "off: bus address = physical, D4 holds" } else { "ON: D4 does not hold" }
+        );
+    }
+}
+
+fn probe_device(r: &mut String) {
+    let mut found = None;
+    crate::pci::for_each_function(|f| {
+        if found.is_none() && f.vendor == VENDOR_NVIDIA && f.device_id == DEVICE_GA106 && f.class == 0x03 {
+            found = Some(f);
+        }
+    });
+    let Some(f) = found else {
+        let _ = writeln!(r, "device: no {:04x}:{:04x} on the bus", VENDOR_NVIDIA, DEVICE_GA106);
+        return;
+    };
+    let (b, d, fun) = (f.bus, f.device, f.function);
+    let _ = writeln!(r, "device: {:02x}:{:02x}.{} {:04x}:{:04x} rev {:02x}", b, d, fun, f.vendor, f.device_id, f.revision);
+
+    let cfg = crate::pci::config_space(b, d, fun);
+    let cmd = crate::pci::command(b, d, fun);
+    let _ = writeln!(r, "command: {:#06x}", cmd);
+    let _ = write!(r, "capabilities:");
+    for (id, off) in hal::pcicfg::capabilities(&cfg) {
+        let _ = write!(r, " {:02x}@{:02x}", id, off);
+    }
+    let _ = writeln!(r);
+    match MsiCap::decode(&cfg) {
+        Some(m) => {
+            let _ = writeln!(
+                r,
+                "msi: @{:02x} enabled={} 64bit={} maskable={} vectors={} address={:#x} data={:#06x}",
+                m.offset, m.enabled, m.is_64, m.per_vector_mask, m.vectors_capable, m.address, m.data
+            );
+        }
+        None => {
+            let _ = writeln!(r, "msi: none");
+        }
+    }
+    match MsixCap::decode(&cfg) {
+        Some(m) => {
+            let _ = writeln!(r, "msi-x: @{:02x} enabled={} table_size={} bar={} offset={:#x}", m.offset, m.enabled, m.table_size, m.table_bar, m.table_offset);
+        }
+        None => {
+            let _ = writeln!(r, "msi-x: none");
+        }
+    }
+
+    // Drain write-combined framebuffer stores before BAR sizing switches
+    // decoding off (they would be lost, not misdirected, but pixels are
+    // pixels).
+    // SAFETY: a fence.
+    unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) };
+    let bars = crate::pci::size_bars(b, d, fun);
+    for bar in bars.iter().flatten() {
+        let kind = match bar.kind {
+            BarKind::Io => "io",
+            BarKind::Mem32 { prefetchable: false } => "mem32",
+            BarKind::Mem32 { prefetchable: true } => "mem32 pref",
+            BarKind::Mem64 { prefetchable: false } => "mem64",
+            BarKind::Mem64 { prefetchable: true } => "mem64 pref",
+        };
+        let _ = writeln!(r, "bar{}: {} {:#x} size {:#x}", bar.index, kind, bar.addr, bar.size);
+    }
+
+    if cmd & hal::pcicfg::COMMAND_MEMORY == 0 {
+        let _ = writeln!(r, "memory decoding is off; not touching the BARs (probe writes nothing)");
+        return;
+    }
+
+    let Some(bar0) = bars[0].filter(|b| !matches!(b.kind, BarKind::Io)) else {
+        let _ = writeln!(r, "bar0: not a memory BAR");
+        return;
+    };
+    // SAFETY: BAR0 is the GPU's register window.
+    let Some(v0) = (unsafe { crate::memory::mmio::map(x86_64::PhysAddr::new(bar0.addr), bar0.size as usize) }) else {
+        let _ = writeln!(r, "bar0: cannot map {:#x} bytes", bar0.size);
+        return;
+    };
+    let _ = writeln!(r, "bar0: mapped UC at {:#x}", v0.as_u64());
+    let regs = Bar0 { base: v0.as_mut_ptr(), len: bar0.size };
+    let boot0 = nvgpu::Mmio::rd32(&regs, nvgpu::id::PMC_BOOT_0);
+    match ChipId::decode(boot0) {
+        Some(id) => {
+            let _ = writeln!(
+                r,
+                "PMC_BOOT_0: {:#010x} chipset {:#x} rev {:#04x} arch {} impl {} chip {}",
+                boot0,
+                id.chipset,
+                id.chiprev,
+                id.arch().unwrap_or("?"),
+                id.implementation(),
+                id.name().unwrap_or("?")
+            );
+        }
+        None => {
+            let _ = writeln!(r, "PMC_BOOT_0: {:#010x} (not an NVIDIA chip id)", boot0);
+        }
+    }
+
+    if let Some(bar1) = bars[1].filter(|b| matches!(b.kind, BarKind::Mem64 { .. } | BarKind::Mem32 { .. })) {
+        let len = bar1.size.min(BAR1_WINDOW);
+        use crate::memory::memtype::PatProgram;
+        let pat_wc = matches!(
+            crate::memory::memtype::pat_program_status(),
+            Some(PatProgram::Programmed { .. }) | Some(PatProgram::AlreadyWc { .. })
+        );
+        // SAFETY: the start of BAR1 (VRAM aperture); only mapped, not accessed.
+        match unsafe { crate::memory::mmio::map(x86_64::PhysAddr::new(bar1.addr), len as usize) } {
+            Some(v1) => {
+                if !pat_wc {
+                    let _ = writeln!(r, "bar1: mapped UC at {:#x}: the PAT has no WC entry", v1.as_u64());
+                } else { match crate::memory::memtype::set_pat_index_range(v1.as_u64(), len, hal::memtype::PAT_WC_INDEX) {
+                    Ok(_) => {
+                        let _ = writeln!(r, "bar1: {:#x} bytes mapped WC at {:#x} (not accessed)", len, v1.as_u64());
+                    }
+                    Err(e) => {
+                        let _ = writeln!(r, "bar1: mapped at {:#x} but not WC: {}", v1.as_u64(), e);
+                    }
+                } }
+            }
+            None => {
+                let _ = writeln!(r, "bar1: cannot map a {:#x}-byte window", len);
+            }
+        }
+    }
+
+    crate::pci::claim(b, d, fun, "nvgpu");
+}

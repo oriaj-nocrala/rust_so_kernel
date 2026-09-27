@@ -17,11 +17,16 @@ mod acpi;
 mod allocator;
 mod autorun;
 mod block;
+mod bootopts;
 mod cpu;
 mod debug;
 mod drivers;
+#[cfg(test)]
+mod edu;
 mod framebuffer;
+mod firmware;
 mod fs;
+mod gpu;
 mod hal;
 #[cfg(test)]
 mod hw_tests;

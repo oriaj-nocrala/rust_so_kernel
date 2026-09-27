@@ -12,6 +12,7 @@ pub mod demand_paging;
 pub mod address_space;
 pub mod elf;
 pub mod elf_loader;
+pub mod dma;
 pub mod mmio;
 pub mod memtype;
 pub mod tlb;

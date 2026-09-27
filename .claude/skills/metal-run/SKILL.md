@@ -30,6 +30,7 @@ scripts/metal-run.sh --collect   # verdict + log archived in target/metal/runs/<
 
 - A job is an `ash` script, written to `/mnt/autorun/job`. PID 1 prints `METAL-BEGIN <nonce>` … `METAL-DONE <nonce> exit=N|signal=N` and reboots.
 - Verdicts: `OK`, `FAIL`, `PANIC`, `HANG`, `NO-JOB`, `NO-BOOT` (plus `watchdog reset` when Linux's `sp5100_tco` reports `bootstatus=32`). The watchdog resets a hung boot after 300 s.
+- Boot options for one run: `--kconf 'gpu=probe'` (written to `autorun/kernel.conf`, gone after the run; `docs/reference/gpu.md`). Reusable jobs live in `scripts/metal-jobs/`.
 - Other options:
   - `--abort` undoes a run that never booted;
   - `--no-reboot`/`--no-deploy` for dry runs;

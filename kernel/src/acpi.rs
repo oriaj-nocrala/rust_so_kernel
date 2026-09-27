@@ -29,6 +29,7 @@ use crate::serial_println;
 
 static TOPOLOGY: spin::Once<AcpiTopology> = spin::Once::new();
 static RESET_REG: spin::Once<hal::acpi::ResetReg> = spin::Once::new();
+static IOMMUS: spin::Once<alloc::vec::Vec<hal::acpi::Ivhd>> = spin::Once::new();
 
 /// Returns the parsed topology, if ACPI parsing succeeded at boot.
 pub fn topology() -> Option<&'static AcpiTopology> {
@@ -39,6 +40,11 @@ pub fn topology() -> Option<&'static AcpiTopology> {
 /// method `crate::reboot` tries.
 pub fn reset_reg() -> Option<hal::acpi::ResetReg> {
     RESET_REG.get().copied()
+}
+
+/// The IOMMUs the IVRS describes (empty without one, or before ACPI ran).
+pub fn iommus() -> &'static [hal::acpi::Ivhd] {
+    IOMMUS.get().map_or(&[], |v| v.as_slice())
 }
 
 /// `crate::hal::Driver` adapter around the ACPI parse — this is what
@@ -75,6 +81,16 @@ impl Driver for AcpiDriver {
                 RESET_REG.call_once(|| reg);
             }
             Err(e) => serial_println!("[acpi] no FADT reset register: {:?}", e),
+        }
+
+        match hal::acpi::parse_ivrs(&KernelPhysMem, rsdp_pa) {
+            Ok(v) => {
+                for h in &v {
+                    serial_println!("[acpi] IVRS: IVHD {:#04x} devid {:#06x} mmio {:#x}", h.kind, h.devid, h.mmio_phys);
+                }
+                IOMMUS.call_once(|| v);
+            }
+            Err(e) => serial_println!("[acpi] IVRS unreadable: {:?}", e),
         }
 
         let topo = match hal::acpi::parse(&KernelPhysMem, rsdp_pa) {

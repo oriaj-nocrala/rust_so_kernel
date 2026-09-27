@@ -6,6 +6,7 @@
 # root Cargo.toml's `exclude`), so each grows its own target/ dir rather
 # than sharing the root one above.
 /hal/target/
+/nvgpu/target/
 /ext2/target/
 /mm/target/
 /vfs/target/
@@ -72,6 +73,10 @@
 # a build artifact, rebuilt every `cargo build`, not source. Synced onto
 # disk.img's /bin by the root build.rs's sync_disk_bin_dir.
 /disk-image-root/bin/
+# NVIDIA firmware, staged by build.rs from the host (GPU plan, decision D3).
+/disk-image-root/lib/firmware/
+# Boot options for this checkout (`kernel/src/bootopts.rs`).
+/disk-image-root/etc/kernel.conf
 
 # Embedded userspace ELFs (shell, busybox, kdebug, the small Rust programs)
 # that kernel/build.rs regenerates and main.rs `include_bytes!`s. These used

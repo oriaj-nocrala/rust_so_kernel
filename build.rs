@@ -45,6 +45,9 @@ fn main() {
     sync_disk_tree(&disk_image, "etc/gui");
     // Icons (PNG, `userspace::img`), read at run time like the fonts.
     sync_disk_tree(&disk_image, "usr/share/icons");
+    // GPU firmware (`kernel/src/firmware.rs`, GPU plan decision D3).
+    ensure_firmware();
+    sync_disk_tree(&disk_image, "lib/firmware");
 
     // pass the disk image paths as env variables to the `main.rs`
     println!("cargo:rustc-env=UEFI_PATH={}", uefi_path.display());
@@ -348,6 +351,55 @@ fn ensure_fonts() {
         .unwrap_or(false);
     if !ok {
         println!("cargo:warning=scripts/fetch-fonts.sh failed; disk.img gets no fonts");
+    }
+}
+
+/// NVIDIA firmware the kernel loads from `/mnt/lib/firmware`
+/// (`docs/gpu/gpu-plan.md`, decision D3): copied from the host's
+/// linux-firmware package and decompressed here, never committed (it is
+/// NVIDIA's, redistributable only with its licence, which goes along).
+/// Pinned to the GSP-RM version of decision D1. `gsp-570.144.bin` itself
+/// (63 MB) is not here yet: it does not fit on the 96 MiB `disk.img`, and
+/// phase 4 decides where it lives. Best-effort: without the package the
+/// build goes on and the kernel reports the files missing.
+const FIRMWARE: [&str; 3] = [
+    "nvidia/ga106/gsp/bootloader-570.144.bin",
+    "nvidia/ga106/gsp/booter_load-570.144.bin",
+    "nvidia/ga106/gsp/booter_unload-570.144.bin",
+];
+const FIRMWARE_LICENCE: &str = "/usr/share/licenses/linux-firmware-nvidia/LICENCE.nvidia";
+
+fn ensure_firmware() {
+    let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let root = manifest_dir.join("disk-image-root/lib/firmware");
+    for rel in FIRMWARE {
+        let dst = root.join(rel);
+        if dst.exists() {
+            continue;
+        }
+        let src = PathBuf::from("/usr/lib/firmware").join(format!("{rel}.zst"));
+        if !src.exists() {
+            println!("cargo:warning=firmware {} not on the host (linux-firmware-nvidia?); disk.img goes without it", src.display());
+            continue;
+        }
+        std::fs::create_dir_all(dst.parent().unwrap()).expect("creating disk-image-root/lib/firmware/...");
+        let ok = Command::new("zstd")
+            .args(["-q", "-d", "-f", "-o"])
+            .arg(&dst)
+            .arg(&src)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            let _ = std::fs::remove_file(&dst);
+            println!("cargo:warning=zstd could not decompress {}; disk.img goes without it", src.display());
+        }
+    }
+    let licence = root.join("nvidia/LICENCE.nvidia");
+    if root.join("nvidia").is_dir() && !licence.exists() {
+        if std::fs::copy(FIRMWARE_LICENCE, &licence).is_err() {
+            println!("cargo:warning={FIRMWARE_LICENCE} missing: firmware staged without its licence");
+        }
     }
 }
 

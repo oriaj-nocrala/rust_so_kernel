@@ -2,7 +2,7 @@
 # scripts/metal-run.sh — one unattended round trip on the bare-metal machine
 # (docs/metal/autonomous-loop-plan.md, phase 5).
 #
-#   scripts/metal-run.sh [--no-deploy] [--no-reboot] JOB.sh
+#   scripts/metal-run.sh [--no-deploy] [--no-reboot] [--kconf 'k=v ...'] JOB.sh
 #       build, deploy kernel + data to the stick, drop JOB.sh as the autorun
 #       job, BootNext into the stick and reboot. Linux comes back by itself:
 #       the job ends in reboot(2), a panic resets (autorun mode), and BootNext
@@ -33,6 +33,9 @@
 #               (the job still goes onto the stick)
 # --no-reboot   do everything except BootNext + reboot (dry run of the
 #               host side; follow with --abort)
+# --kconf OPTS  boot options for this run only (e.g. 'gpu=probe'), written
+#               to autorun/kernel.conf and gone with autorun/ afterwards
+#               (kernel/src/bootopts.rs)
 #
 # Deploy is skipped by itself when the kernel ELF hashes the same as at the
 # last deploy (each deploy rewrites ~6 MB of the stick's FAT).
@@ -115,6 +118,9 @@ put_job() {
     sudo mkdir "$MNT/autorun"
     sudo install -m 0644 "$JOB" "$MNT/autorun/job"
     echo "$NONCE" | sudo tee "$MNT/autorun/nonce" >/dev/null
+    if [[ -n "$KCONF" ]]; then
+        echo "$KCONF" | sudo tee "$MNT/autorun/kernel.conf" >/dev/null
+    fi
     sudo sync
 }
 
@@ -126,9 +132,11 @@ remove_job() {
 # ── JOB.sh ──────────────────────────────────────────────────────────────
 cmd_run() {
     local deploy=1 reboot=1
+    KCONF=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --no-deploy) deploy=0; shift ;;
+            --kconf) [[ $# -ge 2 ]] || usage; KCONF="$2"; shift 2 ;;
             --no-reboot) reboot=0; shift ;;
             -*) usage ;;
             *) break ;;
@@ -167,8 +175,9 @@ cmd_run() {
     {
         echo "nonce=$NONCE"
         echo "created=$(date -Is)"
-        echo "commit=$(git rev-parse --short HEAD)$(git diff --quiet HEAD -- kernel userspace hal ext2 mm vfs diag sched usock || echo -dirty)"
+        echo "commit=$(git rev-parse --short HEAD)$(git diff --quiet HEAD -- kernel userspace hal ext2 mm vfs diag sched usock nvgpu || echo -dirty)"
         echo "job=$JOB"
+        echo "kconf=$KCONF"
         echo "prev_boot_seq=$prev_seq"
         echo "usb_entry=$entry"
         # The Claude Code session to resume afterwards (scripts/metal-resume.sh).

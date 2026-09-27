@@ -1,0 +1,13 @@
+[package]
+name = "nvgpu"
+version = "0.1.0"
+edition = "2021"
+
+# The pure half of the NVIDIA GA106 driver (`docs/gpu/gpu-plan.md`,
+# principle 3). Detached from the parent workspace (empty `[workspace]`
+# table) for the same reason as `hal`: the root profile's
+# `panic = "abort"` would break `cargo test`. The kernel pulls it in by
+# `path`; the adapter is `kernel/src/gpu/`.
+[workspace]
+
+[dependencies]

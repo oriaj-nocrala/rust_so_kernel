@@ -195,6 +195,8 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     crate::watchdog::test_hang_before_fs();
     crate::fs::init();
     serial_println!("VFS: initramfs @ /bin, devfs @ /dev");
+    // `/mnt/etc/kernel.conf` (+ `/mnt/autorun/kernel.conf`): the command line.
+    crate::bootopts::load();
     // Unattended run? From here on a panic resets instead of halting.
     crate::autorun::detect();
     // ...and the watchdog armed above stays armed only for that.
@@ -205,6 +207,11 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     // from here on the idle task, `sync(2)` and the panic handler copy the
     // log ring there. See `block::logpart`.
     crate::block::logpart::init();
+
+    // ── GPU (`gpu=`, off by default) ───────────────────────────────
+    // After the log partition, so a metal run keeps what it printed; before
+    // the APs are released, which BAR sizing needs (see `gpu`).
+    crate::gpu::probe();
 
     // ── FPU/SSE ────────────────────────────────────────────────────
     // Must run before the first `Process` is created below — every

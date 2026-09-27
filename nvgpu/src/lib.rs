@@ -1,0 +1,19 @@
+//! `nvgpu` — host-testable logic of the NVIDIA GA106 (RTX 3050) driver.
+//!
+//! The plan is `docs/gpu/gpu-plan.md`. The rules that matter here:
+//! - every register offset, bit and structure layout cites
+//!   `file:line` of the pinned references (`~/src/gpu-ref/PINNED`: Linux
+//!   v7.2.2's nouveau, open-gpu-kernel-modules 570.144);
+//! - registers are reached through the [`Mmio`] seam, so sequences run
+//!   under `cargo test` against real captured values;
+//! - nothing blocks and nothing logs: results come back as data, and the
+//!   kernel adapter (`kernel/src/gpu/`) does the logging.
+
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
+
+pub mod id;
+pub mod mmio;
+
+pub use mmio::Mmio;

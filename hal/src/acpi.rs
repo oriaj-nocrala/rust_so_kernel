@@ -386,6 +386,63 @@ pub fn parse_reset_reg(mem: &dyn PhysMem, rsdp_pa: u64) -> Result<ResetReg, Rese
     Ok(ResetReg { space, value })
 }
 
+// ── IVRS (AMD IOMMU) ─────────────────────────────────────────────────────────
+//
+// Only far enough to find each IOMMU's register block, so the GPU probe can
+// report whether firmware left translation on (decision D4 of
+// `docs/gpu/gpu-plan.md`: this kernel does no IOMMU, so bus address =
+// physical address holds only while IommuEn is 0). Layout from Linux v7.2.2
+// `drivers/iommu/amd/init.c`: the IVHD blocks start after a 48-byte header
+// (`IVRS_HEADER_LENGTH`, `init.c:43`), each is `struct ivhd_header`
+// (`init.c:101-115`: type u8, flags u8, length u16, devid u16, cap_ptr u16,
+// mmio_phys u64), and the walk steps by `length` (`init.c:604`).
+
+const IVRS_HEADER_LENGTH: usize = 48;
+
+/// One IOMMU as the IVRS describes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ivhd {
+    pub kind: u8,
+    /// PCI bus/device/function of the IOMMU itself.
+    pub devid: u16,
+    pub mmio_phys: u64,
+}
+
+/// Every IVHD block of the IVRS, up to 8. `Err` when the root table is
+/// broken; `Ok(empty)` when there is no IVRS (no IOMMU, or QEMU).
+pub fn parse_ivrs(mem: &dyn PhysMem, rsdp_pa: u64) -> Result<Vec<Ivhd>, AcpiError> {
+    let root = root_table(mem, rsdp_pa)?;
+    let mut out = Vec::new();
+    let Some((pa, len)) = find_table(mem, root, b"IVRS") else {
+        return Ok(out);
+    };
+    let mut off = IVRS_HEADER_LENGTH;
+    // Each block is at least 16 bytes long (through mmio_phys).
+    while off + 16 <= len && out.len() < 8 {
+        let h = read_bytes::<16>(mem, pa + off as u64);
+        let blen = u16::from_le_bytes([h[2], h[3]]) as usize;
+        if blen < 16 || off + blen > len {
+            break;
+        }
+        // IVHD types (0x10, 0x11, 0x40, `init.c:482-486`); IVMD blocks
+        // (0x20-0x22) share the walk but carry no register block.
+        if matches!(h[0], 0x10 | 0x11 | 0x40) {
+            out.push(Ivhd {
+                kind: h[0],
+                devid: u16::from_le_bytes([h[4], h[5]]),
+                mmio_phys: u64::from_le_bytes(h[8..16].try_into().unwrap()),
+            });
+        }
+        off += blen;
+    }
+    Ok(out)
+}
+
+/// `MMIO_CONTROL_OFFSET` (`drivers/iommu/amd/amd_iommu_types.h:58`).
+pub const IOMMU_MMIO_CONTROL: u64 = 0x18;
+/// `CONTROL_IOMMU_EN` (`amd_iommu_types.h:164`), a bit number.
+pub const IOMMU_CONTROL_EN_BIT: u32 = 0;
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -613,6 +670,65 @@ mod tests {
         g[3] = 1; // byte access
         g[4..12].copy_from_slice(&address.to_le_bytes());
         g
+    }
+
+    /// An image whose XSDT's single entry is an IVRS with the given
+    /// blocks (type, length, devid, mmio) after its 48-byte header.
+    fn build_ivrs_image(blocks: &[(u8, u16, u16, u64)]) -> AVec<u8> {
+        let mut data = build_valid_image();
+        let t = MADT_PA;
+        data[t..t + 0x200].fill(0);
+        data[t..t + 4].copy_from_slice(b"IVRS");
+        let mut off = t + 48;
+        for &(kind, len, devid, mmio) in blocks {
+            data[off] = kind;
+            data[off + 2..off + 4].copy_from_slice(&len.to_le_bytes());
+            data[off + 4..off + 6].copy_from_slice(&devid.to_le_bytes());
+            data[off + 8..off + 16].copy_from_slice(&mmio.to_le_bytes());
+            off += len.max(1) as usize;
+        }
+        let total = (off - t) as u32;
+        data[t + 4..t + 8].copy_from_slice(&total.to_le_bytes());
+        fix_checksum(&mut data, t, total as usize, t + 9);
+        data
+    }
+
+    #[test]
+    fn ivrs_blocks() {
+        // The usual AMD shape (address made up): one IOMMU at 00:00.2
+        // (devid 0x0002) described twice, by IVHD 0x10 and 0x11, plus an
+        // IVMD (0x21) to skip.
+        let mem = VecMem {
+            data: build_ivrs_image(&[
+                (0x10, 24, 0x0002, 0xfd20_0000),
+                (0x11, 40, 0x0002, 0xfd20_0000),
+                (0x21, 32, 0, 0),
+            ]),
+        };
+        let v = parse_ivrs(&mem, RSDP_PA as u64).unwrap();
+        assert_eq!(
+            v,
+            [
+                Ivhd { kind: 0x10, devid: 2, mmio_phys: 0xfd20_0000 },
+                Ivhd { kind: 0x11, devid: 2, mmio_phys: 0xfd20_0000 },
+            ]
+        );
+        // No IVRS at all (QEMU): empty, not an error.
+        let mem = VecMem { data: build_valid_image() };
+        assert_eq!(parse_ivrs(&mem, RSDP_PA as u64), Ok(AVec::new()));
+    }
+
+    #[test]
+    fn ivrs_bad_lengths_stop_the_walk() {
+        // A zero-length block would loop forever; one past the end would
+        // read outside the table.
+        let mem = VecMem { data: build_ivrs_image(&[(0x10, 0, 2, 0x1000)]) };
+        assert!(parse_ivrs(&mem, RSDP_PA as u64).unwrap().is_empty());
+        let mut data = build_ivrs_image(&[(0x10, 24, 2, 0x1000)]);
+        data[MADT_PA + 48 + 2] = 0xff; // length 255 > table
+        fix_checksum(&mut data, MADT_PA, 48 + 24, MADT_PA + 9);
+        let mem = VecMem { data };
+        assert!(parse_ivrs(&mem, RSDP_PA as u64).unwrap().is_empty());
     }
 
     const RESET_SUP: u32 = 1 << 10;

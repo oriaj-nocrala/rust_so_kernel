@@ -923,3 +923,70 @@ fn tlb_shootdown_leaves_no_stale_translation() {
     assert_eq!(r.stale, 0, "{}", r);
     crate::serial_println!("{}", crate::memory::tlb::render());
 }
+
+/// Phase 1 of `docs/gpu/gpu-plan.md`: everything the GPU driver will need
+/// from the kernel, against QEMU's `edu` device (the runner adds
+/// `-device edu,dma_mask=...`): BAR sizing and an uncached mapping
+/// (identification, liveness, factorial over MMIO), an MSI routed to a
+/// chosen CPU through a dynamically allocated vector, and DMA both ways
+/// through `memory::dma`.
+///
+/// The MSI goes to CPU 1, not 0: the test boot keeps IF=0 on the BSP (see
+/// `init::test_support`), while the APs idle with IF=1. That also checks
+/// that the destination field of the message is honoured.
+#[test_case]
+fn edu_mmio_dma_msi() {
+    use core::sync::atomic::Ordering;
+    use crate::edu::{Edu, DMA_BUF_ADDR, DMA_BUF_SIZE, DMA_DONE_IRQ, IRQ_CPU, IRQ_SEEN};
+
+    let edu = Edu::find().unwrap_or_else(|e| panic!("{}", e));
+    // `0xRRrr00edu` (edu.rst:44-47).
+    assert_eq!(edu.ident() & 0xffff, 0x00ed, "ident {:#x}", edu.ident());
+    assert_eq!(edu.liveness(0x1234_5678), !0x1234_5678u32);
+    assert_eq!(edu.factorial(10), Some(3_628_800));
+
+    // MSI, to CPU 1.
+    assert!(crate::smp::is_online_ap(1), "test boot has no CPU 1");
+    let vector = edu.enable_msi(crate::smp::apic_id(1)).unwrap_or_else(|e| panic!("{}", e));
+    let cfg = crate::pci::config_space(edu.bdf.0, edu.bdf.1, edu.bdf.2);
+    let msi = hal::pcicfg::MsiCap::decode(&cfg).expect("edu has an MSI capability (edu.c:380)");
+    assert!(msi.enabled);
+    assert_eq!(msi.data, vector as u16);
+    assert_eq!(msi.address, 0xfee0_0000 | (crate::smp::apic_id(1) as u64) << 12);
+    edu.raise_irq(0x42);
+    assert!(
+        crate::edu::wait_ms(1000, || IRQ_SEEN.load(Ordering::Acquire) & 0x42 != 0),
+        "no MSI in 1 s (count {})",
+        crate::interrupts::msi::count(vector)
+    );
+    assert_eq!(IRQ_CPU.load(Ordering::Acquire), 1, "MSI ran on the wrong CPU");
+    assert_eq!(edu.irq_status(), 0, "ISR did not acknowledge");
+    assert!(crate::interrupts::msi::count(vector) >= 1);
+
+    // DMA: RAM -> device buffer -> another RAM block.
+    let src = Edu::alloc_dma().expect("DMA source");
+    let dst = Edu::alloc_dma().expect("DMA destination");
+    let mut pattern = [0u8; DMA_BUF_SIZE];
+    for (i, b) in pattern.iter_mut().enumerate() {
+        *b = (i * 7 + 3) as u8;
+    }
+    src.write(0, &pattern);
+    edu.dma(src.bus_addr(), DMA_BUF_ADDR, DMA_BUF_SIZE, false).unwrap_or_else(|e| panic!("{}", e));
+    edu.dma(DMA_BUF_ADDR, dst.bus_addr(), DMA_BUF_SIZE, true).unwrap_or_else(|e| panic!("{}", e));
+    let mut back = [0u8; DMA_BUF_SIZE];
+    dst.read(0, &mut back);
+    assert!(back == pattern, "DMA round trip corrupted the data");
+    assert!(
+        crate::edu::wait_ms(1000, || IRQ_SEEN.load(Ordering::Acquire) & DMA_DONE_IRQ as u64 != 0),
+        "no DMA-done MSI"
+    );
+    src.free();
+    dst.free();
+
+    // A mask nothing fits under is refused, not handed out.
+    assert!(matches!(
+        crate::memory::dma::DmaBuf::alloc(4096, 0),
+        Err(crate::memory::dma::DmaError::AboveMask { .. })
+    ));
+    crate::interrupts::msi::free(vector);
+}

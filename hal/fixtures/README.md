@@ -42,3 +42,9 @@ first 64 bytes):
 for d in /sys/bus/pci/devices/*; do b=$(basename $d); echo "${b#0000:} $(head -c 64 $d/config | xxd -p | tr -d '\n')"; done
 for d in /sys/bus/pci/devices/*; do b=$(basename $d); s=$(cat $d/secondary_bus_number 2>/dev/null); u=$(cat $d/subordinate_bus_number 2>/dev/null); echo "${b#0000:} $(cat $d/vendor $d/device $d/class $d/revision $d/subsystem_vendor $d/subsystem_device | tr '\n' ' ')${s:--} ${u:--}"; done
 ```
+
+`ga106-config.txt` — the first 256 bytes of the RTX 3050's (09:00.0)
+configuration space, the hex rows of `lspci -xxxx -s 09:00.0` on the target
+board (captured by `scripts/gpu-oracle.sh` into
+`~/constanos-gpu-oracle/static/lspci.txt`, under the `nvidia` driver, which
+had MSI enabled). Read by `hal/src/pcicfg.rs`'s tests.

@@ -310,6 +310,112 @@ pub fn enable_mem_and_bus_master(bus: u8, device: u8, function: u8) {
     config_write32(bus, device, function, 0x04, new_dword);
 }
 
+// ── Full configuration space, BAR sizing, MSI (phase 1 of the GPU plan) ─────
+//
+// The decoding is `hal::pcicfg` (host-tested against the GA106's real
+// configuration space); this is only the port I/O it needs.
+
+/// The whole 256-byte configuration space mechanism #1 reaches (the
+/// extended space above it needs ECAM, which this kernel does not map).
+pub fn config_space(bus: u8, device: u8, function: u8) -> [u8; 256] {
+    let mut cfg = [0u8; 256];
+    let _g = CONFIG.lock();
+    for i in 0..64 {
+        let dword = raw_read32(bus, device, function, (i * 4) as u8);
+        cfg[i * 4..i * 4 + 4].copy_from_slice(&dword.to_le_bytes());
+    }
+    cfg
+}
+
+/// Writes the 16-bit register at `offset` (2-aligned), read-modify-write
+/// of its dword under one hold of [`CONFIG`].
+pub fn config_write16(bus: u8, device: u8, function: u8, offset: u8, value: u16) {
+    let _g = CONFIG.lock();
+    let shift = (offset as u32 & 2) * 8;
+    let dword = raw_read32(bus, device, function, offset & 0xFC);
+    let dword = (dword & !(0xFFFF << shift)) | ((value as u32) << shift);
+    raw_write32(bus, device, function, offset & 0xFC, dword);
+}
+
+pub fn command(bus: u8, device: u8, function: u8) -> u16 {
+    config_read16(bus, device, function, hal::pcicfg::COMMAND)
+}
+
+/// Sets `set` and clears `clear` in the Command register, leaving the rest.
+pub fn update_command(bus: u8, device: u8, function: u8, set: u16, clear: u16) {
+    let cmd = command(bus, device, function);
+    config_write16(bus, device, function, hal::pcicfg::COMMAND, (cmd & !clear) | set);
+}
+
+/// Every implemented BAR of a type-0 function, with its size, by the
+/// sizing protocol of Linux's `__pci_read_base` (`drivers/pci/probe.c:201`):
+/// write all ones, read back, restore. Like Linux (`probe.c:342-356`),
+/// memory and I/O decoding are switched off for the duration, so no CPU
+/// access can land on a BAR while it holds all ones; the whole sequence
+/// runs under one hold of [`CONFIG`] (an `IrqLock`, so IF=0 here) and takes
+/// microseconds. While decoding is off, CPU accesses to the function's BARs
+/// are lost — on the GPU that includes the GOP framebuffer, which is why
+/// nothing may draw concurrently (callers run at boot, before the APs are
+/// released).
+pub fn size_bars(bus: u8, device: u8, function: u8) -> [Option<hal::pcicfg::Bar>; 6] {
+    use hal::pcicfg::{bar_is_64, decode_bar, BAR0, COMMAND, COMMAND_IO, COMMAND_MEMORY};
+    let mut bars = [None; 6];
+    let _g = CONFIG.lock();
+    let cmd_dword = raw_read32(bus, device, function, COMMAND);
+    let decode = (COMMAND_IO | COMMAND_MEMORY) as u32;
+    if cmd_dword & decode != 0 {
+        // Status (the high half) is RW1C: write zeros there to leave it.
+        raw_write32(bus, device, function, COMMAND, cmd_dword & 0xFFFF & !decode);
+    }
+    let mut i = 0u8;
+    while i < 6 {
+        let reg = BAR0 + 4 * i;
+        let raw_lo = raw_read32(bus, device, function, reg);
+        let wide = bar_is_64(raw_lo) && i < 5;
+        let raw_hi = if wide { raw_read32(bus, device, function, reg + 4) } else { 0 };
+        raw_write32(bus, device, function, reg, 0xFFFF_FFFF);
+        let sized_lo = raw_read32(bus, device, function, reg);
+        raw_write32(bus, device, function, reg, raw_lo);
+        let sized_hi = if wide {
+            raw_write32(bus, device, function, reg + 4, 0xFFFF_FFFF);
+            let v = raw_read32(bus, device, function, reg + 4);
+            raw_write32(bus, device, function, reg + 4, raw_hi);
+            v
+        } else {
+            0
+        };
+        bars[i as usize] = decode_bar(i, raw_lo, raw_hi, sized_lo, sized_hi);
+        i += if wide { 2 } else { 1 };
+    }
+    if cmd_dword & decode != 0 {
+        raw_write32(bus, device, function, COMMAND, cmd_dword & 0xFFFF);
+    }
+    bars
+}
+
+/// Makes the function signal `vector` to the local APIC `dest_apic_id`
+/// through its MSI capability (one vector), and disables its INTx line.
+/// The vector must already have a handler (`interrupts::msi::alloc`).
+pub fn enable_msi(bus: u8, device: u8, function: u8, dest_apic_id: u32, vector: u8) -> Result<(), &'static str> {
+    use hal::pcicfg::{MsiCap, Width, COMMAND_INTX_DISABLE};
+    if !crate::interrupts::apic::active() {
+        return Err("MSI needs the local APIC, and this boot fell back to the 8259");
+    }
+    let cfg = config_space(bus, device, function);
+    let msi = MsiCap::decode(&cfg).ok_or("function has no MSI capability")?;
+    let (address, data) = hal::pcicfg::x86_msi_message(dest_apic_id, vector)
+        .ok_or("APIC ID or vector out of MSI range")?;
+    update_command(bus, device, function, COMMAND_INTX_DISABLE, 0);
+    let flags_now = config_read16(bus, device, function, msi.offset + 2);
+    for &(offset, width, value) in msi.enable_writes(flags_now, address, data).as_slice() {
+        match width {
+            Width::W16 => config_write16(bus, device, function, offset, value as u16),
+            Width::W32 => config_write32(bus, device, function, offset, value),
+        }
+    }
+    Ok(())
+}
+
 // ── Claims and /proc/pci ──────────────────────────────────────────────────────
 //
 // Which driver owns which function, so `/proc/pci` can say what nothing

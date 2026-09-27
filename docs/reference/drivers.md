@@ -26,8 +26,9 @@ A device is a `FileHandle` (`read`/`write`/`ioctl`/`stat`/`dup`/…). Device sta
 
 - Config access through ports 0xCF8/0xCFC, **behind the lock `pci::CONFIG`** (`IrqLock`; SMN access uses it too). `config_write8` on the reset/panic path only *tries* the lock, for a bounded time.
 - Discovery: `find_device` (vendor/device, bus 0) and `for_each_by_class` (all buses, 64-bit BARs).
-- **A driver that takes a PCI function must `pci::claim` it** (`claim_matching` for legacy ATA). `/proc/pci` lists every function with its claiming driver or `-`; `unclaimed` is the to-do list for new drivers (on the Ryzen: RTL8111 Ethernet, NVMe, SATA, HDA). The GPU stays unclaimed: the GOP framebuffer is not a driver for it.
+- **A driver that takes a PCI function must `pci::claim` it** (`claim_matching` for legacy ATA). `/proc/pci` lists every function with its claiming driver or `-`; `unclaimed` is the to-do list for new drivers (on the Ryzen: RTL8111 Ethernet, NVMe, SATA, HDA). The GPU is claimed as `nvgpu` only with `gpu=probe` or higher (`gpu.md`).
 - Decoding is host-tested against the Ryzen's real config space (`hal/fixtures/ryzen-pci-config.txt`).
+- Full 256-byte space, capabilities, BAR sizing and MSI: `gpu.md`.
 
 ## AC97 (`kernel/src/ac97.rs`)
 

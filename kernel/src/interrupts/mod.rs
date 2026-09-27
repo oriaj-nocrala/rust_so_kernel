@@ -1,5 +1,6 @@
 pub mod apic;
 pub mod idt;
+pub mod msi;
 pub mod pic;
 pub mod exception;
 

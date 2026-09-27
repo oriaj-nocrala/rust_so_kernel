@@ -21,6 +21,7 @@ font8x8 = { version = "0.3.1", default-features = false, features = ["unicode"] 
 noto-sans-mono-bitmap = { version = "0.3.2", default-features = false, features = ["regular", "bold", "size_16", "size_20", "size_24", "size_32", "unicode-basic-latin"] }
 x86_64 = "0.15.4"
 hal = { path = "../hal" }
+nvgpu = { path = "../nvgpu" }
 ext2 = { path = "../ext2" }
 mm = { path = "../mm" }
 vfs = { path = "../vfs" }

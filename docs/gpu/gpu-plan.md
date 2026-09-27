@@ -2,8 +2,9 @@
 
 > **Estado (2026-09-26):** **fase 0 cerrada.** Trazas capturadas, válidas y
 > segmentadas (ver "Resultados de la fase 0"); D1 = **570.144** y D6 =
-> **modeset propio sin GSP**, ambas medidas. Siguiente: fase 1.
-> Ninguna fase se da por hecha sin su criterio medido en la Ryzen.
+> **modeset propio sin GSP**, ambas medidas. **Fase 1 implementada y
+> verificada en QEMU; falta el criterio en la Ryzen** (ver "Resultados de la
+> fase 1"). Ninguna fase se da por hecha sin su criterio medido en la Ryzen.
 
 ## Objetivo
 
@@ -108,6 +109,7 @@ fase 0) en una etiqueta concreta, anotada aquí al fijarla.
 | Linux `drivers/gpu/nova-core/` | **Referencia estructural principal de la fase 4.** En v7.2.2 arranca el GSP en GA106 exactamente hasta el hito de la fase 4: `wait_gsp_init_done` y `GET_GSP_STATIC_INFO` → nombre de la GPU (`gsp/boot.rs:154-159`), más el descargado. Unas 13 000 líneas de Rust. **No tiene display.** No está compilado en el kernel del host (`CONFIG_NOVA_CORE` sin activar), así que no hay traza suya | GPL-2.0: **leer, no copiar** |
 | `envytools` / `rnndb` | Nombres de registros para leer trazas mmiotrace (`demmio`) | MIT |
 | Mesa `src/nouveau/` (NVK) | Solo para la fase 7 | MIT |
+| QEMU v11.1.1 `hw/misc/edu.c`, `docs/specs/edu.rst` | Dispositivo `edu` del test de la fase 1 | GPL-2.0: leer, el driver de test sigue la especificación |
 
 ## Decisiones
 
@@ -124,7 +126,7 @@ fase 0) en una etiqueta concreta, anotada aquí al fijarla.
   los headers de open-gpu-kernel-modules en la etiqueta fijada, filtrado a
   una lista blanca. Se genera un `.rs` que se commitea con
   `assert!(size_of/offset_of)`. El generador vive en `nvgpu/gen/`.
-- **D3: el firmware no entra en git.** `kernel/build.rs` lo copia de
+- **D3: el firmware no entra en git.** El `build.rs` raíz (`ensure_firmware`) lo copia de
   `/usr/lib/firmware/nvidia/ga106/` a `disk-image-root/lib/firmware/...`, lo
   descomprime (zstd) en el host y deja el fichero `LICENCE.nvidia` al lado.
   El kernel lo lee de `/mnt/lib/firmware` después de `fs::init`. **El VBIOS
@@ -232,6 +234,36 @@ fin de la lectura de la PROM), que coinciden al 0,1 ms.
 **Fase 0 cerrada.** Los fixtures derivados (EDIDs, extractos de traza por
 paso) se sacan con `gpu-trace.py extract` en la fase que los usa, empezando
 por la 2.
+
+## Resultados de la fase 1 (2026-09-26)
+
+Estado actual en `docs/reference/gpu.md`. Medido:
+- **QEMU:** `hw_tests::edu_mmio_dma_msi` pasa (MMIO, factorial, MSI a la
+  CPU 1 por un vector dinámico, DMA de ida y vuelta de 4 KiB, rechazo por
+  máscara). Suite completa 11/11; `boot-matrix 4 5` 20/20 OK.
+- **Sabotajes que el test detecta:** despacho MSI sin llamar al handler, DMA
+  que no escribe (kernel); tamaño de BAR de 64 bits, campo de destino MSI,
+  falta del bit de enable final, recorrido de capacidades sin cota (host).
+- **Firmware:** los tres ficheros pequeños de 570.144 se leen desde `/mnt`
+  con FNV-1a idéntico al del host. Primera palabra `0x10de` =
+  `nvfw_bin_hdr.bin_magic`.
+- **`gsp-570.144.bin` no entra en `disk.img`** (96 MiB, ~20 MB libres; el
+  fichero tiene 63 MB). Se decide en la fase 4: agrandar `disk.img` o
+  llevarlo solo al pendrive (2 GB).
+- **Configuración PCI de la GA106** (lspci del host, ahora fixture): MSI en
+  0x68, 64 bits, sin enmascarado, 1 vector; **sin MSI-X**. La lista de
+  capacidades estándar es PM, MSI, Express, vendor.
+- **Opciones de arranque:** no había línea de comandos. Ahora son
+  `/mnt/etc/kernel.conf` y `/mnt/autorun/kernel.conf` (`metal-run.sh
+  --kconf`).
+- **IOMMU del host:** la GPU está sola en el grupo 16 junto con su audio
+  (`09:00.1`). Paso por VFIO a QEMU: posible (ver la propuesta en la
+  conversación de la fase 1; sin decidir).
+
+Pendiente para cerrar: `scripts/metal-run.sh --kconf 'gpu=probe'
+scripts/metal-jobs/gpu-probe.sh` en la Ryzen (veredicto OK = dispositivo,
+MSI, `PMC_BOOT_0` = GA106 impl 6, BAR1 WC, firmware idéntico, `IommuEn=0`),
+y un reinicio que vuelva con imagen.
 
 ## Fases
 

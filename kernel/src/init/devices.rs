@@ -67,6 +67,8 @@ pub fn init_idt() {
         // The LAPIC's own spurious vector (see `apic::SPURIOUS_VECTOR`).
         idt.add_handler(crate::interrupts::apic::SPURIOUS_VECTOR, lapic_spurious_handler);
         // Inter-processor interrupts (stage 5 of `docs/smp/smp-plan.md`).
+        // MSI vectors: stubs now, handlers when a driver finds its device.
+        crate::interrupts::msi::register_idt(&mut idt);
         idt.add_handler(crate::memory::tlb::SHOOTDOWN_VECTOR, tlb_shootdown_handler);
         idt.add_handler(crate::smp::WAKE_VECTOR, wake_ipi_handler);
         // Stage 7: a raw entry like the timer's — it may switch processes.
