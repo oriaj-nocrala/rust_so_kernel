@@ -6,8 +6,10 @@
 > (a6c221a, Ryzen boot #66; ver "Resultados de la fase 1"). **Fase 2
 > cerrada** (Ryzen boot #67; ver "Resultados de la fase 2"). **Fase 3
 > cerrada** (Ryzen boot #68: vblank por MSI a 59,995 Hz, sin tearing; ver
-> "Resultados de la fase 3"). Siguiente: fase 5, partida en subfases
-> 5.0–5.7 (ver su sección); se empieza por la 5.0. Ninguna fase se da por hecha sin su
+> "Resultados de la fase 3"). **Fase 5.0 cerrada** (oráculo del modeset
+> segmentado; subfases reordenadas, ver "Resultados de la fase 5.0").
+> Siguiente: 5.1 (oráculo de métodos con `nogsp-vrampush` + estado del GOP
+> en metal). Ninguna fase se da por hecha sin su
 > criterio medido en la Ryzen.
 
 ## Objetivo
@@ -391,6 +393,61 @@ scripts/metal-jobs/gpu-vblank.sh`, veredicto OK exit=0):**
 
 **Fase 3 cerrada.**
 
+## Resultados de la fase 5.0 (2026-09-27)
+
+Solo oráculo: sin código de driver ni metal. Herramientas nuevas en
+`scripts/gpu-trace.py` (`core`, `disp`, `mem`; ver `docs/reference/gpu.md`)
+y extractos por paso en `nvgpu/fixtures/modeset-*.txt`.
+
+**El modeset de `trace-nogsp`, paso a paso** (horas de dmesg):
+
+| Paso | dmesg (s) | Qué hay | Fixture |
+|---|---|---|---|
+| Init del display | 11,4489–11,4514 | `tu102_disp_init` (`engine/disp/tu102.c`): `0x6254e8 = 0` (el VBIOS ya soltó el display: no hay que reclamarlo), 100 escrituras de capacidades en `0x640000`, memoria de instancia en VRAM `0x1ffc90000` (`0x610010 = 9`, `0x610014`), MSK/EN de interrupciones, encendido de los 4 SOR | `modeset-1-disp-init.txt` |
+| Canales | 11,4514–11,4590 | core, 8 ventanas, 8 ventanas inmediatas y 4 cursores (`gv100.c:373,587,760`): dirección del push en `0x610b20 + ctrl·0x10`, control `0x6104e0 + ctrl·4 = 0x13`, espera de idle, PUT inicial del core `0xa8`. Memoria de instancia: 89 escrituras no nulas, RAMHT en +0x1000 (dos handles por canal: `0xf0000000` VRAM, `0xf0000001` sync) y objetos DMA en +0x2000 | `modeset-2-chan-init.txt`, `modeset-2-inst.txt` |
+| Ronda 1 | 11,8213–11,8578 | UPDATE del core (PUT `0xdc`): solo `SOR_SET_CONTROL(1)` `0x901 → 0` (desengancha el SOR-1 de la cabeza 0: pantalla negra) y los límites de uso de las ventanas. Supervisores 1/2/3 en 36 ms | `modeset-3-round1.txt`, `modeset-core-round1.txt` |
+| Enlace DP | 11,8585–11,9825 | liberar/adquirir SOR-1, enlace 4×HBR2 (`ga102_sor_dp_links`: 40 ms de espera fija, `ga102.c:61-66`), entrenamiento por AUX: 29 transacciones, TPS1 (CR con nivel `02`), TPS3 (EQ con nivel `07`, estado `0x77`/`0x81`) | `modeset-4-link.txt`, `modeset-4-aux-training.txt` |
+| Ronda 2 | 11,9847–11,9883 | UPDATE del core (PUT `0x218`): supervisor 2.1 solo para la cabeza 1 (HDMI, VPLL1: `0xef40/58/44` y `0xe9c4`, `subdev/devinit/ga100.c:52-55`, 148,5 MHz); **la cabeza 0 no pasa por 2.1: su reloj es el del GOP**; 2.2 engancha SOR-1 a la cabeza 0 y SOR-0 a la 1; 3.0 | `modeset-5-round2.txt`, `modeset-core-round2.txt` |
+| Primer flip | 12,0310 | PUT de las ventanas 0 y 2 (`0x94`) y del core (`0x264`): la imagen de nouveau aparece. **No dispara supervisores** | `modeset-5-round2.txt` |
+
+Hechos medidos:
+- **Los métodos no están en la traza.** En Ampere los push buffers del
+  display van en memoria del host (`0x610b24 = 0x00fff1c3`: destino 3 =
+  HOST, dirección `0xfff1c000`; `dispnv50/disp.c:239-255`,
+  `engine/disp/nv50.c:684-701`); mmiotrace solo ve los PUT. Del canal core
+  se ve el estado, porque nouveau lo vuelca en cada supervisor 1 (ARMED en
+  `0x688000 + m`, ASSEMBLY en `0x680000 + m`, `gv100.c:708-716`); de las
+  ventanas, nada. Remedio: modo `nogsp-vrampush` de `gpu-oracle.sh`
+  (`kms_vram_pushbuf=1`: push en VRAM, escrito por BAR1, que mmiotrace sí
+  traza). **Sin capturar todavía** (reinicia el host).
+- **El GOP deja la cabeza 0 configurada en el estado ARMED del core, igual
+  que la deja nouveau.** Columna ARMED de `modeset-core-round1.txt` frente a
+  ASSEMBLY de `modeset-core-round2.txt`: raster 2200×1125, 1920×1080,
+  148,5 MHz, ventana 0 → cabeza 0 y `SOR_SET_CONTROL(1) = 0x901` son
+  idénticos. En lo que toca a la cabeza 0 solo cambian
+  `HEAD_SET_DISPLAY_ID(0,0)` (`0 → 0x10`), `HEAD_SET_HEAD_USAGE_BOUNDS(0)`
+  (`0x1110 → 0x1114`) y los límites de uso de la ventana 0
+  (`WINDOW_SET_WINDOW_FORMAT_USAGE_BOUNDS(0)` `0x197 → 0xf`,
+  `WINDOW_SET_WINDOW_USAGE_BOUNDS(0)` `0x110780 → 0x117fff`); el resto de
+  diferencias son el notificador de nouveau, las ventanas 1-7 y la cabeza 1
+  (HDMI). Con el GOP, el canal core no está activo (`0x6104e0 = 0x21`,
+  `0x610630 = 0x200b0000`).
+- **Consecuencia: tomar el display al mismo modo no necesita supervisores,
+  VPLL ni entrenamiento DP.** nouveau apaga y vuelve a encender la cabeza
+  porque el estado atómico de DRM no conoce el del GOP. Un driver que parte
+  del estado ARMED puede levantar core + ventana 0 y hacer flip, como el
+  de las 12,0310 s, que no dispara supervisores. Eso reordena las subfases
+  (abajo): el scanout propio va antes que los supervisores, el reloj y el
+  enlace, que solo hacen falta para cambiar de modo.
+- La cadena de supervisores está confirmada: `0x611ec0` bit 12 →
+  `0x611c30` (1, 2, 4) → ack en `0x611860`; trabajo en `gv100_disp_super`
+  (`gv100.c:835-891`), fin con `0x6107ac + head·4 = 0` y `0x6107a8 =
+  0x80000000`.
+- Sin identificar: una escritura de `0x00e86c = 2` al adquirir el SOR (no
+  aparece en nouveau v7.2.2).
+
+**Fase 5.0 cerrada.**
+
 ## Fases
 
 Calendario orientativo en días de trabajo. El riesgo está en la fase 4.
@@ -402,7 +459,7 @@ Calendario orientativo en días de trabajo. El riesgo está en la fase 4.
 | 2 | `nvdisp` de lectura: VBIOS, DCB, EDID | 3–4 | `/proc/displays` con nombres |
 | 3 | vblank | 2 | vsync en el compositor |
 | 4 | Arranque del GSP hasta RM | 8–10 | RM devuelve "NVIDIA GeForce RTX 3050" |
-| 5 | Modeset vía RM | 5–6 | 180 Hz en el menú del monitor |
+| 5 | Modeset propio (D6), subfases 5.0–5.8 | 5–6 | 180 Hz en el menú del monitor |
 | 6 | Canal + motor de copia | 3–4 | blit por CE medido |
 | 7 | Decisión de la pila 3D | — | documento, no código |
 
@@ -555,54 +612,38 @@ posterior arranca con imagen.
 
 ### Fase 5: Modeset (propio, sin GSP; D6)
 
-> **Reescrita por D6.** Lo que sigue en esta sección describe la ruta RM,
-> descartada. La ruta vigente porta lo que hace nouveau sin GSP, con la
-> traza `nogsp` como oráculo: canal core y de ventana por EVO/NVDisplay
-> directo, relojes de píxel desde las tablas del VBIOS y entrenamiento DP
-> propio por AUX (portado de `nouveau/nvkm/engine/disp/` y
-> `dispnv50/`). Esta sección se reescribe entera al empezar la fase, después
-> de segmentar la traza. El criterio de "hecho" no cambia.
+Porta lo que hace nouveau sin GSP (`nvkm/engine/disp/` y `dispnv50/`), con
+la traza `nogsp` como oráculo (segmentada en "Resultados de la fase 5.0").
+Clases de GA106: core `c67d`, ventana `c67e`, ventana inmediata `c67b`,
+cursor `c67a` (`nouveau/include/nvif/class.h:128-177`); nombres y campos de
+los métodos, de `clc67*.h` de open-gpu-kernel-modules 570.144.
 
-**Subfases (2026-09-27).** Una por sesión con contexto en blanco, como las
-fases: cada una con su extracto de la traza `nogsp` como oráculo, su propio
+**Subfases.** Una por sesión con contexto en blanco, como las fases: cada una
+con su extracto de `nvgpu/fixtures/modeset-*.txt` como oráculo, su propio
 nivel `gpu=` (`off` por defecto, master siempre funcionando), un criterio
-medible en la Ryzen y su apartado de resultados aquí al cerrarla. La 5.0
-comprueba esta partición contra la traza y la corrige si hace falta.
+medible en la Ryzen y su apartado de resultados aquí al cerrarla. Orden
+fijado por la 5.0: primero tomar el display **sin cambiar el modo** (el GOP
+ya dejó la cabeza 0 armada), después lo que hace falta para cambiarlo.
 
 | Sub | Qué | Hecho cuando |
 |---|---|---|
-| **5.0** | Oráculo y plan, sin código de driver: segmentar el modeset de `trace-nogsp` (11,8215–11,8789 s y la ronda desde 11,9849 s), clasificar las escrituras (memoria de instancia, canal core, supervisores, relojes, entrenamiento DP, SOR) y reescribir esta sección con las subfases confirmadas | Sección reescrita; extractos por paso en `nvgpu/fixtures/`. Sin metal |
-| **5.1** | Interrupciones de supervisor (`0x611ec0` bit 12, `ctrl_disp`: supervisor 1/2/3, `engine/disp/gv100.c`) sobre el servicio de la fase 3. Lógica pura contra la traza | Tests de host; en metal, armadas sin romper el vblank |
-| **5.2** | **Tomar el display**: memoria de instancia en VRAM, canal core, y un modeset **al mismo modo del GOP** (1920×1080 a 60 Hz, mismo framebuffer). Es la puerta de riesgo; si no cabe en una sesión, se parte en "canal core arriba sin tocar el modo" y "modeset al mismo modo" | En metal la imagen no cambia, pero la programa constanos |
-| **5.3** | Relojes de píxel (VPLL desde las tablas del VBIOS). Lógica pura | Tests contra los 148,5 MHz de la traza; en metal, el mismo modo con el reloj reprogramado |
-| **5.4** | Entrenamiento DP por AUX (la AUX es la de la fase 2), HBR2 ×4, y asignación de SOR | Tests contra las transacciones AUX de la traza; en metal, enlace entrenado |
-| **5.5** | Scanout propio en VRAM (ventana WC de BAR1), canal de ventana, flip en vblank; `/dev/fb0` pasa a apuntar ahí | Imagen de constanos desde VRAM propia; el compositor hace flip en vblank |
-| **5.6** | Modos: los del EDID más CVT-RB2 (generador con tests de host), interfaz para pedir el modo (`/proc/displays` o ioctl de `/dev/fb0`), consola y compositor avisados del cambio | Foto del menú del ASUS a **180 Hz**; `/proc/kdebug` a 180 vblanks/s; volver a 60 Hz sin reiniciar |
-| **5.7** | El HP por HDMI (ruta TMDS, segunda cabeza) | El HP enciende a 1920×1080 a 60 Hz con su propio contenido |
+| **5.0** | Oráculo y plan (hecho) | Sección reescrita; extractos en `nvgpu/fixtures/modeset-*.txt` |
+| **5.1** | **Oráculo de métodos y estado del GOP, sin escribir en la GPU.** (a) Captura `sudo scripts/gpu-oracle.sh install; entry nogsp-vrampush` + reinicio (lo lanza el usuario) y subcomando `push` de `gpu-trace.py` que decodifica los push de core y ventanas con nombres de `clc67d.h`/`clc67e.h`. (b) `gpu=dispstate`: lee el estado ARMED del core (`0x688000 + m`) y de la ventana 0 (`0x690800 + m`, `gv100.c:417-516`) y lo publica en `/proc` | Métodos de init, ronda 2 y primer flip como fixtures; en metal, el ARMED del core igual a la columna ARMED de `modeset-core-round1.txt` y la superficie de la ventana 0 = framebuffer del GOP |
+| **5.2** | **Canales arriba sin cambiar la imagen** (puerta de riesgo): memoria de instancia (RAMHT + objetos DMA; por la ventana PRAMIN, `0x700000`, que nouveau ya prueba en esta GPU para leer el VBIOS, en vez de la VM de BAR2 de nouveau; a confirmar), push en memoria DMA por debajo de 4 GiB (destino HOST; partes de EVO solo aceptan 40 bits, `dispnv50/disp.c:242-250`), core + ventana 0 como en `modeset-2-*`, y un UPDATE que repite el estado ARMED | En metal la imagen no cambia; canales en idle; sin excepciones de canal (`0x611020 + chid·12`) ni supervisores. Si aparece un supervisor, se registra y se atiende antes de seguir |
+| **5.3** | **Scanout propio**: flip de la ventana 0 a un búfer en VRAM (ventana WC de BAR1) al mismo modo; `/dev/fb0` pasa ahí; el compositor hace flip en vblank en vez de copiar la sombra | Imagen de constanos desde VRAM propia; flips por vblank medidos en `/proc/kdebug` |
+| **5.4** | **Supervisores**: interrupción (`0x611ec0` bit 12 → `0x611c30`), trabajo 1.0/2.0/2.2/3.0 y ack, sobre el servicio de la fase 3. Lógica pura contra `modeset-3-round1.txt` y `modeset-5-round2.txt` | Tests de host; en metal, desenganchar y volver a enganchar SOR-1 a la cabeza 0 al mismo modo (negro un instante y vuelve), con el enlace y el reloj del GOP |
+| **5.5** | **Relojes de píxel**: VPLL desde la tabla PLL del VBIOS (`gt215_pll_calc`), escritura `0xef00 + head·0x40` y `0xe9c0 + head·4` (`subdev/devinit/ga100.c:30-60`), en el supervisor 2.1. Lógica pura | Tests contra los 148,5 MHz de la traza (`N=54 fN=0x1000 M=1 P=10`); en metal, el mismo modo con el reloj reprogramado |
+| **5.6** | **Enlace DP**: SOR (`0x612300`, `0x61c10c`, `ga102.c:61-66`) y entrenamiento por AUX (TPS1/TPS3, niveles de tensión y preénfasis), 4×HBR2 | Tests contra `modeset-4-link.txt` y `modeset-4-aux-training.txt`; en metal, enlace re-entrenado al mismo modo |
+| **5.7** | **Modos**: los del EDID más CVT-RB2 (generador con tests de host), interfaz para pedirlo (`/proc/displays` o ioctl de `/dev/fb0`), consola y compositor avisados del cambio de tamaño | Foto del menú del ASUS a **180 Hz**; `/proc/kdebug` a 180 vblanks/s; volver a 60 Hz sin reiniciar |
+| **5.8** | **El HP por HDMI** (TMDS, SOR-0, cabeza 1, VPLL1, ELD de audio opcional) | El HP enciende a 1920×1080 a 60 Hz con su propio contenido |
 
-Ruta RM (descartada): con RM, el entrenamiento del enlace DP y los relojes de
-píxel los hace el GSP. El driver asigna los canales de display y les envía
-métodos.
+Si una subfase no cabe en una sesión, se parte (por ejemplo, 5.2 en
+"memoria de instancia + core" y "ventana 0").
 
-- Asignar por RM el display común (`NV04_DISPLAY_COMMON`) y los canales de
-  display de GA10x: core, ventana, ventana inmediata y cursor. Las clases, de
-  los headers fijados; nada de copiarlas de memoria.
-- Detección y DP por las llamadas de control `NV0073_*`: conector, EDID vía
-  RM (se compara con la fase 2), entrenamiento del enlace y asignación de SOR.
-- Búfer de scanout en VRAM (ventana de BAR1 WC) con doble búfer y cambio de
-  página en vblank. Así queda el vsync real y, si hacía falta, se sustituye el
-  plan B de la fase 3.
-- Lista de modos desde `nvgpu::edid`, más un modo CVT-RB2 para 180 Hz dentro
-  del rango del monitor (dotclock ≤ 430 MHz). Generador CVT con tests de host
-  contra tablas conocidas.
-- Interfaz: la escritura en `/proc/displays` (o un ioctl en `/dev/fb0`) pide
-  el modo, y `/dev/fb0` pasa a apuntar al nuevo scanout. La consola y el
-  compositor se enteran del cambio de tamaño (evento).
-
-**Hecho cuando:** el menú del VG279Q3A muestra **180 Hz** (foto); el HP 2309
-se enciende a 1920×1080 a 60 Hz con su propio contenido; el compositor
-presenta un frame por vblank a 180 Hz (contador en `/proc/kdebug`); y volver
-a 60 Hz funciona sin reiniciar.
+**Hecho cuando** (la fase entera): el menú del VG279Q3A muestra **180 Hz**
+(foto); el HP 2309 se enciende a 1920×1080 a 60 Hz con su propio contenido;
+el compositor presenta un frame por vblank a 180 Hz (contador en
+`/proc/kdebug`); y volver a 60 Hz funciona sin reiniciar.
 
 ---
 

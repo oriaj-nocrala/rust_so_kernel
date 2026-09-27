@@ -5,7 +5,9 @@
 #   sudo scripts/gpu-oracle.sh static        any boot: VBIOS, EDIDs, lspci, versions
 #   sudo scripts/gpu-oracle.sh entry MODE    add a one-shot systemd-boot entry to trace MODE
 #   sudo scripts/gpu-oracle.sh trace MODE    in the trace boot: mmiotrace nouveau (MODE nogsp|gsp),
-#                                            or gspnotrace: GSP, no mmiotrace, dmesg only (D6)
+#                                            or gspnotrace: GSP, no mmiotrace, dmesg only (D6),
+#                                            or nogsp-vrampush: nogsp with the display push
+#                                            buffers in VRAM, so the methods are in the trace
 #   sudo scripts/gpu-oracle.sh install       unattended: a service that runs `auto` in the trace boot
 #   sudo scripts/gpu-oracle.sh auto          (the service) trace the boot's MODE, then reboot:
 #                                            nogsp → arms gsp; gsp → back to the normal entry
@@ -15,6 +17,7 @@
 # One reboot per trace, so both start from the firmware's GOP state (the
 # same state constanos sees). Unattended:
 #   static → install → entry nogsp → reboot   (two more reboots happen alone)
+#   install → entry nogsp-vrampush → reboot    (one trace, then back alone)
 # The entry is one-shot: if a trace boot hangs, a power cycle returns to the
 # normal entry.
 #
@@ -85,7 +88,7 @@ cmd_static() {
 cmd_entry() {
     need_root
     local mode="${1:-}"
-    [[ $mode =~ ^(nogsp|gsp|gspnotrace)$ ]] || die "entry nogsp|gsp|gspnotrace"
+    [[ $mode =~ ^(nogsp|gsp|gspnotrace|nogsp-vrampush)$ ]] || die "entry nogsp|gsp|gspnotrace|nogsp-vrampush"
     local cur; cur="$(bootctl status 2>/dev/null | sed -n 's/^ *Current Entry: *//p')"
     [[ -n $cur ]] || die "bootctl did not report the current entry"
     [[ $cur == "$ENTRY_ID" ]] && cur="$(cat "$ESP/loader/entries/.constanos-gpu-trace-base")"
@@ -164,13 +167,18 @@ cmd_auto() {
 
 cmd_trace() {
     need_root
-    local mode="${1:-}" gsprm mmio=1
+    local mode="${1:-}" gsprm mmio=1 extra=()
     case "$mode" in
         nogsp) gsprm=0 ;;
+        # Phase 5: on Ampere the display push buffers live in host memory, so
+        # plain nogsp only traces their PUTs. kms_vram_pushbuf=1 moves them to
+        # VRAM (dispnv50/disp.c:227-253), where the CPU writes them through a
+        # BAR1 mapping that mmiotrace records.
+        nogsp-vrampush) gsprm=0; extra=(kms_vram_pushbuf=1) ;;
         gsp) gsprm=1 ;;
         # D6: is the GSP display failure nouveau's, or mmiotrace's (one CPU, slow MMIO)?
         gspnotrace) gsprm=1; mmio=0 ;;
-        *) die "trace nogsp|gsp|gspnotrace" ;;
+        *) die "trace nogsp|gsp|gspnotrace|nogsp-vrampush" ;;
     esac
     grep -q "module_blacklist=nvidia" /proc/cmdline || die "not in the trace boot (run 'entry' and reboot)"
     lsmod | grep -qE '^(nvidia|nouveau) ' && die "nvidia or nouveau already loaded: reboot into the trace entry"
@@ -201,7 +209,7 @@ cmd_trace() {
     # modeset=1 overrides the host's /etc/modprobe.d/blacklist.conf
     # (`options nouveau modeset=0`, which loads nouveau without binding the
     # GPU): modprobe puts config options first, and the last value wins.
-    modprobe nouveau modeset=1 config="NvGspRm=$gsprm" \
+    modprobe nouveau modeset=1 config="NvGspRm=$gsprm" "${extra[@]}" \
         debug="gsp=trace,disp=debug,i2c=debug,bios=debug,devinit=debug" \
         || echo "  modprobe failed (kept going to save the trace)"
     sleep "$SETTLE_SECS"
@@ -243,7 +251,7 @@ cmd_summary() {
     [[ -d $ORACLE ]] || die "nothing captured in $ORACLE"
     echo "$ORACLE:"
     du -sh "$ORACLE"/* 2>/dev/null
-    for m in nogsp gsp gspnotrace; do
+    for m in nogsp gsp gspnotrace nogsp-vrampush; do
         local d="$ORACLE/trace-$m"
         [[ -d $d ]] || { echo "trace-$m: missing"; continue; }
         echo "== trace-$m"

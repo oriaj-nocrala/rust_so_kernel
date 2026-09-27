@@ -50,6 +50,9 @@ Everything `disp` does, then `gpu::vblank::setup` (still at boot, IF=0, before t
 
 - `aux DIR CH` lists AUX transactions on a channel; `aux DIR CH SEL OUT` writes them as a `ReplayMmio` fixture (`nvgpu/fixtures/aux-ch3-dpcd-edid.txt`).
 - `i2c DIR DRIVE` decodes bit-banged I2C from a trace (proved the port-register bits: it yields the HP's EDID byte for byte).
+- `core DIR [N OUT]` decodes nouveau's core-channel dumps in dmesg (one per supervisor 1: ARMED `0x688000+m` → ASSEMBLY `0x680000+m`), naming each method from `clc67d.h` (needs `~/src/gpu-ref`).
+- `disp DIR T0 T1` lists display writes labelled with the nouveau code that owns each range (`DISP_CLASSES`); `mem DIR LO HI T0 T1` lists non-zero writes into a mapped range (BAR3 instance memory).
+- The display push buffers are in host memory on Ampere, so a `nogsp` trace has only their PUTs. `scripts/gpu-oracle.sh` mode `nogsp-vrampush` (`kms_vram_pushbuf=1`) puts them in VRAM behind BAR1, where mmiotrace sees them.
 
 ## PCI configuration space (`kernel/src/pci.rs`, `hal::pcicfg`)
 
@@ -80,6 +83,6 @@ Everything `disp` does, then `gpu::vblank::setup` (still at boot, IF=0, before t
 ## Tests
 
 - Host: `cd hal && cargo test` (pcicfg, dma, bootopts, acpi IVRS), `cd nvgpu && cargo test`.
-- `nvgpu` fixtures: the two EDIDs + their `edid-decode` output, an AUX trace extract, and one vblank interrupt as nouveau serviced it (`vblank-service.txt`) (committed); the VBIOS is read from `$GPU_ORACLE/static/vbios-rom.bin` (default `~/constanos-gpu-oracle`, not in git, D3) and those tests print `SKIP` without it.
+- `nvgpu` fixtures: the two EDIDs + their `edid-decode` output, an AUX trace extract, one vblank interrupt as nouveau serviced it (`vblank-service.txt`), and the modeset by steps (`modeset-*.txt`: display init, channel bring-up, instance memory, both supervisor rounds, link + AUX training, and the core state at each supervisor 1, whose ARMED column in round 1 is the state the GOP left) (committed); the VBIOS is read from `$GPU_ORACLE/static/vbios-rom.bin` (default `~/constanos-gpu-oracle`, not in git, D3) and those tests print `SKIP` without it.
 - `nvgpu` mocks: `TableMmio` (fixed values), `ReplayMmio` (per-register read queues from a trace extract + write log to compare), `i2c::tests::DdcSim` (open-drain bus with a DDC EEPROM).
 - QEMU: `hw_tests::edu_mmio_dma_msi` (`scripts/run-kernel-tests.sh`; the runner adds `-device edu,dma_mask=0xffffffffffff`): MMIO, MSI to CPU 1 (the test boot keeps IF=0 on CPU 0), DMA both ways, mask refusal. The `edu` driver (`kernel/src/edu.rs`) is test-only.

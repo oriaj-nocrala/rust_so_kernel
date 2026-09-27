@@ -1,0 +1,22 @@
+# trace-nogsp, dmesg 11.8210..11.8585: round 1: core UPDATE (PUT 0xdc) detaches SOR-1 from head 0; supervisors 1/2/3 (scripts/gpu-trace.py disp trace-nogsp 11.8210 11.8585)
+# time class BAR0-offset value; classes and their nouveau owners: DISP_CLASSES in scripts/gpu-trace.py
+11.821333 core-put  680000 000000dc
+11.821371 intr      611860 00000001
+11.822696 super-ack 6107ac 00000000
+11.822697 super-ack 6107b0 00000000
+11.822698 super-ack 6107b4 00000000
+11.822700 super-ack 6107b8 00000000
+11.822701 super-ack 6107a8 80000000
+11.857612 intr      611860 00000002
+11.857654 head      616540 00034100
+11.857691 super-ack 6107ac 00000000
+11.857693 super-ack 6107b0 00000000
+11.857694 super-ack 6107b4 00000000
+11.857695 super-ack 6107b8 00000000
+11.857696 super-ack 6107a8 80000000
+11.857713 intr      611860 00000004
+11.857754 super-ack 6107ac 00000000
+11.857755 super-ack 6107b0 00000000
+11.857756 super-ack 6107b4 00000000
+11.857757 super-ack 6107b8 00000000
+11.857758 super-ack 6107a8 80000000
