@@ -3,14 +3,19 @@
 # host Linux of the Ryzen itself, what the GPU driver must reproduce.
 #
 #   sudo scripts/gpu-oracle.sh static        any boot: VBIOS, EDIDs, lspci, versions
-#   sudo scripts/gpu-oracle.sh entry         add a one-shot systemd-boot entry for tracing
-#   sudo scripts/gpu-oracle.sh trace nogsp   in the trace boot: mmiotrace nouveau, NvGspRm=0
-#   sudo scripts/gpu-oracle.sh trace gsp     in the trace boot: mmiotrace nouveau, NvGspRm=1
+#   sudo scripts/gpu-oracle.sh entry MODE    add a one-shot systemd-boot entry to trace MODE
+#   sudo scripts/gpu-oracle.sh trace MODE    in the trace boot: mmiotrace nouveau (MODE nogsp|gsp)
+#   sudo scripts/gpu-oracle.sh install       unattended: a service that runs `auto` in the trace boot
+#   sudo scripts/gpu-oracle.sh auto          (the service) trace the boot's MODE, then reboot:
+#                                            nogsp → arms gsp; gsp → back to the normal entry
+#   sudo scripts/gpu-oracle.sh uninstall     remove the service
 #        scripts/gpu-oracle.sh summary       what was captured, and the GSP firmware version (D1)
 #
-# The full sequence (one reboot per trace, so both start from the firmware's
-# GOP state — the same state constanos sees):
-#   static → entry → reboot → trace nogsp → entry → reboot → trace gsp → reboot (normal)
+# One reboot per trace, so both start from the firmware's GOP state (the
+# same state constanos sees). Unattended:
+#   static → install → entry nogsp → reboot   (two more reboots happen alone)
+# The entry is one-shot: if a trace boot hangs, a power cycle returns to the
+# normal entry.
 #
 # Output: $ORACLE (default ~/constanos-gpu-oracle of the invoking user),
 # outside git: the traces are large and the VBIOS is not ours to publish.
@@ -51,6 +56,11 @@ read_rom() { # $1 = output file; the PCI ROM BAR, as the firmware left it
     echo 0 > "$GPU_SYS/rom"
 }
 
+copy_edid() { # $1 = connector dir, $2 = output; sysfs reports size 0, so test after copying
+    cat "$1/edid" > "$2" 2>/dev/null || true
+    [[ -s $2 ]] || { rm -f "$2"; return 1; }
+}
+
 cmd_static() {
     need_root
     local out="$ORACLE/static"; mkdir -p "$out"
@@ -61,9 +71,8 @@ cmd_static() {
     for c in /sys/class/drm/card*-*; do
         [[ -f $c/edid ]] || continue
         local name="${c##*/}"; name="${name#card*-}"
-        [[ -s $c/edid ]] && cp "$c/edid" "$out/edid-$name.bin"
+        copy_edid "$c" "$out/edid-$name.bin" && edid-decode "$out/edid-$name.bin" > "$out/edid-$name.txt" 2>&1 || true
         { echo "status: $(cat "$c/status")"; cat "$c/modes"; } > "$out/modes-$name.txt"
-        [[ -s $c/edid ]] && edid-decode "$c/edid" > "$out/edid-$name.txt" 2>&1 || true
     done
     nvidia-smi -q > "$out/nvidia-smi.txt" 2>&1 || true
     { uname -a; cat /proc/cmdline; modinfo -F version nvidia 2>/dev/null || true;
@@ -74,6 +83,8 @@ cmd_static() {
 
 cmd_entry() {
     need_root
+    local mode="${1:-}"
+    [[ $mode == nogsp || $mode == gsp ]] || die "entry nogsp|gsp"
     local cur; cur="$(bootctl status 2>/dev/null | sed -n 's/^ *Current Entry: *//p')"
     [[ -n $cur ]] || die "bootctl did not report the current entry"
     [[ $cur == "$ENTRY_ID" ]] && cur="$(cat "$ESP/loader/entries/.constanos-gpu-trace-base")"
@@ -85,9 +96,10 @@ cmd_entry() {
         '^(quiet|loglevel=.*|nvidia_drm\.modeset=.*|initcall_blacklist=.*|modprobe\.blacklist=.*|module_blacklist=.*)$' \
         | tr '\n' ' ')"
     opts+="module_blacklist=nvidia,nvidia_drm,nvidia_modeset,nvidia_uvm "
-    opts+="modprobe.blacklist=nouveau systemd.unit=multi-user.target log_buf_len=64M"
+    opts+="modprobe.blacklist=nouveau systemd.unit=multi-user.target log_buf_len=64M "
+    opts+="constanos.gputrace=$mode"
     {
-        echo "title   constanos GPU trace (nouveau, no nvidia)"
+        echo "title   constanos GPU trace $mode (nouveau, no nvidia)"
         grep -E '^(linux|initrd|machine-id|sort-key)' "$src"
         echo "options $opts"
     } > "$ESP/loader/entries/$ENTRY_ID"
@@ -95,7 +107,58 @@ cmd_entry() {
     bootctl set-oneshot "$ENTRY_ID"
     echo "wrote $ESP/loader/entries/$ENTRY_ID (one-shot, next boot only):"
     cat "$ESP/loader/entries/$ENTRY_ID"
-    echo; echo "Reboot, log in on the text console, and run: sudo scripts/gpu-oracle.sh trace nogsp|gsp"
+    echo; echo "Reboot. With 'install' done the trace runs alone; otherwise: sudo $0 trace $mode"
+}
+
+SERVICE=/etc/systemd/system/constanos-gpu-trace.service
+
+cmd_install() {
+    need_root
+    cat > "$SERVICE" <<UNIT
+[Unit]
+Description=constanos GPU oracle trace (docs/gpu/gpu-plan.md, phase 0)
+ConditionKernelCommandLine=constanos.gputrace
+After=local-fs.target systemd-modules-load.service
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+Environment=ORACLE=$ORACLE SUDO_USER=$owner
+ExecStart=$(realpath "$0") auto
+TimeoutStartSec=600
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable constanos-gpu-trace.service
+    echo "installed $SERVICE (runs only when the cmdline has constanos.gputrace=)"
+}
+
+cmd_uninstall() {
+    need_root
+    systemctl disable constanos-gpu-trace.service 2>/dev/null || true
+    rm -f "$SERVICE"; systemctl daemon-reload
+    echo "removed $SERVICE"
+}
+
+cmd_auto() {
+    need_root
+    local mode; mode="$(tr ' ' '\n' < /proc/cmdline | sed -n 's/^constanos.gputrace=//p')"
+    [[ -n $mode ]] || die "no constanos.gputrace= on the cmdline"
+    mkdir -p "$ORACLE"
+    # Whatever happens to the trace, leave this boot: a failure must not
+    # strand the machine in the trace entry.
+    (cmd_trace "$mode") > "$ORACLE/auto-$mode.log" 2>&1 || echo "trace $mode failed: $?" >> "$ORACLE/auto-$mode.log"
+    if [[ $mode == nogsp && ! -e $ORACLE/trace-gsp ]]; then
+        cmd_entry gsp >> "$ORACLE/auto-$mode.log" 2>&1
+    else
+        cmd_uninstall >> "$ORACLE/auto-$mode.log" 2>&1
+    fi
+    finish
+    sync
+    systemctl reboot
 }
 
 cmd_trace() {
@@ -116,7 +179,9 @@ cmd_trace() {
     dmesg -C
 
     echo nop > "$TRACEFS/current_tracer"
-    echo 262144 > "$TRACEFS/buffer_size_kb"
+    # Per CPU (all possible CPUs, even the ones mmiotrace offlines); trace_pipe
+    # drains it continuously, so 32 MiB each is plenty.
+    echo 32768 > "$TRACEFS/buffer_size_kb"
     echo mmiotrace > "$TRACEFS/current_tracer"
     cat "$TRACEFS/trace_pipe" > "$out/mmiotrace.txt" &
     local reader=$!
@@ -136,7 +201,7 @@ cmd_trace() {
     for c in /sys/class/drm/card*-*; do
         [[ -f $c/status ]] || continue
         local name="${c##*/}"; name="${name#card*-}"
-        [[ -s $c/edid ]] && cp "$c/edid" "$out/edid-$name.bin"
+        copy_edid "$c" "$out/edid-$name.bin" || true
         { echo "status: $(cat "$c/status")"; cat "$c/modes"; } > "$out/modes-$name.txt"
     done
     # The VBIOS image nouveau actually parsed (PROM/PRAMIN), which may differ
@@ -166,8 +231,11 @@ cmd_summary() {
 
 case "${1:-}" in
     static)  cmd_static ;;
-    entry)   cmd_entry ;;
+    entry)   shift; cmd_entry "$@" ;;
+    install) cmd_install ;;
+    uninstall) cmd_uninstall ;;
+    auto)    cmd_auto ;;
     trace)   shift; cmd_trace "$@" ;;
     summary) cmd_summary ;;
-    *) sed -n '2,12p' "$0"; exit 1 ;;
+    *) sed -n '2,15p' "$0"; exit 1 ;;
 esac
