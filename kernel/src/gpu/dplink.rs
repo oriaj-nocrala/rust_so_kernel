@@ -92,6 +92,11 @@ pub fn setup(r: &mut String, _regs: &Bar0, bios: &nvgpu::vbios::Bios, outp: &Out
     let _ = writeln!(r, "dplink: ready: /dev/dispctl train <lanes> <rate> retrains it while detached");
 }
 
+/// `setup` found the output's DP table entry: `train` can run.
+pub fn ready() -> bool {
+    INFO.get().is_some()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrainError {
     /// No `gpu=dplink`, or setup stopped.

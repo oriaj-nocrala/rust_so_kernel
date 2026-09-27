@@ -48,6 +48,11 @@
 //          retrain the primary head's DP link while its SOR is detached
 //          (`dplink.rs`, `nvgpu::dp`). Result: `dplink:` lines in /proc/gpu,
 //          `gpu_dplink:` in /proc/kdebug.
+//   modes  (phase 5.7) — also let `/dev/dispctl`'s `mode WxH@Hz` set the
+//          primary head to an EDID or CVT-RB2 mode of the framebuffer's
+//          size: detach, retrain the link if the mode needs it, attach with
+//          the new raster and clock (`modeset.rs`, `nvgpu::mode`). Result:
+//          `modes:`/`mode:` lines in /proc/gpu, `gpu_mode:` in /proc/kdebug.
 //
 // Runs once at boot, after `fs::init` (firmware is on `/mnt`) and before the
 // APs are released (BAR sizing turns decoding off for a few microseconds,
@@ -64,6 +69,7 @@ use crate::serial_println;
 
 pub mod dplink;
 pub mod evo;
+pub mod modeset;
 pub mod scanout;
 pub mod supervisor;
 pub mod vblank;
@@ -91,6 +97,9 @@ static REPORT: spin::Once<String> = spin::Once::new();
 /// work runs the VBIOS's IED scripts (`supervisor.rs`).
 static VBIOS: spin::Once<(nvgpu::vbios::Bios, nvgpu::dcb::Dcb)> = spin::Once::new();
 static DISPLAYS: spin::Once<String> = spin::Once::new();
+/// What `gpu=disp` read from each connector (DPCD, EDID): `modeset.rs`
+/// takes the modes of the primary head's monitor from it.
+static PROBES: spin::Once<alloc::vec::Vec<nvgpu::display::Probe>> = spin::Once::new();
 static DISPSTATE: spin::Once<String> = spin::Once::new();
 
 /// `/proc/gpu`: the boot report, then what the supervisors did since.
@@ -385,7 +394,12 @@ fn probe_device(r: &mut String, level: GpuLevel) {
             }
             if level >= GpuLevel::Super {
                 match put {
-                    Some(_) => supervisor::setup(r, &regs, level >= GpuLevel::Vpll, level >= GpuLevel::Dplink),
+                    Some(_) => {
+                        supervisor::setup(r, &regs, level >= GpuLevel::Vpll, level >= GpuLevel::Dplink);
+                        if level >= GpuLevel::Modes {
+                            modeset::setup(r, &regs);
+                        }
+                    }
                     None => {
                         let _ = writeln!(r, "super: not attempted: the channels are not up (see chan:)");
                     }
@@ -466,6 +480,7 @@ fn probe_displays(r: &mut String, regs: &Bar0) {
         crate::serial_println!("displays: {}", line);
     }
     DISPLAYS.call_once(|| text);
+    PROBES.call_once(|| probes);
     VBIOS.call_once(|| (bios, dcb));
 }
 

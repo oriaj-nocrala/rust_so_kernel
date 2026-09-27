@@ -186,7 +186,7 @@ pub fn set_vpll(m: &dyn Mmio, bios: &Bios, head: u32, khz: u32) -> Result<Coeffs
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::mmio::testing::TableMmio;
     use crate::vbios::tests::{oracle_vbios, tiny_image};
@@ -197,7 +197,7 @@ mod tests {
 
     /// VPLL0-3 of this board (VBIOS 94.06.37.00.40, PLL table at 0x4f51,
     /// version 0x50, entries 7-10).
-    fn vpll() -> Limits {
+    pub(crate) fn vpll() -> Limits {
         Limits {
             kind: PLL_VPLL0,
             refclk: 27_000,

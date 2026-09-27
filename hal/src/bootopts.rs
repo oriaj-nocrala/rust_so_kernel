@@ -93,6 +93,10 @@ pub enum GpuLevel {
     /// the DP link of the primary head's output while its SOR is detached
     /// (VBIOS DP scripts, SOR lane setup, training over AUX).
     Dplink,
+    /// Phase 5.7: also let `/dev/dispctl`'s `mode WxH@Hz` set the primary
+    /// head to one of the monitor's EDID modes or a CVT-RB2 one (same size
+    /// as the framebuffer), retraining the DP link when the mode needs it.
+    Modes,
 }
 
 impl GpuLevel {
@@ -111,6 +115,7 @@ impl GpuLevel {
             "super" => Some(GpuLevel::Super),
             "vpll" => Some(GpuLevel::Vpll),
             "dplink" => Some(GpuLevel::Dplink),
+            "modes" => Some(GpuLevel::Modes),
             _ => None,
         }
     }
@@ -154,6 +159,8 @@ mod tests {
         assert_eq!(GpuLevel::parse("vpll"), Some(GpuLevel::Vpll));
         assert_eq!(GpuLevel::parse("dplink"), Some(GpuLevel::Dplink));
         assert!(GpuLevel::Dplink > GpuLevel::Vpll);
+        assert_eq!(GpuLevel::parse("modes"), Some(GpuLevel::Modes));
+        assert!(GpuLevel::Modes > GpuLevel::Dplink);
         assert!(GpuLevel::Vpll > GpuLevel::Super);
         assert!(GpuLevel::Super > GpuLevel::Scanout && GpuLevel::Scanout > GpuLevel::Chan);
         assert!(GpuLevel::Chan > GpuLevel::Dispstate && GpuLevel::Dispstate > GpuLevel::Vblank);

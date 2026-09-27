@@ -18,11 +18,13 @@
 //   `SOR_SET_CONTROL(sor)` = 0 or the GOP's value, then UPDATE; not waited
 //   on. With `gpu=vpll` (phase 5.5) also `clock <kHz>`:
 //   `HEAD_SET_PIXEL_CLOCK_FREQUENCY(_MAX)(head)`, then UPDATE; supervisor
-//   2.1 programs the VPLL. Bounded to the raster at >= 48 Hz (the ASUS's
-//   floor) and to what the DP link carries (the GOP's, or the last one
-//   `dplink.rs` trained). Refused (EAGAIN) while the core channel has not
-//   finished the last one or a link training runs. Under `PUSH_AT`, the
-//   only user of the core push buffer after boot.
+//   2.1 programs the VPLL. Bounded to the current raster at >= 48 Hz (the
+//   ASUS's floor) and to what the DP link carries (the GOP's, or the last
+//   one `dplink.rs` trained). With `gpu=modes` (phase 5.7), `Cmd::Mode`
+//   (from `modeset.rs`): a whole mode's head methods and the attach in one
+//   UPDATE. Refused (EAGAIN) while the core channel has not finished the
+//   last one or a link training runs. Under `PUSH_AT`, the only user of
+//   the core push buffer after boot.
 // - Link training (`gpu=dplink`, `dplink.rs`) needs the SOR detached: the
 //   ISR records at each supervisor 3 whether the head's SOR drives nothing
 //   (`LINK_FREE`); a request that can attach it clears that, and both
@@ -82,15 +84,14 @@ pub(super) struct Disp {
     /// The DCB's limits for that output (`dpconf`: lanes, rate).
     pub(super) board_nr: u8,
     pub(super) board_bw: u8,
-    ctrl: u32,
+    pub(super) ctrl: u32,
     /// `gpu=vpll`: 2.1 programs VPLLs and `clock` is accepted.
     clocks: bool,
     /// `gpu=dplink`: `train` is accepted.
     pub(super) train: bool,
-    /// The pixel clock the GOP set (Hz) and the lower bound `clock`
-    /// accepts (kHz, the raster at 48 Hz); the upper bound is `MAX_KHZ`.
+    /// The pixel clock the GOP set (Hz). `clock` accepts the current
+    /// raster at >= 48 Hz up to `MAX_KHZ`.
     gop_hz: u32,
-    min_khz: u32,
 }
 
 /// What the DP link carries (kHz of pixel clock): the GOP's link at boot,
@@ -151,6 +152,11 @@ pub(super) fn disp() -> Option<&'static Disp> {
     DISP.get().filter(|_| ready())
 }
 
+/// What `setup` found, before vblank is armed (boot).
+pub(super) fn disp_at_boot() -> Option<&'static Disp> {
+    DISP.get()
+}
+
 /// The pixel rate (kHz) a DP link's payload carries at `depth` bits per
 /// pixel: lanes x rate x 8 bits per symbol / bpp (the units of nouveau's
 /// `link_kbps`, `nv50.c:1177`).
@@ -161,6 +167,29 @@ pub(super) fn link_max_khz(l: &sup::DpLink, depth: u32) -> u32 {
 /// `clock`'s upper bound follows a newly trained link.
 pub(super) fn set_max_khz(khz: u32) {
     MAX_KHZ.store(khz, Ordering::Relaxed);
+}
+
+/// Supervisors 3 serviced so far: one per completed core UPDATE that
+/// changed what drives a head (`modeset.rs` waits on it).
+pub(super) fn supers_done() -> u64 {
+    SERVICED[2].load(Ordering::Acquire)
+}
+
+/// The core channel has fetched everything pushed: a `request` now is not
+/// refused as busy (unless a training starts meanwhile).
+pub(super) fn core_idle() -> bool {
+    let Some(d) = disp() else { return false };
+    PUSH_AT.with(|at| d.regs.rd32(evo::CORE.get()) == *at && evo::CORE.idle(&d.regs)) && !TRAINING.load(Ordering::Acquire)
+}
+
+/// The primary head's SOR drives nothing (a detach completed).
+pub(super) fn link_free() -> bool {
+    LINK_FREE.load(Ordering::Acquire)
+}
+
+/// The lowest pixel clock (kHz) `clock` takes on raster `t`: 48 Hz.
+fn min_khz(t: &HeadTiming) -> u32 {
+    (t.htotal as u64 * t.vtotal as u64 * MIN_REFRESH_HZ).div_ceil(1000) as u32
 }
 
 /// Starts a link training if the SOR is detached and nothing is pending:
@@ -276,7 +305,7 @@ pub fn setup(r: &mut String, regs: &Bar0, clocks: bool, train: bool) {
     // `clock` bounds: the raster at MIN_REFRESH_HZ, and the pixel rate the
     // link's payload carries (lanes x rate x 8 bits per symbol / bpp; the
     // units of nouveau's `link_kbps`, `nv50.c:1177`).
-    let min_khz = ((t.htotal as u64 * t.vtotal as u64 * MIN_REFRESH_HZ).div_ceil(1000)) as u32;
+    let min_khz = min_khz(&t);
     let max_khz = link.map_or(0, |l| link_max_khz(&l, t.depth_bits()));
     if clocks {
         match nvgpu::pll::parse(bios, nvgpu::pll::PLL_VPLL0 + head as u8) {
@@ -324,7 +353,6 @@ pub fn setup(r: &mut String, regs: &Bar0, clocks: bool, train: bool) {
         clocks,
         train,
         gop_hz: t.hz,
-        min_khz,
     });
     sup::arm(regs);
     ENABLED.store(true, Ordering::Release);
@@ -399,6 +427,19 @@ pub enum Cmd {
     Attach,
     /// Pixel clock of the primary head, kHz (`gpu=vpll`); 0 = the GOP's.
     Clock(u32),
+    /// A mode's head methods (`nvgpu::mode::Mode::methods`), then the
+    /// GOP's SOR control (`gpu=modes`, from `modeset.rs`).
+    Mode([(u32, u32); 9]),
+}
+
+impl Cmd {
+    /// For the log (a mode's methods are logged with the push).
+    fn name(&self) -> String {
+        match self {
+            Cmd::Mode(_) => String::from("Mode"),
+            c => alloc::format!("{:?}", c),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -411,28 +452,34 @@ pub enum RequestError {
     Chan(evo::ChanError),
 }
 
-/// `/dev/dispctl`: pushes `SOR_SET_CONTROL(sor)` (0, or the GOP's value)
-/// or the head's pixel clock, and UPDATE on the core channel. Returns the
-/// value pushed.
+/// `/dev/dispctl`: pushes `SOR_SET_CONTROL(sor)` (0, or the GOP's value),
+/// the head's pixel clock or a whole mode, and UPDATE on the core channel.
+/// Returns the last value pushed.
 pub fn request(cmd: Cmd) -> Result<u32, RequestError> {
     let d = DISP.get().filter(|_| ready()).ok_or(RequestError::NotReady)?;
     let (buf, _) = super::evo::core_push().ok_or(RequestError::NotReady)?;
-    let (mthds, n, value) = match cmd {
-        Cmd::Detach => ([sor_set_control(d.sor), 0], 1, 0),
-        Cmd::Attach => ([sor_set_control(d.sor), 0], 1, d.ctrl),
+    let mut methods: Vec<(u32, u32)> = Vec::new();
+    match cmd {
+        Cmd::Detach => methods.push((sor_set_control(d.sor), 0)),
+        Cmd::Attach => methods.push((sor_set_control(d.sor), d.ctrl)),
         Cmd::Clock(khz) => {
             let khz = if khz == 0 { d.gop_hz / 1000 } else { khz };
             let max_khz = MAX_KHZ.load(Ordering::Relaxed);
-            if !d.clocks || khz < d.min_khz || khz > max_khz {
+            let min_khz = min_khz(&HeadTiming::read_armed(&d.regs, d.head));
+            if !d.clocks || khz < min_khz || khz > max_khz {
                 REFUSED.fetch_add(1, Ordering::Relaxed);
-                log(alloc::format!("dispctl: {:?} refused: needs gpu=vpll and {}..={} kHz", cmd, d.min_khz, max_khz));
+                log(alloc::format!("dispctl: {:?} refused: needs gpu=vpll and {}..={} kHz", cmd, min_khz, max_khz));
                 return Err(RequestError::Invalid);
             }
             let (f, max) = head_pixel_clock(d.head);
-            ([f, max], 2, khz * 1000)
+            methods.extend([(f, khz * 1000), (max, khz * 1000)]);
         }
-    };
-    let methods = &mthds[..n];
+        Cmd::Mode(head) => {
+            methods.extend(head);
+            methods.push((sor_set_control(d.sor), d.ctrl));
+        }
+    }
+    let value = methods.last().map_or(0, |&(_, v)| v);
     REQUESTS.fetch_add(1, Ordering::Relaxed);
     let res = PUSH_AT.with(|at| {
         let regs = &d.regs;
@@ -445,11 +492,11 @@ pub fn request(cmd: Cmd) -> Result<u32, RequestError> {
         }
         let before = *at;
         let mut p = Push::new(buf, *at);
-        if p.room_words() < 8 {
+        if p.room_words() < 2 * methods.len() + 8 {
             evo::wind(regs, evo::CORE, &mut p).map_err(RequestError::Chan)?;
         }
-        for &mth in methods {
-            p.mthd(mth, &[value]).map_err(RequestError::Chan)?;
+        for &(mth, v) in &methods {
+            p.mthd(mth, &[v]).map_err(RequestError::Chan)?;
         }
         evo::push_update(&mut p).map_err(RequestError::Chan)?;
         evo::submit(regs, evo::CORE, &p);
@@ -458,17 +505,16 @@ pub fn request(cmd: Cmd) -> Result<u32, RequestError> {
     });
     let line = match res {
         Ok((a, b)) => alloc::format!(
-            "dispctl: {:?} at {} ms: methods {:x?} = {:#x} + UPDATE pushed (core put {:#x} -> {:#x})",
-            cmd,
+            "dispctl: {} at {} ms: methods {:x?} + UPDATE pushed (core put {:#x} -> {:#x})",
+            cmd.name(),
             crate::time::ktime_get() / 1_000_000,
             methods,
-            value,
             a,
             b
         ),
         Err(e) => {
             REFUSED.fetch_add(1, Ordering::Relaxed);
-            alloc::format!("dispctl: {:?} refused: {:?}", cmd, e)
+            alloc::format!("dispctl: {} refused: {:?}", cmd.name(), e)
         }
     };
     crate::serial_println!("{}", line);

@@ -7,7 +7,7 @@ Plan and decisions: `docs/gpu/gpu-plan.md`. This page is the current state. Pure
 - UEFI gives no command line. `key=value` words are read once after `fs::init` from `/mnt/etc/kernel.conf`, then `/mnt/autorun/kernel.conf` (later wins; `#` comments). Before that, everything is at its default.
 - `/mnt/autorun/kernel.conf` is written by `scripts/metal-run.sh --kconf '...'` and removed with `autorun/`, so an option applies to one unattended run only.
 - `disk-image-root/etc/kernel.conf` is gitignored: a checkout's own options.
-- `gpu=` (`hal::bootopts::GpuLevel`): `off` (default: the GPU is not touched), `probe`, `disp`, `vblank`, `dispstate`, `chan`, `scanout`, `super`, `vpll`, `dplink`. Each level does everything the previous ones do. An unknown value is logged and read as `off`.
+- `gpu=` (`hal::bootopts::GpuLevel`): `off` (default: the GPU is not touched), `probe`, `disp`, `vblank`, `dispstate`, `chan`, `scanout`, `super`, `vpll`, `dplink`, `modes`. Each level does everything the previous ones do. An unknown value is logged and read as `off`.
 - `disk-image-root/etc/` is not synced to `disk.img` (only `etc/gui` is). To try a level in QEMU, write the file into the image: `debugfs -w -R "write <file> /etc/kernel.conf" disk.img` (and `rm` it after).
 
 ## `gpu=probe` (phase 1)
@@ -112,6 +112,16 @@ Everything `vpll` does; `supervisor::setup` also finds the output's DP table ent
 - `dispctl` status adds `link NxRATE[ef]` and `free 0|1`; `/proc/kdebug` `gpu_dplink: trains ok failed refused last_ms`.
 - Not ported: LTTPRs, post-LT adjust, eDP rate tables, MST.
 - Metal job: `touch build.rs`, then `scripts/metal-run.sh --kconf 'gpu=dplink' scripts/metal-jobs/gpu-dplink.sh` (4x HBR2, then back to the GOP's 2x HBR, at 1080p60).
+
+## `gpu=modes` (phase 5.7)
+
+Everything `dplink` does; then `gpu::modeset::setup` (boot, reads only): the EDID and DPCD `gpu=disp` read on the primary head's output's AUX channel, its modes, the size the head scans out now. Logged as `modes:` lines in `/proc/gpu` (every EDID mode and the CVT-RB2 ones at 48/60/75/100/120/144/165/180 Hz inside the range, each with its VPLL coefficients and DP packing on the max link; then the GOP's mode read back).
+- **Modes** (`nvgpu::mode`): `Mode::from_timing` (EDID DTDs, progressive only), `cvt_rb2` (VESA CVT 1.2 RB v2 with integer arithmetic; = `edid-decode --cvt ...,rb=2` except where its float floor lands 1 kHz lower, e.g. 1080p50), `select` (first EDID DTD of that size whose refresh rounds to the request, else CVT-RB2 if inside the range descriptor's V rate and max pixel clock; its H limits are ignored: the ASUS's say 250-250 kHz, which its own DTDs violate), `Mode::methods` (nouveau's `nv50_head_atomic_check_mode` + `headc57d_mode` + `headc57d_or`: raster size, sync end, blank end/start, `0x2074 = 1`, `HEAD_SET_CONTROL = 0`, pixel clock and max, OR word with the polarities; = the trace's round-2 push for 1080p60), `Mode::from_head` (the inverse, for the GOP's).
+- **`/dev/dispctl` `mode WxH@Hz`** (`modeset::set`, synchronous in the writer's syscall, IF=1): everything checked first (EINVAL: syntax, no such mode, **another size** (window 0, framebuffer, console and compositor keep theirs: not ported), no VPLL coefficients, no link carries it). Then, only if the current link cannot carry it (`lanes*rate*8/bpp` and `dp_config`): `detach`, wait for a new supervisor 3 (`LINK_FREE`), `dplink::train` to `nvgpu::dp::max_config` (nouveau's link: sink lanes/rate capped by the board's; 4x HBR2 on the ASUS). Then one core push with the mode's methods + `SOR_SET_CONTROL` = the GOP's value + UPDATE (`Cmd::Mode`); wait for supervisor 3 again (2.1 VPLL, 2.2 packing); ARMED raster/clock must equal the mode's. Waits bounded to 1 s each. **`set` runs with IF=1** (restored after): a syscall enters with IF=0, and on CPU 0 that blocks the supervisors' MSI until it returns (Ryzen #84). A mode identical to the ARMED one waits for no supervisor (the UPDATE raises none). No detach unless retraining: while detached the head raises no vblank (#83/#84); with the SOR attached a raster/clock change runs 2.0/2.1/2.2 by itself. A failure after the detach retrains the old link (if changed) and re-attaches at the old mode, then EIO. EAGAIN while another `set`/push/training runs.
+- Going back down (e.g. to 60 Hz) keeps the faster link: it carries the mode, so no retrain.
+- `dispctl` read adds a `mode:` line (connector, current mode or "the GOP's", size); `/proc/gpu` `mode:` lines per request; `/proc/kdebug` `gpu_mode: sets ok failed refused retrains last_ms current_mhz`.
+- `clock`'s lower bound is now the current raster at 48 Hz (was the GOP's raster).
+- Metal job: `touch build.rs`, then `scripts/metal-run.sh --kconf 'gpu=modes' scripts/metal-jobs/gpu-modes.sh` (180 Hz = the ASUS's DTD 4, 420.78 MHz, retrains to 4x HBR2; then 120 Hz CVT-RB2; then 60 Hz). Ryzen #85: OK (179.86, 119.93, 60.02 Hz).
 
 ## Oracle tools (`scripts/gpu-trace.py`)
 

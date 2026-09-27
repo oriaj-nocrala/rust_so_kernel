@@ -24,6 +24,7 @@ pub mod i2c;
 pub mod id;
 pub mod init;
 pub mod mmio;
+pub mod mode;
 pub mod pad;
 pub mod pll;
 pub mod supervisor;

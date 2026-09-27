@@ -20,7 +20,7 @@
 > (VPLL en el supervisor 2.1, `gpu=vpll`; host y QEMU verdes). Ryzen #78:
 > **Fase 5.5 cerrada** (Ryzen #80: 50 Hz y vuelta a 60 Hz reprogramando el
 > VPLL; la codificación de `fN` de nouveau está mal en GA106, medido y
-> corregido; ver "Resultados de la fase 5.5"). **Fase 5.6 cerrada** (Ryzen #82: reentrenado a 4×HBR2 y de vuelta a 2×HBR al mismo modo, 60 Hz, visto a mano; ver "Resultados de la fase 5.6"). Siguiente: 5.7 (modos, 180 Hz). Ninguna fase se da por hecha sin su
+> corregido; ver "Resultados de la fase 5.5"). **Fase 5.6 cerrada** (Ryzen #82: reentrenado a 4×HBR2 y de vuelta a 2×HBR al mismo modo, 60 Hz, visto a mano; ver "Resultados de la fase 5.6"). **Fase 5.7 cerrada** (Ryzen #85: 180 Hz, 120 Hz CVT-RB2 y vuelta a 60 Hz sin reiniciar; 180 Hz visto en el menú del ASUS; ver "Resultados de la fase 5.7"). Siguiente: 5.8 (el HP por HDMI). Ninguna fase se da por hecha sin su
 > criterio medido en la Ryzen.
 
 ## Objetivo
@@ -753,6 +753,86 @@ sobrevivió):**
 - El usuario vio dos apagones breves, la misma imagen después y fire bien.
 
 **Fase 5.6 cerrada.**
+
+## Resultados de la fase 5.7 (2026-09-27)
+
+Código: `nvgpu::mode` (modo desde un DTD, `cvt_rb2`, `select`, métodos de
+cabeza de nouveau, inversa para el modo del GOP), `nvgpu::dp::max_config`
+(el enlace de `nouveau_dp_probe_dpcd`), `kernel/src/gpu/modeset.rs`, `mode
+WxH@Hz` en `/dev/dispctl`, nivel `gpu=modes`. Job:
+`scripts/metal-jobs/gpu-modes.sh`.
+
+Hechos (del EDID, la traza y las referencias, sin metal):
+- El ASUS da 180 Hz en su **DTD 4** (bloque CTA): 1920×1080, 420,78 MHz,
+  raster 2080×1125, −V, **179,8205 Hz**. También 143,98 Hz (DTD 2) y
+  164,92 Hz (DTD 3). No cabe en el enlace 2×HBR del GOP (180 MHz como
+  máximo): hace falta 4×HBR2 (720 MHz). VPLL: P = 3, VCO 1262 MHz.
+- CVT-RB2 a 180 Hz saldría a 424,08 MHz (180,000 Hz), también dentro del
+  rango (máx. 430 MHz); `select` prefiere el DTD del EDID, como DRM.
+- `Mode::methods` para el DTD 1 reproduce, valor a valor, el push de la
+  ronda 2 de `trace-nogsp-vrampush` para las cabezas 0 y 1.
+- El descriptor de rango del ASUS dice 250-250 kHz de H (imposible: sus
+  DTDs van de 67 a 202 kHz); solo se aplican V y el reloj máximo.
+- **Recorte de alcance**: solo modos del **mismo tamaño** que el actual.
+  Cambiar de tamaño exige reconfigurar la ventana 0 (tamaño, pitch), los
+  búferes de VRAM, el framebuffer, la consola y el compositor: queda para
+  una subfase propia (5.7b) si hace falta; el criterio de la 5.7 (180 Hz y
+  vuelta a 60) no lo necesita.
+- Tests de host: 9 en `mode` + `max_config`, probados por sabotaje (11
+  mutaciones, todas detectadas). QEMU: `run-kernel-tests.sh` PASS,
+  `boot-matrix 4 2` 0/8, arranque con `gpu=modes` sin GPU: `ENODEV`.
+
+**Ryzen boot #83 (veredicto FAIL; el log envolvió, el resumen sobrevivió):**
+- **1920×1080 a 180 Hz funcionó**: `mode 1920x1080@180` eligió el DTD 4,
+  reentrenó a 4×HBR2 y enganchó en 161 ms; ARMED = el modo, VPLL
+  `0x2e181b 0x30001` (N 46, P 3), **179,8137 Hz** medidos (nominal
+  179,8205). `compositor fire` 10 s a 180 Hz: 641 flips, 0 rechazados.
+  Las 5 peticiones imposibles, rechazadas sin tocar nada.
+- **Fallo al bajar**: el `detach` desde 180 Hz paró el vblank de la cabeza
+  (la secuencia no avanzó en 10 s con el SOR desenganchado) y los
+  supervisores 1-3 llegaron **~1 s tarde**; la espera de 1 s de `set`
+  expiró (120 Hz: FAILED, pantalla sin SOR). Luego 60 Hz empujó detach y
+  modo juntos (un `LINK_FREE` rancio) y aplicó tras otro ~1 s: 59,98 Hz,
+  enganchado.
+- El usuario vio **180 Hz en el menú del ASUS**.
+- El reintento de `push` registró ~13 000 líneas `refused: Busy`: por eso
+  envolvió el log.
+- Arreglo (sin medir aún): sin reentrenamiento no se desengancha (un solo
+  UPDATE con el SOR enganchado; 5.5 ya mostró que el hardware corre
+  2.0/2.1/2.2 así); la espera del detach exige un supervisor 3 nuevo;
+  esperas de 3 s; `push` espera a que el core esté libre en vez de
+  reintentar. Job: 4,4,4 supervisores.
+
+**Ryzen boot #84 (veredicto FAIL) — corrige el diagnóstico del #83:**
+- Ya a 60 Hz, el `detach` de `mode 1920x1080@180` esperó 3 s sin
+  supervisores y el log dijo **`IF=0`**: el `write` a `/dev/dispctl` corría
+  en la CPU 0 con interrupciones apagadas (un syscall entra con IF=0), y la
+  MSI de los supervisores va a la CPU 0: no entra hasta que el syscall
+  vuelve. El "~1 s tarde" del #83 era mi propio timeout; su primer `set`
+  salió bien porque ese syscall corrió en otra CPU.
+- Lo que sí es del hardware: **con el SOR desenganchado la cabeza no da
+  vblank** (#83 a 180 Hz y #84 a 60 Hz: la secuencia quieta, los flips
+  pendientes no terminan).
+- `mode 1920x1080@60` estando ya a 60 Hz: el UPDATE no cambia nada y no
+  levanta supervisores; `set` los esperaba.
+- Arreglo (sin medir): `set` corre con IF=1 y devuelve el estado del
+  llamador; un modo idéntico al ARMED no espera supervisores; esperas de
+  1 s otra vez.
+
+**Ryzen boot #85 (veredicto OK):**
+- `mode 1920x1080@180`: detach 31 ms, reentrenado a 4×HBR2, enganchado en
+  161 ms; VPLL `0x2e181b 0x30001`; **179,86 Hz** medidos (GOP en el mismo
+  arranque: 60,035 Hz, el instrumento va +0,05 %). `compositor fire` 10 s a
+  180 Hz: 559 flips, 0 rechazados.
+- `mode 1920x1080@120` (CVT-RB2, 274,56 MHz): un solo UPDATE con el SOR
+  enganchado, 22 ms, sin reentrenar: **119,93 Hz**.
+- `mode 1920x1080@60` (DTD 1): 33 ms, **60,02 Hz**, VPLL `0x370000` (= GOP).
+- 4+4+4 supervisores, 0 errores de script, nada sin hacer, 0 errores de
+  CTRL_DISP; 5 peticiones imposibles rechazadas sin tocar nada.
+- El usuario vio **180 Hz en el menú del ASUS** (#83).
+
+**Fase 5.7 cerrada** (solo mismo tamaño; el cambio de resolución queda
+como 5.7b si hace falta).
 
 ## Fases
 

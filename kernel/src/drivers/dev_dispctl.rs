@@ -14,14 +14,19 @@
 //   `gpu=dplink` (phase 5.6), `train <lanes> <rate>` (rate in DPCD units,
 //   e.g. `train 4 0x14` = 4x HBR2) retrains the DP link, synchronously
 //   (~130 ms): EAGAIN unless detached and idle, EINVAL if the sink or the
-//   board cannot run it, EIO if the training failed (see /proc/gpu).
+//   board cannot run it, EIO if the training failed (see /proc/gpu). With
+//   `gpu=modes` (phase 5.7), `mode WxH@Hz` sets the primary head to that
+//   EDID or CVT-RB2 mode (same size only), synchronously: detach, retrain
+//   if needed, attach at the new mode (`gpu/modeset.rs`); EINVAL if refused
+//   before touching anything, EAGAIN if busy, EIO if it failed after.
 // - `read`: one status line (the SOR's ARMED control, the core channel's
-//   PUT/GET), then EOF.
+//   PUT/GET), with `gpu=modes` a second (`mode: ...`), then EOF.
 
 use alloc::boxed::Box;
 
 use crate::fs::types::{Errno, Stat};
 use crate::gpu::dplink::{self, TrainError};
+use crate::gpu::modeset::{self, SetError};
 use crate::gpu::supervisor::{self, Cmd, RequestError};
 use crate::process::file::{FileError, FileHandle, FileResult};
 
@@ -34,7 +39,8 @@ impl FileHandle for DispctlDevice {
         if self.read_done {
             return Ok(0);
         }
-        let s = supervisor::status();
+        let mut s = supervisor::status();
+        s.push_str(&modeset::status());
         let n = s.len().min(buf.len());
         buf[..n].copy_from_slice(&s.as_bytes()[..n]);
         self.read_done = true;
@@ -43,6 +49,14 @@ impl FileHandle for DispctlDevice {
 
     fn write(&mut self, buf: &[u8]) -> FileResult<usize> {
         let text = core::str::from_utf8(buf).map(str::trim).map_err(|_| FileError::InvalidArgument)?;
+        if let Some(req) = text.strip_prefix("mode ") {
+            return match modeset::set(req.trim()) {
+                Ok(()) => Ok(buf.len()),
+                Err(SetError::Busy) => Err(FileError::Again),
+                Err(SetError::Invalid) => Err(FileError::InvalidArgument),
+                Err(SetError::NotReady | SetError::Failed) => Err(FileError::IOError),
+            };
+        }
         if let Some(args) = text.strip_prefix("train ") {
             let mut it = args.split_whitespace();
             let num = |s: Option<&str>| -> Result<u8, FileError> {

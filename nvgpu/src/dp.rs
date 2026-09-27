@@ -246,6 +246,19 @@ pub fn check_config(dpcd: &[u8; RECEIVER_CAP_SIZE], board_nr: u8, board_bw: u8, 
     Ok(())
 }
 
+/// The link nouveau trains a DP sink to (`nouveau_dp_probe_dpcd`,
+/// `nouveau_dp.c:89-92,127-159`, no LTTPR, not eDP): the sink's lane count
+/// capped by the board's, and the highest of 8.1/5.4/2.7/1.62 Gb/s at or
+/// under both the sink's and the board's rate. `None` if `check_config`
+/// refuses even that.
+pub fn max_config(dpcd: &[u8; RECEIVER_CAP_SIZE], board_nr: u8, board_bw: u8) -> Option<LinkConfig> {
+    let nr = (dpcd[DPCD_RC02] & RC02_MAX_LANE_COUNT).min(board_nr);
+    let max = dpcd[DPCD_MAX_LINK_RATE].min(board_bw);
+    let bw = [0x1e, 0x14, 0x0a, 0x06].into_iter().find(|&bw| bw <= max)?;
+    let cfg = LinkConfig { nr, bw };
+    check_config(dpcd, board_nr, board_bw, cfg).ok().map(|_| cfg)
+}
+
 /// Which DP-table script ran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Script {
@@ -785,6 +798,12 @@ mod tests {
         assert_eq!(check_config(&post, 4, 0x1e, ok), Err(ConfigError::PostLtAdjust));
         post[DPCD_RC03] |= RC03_TPS4_SUPPORTED;
         assert_eq!(check_config(&post, 4, 0x1e, ok), Ok(()));
+        // What `/dev/dispctl mode` retrains to: the ASUS's 4x HBR2 (the
+        // trace's link), capped by a smaller board.
+        assert_eq!(max_config(&ASUS_DPCD, 4, 0x1e), Some(ok));
+        assert_eq!(max_config(&ASUS_DPCD, 2, 0x0a), Some(LinkConfig { nr: 2, bw: 0x0a }));
+        assert_eq!(max_config(&ASUS_DPCD, 4, 0x05), None);
+        assert_eq!(max_config(&post, 4, 0x1e), Some(ok));
     }
 
     /// A DP sink on AUX channel 3 (`0xda20..0xda5c`, `aux.rs`) behind a
