@@ -1,0 +1,19 @@
+# One display interrupt with supervisor 2 pending (and head 0's vblank status set), as nouveau serviced it:
+# trace-nogsp, dmesg 11.857592-11.857613 (round 1 of the modeset: SOR-1 detached from head 0).
+# Handler: nvkm/core/intr.c:173-228, subdev/vfn/tu102.c:26-91, engine/disp/gv100.c:1052-1110 and
+# gv100_disp_intr_ctrl_disp (gv100.c:935-962). nouveau had no vblank enabled then, so only LOADV is
+# acked with a write of the bits it saw and VBLANK with 4 (gv100.c:1057-1073).
+W b81610 0xf
+W 088704 0x0
+R b81600 0x4
+R b81010 0x4000000
+R b81014 0x0
+R 000000 0xb76000a1
+W b81010 0x4000000
+R 611ec0 0x1001
+R 611800 0x7
+W 611800 0x3
+W 611800 0x4
+R 611c30 0x2
+W 611860 0x2
+W b81608 0xf

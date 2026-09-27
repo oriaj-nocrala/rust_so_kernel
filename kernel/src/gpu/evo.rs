@@ -20,6 +20,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use nvgpu::evo::{self, Chan, ChanError, Faults, Pramin, Push, PushMem, Ramht};
 use nvgpu::Mmio;
@@ -30,6 +31,9 @@ use super::Bar0;
 
 /// Push buffers live as long as the channels run: never freed.
 static PUSH: spin::Once<[PushBuf; 2]> = spin::Once::new();
+/// Where the core channel's next push goes (bytes), once `bring_up` pushed
+/// its UPDATE: the supervisor phase (`supervisor.rs`) carries on from there.
+static CORE_PUT: AtomicU32 = AtomicU32::new(0);
 
 /// A 4 KiB push buffer in host memory.
 pub struct PushBuf(DmaBuf);
@@ -219,6 +223,7 @@ pub fn bring_up(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8)) -> Option<u32> {
         report_chan_error(r, regs, "core UPDATE", e);
         return None;
     }
+    CORE_PUT.store(push.put_bytes(), Ordering::Release);
     // The UPDATE latches at the next vblank: give it two frames.
     regs.udelay(40_000);
     let _ = writeln!(r, "chan: core UPDATE done: put/get {:#x}", regs.rd32(evo::CORE.get()));
@@ -290,6 +295,12 @@ pub fn bring_up(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8)) -> Option<u32> {
         super::ms_since(t0)
     );
     (core_ok && wndw_ok && latched).then(|| push.put_bytes())
+}
+
+/// The core channel's push buffer and where its next push goes, once
+/// `bring_up` allocated it.
+pub fn core_push() -> Option<(&'static PushBuf, u32)> {
+    PUSH.get().map(|b| (&b[0], CORE_PUT.load(Ordering::Acquire)))
 }
 
 /// Window 0's push buffer, once `bring_up` allocated it.

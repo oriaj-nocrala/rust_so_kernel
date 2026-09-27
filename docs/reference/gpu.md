@@ -7,7 +7,7 @@ Plan and decisions: `docs/gpu/gpu-plan.md`. This page is the current state. Pure
 - UEFI gives no command line. `key=value` words are read once after `fs::init` from `/mnt/etc/kernel.conf`, then `/mnt/autorun/kernel.conf` (later wins; `#` comments). Before that, everything is at its default.
 - `/mnt/autorun/kernel.conf` is written by `scripts/metal-run.sh --kconf '...'` and removed with `autorun/`, so an option applies to one unattended run only.
 - `disk-image-root/etc/kernel.conf` is gitignored: a checkout's own options.
-- `gpu=` (`hal::bootopts::GpuLevel`): `off` (default: the GPU is not touched), `probe`, `disp`, `vblank`, `dispstate`, `chan`, `scanout`. Each level does everything the previous ones do. An unknown value is logged and read as `off`.
+- `gpu=` (`hal::bootopts::GpuLevel`): `off` (default: the GPU is not touched), `probe`, `disp`, `vblank`, `dispstate`, `chan`, `scanout`, `super`. Each level does everything the previous ones do. An unknown value is logged and read as `off`.
 - `disk-image-root/etc/` is not synced to `disk.img` (only `etc/gui` is). To try a level in QEMU, write the file into the image: `debugfs -w -R "write <file> /etc/kernel.conf" disk.img` (and `rm` it after).
 
 ## `gpu=probe` (phase 1)
@@ -79,6 +79,18 @@ Everything `chan` does; if `bring_up` ended OK (it returns window 0's PUT), `gpu
 - `/proc/kdebug`: `gpu_flip: submitted latched not_yet refused shown latency_us last max avg vblanks_per_flip sum max` (latency = submit to the first `flip_done` that saw it done: an upper bound).
 - Metal job: `touch build.rs`, then `scripts/metal-run.sh --kconf 'gpu=scanout' scripts/metal-jobs/gpu-scanout.sh`. Ryzen #75/#76: OK, ~1000 flips in 20 s of `compositor fire`, none refused.
 
+## `gpu=super` (phase 5.4)
+
+Everything `scanout` does (needs `chan` OK); then `gpu::supervisor::setup`, at boot before vblank is armed:
+- Reads heads/SORs present (`0x610060`), each DP/TMDS output's SOR by pad routing (`nvgpu::supervisor::route_get`, nouveau's `gm200_sor_route_get`), the primary head (lowest lit), the SOR driving it (ARMED `SOR_SET_CONTROL`), the GOP's DP link (`DpLink::read`: `0x612300`/`0x61c10c`) and the IED scripts a detach/attach would run. STOP unless that SOR runs DP with a routed DP output (only a DP attach is ported).
+- Enables CTRL_DISP interrupts for the supervisors only (`0x611cf0`/`0x611db0` = 7; nouveau sets `0x187`).
+- **Interrupt**: `nvgpu::vblank::service(m, true)` acks DISP_INTR bit 12 as `gv100_disp_intr_ctrl_disp` (pending → `0x611860`, error info from `0x611848`); `vblank::on_msi` then calls `supervisor::on_pending` (ISR, CPU 0, global work).
+- **Work** (`nvgpu::supervisor::Supervisor::service`, `gv100_disp_super`): 1 reads head/SOR ARM+ASSEMBLY state, 1.0/2.0 run the output's `OffInt1/2`, 2.1 (clock change) is reported `ClockNotPorted` (phase 5.5), 2.2 runs `OnInt2`, RG divider, DP audio symbols + watermark (nouveau's formula, GA102 has no `activesym`) and the SOR clock; non-DP attach is `AttachNotPorted` (5.8); 3.0 runs `OnInt3`. Heads not owned are released untouched (`Foreign`). Always releases (`0x6107ac+h*4 = 0`, `0x6107a8 = 0x80000000`).
+- **IED scripts**: `nvgpu::init`, nouveau's VBIOS script interpreter with 9 opcodes (`NOT`, `GENERIC_CONDITION`, `SUB_DIRECT`, `COPY_NV_REG`, `NV_REG`, `DONE`, `RESUME`, `TIME`, `ZM_REG`); any other opcode stops the script (`ScriptError::Unsupported`). Enough for DP-3's scripts; HDMI's need more. `OffInt2` writes `0x21234`, which PRI-faults on this GPU (nouveau does the same; the PRIVRING leaf is blocked here).
+- **`/dev/dispctl`** (`drivers/dev_dispctl.rs`): `write` `detach` / `attach` pushes `SOR_SET_CONTROL(sor)` = 0 / the GOP's value + UPDATE on the core channel (under `PUSH_AT`), not waited on; `EAGAIN` while the core is not idle, `ENODEV` on open unless set up and vblank armed. `read`: one status line (ARMED control, core PUT/GET).
+- Report: `super:` lines in `/proc/gpu` (boot, then one per supervisor and per request, 64 kept) and the klog; `/proc/kdebug` `gpu_super: serviced=s1,s2,s3 script_errors not_done ctrl_disp_errors requests refused work_us`.
+- Metal job: `touch build.rs`, then `scripts/metal-run.sh --kconf 'gpu=super' scripts/metal-jobs/gpu-super.sh`.
+
 ## Oracle tools (`scripts/gpu-trace.py`)
 
 - `aux DIR CH` lists AUX transactions on a channel; `aux DIR CH SEL OUT` writes them as a `ReplayMmio` fixture (`nvgpu/fixtures/aux-ch3-dpcd-edid.txt`).
@@ -86,6 +98,7 @@ Everything `chan` does; if `bring_up` ended OK (it returns window 0's PUT), `gpu
 - `core DIR [N OUT]` decodes nouveau's core-channel dumps in dmesg (one per supervisor 1: ARMED `0x688000+m` → ASSEMBLY `0x680000+m`), naming each method from `clc67d.h` (needs `~/src/gpu-ref`).
 - `disp DIR T0 T1` lists display writes labelled with the nouveau code that owns each range (`DISP_CLASSES`); `mem DIR LO HI T0 T1` lists non-zero writes into a mapped range (BAR3 instance memory).
 - The display push buffers are in host memory on Ampere, so a `nogsp` trace has only their PUTs. `scripts/gpu-oracle.sh` mode `nogsp-vrampush` (`kms_vram_pushbuf=1`) puts them in VRAM behind BAR1, where mmiotrace sees them.
+- `supers DIR T0 T1 [OUT]` extracts each supervisor service (from `R 0x6107a8` to the release) as a `ReplayMmio` fixture, minus other contexts' accesses (`SUPER_OTHER`): `nvgpu/fixtures/super-round1.txt`, `super-round2.txt`.
 - `push DIR [T0 T1 [OUT]]` decodes those push buffers (needs a `nogsp-vrampush` trace): one block per PUT write, each method named from `clc67d.h`/`clc67e.h`/`clc67b.h` (+ `EXTRA_METHODS`, the ones nouveau writes by number). Fixture: `nvgpu/fixtures/modeset-push.txt`.
 - `core` and `push` name methods through `method_names(cls)`: header indices have no bound, so offsets are claimed index 0 first across all methods, then 1, …
 

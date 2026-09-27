@@ -14,7 +14,9 @@
 > UPDATE latchea solo lo empujado, la imagen no cambia; ver "Resultados de
 > la fase 5.2"). **Fase 5.3 cerrada** (Ryzen #75/#76: scanout desde VRAM
 > propia, ~1000 flips en 20 s, visto a mano; ver
-> "Resultados de la fase 5.3"). Siguiente: 5.4 (supervisores). Ninguna fase se da por hecha sin su
+> "Resultados de la fase 5.3"). **Fase 5.4 cerrada** (Ryzen #77: SOR-1
+> desenganchado y vuelto a enganchar por supervisores atendidos en el ISR,
+> visto a mano; ver "Resultados de la fase 5.4"). Siguiente: 5.5 (VPLL). Ninguna fase se da por hecha sin su
 > criterio medido en la Ryzen.
 
 ## Objetivo
@@ -592,6 +594,42 @@ probados por sabotaje. Job: `scripts/metal-jobs/gpu-scanout.sh`.
   de vuelta).
 
 **Fase 5.3 cerrada.**
+
+## Resultados de la fase 5.4 (2026-09-27)
+
+Código: `nvgpu::init` (intérprete de scripts del VBIOS de nouveau, 9
+opcodes: los que usan los scripts IED de DP-3), `nvgpu::supervisor` (tabla
+IEDT del BIT 'U', `route_get`, estados ARM/ASSEMBLY, trabajo 1.0/2.0/2.2/3.0
+y liberación; 2.1 solo se reporta), `nvgpu::vblank::service(m, ctrl_disp)`
+(bit 12 → `0x611c30` → ack `0x611860`), `kernel/src/gpu/supervisor.rs` (el
+trabajo corre en el ISR del vblank, CPU 0) y `/dev/dispctl` (`detach` /
+`attach`). Fixtures `super-round1.txt`, `super-round2.txt` (subcomando
+`supers` de `gpu-trace.py`) y `super-intr.txt`: los tests reproducen las dos
+rondas de nouveau registro a registro (la ronda 2 solo la cabeza 0);
+probados por sabotaje. Job: `scripts/metal-jobs/gpu-super.sh`.
+
+Scripts de DP-3 en la cabeza 0 (salida `0006:0182`, protocolo 9): OffInt1
+`0x78f9` y OnInt3 `0x6821` vacíos; OffInt2 `0x7355` limpia `0x616540` bit 0,
+escribe `0x21234` (falla PRI, como en nouveau) y `0xd604 = 0`; OnInt2
+`0x71b9` hace `0x616540 = (… & 0xbf00bffe) | (0x61c98c & 0x40ff4001)`. Los
+de HDMI usan más opcodes (condiciones por tabla, sondeos): fase 5.8.
+
+**Medido en la Ryzen (boot #77, veredicto OK):**
+- `detach`: supervisores 1-3 en 30 ms, trabajo de 17-71 µs cada uno; ARMED
+  `SOR_SET_CONTROL(1) = 0`. `attach` 5 s después: supervisores 1-3, OnInt2 +
+  empaquetado DP + relojes; ARMED `= 0x901`. Sin errores de script ni de
+  CTRL_DISP.
+- **El GOP entrena el DP a 2×HBR** (`bw 0x0a`, 2 carriles, framing
+  mejorado), no a 4×HBR2 como nouveau. Con ese enlace la fórmula de nouveau
+  da `h = 0x1e7`, el valor del GOP; `v` (`0x768` frente a `0xd74`) y el
+  watermark (15 frente a 20) difieren, y la imagen sale igual.
+- Después: vblank a 59,97 Hz, sin interrupciones espurias; `compositor fire`
+  496 flips, ninguno rechazado.
+- El usuario vio la pantalla negra ~5 s y la imagen de vuelta, y fire bien.
+- El log de 64 KiB envolvió otra vez; el job repite las líneas `super:` al
+  final.
+
+**Fase 5.4 cerrada.**
 
 ## Fases
 

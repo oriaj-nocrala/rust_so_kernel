@@ -275,6 +275,19 @@ pub mod tests {
         }
     }
 
+    /// The smallest image `Bios::new` takes: one 4 KiB x86 image (ROM and
+    /// PCIR headers only, no BIT), zeros elsewhere for tests to fill.
+    pub fn tiny_image() -> Vec<u8> {
+        let mut d = std::vec![0u8; 0x1000];
+        d[0] = 0x55;
+        d[1] = 0xaa;
+        d[0x18] = 0x40; // PCIR at 0x40
+        d[0x40..0x44].copy_from_slice(b"PCIR");
+        d[0x50] = 0x08; // image length, 512-byte units
+        d[0x55] = 0x80; // last image
+        d
+    }
+
     #[test]
     fn oracle_images_and_version() {
         let Some(rom) = oracle_vbios() else { return };

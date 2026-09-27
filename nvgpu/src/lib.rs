@@ -21,8 +21,10 @@ pub mod edid;
 pub mod evo;
 pub mod i2c;
 pub mod id;
+pub mod init;
 pub mod mmio;
 pub mod pad;
+pub mod supervisor;
 pub mod vbios;
 pub mod vblank;
 

@@ -40,6 +40,21 @@ pub struct Output {
     /// DP only: maximum link rate (DPCD units of 0.27 Gb/s) and lanes.
     pub dp_link_bw: u8,
     pub dp_link_nr: u8,
+    /// External encoder, only for off-chip outputs (`dcb.c:176-178`).
+    pub extdev: u8,
+}
+
+impl Output {
+    /// `dcb_outp_hasht` (`dcb.c:108-112`): what the VBIOS output tables
+    /// (IEDT, DP) are keyed by.
+    pub fn hasht(&self) -> u16 {
+        (self.extdev as u16) << 8 | (self.location as u16) << 4 | self.kind as u16
+    }
+
+    /// `dcb_outp_hashm` (`dcb.c:114-118`).
+    pub fn hashm(&self) -> u16 {
+        (self.heads as u16) << 8 | (self.link as u16) << 6 | self.or as u16
+    }
 }
 
 /// One CCB entry (`bios/i2c.c:65-135`, the `DCB_I2C_PMGR` case). `None` =
@@ -115,6 +130,7 @@ impl Dcb {
                 link: 0,
                 dp_link_bw: 0,
                 dp_link_nr: 0,
+                extdev: 0,
             };
             if version >= 0x40 {
                 let conf = bios.rd32(e + 4);
@@ -134,6 +150,9 @@ impl Dcb {
                 }
                 if matches!(o.kind, OUTPUT_DP | OUTPUT_TMDS | 0x3) {
                     o.link = ((conf & 0x30) >> 4) as u8;
+                    if o.location != 0 {
+                        o.extdev = ((conf & 0xff00) >> 8) as u8;
+                    }
                 }
             }
             outputs.push(o);

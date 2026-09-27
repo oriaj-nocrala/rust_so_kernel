@@ -35,6 +35,11 @@
 //          (`scanout.rs`): the framebuffer copies its shadow there and
 //          `FBIO_FLUSH` flips at the next vblank. Result: `scanout:` lines,
 //          `gpu_flip:` in /proc/kdebug.
+//   super  (phase 5.4) — also service the display's supervisor interrupts
+//          from the vblank MSI handler, and open `/dev/dispctl`, which
+//          detaches the primary head's SOR and attaches it back at the same
+//          mode (`supervisor.rs`). Result: `super:` lines in /proc/gpu,
+//          `gpu_super:` in /proc/kdebug.
 //
 // Runs once at boot, after `fs::init` (firmware is on `/mnt`) and before the
 // APs are released (BAR sizing turns decoding off for a few microseconds,
@@ -51,6 +56,7 @@ use crate::serial_println;
 
 pub mod evo;
 pub mod scanout;
+pub mod supervisor;
 pub mod vblank;
 
 /// `10de:2507`, the only GPU this driver is for (plan, "No-objetivos").
@@ -72,12 +78,17 @@ const FIRMWARE: [&str; 3] = [
 const BAR1_WINDOW: u64 = 16 << 20;
 
 static REPORT: spin::Once<String> = spin::Once::new();
+/// The VBIOS and its DCB, kept after `gpu=disp` read them: the supervisor
+/// work runs the VBIOS's IED scripts (`supervisor.rs`).
+static VBIOS: spin::Once<(nvgpu::vbios::Bios, nvgpu::dcb::Dcb)> = spin::Once::new();
 static DISPLAYS: spin::Once<String> = spin::Once::new();
 static DISPSTATE: spin::Once<String> = spin::Once::new();
 
-/// `/proc/gpu`.
+/// `/proc/gpu`: the boot report, then what the supervisors did since.
 pub fn render() -> String {
-    REPORT.get().cloned().unwrap_or_else(|| String::from("gpu: off\n"))
+    let mut out = REPORT.get().cloned().unwrap_or_else(|| String::from("gpu: off\n"));
+    out.push_str(&supervisor::render_log());
+    out
 }
 
 /// `/proc/displays`: filled once at boot with `gpu=disp`.
@@ -349,6 +360,14 @@ fn probe_device(r: &mut String, level: GpuLevel) {
                     }
                 }
             }
+            if level >= GpuLevel::Super {
+                match put {
+                    Some(_) => supervisor::setup(r, &regs),
+                    None => {
+                        let _ = writeln!(r, "super: not attempted: the channels are not up (see chan:)");
+                    }
+                }
+            }
             if level >= GpuLevel::Vblank {
                 vblank::setup(r, &regs, (b, d, fun));
             }
@@ -424,6 +443,7 @@ fn probe_displays(r: &mut String, regs: &Bar0) {
         crate::serial_println!("displays: {}", line);
     }
     DISPLAYS.call_once(|| text);
+    VBIOS.call_once(|| (bios, dcb));
 }
 
 /// Phase 5.1: the ARMED display state the GOP left (`nvgpu::dispstate`),

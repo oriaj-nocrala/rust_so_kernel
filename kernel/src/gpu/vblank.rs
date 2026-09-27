@@ -65,7 +65,14 @@ pub fn last_ns() -> u64 {
 /// MSI handler: ISR context, IF=0, CPU 0.
 fn on_msi(_vector: u8) {
     let Some(s) = STATE.get() else { return };
-    let r = vb::service(&s.regs);
+    let r = vb::service(&s.regs, super::supervisor::enabled());
+    // Supervisors first: the display is stopped until they are released.
+    if r.supervisor != 0 {
+        super::supervisor::on_pending(&s.regs, r.supervisor);
+    }
+    if let Some(info) = r.ctrl_disp_error {
+        super::supervisor::note_error(info);
+    }
     if r.spurious {
         SPURIOUS.fetch_add(1, Ordering::Relaxed);
     }

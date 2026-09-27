@@ -80,6 +80,11 @@ pub enum GpuLevel {
     /// mode; the framebuffer copies its RAM shadow there and `/dev/fb0`'s
     /// `FBIO_FLUSH` becomes a page flip at the next vblank.
     Scanout,
+    /// Phase 5.4: also service the display's supervisor interrupts (the
+    /// three steps of a core UPDATE that changes what drives a head), and
+    /// open `/dev/dispctl`, whose `detach`/`attach` take the primary head's
+    /// SOR off and put it back at the same mode.
+    Super,
 }
 
 impl GpuLevel {
@@ -95,6 +100,7 @@ impl GpuLevel {
             "dispstate" => Some(GpuLevel::Dispstate),
             "chan" => Some(GpuLevel::Chan),
             "scanout" => Some(GpuLevel::Scanout),
+            "super" => Some(GpuLevel::Super),
             _ => None,
         }
     }
@@ -134,7 +140,8 @@ mod tests {
         assert_eq!(GpuLevel::parse("gsp"), None);
         assert_eq!(GpuLevel::parse("chan"), Some(GpuLevel::Chan));
         assert_eq!(GpuLevel::parse("scanout"), Some(GpuLevel::Scanout));
-        assert!(GpuLevel::Scanout > GpuLevel::Chan);
+        assert_eq!(GpuLevel::parse("super"), Some(GpuLevel::Super));
+        assert!(GpuLevel::Super > GpuLevel::Scanout && GpuLevel::Scanout > GpuLevel::Chan);
         assert!(GpuLevel::Chan > GpuLevel::Dispstate && GpuLevel::Dispstate > GpuLevel::Vblank);
         assert!(GpuLevel::Vblank > GpuLevel::Disp && GpuLevel::Disp > GpuLevel::Probe && GpuLevel::Probe > GpuLevel::Off);
     }

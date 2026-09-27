@@ -54,6 +54,7 @@ const PMC_BOOT_0: u32 = 0x00_0000;
 /// (supervisor) (`engine/disp/gv100.c:1082-1110`).
 pub const DISP_INTR: u32 = 0x61_1ec0;
 const DISP_INTR_HEADS: u32 = 0x0000_00ff;
+pub const DISP_INTR_CTRL_DISP: u32 = 0x0000_1000;
 
 /// CTRL_DISP interrupt enable (AWAKEN, ERROR, SUPERVISOR1-3), which
 /// nouveau sets to `0x187` (`engine/disp/gv100.c:1198`). Only read here:
@@ -82,9 +83,11 @@ pub const HEAD_RG_VLINE: u32 = 0x61_6330;
 pub const HEAD_RG_HLINE: u32 = 0x61_6334;
 const HEAD_RG_STRIDE: u32 = 0x800;
 
-/// Head state: `0x682000 + 0x8000` for the ARM copy (what scans out now)
-/// `+ head * 0x400` (`engine/disp/gv100.c:270`).
-const HEAD_STATE_ARM: u32 = 0x68_2000 + 0x8000;
+/// Head state: `0x682000` (ASSEMBLY, what the next UPDATE applies), `+
+/// 0x8000` for the ARM copy (what scans out now), `+ head * 0x400`
+/// (`engine/disp/gv100.c:270`).
+const HEAD_STATE_ASY: u32 = 0x68_2000;
+const HEAD_STATE_ARM: u32 = HEAD_STATE_ASY + 0x8000;
 const HEAD_STATE_STRIDE: u32 = 0x400;
 /// `engine/disp/gv100.c:273-287`.
 const HS_DEPTH: u32 = 0x004;
@@ -119,7 +122,13 @@ pub struct HeadTiming {
 
 impl HeadTiming {
     pub fn read_armed(m: &dyn Mmio, head: u32) -> HeadTiming {
-        let base = HEAD_STATE_ARM + head * HEAD_STATE_STRIDE;
+        Self::read(m, head, true)
+    }
+
+    /// `gv100_head_state` for the ARM (`armed`) or ASSEMBLY copy, in its
+    /// read order.
+    pub fn read(m: &dyn Mmio, head: u32, armed: bool) -> HeadTiming {
+        let base = if armed { HEAD_STATE_ARM } else { HEAD_STATE_ASY } + head * HEAD_STATE_STRIDE;
         let hi = |v: u32| (v >> 16) as u16;
         let lo = |v: u32| (v & 0xffff) as u16;
         let total = m.rd32(base + HS_TOTAL);
@@ -137,6 +146,16 @@ impl HeadTiming {
             hblanks: lo(blanks),
             hz: m.rd32(base + HS_HZ),
             depth_code: ((m.rd32(base + HS_DEPTH) >> 4) & 0xf) as u8,
+        }
+    }
+
+    /// Bits per pixel on the output (`gv100.c:288-296`: 30, 24, 18; nouveau
+    /// warns and takes 18 for any other code).
+    pub fn depth_bits(&self) -> u32 {
+        match self.depth_code {
+            5 => 30,
+            4 => 24,
+            _ => 18,
         }
     }
 
@@ -220,12 +239,24 @@ pub struct Serviced {
     pub gone: bool,
     /// No leaf had anything (a spurious MSI).
     pub spurious: bool,
+    /// Supervisors pending (CTRL_DISP bits 0-2), acknowledged: the caller
+    /// must run [`crate::supervisor::Supervisor::service`] for them, or the
+    /// display stays stopped. Only with `ctrl_disp`.
+    pub supervisor: u32,
+    /// CTRL_DISP's error bit was set; this is what `0x611848` held.
+    pub ctrl_disp_error: Option<u32>,
 }
 
 /// One interrupt, as `nvkm_intr` (`core/intr.c:163-229`) and
 /// `gv100_disp_intr` (`engine/disp/gv100.c:1078-1110`) service it. Run it
 /// once per MSI; it rearms the tree and the MSI before returning.
-pub fn service(m: &dyn Mmio) -> Serviced {
+///
+/// With `ctrl_disp` (the supervisor interrupts are enabled,
+/// [`crate::supervisor::arm`]), DISP_INTR bit 12 is serviced as
+/// `gv100_disp_intr_ctrl_disp` does (`gv100.c:935-962`): the pending
+/// supervisors are acknowledged and returned, the error bit's information
+/// read back. Without it, that bit is left alone in `disp_other`.
+pub fn service(m: &dyn Mmio, ctrl_disp: bool) -> Serviced {
     let mut out = Serviced::default();
     m.wr32(VFN_UNARM, VFN_ALL_TOP);
     m.wr32(PCI_MSI_REARM, 0);
@@ -273,6 +304,18 @@ pub fn service(m: &dyn Mmio) -> Serviced {
             }
         }
         out.disp_other = intr & !DISP_INTR_HEADS;
+        if ctrl_disp && intr & DISP_INTR_CTRL_DISP != 0 {
+            use crate::supervisor::{CTRL_DISP, CTRL_DISP_ACK, CTRL_DISP_ERROR, CTRL_DISP_ERROR_INFO, CTRL_DISP_SUPERVISORS};
+            let stat = m.rd32(CTRL_DISP);
+            if stat & CTRL_DISP_SUPERVISORS != 0 {
+                out.supervisor = stat & CTRL_DISP_SUPERVISORS;
+                m.wr32(CTRL_DISP_ACK, out.supervisor);
+            }
+            if stat & CTRL_DISP_ERROR != 0 {
+                out.ctrl_disp_error = Some(m.mask(CTRL_DISP_ERROR_INFO, 0, 0));
+            }
+            out.disp_other &= !DISP_INTR_CTRL_DISP;
+        }
     } else {
         for leaf in 0..VFN_LEAVES {
             if stat[leaf as usize] != 0 {
@@ -298,12 +341,29 @@ mod tests {
     #[test]
     fn service_replays_the_trace() {
         let m = ReplayMmio::from_extract(SERVICE);
-        let s = service(&m);
+        let s = service(&m, true);
         assert_eq!(s, Serviced { vblank: 0b11, display: true, ..Default::default() });
         assert_eq!(*m.writes.borrow(), m.expected_writes);
         for reg in [VFN_TOP, VFN_LEAF_STAT + 16, VFN_LEAF_STAT + 20, DISP_INTR, HEAD_TIMING_STAT, HEAD_TIMING_STAT + 4] {
             assert_eq!(m.unread(reg), 0, "{reg:#x} read a different number of times than the trace");
         }
+    }
+
+    const SUPER_INTR: &str = include_str!("../fixtures/super-intr.txt");
+
+    /// An interrupt with supervisor 2 pending: acknowledged as nouveau did,
+    /// register for register, and handed back.
+    #[test]
+    fn supervisor_interrupt_replays_the_trace() {
+        let m = ReplayMmio::from_extract(SUPER_INTR);
+        let s = service(&m, true);
+        assert_eq!(s, Serviced { vblank: 0b1, display: true, supervisor: 2, ..Default::default() });
+        assert_eq!(*m.writes.borrow(), m.expected_writes);
+        // Without the supervisor interrupts enabled, bit 12 is not touched.
+        let m = ReplayMmio::from_extract(SUPER_INTR);
+        let s = service(&m, false);
+        assert_eq!((s.supervisor, s.disp_other), (0, DISP_INTR_CTRL_DISP));
+        assert!(!m.writes.borrow().iter().any(|w| w.0 == crate::supervisor::CTRL_DISP_ACK));
     }
 
     #[test]
@@ -361,7 +421,7 @@ mod tests {
     #[test]
     fn spurious_msi_rearms_and_touches_nothing_else() {
         let m = TableMmio::new(&[(0xb81600, 0)]);
-        let s = service(&m);
+        let s = service(&m, true);
         assert!(s.spurious);
         assert_eq!(*m.writes.borrow(), vec![(0xb81610, 0xf), (0x088704, 0), (0xb81608, 0xf)]);
     }
@@ -371,7 +431,7 @@ mod tests {
         // PRIVRING (leaf 4 bit 30), pending at arm time in the trace
         // (8.419231: 0x40000000), with the display bit clear.
         let m = TableMmio::new(&[(0xb81600, 0x4), (0xb81010, 0x4000_0000), (0xb81014, 0), (0x000000, 0xb760_00a1)]);
-        let s = service(&m);
+        let s = service(&m, true);
         assert!(s.blocked && !s.display && s.vblank == 0);
         assert_eq!(
             *m.writes.borrow(),
@@ -382,7 +442,7 @@ mod tests {
     #[test]
     fn gpu_off_the_bus_is_reported() {
         let m = TableMmio::new(&[(0xb81600, 0x4), (0xb81010, DISP_BIT), (0xb81014, 0), (0x000000, 0xffff_ffff)]);
-        let s = service(&m);
+        let s = service(&m, true);
         assert!(s.gone && s.vblank == 0);
         assert_eq!(*m.writes.borrow(), vec![(0xb81610, 0xf), (0x088704, 0), (0xb81608, 0xf)]);
     }
@@ -397,7 +457,8 @@ mod tests {
             (0x611ec0, 0x1004),
             (0x611808, 0x0000_0014),
         ]);
-        let s = service(&m);
+        // Supervisor interrupts not enabled: bit 12 is only reported.
+        let s = service(&m, false);
         assert_eq!(s.vblank, 0b100);
         assert_eq!(s.head_other, 0x10);
         assert_eq!(s.disp_other, 0x1000);

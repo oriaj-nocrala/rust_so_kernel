@@ -29,6 +29,11 @@ A trace dir is what scripts/gpu-oracle.sh leaves: mmiotrace.txt + dmesg.txt.
   gpu-trace.py push    DIR [T0 T1 [OUT]]    display push-buffer methods, one block per PUT
                                             write, named from clc67d/e/b.h (needs a
                                             nogsp-vrampush trace: push buffers in VRAM)
+  gpu-trace.py supers  DIR T0 T1 [OUT]      each display supervisor serviced between dmesg times
+                                            T0..T1, from its R 0x6107a8 to the release (W 0x6107a8
+                                            0x80000000), as a replay fixture ("R|W offset value");
+                                            accesses of other contexts (interrupt handlers, timer,
+                                            AUX polling) are left out, see SUPER_OTHER
 
 Clock alignment. mmiotrace and printk stamp with different clocks. The
 anchor is the VBIOS PROM read (BAR0 0x300000..0x3fffff): nouveau prints
@@ -569,6 +574,59 @@ def push(d, t0=0.0, t1=1e9, out=None):
         print(f"{n_puts} pushes -> {out}")
 
 
+# BAR0 ranges a supervisor's work never touches but other contexts do while
+# it runs (the interrupt handler of the next supervisor or of a PRI fault,
+# the timer, AUX/HPD polling): left out of `supers` fixtures.
+SUPER_OTHER = [
+    (0x000000, 0x000004, "PMC_BOOT_0 (interrupt handler)"),
+    (0x009400, 0x009420, "PTIMER"),
+    (0x00d900, 0x00dc00, "AUX/HPD polling"),
+    (0x088704, 0x088708, "MSI rearm"),
+    (0x120000, 0x130000, "PRIVRING interrupt"),
+    (0x611800, 0x611820, "head timing ack (interrupt handler)"),
+    (0x611860, 0x611864, "CTRL_DISP ack (interrupt handler)"),
+    (0x611c30, 0x611c34, "CTRL_DISP status (interrupt handler)"),
+    (0x611ec0, 0x611ec4, "DISP_INTR (interrupt handler)"),
+    (0xb80000, 0xb90000, "VFN interrupt tree"),
+]
+
+
+def supers(d, t0, t1, out=None):
+    """Supervisor services (`gv100_disp_super`, gv100.c:835-891) between
+    dmesg times t0..t1: from the read of 0x6107a8 to the write of
+    0x80000000 there, minus SUPER_OTHER."""
+    off, base = align(d, quiet=True)
+    lines, cur, n = [], None, 0
+    for k, t, a, v in iter_trace(d):
+        if t > t1 + off:
+            break
+        if t < t0 + off or not base <= a < base + 0x1000000:
+            continue
+        o = a - base
+        if cur is None:
+            if k == "R" and o == 0x6107a8:
+                n += 1
+                cur = [f"# service {n} at {t - off:.6f}"]
+            else:
+                continue
+        if any(lo <= o < hi for lo, hi, _ in SUPER_OTHER):
+            continue
+        cur.append(f"{k} {o:#08x} {v:#010x}")
+        if k == "W" and o == 0x6107a8 and v == 0x80000000:
+            lines += cur
+            cur = None
+    text = "\n".join(lines) + "\n"
+    if out:
+        with open(out, "w") as f:
+            f.write(f"# {d.rsplit('/', 1)[-1]}: display supervisor services, dmesg {t0}..{t1} "
+                    f"(scripts/gpu-trace.py supers {d.rsplit('/', 1)[-1]} {t0} {t1} OUT)\n")
+            f.write("# R|W BAR0-offset value; left out: " + ", ".join(w for _, _, w in SUPER_OTHER) + "\n")
+            f.write(text)
+        print(f"{n} services -> {out}")
+    else:
+        sys.stdout.write(text)
+
+
 def main(argv):
     if len(argv) < 3:
         sys.exit(__doc__)
@@ -604,6 +662,8 @@ def main(argv):
             push(d, float(argv[3]), float(argv[4]), argv[5] if len(argv) > 5 else None)
         else:
             push(d)
+    elif cmd == "supers":
+        supers(d, float(argv[3]), float(argv[4]), argv[5] if len(argv) > 5 else None)
     else:
         sys.exit(__doc__)
 
