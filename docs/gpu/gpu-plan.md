@@ -1,9 +1,9 @@
 # Plan: GPU NVIDIA (display, GSP, canales)
 
-> **Estado (2026-09-26):** fase 0 en curso. Referencias clonadas
-> (`scripts/gpu-ref.sh`); `scripts/gpu-oracle.sh` escrito, falta ejecutarlo
-> (necesita root y dos reinicios). Ninguna fase se da por hecha sin su
-> criterio medido en la Ryzen.
+> **Estado (2026-09-26):** fase 0 casi cerrada. Trazas capturadas y
+> válidas (ver "Resultados de la fase 0"); D1 fijada en **570.144**, medido.
+> Falta segmentar las trazas por paso y aclarar el fallo de display con GSP
+> (D6). Ninguna fase se da por hecha sin su criterio medido en la Ryzen.
 
 ## Objetivo
 
@@ -114,11 +114,11 @@ fase 0) en una etiqueta concreta, anotada aquí al fijarla.
   fija la versión que carga el nouveau del host, porque es la única que se
   puede trazar. Candidatas: 535.113.01, con r535 en nouveau y la más madura,
   y 570.144, la que usa nova-core. Nada de mezclar ABIs.
-  **Previsión (fuente, no medido):** el nouveau de v7.2.2 prefiere 570.144
+  **Fijada: 570.144, medido** (dmesg de `trace-gsp`: `gsp: RM version:
+  570.144`, carga `gsp-570.144.bin`, 63 571 696 bytes). Previsión original: el nouveau de v7.2.2 prefiere 570.144
   para GA106 (`nvkm/subdev/gsp/ga102.c:180`, prioridad 1 frente a 535 en
   `:181`), y el GSP está activado por defecto (`NvGspRm`, `tu102.c:460`). Las
-  referencias ya están clonadas con esa versión (`~/src/gpu-ref/PINNED`). Queda
-  confirmarlo en el dmesg de la traza.
+  referencias ya están clonadas con esa versión (`~/src/gpu-ref/PINNED`).
 - **D2: estructuras de RM generadas, no escritas a mano.** `bindgen` sobre
   los headers de open-gpu-kernel-modules en la etiqueta fijada, filtrado a
   una lista blanca. Se genera un `.rs` que se commitea con
@@ -137,6 +137,56 @@ fase 0) en una etiqueta concreta, anotada aquí al fijarla.
   anterior pierde la imagen (por ejemplo, RM toma el display al arrancar el
   GSP), se registra como hecho medido y la fase 5 pasa a ser la que la
   recupera. No se improvisa un arreglo.
+- **D6: ruta del modeset (abierta, se decide antes de la fase 5).** Medido en
+  la fase 0: nouveau **sin GSP** hace un modeset completo y limpio en esta
+  tarjeta (fbcon a los 11,7 s, sin errores), y nouveau **con GSP** arranca
+  RM bien pero su display falla (ver resultados). Hay dos rutas: modeset vía
+  RM, como está escrita la fase 5, o modeset propio con la traza `nogsp`
+  como oráculo, portando lo que hace nouveau sin GSP (entrenamiento DP y
+  relojes incluidos). Para elegir, primero hay que saber si el fallo con GSP
+  es de nouveau r570 en GA106 o un efecto de mmiotrace. Se mide con un
+  arranque de nouveau con GSP **sin** mmiotrace.
+
+## Resultados de la fase 0 (2026-09-26)
+
+Capturas en `~/constanos-gpu-oracle/` (fuera de git), con
+`scripts/gpu-oracle.sh` en modo desatendido. El primer intento salió vacío:
+el `modprobe.d` del host fuerza `nouveau modeset=0`; el script ahora lo anula.
+
+| Captura | Contenido |
+|---|---|
+| `static/` | VBIOS (148 992 B, igual en los tres arranques), EDIDs, `lspci -xxxx`, `nvidia-smi -q` |
+| `trace-nogsp/` | 98 MB: 2 289 019 escrituras y 255 128 lecturas MMIO; dmesg de 1 713 líneas |
+| `trace-gsp/` | 364 MB: 2 136 705 escrituras y 7 421 042 lecturas; dmesg de 22 214 líneas con 1 332 RPC volcados (`debug=gsp=trace`) |
+
+Hechos medidos:
+- **Los EDIDs leídos por nouveau (con y sin GSP) son idénticos byte a byte a
+  los de sysfs bajo `nvidia`.** Son el fixture de la fase 2.
+- **El nombre de un mismo conector cambia según la ruta.** El DP del ASUS es
+  `DP-3` sin GSP y `DP-1` con GSP y con `nvidia`. Por eso los nombres de
+  `/proc/displays` no se copian de Linux: se definen desde la DCB y se
+  documentan.
+- **Arranque del GSP, completo en la traza:** `fwsec-frts` parchea 3 firmas,
+  arranca en unos 235 ms y deja **WPR2 en `0x01ffe000`–`0x01ffee00`**. Son
+  los valores crudos de los registros `0x1fa824`/`0x1fa828`
+  (`nvkm/subdev/gsp/fwsec.c:369-371`); todavía no se han interpretado las
+  unidades. La primera init de RM
+  tarda 247 ms, y el resto son RPC. Es el oráculo completo de la fase 4.
+- **Display con GSP: falla en la traza.** `NV0073_CTRL_CMD_DFP_ASSIGN_SOR`
+  (`0x731152`, `ctrl0073dfp.h:598`) devuelve `0xffff`. `DP_TRAIN` falla en
+  todas las combinaciones de carriles y velocidades (-EIO), y aparecen
+  `core notifier timeout` y `dotclock = 0`. No sirve como oráculo de la
+  fase 5 hasta resolver D6.
+- **Display sin GSP: limpio.** La traza `nogsp` contiene un modeset completo
+  de las dos pantallas.
+- Los relojes de dmesg y de mmiotrace son el mismo (tiempo desde el
+  arranque), así que las trazas se pueden segmentar por los mensajes de
+  nouveau.
+
+Pendiente para cerrar la fase 0:
+1. Segmentar las trazas: anotar aquí los rangos de tiempo de cada paso
+   (lectura de VBIOS, AUX/EDID, vblank, FWSEC, booter, RPC de init, modeset).
+2. Medir D6: nouveau con GSP sin mmiotrace (un reinicio, solo el dmesg).
 
 ## Fases
 
