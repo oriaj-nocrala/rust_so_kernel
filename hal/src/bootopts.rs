@@ -69,6 +69,12 @@ pub enum GpuLevel {
     /// window 0) before arming vblank, and publish it in `/proc/dispstate`.
     /// Reads only.
     Dispstate,
+    /// Phase 5.2: also, before arming vblank, bring up the display's
+    /// instance memory (VRAM, through PRAMIN), the core channel and window
+    /// 0 (push buffers in host memory), and push one UPDATE on each that
+    /// repeats the state the GOP left: the image must not change. Leaves
+    /// both channels running and bus mastering on.
+    Chan,
 }
 
 impl GpuLevel {
@@ -82,6 +88,7 @@ impl GpuLevel {
             "disp" => Some(GpuLevel::Disp),
             "vblank" => Some(GpuLevel::Vblank),
             "dispstate" => Some(GpuLevel::Dispstate),
+            "chan" => Some(GpuLevel::Chan),
             _ => None,
         }
     }
@@ -119,7 +126,8 @@ mod tests {
         assert_eq!(GpuLevel::parse("vblank"), Some(GpuLevel::Vblank));
         assert_eq!(GpuLevel::parse("dispstate"), Some(GpuLevel::Dispstate));
         assert_eq!(GpuLevel::parse("gsp"), None);
-        assert!(GpuLevel::Dispstate > GpuLevel::Vblank);
+        assert_eq!(GpuLevel::parse("chan"), Some(GpuLevel::Chan));
+        assert!(GpuLevel::Chan > GpuLevel::Dispstate && GpuLevel::Dispstate > GpuLevel::Vblank);
         assert!(GpuLevel::Vblank > GpuLevel::Disp && GpuLevel::Disp > GpuLevel::Probe && GpuLevel::Probe > GpuLevel::Off);
     }
 }

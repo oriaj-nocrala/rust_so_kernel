@@ -25,6 +25,11 @@
 //          ARMED method state (core + window 0) the GOP left and compare
 //          window 0's surface with the GOP framebuffer. Reads only. Result
 //          in /proc/dispstate.
+//   chan   (phase 5.2) — also, after reading that state and before arming
+//          vblank, bring up the display's instance memory (VRAM through
+//          PRAMIN), the core channel and window 0, and push one UPDATE on
+//          each that repeats what the GOP left (`evo.rs`): the image must
+//          not change. Result in /proc/gpu (`chan:` lines).
 //
 // Runs once at boot, after `fs::init` (firmware is on `/mnt`) and before the
 // APs are released (BAR sizing turns decoding off for a few microseconds,
@@ -39,6 +44,7 @@ use nvgpu::id::ChipId;
 
 use crate::serial_println;
 
+pub mod evo;
 pub mod vblank;
 
 /// `10de:2507`, the only GPU this driver is for (plan, "No-objetivos").
@@ -327,6 +333,9 @@ fn probe_device(r: &mut String, level: GpuLevel) {
             probe_displays(r, &regs);
             if level >= GpuLevel::Dispstate {
                 read_dispstate(r, &regs, bars[1].map(|b| (b.addr, b.size)));
+            }
+            if level >= GpuLevel::Chan {
+                evo::bring_up(r, &regs, (b, d, fun));
             }
             if level >= GpuLevel::Vblank {
                 vblank::setup(r, &regs, (b, d, fun));

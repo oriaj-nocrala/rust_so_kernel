@@ -7,7 +7,7 @@ Plan and decisions: `docs/gpu/gpu-plan.md`. This page is the current state. Pure
 - UEFI gives no command line. `key=value` words are read once after `fs::init` from `/mnt/etc/kernel.conf`, then `/mnt/autorun/kernel.conf` (later wins; `#` comments). Before that, everything is at its default.
 - `/mnt/autorun/kernel.conf` is written by `scripts/metal-run.sh --kconf '...'` and removed with `autorun/`, so an option applies to one unattended run only.
 - `disk-image-root/etc/kernel.conf` is gitignored: a checkout's own options.
-- `gpu=` (`hal::bootopts::GpuLevel`): `off` (default: the GPU is not touched), `probe`, `disp`, `vblank`, `dispstate`. Each level does everything the previous ones do. An unknown value is logged and read as `off`.
+- `gpu=` (`hal::bootopts::GpuLevel`): `off` (default: the GPU is not touched), `probe`, `disp`, `vblank`, `dispstate`, `chan`. Each level does everything the previous ones do. An unknown value is logged and read as `off`.
 - `disk-image-root/etc/` is not synced to `disk.img` (only `etc/gui` is). To try a level in QEMU, write the file into the image: `debugfs -w -R "write <file> /etc/kernel.conf" disk.img` (and `rm` it after).
 
 ## `gpu=probe` (phase 1)
@@ -54,6 +54,18 @@ Everything `vblank` does; before arming vblank, `gpu::read_dispstate` reads the 
 - On the Ryzen (boot #69): identical to the trace's ARMED column except `UPDATE`; the GOP scans out BAR1 + 0, pitch 8192, context DMA handle `0x45564144`.
 - Metal job: `scripts/metal-run.sh --kconf 'gpu=dispstate' scripts/metal-jobs/gpu-dispstate.sh`.
 
+## `gpu=chan` (phase 5.2)
+
+Everything `dispstate` does; then, before arming vblank, `gpu::evo::bring_up` (`nvgpu::evo`):
+- **Instance memory**: 64 KiB of VRAM at `0x1ffc90000` (nouveau's address), written through PRAMIN (`0x1700` = VRAM >> 16, window at BAR0 `0x700000`; the base is put back). RAMHT at +0 (0x2000 bytes, 10-bit hash, `core/ramht.c`), context DMAs from +0x2000. One object: `0xfb000000` = all of VRAM, for window 0.
+- **Display init** (`tu102_disp_init` minus ownership claim, interrupts and SOR power): capability copy into `0x640000`, `0x610078` bit 0, `0x610010 = 9` (VRAM, valid), `0x610014`.
+- **Channels**: core (ctrl/user 0) and window 0 (1/1). Push buffers: 4 KiB `DmaBuf`s (below 4 GiB, else 40 bits), target HOST, kept forever (`PUSH`). Bus mastering is turned on here.
+- **Gate** before each UPDATE: ASSEMBLY (`user_base + m`) = ARMED (`armed_base + m`) on every dumped method except the pushed ones and PRI-error reads (`0xbadf5xxx`). The core inherits ARMED; **a window starts with a reset ASSEMBLY**, so its differing methods are pushed with their ARMED values first, then the gate runs again.
+- Pushes: core `SET_INTERLOCK_FLAGS = 0`, `SET_WINDOW_INTERLOCK_FLAGS = 0`, UPDATE; window 0 the restore + `SET_CONTEXT_DMA_ISO(0) = 0xfb000000` + interlocks 0, then UPDATE. The image is the same (the GOP framebuffer at VRAM 0, pitch 8192).
+- **Faults** are polled, never enabled as interrupts: CTRL_DISP `0x611c30` (supervisors, error), EXC_OTHER/WIN/WINIM `0x611854/4c/50`, compared with what was there before. The per-channel exception slots are not zero at rest (`0x80`) and are only meaningful when an EXC bit is set.
+- Report: `chan:` lines in `/proc/gpu` and the log, ending in `chan: OK: ...` or `chan: STOP: ...`. Afterwards both channels stay running and idle.
+- Metal job: `touch build.rs` (the root build does not watch `nvgpu`), then `scripts/metal-run.sh --kconf 'gpu=chan' scripts/metal-jobs/gpu-chan.sh`. Ryzen boot #74: OK.
+
 ## Oracle tools (`scripts/gpu-trace.py`)
 
 - `aux DIR CH` lists AUX transactions on a channel; `aux DIR CH SEL OUT` writes them as a `ReplayMmio` fixture (`nvgpu/fixtures/aux-ch3-dpcd-edid.txt`).
@@ -94,5 +106,6 @@ Everything `vblank` does; before arming vblank, `gpu::read_dispstate` reads the 
 
 - Host: `cd hal && cargo test` (pcicfg, dma, bootopts, acpi IVRS), `cd nvgpu && cargo test`.
 - `nvgpu` fixtures: the two EDIDs + their `edid-decode` output, an AUX trace extract, one vblank interrupt as nouveau serviced it (`vblank-service.txt`), and the modeset by steps (`modeset-*.txt`: display init, channel bring-up, instance memory, both supervisor rounds, link + AUX training, and the core state at each supervisor 1, whose ARMED column in round 1 is the state the GOP left) (committed); the VBIOS is read from `$GPU_ORACLE/static/vbios-rom.bin` (default `~/constanos-gpu-oracle`, not in git, D3) and those tests print `SKIP` without it.
+- `nvgpu::evo` tests use a small EVO simulator (`Sim`: PRAMIN onto a VRAM map, PUT executes pushed methods into ASSEMBLY, UPDATE copies ASSEMBLY to ARMED).
 - `nvgpu` mocks: `TableMmio` (fixed values), `ReplayMmio` (per-register read queues from a trace extract + write log to compare), `i2c::tests::DdcSim` (open-drain bus with a DDC EEPROM).
 - QEMU: `hw_tests::edu_mmio_dma_msi` (`scripts/run-kernel-tests.sh`; the runner adds `-device edu,dma_mask=0xffffffffffff`): MMIO, MSI to CPU 1 (the test boot keeps IF=0 on CPU 0), DMA both ways, mask refusal. The `edu` driver (`kernel/src/edu.rs`) is test-only.

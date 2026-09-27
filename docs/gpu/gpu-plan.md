@@ -10,7 +10,10 @@
 > segmentado; subfases reordenadas, ver "Resultados de la fase 5.0").
 > **Fase 5.1 cerrada** (Ryzen boot #69: el ARMED del GOP = el de la traza,
 > ventana 0 = framebuffer del GOP; ver "Resultados de la fase 5.1").
-> Siguiente: 5.2 (canales arriba sin cambiar la imagen). Ninguna fase se da por hecha sin su
+> **Fase 5.2 cerrada** (Ryzen boot #74: core y ventana 0 arriba, cada
+> UPDATE latchea solo lo empujado, la imagen no cambia; ver "Resultados de
+> la fase 5.2"). Siguiente: 5.3
+> (scanout propio). Ninguna fase se da por hecha sin su
 > criterio medido en la Ryzen.
 
 ## Objetivo
@@ -500,6 +503,54 @@ context DMA ha de ser nuestro (el handle del GOP no existe en nuestra
 RAMHT), con base 0 en VRAM.
 
 **Fase 5.1 cerrada.**
+
+## Resultados de la fase 5.2 (2026-09-27)
+
+Código: `nvgpu::evo` (lógica pura, 15 tests: RAMHT, ctxdma y arranque de
+canales contra `modeset-1/2-*`, y un simulador EVO pequeño) y
+`kernel/src/gpu/evo.rs` (`gpu=chan`). Job: `scripts/metal-jobs/gpu-chan.sh`.
+
+**Qué hace, en orden** (cada paso se comprueba antes del siguiente; la
+primera sorpresa para la secuencia sin desmontar nada):
+1. Memoria de instancia en VRAM `0x1ffc90000` (la de nouveau) por la ventana
+   PRAMIN (`0x1700`, restaurada después): se pone a cero y se escribe un
+   ctxdma de toda la VRAM (`0xfb000000`, flags 5) con su entrada de RAMHT
+   para la ventana 0. **La RAMHT va en +0 y los ctxdma en +0x2000** (la nota
+   de la 5.0 decía +0x1000: el hash lo desmiente). Se relee.
+2. Copia de capacidades de `tu102_disp_init` (46 palabras cambiaron: el GOP
+   no las rellena), `0x610078` bit 0, `0x610010 = 9`, `0x610014 = 0x1ffc9`.
+   Las interrupciones de excepción y de supervisor siguen apagadas; se sondean.
+3. Core arriba (push en RAM del host, destino HOST). **Puerta:** ASSEMBLY =
+   ARMED en los 240 métodos no empujados. Push: interlocks a 0 + UPDATE.
+4. Ventana 0 arriba. **Su ASSEMBLY arranca reseteado** (a diferencia del
+   core): `SET_SIZE`, `SET_PARAMS` (`0xe9`), `SET_PLANAR_STORAGE`,
+   `SET_SIZE_IN/OUT` y `SET_COMPOSITION_FACTOR_SELECT` difieren del ARMED.
+   Se empujan sus valores ARMED más el ctxdma propio y los interlocks a 0,
+   se vuelve a pasar la puerta, y solo entonces UPDATE.
+
+**Medido en la Ryzen:**
+- Boot #72: UPDATE del core; el ARMED cambió solo `0x218 0x10000→0` y
+  `0x21c 1→0`. Sin supervisor ni excepción. **Primer método de constanos
+  aceptado por el display de la GPU.**
+- Boot #73: la puerta paró la ventana 0 al ver su ASSEMBLY reseteado (un
+  UPDATE ahí habría dejado la pantalla sin superficie).
+- **Boot #74 (OK):** los dos UPDATEs latchearon; el ARMED de la ventana 0
+  cambió solo en `0x240 'DAVE'→0xfb000000`, `0x370` y `0x374` (1→0).
+  Secuencia completa en 54 ms. Después: raster 59,991 Hz y 602 vblanks en
+  10 s (59,991 Hz); ninguna interrupción espuria ni desconocida.
+- El GOP no tiene memoria de instancia válida (`0x610010 = 1`, sin el bit 3):
+  el handle `0x45564144` no está en ninguna RAMHT legible.
+- Las ranuras de excepción (`0x611020 + chid·12`) **no son cero en reposo**
+  (`0x80`; `0x178` tras levantar la ventana): guardan el último método. Solo
+  valen cuando `EXC_*` (`0x61184c/50/54`) tiene su bit, como en nouveau.
+- **La imagen no cambia:** el usuario miró un arranque con `gpu=chan` y vio
+  la consola todo el tiempo.
+- Una vez (#72) el conteo de vblanks dio 58,0 Hz con el raster a 59,99:
+  MSI perdidas, no el display; no se repitió en #73 ni #74.
+- Tropiezo de proceso: el `cargo build` raíz no vigila `nvgpu`, así que
+  `metal-run` desplegó el kernel viejo en #71. Hace falta `touch build.rs`.
+
+**Fase 5.2 cerrada.**
 
 ## Fases
 

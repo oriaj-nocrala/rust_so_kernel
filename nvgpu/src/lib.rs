@@ -18,6 +18,7 @@ pub mod dcb;
 pub mod display;
 pub mod dispstate;
 pub mod edid;
+pub mod evo;
 pub mod i2c;
 pub mod id;
 pub mod mmio;
