@@ -1,27 +1,31 @@
-//! `imgview [file.png ...]` — shows PNG images (default: the sample icon
-//! in `/mnt/usr/share/icons`) over a checkerboard and over a solid colour,
-//! through `userspace::img` (decode) and `Canvas::blit_over` (AVX2
-//! premultiplied "over" when the CPU has it).
+//! `imgview [file.png ...]` — shows PNG images over a checkerboard and
+//! over a solid colour, through `userspace::img` (decode, resample) and
+//! `Canvas::blit_over` (AVX2 premultiplied "over" when the CPU has it).
 //!
-//! Drawn 1:1 in screen pixels: on a `HIDPI` screen the images come out
-//! smaller, not scaled.
+//! Without arguments: the `sample` icon from the theme in
+//! `/mnt/usr/share/icons` at several logical sizes, through `load_icon` —
+//! each picks a themed size (64x64 or 128x128 there) and resamples it to
+//! `size * scale` pixels. With files: each at its own size in logical
+//! pixels, i.e. enlarged by the `HIDPI` scale.
 //!
-//! Prints, per image, its size and decode time, then which blend path is
-//! live and what one `blit_over` of each image costs (averaged over many),
-//! so the AVX2 path can be checked on the machine itself. Esc or Q quits.
+//! Prints what each image came from, its size and load time, then which
+//! blend path is live and what one `blit_over` of each costs (averaged
+//! over many), and a full frame of blending scalar against that path.
+//! Esc or Q quits.
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use draw::Canvas;
 use userspace::args::Args;
 use userspace::gfx::{Gfx, EV_KEY, HIDPI};
-use userspace::img::{self, Image, ICON_DIR};
+use userspace::img::{self, Image};
 use userspace::{entry, println, syscall};
 
 entry!(main);
@@ -34,6 +38,8 @@ const SOLID: u32 = 0x1E_2127;
 const KEY_ESC: u16 = 1;
 const KEY_Q: u16 = 16;
 const BLITS: u32 = 2000;
+/// Logical sizes the default view asks for.
+const ICON_SIZES_SHOWN: [usize; 5] = [24, 48, 64, 96, 128];
 
 fn now_us() -> i64 {
     let (s, ns) = syscall::clock_gettime();
@@ -51,22 +57,44 @@ fn checkerboard(cv: &mut Canvas, side: i32) {
 }
 
 fn main(args: Args) -> i32 {
-    let mut paths: Vec<&str> = (1..args.len())
+    let Some(mut gfx) = Gfx::open(args.env(b"GUI_DISPLAY"), "imgview", W, H, HIDPI) else {
+        println!("imgview: nothing to draw on (no /dev/fb, no compositor)");
+        return 1;
+    };
+    let k = gfx.scale();
+    let (fw, fh) = (W * k, H * k);
+
+    let paths: Vec<&str> = (1..args.len())
         .filter_map(|i| args.get(i))
         .filter_map(|a| core::str::from_utf8(a).ok())
         .collect();
-    let default = alloc::format!("{}/sample.png", ICON_DIR);
+    let mut images: Vec<(String, Image)> = Vec::new();
     if paths.is_empty() {
-        paths.push(&default);
+        for size in ICON_SIZES_SHOWN {
+            let t0 = now_us();
+            match img::load_icon("sample", size, k) {
+                Ok(icon) => {
+                    println!(
+                        "imgview: icon sample {}px x{} -> {}x{} from {} in {} us",
+                        size, k, icon.image.w, icon.image.h, icon.path, now_us() - t0
+                    );
+                    images.push((icon.path, icon.image));
+                }
+                Err(e) => println!("imgview: icon sample {}px: {}", size, e),
+            }
+        }
     }
-
-    let mut images: Vec<Image> = Vec::new();
     for path in &paths {
         let t0 = now_us();
-        match img::load(path) {
+        // Its own size in logical pixels: `k` times as many on screen.
+        let im = img::load(path).map(|im| {
+            let (w, h) = (im.w * k, im.h * k);
+            if k == 1 { im } else { im.resized(w, h) }
+        });
+        match im {
             Ok(im) => {
-                println!("imgview: {} {}x{} decoded in {} us", path, im.w, im.h, now_us() - t0);
-                images.push(im);
+                println!("imgview: {} -> {}x{} in {} us", path, im.w, im.h, now_us() - t0);
+                images.push((String::from(*path), im));
             }
             Err(e) => println!("imgview: {}: {}", path, e),
         }
@@ -74,13 +102,6 @@ fn main(args: Args) -> i32 {
     if images.is_empty() {
         return 1;
     }
-
-    let Some(mut gfx) = Gfx::open(args.env(b"GUI_DISPLAY"), "imgview", W, H, HIDPI) else {
-        println!("imgview: nothing to draw on (no /dev/fb, no compositor)");
-        return 1;
-    };
-    let k = gfx.scale();
-    let (fw, fh) = (W * k, H * k);
     let mut frame = vec![SOLID; fw * fh];
     let mut cv = Canvas::new(&mut frame, fw, fh, fw);
 
@@ -89,7 +110,7 @@ fn main(args: Args) -> i32 {
     checkerboard(&mut cv, 8 * k as i32);
     cv.rect(0, fh as i32 / 2, fw as i32, fh as i32 / 2, SOLID);
     let mut x = 16 * k as i32;
-    for im in &images {
+    for (_, im) in &images {
         cv.blit_over(&im.px, im.w, im.h, x, 16 * k as i32);
         cv.blit_over(&im.px, im.w, im.h, x, fh as i32 / 2 + 16 * k as i32);
         x += im.w as i32 + 16 * k as i32;
@@ -97,7 +118,7 @@ fn main(args: Args) -> i32 {
 
     // What one blit costs, into a scratch buffer so the picture stays.
     let path = if draw::blend::has_avx2() { "avx2" } else { "scalar" };
-    for (im, name) in images.iter().zip(&paths) {
+    for (name, im) in &images {
         let mut scratch = vec![SOLID; im.w * im.h];
         let mut sc = Canvas::new(&mut scratch, im.w, im.h, im.w);
         let t0 = now_us();
@@ -110,7 +131,7 @@ fn main(args: Args) -> i32 {
 
     // A whole frame of translucent pixels (the first image tiled), blended
     // row by row: scalar against the dispatched path.
-    let im = &images[0];
+    let im = &images[0].1;
     let layer: Vec<u32> = (0..fw * fh).map(|i| im.px[(i / fw % im.h) * im.w + i % fw % im.w]).collect();
     let mut scratch = vec![SOLID; fw * fh];
     for (name, f) in [

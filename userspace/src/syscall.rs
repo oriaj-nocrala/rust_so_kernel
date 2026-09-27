@@ -841,16 +841,24 @@ pub fn poll(fds: &mut [PollFd], timeout_ms: i32) -> i64 {
     }
 }
 
-// ── C-string helper (no alloc) ──────────────────────────────────────────
+// ── C-string helper ─────────────────────────────────────────────────────
 
-/// Builds a NUL-terminated path in a fixed 64-byte stack buffer and calls
-/// `f` with the resulting byte slice (including the trailing NUL).
-/// Truncates paths longer than 63 bytes.
+/// Builds a NUL-terminated copy of `s` and calls `f` with it (trailing NUL
+/// included): on the stack up to 63 bytes, on the heap beyond — a path is
+/// never truncated (it once was, silently, at 63: a long icon path opened
+/// a different file).
 pub fn with_cstr<R>(s: &str, f: impl FnOnce(&[u8]) -> R) -> R {
-    let mut buf = [0u8; 64];
-    let n = s.len().min(63);
-    buf[..n].copy_from_slice(&s.as_bytes()[..n]);
-    f(&buf[..=n])
+    let n = s.len();
+    if n < 64 {
+        let mut buf = [0u8; 64];
+        buf[..n].copy_from_slice(s.as_bytes());
+        f(&buf[..=n])
+    } else {
+        let mut buf = alloc::vec::Vec::with_capacity(n + 1);
+        buf.extend_from_slice(s.as_bytes());
+        buf.push(0);
+        f(&buf)
+    }
 }
 
 // ── Power ────────────────────────────────────────────────────────────────

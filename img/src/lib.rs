@@ -6,8 +6,13 @@
 //! grey + alpha, RGB, RGBA, 1–16 bits, interlaced or not; 16-bit channels
 //! are rounded to 8.
 //!
-//! The decoding is `zune-png`'s; what is ours is the conversion and
-//! the limits. `no_std` + `alloc`, no syscalls: the caller reads the file
+//! [`Image::resized`] resamples one (Catmull-Rom, premultiplied; see
+//! [`resize`]) — how an icon gets to a `HIDPI` screen's size, once, at
+//! load time — and [`pick_size`] chooses which of a theme's sizes to start
+//! from.
+//!
+//! The decoding is `zune-png`'s; what is ours is the conversion, the
+//! limits and the resampling. `no_std` + `alloc`, no syscalls: the caller reads the file
 //! (`userspace::img::load`).
 //!
 //! [`draw::Canvas::blit_over`]: ../draw/canvas/struct.Canvas.html#method.blit_over
@@ -15,6 +20,10 @@
 #![no_std]
 
 extern crate alloc;
+
+pub mod resize;
+
+pub use resize::pick_size;
 
 use alloc::vec::Vec;
 use core::fmt;
