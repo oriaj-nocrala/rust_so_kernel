@@ -188,14 +188,27 @@ cmd_trace() {
     sleep 1
 
     echo "  modprobe nouveau config=NvGspRm=$gsprm (settling ${SETTLE_SECS}s)"
-    modprobe nouveau config="NvGspRm=$gsprm" \
+    # modeset=1 overrides the host's /etc/modprobe.d/blacklist.conf
+    # (`options nouveau modeset=0`, which loads nouveau without binding the
+    # GPU): modprobe puts config options first, and the last value wins.
+    modprobe nouveau modeset=1 config="NvGspRm=$gsprm" \
         debug="gsp=trace,disp=debug,i2c=debug,bios=debug,devinit=debug" \
         || echo "  modprobe failed (kept going to save the trace)"
     sleep "$SETTLE_SECS"
 
+    if [[ -e /sys/bus/pci/drivers/nouveau/$GPU_BDF ]]; then
+        echo "  nouveau is bound to $GPU_BDF"
+    else
+        echo "  NOUVEAU DID NOT BIND $GPU_BDF: the trace is empty"
+    fi
+
     echo "marker: settled" > "$TRACEFS/trace_marker" 2>/dev/null || true
+    # The tracer can't be changed while trace_pipe is open (EBUSY): stop
+    # recording, let the reader drain, close it, then switch to nop.
+    echo 0 > "$TRACEFS/tracing_on"
+    sleep 3; kill "$reader" 2>/dev/null || true; wait "$reader" 2>/dev/null || true
     echo nop > "$TRACEFS/current_tracer"
-    sleep 1; kill "$reader" 2>/dev/null || true; wait "$reader" 2>/dev/null || true
+    echo 1 > "$TRACEFS/tracing_on"
 
     dmesg > "$out/dmesg.txt"
     for c in /sys/class/drm/card*-*; do
