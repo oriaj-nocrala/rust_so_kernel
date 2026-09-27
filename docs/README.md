@@ -31,6 +31,7 @@ Docs are grouped by subsystem, one subfolder each, each with its own `README.md`
 docs/
 ├── README.md                 ← you are here
 ├── reference/                ← current-state subsystem notes (the index lives in CLAUDE.md)
+├── gpu/gpu-plan.md           ← NVIDIA RTX 3050 plan: EDID, vblank, GSP boot, modeset via RM, copy engine
 ├── drivers/                  ← the device-driver subsystem (current focus)
 │   ├── README.md             ← driver-docs index
 │   ├── architecture.md       ← where we are: the trait/seam design, today
