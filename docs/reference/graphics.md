@@ -1,6 +1,6 @@
 # Graphics: framebuffer, console, `/dev/fb0`, compositor, GUI programs
 
-Code: `kernel/src/framebuffer.rs`, `kernel/src/drivers/{framebuffer_console,dev_fb0}.rs`, `kernel/src/memory/memtype.rs`, `hal::{memtype,fbdirty}`. Userspace: `userspace/src/bin/{compositor,panel,term,cpumon,textdemo,imgview}.rs`, crates `gui`/`vt`/`draw`/`text`/`img`. Plans: `docs/fb/`, `docs/gui/gui-plan.md`, `docs/gui/text-plan.md`.
+Code: `kernel/src/framebuffer.rs`, `kernel/src/drivers/{framebuffer_console,dev_fb0}.rs`, `kernel/src/memory/memtype.rs`, `hal::{memtype,fbdirty}`. Userspace: `userspace/src/bin/{compositor,panel,term,cpumon,textdemo,imgview}.rs`, crates `gui`/`vt`/`draw`/`text`/`img`. Plans: `docs/fb/`, `docs/gui/gui-plan.md`, `docs/gui/text-plan.md`, `docs/gui/perf-plan.md` (pending: 50 fps timer cap, AVX/compiler-flag candidates).
 
 ## Framebuffer (`Framebuffer`)
 
