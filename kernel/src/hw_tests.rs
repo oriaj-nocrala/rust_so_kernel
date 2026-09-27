@@ -810,6 +810,10 @@ fn init_this_cpu_restores_what_an_ap_lacks() {
     const PAT_POWER_ON: u64 = 0x0007_0406_0007_0406;
     const CR0_WP: u64 = 1 << 16;
     const CR4_OSXMMEXCPT: u64 = 1 << 10;
+    const CR4_OSXSAVE: u64 = 1 << 18;
+    let xsetbv = |v: u64| unsafe {
+        core::arch::asm!("xsetbv", in("ecx") 0, in("eax") v as u32, in("edx") (v >> 32) as u32);
+    };
 
     crate::cpu::verify_this_cpu(0).expect("BSP not fully initialised by boot_for_tests");
 
@@ -855,6 +859,15 @@ fn init_this_cpu_restores_what_an_ap_lacks() {
         expect_fail("sse");
         core::arch::asm!("mov cr4, {}", in(reg) cr4);
 
+        // AVX off in XCR0 (x87|SSE only), with OSXSAVE still set: a CPU
+        // whose user code would #UD on the first VEX instruction.
+        let avx = cr4 & CR4_OSXSAVE != 0;
+        if avx {
+            xsetbv(0b11);
+            expect_fail("sse");
+            xsetbv(0b111);
+        }
+
         // Now all of it at once, as an AP would have it, and let
         // `init_this_cpu` put it back.
         Msr::new(IA32_EFER).write(good[0] & !1); // SCE
@@ -866,6 +879,11 @@ fn init_this_cpu_restores_what_an_ap_lacks() {
         let (cr0, cr4) = read_cr();
         core::arch::asm!("mov cr4, {}", in(reg) cr4 & !CR4_OSXMMEXCPT);
         core::arch::asm!("mov cr0, {}", in(reg) cr0 & !CR0_WP);
+        if avx {
+            // XCR0's reset value, then OSXSAVE off (XSETBV needs it on).
+            xsetbv(1);
+            core::arch::asm!("mov cr4, {}", in(reg) cr4 & !CR4_OSXMMEXCPT & !CR4_OSXSAVE);
+        }
 
         if let Err((step, why)) = crate::cpu::init_this_cpu(0) {
             panic!("init_this_cpu did not restore `{}`: {}", step, why);
@@ -874,6 +892,15 @@ fn init_this_cpu_restores_what_an_ap_lacks() {
 
     assert_eq!([IA32_EFER, IA32_STAR, IA32_LSTAR, IA32_FMASK, IA32_KERNEL_GS_BASE, IA32_PAT].map(msr), good);
     assert_eq!(read_cr(), good_cr);
+    if good_cr.1 & CR4_OSXSAVE != 0 {
+        let xcr0: u64;
+        unsafe {
+            let (lo, hi): (u32, u32);
+            core::arch::asm!("xgetbv", in("ecx") 0, out("eax") lo, out("edx") hi);
+            xcr0 = (hi as u64) << 32 | lo as u64;
+        }
+        assert_eq!(xcr0, 0b111, "XCR0 not restored to x87|SSE|AVX");
+    }
 }
 
 /// Stage 5 of `docs/smp/smp-plan.md`, "done when": a CPU reading a page in

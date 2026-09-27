@@ -25,16 +25,17 @@ Code: `kernel/src/process/` (`scheduler.rs`, `timer_preempt.rs`, `trapframe.rs`,
 ## Context switch
 
 - The timer ISR (hand-written asm, pushes all GPRs) calls `timer_tick`. `switch_to_next()` returns the next `TrapFrame`, and `jump_to_trapframe` restores every register and does `iretq`. Kill and switch go through the same path.
-- **FPU/SSE**: `Process::fpu_state` (512-byte FXSAVE image) is saved and restored at every switch point, together with `fs_base`:
+- **FPU/SSE/AVX**: `Process::fpu_state` (an 832-byte XSAVE image, 64-aligned: x87 + SSE + AVX; FXSAVE in its first 512 bytes on a CPU without AVX) is saved and restored at every switch point, together with `fs_base`:
   - save and restore: `switch_to_next`, `block_current`, `stop_and_switch_tf`;
   - restore only: `kill_and_switch_tf`, `start_first`.
 - Starting FPU state:
-  - `fpu::init()` enables SSE and captures a clean template. It must run before the first `Process` exists.
+  - `fpu::init_this_cpu` (every CPU, from `cpu::init_this_cpu`) enables SSE and, if CPUID has XSAVE + AVX, CR4.OSXSAVE and XCR0 = x87|SSE|AVX (nothing wider: the target is Zen 3). Without that every VEX instruction in user code is #UD.
+  - `fpu::init()` captures a clean template. It must run before the first `Process` exists.
   - fork: a fresh `fpu::save()` of the live registers, plus the parent's FS base read from the live MSR.
   - clone: the template.
   - exec: the template, written straight to the hardware.
-- **Signal frames carry the FXSAVE image.** `sigreturn` passes it through `fpu::sanitize` first, which clears MXCSR bits outside the CPU's `MXCSR_MASK` (the frame is user memory; a bad MXCSR makes `fxrstor` #GP in the kernel).
-- Tests: `fpu_test`, `sse_test`.
+- **Signal frames carry the XSAVE image** (64-aligned frame). `sigreturn` passes it through `fpu::sanitize` first, which clears MXCSR bits outside the CPU's `MXCSR_MASK` and resets the XSAVE header (XSTATE_BV ⊆ XCR0, XCOMP_BV and reserved bytes zero): the frame is user memory, and either one bad makes `xrstor` #GP in the kernel.
+- Tests: `fpu_test`, `sse_test` (E–G: ymm across preemption and signals, a garbage XSAVE header), hw_test `init_this_cpu_restores_what_an_ap_lacks` (XCR0/OSXSAVE).
 - TSS: one per CPU (RSP0 + double-fault IST stack). See `smp-interrupts-time.md`.
 
 ## SMP safety rules of the scheduler

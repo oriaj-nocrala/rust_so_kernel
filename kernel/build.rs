@@ -66,6 +66,8 @@ const DISK_RUST_PROGRAMS: &[&str] = &[
     // Window titles through the text engine (phase 4 of docs/gui/gui-plan.md).
     "compositor",
     "panel",
+    // PNG decoding (`img`) + AVX2 alpha blits, and the sample icon on disk.
+    "imgview",
 ];
 
 /// C binaries that stay embedded in the kernel: (source file stem, embedded
@@ -245,6 +247,12 @@ fn main() {
     watch_dir_recursive(&workspace_root.join("mlibc-port"));
     watch_dir_recursive(&workspace_root.join("doom-port"));
     watch_dir_recursive(&workspace_root.join("quake-port"));
+    // The library crates userspace links by path: an edit to one of them
+    // (a `draw` blit, an `img` decoder fix) must rebuild the programs.
+    for krate in ["gui", "vt", "draw", "text", "img", "sched"] {
+        println!("cargo:rerun-if-changed={}", workspace_root.join(krate).join("Cargo.toml").display());
+        watch_dir_recursive(&workspace_root.join(krate).join("src"));
+    }
 
     // ── Build the mlibc sysroot if missing ──────────────────────────────────
     //

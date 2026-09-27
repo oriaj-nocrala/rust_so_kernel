@@ -19,7 +19,7 @@ use draw::Canvas;
 pub use text::cache::Stats;
 pub use text::{Align, Fonts, GlyphCache, LineBox, Style, TextLayout, Weight, MONO, SANS};
 
-use crate::syscall;
+use crate::fs::read_file;
 
 pub const FONT_DIR: &str = "/mnt/usr/share/fonts";
 pub const FONT_FILES: [&str; 4] =
@@ -176,25 +176,3 @@ fn fallback_lines(s: &str, font: Smooth, max_width: Option<f32>) -> Vec<&str> {
     out
 }
 
-/// The whole of `path`, or the negative errno of the `open`.
-pub fn read_file(path: &str) -> Result<Vec<u8>, i64> {
-    let fd = syscall::with_cstr(path, |p| syscall::open(p, syscall::O_RDONLY));
-    if fd < 0 {
-        return Err(fd);
-    }
-    let fd = fd as i32;
-    let mut buf = Vec::new();
-    if let Ok(st) = syscall::fstat(fd) {
-        buf.reserve_exact(st.st_size as usize);
-    }
-    let mut chunk = [0u8; 16384];
-    loop {
-        let n = syscall::read(fd, &mut chunk);
-        if n <= 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n as usize]);
-    }
-    syscall::close(fd);
-    Ok(buf)
-}

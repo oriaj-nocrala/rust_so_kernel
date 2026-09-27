@@ -37,7 +37,7 @@ cd kernel && cargo build --target x86_64-unknown-none  # the kernel crate alone
 | `kernel/src/ipc/` + crates `usock`, `tty` | pipes, AF_UNIX, ptys | `docs/reference/ipc.md` |
 | `kernel/src/fs/`, `block/` + crates `vfs`, `ext2` | VFS, mounts, procfs, ext2, block devices | `docs/reference/filesystems.md` |
 | `kernel/src/drivers/`, `pci.rs`, `ac97.rs` | `/dev` files, PCI, audio | `docs/reference/drivers.md` |
-| `kernel/src/framebuffer.rs`, `drivers/framebuffer_console.rs` + crates `gui`, `vt`, `draw`, `text` | framebuffer, console, `/dev/fb0`, compositor, GUI libraries | `docs/reference/graphics.md` |
+| `kernel/src/framebuffer.rs`, `drivers/framebuffer_console.rs` + crates `gui`, `vt`, `draw`, `text`, `img` | framebuffer, console, `/dev/fb0`, compositor, GUI libraries, PNG + alpha blits | `docs/reference/graphics.md` |
 | `kernel/src/usb/` | xHCI keyboard, mouse, mass storage | `docs/reference/usb.md` |
 | `kernel/src/cpu/`, `smp.rs`, `interrupts/`, `time/` | per-CPU init, APs, APIC, TLB shootdown, time, sensors | `docs/reference/cpu.md` |
 | `kernel/src/klog.rs`, `autorun.rs`, `watchdog.rs`, `block/logpart.rs` | kernel log, log partition, unattended runs | `docs/reference/metal.md` |

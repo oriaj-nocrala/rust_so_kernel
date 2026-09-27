@@ -20,6 +20,9 @@ draw = { path = "../draw", features = ["noto"] }
 # Proportional text at any size (docs/gui/text-plan.md), behind
 # `userspace::text`. Only programs that use it link parley + swash.
 text = { path = "../text" }
+# PNG decoding into premultiplied ARGB for `Canvas::blit_over` (icons),
+# behind `userspace::img`.
+img = { path = "../img" }
 # `sched::cputime`: the `/proc/stat` line format, shared with the kernel
 # that renders it (`cpumon` parses it).
 sched = { path = "../sched" }

@@ -43,6 +43,8 @@ fn main() {
     sync_disk_tree(&disk_image, "usr/share/fonts");
     // The panel's launcher list (phase 4 of docs/gui/gui-plan.md).
     sync_disk_tree(&disk_image, "etc/gui");
+    // Icons (PNG, `userspace::img`), read at run time like the fonts.
+    sync_disk_tree(&disk_image, "usr/share/icons");
 
     // pass the disk image paths as env variables to the `main.rs`
     println!("cargo:rustc-env=UEFI_PATH={}", uefi_path.display());

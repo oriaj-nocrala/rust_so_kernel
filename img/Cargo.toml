@@ -1,0 +1,25 @@
+[package]
+name = "img"
+version = "0.1.0"
+edition = "2021"
+
+# Images for userspace programs: PNG decoding into premultiplied
+# 0xAARRGGBB, the format `draw::Canvas::blit_over` composites. A thin layer
+# over `zune-png` (no_std + alloc without its `std` feature). no syscalls:
+# the caller reads the file — `cd img && cargo test`. Its own workspace
+# root (empty table below), like `draw`/`text`: the parent workspace's
+# `panic = "abort"` would break the test harness. `userspace` depends on
+# it by path.
+[workspace]
+
+[dependencies]
+# `sse`: its SIMD defilters. Without `std` there is no run-time detection,
+# so they are chosen at compile time from the target's features (SSE2 on
+# ours; the SSE4.1 ones stay off).
+zune-png = { version = "0.5", default-features = false, features = ["sse"] }
+zune-core = { version = "0.5", default-features = false }
+
+[dev-dependencies]
+# Encodes the test images, so the decoder is checked against a second,
+# independent implementation.
+png = "0.18"

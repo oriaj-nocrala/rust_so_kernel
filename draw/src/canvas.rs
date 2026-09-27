@@ -134,6 +134,24 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Composites a `sw x sh` premultiplied `0xAARRGGBB` image (rows `sw`
+    /// apart) over the canvas with its top left at `(dx, dy)`, clipped —
+    /// an icon, a cursor. See [`blend`](crate::blend).
+    pub fn blit_over(&mut self, src: &[u32], sw: usize, sh: usize, dx: i32, dy: i32) {
+        let (sw, sh) = (sw as i32, sh as i32);
+        let x0 = dx.max(0);
+        let x1 = (dx + sw).min(self.w);
+        if x0 >= x1 {
+            return;
+        }
+        for y in dy.max(0)..(dy + sh).min(self.h) {
+            let s = ((y - dy) * sw + (x0 - dx)) as usize;
+            let d = self.at(x0, y);
+            let n = (x1 - x0) as usize;
+            crate::blend::over_row(&mut self.px[d..d + n], &src[s..s + n]);
+        }
+    }
+
     /// Pixel bounds of a fixed-point circle, clipped; `None` if nothing of
     /// it is on the canvas.
     fn circle_box(&self, cx: i32, cy: i32, r: i32) -> Option<(i32, i32, i32, i32)> {
@@ -385,6 +403,25 @@ mod tests {
         cv.blit(&src, 3, 2, 15, 9); // only the top-left pixel lands
         assert_eq!(cv.get(15, 9), Some(1));
         cv.blit(&src, 3, 2, 40, 40);
+        assert!(padding_untouched(&px));
+    }
+
+    #[test]
+    fn blit_over_blends_and_clips() {
+        // Opaque red, half-transparent white (premultiplied), transparent.
+        let src: [u32; 3 * 2] = [0xFFFF0000, 0x80808080, 0, 0xFFFF0000, 0x80808080, 0];
+        let mut px = buf();
+        let mut cv = Canvas::new(&mut px, 16, 10, 20);
+        cv.fill(0x000000);
+        cv.blit_over(&src, 3, 2, 1, 1);
+        assert_eq!(cv.get(1, 1), Some(0xFF0000));
+        assert_eq!(cv.get(2, 2), Some(0x808080));
+        assert_eq!(cv.get(3, 1), Some(0x000000));
+        cv.blit_over(&src, 3, 2, -2, -1); // only the bottom-right 1x1 lands
+        assert_eq!(cv.get(0, 0), Some(0x000000));
+        cv.blit_over(&src, 3, 2, 15, 9); // only the top-left pixel lands
+        assert_eq!(cv.get(15, 9), Some(0xFF0000));
+        cv.blit_over(&src, 3, 2, 40, 40);
         assert!(padding_untouched(&px));
     }
 

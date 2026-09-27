@@ -9,7 +9,7 @@ description: Playbook for verifying a change to rust_so_kernel: which test suite
 
 | Changed | Verify with |
 |---------|-------------|
-| a host-testable crate (`hal`, `ext2`, `mm`, `vfs`, `diag`, `sched`, `usock`, `tty`, `gui`, `vt`, `draw`, `text`) | `cd <crate> && cargo test` |
+| a host-testable crate (`hal`, `ext2`, `mm`, `vfs`, `diag`, `sched`, `usock`, `tty`, `gui`, `vt`, `draw`, `text`, `img`) | `cd <crate> && cargo test` |
 | a crate the kernel links (`hal` … `tty`) | **also** `cd kernel && cargo build --target x86_64-unknown-none`; a root `cargo build` skips them |
 | kernel code on a hardware path | `scripts/run-kernel-tests.sh` |
 | syscalls, process or FS behaviour | the matching `userspace/c/*_test.c`, run in a booted kernel (`qemu-debug` skill). The tests live in `/mnt/bin` |

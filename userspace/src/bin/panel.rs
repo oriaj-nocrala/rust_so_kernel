@@ -64,7 +64,7 @@ struct App {
 /// terminal when the file is missing.
 fn read_apps() -> Vec<App> {
     let mut apps = Vec::new();
-    if let Ok(bytes) = userspace::text::read_file(APPS_FILE) {
+    if let Ok(bytes) = userspace::fs::read_file(APPS_FILE) {
         for line in core::str::from_utf8(&bytes).unwrap_or("").lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {

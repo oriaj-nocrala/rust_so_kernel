@@ -14,7 +14,13 @@
 //! - D: a handler that writes garbage into that saved MXCSR does not make
 //!   `sigreturn` fault in the kernel; the reserved bits are dropped.
 //!
-//! B–D hold every register inside one `asm!` block, so nothing the
+//! - E–G: the same for the full 256-bit ymm registers, when the kernel has
+//!   enabled AVX (CR4.OSXSAVE + XCR0, `kernel/src/process/fpu.rs`): upper
+//!   halves survive preemption (E) and a handler that clobbers them (F),
+//!   and a handler that writes garbage into the saved XSAVE header does not
+//!   make `sigreturn` fault in the kernel (G). Skipped without AVX.
+//!
+//! B–G hold every register inside one `asm!` block, so nothing the
 //! compiler emits can move a value in or out of them behind the test's back.
 
 use core::arch::{asm, naked_asm};
@@ -338,6 +344,214 @@ fn case_d() -> bool {
     ok
 }
 
+// ── E–G: AVX ────────────────────────────────────────────────────────────
+
+/// Sixteen YMM registers' worth of bytes.
+#[repr(C, align(32))]
+struct Ymm([u8; 512]);
+
+fn ymm_pattern(seed: u64) -> Ymm {
+    let (a, b) = (pattern(seed), pattern(!seed));
+    let mut y = Ymm([0; 512]);
+    y.0[..256].copy_from_slice(&a.0);
+    y.0[256..].copy_from_slice(&b.0);
+    y
+}
+
+/// How many of the sixteen registers differ between two images.
+fn changed_ymm(a: &Ymm, b: &Ymm) -> usize {
+    (0..16).filter(|i| a.0[i * 32..i * 32 + 32] != b.0[i * 32..i * 32 + 32]).count()
+}
+
+/// AVX in CPUID and enabled by the OS: OSXSAVE set and XCR0 holding the
+/// SSE and AVX components.
+fn avx_enabled() -> bool {
+    let leaf1 = core::arch::x86_64::__cpuid(1);
+    if leaf1.ecx & (1 << 27) == 0 || leaf1.ecx & (1 << 28) == 0 {
+        return false;
+    }
+    let lo: u32;
+    unsafe { asm!("xgetbv", in("ecx") 0, out("eax") lo, out("edx") _, options(nomem, nostack)) };
+    lo & 0b110 == 0b110
+}
+
+/// `hold_across_spin` with ymm registers.
+#[target_feature(enable = "avx")]
+unsafe fn hold_ymm_across_spin(pat: &Ymm, out: &mut Ymm, cycles: u64) {
+    unsafe {
+        asm!(
+            "vmovdqu ymm0,  [r8 + 0x000]", "vmovdqu ymm1,  [r8 + 0x020]",
+            "vmovdqu ymm2,  [r8 + 0x040]", "vmovdqu ymm3,  [r8 + 0x060]",
+            "vmovdqu ymm4,  [r8 + 0x080]", "vmovdqu ymm5,  [r8 + 0x0a0]",
+            "vmovdqu ymm6,  [r8 + 0x0c0]", "vmovdqu ymm7,  [r8 + 0x0e0]",
+            "vmovdqu ymm8,  [r8 + 0x100]", "vmovdqu ymm9,  [r8 + 0x120]",
+            "vmovdqu ymm10, [r8 + 0x140]", "vmovdqu ymm11, [r8 + 0x160]",
+            "vmovdqu ymm12, [r8 + 0x180]", "vmovdqu ymm13, [r8 + 0x1a0]",
+            "vmovdqu ymm14, [r8 + 0x1c0]", "vmovdqu ymm15, [r8 + 0x1e0]",
+            "rdtsc",
+            "shl rdx, 32",
+            "or rax, rdx",
+            "lea r10, [rax + r11]",
+            "2:",
+            "rdtsc",
+            "shl rdx, 32",
+            "or rax, rdx",
+            "cmp rax, r10",
+            "jb 2b",
+            "vmovdqu [r9 + 0x000], ymm0",  "vmovdqu [r9 + 0x020], ymm1",
+            "vmovdqu [r9 + 0x040], ymm2",  "vmovdqu [r9 + 0x060], ymm3",
+            "vmovdqu [r9 + 0x080], ymm4",  "vmovdqu [r9 + 0x0a0], ymm5",
+            "vmovdqu [r9 + 0x0c0], ymm6",  "vmovdqu [r9 + 0x0e0], ymm7",
+            "vmovdqu [r9 + 0x100], ymm8",  "vmovdqu [r9 + 0x120], ymm9",
+            "vmovdqu [r9 + 0x140], ymm10", "vmovdqu [r9 + 0x160], ymm11",
+            "vmovdqu [r9 + 0x180], ymm12", "vmovdqu [r9 + 0x1a0], ymm13",
+            "vmovdqu [r9 + 0x1c0], ymm14", "vmovdqu [r9 + 0x1e0], ymm15",
+            "vzeroupper",
+            in("r8") pat.0.as_ptr(),
+            in("r9") out.0.as_mut_ptr(),
+            in("r11") cycles,
+            out("rax") _, out("rdx") _, out("r10") _,
+            out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _,
+            out("ymm4") _, out("ymm5") _, out("ymm6") _, out("ymm7") _,
+            out("ymm8") _, out("ymm9") _, out("ymm10") _, out("ymm11") _,
+            out("ymm12") _, out("ymm13") _, out("ymm14") _, out("ymm15") _,
+            options(nostack),
+        );
+    }
+}
+
+/// `hold_across_signal` with ymm registers.
+#[target_feature(enable = "avx")]
+unsafe fn hold_ymm_across_signal(pat: &Ymm, out: &mut Ymm, pid: i64, sig: u32) -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!(
+            "vmovdqu ymm0,  [r8 + 0x000]", "vmovdqu ymm1,  [r8 + 0x020]",
+            "vmovdqu ymm2,  [r8 + 0x040]", "vmovdqu ymm3,  [r8 + 0x060]",
+            "vmovdqu ymm4,  [r8 + 0x080]", "vmovdqu ymm5,  [r8 + 0x0a0]",
+            "vmovdqu ymm6,  [r8 + 0x0c0]", "vmovdqu ymm7,  [r8 + 0x0e0]",
+            "vmovdqu ymm8,  [r8 + 0x100]", "vmovdqu ymm9,  [r8 + 0x120]",
+            "vmovdqu ymm10, [r8 + 0x140]", "vmovdqu ymm11, [r8 + 0x160]",
+            "vmovdqu ymm12, [r8 + 0x180]", "vmovdqu ymm13, [r8 + 0x1a0]",
+            "vmovdqu ymm14, [r8 + 0x1c0]", "vmovdqu ymm15, [r8 + 0x1e0]",
+            "syscall",
+            "vmovdqu [r9 + 0x000], ymm0",  "vmovdqu [r9 + 0x020], ymm1",
+            "vmovdqu [r9 + 0x040], ymm2",  "vmovdqu [r9 + 0x060], ymm3",
+            "vmovdqu [r9 + 0x080], ymm4",  "vmovdqu [r9 + 0x0a0], ymm5",
+            "vmovdqu [r9 + 0x0c0], ymm6",  "vmovdqu [r9 + 0x0e0], ymm7",
+            "vmovdqu [r9 + 0x100], ymm8",  "vmovdqu [r9 + 0x120], ymm9",
+            "vmovdqu [r9 + 0x140], ymm10", "vmovdqu [r9 + 0x160], ymm11",
+            "vmovdqu [r9 + 0x180], ymm12", "vmovdqu [r9 + 0x1a0], ymm13",
+            "vmovdqu [r9 + 0x1c0], ymm14", "vmovdqu [r9 + 0x1e0], ymm15",
+            "vzeroupper",
+            in("r8") pat.0.as_ptr(),
+            in("r9") out.0.as_mut_ptr(),
+            inlateout("rax") 62i64 => ret, // kill
+            in("rdi") pid,
+            in("rsi") sig as u64,
+            out("rcx") _, out("r11") _,
+            out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _,
+            out("ymm4") _, out("ymm5") _, out("ymm6") _, out("ymm7") _,
+            out("ymm8") _, out("ymm9") _, out("ymm10") _, out("ymm11") _,
+            out("ymm12") _, out("ymm13") _, out("ymm14") _, out("ymm15") _,
+        );
+    }
+    ret
+}
+
+/// Sets every bit of every ymm register, then returns. (The assembler
+/// takes AVX here without `#[target_feature]`, which a handler — a safe
+/// `fn` pointer — cannot carry.)
+#[unsafe(naked)]
+extern "C" fn clobber_ymm_handler(_sig: i32) {
+    naked_asm!(
+        "vcmptrueps ymm0, ymm0, ymm0", "vcmptrueps ymm1, ymm1, ymm1",
+        "vcmptrueps ymm2, ymm2, ymm2", "vcmptrueps ymm3, ymm3, ymm3",
+        "vcmptrueps ymm4, ymm4, ymm4", "vcmptrueps ymm5, ymm5, ymm5",
+        "vcmptrueps ymm6, ymm6, ymm6", "vcmptrueps ymm7, ymm7, ymm7",
+        "vcmptrueps ymm8, ymm8, ymm8", "vcmptrueps ymm9, ymm9, ymm9",
+        "vcmptrueps ymm10, ymm10, ymm10", "vcmptrueps ymm11, ymm11, ymm11",
+        "vcmptrueps ymm12, ymm12, ymm12", "vcmptrueps ymm13, ymm13, ymm13",
+        "vcmptrueps ymm14, ymm14, ymm14", "vcmptrueps ymm15, ymm15, ymm15",
+        "ret",
+    )
+}
+
+/// Fills the XSAVE header of its own signal frame (offset 512 of the
+/// image, which starts 8 bytes above `rsp`) with ones: XSTATE_BV beyond
+/// XCR0, XCOMP_BV's compacted bit, the reserved bytes — each alone makes
+/// `xrstor` #GP.
+#[unsafe(naked)]
+extern "C" fn corrupt_header_handler(_sig: i32) {
+    naked_asm!(
+        "lea rax, [rsp + 8 + 512]",
+        "mov rcx, -1",
+        "mov [rax + 0x00], rcx", "mov [rax + 0x08], rcx",
+        "mov [rax + 0x10], rcx", "mov [rax + 0x18], rcx",
+        "mov [rax + 0x20], rcx", "mov [rax + 0x28], rcx",
+        "mov [rax + 0x30], rcx", "mov [rax + 0x38], rcx",
+        "ret",
+    )
+}
+
+fn case_e() -> bool {
+    let mut pids = [0i64; B_CHILDREN as usize];
+    for (i, slot) in pids.iter_mut().enumerate() {
+        let pid = syscall::fork();
+        if pid == 0 {
+            let pat = ymm_pattern(0xE000 + i as u64);
+            let mut out = Ymm([0; 512]);
+            unsafe { hold_ymm_across_spin(&pat, &mut out, B_SPIN_CYCLES) };
+            syscall::exit(changed_ymm(&pat, &out) as i32);
+        }
+        if pid < 0 {
+            println!("sse_test: E fork failed ({})", pid);
+            return false;
+        }
+        *slot = pid;
+    }
+    let (mut bad, mut regs) = (0, 0);
+    for pid in pids {
+        let (_, status) = syscall::waitpid_status(pid);
+        if status & 0x200 == 0 || status & 0xFF != 0 {
+            bad += 1;
+            regs += status & 0xFF;
+        }
+    }
+    println!(
+        "sse_test: E {} processes holding ymm0-15, {} corrupted ({} registers) -> {}",
+        B_CHILDREN, bad, regs, verdict(bad == 0)
+    );
+    bad == 0
+}
+
+fn case_f_g(sig: u32, handler: extern "C" fn(i32), name: &str) -> bool {
+    if syscall::sigaction(sig, handler as *const () as u64) < 0 {
+        println!("sse_test: {} sigaction failed", name);
+        return false;
+    }
+    let pat = ymm_pattern(0xF000 + sig as u64);
+    let mut out = Ymm([0; 512]);
+    let r = unsafe { hold_ymm_across_signal(&pat, &mut out, syscall::getpid(), sig) };
+    syscall::sigaction(sig, 0);
+    let regs = changed_ymm(&pat, &out);
+    let ok = r == 0 && regs == 0;
+    println!("sse_test: {} kill={} ymm registers changed across the handler: {}/16 -> {}", name, r, regs, verdict(ok));
+    ok
+}
+
+fn case_avx() -> bool {
+    if !avx_enabled() {
+        println!("sse_test: E-G skipped: AVX not enabled by the OS on this CPU");
+        return true;
+    }
+    let e = case_e();
+    let f = case_f_g(syscall::SIGUSR1, clobber_ymm_handler, "F");
+    // Reaching G's line at all means sigreturn did not #GP in the kernel.
+    let g = case_f_g(syscall::SIGUSR2, corrupt_header_handler, "G");
+    e && f && g
+}
+
 fn verdict(ok: bool) -> &'static str {
     if ok { "ok" } else { "FAIL" }
 }
@@ -345,7 +559,7 @@ fn verdict(ok: bool) -> &'static str {
 userspace::entry!(main);
 
 fn main(_args: userspace::args::Args) -> i32 {
-    let results = [case_a(), case_b(), case_c(), case_d()];
+    let results = [case_a(), case_b(), case_c(), case_d(), case_avx()];
     let pass = results.iter().all(|&r| r);
     println!("sse_test: {}", if pass { "PASS" } else { "FAIL" });
     if pass { 0 } else { 1 }

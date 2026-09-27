@@ -10,9 +10,12 @@
 //! `no_std`, no `alloc`, no floating point: written when the userspace
 //! target was soft-float, so sub-pixel positions are fixed point ([`FP`]
 //! units per pixel) and colours are integer arithmetic. The target has
-//! SSE2 now (`userspace/x86_64-constanos.json`); nothing here needed it.
+//! SSE2 now (`userspace/x86_64-constanos.json`); only [`blend`] uses
+//! wider vectors (AVX2, detected at run time).
 //!
 //! - [`color`]: packing, scaling, mixing, additive light, HSV.
+//! - [`blend`]: premultiplied-alpha "over", AVX2 when the CPU has it —
+//!   behind [`Canvas::blit_over`].
 //! - [`canvas`]: [`Canvas`], a clipped view of a pixel buffer (with a
 //!   stride, so it can be a framebuffer row pitch) and its primitives.
 //! - [`font`]: two pixel fonts (3x5 and 5x7) and text drawing.
@@ -22,6 +25,7 @@
 
 #![no_std]
 
+pub mod blend;
 pub mod canvas;
 pub mod color;
 pub mod font;

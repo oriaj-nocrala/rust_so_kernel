@@ -1,6 +1,6 @@
 # Graphics: framebuffer, console, `/dev/fb0`, compositor, GUI programs
 
-Code: `kernel/src/framebuffer.rs`, `kernel/src/drivers/{framebuffer_console,dev_fb0}.rs`, `kernel/src/memory/memtype.rs`, `hal::{memtype,fbdirty}`. Userspace: `userspace/src/bin/{compositor,panel,term,cpumon,textdemo}.rs`, crates `gui`/`vt`/`draw`/`text`. Plans: `docs/fb/`, `docs/gui/gui-plan.md`, `docs/gui/text-plan.md`.
+Code: `kernel/src/framebuffer.rs`, `kernel/src/drivers/{framebuffer_console,dev_fb0}.rs`, `kernel/src/memory/memtype.rs`, `hal::{memtype,fbdirty}`. Userspace: `userspace/src/bin/{compositor,panel,term,cpumon,textdemo,imgview}.rs`, crates `gui`/`vt`/`draw`/`text`/`img`. Plans: `docs/fb/`, `docs/gui/gui-plan.md`, `docs/gui/text-plan.md`.
 
 ## Framebuffer (`Framebuffer`)
 
@@ -70,4 +70,8 @@ Code: `kernel/src/framebuffer.rs`, `kernel/src/drivers/{framebuffer_console,dev_
 - Games lock the pointer (`lock_pointer`/`relative_motion`): only while focused; Ctrl+Alt releases it, a click takes it back.
 - **Proportional text**: `userspace::text` (crate `text`: parley + swash). `Text::load()` reads fonts from `/mnt/usr/share/fonts` and falls back to `draw`'s bitmap font. Programs linking it are ~1.2 MB larger, so they are disk-resident.
 - **`term`**: pty + `busybox ash` as session leader (`TERM=xterm-256color`) + the `vt` crate (xterm grid, parser, renderer, keymap). It exits when the master reports EIO.
+- **Images and alpha**: `userspace::img::load(path)` (crate `img`, over `zune-png`) decodes any PNG to **premultiplied `0xAARRGGBB`**; `Canvas::blit_over` composites it ("over", exact `/255` rounding, the destination's top byte kept). `draw::blend::over_row` runs AVX2 (8 px/step, all-transparent and all-opaque blocks short-circuited) when CPUID + XCR0 say so, else scalar; both give identical bits (`cd draw && cargo test`; `cargo test --release -- --ignored bench` for timings).
+  - AVX works in userspace only because the kernel enables XSAVE (`process/fpu.rs`); a program must check `draw::blend::has_avx2()`, never assume.
+  - Icons live on disk in `/mnt/usr/share/icons` (`disk-image-root/usr/share/icons`, synced by the root `build.rs`), never embedded. `imgview [file.png…]` shows them and prints the blit path and cost.
+  - Not there yet: scaling an image (HIDPI draws icons 1:1).
 - Test end to end: `scripts/gui-e2e.sh [term|wm|text]` (screendumps + serial log).
