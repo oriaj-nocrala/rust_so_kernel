@@ -22,5 +22,6 @@ pub mod id;
 pub mod mmio;
 pub mod pad;
 pub mod vbios;
+pub mod vblank;
 
 pub use mmio::Mmio;

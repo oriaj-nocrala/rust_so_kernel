@@ -1,0 +1,28 @@
+# One vblank interrupt as nouveau serviced it (trace-nogsp, mmiotrace 13.009420-13.009480,
+# after its modeset: heads 0 and 1 running). Handler: nvkm/core/intr.c:173-228 (nvkm_intr),
+# subdev/vfn/tu102.c:26-91, subdev/pci/gp100.c:26-30, engine/disp/gv100.c:1052-1110.
+# The head-state reads (0x68a0xx, 0x61633x) are DRM's vblank timestamp, kept as the
+# fixture of HeadTiming (GOP-state values are unmeasured: the trace never read them).
+W b81610 0xf
+W 088704 0x0
+R b81600 0x4
+R b81010 0x4000000
+R b81014 0x0
+R 000000 0xb76000a1
+W b81010 0x4000000
+R 611ec0 0x3
+R 611800 0x7
+W 611800 0x3
+R 68a064 0x4650898
+R 68a068 0x4002b
+R 68a06c 0x2800bf
+R 68a070 0x460083f
+R 68a00c 0x8d9ee20
+R 68a004 0xfc000040
+R 616330 0x370015
+R 616334 0x5fe
+W 611800 0x4
+R 611804 0x7
+W 611804 0x3
+W 611804 0x4
+W b81608 0xf

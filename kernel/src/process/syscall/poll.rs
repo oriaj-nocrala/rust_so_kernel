@@ -19,7 +19,9 @@ enum PollSource {
     Socket(SocketId),
     /// An evdev device: which queue feeds it (`drivers::evdev::QUEUE_*`),
     /// and whether the handle held records of its own at snapshot time.
-    Input { queue: usize, buffered: bool },
+    /// `seen`: a sequence queue's number the handle had seen (`/dev/vblank`).
+    /// `queue` is a `u32` so the variant stays 16 bytes (see below).
+    Input { queue: u32, buffered: bool, seen: u64 },
     /// One end of a pseudo-terminal (`ipc::pty`).
     Pty { index: usize, master: bool },
 }
@@ -45,6 +47,13 @@ enum PollSource {
 /// the fast path return and the process never blocks on a stale answer.
 type SocketMap = [PollSource; MAX_FILES_PER_PROC];
 
+// Every `PollWaiter` carries a `SocketMap`, and `poll_wake_where` holds up
+// to `MAX_WAKE_PER_EVENT` waiters on the stack of the ISR that calls it
+// (the interrupted process's kernel stack). Growing `PollSource` from 16
+// to 24 bytes overflowed that stack in a debug build (double fault in the
+// GUI e2e test), so its size is pinned.
+const _: () = assert!(core::mem::size_of::<PollSource>() <= 16);
+
 const NO_SOCKETS: SocketMap = [PollSource::Other; MAX_FILES_PER_PROC];
 
 /// Resolve every fd of the *running* process to what can make it ready.
@@ -63,7 +72,7 @@ fn snapshot_sockets() -> SocketMap {
             *slot = if let Some(id) = h.socket_id() {
                 PollSource::Socket(id)
             } else if let Some(src) = h.event_source() {
-                PollSource::Input { queue: src.queue, buffered: src.buffered }
+                PollSource::Input { queue: src.queue as u32, buffered: src.buffered, seen: src.seen }
             } else if let Some(end) = h.pty_end() {
                 PollSource::Pty { index: end.index, master: end.master }
             } else {
@@ -299,8 +308,8 @@ fn fd_check_ready(socks: &SocketMap, fd: i32, events: i16) -> i16 {
     let fd_usize = fd as usize;
     let source = socks.get(fd_usize).copied().unwrap_or(PollSource::Other);
 
-    if let PollSource::Input { queue, buffered } = source {
-        let ready = buffered || crate::drivers::evdev::queue_ready(queue);
+    if let PollSource::Input { queue, buffered, seen } = source {
+        let ready = buffered || crate::drivers::evdev::queue_ready(queue as usize, seen);
         let rev = events & POLLOUT;
         return if events & POLLIN != 0 && ready { rev | POLLIN } else { rev };
     }
@@ -524,10 +533,11 @@ pub(crate) fn poll_wakeup_for_fd0() {
 
 /// Called by an input producer after pushing to evdev queue `queue`
 /// (`drivers::evdev::QUEUE_*`): the keyboard ISR and the USB poll for the
-/// keyboard, the IRQ12 ISR and the USB poll for the mouse. IF=0.
+/// keyboard, the IRQ12 ISR and the USB poll for the mouse, the GPU's vblank
+/// MSI for `/dev/vblank`. IF=0.
 pub(crate) fn poll_wakeup_for_input(queue: usize) {
     poll_wake_where(|w, fd| {
-        matches!(waiter_source(w, fd), PollSource::Input { queue: q, .. } if q == queue)
+        matches!(waiter_source(w, fd), PollSource::Input { queue: q, .. } if q as usize == queue)
     });
 }
 

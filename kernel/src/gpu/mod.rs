@@ -18,6 +18,9 @@
 //          over bit-banged I2C (`nvgpu::display`). The only GPU writes are
 //          those transactions' and the pad/AUX bits they need, all put back.
 //          Result in /proc/displays.
+//   vblank (phase 3) — also report the heads the firmware lit and arm the
+//          display's vblank interrupt on them, by MSI to CPU 0
+//          (`vblank.rs`); `/dev/vblank` then wakes pollers each frame.
 //
 // Runs once at boot, after `fs::init` (firmware is on `/mnt`) and before the
 // APs are released (BAR sizing turns decoding off for a few microseconds,
@@ -31,6 +34,8 @@ use hal::pcicfg::{BarKind, MsiCap, MsixCap};
 use nvgpu::id::ChipId;
 
 use crate::serial_println;
+
+pub mod vblank;
 
 /// `10de:2507`, the only GPU this driver is for (plan, "No-objetivos").
 const VENDOR_NVIDIA: u16 = 0x10de;
@@ -69,8 +74,9 @@ pub struct Bar0 {
     len: u64,
 }
 
-// SAFETY: a register window; concurrent use is serialised by whoever owns
-// the driver state (nothing yet: phase 1 reads one register at boot).
+// SAFETY: a register window. The boot uses it alone (before the APs run);
+// afterwards only the vblank MSI handler does, which never overlaps itself
+// (`vblank.rs`).
 unsafe impl Send for Bar0 {}
 unsafe impl Sync for Bar0 {}
 
@@ -309,6 +315,9 @@ fn probe_device(r: &mut String, level: GpuLevel) {
     if level >= GpuLevel::Disp {
         if chip.and_then(|c| c.name()).is_some() {
             probe_displays(r, &regs);
+            if level >= GpuLevel::Vblank {
+                vblank::setup(r, &regs, (b, d, fun));
+            }
         } else {
             let _ = writeln!(r, "displays: not a GA106; not probing");
         }

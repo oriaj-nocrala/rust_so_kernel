@@ -17,15 +17,25 @@ pub const RECORD_SIZE: usize = 24;
 /// names the one it just pushed to (`poll_wakeup_for_input`).
 pub const QUEUE_KEYBOARD: usize = 1;
 pub const QUEUE_MOUSE: usize = 2;
+/// Not evdev: `/dev/vblank` (`dev_vblank.rs`), a sequence number the GPU's
+/// vblank MSI advances. Shares the machinery because a poller is found and
+/// woken the same way.
+pub const QUEUE_VBLANK: usize = 3;
 
 /// Whether `queue` has anything a reader could take. Some of it may still
 /// decode to no record (an unmapped scancode, a mouse packet that changed
 /// nothing), so a `read` after a positive answer can return 0 — the same
 /// spurious-readiness `poll(2)` allows everywhere.
-pub fn queue_ready(queue: usize) -> bool {
+///
+/// `seen` is for sequence queues: `/dev/vblank` is ready once a vblank
+/// happened after the one its handle last read. The check uses the live
+/// number, so `poll`'s register-then-recheck step closes the window
+/// between a handle's snapshot and its sleep.
+pub fn queue_ready(queue: usize, seen: u64) -> bool {
     match queue {
         QUEUE_KEYBOARD => crate::keyboard_buffer::RAW_KEY_EVENTS.peek(),
         QUEUE_MOUSE => crate::mouse::has_events(),
+        QUEUE_VBLANK => crate::gpu::vblank::seq() != seen,
         _ => false,
     }
 }

@@ -9,7 +9,14 @@
 //! `event1`, listens on `/tmp/gui-0`, and waits on all of them with one
 //! `epoll`. Every client message goes into the state machine; whatever it
 //! queued — events, disconnects, fds to close, damage — is carried out
-//! here. At most one compose + `FBIO_FLUSH` every 16 ms.
+//! here.
+//!
+//! Pacing. With `/dev/vblank` (the GPU driver's `gpu=vblank`), the screen's
+//! RAM copy is the back buffer: each vblank first flushes what the
+//! previous frame composed — the copy starts in the blanking interval and
+//! outruns the beam, so no tearing — and then composes the next frame. A
+//! vblank that does not come within `VSYNC_GRACE_MS` is not waited for.
+//! Without it, at most one compose + `FBIO_FLUSH` every 16 ms.
 //!
 //! `compositor [prog...]` starts each `prog` (from `/bin` or `/mnt/bin`
 //! unless it has a `/`) once the socket is listening; with no arguments it
@@ -39,6 +46,8 @@ entry!(main);
 
 const SOCKET_PATH: &[u8] = b"/tmp/gui-0";
 const FRAME_MS: i64 = 16;
+/// Longest wait for a vblank before presenting anyway (three frames at 60 Hz).
+const VSYNC_GRACE_MS: i64 = 50;
 
 const FBIO_GET_INFO: u64 = 0x4642_0010;
 const FBIO_FLUSH: u64 = 0x4642_0011;
@@ -54,6 +63,7 @@ const REL_Y: u16 = 1;
 const TAG_LISTEN: u64 = 1;
 const TAG_KBD: u64 = 2;
 const TAG_MOUSE: u64 = 3;
+const TAG_VBLANK: u64 = 4;
 const TAG_CLIENT: u64 = 1000;
 
 #[repr(C)]
@@ -81,6 +91,13 @@ struct Fb0Flush {
     count: u32,
     _pad: u32,
     rects: [Fb0Rect; 16],
+}
+
+/// Marks the current vblank seen (`/dev/vblank`'s record: sequence number,
+/// time in ns), so the next poll waits for the one after it.
+fn read_vblank(fd: i32) {
+    let mut rec = [0u8; 16];
+    syscall::read(fd, &mut rec);
 }
 
 /// A client's pool, mapped shared; unmapped when the last buffer of it
@@ -321,22 +338,72 @@ fn main(args: Args) -> i32 {
         println!("compositor: no panel, an empty session (Ctrl+Alt+Backspace quits)");
     }
 
+    // ENODEV without the GPU driver: then the timer paces.
+    let vblank = open_path("/dev/vblank", syscall::O_RDONLY);
+    println!("compositor: pacing by {}", if vblank >= 0 { "vblank (/dev/vblank)" } else { "a 16 ms timer" });
+
     let mut last_frame: i64 = -FRAME_MS;
     let mut frames: u64 = 0;
     let mut compose_ms_total: i64 = 0;
     let (mut mdx, mut mdy) = (0i32, 0i32);
     let mut buf = alloc::vec![0u8; 4096];
     let mut evs = [EpollEvent::default(); 16];
+    // Vblank pacing: what the last compose left in the RAM copy for the
+    // next vblank to flush; whether `vblank` is in the epoll set; since
+    // when a vblank is awaited; presents on a vblank and by grace timeout.
+    let mut pending: Option<Fb0Flush> = None;
+    let mut watching = false;
+    let mut wait_from: i64 = 0;
+    let (mut on_vblank, mut on_timeout) = (0u64, 0u64);
 
     while !comp.quit_requested() {
         let busy = comp.has_damage() || comp.has_frame_callbacks();
-        let timeout = if busy { (last_frame + FRAME_MS - syscall::uptime_ms()).clamp(0, FRAME_MS) as i32 } else { -1 };
+        let want = vblank >= 0 && (busy || pending.is_some());
+        if want != watching {
+            if want {
+                read_vblank(vblank); // a vblank from while idle is not this frame's
+                syscall::epoll_ctl(ep, syscall::EPOLL_CTL_ADD, vblank, syscall::EPOLLIN, TAG_VBLANK);
+                wait_from = syscall::uptime_ms();
+            } else {
+                syscall::epoll_ctl(ep, syscall::EPOLL_CTL_DEL, vblank, 0, 0);
+            }
+            watching = want;
+        }
+        let now = syscall::uptime_ms();
+        let timeout = if want {
+            (wait_from + VSYNC_GRACE_MS - now).clamp(0, VSYNC_GRACE_MS) as i32
+        } else if busy {
+            (last_frame + FRAME_MS - now).clamp(0, FRAME_MS) as i32
+        } else {
+            -1
+        };
         let n = syscall::epoll_wait(ep, &mut evs, timeout);
+        let evs = &evs[..n.max(0) as usize];
+        // Present first, before any client message: the flush has to start
+        // inside the blanking interval to stay ahead of the beam.
+        let mut tick = false;
+        if want {
+            if evs.iter().any(|e| e.data == TAG_VBLANK) {
+                read_vblank(vblank);
+                on_vblank += 1;
+                tick = true;
+            } else if syscall::uptime_ms() >= wait_from + VSYNC_GRACE_MS {
+                on_timeout += 1;
+                tick = true;
+            }
+            if tick {
+                if let Some(fl) = pending.take() {
+                    syscall::ioctl(fb, FBIO_FLUSH, &fl as *const Fb0Flush as u64);
+                }
+                wait_from = syscall::uptime_ms();
+            }
+        }
         comp.set_time(syscall::uptime_ms() as u32);
         while syscall::reap_any() > 0 {} // what we started and has exited
-        for ev in evs.iter().take(n.max(0) as usize) {
+        for ev in evs {
             let tag = ev.data;
             match tag {
+                TAG_VBLANK => {} // handled above
                 TAG_LISTEN => loop {
                     let fd = syscall::accept4(lfd, SOCK_NONBLOCK);
                     if fd < 0 {
@@ -390,7 +457,8 @@ fn main(args: Args) -> i32 {
         io.flush(&mut comp);
 
         let now = syscall::uptime_ms();
-        if (comp.has_damage() || comp.has_frame_callbacks()) && now >= last_frame + FRAME_MS {
+        let due = if vblank >= 0 { tick } else { now >= last_frame + FRAME_MS };
+        if (comp.has_damage() || comp.has_frame_callbacks()) && due {
             let t0 = syscall::uptime_ms();
             let rects = comp.compose_with(screen, info.stride as usize, &mut |t, clip, dst, stride| titles.paint(t, clip, dst, stride));
             titles.prune(&comp);
@@ -399,7 +467,11 @@ fn main(args: Args) -> i32 {
                 for (d, r) in fl.rects.iter_mut().zip(&rects) {
                     *d = Fb0Rect { x: r.x as u32, y: r.y as u32, w: r.w as u32, h: r.h as u32 };
                 }
-                syscall::ioctl(fb, FBIO_FLUSH, &fl as *const Fb0Flush as u64);
+                if vblank >= 0 {
+                    pending = Some(fl); // the next vblank shows it
+                } else {
+                    syscall::ioctl(fb, FBIO_FLUSH, &fl as *const Fb0Flush as u64);
+                }
             }
             compose_ms_total += syscall::uptime_ms() - t0;
             frames += 1;
@@ -410,6 +482,10 @@ fn main(args: Args) -> i32 {
     }
 
     println!("compositor: quit after {} frames, {} ms composing + flushing", frames, compose_ms_total);
+    if vblank >= 0 {
+        println!("compositor: presented {} times on vblank, {} by the {} ms grace timeout", on_vblank, on_timeout, VSYNC_GRACE_MS);
+        syscall::close(vblank);
+    }
     for (_, fd) in core::mem::take(&mut io.sockets) {
         syscall::close(fd);
     }

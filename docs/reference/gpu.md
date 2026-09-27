@@ -7,7 +7,7 @@ Plan and decisions: `docs/gpu/gpu-plan.md`. This page is the current state. Pure
 - UEFI gives no command line. `key=value` words are read once after `fs::init` from `/mnt/etc/kernel.conf`, then `/mnt/autorun/kernel.conf` (later wins; `#` comments). Before that, everything is at its default.
 - `/mnt/autorun/kernel.conf` is written by `scripts/metal-run.sh --kconf '...'` and removed with `autorun/`, so an option applies to one unattended run only.
 - `disk-image-root/etc/kernel.conf` is gitignored: a checkout's own options.
-- `gpu=` (`hal::bootopts::GpuLevel`): `off` (default: the GPU is not touched), `probe`, `disp`. An unknown value is logged and read as `off`.
+- `gpu=` (`hal::bootopts::GpuLevel`): `off` (default: the GPU is not touched), `probe`, `disp`, `vblank`. Each level does everything the previous ones do. An unknown value is logged and read as `off`.
 - `disk-image-root/etc/` is not synced to `disk.img` (only `etc/gui` is). To try a level in QEMU, write the file into the image: `debugfs -w -R "write <file> /etc/kernel.conf" disk.img` (and `rm` it after).
 
 ## `gpu=probe` (phase 1)
@@ -33,6 +33,18 @@ Everything `probe` does, then (`gpu::probe_displays`, only if `PMC_BOOT_0` says 
 - `/proc/displays`: one line per connector (`name status conn N aux|i2c N  MFG name`), then `dpcd:`, `preferred:`, `range:`, `modes:` (every DTD), `edid-fnv1a64:` and `edid-hex:`.
 - Runs before the APs are released; delays are TSC busy-waits that service TLB shootdowns.
 - Metal job: `scripts/metal-run.sh --kconf 'gpu=disp' scripts/metal-jobs/gpu-disp.sh`.
+
+## `gpu=vblank` (phase 3)
+
+Everything `disp` does, then `gpu::vblank::setup` (still at boot, IF=0, before the APs):
+- **Heads** (`nvgpu::vblank`): which exist (`0x610060`) and what each scans out, from its ARM state (`0x68a000 + head*0x400`: totals, blanking, pixel clock → refresh). A head with a clock and a raster is "lit"; the lowest lit one is the **primary**.
+- Read-only evidence, logged before arming: the interrupt tree and display interrupt registers as the firmware left them; the primary head's raster position sampled for 200 ms (frames counted by vline wrapping: plan B's instrument); whether its vblank status bit latches (cleared, read 40 ms later).
+- **Arming** (`nvgpu::vblank::arm`, nouveau's order): unarm the VFN tree (`0xb81610`), block every leaf, reset + allow only the display bit (leaf 4, `0x04000000`), MSK=vblank for every head (`0x611cc0`), EN bit 2 for the lit ones (`0x611d80`), MSI rearm (`0x088704`), rearm (`0xb81608`). Then PCI bus mastering on (MSI is a memory write; the GOP leaves it off) and MSI to CPU 0.
+- **Handler** (`on_msi`, ISR on CPU 0, global work): `nvgpu::vblank::service`, the trace's handler register for register (unarm, MSI rearm, leaves, `PMC_BOOT_0` check, reset, `0x611ec0`, per-head ack of LOADV and VBLANK, rearm). Nothing else touches BAR0 after boot, and the GPU sends no second MSI before the rearm, so no lock. Leaf bits with no handler are blocked (nouveau's storm guard).
+- Counters in `/proc/kdebug`: `gpu_vblank: enabled primary_head seq last_ns msi vector spurious blocked gone disp_other head_other`, plus `gpu_vblank_headN` per lit head. `seq`/`last_ns` are the primary head's vblank count and the `ktime_get` of the last one, so a rate needs no sleep precision.
+- **`/dev/vblank`** (`drivers/dev_vblank.rs`): `ENODEV` unless armed. Readable (poll/epoll) once a vblank happened after the one the handle last read; `read` never blocks and returns 16 bytes (sequence number, ns). Blocking reuses poll's input-queue machinery (`evdev::QUEUE_VBLANK`; `EventSource::seen` carries the handle's number and the re-check compares it with the live one).
+- `PollSource` is pinned at 16 bytes (`const` assert in `poll.rs`): `poll_wake_where` keeps 8 waiters with a 16-entry map each on the ISR's stack, and 24 bytes overflowed it.
+- Metal job: `scripts/metal-run.sh --kconf 'gpu=vblank' scripts/metal-jobs/gpu-vblank.sh` (rate over 30 s must be 60.0 ± 0.1, then `compositor fire` for 20 s for a tearing photo).
 
 ## Oracle tools (`scripts/gpu-trace.py`)
 
@@ -68,6 +80,6 @@ Everything `probe` does, then (`gpu::probe_displays`, only if `PMC_BOOT_0` says 
 ## Tests
 
 - Host: `cd hal && cargo test` (pcicfg, dma, bootopts, acpi IVRS), `cd nvgpu && cargo test`.
-- `nvgpu` fixtures: the two EDIDs + their `edid-decode` output, and an AUX trace extract (committed); the VBIOS is read from `$GPU_ORACLE/static/vbios-rom.bin` (default `~/constanos-gpu-oracle`, not in git, D3) and those tests print `SKIP` without it.
+- `nvgpu` fixtures: the two EDIDs + their `edid-decode` output, an AUX trace extract, and one vblank interrupt as nouveau serviced it (`vblank-service.txt`) (committed); the VBIOS is read from `$GPU_ORACLE/static/vbios-rom.bin` (default `~/constanos-gpu-oracle`, not in git, D3) and those tests print `SKIP` without it.
 - `nvgpu` mocks: `TableMmio` (fixed values), `ReplayMmio` (per-register read queues from a trace extract + write log to compare), `i2c::tests::DdcSim` (open-drain bus with a DDC EEPROM).
 - QEMU: `hw_tests::edu_mmio_dma_msi` (`scripts/run-kernel-tests.sh`; the runner adds `-device edu,dma_mask=0xffffffffffff`): MMIO, MSI to CPU 1 (the test boot keeps IF=0 on CPU 0), DMA both ways, mask refusal. The `edu` driver (`kernel/src/edu.rs`) is test-only.

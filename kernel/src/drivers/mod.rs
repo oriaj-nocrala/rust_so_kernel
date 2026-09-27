@@ -15,6 +15,7 @@ pub mod dev_input_event;
 pub mod dev_kbd;
 pub mod dev_mouse_event;
 pub mod dev_null;
+pub mod dev_vblank;
 pub mod dev_zero;
 pub mod serial_console;
 pub mod framebuffer_console;
@@ -47,6 +48,8 @@ static DEVICES: &[DeviceEntry] = &[
     DeviceEntry { path: "/dev/input/event0", open: || Ok(dev_input_event::open()) }, // keyboard
     DeviceEntry { path: "/dev/input/event1", open: || Ok(dev_mouse_event::open()) }, // mouse
     DeviceEntry { path: "/dev/dsp", open: || Ok(dev_dsp::open()) }, // AC97 PCM output, see ac97.rs
+    // The GPU's vblank (gpu=vblank): ENODEV unless the interrupt is armed.
+    DeviceEntry { path: "/dev/vblank", open: dev_vblank::open },
     // Pseudo-terminals (ipc/pty.rs): each open of ptmx is a new pair; the
     // slaves are /dev/pts/<n> (fs/devfs.rs's PtsDirInode). /dev/tty is the
     // caller's controlling terminal (ENXIO without one).

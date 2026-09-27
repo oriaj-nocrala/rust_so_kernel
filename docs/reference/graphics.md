@@ -53,6 +53,7 @@ Code: `kernel/src/framebuffer.rs`, `kernel/src/drivers/{framebuffer_console,dev_
 
   Children are reaped with `syscall::reap_any`.
 - The compositor ignores SIGINT/SIGTSTP; `^\` (SIGQUIT) still kills it.
+- **Pacing.** With `/dev/vblank` (`gpu=vblank`, `docs/reference/gpu.md`) the RAM shadow is the back buffer: on each vblank it first `FBIO_FLUSH`es what the previous frame composed (the copy starts in the blanking interval and outruns the beam), then composes the next frame, so a change shows one frame after it is composed. The vblank fd is in the epoll set only while there is damage or a pending flush; a vblank missing for 50 ms (`VSYNC_GRACE_MS`) is not waited for. Without `/dev/vblank` (QEMU, `gpu=off`): at most one compose + flush every 16 ms, which the 100 Hz tick turns into 20 ms.
 - `REL_Y` is PS/2-signed (up is positive) and is negated for the screen.
 - **Window management** (`gui::compositor`, host-tested):
   - The compositor draws the decorations (title, close, maximize).

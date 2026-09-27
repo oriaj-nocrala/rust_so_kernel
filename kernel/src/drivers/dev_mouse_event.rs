@@ -121,6 +121,7 @@ impl FileHandle for MouseEventDevice {
         Some(vfs::file::EventSource {
             queue: QUEUE_MOUSE,
             buffered: self.pending_pos < self.pending_len,
+            seen: 0,
         })
     }
 

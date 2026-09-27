@@ -402,7 +402,7 @@ pub fn render_report() -> alloc::string::String {
         crate::cpu::tsc::uptime_ms(),
         alloc::format!("{}\n{}\n{}\n{}\n{}\n{}", crate::cpu::percpu::render(), crate::smp::render(), crate::cpu::render_init(), crate::memory::tlb::render(), crate::process::scheduler::render().trim_end(), crate::cpu::idle::render()),
         alloc::format!(
-            "{}\n{}",
+            "{}\n{}\n{}",
             match crate::fs::ext2::cache_stats() {
                 Some(c) => alloc::format!(
                     "ext2_cache: hits={} misses={} device_reads={} device_kib={} passthrough={}",
@@ -411,6 +411,7 @@ pub fn render_report() -> alloc::string::String {
                 None => alloc::string::String::from("ext2_cache: (no ext2 mount)"),
             },
             crate::watchdog::render(),
+            crate::gpu::vblank::render_kdebug(),
         ),
         SCHEDULER_LOCK.render("scheduler"),
         RAMFS_ENTRIES_LOCK.render("ramfs_entries_lock"),

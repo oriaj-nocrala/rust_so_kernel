@@ -61,6 +61,10 @@ pub enum GpuLevel {
     /// DPCD/EDID. Writes only the AUX and I2C transactions nouveau makes
     /// for that, and puts back every register it changes.
     Disp,
+    /// Phase 3: also arm the display's vblank interrupt (MSI) on the heads
+    /// the firmware lit, and serve `/dev/vblank`. Leaves interrupts
+    /// enabled in the GPU and bus mastering on (MSI is a memory write).
+    Vblank,
 }
 
 impl GpuLevel {
@@ -72,6 +76,7 @@ impl GpuLevel {
             "off" => Some(GpuLevel::Off),
             "probe" => Some(GpuLevel::Probe),
             "disp" => Some(GpuLevel::Disp),
+            "vblank" => Some(GpuLevel::Vblank),
             _ => None,
         }
     }
@@ -106,7 +111,8 @@ mod tests {
         assert_eq!(GpuLevel::parse("off"), Some(GpuLevel::Off));
         assert_eq!(GpuLevel::parse("probe"), Some(GpuLevel::Probe));
         assert_eq!(GpuLevel::parse("disp"), Some(GpuLevel::Disp));
+        assert_eq!(GpuLevel::parse("vblank"), Some(GpuLevel::Vblank));
         assert_eq!(GpuLevel::parse("gsp"), None);
-        assert!(GpuLevel::Disp > GpuLevel::Probe && GpuLevel::Probe > GpuLevel::Off);
+        assert!(GpuLevel::Vblank > GpuLevel::Disp && GpuLevel::Disp > GpuLevel::Probe && GpuLevel::Probe > GpuLevel::Off);
     }
 }

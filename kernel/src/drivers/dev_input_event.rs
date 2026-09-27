@@ -148,7 +148,7 @@ impl FileHandle for InputEventDevice {
     }
 
     fn event_source(&self) -> Option<vfs::file::EventSource> {
-        Some(vfs::file::EventSource { queue: QUEUE_KEYBOARD, buffered: self.pending_syn })
+        Some(vfs::file::EventSource { queue: QUEUE_KEYBOARD, buffered: self.pending_syn, seen: 0 })
     }
 
     fn dup(&self) -> Option<Box<dyn FileHandle>> {

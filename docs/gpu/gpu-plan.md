@@ -4,8 +4,9 @@
 > segmentadas (ver "Resultados de la fase 0"); D1 = **570.144** y D6 =
 > **modeset propio sin GSP**, ambas medidas. **Fase 1 cerrada**
 > (a6c221a, Ryzen boot #66; ver "Resultados de la fase 1"). **Fase 2
-> cerrada** (Ryzen boot #67; ver "Resultados de la fase 2"). Siguiente:
-> fase 3. Ninguna fase se da por hecha sin su
+> cerrada** (Ryzen boot #67; ver "Resultados de la fase 2"). **Fase 3
+> cerrada** (Ryzen boot #68: vblank por MSI a 59,995 Hz, sin tearing; ver
+> "Resultados de la fase 3"). Siguiente: fase 5 (orden de D6). Ninguna fase se da por hecha sin su
 > criterio medido en la Ryzen.
 
 ## Objetivo
@@ -321,6 +322,73 @@ scripts/metal-jobs/gpu-disp.sh`, veredicto OK exit=0):**
   instante, hasta el reinicio del trabajo): la imagen GOP sigue intacta.
 
 **Fase 2 cerrada.**
+
+## Resultados de la fase 3 (2026-09-27)
+
+Estado actual en `docs/reference/gpu.md`. Oráculo (`trace-nogsp`):
+- **Cadena completa de la interrupción, medida.** Árbol VFN en `0xb80000`
+  (`subdev/vfn/tu102.c`, base en `ga100.c:51`); display = hoja 4, bit 26
+  (`ga100.c:30`); rearme MSI escribiendo 0 en `0x088704`
+  (`pci/gp100.c:29,34`); resumen del display en `0x611ec0`, estado por
+  cabeza en `0x611800` (bit 2 = vblank), MSK `0x611cc0`, EN `0x611d80`
+  (`engine/disp/gv100.c`). Unas 1 500 interrupciones por cabeza en la
+  traza, una cada ~16,5 ms; el handler de una está en
+  `nvgpu/fixtures/vblank-service.txt` y `service` lo reproduce escritura por
+  escritura.
+- **Lo que la traza no contesta:** las cabezas solo se leen después del
+  modeset de nouveau (1920×1080, 148,5 MHz, 2200×1125 → 60,000 Hz), así que
+  el estado que deja el GOP no está medido, ni tampoco si el vblank
+  interrumpe sin el canal core. En la traza, el bit de vblank de la cabeza
+  0 ya estaba latcheado (`0x611800 = 0x7`) antes de que nouveau activara su
+  EN: el estado latchea aunque la interrupción esté desactivada. El trabajo
+  de metal registra ese estado antes de armar, la tasa por posición del
+  barrido (plan B) y si el bit latchea con la configuración del GOP.
+- **Decisión:** se intenta el plan A (MSI) sin canal core; el plan B queda
+  medido en el mismo arranque como respaldo y diagnóstico.
+- **Mecanismo hacia el compositor:** `/dev/vblank` con `epoll` (reutiliza
+  la maquinaria de colas de entrada de `poll`, con un número de secuencia
+  por handle). El compositor usa la sombra en RAM como búfer trasero: en
+  cada vblank vuelca lo compuesto en el frame anterior y luego compone.
+
+Medido en host y QEMU:
+- Tests de host de `nvgpu::vblank`, con los sabotajes que detectan: ack de
+  vblank omitido, `arm` sin rearme MSI, bit del registro top mal calculado
+  por hoja, `disp_other` sin reportar.
+- **Encontrado al probar:** ampliar `PollSource` de 16 a 24 bytes provocó
+  un DOUBLE FAULT (pila desbordada en `poll_wake_where`, que guarda 8
+  waiters en la pila del ISR) en `gui-e2e wm`, que en master pasa. Ahora
+  hay un `const assert` de 16 bytes.
+- `run-kernel-tests.sh` en verde; `gui-e2e wm/term/text` en verde (el
+  compositor cae al temporizador: «pacing by a 16 ms timer»);
+  `boot-matrix 4 5` 20/20; el trabajo de metal probado en QEMU (sin GA106
+  falla limpio con `exit=1` y no se cuelga).
+- **Hueco encontrado (no arreglado aquí):** `kill(pid, 0)` devuelve
+  `EINVAL` (`process_ctl.rs:955`), así que el `timeout` de BusyBox se rinde
+  al primer segundo. El trabajo usa `&` + `sleep` + `kill -TERM` (SIGQUIT
+  llega ignorado a los trabajos `&` de un shell no interactivo).
+
+**En la Ryzen (boot #68, `metal-run.sh --kconf 'gpu=vblank'
+scripts/metal-jobs/gpu-vblank.sh`, veredicto OK exit=0):**
+- **El GOP enciende solo la cabeza 0**: 1920×1080, total 2200×1125,
+  148,5 MHz, 60,000 Hz nominales, profundidad 24 bpp. Las cabezas 1-3 están
+  apagadas (reloj 0, total 8×5).
+- **Estado que deja el firmware:** árbol VFN sin nada pendiente,
+  `disp_intr = 0x1`, `ctrl_disp_en = 0`, EN de todas las cabezas a 0 y MSK a
+  `0x3f017f` (nouveau lo deja en 4; `arm` lo sobrescribe). **El bit de
+  vblank de la cabeza 0 latchea sin driver** (`0x7`; tras borrarlo, `0x3`,
+  y 40 ms después otra vez `0x7`).
+- **Plan A funciona sin canal core:** MSI por el vector 0x50 a la CPU 0,
+  **1 803 vblanks en 30 s = 59,9953 Hz** (secuencia y marcas de tiempo del
+  propio handler). Sin interrupciones espurias, bloqueadas ni «GPU fuera
+  del bus». El plan B (posición del barrido) midió lo mismo: 59,995 Hz.
+  La diferencia con 60,000 (~80 ppm) es la del cristal del display frente
+  al TSC.
+- `compositor fire` se ritmó con `/dev/vblank` («pacing by vblank»): 1 217
+  vblanks en los 20 s, y la máquina volvió a Linux sola.
+- **Sin tearing:** el usuario miró la pantalla durante los 20 s de `fire`
+  bajo el compositor y no vio ninguno.
+
+**Fase 3 cerrada.**
 
 ## Fases
 

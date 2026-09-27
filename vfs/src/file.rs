@@ -84,6 +84,10 @@ pub struct EventSource {
     pub queue: usize,
     /// The handle holds records already taken off that queue.
     pub buffered: bool,
+    /// For a queue that is a sequence number rather than records
+    /// (`/dev/vblank`): the number this handle has seen. The queue is ready
+    /// for it once the number moved on. 0 and ignored for record queues.
+    pub seen: u64,
 }
 
 /// What `FileHandle::pty_end` reports — see there.
