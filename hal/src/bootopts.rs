@@ -65,6 +65,10 @@ pub enum GpuLevel {
     /// the firmware lit, and serve `/dev/vblank`. Leaves interrupts
     /// enabled in the GPU and bus mastering on (MSI is a memory write).
     Vblank,
+    /// Phase 5.1: also read the display's ARMED method state (core and
+    /// window 0) before arming vblank, and publish it in `/proc/dispstate`.
+    /// Reads only.
+    Dispstate,
 }
 
 impl GpuLevel {
@@ -77,6 +81,7 @@ impl GpuLevel {
             "probe" => Some(GpuLevel::Probe),
             "disp" => Some(GpuLevel::Disp),
             "vblank" => Some(GpuLevel::Vblank),
+            "dispstate" => Some(GpuLevel::Dispstate),
             _ => None,
         }
     }
@@ -112,7 +117,9 @@ mod tests {
         assert_eq!(GpuLevel::parse("probe"), Some(GpuLevel::Probe));
         assert_eq!(GpuLevel::parse("disp"), Some(GpuLevel::Disp));
         assert_eq!(GpuLevel::parse("vblank"), Some(GpuLevel::Vblank));
+        assert_eq!(GpuLevel::parse("dispstate"), Some(GpuLevel::Dispstate));
         assert_eq!(GpuLevel::parse("gsp"), None);
+        assert!(GpuLevel::Dispstate > GpuLevel::Vblank);
         assert!(GpuLevel::Vblank > GpuLevel::Disp && GpuLevel::Disp > GpuLevel::Probe && GpuLevel::Probe > GpuLevel::Off);
     }
 }

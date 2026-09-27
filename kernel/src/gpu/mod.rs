@@ -21,6 +21,10 @@
 //   vblank (phase 3) — also report the heads the firmware lit and arm the
 //          display's vblank interrupt on them, by MSI to CPU 0
 //          (`vblank.rs`); `/dev/vblank` then wakes pollers each frame.
+//   dispstate (phase 5.1) — also, before arming vblank, read the display's
+//          ARMED method state (core + window 0) the GOP left and compare
+//          window 0's surface with the GOP framebuffer. Reads only. Result
+//          in /proc/dispstate.
 //
 // Runs once at boot, after `fs::init` (firmware is on `/mnt`) and before the
 // APs are released (BAR sizing turns decoding off for a few microseconds,
@@ -57,6 +61,7 @@ const BAR1_WINDOW: u64 = 16 << 20;
 
 static REPORT: spin::Once<String> = spin::Once::new();
 static DISPLAYS: spin::Once<String> = spin::Once::new();
+static DISPSTATE: spin::Once<String> = spin::Once::new();
 
 /// `/proc/gpu`.
 pub fn render() -> String {
@@ -66,6 +71,11 @@ pub fn render() -> String {
 /// `/proc/displays`: filled once at boot with `gpu=disp`.
 pub fn render_displays() -> String {
     DISPLAYS.get().cloned().unwrap_or_else(|| String::from("displays: not probed (needs gpu=disp and the GA106)\n"))
+}
+
+/// `/proc/dispstate`: filled once at boot with `gpu=dispstate`.
+pub fn render_dispstate() -> String {
+    DISPSTATE.get().cloned().unwrap_or_else(|| String::from("dispstate: not read (needs gpu=dispstate and the GA106)\n"))
 }
 
 /// BAR0 through the uncached mapping `memory::mmio` made.
@@ -315,6 +325,9 @@ fn probe_device(r: &mut String, level: GpuLevel) {
     if level >= GpuLevel::Disp {
         if chip.and_then(|c| c.name()).is_some() {
             probe_displays(r, &regs);
+            if level >= GpuLevel::Dispstate {
+                read_dispstate(r, &regs, bars[1].map(|b| (b.addr, b.size)));
+            }
             if level >= GpuLevel::Vblank {
                 vblank::setup(r, &regs, (b, d, fun));
             }
@@ -390,4 +403,58 @@ fn probe_displays(r: &mut String, regs: &Bar0) {
         crate::serial_println!("displays: {}", line);
     }
     DISPLAYS.call_once(|| text);
+}
+
+/// Phase 5.1: the ARMED display state the GOP left (`nvgpu::dispstate`),
+/// read before anything arms an interrupt. Window 0's surface is compared
+/// with the GOP framebuffer's physical address, taken as an offset into
+/// BAR1 (the plan's criterion: they should be the same memory).
+fn read_dispstate(r: &mut String, regs: &Bar0, bar1: Option<(u64, u64)>) {
+    let snap = nvgpu::dispstate::Snapshot::read_armed(regs);
+    let mut text = nvgpu::dispstate::render(&snap);
+    let surf = snap.surface0();
+    let gop = crate::framebuffer::FRAMEBUFFER.lock().as_ref().map(|fb| (fb.virt_addr(), fb.stride() * fb.bytes_per_pixel(), fb.dimensions()));
+    let mut summary = String::new();
+    match gop {
+        Some((virt, pitch, (w, h))) => {
+            let phys = crate::memory::memtype::leaf_for(x86_64::VirtAddr::new(virt)).map(|l| l.phys + (virt - l.virt_base));
+            let _ = write!(summary, "gop: {}x{} pitch {} phys ", w, h, pitch);
+            match phys {
+                Some(p) => {
+                    let _ = write!(summary, "{:#x}", p);
+                    if let Some((b1, len)) = bar1.filter(|(b1, len)| (*b1..b1 + len).contains(&p)) {
+                        let off = p - b1;
+                        let _ = write!(
+                            summary,
+                            " = BAR1 {:#x} + {:#x} (of {:#x}); window0 offset {} it, pitch {}",
+                            b1,
+                            off,
+                            len,
+                            if off == surf.offset { "matches" } else { "DIFFERS from" },
+                            if pitch as u32 == surf.pitch { "matches" } else { "DIFFERS" }
+                        );
+                    } else {
+                        let _ = write!(summary, " (not inside BAR1)");
+                    }
+                }
+                None => {
+                    let _ = write!(summary, "? (virt {:#x} not mapped)", virt);
+                }
+            }
+        }
+        None => {
+            let _ = write!(summary, "gop: no framebuffer");
+        }
+    }
+    let _ = writeln!(summary);
+    text.insert_str(0, &summary);
+    // The summary lines go to the report and the log; the per-method rows
+    // (324) only to /proc/dispstate and the log.
+    for line in text.lines().take_while(|l| !l.starts_with("core ")) {
+        let _ = writeln!(r, "dispstate: {}", line);
+    }
+    for line in text.lines().skip_while(|l| !l.starts_with("core ")) {
+        crate::serial_println!("dispstate: {}", line);
+    }
+    DISPSTATE.call_once(|| text);
 }

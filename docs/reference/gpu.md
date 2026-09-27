@@ -7,7 +7,7 @@ Plan and decisions: `docs/gpu/gpu-plan.md`. This page is the current state. Pure
 - UEFI gives no command line. `key=value` words are read once after `fs::init` from `/mnt/etc/kernel.conf`, then `/mnt/autorun/kernel.conf` (later wins; `#` comments). Before that, everything is at its default.
 - `/mnt/autorun/kernel.conf` is written by `scripts/metal-run.sh --kconf '...'` and removed with `autorun/`, so an option applies to one unattended run only.
 - `disk-image-root/etc/kernel.conf` is gitignored: a checkout's own options.
-- `gpu=` (`hal::bootopts::GpuLevel`): `off` (default: the GPU is not touched), `probe`, `disp`, `vblank`. Each level does everything the previous ones do. An unknown value is logged and read as `off`.
+- `gpu=` (`hal::bootopts::GpuLevel`): `off` (default: the GPU is not touched), `probe`, `disp`, `vblank`, `dispstate`. Each level does everything the previous ones do. An unknown value is logged and read as `off`.
 - `disk-image-root/etc/` is not synced to `disk.img` (only `etc/gui` is). To try a level in QEMU, write the file into the image: `debugfs -w -R "write <file> /etc/kernel.conf" disk.img` (and `rm` it after).
 
 ## `gpu=probe` (phase 1)
@@ -46,6 +46,14 @@ Everything `disp` does, then `gpu::vblank::setup` (still at boot, IF=0, before t
 - `PollSource` is pinned at 16 bytes (`const` assert in `poll.rs`): `poll_wake_where` keeps 8 waiters with a 16-entry map each on the ISR's stack, and 24 bytes overflowed it.
 - Metal job: `scripts/metal-run.sh --kconf 'gpu=vblank' scripts/metal-jobs/gpu-vblank.sh` (rate over 30 s must be 60.0 ± 0.1, then `compositor fire` for 20 s for a tearing photo).
 
+## `gpu=dispstate` (phase 5.1)
+
+Everything `vblank` does; before arming vblank, `gpu::read_dispstate` reads the display's ARMED method state (`nvgpu::dispstate`), with no writes:
+- core: `0x688000 + method` for nouveau's 243 dumped methods (`gv100.c:610-705`); window 0: `0x690800 + method` for its 80 (`gv100.c:417-505`).
+- `/proc/dispstate`: `gop:` (the GOP framebuffer's physical address as a BAR1 offset, compared with window 0's `SET_OFFSET` and pitch), `headN:`, `sorN:`, `window owners:`, `window0:` (surface), then one `core MMMM VVVVVVVV` / `wndw0 MMMM VVVVVVVV` line per method, to diff against `nvgpu/fixtures/modeset-core-round1.txt`.
+- On the Ryzen (boot #69): identical to the trace's ARMED column except `UPDATE`; the GOP scans out BAR1 + 0, pitch 8192, context DMA handle `0x45564144`.
+- Metal job: `scripts/metal-run.sh --kconf 'gpu=dispstate' scripts/metal-jobs/gpu-dispstate.sh`.
+
 ## Oracle tools (`scripts/gpu-trace.py`)
 
 - `aux DIR CH` lists AUX transactions on a channel; `aux DIR CH SEL OUT` writes them as a `ReplayMmio` fixture (`nvgpu/fixtures/aux-ch3-dpcd-edid.txt`).
@@ -53,6 +61,8 @@ Everything `disp` does, then `gpu::vblank::setup` (still at boot, IF=0, before t
 - `core DIR [N OUT]` decodes nouveau's core-channel dumps in dmesg (one per supervisor 1: ARMED `0x688000+m` → ASSEMBLY `0x680000+m`), naming each method from `clc67d.h` (needs `~/src/gpu-ref`).
 - `disp DIR T0 T1` lists display writes labelled with the nouveau code that owns each range (`DISP_CLASSES`); `mem DIR LO HI T0 T1` lists non-zero writes into a mapped range (BAR3 instance memory).
 - The display push buffers are in host memory on Ampere, so a `nogsp` trace has only their PUTs. `scripts/gpu-oracle.sh` mode `nogsp-vrampush` (`kms_vram_pushbuf=1`) puts them in VRAM behind BAR1, where mmiotrace sees them.
+- `push DIR [T0 T1 [OUT]]` decodes those push buffers (needs a `nogsp-vrampush` trace): one block per PUT write, each method named from `clc67d.h`/`clc67e.h`/`clc67b.h` (+ `EXTRA_METHODS`, the ones nouveau writes by number). Fixture: `nvgpu/fixtures/modeset-push.txt`.
+- `core` and `push` name methods through `method_names(cls)`: header indices have no bound, so offsets are claimed index 0 first across all methods, then 1, …
 
 ## PCI configuration space (`kernel/src/pci.rs`, `hal::pcicfg`)
 

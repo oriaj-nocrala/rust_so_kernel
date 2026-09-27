@@ -16,6 +16,7 @@ extern crate alloc;
 pub mod aux;
 pub mod dcb;
 pub mod display;
+pub mod dispstate;
 pub mod edid;
 pub mod i2c;
 pub mod id;

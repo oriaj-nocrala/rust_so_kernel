@@ -8,8 +8,9 @@
 > cerrada** (Ryzen boot #68: vblank por MSI a 59,995 Hz, sin tearing; ver
 > "Resultados de la fase 3"). **Fase 5.0 cerrada** (oráculo del modeset
 > segmentado; subfases reordenadas, ver "Resultados de la fase 5.0").
-> Siguiente: 5.1 (oráculo de métodos con `nogsp-vrampush` + estado del GOP
-> en metal). Ninguna fase se da por hecha sin su
+> **Fase 5.1 cerrada** (Ryzen boot #69: el ARMED del GOP = el de la traza,
+> ventana 0 = framebuffer del GOP; ver "Resultados de la fase 5.1").
+> Siguiente: 5.2 (canales arriba sin cambiar la imagen). Ninguna fase se da por hecha sin su
 > criterio medido en la Ryzen.
 
 ## Objetivo
@@ -419,7 +420,10 @@ Hechos medidos:
   `0x688000 + m`, ASSEMBLY en `0x680000 + m`, `gv100.c:708-716`); de las
   ventanas, nada. Remedio: modo `nogsp-vrampush` de `gpu-oracle.sh`
   (`kms_vram_pushbuf=1`: push en VRAM, escrito por BAR1, que mmiotrace sí
-  traza). **Sin capturar todavía** (reinicia el host).
+  traza). **Capturada** (`trace-nogsp-vrampush/`, 2 214 593 escrituras):
+  los push aparecen como escrituras BAR1 en páginas nuevas (core
+  `0x7c00023000`, 153 escrituras; ventanas `0x7c0002a000` y
+  `0x7c00040000`, 37 cada una, con SetSize `0x224` = `0x04380780`).
 - **El GOP deja la cabeza 0 configurada en el estado ARMED del core, igual
   que la deja nouveau.** Columna ARMED de `modeset-core-round1.txt` frente a
   ASSEMBLY de `modeset-core-round2.txt`: raster 2200×1125, 1920×1080,
@@ -447,6 +451,55 @@ Hechos medidos:
   aparece en nouveau v7.2.2).
 
 **Fase 5.0 cerrada.**
+
+## Resultados de la fase 5.1 (2026-09-27)
+
+**Oráculo de métodos.** `gpu-oracle.sh entry nogsp-vrampush` capturó
+`trace-nogsp-vrampush/` (2 214 593 escrituras). Los push del display están
+en VRAM, escritos por BAR1: core en `0x7c00023000`, ventanas 0 y 2 en
+`0x7c0002a000` y `0x7c00040000`. `gpu-trace.py push` los empareja con sus
+PUT (el buffer de cada canal es la página escrita más recientemente que
+contiene la palabra anterior al primer PUT) y decodifica las cabeceras
+(`clc67d.h:59-69`). Salen las 6 pushes cuyos PUT ya se veían en `nogsp`;
+fixture `nvgpu/fixtures/modeset-push.txt`:
+
+| PUT | Qué |
+|---|---|
+| core `0 → a8` | init: `SET_CONTEXT_DMA_NOTIFIER = 0xf0000000` y límites de uso de las 8 ventanas (`0xf`, `0x117fff`) |
+| core `a8 → dc` | ronda 1: `HEAD_SET_DISPLAY_ID(0,0) = 0`, `SOR_SET_CONTROL(1) = 0`, UPDATE con notificador |
+| core `dc → 218` | ronda 2: cabezas 0 y 1 a 1080p (raster 2200×1125, 148,5 MHz), `SOR_SET_CONTROL(0) = 0x102` (HDMI), `(1) = 0x901` (DP), dueños de las ventanas (`i >> 1`), UPDATE |
+| ventana 0 y 2 `0 → 94` | primer flip: 1920×1080 A8R8G8B8, pitch 7680, `SET_CONTEXT_DMA_ISO = 0xfb000000`, `SET_OFFSET = 0x2000` (2 MiB), ILUT, composición, UPDATE |
+| core `218 → 264` | OLUT de las cabezas 0 y 1, UPDATE con `SET_WINDOW_INTERLOCK_FLAGS = 5` |
+
+Nombres de `clc67d/e/b.h`, más `0x2074` (`HEAD_SET_RASTER_VERT_BLANK2`,
+que no está en el header: `dispnv50/headc57d.c:229`). Al generalizar la
+tabla se corrigieron nombres del decodificador `core`: un índice sin cota
+del header tapaba al método siguiente (`0x2090` era
+`HEAD_SET_OFFSET_CURSOR`, no `CONTEXT_DMA_CURSOR(0,2)`);
+`modeset-core-round*.txt` regenerados (solo cambia la columna de nombres).
+
+**`gpu=dispstate` en metal (boot #69, veredicto OK).** Lee el ARMED del
+core (243 métodos, listas de `gv100.c:610-705`) y de la ventana 0 (80,
+`gv100.c:417-505`) antes de armar el vblank; sin escrituras.
+- Core: **242 de 243 métodos idénticos** a la columna ARMED de
+  `modeset-core-round1.txt`. Solo difiere `UPDATE` (`0x9155b219` en la
+  traza, `0x91559218` en constanos): es un disparador, el valor ARMED es
+  residuo de la última escritura del firmware, no estado del scanout.
+- Ventana 0 del GOP: 1920×1080 A8R8G8B8, bloque lineal (block height 0),
+  **pitch 8192** (no 7680 como nouveau), `SET_OFFSET = 0`, context DMA
+  `0x45564144` (ASCII "DAVE": un handle del firmware, no de nouveau). El
+  framebuffer del GOP está en BAR1 + 0 (`0x7c00000000`), mismo pitch: la
+  superficie de la ventana 0 **es** el framebuffer del GOP, y BAR1 apunta
+  a la VRAM desde 0 sin VM.
+- Cabezas 1-3 apagadas (raster 8×5, reloj 0); ventanas 1-7 sin dueño
+  (`0xf`).
+
+Consecuencia para la 5.2: el UPDATE que repita el estado ARMED puede
+apuntar la ventana 0 a la VRAM 0 con pitch 8192 y la imagen no cambia; el
+context DMA ha de ser nuestro (el handle del GOP no existe en nuestra
+RAMHT), con base 0 en VRAM.
+
+**Fase 5.1 cerrada.**
 
 ## Fases
 

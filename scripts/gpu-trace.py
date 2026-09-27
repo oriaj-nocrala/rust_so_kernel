@@ -26,6 +26,9 @@ A trace dir is what scripts/gpu-oracle.sh leaves: mmiotrace.txt + dmesg.txt.
                                             register (see DISP_CLASSES); AUX/I2C/timer excluded
   gpu-trace.py mem     DIR LO HI T0 T1      non-zero writes into physical [LO, HI) (a MAP line's
                                             range, e.g. BAR3 instance memory), offsets from LO
+  gpu-trace.py push    DIR [T0 T1 [OUT]]    display push-buffer methods, one block per PUT
+                                            write, named from clc67d/e/b.h (needs a
+                                            nogsp-vrampush trace: push buffers in VRAM)
 
 Clock alignment. mmiotrace and printk stamp with different clocks. The
 anchor is the VBIOS PROM read (BAR0 0x300000..0x3fffff): nouveau prints
@@ -307,33 +310,53 @@ def i2c(d, drive):
         print(f"{t - off:10.6f} addr {a >> 1:#04x} {'rd' if a & 1 else 'wr'} {len(body):3d} [{acks[:4]}...] {body.hex()}")
 
 
-CLC67D = "src/common/sdk/nvidia/inc/class/clc67d.h"
+CLASS_DIR = "src/common/sdk/nvidia/inc/class"
 GPU_REF = __import__("os").path.expanduser("~/src/gpu-ref")
-DEF = re.compile(r"#define (NVC67D_\w+?)(\((a)\)|\((a),\s*(b)\))?\s+\((0x[0-9A-Fa-f]+)"
-                 r"(?:\s*\+\s*\(a\)\*(0x[0-9A-Fa-f]+))?(?:\s*\+\s*\(b\)\*(0x[0-9A-Fa-f]+))?\)")
-FIELD = re.compile(r"#define NVC67D_\w+\s+\d+:\d+")
+
+
+def method_names(cls="c67d"):
+    """{method offset: (name, clXXXX.h line)} for every method of a GA102
+    display class (c67d core, c67e window, c67b window-immediate): a define
+    whose next line defines one of its fields, plus EXTRA_METHODS."""
+    pfx = f"NV{cls.upper()}_"
+    path = f"{GPU_REF}/open-gpu-kernel-modules/{CLASS_DIR}/cl{cls}.h"
+    lines = open(path).read().splitlines()
+    define = re.compile(rf"#define ({pfx}\w+?)(\(([ab])\)|\((a),\s*(b)\))?\s+\((0x[0-9A-Fa-f]+)"
+                        r"(?:\s*\+\s*\([ab]\)\*(0x[0-9A-Fa-f]+))?(?:\s*\+\s*\(b\)\*(0x[0-9A-Fa-f]+))?\)")
+    # The header gives no bound for the indices. Claim offsets in order of
+    # index (every method's index 0 first, then 1, ...; two-index methods
+    # last), so an index past a method's real bound never hides the next
+    # method (c67e: SET_PLANAR_STORAGE(b) would reach SET_CONTEXT_DMA_ISO).
+    cands = []
+    for i, line in enumerate(lines[:-1]):
+        m = define.match(line)
+        if not m or not lines[i + 1].startswith(f"#define {m.group(1)}_"):
+            continue
+        name, base = m.group(1)[len(pfx):], int(m.group(6), 16)
+        sa, sb = (int(x, 16) if x else 0 for x in m.group(7, 8))
+        two = bool(m.group(5))
+        for a in range(8 if m.group(3) or m.group(4) else 1):
+            for b in range(4 if two else 1):
+                idx = f"({a},{b})" if two else f"({a})" if m.group(3) else ""
+                cands.append(((two, a, b, i), base + a * sa + b * sb, name + idx, f"cl{cls}.h:{i + 1}"))
+    out = {}
+    for _, off, name, where in sorted(cands):
+        out.setdefault(off, (name, where))
+    for off, name, stride, where in EXTRA_METHODS.get(cls, ()):
+        for a in range(8 if stride else 1):
+            out.setdefault(off + a * stride, (f"{name}({a})" if stride else name, where))
+    return out
+
+
+# Methods nouveau sends that the class header does not define:
+# (offset, name, stride of index a or 0, where nouveau writes it).
+EXTRA_METHODS = {
+    "c67d": [(0x2074, "HEAD_SET_RASTER_VERT_BLANK2", 0x400, "dispnv50/headc57d.c:229")],
+}
 
 
 def core_names():
-    """{method offset: (name, clc67d.h line)} for every GA102 core-channel
-    method: a define whose next line is a bit field."""
-    path = f"{GPU_REF}/open-gpu-kernel-modules/{CLC67D}"
-    lines = open(path).read().splitlines()
-    out = {}
-    # Two-index methods (a, b) have no bound for b in the header; they only
-    # fill offsets that no one-index method claims.
-    for two in (False, True):
-        for i, line in enumerate(lines[:-1]):
-            m = DEF.match(line)
-            if not m or not FIELD.match(lines[i + 1]) or bool(m.group(5)) != two:
-                continue
-            name, base = m.group(1)[len("NVC67D_"):], int(m.group(6), 16)
-            sa, sb = (int(x, 16) if x else 0 for x in m.group(7, 8))
-            for a in range(8 if m.group(3) or m.group(4) else 1):
-                for b in range(4 if two else 1):
-                    idx = f"({a},{b})" if two else f"({a})" if m.group(3) else ""
-                    out.setdefault(base + a * sa + b * sb, (name + idx, i + 1))
-    return out
+    return method_names("c67d")
 
 
 DUMP = re.compile(r"^disp: \t([0-9a-f]{4}): ([0-9a-f]{8})(?: -> ([0-9a-f]{8}))?")
@@ -371,8 +394,8 @@ def core(d, n=None, out=None):
         else:
             print(f"== dump {i}: supervisor 1 at {t:.6f} ({len(rows)} methods)")
         for mthd, armed, assy in rows:
-            name, line = names.get(mthd, (None, 0))
-            where = f"{name} clc67d.h:{line}" if name else "(not a c67d method)"
+            name, line = names.get(mthd, (None, ""))
+            where = f"{name} {line}" if name else "(not a c67d method)"
             mark = "*" if armed != assy else " "
             f.write(f"{mthd:04x} {armed:08x} {assy:08x} {mark} {where}\n")
     if out:
@@ -442,6 +465,110 @@ def mem(d, lo, hi, t0, t1):
             print(f"{t - off:.6f} {a - lo:#07x} {v:08x}")
 
 
+# BAR1 (VRAM aperture) of the target GA106 (docs/gpu/gpu-plan.md, "Hechos
+# medidos"). nouveau reaches VRAM through its BAR1 VM, so a push buffer's
+# BAR1 address is not its VRAM address: `push` pairs them by write order.
+BAR1_LO, BAR1_HI = 0x7c00000000, 0x7c00000000 + (8 << 30)
+
+
+def disp_channel(ctrl):
+    """(name, class, PUT offset) of display channel control index CTRL
+    (0x610b20 + ctrl*0x10 push address, 0x6104e0 + ctrl*4 control;
+    gv100.c:373,760; nvif/class.h:128-177 for the classes)."""
+    if ctrl == 0:
+        return "core", "c67d", 0x680000
+    if 1 <= ctrl <= 8:
+        return f"wndw{ctrl - 1}", "c67e", 0x690000 + (ctrl - 1) * 0x1000
+    if 33 <= ctrl <= 40:
+        return f"wimm{ctrl - 33}", "c67b", 0x6b0000 + (ctrl - 33) * 0x1000
+    return None
+
+
+def push_words(mem, base, old, new):
+    """Decode the push bytes [old, new) of a buffer at BAR1 address BASE into
+    (method, value) pairs (clc67d.h:59-69: opcode 31:29, count 27:18,
+    offset 13:2; JUMP 11:2). Yields (None, why) where decoding stops."""
+    pos = old
+    while pos != new:
+        w = mem.get(base + pos)
+        if w is None:
+            yield None, f"unwritten word at +{pos:#x}"
+            return
+        op = w >> 29
+        if op == 1:                      # JUMP (the ring wraps)
+            pos = w & 0xffc
+            continue
+        if op == 3 or w == 0:            # SET_SUBDEVICE_MASK, NOP
+            pos += 4
+            continue
+        if op not in (0, 2):
+            yield None, f"bad header {w:#010x} at +{pos:#x}"
+            return
+        m, n = w & 0x3ffc, (w >> 18) & 0x3ff
+        for i in range(n):
+            v = mem.get(base + pos + 4 + 4 * i)
+            yield (m + (4 * i if op == 0 else 0)), v
+        pos += 4 + 4 * n
+        if pos > 0x10000:
+            yield None, "ran past 64 KiB"
+            return
+
+
+def push(d, t0=0.0, t1=1e9, out=None):
+    """Methods of every display push (a PUT write) between dmesg T0..T1, from
+    a nogsp-vrampush trace."""
+    off, base = align(d, quiet=True)
+    names = {c: method_names(c) for c in ("c67d", "c67e", "c67b")}
+    puts = {}                            # PUT offset -> ctrl
+    for ctrl in [0, *range(1, 9), *range(33, 41)]:
+        puts[disp_channel(ctrl)[2]] = ctrl
+    mem, when = {}, {}                   # BAR1 address -> last value, write time
+    bufs, last_put, owned = {}, {}, set()
+    f = open(out, "w") if out else sys.stdout
+    if out:
+        f.write(f"# {d.rsplit('/', 1)[-1]}: display push buffers, dmesg {t0}..{t1} "
+                f"(scripts/gpu-trace.py push {d.rsplit('/', 1)[-1]} {t0} {t1} ...)\n"
+                f"# time chan method value name clXXXX.h:line; '== ' lines are PUT writes\n")
+    n_puts = 0
+    for k, t, a, v in iter_trace(d):
+        if k != "W":
+            continue
+        if BAR1_LO <= a < BAR1_HI:
+            mem[a], when[a] = v, t
+            continue
+        o = a - base
+        if o not in puts:
+            continue
+        ctrl = puts[o]
+        name, cls, _ = disp_channel(ctrl)
+        old = last_put.get(ctrl, 0)
+        last_put[ctrl] = v
+        if v == 0 or v == old:
+            continue
+        if ctrl not in bufs:
+            # The buffer: an unclaimed page with the words just before the
+            # new PUT written most recently.
+            cands = [(when[p + v - 4], p) for p in {x & ~0xfff for x in mem}
+                     if p not in owned and p + v - 4 in mem and p in mem]
+            if not cands:
+                sys.exit(f"{t - off:.6f} {name}: no BAR1 page holds its first push")
+            bufs[ctrl] = max(cands)[1]
+            owned.add(bufs[ctrl])
+        if not t0 <= t - off <= t1:
+            continue
+        n_puts += 1
+        f.write(f"== {t - off:.6f} {name} PUT {old:#x} -> {v:#x} (BAR1 {bufs[ctrl]:#x})\n")
+        for mthd, val in push_words(mem, bufs[ctrl], old, v):
+            if mthd is None:
+                f.write(f"   ! {val}\n")
+                continue
+            nm, line = names[cls].get(mthd, (None, ""))
+            where = f"{nm} {line}" if nm else f"(not a {cls} method)"
+            f.write(f"{t - off:.6f} {name:<6} {mthd:04x} {val:08x} {where}\n")
+    if out:
+        print(f"{n_puts} pushes -> {out}")
+
+
 def main(argv):
     if len(argv) < 3:
         sys.exit(__doc__)
@@ -472,6 +599,11 @@ def main(argv):
         disp(d, float(argv[3]), float(argv[4]))
     elif cmd == "mem":
         mem(d, int(argv[3], 0), int(argv[4], 0), float(argv[5]), float(argv[6]))
+    elif cmd == "push":
+        if len(argv) > 4:
+            push(d, float(argv[3]), float(argv[4]), argv[5] if len(argv) > 5 else None)
+        else:
+            push(d)
     else:
         sys.exit(__doc__)
 
