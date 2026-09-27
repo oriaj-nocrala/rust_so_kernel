@@ -1,8 +1,8 @@
 # Plan: GPU NVIDIA (display, GSP, canales)
 
-> **Estado (2026-09-26):** fase 0 casi cerrada. Trazas capturadas y
-> válidas (ver "Resultados de la fase 0"); D1 = **570.144** y D6 = **modeset
-> propio sin GSP**, ambas medidas. Falta segmentar las trazas por paso.
+> **Estado (2026-09-26):** **fase 0 cerrada.** Trazas capturadas, válidas y
+> segmentadas (ver "Resultados de la fase 0"); D1 = **570.144** y D6 =
+> **modeset propio sin GSP**, ambas medidas. Siguiente: fase 1.
 > Ninguna fase se da por hecha sin su criterio medido en la Ryzen.
 
 ## Objetivo
@@ -13,7 +13,7 @@ driver propio de la RTX 3050 que:
 1. **nombra los monitores** (EDID leído por la GPU, en caliente);
 2. da **vblank** (vsync real para el compositor);
 3. **arranca el GSP** y habla con GSP-RM;
-4. **cambia de modo** a través de RM (1920×1080 a 180 Hz en el DP);
+4. **cambia de modo** (1920×1080 a 180 Hz en el DP; sin GSP, ver D6);
 5. ejecuta trabajo en la GPU: **canal + motor de copia**.
 
 La pila 3D (Vulkan/OpenGL) **no** forma parte de este plan. La fase 7 es solo
@@ -194,11 +194,44 @@ Hechos medidos:
   arranque), así que las trazas se pueden segmentar por los mensajes de
   nouveau.
 
-Pendiente para cerrar la fase 0:
-1. Segmentar las trazas: anotar aquí los rangos de tiempo de cada paso
-   (lectura de VBIOS, AUX/EDID, vblank, FWSEC, booter, RPC de init, modeset).
-2. ~~Medir D6~~ hecho: `trace-gspnotrace` (solo dmesg, 21 111 líneas). El
-   display falla igual que con mmiotrace; decisión en D6.
+D6 se midió con `trace-gspnotrace` (solo dmesg, 21 111 líneas): el display
+falla igual que con mmiotrace.
+
+### Mapa de las trazas
+
+Herramienta: `scripts/gpu-trace.py` (`align`, `segment`, `extract`, `regs`).
+Las horas son de dmesg. El reloj de mmiotrace va **+0,1218 s** (`nogsp`) y
+**+0,1229 s** (`gsp`) por delante; `align` lo mide con dos anclas (inicio y
+fin de la lectura de la PROM), que coinciden al 0,1 ms.
+
+**`trace-nogsp`** (oráculo de las fases 2, 3, 5 y 6):
+
+| Paso | dmesg (s) | Qué hay |
+|---|---|---|
+| Identificación + VBIOS | 7,9551–8,2382 | `PMC_BOOT_0 = 0xb76000a1`; 141 445 lecturas de la PROM (`0x300000`–`0x3fffff`); imagen de 4 partes, BIT 94.06.37.00.40 |
+| Tabla CCB (I2C/AUX) | 8,2386 | ccb 03–09 → auxch 00–06 |
+| fb / reset | 8,2527–11,3581 | ~2 M escrituras en `0x7d0000`/`0x7c0000` (sin interpretar; ¿limpieza de VRAM por PRAMIN?) |
+| ACR / SEC2 | 11,3581–11,3696 | `gsp(acr)`: ASB, firmas parcheadas |
+| Display: constructores | 11,4452 | 8 ventanas, 4 cabezas, 4 SOR |
+| Display: DCB y rutas | 11,4489–11,4772 | salidas/conectores (`disp:dcb`); **el DP del ASUS es la salida 04 (SOR-1, conector 2, ccb 06)** y el HDMI del HP es la salida 07 (TMDS, conector 3, ccb 05), sin ruta al arrancar |
+| **EDID** | 11,4773–11,6762 | **DP: AUX canal 3**, registros `0xda30`–`0xda58` (`0xd950 + ch·0x50`, `nvkm/subdev/i2c/auxgm200.c:110-120`). **HDMI: I2C por bit-banging, puerto 5**, `0xd0b4` (`0xd014 + drive·0x20`, `busgf119.c:93`), unos 15 000 accesos |
+| fbcon | 11,6762 | |
+| **Modeset** | 11,8215–11,8789 y 11,9849→ | dos rondas de supervisor 1/2/3; cada una trae en dmesg el volcado de los métodos del canal core (`disp: 0200: 9155b219 -> 00000001`…). Entre las dos rondas, `release SOR-1` |
+
+**`trace-gsp`** (oráculo de la fase 4):
+
+| Paso | dmesg (s) | Qué hay |
+|---|---|---|
+| VBIOS | 8,0401–8,3289 | igual que sin GSP |
+| FWSEC-FRTS | 8,3403–8,5757 | parcheo de firmas; IMEM `0xe100` bytes (bloque `0x110000`, falcon GSP); arranque y sondeo, 218 ms |
+| booter-load en SEC2 | 8,5760–8,8377 | IMEM `0x8900` bytes (bloque `0x840000`, falcon SEC2); arranque, 250 ms |
+| Arranque de GSP-RM | 8,8377–10,1112 | 505 mensajes: RPC de init |
+| Control de RM + objetos | 10,1112–13,6881 | unos 2 M escrituras fuera de BAR0 (BAR3); primeras llamadas `NV2080`, luego objetos de display (`NV0073`) |
+| Fallo del display (D6) | 13,6881→ | timeouts de notificador, `DFP_ASSIGN_SOR`, `DP_TRAIN` |
+
+**Fase 0 cerrada.** Los fixtures derivados (EDIDs, extractos de traza por
+paso) se sacan con `gpu-trace.py extract` en la fase que los usa, empezando
+por la 2.
 
 ## Fases
 
