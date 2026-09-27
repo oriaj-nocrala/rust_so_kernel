@@ -12,8 +12,9 @@
 > ventana 0 = framebuffer del GOP; ver "Resultados de la fase 5.1").
 > **Fase 5.2 cerrada** (Ryzen boot #74: core y ventana 0 arriba, cada
 > UPDATE latchea solo lo empujado, la imagen no cambia; ver "Resultados de
-> la fase 5.2"). Siguiente: 5.3
-> (scanout propio). Ninguna fase se da por hecha sin su
+> la fase 5.2"). **Fase 5.3 cerrada** (Ryzen #75/#76: scanout desde VRAM
+> propia, ~1000 flips en 20 s, visto a mano; ver
+> "Resultados de la fase 5.3"). Siguiente: 5.4 (supervisores). Ninguna fase se da por hecha sin su
 > criterio medido en la Ryzen.
 
 ## Objetivo
@@ -551,6 +552,46 @@ primera sorpresa para la secuencia sin desmontar nada):
   `metal-run` desplegó el kernel viejo en #71. Hace falta `touch build.rs`.
 
 **Fase 5.2 cerrada.**
+
+## Resultados de la fase 5.3 (2026-09-27)
+
+Código: `nvgpu::evo::{flip, wind, submit, flip_latched}` (flip = 
+`SET_PRESENT_CONTROL = 1`, `SET_OFFSET(0)`, UPDATE; vuelta del push con JUMP
+a 0 + PUT = 0 como `nv50_dmac_wind`), `kernel/src/gpu/scanout.rs`
+(`gpu=scanout`), `Framebuffer::attach_flip`/`present` (daño pendiente por
+búfer; `present` nunca escribe el búfer en pantalla), `FBIO_FLUSH` = flip
+(`EBUSY` si el anterior no terminó) y el compositor fusiona los rectángulos
+de un frame aplazado. Tests: 3 de host en `nvgpu::evo` y
+`hw_tests::framebuffer_page_flip_writes_only_the_hidden_buffer`, ambos
+probados por sabotaje. Job: `scripts/metal-jobs/gpu-scanout.sh`.
+
+**Medido en la Ryzen** (boots #75 y #76, veredicto OK los dos):
+- Búferes en VRAM `0x1000000` y `0x2000000` (BAR1, WC), mismo formato que
+  el GOP (`0xcf`, pitch 8192). Copia de la sombra a los dos: 2,9 ms.
+- **El ARMED de la ventana cambia al procesar el UPDATE, no en el vblank.**
+  Tres flips cronometrados (#76): el push se lee y el `SET_OFFSET` ARMED
+  cambia a los 4-45 µs, en la misma línea del barrido; **LOADV** (bits 0-1
+  de `0x611800 + head·4`) y VBLANK se activan juntos en la línea 1120,
+  el siguiente vblank (8,7 ms, 9,8 ms y 16,6 ms después: el tercero se
+  pidió en la línea 1121, ya pasado el vblank, y cargó en el siguiente).
+  Consecuencia: "ARMED = pedido" no dice que el flip terminó; lo que lo
+  dice es el vblank siguiente. `flip_done` exige además que la secuencia de
+  vblank haya avanzado desde el envío. Carrera residual: un flip enviado
+  entre el inicio del vblank (línea 1120) y la ISR que cuenta ese vblank
+  (µs) se daría por hecho un frame antes; el compositor envía justo después
+  de la ISR, así que no la toca. Si hiciera falta: contar LOADV en la ISR.
+- Tras el primer flip el framebuffer del GOP (VRAM 0) se pintó de rojo; el
+  job siguió en consola y los dos flips siguientes (0→1→0) cargaron.
+- `compositor fire` 20 s: 1008 (#75) y 993 (#76) flips completados, 0
+  rechazados, 0 `EBUSY`; ~50 flips/s (el ritmo de fire, no el del
+  display), a veces 2 vblanks por flip, latencia media 19 ms.
+- Vblank a 60,003 y 59,994 Hz; ninguna interrupción espuria ni desconocida.
+- El log de 64 KiB envolvió en #75 y se perdieron los tiempos del arranque:
+  el job repite las líneas `scanout:` al final.
+- El usuario vio la pantalla bien (nunca roja, fire sin tearing, consola
+  de vuelta).
+
+**Fase 5.3 cerrada.**
 
 ## Fases
 

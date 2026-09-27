@@ -496,8 +496,8 @@ pub fn init_channel(m: &dyn Mmio, chan: Chan, push: &dyn PushMem) -> Result<(), 
     Ok(())
 }
 
-/// A push buffer being filled from word 0, never wrapping (4 KiB is far
-/// more than this phase pushes).
+/// A push buffer being filled from `at`. It wraps only through [`wind`]
+/// (a JUMP back to word 0), which [`flip`] does when the end is near.
 pub struct Push<'a> {
     mem: &'a dyn PushMem,
     at: usize,
@@ -525,14 +525,54 @@ impl<'a> Push<'a> {
     pub fn put_bytes(&self) -> u32 {
         (self.at * 4) as u32
     }
+
+    /// Words that still fit before the end, keeping one for a JUMP.
+    pub fn room_words(&self) -> usize {
+        self.mem.len_words().saturating_sub(self.at + 1)
+    }
+}
+
+/// A JUMP to byte offset `to` of the push buffer (`clc67e.h:36-45`:
+/// opcode 31:29 = 1, offset 11:2; `nvif/push507c.h:19-24`).
+pub fn jump_header(to: u32) -> u32 {
+    1 << 29 | (to & 0xffc)
+}
+
+/// Back to the start of the push buffer, as `nv50_dmac_wind` and the kick
+/// after it do (`dispnv50/disp.c:169-209`): a JUMP to 0 where the next
+/// method would go, then PUT = 0; GET follows the jump. Only once the
+/// channel has fetched everything (GET = PUT, not 0): a PUT equal to GET
+/// would be ignored.
+pub fn wind(m: &dyn Mmio, chan: Chan, push: &mut Push) -> Result<(), ChanError> {
+    let put = push.put_bytes();
+    if put == 0 {
+        return Ok(());
+    }
+    let get = m.rd32(chan.get());
+    if get != put {
+        return Err(ChanError::Stalled { put, get });
+    }
+    push.mem.write(push.at, jump_header(0));
+    push.at = 0;
+    push.mem.flush();
+    m.wr32(chan.put(), 0);
+    if !wait(m, || m.rd32(chan.get()) == 0) {
+        return Err(ChanError::Stalled { put: 0, get: m.rd32(chan.get()) });
+    }
+    Ok(())
+}
+
+/// Hands the pushed words to the channel without waiting for it.
+pub fn submit(m: &dyn Mmio, chan: Chan, push: &Push) {
+    push.mem.flush();
+    m.wr32(chan.put(), push.put_bytes());
 }
 
 /// Hands the pushed words to the channel and waits until it has fetched
 /// them all and gone idle.
 pub fn kick(m: &dyn Mmio, chan: Chan, push: &Push) -> Result<(), ChanError> {
-    push.mem.flush();
+    submit(m, chan, push);
     let put = push.put_bytes();
-    m.wr32(chan.put(), put);
     if !wait(m, || m.rd32(chan.get()) == put) {
         return Err(ChanError::Stalled { put, get: m.rd32(chan.get()) });
     }
@@ -589,6 +629,68 @@ pub fn push_window_state(p: &mut Push, restore: &[(u32, u32)], handle: u32) -> R
 /// UPDATE with `RELEASE_ELV` (core and window alike).
 pub fn push_update(p: &mut Push) -> Result<(), ChanError> {
     p.mthd(CORE_UPDATE, &[UPDATE_RELEASE_ELV])
+}
+
+// ---------------------------------------------------------------------------
+// Page flips (phase 5.3)
+// ---------------------------------------------------------------------------
+
+pub const WNDW_SET_OFFSET0: u32 = 0x260; // clc67e.h:181
+pub const WNDW_SET_PRESENT_CONTROL: u32 = 0x308; // clc67e.h:279
+/// `MIN_PRESENT_INTERVAL` 1, `BEGIN_MODE_NON_TEARING` (`clc67e.h:280-282`):
+/// nouveau's value in its first flip (`modeset-push.txt`). The GOP leaves
+/// 0 (interval 0) in ARMED (Ryzen boot #73).
+pub const PRESENT_CONTROL_VSYNC: u32 = 0x1;
+/// Words one flip pushes: three one-word methods.
+const FLIP_WORDS: usize = 6;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlipError {
+    /// `SET_OFFSET` holds the address >> 8 (`clc67e.h:181-182`, and the
+    /// trace's `0x2000` for 2 MiB), and a context DMA spans 40 bits.
+    Misaligned { vram: u64 },
+    /// The channel has not fetched the previous flip yet.
+    Busy { put: u32, get: u32 },
+    Chan(ChanError),
+}
+
+impl From<ChanError> for FlipError {
+    fn from(e: ChanError) -> Self {
+        FlipError::Chan(e)
+    }
+}
+
+/// Queues a flip of `chan` (a window) to the surface at `vram`, with every
+/// other surface method as ASSEMBLY already holds it: `SET_PRESENT_CONTROL`
+/// (non-tearing: the new offset latches at a vblank), `SET_OFFSET(0)` and
+/// UPDATE. Does not wait: [`flip_latched`] says when it took. Returns the
+/// `SET_OFFSET` value pushed. Refuses while the previous push is unfetched,
+/// which also keeps GET = PUT for [`wind`].
+pub fn flip(m: &dyn Mmio, chan: Chan, push: &mut Push, vram: u64) -> Result<u32, FlipError> {
+    if vram % 256 != 0 || vram >> 40 != 0 {
+        return Err(FlipError::Misaligned { vram });
+    }
+    let (put, get) = (push.put_bytes(), m.rd32(chan.get()));
+    if put != get {
+        return Err(FlipError::Busy { put, get });
+    }
+    if push.room_words() < FLIP_WORDS {
+        wind(m, chan, push)?;
+    }
+    let origin = (vram >> 8) as u32;
+    push.mthd(WNDW_SET_PRESENT_CONTROL, &[PRESENT_CONTROL_VSYNC])?;
+    push.mthd(WNDW_SET_OFFSET0, &[origin])?;
+    push_update(push)?;
+    submit(m, chan, push);
+    Ok(origin)
+}
+
+/// The flip that pushed `origin` was fetched (GET = PUT) and the window's
+/// ARMED offset is `origin`. Not a completion on its own: ARMED changes
+/// within microseconds of the UPDATE, while the new surface loads (LOADV)
+/// at the next vblank (Ryzen boot #76); the caller also waits for a vblank.
+pub fn flip_latched(m: &dyn Mmio, chan: Chan, push: &Push, origin: u32) -> bool {
+    m.rd32(chan.get()) == push.put_bytes() && m.rd32(chan.armed_base() + WNDW_SET_OFFSET0) == origin
 }
 
 // ---------------------------------------------------------------------------
@@ -783,6 +885,8 @@ mod tests {
         push: RefCell<BTreeMap<u32, Vec<u32>>>, // by channel user base
         writes: RefCell<Vec<(u32, u32)>>,
         updates: RefCell<Vec<u32>>,
+        /// GET does not follow PUT (a channel that has not fetched yet).
+        stall: core::cell::Cell<bool>,
     }
 
     impl Sim {
@@ -799,6 +903,7 @@ mod tests {
                 push: RefCell::new(BTreeMap::new()),
                 writes: RefCell::new(Vec::new()),
                 updates: RefCell::new(Vec::new()),
+                stall: core::cell::Cell::new(false),
             }
         }
         fn set(&self, o: u32, v: u32) {
@@ -827,10 +932,18 @@ mod tests {
             let chans = [CORE, window(0)];
             if let Some(c) = chans.iter().find(|c| c.put() == o) {
                 let (base, armed) = (c.user_base(), c.armed_base());
+                if self.stall.get() {
+                    self.set(c.put(), v);
+                    return;
+                }
                 let words = self.push.borrow().get(&base).cloned().unwrap_or_default();
                 let mut i = (self.val(c.get()) / 4) as usize;
-                while i < (v / 4) as usize {
+                while i != (v / 4) as usize {
                     let h = words[i];
+                    if h >> 29 == 1 {
+                        i = (h & 0xffc) as usize / 4; // JUMP
+                        continue;
+                    }
                     let (n, m) = ((h >> 18) as usize, h & 0x3ffc);
                     for k in 0..n {
                         let mm = m + 4 * k as u32;
@@ -1085,6 +1198,86 @@ mod tests {
         let after = Faults { wndw0_exc: 0x178, ..before };
         assert!(!after.new_since(&before).bad());
         assert!(Faults { exc_win: 1, ..before }.new_since(&before).bad());
+    }
+
+    /// Window 0 up on the simulator, its push at `at` bytes.
+    fn window0_up<'a>(sim: &'a Sim, wm: &'a Mem<'a>) {
+        let w0 = window(0);
+        init_channel(sim, w0, wm).unwrap();
+        sim.set(w0.armed_base() + WNDW_SET_OFFSET0, 0);
+    }
+
+    /// (A) A flip pushes nouveau's surface methods (present control 1, the
+    /// offset >> 8, UPDATE with RELEASE_ELV), and once fetched the ARMED
+    /// offset is the new one.
+    #[test]
+    fn flip_pushes_offset_and_update() {
+        let sim = Sim::new();
+        let w0 = window(0);
+        let wm = Mem { sim: &sim, base: w0.user_base(), bus: 0x10_1000 };
+        window0_up(&sim, &wm);
+        let mut p = Push::new(&wm, 0x94);
+        sim.set(w0.get(), 0x94);
+        let origin = flip(&sim, w0, &mut p, 0x0100_0000).unwrap();
+        assert_eq!(origin, 0x1_0000);
+        assert_eq!(
+            &sim.push.borrow()[&w0.user_base()][0x94 / 4..0x94 / 4 + 6],
+            &[0x40308, 1, 0x40260, 0x1_0000, 0x40200, 1]
+        );
+        assert!(flip_latched(&sim, w0, &p, origin));
+        assert_eq!(sim.val(w0.armed_base() + WNDW_SET_OFFSET0), 0x1_0000);
+        assert!(!flip_latched(&sim, w0, &p, 0x2_0000));
+    }
+
+    /// (A) A second flip before the channel fetched the first is refused
+    /// and pushes nothing; a misaligned surface is refused.
+    #[test]
+    fn flip_refuses_busy_and_misaligned() {
+        let sim = Sim::new();
+        let w0 = window(0);
+        let wm = Mem { sim: &sim, base: w0.user_base(), bus: 0x10_1000 };
+        window0_up(&sim, &wm);
+        let mut p = Push::new(&wm, 0);
+        assert_eq!(flip(&sim, w0, &mut p, 0x80), Err(FlipError::Misaligned { vram: 0x80 }));
+        sim.stall.set(true);
+        let origin = flip(&sim, w0, &mut p, 0x0100_0000).unwrap();
+        assert!(!flip_latched(&sim, w0, &p, origin));
+        let put = p.put_bytes();
+        assert_eq!(flip(&sim, w0, &mut p, 0x0200_0000), Err(FlipError::Busy { put, get: 0 }));
+        assert_eq!(p.put_bytes(), put);
+        sim.stall.set(false);
+        sim.set(w0.put(), 0);
+        sim.wr32(w0.put(), put); // the channel catches up
+        assert!(flip_latched(&sim, w0, &p, origin));
+    }
+
+    /// (B) Hundreds of flips run past the end of the 4 KiB buffer: each
+    /// wrap is a JUMP to 0 followed by PUT = 0, and every flip latches its
+    /// own offset, alternating like a double buffer.
+    #[test]
+    fn flips_wrap_the_push_buffer() {
+        let sim = Sim::new();
+        let w0 = window(0);
+        let wm = Mem { sim: &sim, base: w0.user_base(), bus: 0x10_1000 };
+        window0_up(&sim, &wm);
+        let start = 0x94;
+        sim.set(w0.get(), start);
+        let mut p = Push::new(&wm, start);
+        let mut wraps = 0;
+        for i in 0..700u64 {
+            let before = p.put_bytes();
+            let vram = 0x0100_0000 * (1 + i % 2);
+            let origin = flip(&sim, w0, &mut p, vram).unwrap();
+            if p.put_bytes() < before {
+                wraps += 1;
+                assert_eq!(sim.push.borrow()[&w0.user_base()][before as usize / 4], jump_header(0));
+            }
+            assert!(flip_latched(&sim, w0, &p, origin), "flip {i}");
+            assert!(p.put_bytes() as usize <= 4096 - 4);
+        }
+        assert_eq!(wraps, 4);
+        // The wrap's PUT = 0 is visible in the write log.
+        assert!(sim.writes.borrow().iter().any(|&(o, v)| o == w0.put() && v == 0));
     }
 
     #[test]

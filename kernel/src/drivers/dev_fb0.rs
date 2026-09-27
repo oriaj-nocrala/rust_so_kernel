@@ -23,6 +23,10 @@
 //
 // Without a shadow (its allocation failed at boot and the console runs in
 // direct mode) there is nothing to map: `open` is `ENODEV`.
+//
+// With page flipping (`gpu=scanout`, `Framebuffer::present`) `FBIO_FLUSH`
+// copies into the buffer not on screen and flips to it at the next vblank;
+// while that flip is pending it returns `EBUSY` and copies nothing.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -33,7 +37,7 @@ use x86_64::structures::paging::PhysFrame;
 use x86_64::{PhysAddr, VirtAddr};
 
 use crate::fs::types::{Errno, Stat};
-use crate::framebuffer::FRAMEBUFFER;
+use crate::framebuffer::{PresentError, FRAMEBUFFER};
 use crate::memory::shm::ShmObject;
 use crate::process::file::{FileError, FileHandle, FileResult};
 
@@ -192,12 +196,20 @@ fn flush(arg: u64) -> i64 {
         Err(e) => return e,
     };
     let _ = core::mem::size_of::<Fb0Flush>(); // the layout the two reads follow
+    let mut list = [(0usize, 0usize, 0usize, 0usize); MAX_FLUSH_RECTS];
+    for (d, r) in list.iter_mut().zip(&rects[..count]) {
+        *d = (r.x as usize, r.y as usize, r.w as usize, r.h as usize);
+    }
     let mut guard = FRAMEBUFFER.lock();
     let Some(fb) = guard.as_mut() else { return errno::ENODEV };
-    for r in &rects[..count] {
-        fb.flush_rect(r.x as usize, r.y as usize, r.w as usize, r.h as usize);
+    match fb.present(&list[..count]) {
+        Ok(()) => 0,
+        // A page flip is still pending: the caller keeps its rectangles
+        // and tries again after the next vblank.
+        Err(PresentError::Busy) => errno::EBUSY,
+        // Shown anyway, on the buffer on screen.
+        Err(PresentError::Failed(_)) => errno::EIO,
     }
-    0
 }
 
 impl FileHandle for Fb0Handle {

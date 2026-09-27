@@ -9,6 +9,10 @@ Code: `kernel/src/framebuffer.rs`, `kernel/src/drivers/{framebuffer_console,dev_
   - Outside a batch, each primitive flushes its own rectangle. `begin_batch`/`end_batch` (they nest) coalesce the flushes; the console wraps each `write` in one batch.
   - **Any new code that writes VRAM without going through `Framebuffer`'s primitives desyncs the shadow.**
   - If the shadow can't be allocated, the console runs in direct mode (`shadow:` in `/proc/fbinfo`).
+- **Page flipping** (`attach_flip`, only with `gpu=scanout`, `docs/reference/gpu.md`): the VRAM side becomes two buffers and a `Scanout` (the display) that flips between them; the GOP mapping is never written again. The shadow stays the only thing drawn into; each buffer keeps a `DirtyRect` of what it has not received.
+  - `flush` (primitives, console, `kalert!`, panic) copies to the *front* buffer (on screen, or the target of a pending flip) and marks the other stale.
+  - `present(rects)` (`FBIO_FLUSH`): `Busy` while the last flip is pending; otherwise copies the other buffer's stale area plus `rects` into it and flips. The buffer on screen is never written by `present`.
+  - Tested by `hw_tests::framebuffer_page_flip_writes_only_the_hidden_buffer` (RAM buffers, fake display).
   - The shadow starts `SHADOW_SKEW` bytes into its allocation: sharing the aperture's alignment caused TLB-slot collisions.
 - **Write-combining**: `memtype::program_pat()` makes PAT entry 1 WC (`WB WC UC- UC WB WT UC- UC`), and `map_write_combining()` points the aperture at it. **Consequence: any mapping with `WRITE_THROUGH` set and `NO_CACHE` clear is WC, not write-through.**
 - Always use `stride`, never `width`, for row offsets.
@@ -32,7 +36,7 @@ Code: `kernel/src/framebuffer.rs`, `kernel/src/drivers/{framebuffer_console,dev_
 - **Holding it is graphics mode**: the console keeps parsing and mirroring but draws nothing, the cursor stops, and `FBIO_BLIT` returns `EBUSY`. `kalert!` and the panic screen still draw.
 - The mode ends in `Drop` of the last handle, so killing the holder gives the console back.
 - `mmap(MAP_SHARED)` maps the **RAM shadow** through a pinned `ShmObject` (a static that is never freed), so it behaves as an ordinary shared mapping.
-- ioctls: `FBIO_GET_INFO` (0x4642_0010; geometry + offset of pixel (0,0)) and `FBIO_FLUSH` (0x4642_0011; up to 16 rectangles).
+- ioctls: `FBIO_GET_INFO` (0x4642_0010; geometry + offset of pixel (0,0)) and `FBIO_FLUSH` (0x4642_0011; up to 16 rectangles). With page flipping, `FBIO_FLUSH` is a flip at the next vblank and returns `EBUSY` (nothing copied) while the previous one is pending, `EIO` if the display refused it (the rectangles were shown on the buffer on screen).
 - Test: `fb0_test` (`fb0_test hold` keeps the picture up for a screendump).
 
 ## Compositor (`compositor`, crate `gui`)
@@ -53,7 +57,7 @@ Code: `kernel/src/framebuffer.rs`, `kernel/src/drivers/{framebuffer_console,dev_
 
   Children are reaped with `syscall::reap_any`.
 - The compositor ignores SIGINT/SIGTSTP; `^\` (SIGQUIT) still kills it.
-- **Pacing.** With `/dev/vblank` (`gpu=vblank`, `docs/reference/gpu.md`) the RAM shadow is the back buffer: on each vblank it first `FBIO_FLUSH`es what the previous frame composed (the copy starts in the blanking interval and outruns the beam), then composes the next frame, so a change shows one frame after it is composed. The vblank fd is in the epoll set only while there is damage or a pending flush; a vblank missing for 50 ms (`VSYNC_GRACE_MS`) is not waited for. Without `/dev/vblank` (QEMU, `gpu=off`): at most one compose + flush every 16 ms, which the 100 Hz tick turns into 20 ms.
+- **Pacing.** With `/dev/vblank` (`gpu=vblank`, `docs/reference/gpu.md`) the RAM shadow is the back buffer: on each vblank it first `FBIO_FLUSH`es what the previous frame composed (the copy starts in the blanking interval and outruns the beam), then composes the next frame, so a change shows one frame after it is composed. The vblank fd is in the epoll set only while there is damage or a pending flush; a vblank missing for 50 ms (`VSYNC_GRACE_MS`) is not waited for. Without `/dev/vblank` (QEMU, `gpu=off`): at most one compose + flush every 16 ms, which the 100 Hz tick turns into 20 ms. With page flipping, an `EBUSY` flush keeps its rectangles; they are merged with the next frame's (bounding box past 16).
 - `REL_Y` is PS/2-signed (up is positive) and is negated for the screen.
 - **Window management** (`gui::compositor`, host-tested):
   - The compositor draws the decorations (title, close, maximize).

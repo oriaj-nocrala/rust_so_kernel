@@ -30,6 +30,11 @@
 //          PRAMIN), the core channel and window 0, and push one UPDATE on
 //          each that repeats what the GOP left (`evo.rs`): the image must
 //          not change. Result in /proc/gpu (`chan:` lines).
+//   scanout (phase 5.3) — also, once the channels are up, scan out two
+//          VRAM buffers of this kernel's instead of the GOP framebuffer
+//          (`scanout.rs`): the framebuffer copies its shadow there and
+//          `FBIO_FLUSH` flips at the next vblank. Result: `scanout:` lines,
+//          `gpu_flip:` in /proc/kdebug.
 //
 // Runs once at boot, after `fs::init` (firmware is on `/mnt`) and before the
 // APs are released (BAR sizing turns decoding off for a few microseconds,
@@ -45,6 +50,7 @@ use nvgpu::id::ChipId;
 use crate::serial_println;
 
 pub mod evo;
+pub mod scanout;
 pub mod vblank;
 
 /// `10de:2507`, the only GPU this driver is for (plan, "No-objetivos").
@@ -334,8 +340,14 @@ fn probe_device(r: &mut String, level: GpuLevel) {
             if level >= GpuLevel::Dispstate {
                 read_dispstate(r, &regs, bars[1].map(|b| (b.addr, b.size)));
             }
-            if level >= GpuLevel::Chan {
-                evo::bring_up(r, &regs, (b, d, fun));
+            let put = if level >= GpuLevel::Chan { evo::bring_up(r, &regs, (b, d, fun)) } else { None };
+            if level >= GpuLevel::Scanout {
+                match put {
+                    Some(put) => scanout::setup(r, &regs, bars[1].map(|b| (b.addr, b.size)), put),
+                    None => {
+                        let _ = writeln!(r, "scanout: not attempted: the channels are not up (see chan:)");
+                    }
+                }
             }
             if level >= GpuLevel::Vblank {
                 vblank::setup(r, &regs, (b, d, fun));

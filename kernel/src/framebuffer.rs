@@ -30,6 +30,46 @@ pub struct Framebuffer {
     /// own rectangle before returning, so a caller that has never heard
     /// of the shadow still leaves the screen up to date.
     batch_depth: u32,
+    /// Two scanout buffers and a display that flips between them, once a
+    /// display driver attached them (`attach_flip`); VRAM writes then go
+    /// there instead of `buffer`.
+    flip: Option<Flip>,
+}
+
+/// A display that can switch which of two buffers it scans out
+/// (`gpu::scanout`, phase 5.3 of `docs/gpu/gpu-plan.md`).
+pub trait Scanout: Send {
+    /// Show buffer `buf` from the next vblank on. `Err` means nothing was
+    /// submitted: the display keeps showing what it showed.
+    fn flip(&mut self, buf: usize) -> Result<(), &'static str>;
+    /// The last flip has taken effect: the buffer it left is no longer
+    /// scanned out and may be written.
+    fn flip_done(&mut self) -> bool;
+}
+
+/// Page flipping state. The RAM shadow stays the only thing drawn into;
+/// each buffer is a copy of it that lags by `stale`.
+struct Flip {
+    bufs: [NonNull<u8>; 2],
+    /// The buffer writes that must show go to: the one scanned out, or the
+    /// one a pending flip will scan out.
+    front: usize,
+    /// What of the shadow each buffer has not received.
+    stale: [hal::fbdirty::DirtyRect; 2],
+    /// A flip was submitted and has not been seen done: the other buffer
+    /// may still be scanned out, so nothing writes it.
+    pending: bool,
+    scanout: alloc::boxed::Box<dyn Scanout>,
+}
+
+/// Why `present` did not flip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentError {
+    /// The previous flip has not taken effect yet (try after a vblank).
+    Busy,
+    /// The display refused the flip; the rectangles were copied to the
+    /// buffer on screen instead (they show, maybe torn).
+    Failed(&'static str),
 }
 
 // SAFETY: El framebuffer es solo memoria de video, podemos compartirlo
@@ -53,6 +93,7 @@ impl Framebuffer {
             shadow: None,
             dirty: hal::fbdirty::DirtyRect::new(width, height),
             batch_depth: 0,
+            flip: None,
         }
     }
 
@@ -124,35 +165,144 @@ impl Framebuffer {
     /// padding is never written, same as every primitive. This is the
     /// only place VRAM is touched in shadow mode, so `fb_flush`'s MB/s in
     /// `/proc/fbinfo` is the real write bandwidth to the aperture.
+    ///
+    /// With page flipping the copy goes to the front buffer (the one on
+    /// screen, or about to be), and the other one records it as stale.
     pub fn flush(&mut self) {
-        let Some(shadow) = self.shadow else { return };
+        if self.shadow.is_none() {
+            return;
+        }
         let Some(r) = self.dirty.take() else { return };
+        let dst = match self.flip.as_mut() {
+            Some(f) => {
+                f.stale[1 - f.front].mark(r.x0, r.y0, r.width(), r.height());
+                f.bufs[f.front]
+            }
+            None => self.buffer,
+        };
+        self.copy_out(dst, r);
+        // With the aperture WC the stores above may still sit in the
+        // write-combining buffers; draining them here makes `fb_flush`
+        // measure the data leaving the CPU, not just the stores retiring,
+        // and puts the frame on screen before the caller moves on.
+        sfence();
+    }
+
+    /// Copy rectangle `r` (clipped to the screen) of the shadow to `dst`,
+    /// a VRAM buffer of the same layout, and account it in `fb_flush`. The
+    /// caller fences.
+    fn copy_out(&self, dst: NonNull<u8>, r: hal::fbdirty::Rect) {
+        let Some(shadow) = self.shadow else { return };
         let t0 = crate::cpu::tsc::read();
         let bpp = self.bytes_per_pixel;
         let row_bytes = self.stride * bpp;
         let span = r.width() * bpp;
         for row in r.y0..r.y1 {
             let off = row * row_bytes + r.x0 * bpp;
-            // SAFETY: `DirtyRect` clips to `width` x `height`, so
-            // `off + span` stays inside `byte_len()` in both buffers,
-            // and the shadow never overlaps the VRAM mapping.
+            // SAFETY: every rectangle here comes from a `DirtyRect`, which
+            // clips to `width` x `height`, so `off + span` stays inside
+            // `byte_len()` in both buffers; the shadow never overlaps VRAM.
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    shadow.as_ptr().add(off),
-                    self.buffer.as_ptr().add(off),
-                    span,
-                );
+                core::ptr::copy_nonoverlapping(shadow.as_ptr().add(off), dst.as_ptr().add(off), span);
             }
         }
-        // With the aperture WC the stores above may still sit in the
-        // write-combining buffers; draining them here makes `fb_flush`
-        // measure the data leaving the CPU, not just the stores retiring,
-        // and puts the frame on screen before the caller moves on.
+        crate::debug::FB_FLUSH.record((r.height() * span) as u64, crate::cpu::tsc::read().wrapping_sub(t0));
+    }
+
+    /// Start scanning out from `bufs` (two VRAM buffers of `byte_len()`
+    /// bytes, this framebuffer's layout, mapped for as long as the screen
+    /// lives). The whole shadow is copied into both first; then
+    /// `scanout.flip(0)` switches the display, and returns once it is done
+    /// (it is only called at boot). Returns false, attaching nothing, if
+    /// there is no shadow or the display refused the flip.
+    pub fn attach_flip(&mut self, bufs: [&'static mut [u8]; 2], mut scanout: alloc::boxed::Box<dyn Scanout>) -> Result<(), &'static str> {
+        if self.shadow.is_none() {
+            return Err("no shadow");
+        }
+        if bufs.iter().any(|b| b.len() < self.byte_len()) {
+            return Err("buffer smaller than the screen");
+        }
+        self.flush();
+        let bufs = bufs.map(|b| NonNull::new(b.as_mut_ptr()).unwrap());
+        let all = hal::fbdirty::Rect { x0: 0, y0: 0, x1: self.width, y1: self.height };
+        for b in bufs {
+            self.copy_out(b, all);
+        }
         sfence();
-        crate::debug::FB_FLUSH.record(
-            (r.height() * span) as u64,
-            crate::cpu::tsc::read().wrapping_sub(t0),
-        );
+        scanout.flip(0)?;
+        self.flip = Some(Flip {
+            bufs,
+            front: 0,
+            stale: [hal::fbdirty::DirtyRect::new(self.width, self.height); 2],
+            pending: true,
+            scanout,
+        });
+        Ok(())
+    }
+
+    /// Whether the last flip is done (no flip pending), asking the display.
+    pub fn flip_settled(&mut self) -> bool {
+        match self.flip.as_mut() {
+            Some(f) if f.pending => {
+                if f.scanout.flip_done() {
+                    f.pending = false;
+                }
+                !f.pending
+            }
+            _ => true,
+        }
+    }
+
+    /// Make these shadow rectangles visible. Without page flipping, copied
+    /// to VRAM now (`flush_rect` each). With it: copied, with whatever else
+    /// that buffer missed, into the buffer not on screen, then a flip to it
+    /// at the next vblank — so what shows is always a whole frame.
+    /// `Busy` while the previous flip is pending: nothing is copied and the
+    /// caller keeps its rectangles.
+    pub fn present(&mut self, rects: &[(usize, usize, usize, usize)]) -> Result<(), PresentError> {
+        if self.flip.is_none() {
+            for &(x, y, w, h) in rects {
+                self.flush_rect(x, y, w, h);
+            }
+            return Ok(());
+        }
+        self.flush();
+        if !self.flip_settled() {
+            return Err(PresentError::Busy);
+        }
+        let (w, h) = (self.width, self.height);
+        let mut f = self.flip.take().unwrap();
+        let back = 1 - f.front;
+        let mut now = hal::fbdirty::DirtyRect::new(w, h);
+        for &(x, y, rw, rh) in rects {
+            f.stale[back].mark(x, y, rw, rh);
+            now.mark(x, y, rw, rh);
+        }
+        if let Some(r) = f.stale[back].take() {
+            self.copy_out(f.bufs[back], r);
+        }
+        sfence();
+        let res = f.scanout.flip(back);
+        match res {
+            Ok(()) => {
+                // The old front lacks this frame's rectangles.
+                if let Some(r) = now.take() {
+                    f.stale[f.front].mark(r.x0, r.y0, r.width(), r.height());
+                }
+                f.front = back;
+                f.pending = true;
+            }
+            Err(_) => {
+                // Nothing was submitted: show the rectangles on the buffer
+                // that is on screen, and remember the back one has them.
+                if let Some(r) = now.take() {
+                    self.copy_out(f.bufs[f.front], r);
+                }
+                sfence();
+            }
+        }
+        self.flip = Some(f);
+        res.map_err(PresentError::Failed)
     }
 
     /// Limpia toda la pantalla con el color especificado

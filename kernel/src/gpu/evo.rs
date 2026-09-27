@@ -95,7 +95,9 @@ fn diff_line(r: &mut String, what: &str, before: &[(u32, u32)], after: &[(u32, u
     unexpected.is_empty()
 }
 
-pub fn bring_up(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8)) {
+/// Returns window 0's push position (PUT, bytes) when every step went as
+/// expected, so page flips (`scanout.rs`) carry on in the same buffer.
+pub fn bring_up(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8)) -> Option<u32> {
     let t0 = crate::cpu::tsc::read();
     let core_methods: Vec<u32> = nvgpu::dispstate::core_methods().collect();
     // nouveau's window list plus the ILUT methods (`clc67e.h:500-514`),
@@ -133,11 +135,11 @@ pub fn bring_up(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8)) {
     faults_line(r, "before", &start);
     if owner & evo::DISP_OWNER_VBIOS != 0 {
         let _ = writeln!(r, "chan: STOP: the VBIOS still owns the display (nouveau would claim it; this phase does not)");
-        return;
+        return None;
     }
     if vram < evo::INST_VRAM + evo::INST_SIZE as u64 {
         let _ = writeln!(r, "chan: STOP: VRAM too small for the instance memory at {:#x}", evo::INST_VRAM);
-        return;
+        return None;
     }
     let core_armed0 = armed(regs, evo::CORE, &core_methods);
     let wndw_armed0 = armed(regs, w0, &wndw_methods);
@@ -149,7 +151,7 @@ pub fn bring_up(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8)) {
         (Ok(a), Ok(b)) => [a, b],
         (a, b) => {
             let _ = writeln!(r, "chan: STOP: push buffers: {:?} {:?}", a.err(), b.err());
-            return;
+            return None;
         }
     };
     let _ = writeln!(r, "chan: push core {:#x} wndw0 {:#x}", bufs[0].bus_addr(), bufs[1].bus_addr());
@@ -176,7 +178,7 @@ pub fn bring_up(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8)) {
         }
         Err(e) => {
             let _ = writeln!(r, "chan: STOP: instance memory: {:?}", e);
-            return;
+            return None;
         }
     }
     let changed = evo::copy_caps(regs);
@@ -189,17 +191,17 @@ pub fn bring_up(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8)) {
         regs.rd32(evo::DISP_INST_ADDR)
     );
     if !check(r, regs, "display init", &start) {
-        return;
+        return None;
     }
 
     // --- Core channel.
     if let Err(e) = evo::init_channel(regs, evo::CORE, &bufs[0]) {
         report_chan_error(r, regs, "core init", e);
-        return;
+        return None;
     }
     let _ = writeln!(r, "chan: core up: ctl {:#x} status {:#x} get {:#x}", regs.rd32(evo::CORE.control()), regs.rd32(evo::CORE.status().0), regs.rd32(evo::CORE.get()));
     if !check(r, regs, "core init", &start) {
-        return;
+        return None;
     }
     let differ = evo::gate(regs, evo::CORE, &core_methods, &evo::CORE_PUSHED);
     if !differ.is_empty() {
@@ -208,35 +210,35 @@ pub fn bring_up(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8)) {
             let _ = write!(r, " {:04x} assembly {:08x} armed {:08x}", m, a, b);
         }
         let _ = writeln!(r);
-        return;
+        return None;
     }
     let _ = writeln!(r, "chan: core gate: ASSEMBLY = ARMED on {} methods", core_methods.len() - evo::CORE_PUSHED.len());
     let mut push = Push::new(&bufs[0], 0);
     let res = evo::push_core_update(&mut push).and_then(|_| evo::kick(regs, evo::CORE, &push));
     if let Err(e) = res {
         report_chan_error(r, regs, "core UPDATE", e);
-        return;
+        return None;
     }
     // The UPDATE latches at the next vblank: give it two frames.
     regs.udelay(40_000);
     let _ = writeln!(r, "chan: core UPDATE done: put/get {:#x}", regs.rd32(evo::CORE.get()));
     if !check(r, regs, "core UPDATE", &start) {
-        return;
+        return None;
     }
     let core_ok = diff_line(r, "core", &core_armed0, &armed(regs, evo::CORE, &core_methods), &evo::CORE_PUSHED);
 
     // --- Window 0.
     if ilut != 0 && !evo::is_pri_error(ilut) {
         let _ = writeln!(r, "chan: STOP: window 0's ILUT names context DMA {:#x}, not in this RAMHT", ilut);
-        return;
+        return None;
     }
     if let Err(e) = evo::init_channel(regs, w0, &bufs[1]) {
         report_chan_error(r, regs, "window 0 init", e);
-        return;
+        return None;
     }
     let _ = writeln!(r, "chan: window 0 up: ctl {:#x} status {:#x}", regs.rd32(w0.control()), regs.rd32(w0.status().0));
     if !check(r, regs, "window 0 init", &start) {
-        return;
+        return None;
     }
     // A window channel starts with a reset ASSEMBLY (boot #73): put back
     // the ARMED value of every method that differs, re-check, then UPDATE.
@@ -256,10 +258,10 @@ pub fn bring_up(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8)) {
     let mut push = Push::new(&bufs[1], 0);
     if let Err(e) = evo::push_window_state(&mut push, &restore, evo::HANDLE_WNDW_CTX).and_then(|_| evo::kick(regs, w0, &push)) {
         report_chan_error(r, regs, "window 0 state", e);
-        return;
+        return None;
     }
     if !check(r, regs, "window 0 state", &start) {
-        return;
+        return None;
     }
     let still = wndw_gate();
     if !still.is_empty() {
@@ -268,17 +270,17 @@ pub fn bring_up(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8)) {
             let _ = write!(r, " {:04x} assembly {:08x} armed {:08x}", m, a, b);
         }
         let _ = writeln!(r);
-        return;
+        return None;
     }
     let _ = writeln!(r, "chan: window 0 gate: ASSEMBLY = ARMED (put {:#x})", push.put_bytes());
     if let Err(e) = evo::push_update(&mut push).and_then(|_| evo::kick(regs, w0, &push)) {
         report_chan_error(r, regs, "window 0 UPDATE", e);
-        return;
+        return None;
     }
     let latched = evo::wait(regs, || regs.rd32(w0.armed_base() + evo::WNDW_SET_CONTEXT_DMA_ISO0) == evo::HANDLE_WNDW_CTX);
     let _ = writeln!(r, "chan: window 0 UPDATE {}", if latched { "latched" } else { "NOT latched (ARMED ctxdma unchanged)" });
     if !check(r, regs, "window 0 UPDATE", &start) {
-        return;
+        return None;
     }
     let wndw_ok = diff_line(r, "window 0", &wndw_armed0, &armed(regs, w0, &wndw_methods), &evo::WNDW_PUSHED);
     let _ = writeln!(
@@ -287,6 +289,12 @@ pub fn bring_up(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8)) {
         if core_ok && wndw_ok && latched { "OK: channels up, both UPDATEs latched only what was pushed" } else { "DONE with differences (see above)" },
         super::ms_since(t0)
     );
+    (core_ok && wndw_ok && latched).then(|| push.put_bytes())
+}
+
+/// Window 0's push buffer, once `bring_up` allocated it.
+pub fn window_push() -> Option<&'static PushBuf> {
+    PUSH.get().map(|b| &b[1])
 }
 
 fn report_chan_error(r: &mut String, regs: &Bar0, step: &str, e: ChanError) {

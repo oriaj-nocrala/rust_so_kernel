@@ -75,6 +75,11 @@ pub enum GpuLevel {
     /// repeats the state the GOP left: the image must not change. Leaves
     /// both channels running and bus mastering on.
     Chan,
+    /// Phase 5.3: also scan out from two buffers of this kernel's own in
+    /// VRAM (BAR1, write-combining) instead of the GOP framebuffer, same
+    /// mode; the framebuffer copies its RAM shadow there and `/dev/fb0`'s
+    /// `FBIO_FLUSH` becomes a page flip at the next vblank.
+    Scanout,
 }
 
 impl GpuLevel {
@@ -89,6 +94,7 @@ impl GpuLevel {
             "vblank" => Some(GpuLevel::Vblank),
             "dispstate" => Some(GpuLevel::Dispstate),
             "chan" => Some(GpuLevel::Chan),
+            "scanout" => Some(GpuLevel::Scanout),
             _ => None,
         }
     }
@@ -127,6 +133,8 @@ mod tests {
         assert_eq!(GpuLevel::parse("dispstate"), Some(GpuLevel::Dispstate));
         assert_eq!(GpuLevel::parse("gsp"), None);
         assert_eq!(GpuLevel::parse("chan"), Some(GpuLevel::Chan));
+        assert_eq!(GpuLevel::parse("scanout"), Some(GpuLevel::Scanout));
+        assert!(GpuLevel::Scanout > GpuLevel::Chan);
         assert!(GpuLevel::Chan > GpuLevel::Dispstate && GpuLevel::Dispstate > GpuLevel::Vblank);
         assert!(GpuLevel::Vblank > GpuLevel::Disp && GpuLevel::Disp > GpuLevel::Probe && GpuLevel::Probe > GpuLevel::Off);
     }

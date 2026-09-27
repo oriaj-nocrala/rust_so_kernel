@@ -8,10 +8,10 @@
 //
 // The MSI goes to CPU 0 and its work is global: one sequence number (the
 // primary head's vblanks), per-head counters, and a poll wakeup for
-// `/dev/vblank` (`drivers/dev_vblank.rs`). The handler is the only user
-// of BAR0 once the boot has finished; it runs on one CPU, and the GPU
-// sends no second MSI before the handler rearms, so it never overlaps
-// itself.
+// `/dev/vblank` (`drivers/dev_vblank.rs`). After the boot BAR0 has two
+// users: this handler, which runs on one CPU and never overlaps itself (the
+// GPU sends no second MSI before it rearms), and page flips (`scanout.rs`),
+// which touch only window 0's channel registers, none of the handler's.
 
 use alloc::string::String;
 use core::fmt::Write;

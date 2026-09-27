@@ -678,6 +678,140 @@ fn framebuffer_shadow_mode_flushes_exactly_what_changed() {
     assert!(!fb.attach_shadow(other), "attach_shadow must not replace an attached shadow");
 }
 
+/// Page flipping (`Framebuffer::attach_flip`/`present`, phase 5.3 of
+/// `docs/gpu/gpu-plan.md`) with RAM for the two VRAM buffers and a fake
+/// display (`Scanout`) whose flips the test completes by hand. The real
+/// display is the Ryzen's GPU, which QEMU has not; this pins the
+/// framebuffer's side of the contract:
+/// 1. attaching copies the shadow into both buffers and flips to buffer 0;
+///    the old (GOP) buffer is never written again;
+/// 2. while a flip is pending, `present` is `Busy` and copies nothing;
+/// 3. a present writes only the buffer not on screen, and afterwards that
+///    buffer equals the shadow: it also got what the other frame changed;
+/// 4. primitives (console, `kalert!`) write the front buffer and the next
+///    present brings the other one up to date;
+/// 5. a refused flip shows the rectangles on the buffer on screen and the
+///    next present still converges;
+/// 6. `stride` padding is never written.
+#[test_case]
+fn framebuffer_page_flip_writes_only_the_hidden_buffer() {
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use alloc::vec;
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use crate::framebuffer::{Color, Framebuffer, PresentError, Scanout};
+
+    const W: usize = 32;
+    const H: usize = 24;
+    const STRIDE: usize = 40;
+    const BPP: usize = 4;
+    const LEN: usize = H * STRIDE * BPP;
+
+    struct Fake {
+        shown: Arc<AtomicUsize>,
+        done: Arc<AtomicBool>,
+        refuse: Arc<AtomicBool>,
+    }
+    impl Scanout for Fake {
+        fn flip(&mut self, buf: usize) -> Result<(), &'static str> {
+            if self.refuse.load(Ordering::SeqCst) {
+                return Err("refused");
+            }
+            self.shown.store(buf, Ordering::SeqCst);
+            self.done.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+        fn flip_done(&mut self) -> bool {
+            self.done.load(Ordering::SeqCst)
+        }
+    }
+
+    let leak = |fill: u8| -> &'static mut [u8] { Box::leak(vec![fill; LEN].into_boxed_slice()) };
+    let gop = leak(0xAA);
+    let shadow = leak(0);
+    let (a, b) = (leak(0xAA), leak(0xAA));
+    let base = |s: &[u8]| s.as_ptr() as usize;
+    let (gop_b, shadow_b, bufs_b) = (base(gop), base(shadow), [base(a), base(b)]);
+    // SAFETY (helpers): leaked buffers of `LEN` bytes, alive for the boot.
+    let bytes = |p: usize| -> alloc::vec::Vec<u8> { unsafe { core::slice::from_raw_parts(p as *const u8, LEN) }.to_vec() };
+    let visible_eq = |p: usize| -> bool {
+        let (x, s) = (bytes(p), bytes(shadow_b));
+        (0..H).all(|y| x[y * STRIDE * BPP..(y * STRIDE + W) * BPP] == s[y * STRIDE * BPP..(y * STRIDE + W) * BPP])
+    };
+    let padding_ok = |p: usize| -> bool {
+        let x = bytes(p);
+        (0..H).all(|y| x[(y * STRIDE + W) * BPP..(y + 1) * STRIDE * BPP].iter().all(|&v| v == 0xAA))
+    };
+    // The compositor writes the shadow through its own mapping.
+    let paint = |x0: usize, y0: usize, w: usize, h: usize, v: u32| {
+        for y in y0..y0 + h {
+            for x in x0..x0 + w {
+                unsafe { *((shadow_b + (y * STRIDE + x) * BPP) as *mut u32) = v };
+            }
+        }
+    };
+    let px = |p: usize, x: usize, y: usize| -> u32 { unsafe { *((p + (y * STRIDE + x) * BPP) as *const u32) } };
+
+    let mut fb = Framebuffer::new(gop, W, H, STRIDE, BPP);
+    assert!(fb.attach_shadow(shadow));
+    fb.fill_rect(1, 1, 4, 4, Color::rgb(0x10, 0x20, 0x30));
+    let shown = Arc::new(AtomicUsize::new(9));
+    let done = Arc::new(AtomicBool::new(false));
+    let refuse = Arc::new(AtomicBool::new(false));
+    let fake = Fake { shown: shown.clone(), done: done.clone(), refuse: refuse.clone() };
+
+    // (1)
+    assert_eq!(fb.attach_flip([a, b], Box::new(fake)), Ok(()));
+    assert_eq!(shown.load(Ordering::SeqCst), 0);
+    assert!(visible_eq(bufs_b[0]) && visible_eq(bufs_b[1]), "attach copies the shadow into both buffers");
+    let gop_after_attach = bytes(gop_b);
+
+    // (2)
+    paint(10, 10, 3, 3, 0x0011_2233);
+    let (a0, b0) = (bytes(bufs_b[0]), bytes(bufs_b[1]));
+    assert_eq!(fb.present(&[(10, 10, 3, 3)]), Err(PresentError::Busy));
+    assert!(bytes(bufs_b[0]) == a0 && bytes(bufs_b[1]) == b0, "a busy present copied something");
+
+    // (3) buffer 0 on screen: only buffer 1 is written.
+    done.store(true, Ordering::SeqCst);
+    assert_eq!(fb.present(&[(10, 10, 3, 3)]), Ok(()));
+    assert_eq!(shown.load(Ordering::SeqCst), 1);
+    assert!(bytes(bufs_b[0]) == a0, "present wrote the buffer on screen");
+    assert!(visible_eq(bufs_b[1]));
+    // Buffer 1 now on screen; the next frame goes to 0 and catches up.
+    done.store(true, Ordering::SeqCst);
+    paint(20, 2, 5, 5, 0x0044_5566);
+    let b1 = bytes(bufs_b[1]);
+    assert_eq!(fb.present(&[(20, 2, 5, 5)]), Ok(()));
+    assert_eq!(shown.load(Ordering::SeqCst), 0);
+    assert!(bytes(bufs_b[1]) == b1, "present wrote the buffer on screen");
+    assert!(visible_eq(bufs_b[0]), "buffer 0 missed the previous frame's rectangle");
+    assert_eq!(px(bufs_b[0], 11, 11), 0x0011_2233);
+
+    // (4) a primitive during the pending flip lands on the new front (0).
+    fb.fill_rect(0, 20, W, 2, Color::rgb(0xFF, 0, 0));
+    assert!(visible_eq(bufs_b[0]));
+    assert!(bytes(bufs_b[1]) == b1, "a primitive wrote the buffer still on screen");
+    done.store(true, Ordering::SeqCst);
+    assert_eq!(fb.present(&[]), Ok(()));
+    assert!(visible_eq(bufs_b[1]), "the primitive's rectangle did not reach the other buffer");
+
+    // (5) buffer 1 on screen; a refused flip shows on it.
+    done.store(true, Ordering::SeqCst);
+    refuse.store(true, Ordering::SeqCst);
+    paint(0, 0, 2, 2, 0x0077_7777);
+    assert_eq!(fb.present(&[(0, 0, 2, 2)]), Err(PresentError::Failed("refused")));
+    assert_eq!(px(bufs_b[1], 1, 1), 0x0077_7777, "a refused flip must still show the rectangles");
+    refuse.store(false, Ordering::SeqCst);
+    assert_eq!(fb.present(&[]), Ok(()));
+    assert_eq!(shown.load(Ordering::SeqCst), 0);
+    assert!(visible_eq(bufs_b[0]) && visible_eq(bufs_b[1]));
+
+    // (1)/(6)
+    assert!(bytes(gop_b) == gop_after_attach, "the GOP buffer was written after attach_flip");
+    assert!(padding_ok(bufs_b[0]) && padding_ok(bufs_b[1]), "stride padding written");
+}
+
 /// Phase 2 of `docs/fb/wc-shadow-plan.md`: `program_pat` (run by
 /// `boot_for_tests`, as by the real boot) made PAT entry 1 WC, left the
 /// other seven entries exactly as they were, and the live `IA32_PAT` —

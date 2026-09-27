@@ -7,7 +7,7 @@ Plan and decisions: `docs/gpu/gpu-plan.md`. This page is the current state. Pure
 - UEFI gives no command line. `key=value` words are read once after `fs::init` from `/mnt/etc/kernel.conf`, then `/mnt/autorun/kernel.conf` (later wins; `#` comments). Before that, everything is at its default.
 - `/mnt/autorun/kernel.conf` is written by `scripts/metal-run.sh --kconf '...'` and removed with `autorun/`, so an option applies to one unattended run only.
 - `disk-image-root/etc/kernel.conf` is gitignored: a checkout's own options.
-- `gpu=` (`hal::bootopts::GpuLevel`): `off` (default: the GPU is not touched), `probe`, `disp`, `vblank`, `dispstate`, `chan`. Each level does everything the previous ones do. An unknown value is logged and read as `off`.
+- `gpu=` (`hal::bootopts::GpuLevel`): `off` (default: the GPU is not touched), `probe`, `disp`, `vblank`, `dispstate`, `chan`, `scanout`. Each level does everything the previous ones do. An unknown value is logged and read as `off`.
 - `disk-image-root/etc/` is not synced to `disk.img` (only `etc/gui` is). To try a level in QEMU, write the file into the image: `debugfs -w -R "write <file> /etc/kernel.conf" disk.img` (and `rm` it after).
 
 ## `gpu=probe` (phase 1)
@@ -65,6 +65,19 @@ Everything `dispstate` does; then, before arming vblank, `gpu::evo::bring_up` (`
 - **Faults** are polled, never enabled as interrupts: CTRL_DISP `0x611c30` (supervisors, error), EXC_OTHER/WIN/WINIM `0x611854/4c/50`, compared with what was there before. The per-channel exception slots are not zero at rest (`0x80`) and are only meaningful when an EXC bit is set.
 - Report: `chan:` lines in `/proc/gpu` and the log, ending in `chan: OK: ...` or `chan: STOP: ...`. Afterwards both channels stay running and idle.
 - Metal job: `touch build.rs` (the root build does not watch `nvgpu`), then `scripts/metal-run.sh --kconf 'gpu=chan' scripts/metal-jobs/gpu-chan.sh`. Ryzen boot #74: OK.
+
+## `gpu=scanout` (phase 5.3)
+
+Everything `chan` does; if `bring_up` ended OK (it returns window 0's PUT), `gpu::scanout::setup`, still at boot before vblank is armed:
+- **Buffers**: two in VRAM at 16 MiB and 32 MiB (`BUF_VRAM`; = BAR1 offsets), one WC mapping of BAR1 [16, 48) MiB. Same layout as the GOP framebuffer (pitch 8192); STOP unless window 0's ARMED surface is the framebuffer's size and pitch, pitch-linear.
+- **Attach** (`Framebuffer::attach_flip`): the RAM shadow is copied into both buffers, then a flip to buffer 0. Each boot flip is timed (`scanout: flip ...: fetched/armed/loadv/vblank +N us vline V`): when window 0 fetched the push, when its ARMED `SET_OFFSET` changed, when the head's LOADV and VBLANK status bits latched.
+- **Proof**: the GOP framebuffer (VRAM 0) is then painted dark red. A red screen means window 0 still scans it.
+- Two more flips (buffer 1, back to 0), then `scanout: OK: ...` or `scanout: STOP: ...`.
+- **Flip** (`nvgpu::evo::flip`): `SET_PRESENT_CONTROL = 1` (non-tearing, nouveau's value; the GOP leaves 0), `SET_OFFSET(0) = vram >> 8`, UPDATE; PUT written, not waited on. Refused while the previous push is unfetched. The 4 KiB push buffer wraps with a JUMP to 0 then PUT = 0 (`evo::wind`, nouveau's `nv50_dmac_wind`).
+- **Done** (`Scanout::flip_done`): GET = PUT, ARMED offset = requested, and (once vblank interrupts run) the vblank sequence moved past the one at submit. **ARMED changes within µs of the UPDATE, not at the vblank** (Ryzen #76); LOADV latches at the next vblank. So the vblank condition is what makes it a completion.
+- At runtime `flip`/`flip_done` run under `FRAMEBUFFER` (from `FBIO_FLUSH`, any CPU, IF=1) and touch only window 0's PUT/GET/ARMED registers; the vblank handler never touches those, so BAR0 needs no lock.
+- `/proc/kdebug`: `gpu_flip: submitted latched not_yet refused shown latency_us last max avg vblanks_per_flip sum max` (latency = submit to the first `flip_done` that saw it done: an upper bound).
+- Metal job: `touch build.rs`, then `scripts/metal-run.sh --kconf 'gpu=scanout' scripts/metal-jobs/gpu-scanout.sh`. Ryzen #75/#76: OK, ~1000 flips in 20 s of `compositor fire`, none refused.
 
 ## Oracle tools (`scripts/gpu-trace.py`)
 

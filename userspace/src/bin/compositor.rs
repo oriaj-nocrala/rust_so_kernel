@@ -16,7 +16,10 @@
 //! previous frame composed — the copy starts in the blanking interval and
 //! outruns the beam, so no tearing — and then composes the next frame. A
 //! vblank that does not come within `VSYNC_GRACE_MS` is not waited for.
-//! Without it, at most one compose + `FBIO_FLUSH` every 16 ms.
+//! Without it, at most one compose + `FBIO_FLUSH` every 16 ms. With the
+//! kernel's page flipping (`gpu=scanout`) the flush is a flip at the next
+//! vblank; `EBUSY` means the previous flip has not landed, and that frame's
+//! rectangles go out with the next one.
 //!
 //! `compositor [prog...]` starts each `prog` (from `/bin` or `/mnt/bin`
 //! unless it has a `/`) once the socket is listening; with no arguments it
@@ -51,6 +54,7 @@ const VSYNC_GRACE_MS: i64 = 50;
 
 const FBIO_GET_INFO: u64 = 0x4642_0010;
 const FBIO_FLUSH: u64 = 0x4642_0011;
+const EBUSY: i64 = -16;
 const EVIOCGRAB: u64 = 0x4004_4590;
 
 const EV_SYN: u16 = 0;
@@ -91,6 +95,25 @@ struct Fb0Flush {
     count: u32,
     _pad: u32,
     rects: [Fb0Rect; 16],
+}
+
+/// `a`'s rectangles followed by `b`'s: a frame whose flush the kernel
+/// refused (`EBUSY`, a page flip still pending) is presented together with
+/// the next one. Past 16 rectangles, their bounding box.
+fn merge(a: Option<Fb0Flush>, b: Fb0Flush) -> Fb0Flush {
+    let Some(mut a) = a else { return b };
+    let (na, nb) = (a.count as usize, b.count as usize);
+    if na + nb <= a.rects.len() {
+        a.rects[na..na + nb].copy_from_slice(&b.rects[..nb]);
+        a.count += b.count;
+        return a;
+    }
+    let all = a.rects[..na].iter().chain(&b.rects[..nb]);
+    let (x0, y0) = all.clone().fold((u32::MAX, u32::MAX), |(x, y), r| (x.min(r.x), y.min(r.y)));
+    let (x1, y1) = all.fold((0, 0), |(x, y), r| (x.max(r.x + r.w), y.max(r.y + r.h)));
+    let mut m = Fb0Flush { count: 1, _pad: 0, rects: [Fb0Rect::default(); 16] };
+    m.rects[0] = Fb0Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    m
 }
 
 /// Marks the current vblank seen (`/dev/vblank`'s record: sequence number,
@@ -355,6 +378,8 @@ fn main(args: Args) -> i32 {
     let mut watching = false;
     let mut wait_from: i64 = 0;
     let (mut on_vblank, mut on_timeout) = (0u64, 0u64);
+    // Presents the kernel refused because its page flip was still pending.
+    let mut flip_busy = 0u64;
 
     while !comp.quit_requested() {
         let busy = comp.has_damage() || comp.has_frame_callbacks();
@@ -393,7 +418,10 @@ fn main(args: Args) -> i32 {
             }
             if tick {
                 if let Some(fl) = pending.take() {
-                    syscall::ioctl(fb, FBIO_FLUSH, &fl as *const Fb0Flush as u64);
+                    if syscall::ioctl(fb, FBIO_FLUSH, &fl as *const Fb0Flush as u64) == EBUSY {
+                        pending = Some(fl); // the last flip has not landed: next vblank
+                        flip_busy += 1;
+                    }
                 }
                 wait_from = syscall::uptime_ms();
             }
@@ -468,7 +496,7 @@ fn main(args: Args) -> i32 {
                     *d = Fb0Rect { x: r.x as u32, y: r.y as u32, w: r.w as u32, h: r.h as u32 };
                 }
                 if vblank >= 0 {
-                    pending = Some(fl); // the next vblank shows it
+                    pending = Some(merge(pending.take(), fl)); // the next vblank shows it
                 } else {
                     syscall::ioctl(fb, FBIO_FLUSH, &fl as *const Fb0Flush as u64);
                 }
@@ -483,7 +511,7 @@ fn main(args: Args) -> i32 {
 
     println!("compositor: quit after {} frames, {} ms composing + flushing", frames, compose_ms_total);
     if vblank >= 0 {
-        println!("compositor: presented {} times on vblank, {} by the {} ms grace timeout", on_vblank, on_timeout, VSYNC_GRACE_MS);
+        println!("compositor: presented {} times on vblank, {} by the {} ms grace timeout, {} deferred (flip pending)", on_vblank, on_timeout, VSYNC_GRACE_MS, flip_busy);
         syscall::close(vblank);
     }
     for (_, fd) in core::mem::take(&mut io.sockets) {
