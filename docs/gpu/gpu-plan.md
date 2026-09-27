@@ -3,8 +3,10 @@
 > **Estado (2026-09-26):** **fase 0 cerrada.** Trazas capturadas, válidas y
 > segmentadas (ver "Resultados de la fase 0"); D1 = **570.144** y D6 =
 > **modeset propio sin GSP**, ambas medidas. **Fase 1 cerrada**
-> (a6c221a, Ryzen boot #66; ver "Resultados de la fase 1"). Siguiente:
-> fase 2. Ninguna fase se da por hecha sin su criterio medido en la Ryzen.
+> (a6c221a, Ryzen boot #66; ver "Resultados de la fase 1"). **Fase 2
+> cerrada** (Ryzen boot #67; ver "Resultados de la fase 2"). Siguiente:
+> fase 3. Ninguna fase se da por hecha sin su
+> criterio medido en la Ryzen.
 
 ## Objetivo
 
@@ -277,6 +279,49 @@ scripts/metal-jobs/gpu-probe.sh`, veredicto OK):**
 - La máquina reinició a Linux y retomó la sesión: el sondeo no dejó la GPU
   mal (no hay foto de la pantalla del arranque de constanos).
 
+## Resultados de la fase 2 (2026-09-27)
+
+Estado actual en `docs/reference/gpu.md`. Medido en host y QEMU:
+- **Oráculo:** `gpu-trace.py aux trace-nogsp 3` lista las 41+ transacciones
+  AUX del ASUS; de ellas salen su DPCD (0x2200: DPCD 1.4, HBR2, 4 carriles)
+  y su EDID, idéntico byte a byte al de sysfs. `gpu-trace.py i2c trace-nogsp
+  5` decodifica el bit-banging del HP y da su EDID idéntico: el mapa de bits
+  del puerto (SCL/SDA en 0/1, lectura en 4/5) está medido, no supuesto.
+- **Hallazgos de la traza:** nouveau deja el bit auto-DPCD del canal AUX
+  borrado para siempre (`auxch.h:10` pasa `false` en los dos sentidos) y
+  enciende el pad del DP sin apagarlo; aquí se restaura todo lo tocado.
+  Linux usó `i2c-algo-bit` para el HDMI, no el `bit.c` de nouveau (misma
+  semántica de registro, otra secuencia), así que el I2C se prueba contra
+  un EEPROM DDC simulado y no contra réplica.
+- **VBIOS:** la lectura por PROM reproduce el volcado de sysfs (148 992
+  bytes, versión 94.06.37.00.40) sin escribir nada (el bit de sombra ya
+  está a 0). La DCB coincide con lo que imprime nouveau (salidas, CCB,
+  conectores).
+- **El ASUS anuncia 144, 165 y 179,82 Hz** en DTDs de su bloque CTA (no
+  solo en el rango): candidatos directos para la fase 5.
+- Tests de host de `nvgpu` en verde, con los sabotajes que cada uno detecta
+  (tamaño AUX, reintento DEFER, cierre I2C, bits SDA, ACK, offset EDID,
+  desplazamiento CCB, EOL, hblank, entrelazado, SVD nativos, NPDE,
+  restauración de sombra/pad/auto-DPCD, bloque 1). `run-kernel-tests.sh`
+  en verde; `boot-matrix 4 5` 20/20; QEMU con `gpu=disp` y sin GA106 no
+  toca nada.
+
+**En la Ryzen (boot #67, `metal-run.sh --kconf 'gpu=disp'
+scripts/metal-jobs/gpu-disp.sh`, veredicto OK exit=0):**
+- VBIOS por la PROM: **565 760 bytes, 4 imágenes** (00, 03, e0, e0: las
+  mismas que nouveau), en 160 ms; los primeros 148 992 bytes idénticos al
+  volcado de sysfs; versión 94.06.37.00.40.
+- DCB: las 7 salidas, línea por línea, iguales a las de nouveau.
+- `DP-1`/`DP-2` desconectados (sin sink en AUX 5/4, 15 ms cada uno);
+  **`DP-3` = ASUS VG279Q3A** (DPCD 1.4 HBR2 ×4, 12 ms) y **`HDMI-A-1` = HP
+  2309** (47 ms, bit-banging). **Los 256 bytes de los dos EDIDs, idénticos
+  a los de sysfs** (hex completo comparado por el trabajo).
+- La máquina volvió a Linux sola y la sesión se retomó: la GPU no quedó mal.
+  El usuario vio la imagen de constanos durante la ejecución (visible un
+  instante, hasta el reinicio del trabajo): la imagen GOP sigue intacta.
+
+**Fase 2 cerrada.**
+
 ## Fases
 
 Calendario orientativo en días de trabajo. El riesgo está en la fase 4.
@@ -370,7 +415,9 @@ transacciones AUX/I2C que nouveau hace en la traza sin GSP.
   detección de conexión se hace por consulta, sin interrupción todavía.
 
 **Hecho cuando:** en la Ryzen, con `gpu=disp`, `/proc/displays` lista
-`DP-1 VG279Q3A` y `HDMI-A-1 HP 2309`, y los 256 bytes de cada EDID leídos
+`DP-3 VG279Q3A` y `HDMI-A-1 HP 2309` (nombres de la DCB, como nouveau; el
+`DP-1` de la versión original era el nombre de `nvidia`, ver fase 0), y
+los 256 bytes de cada EDID leídos
 por constanos son **idénticos** a los de sysfs (el trabajo autorun los
 compara con el fixture). Además, la imagen GOP sigue intacta después.
 

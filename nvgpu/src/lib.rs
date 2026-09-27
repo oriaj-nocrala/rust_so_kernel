@@ -13,7 +13,14 @@
 
 extern crate alloc;
 
+pub mod aux;
+pub mod dcb;
+pub mod display;
+pub mod edid;
+pub mod i2c;
 pub mod id;
 pub mod mmio;
+pub mod pad;
+pub mod vbios;
 
 pub use mmio::Mmio;

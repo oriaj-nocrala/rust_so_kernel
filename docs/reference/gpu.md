@@ -7,7 +7,8 @@ Plan and decisions: `docs/gpu/gpu-plan.md`. This page is the current state. Pure
 - UEFI gives no command line. `key=value` words are read once after `fs::init` from `/mnt/etc/kernel.conf`, then `/mnt/autorun/kernel.conf` (later wins; `#` comments). Before that, everything is at its default.
 - `/mnt/autorun/kernel.conf` is written by `scripts/metal-run.sh --kconf '...'` and removed with `autorun/`, so an option applies to one unattended run only.
 - `disk-image-root/etc/kernel.conf` is gitignored: a checkout's own options.
-- `gpu=` (`hal::bootopts::GpuLevel`): `off` (default: the GPU is not touched), `probe`. An unknown value is logged and read as `off`.
+- `gpu=` (`hal::bootopts::GpuLevel`): `off` (default: the GPU is not touched), `probe`, `disp`. An unknown value is logged and read as `off`.
+- `disk-image-root/etc/` is not synced to `disk.img` (only `etc/gui` is). To try a level in QEMU, write the file into the image: `debugfs -w -R "write <file> /etc/kernel.conf" disk.img` (and `rm` it after).
 
 ## `gpu=probe` (phase 1)
 
@@ -17,6 +18,26 @@ Plan and decisions: `docs/gpu/gpu-plan.md`. This page is the current state. Pure
 - the GA106 (`10de:2507`): capabilities, MSI/MSI-X, BARs with sizes; BAR0 mapped UC and `PMC_BOOT_0` decoded (`nvgpu::id`); the first 16 MiB of BAR1 mapped WC (not accessed); `pci::claim(..., "nvgpu")`.
 - **No GPU register is written.** The only writes are the BAR sizing protocol's, in configuration space, with decoding off for microseconds (no CPU may draw on the GOP framebuffer then: hence before the APs).
 - Metal job: `scripts/metal-run.sh --kconf 'gpu=probe' scripts/metal-jobs/gpu-probe.sh`.
+
+## `gpu=disp` (phase 2)
+
+Everything `probe` does, then (`gpu::probe_displays`, only if `PMC_BOOT_0` says GA106):
+- **VBIOS** from the PROM (`nvgpu::vbios::read_prom`: BAR0 `0x300000`, image chain by PCIR/NPDE like nouveau's `shadow.c`). The ROM-shadow bit (`0x088050` bit 0) is cleared only if set and restored; on the target it is already clear, so no write. `/proc/gpu` shows size, time, FNV-1a of the first 148 992 bytes (= the phase 0 dump), images and the BIT version.
+- **DCB** (`nvgpu::dcb`): outputs (walk of `engine/disp/nv50.c`), CCB 4.1, connector table. Logged as nouveau prints them.
+- **Connectors** (`nvgpu::display::connectors`): the connector-table entries some output uses. Name = DRM type + count per type in table order (nouveau's naming): `DP-1`, `DP-2`, `DP-3` (the ASUS, AUX 3), `HDMI-A-1` (the HP, I2C port 5). The proprietary driver calls the ASUS `DP-1`; these names are not Linux's `nvidia` ones.
+- **Probe** by polling, no interrupts (`nvgpu::display::probe`):
+  - DP: DPCD caps (+ the 0x2200 extended copy) and EDID blocks 0-1 by I2C-over-AUX (`nvgpu::aux`: `auxgm200.c` transaction + DRM's retry policy). No sink (AUX status bit 28) = disconnected.
+  - HDMI: EDID by bit-banged I2C (`nvgpu::i2c`: nouveau's `bit.c` on `busgf119.c`'s port register). NACK at 0x50 = disconnected.
+  - Pads (`nvgpu::pad`) switched to AUX/I2C and put back; the AUX auto-DPCD bit (nouveau leaves it cleared) is restored too.
+  - More than one EDID extension is not read (needs the E-DDC segment pointer, never used in the trace): shown as a `note:`.
+- `/proc/displays`: one line per connector (`name status conn N aux|i2c N  MFG name`), then `dpcd:`, `preferred:`, `range:`, `modes:` (every DTD), `edid-fnv1a64:` and `edid-hex:`.
+- Runs before the APs are released; delays are TSC busy-waits that service TLB shootdowns.
+- Metal job: `scripts/metal-run.sh --kconf 'gpu=disp' scripts/metal-jobs/gpu-disp.sh`.
+
+## Oracle tools (`scripts/gpu-trace.py`)
+
+- `aux DIR CH` lists AUX transactions on a channel; `aux DIR CH SEL OUT` writes them as a `ReplayMmio` fixture (`nvgpu/fixtures/aux-ch3-dpcd-edid.txt`).
+- `i2c DIR DRIVE` decodes bit-banged I2C from a trace (proved the port-register bits: it yields the HP's EDID byte for byte).
 
 ## PCI configuration space (`kernel/src/pci.rs`, `hal::pcicfg`)
 
@@ -47,4 +68,6 @@ Plan and decisions: `docs/gpu/gpu-plan.md`. This page is the current state. Pure
 ## Tests
 
 - Host: `cd hal && cargo test` (pcicfg, dma, bootopts, acpi IVRS), `cd nvgpu && cargo test`.
+- `nvgpu` fixtures: the two EDIDs + their `edid-decode` output, and an AUX trace extract (committed); the VBIOS is read from `$GPU_ORACLE/static/vbios-rom.bin` (default `~/constanos-gpu-oracle`, not in git, D3) and those tests print `SKIP` without it.
+- `nvgpu` mocks: `TableMmio` (fixed values), `ReplayMmio` (per-register read queues from a trace extract + write log to compare), `i2c::tests::DdcSim` (open-drain bus with a DDC EEPROM).
 - QEMU: `hw_tests::edu_mmio_dma_msi` (`scripts/run-kernel-tests.sh`; the runner adds `-device edu,dma_mask=0xffffffffffff`): MMIO, MSI to CPU 1 (the test boot keeps IF=0 on CPU 0), DMA both ways, mask refusal. The `edu` driver (`kernel/src/edu.rs`) is test-only.

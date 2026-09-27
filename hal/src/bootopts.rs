@@ -57,6 +57,10 @@ pub enum GpuLevel {
     /// Phase 1: read configuration space, size and map the BARs, read
     /// `PMC_BOOT_0`. Writes nothing to the GPU's registers.
     Probe,
+    /// Phase 2: also read the VBIOS (PROM), its DCB, and each connector's
+    /// DPCD/EDID. Writes only the AUX and I2C transactions nouveau makes
+    /// for that, and puts back every register it changes.
+    Disp,
 }
 
 impl GpuLevel {
@@ -67,6 +71,7 @@ impl GpuLevel {
         match v {
             "off" => Some(GpuLevel::Off),
             "probe" => Some(GpuLevel::Probe),
+            "disp" => Some(GpuLevel::Disp),
             _ => None,
         }
     }
@@ -100,7 +105,8 @@ mod tests {
     fn gpu_levels() {
         assert_eq!(GpuLevel::parse("off"), Some(GpuLevel::Off));
         assert_eq!(GpuLevel::parse("probe"), Some(GpuLevel::Probe));
-        assert_eq!(GpuLevel::parse("disp"), None);
-        assert!(GpuLevel::Probe > GpuLevel::Off);
+        assert_eq!(GpuLevel::parse("disp"), Some(GpuLevel::Disp));
+        assert_eq!(GpuLevel::parse("gsp"), None);
+        assert!(GpuLevel::Disp > GpuLevel::Probe && GpuLevel::Probe > GpuLevel::Off);
     }
 }

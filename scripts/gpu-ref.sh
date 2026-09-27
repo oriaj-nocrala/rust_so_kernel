@@ -6,7 +6,8 @@
 #
 # Into $GPU_REF (default ~/src/gpu-ref):
 #   linux/                  sparse, shallow: drivers/gpu/drm/nouveau, drivers/gpu/nova-core,
-#                           include/uapi/drm — at the tag of the host's running kernel
+#                           drivers/gpu/drm/display (DP helpers), include/drm, include/uapi/drm
+#                           — at the tag of the host's running kernel
 #   open-gpu-kernel-modules/ shallow, at GSP_VERSION (the RM ABI source of truth)
 #   envytools/              shallow, master (rnndb + demmio, to read mmiotrace traces)
 #
@@ -28,7 +29,8 @@ if [[ ! -d linux ]]; then
     git clone --depth 1 --filter=blob:none --sparse --branch "$LINUX_TAG" \
         https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git linux
     git -C linux sparse-checkout set \
-        drivers/gpu/drm/nouveau drivers/gpu/nova-core include/uapi/drm
+        drivers/gpu/drm/nouveau drivers/gpu/nova-core drivers/gpu/drm/display \
+        include/drm include/uapi/drm
 fi
 
 if [[ ! -d open-gpu-kernel-modules ]]; then

@@ -37,6 +37,7 @@ scripts/metal-run.sh --collect   # verdict + log archived in target/metal/runs/<
   - `--classify` runs the classifier alone.
 - **The session resumes by itself** (`scripts/metal-resume.sh`): tty1 autologins and `~/.zlogin` runs it. It `--collect`s, then `claude --resume`s the session that launched the run, with the verdict in the prompt.
   - Brakes: `target/metal/budget` (automatic resumes left; missing or 0 = collect only) and `target/metal/stop`.
+  - **Check `cat target/metal/budget` before launching a measurement.** At 0 the machine comes back to Linux, collects, and nobody resumes the session: the result waits until the user reopens it. Tell the user which case applies, and raise the budget (`echo 1 > target/metal/budget`) only if they want the automatic resume.
   - `--dry-run` shows what it would do.
 
 ### Test the job in QEMU first
@@ -48,6 +49,9 @@ QEMU_DEBUG_DISK_IMG=/tmp/j.img QEMU_DEBUG_EXTRA_ARGS=-no-reboot QEMU_DEBUG_STATE
 ```
 
 `-no-reboot` makes the job's final reset end QEMU instead of running the job again. Timing bugs have shown up only under host load, so run several in parallel.
+
+- **Keep `QEMU_DEBUG_STATE_DIR` short** (`/tmp/qj`, not the session scratchpad): QEMU puts `monitor.sock` there, and a Unix socket path must be under 108 bytes. Too long and QEMU exits at once ("UNIX socket path ... is too long", only in `qemu-stdout.log`) with an empty `serial.log`, which looks like a hang.
+- A job run with `--kconf` needs that file in the image too: `write kconf /autorun/kernel.conf`.
 
 ## Reading the kernel log
 

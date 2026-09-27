@@ -525,6 +525,7 @@ impl Inode for ProcDirInode {
             "loadavg" => Ok(Arc::new(RenderedInode { ino: 211, render: render_loadavg })),
             "sensors" => Ok(Arc::new(RenderedInode { ino: 212, render: crate::cpu::temp::render })),
             "gpu" => Ok(Arc::new(RenderedInode { ino: 213, render: crate::gpu::render })),
+            "displays" => Ok(Arc::new(RenderedInode { ino: 214, render: crate::gpu::render_displays })),
             _ => {
                 let pid: usize = name.parse().map_err(|_| Errno::ENOENT)?;
                 if crate::process::scheduler::exe_name_for_pid(pid).is_some() {
@@ -553,13 +554,14 @@ impl Inode for ProcDirInode {
             12 => Ok(Some(DirEntry::new(211, FileType::Regular, b"loadavg"))),
             13 => Ok(Some(DirEntry::new(212, FileType::Regular, b"sensors"))),
             14 => Ok(Some(DirEntry::new(213, FileType::Regular, b"gpu"))),
+            15 => Ok(Some(DirEntry::new(214, FileType::Regular, b"displays"))),
             n => {
                 // Live pids, appended after the always-present entries above
                 // — this is what makes `ls /proc` / BusyBox `ps`'s
                 // `opendir("/proc")` scan see every process (previously
                 // direct lookup like `cat /proc/3/exe` worked but nothing
                 // enumerated them, see this module's top doc comment).
-                let idx = (n - 15) as usize;
+                let idx = (n - 16) as usize;
                 let pids = crate::process::scheduler::all_pids();
                 let Some(&pid) = pids.get(idx) else { return Ok(None); };
                 let name = format!("{}", pid);

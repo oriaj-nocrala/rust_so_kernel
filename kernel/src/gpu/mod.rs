@@ -13,6 +13,11 @@
 //          GPU's capabilities and BARs, map BAR0 (UC) and a BAR1 window
 //          (WC), read PMC_BOOT_0. The only writes are the BAR sizing
 //          protocol's, in configuration space; no GPU register is written.
+//   disp   (phase 2) — also read the VBIOS from the PROM, parse its DCB, and
+//          probe every connector by polling: DPCD + EDID over DP AUX, EDID
+//          over bit-banged I2C (`nvgpu::display`). The only GPU writes are
+//          those transactions' and the pad/AUX bits they need, all put back.
+//          Result in /proc/displays.
 //
 // Runs once at boot, after `fs::init` (firmware is on `/mnt`) and before the
 // APs are released (BAR sizing turns decoding off for a few microseconds,
@@ -46,10 +51,16 @@ const FIRMWARE: [&str; 3] = [
 const BAR1_WINDOW: u64 = 16 << 20;
 
 static REPORT: spin::Once<String> = spin::Once::new();
+static DISPLAYS: spin::Once<String> = spin::Once::new();
 
 /// `/proc/gpu`.
 pub fn render() -> String {
     REPORT.get().cloned().unwrap_or_else(|| String::from("gpu: off\n"))
+}
+
+/// `/proc/displays`: filled once at boot with `gpu=disp`.
+pub fn render_displays() -> String {
+    DISPLAYS.get().cloned().unwrap_or_else(|| String::from("displays: not probed (needs gpu=disp and the GA106)\n"))
 }
 
 /// BAR0 through the uncached mapping `memory::mmio` made.
@@ -74,6 +85,21 @@ impl nvgpu::Mmio for Bar0 {
         // SAFETY: as above.
         unsafe { core::ptr::write_volatile(self.base.add(offset as usize) as *mut u32, value) }
     }
+    /// TSC busy-wait. Runs at boot before the APs are released, but still
+    /// answers TLB shootdowns (CLAUDE.md: any busy-wait with IF=0).
+    fn udelay(&self, us: u32) {
+        let cycles = crate::cpu::tsc::freq_hz() / 1_000_000 * us as u64;
+        let t0 = crate::cpu::tsc::read();
+        while crate::cpu::tsc::read().wrapping_sub(t0) < cycles {
+            crate::memory::tlb::service_pending();
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Milliseconds since `t0` (TSC), for the report.
+fn ms_since(t0: u64) -> u64 {
+    crate::cpu::tsc::read().wrapping_sub(t0) / (crate::cpu::tsc::freq_hz() / 1000).max(1)
 }
 
 pub fn probe() {
@@ -86,7 +112,7 @@ pub fn probe() {
     let _ = writeln!(r, "level: {:?}", level);
     report_firmware(&mut r);
     report_iommu(&mut r);
-    probe_device(&mut r);
+    probe_device(&mut r, level);
     for line in r.lines() {
         serial_println!("gpu: {}", line);
     }
@@ -155,7 +181,7 @@ fn report_iommu(r: &mut String) {
     }
 }
 
-fn probe_device(r: &mut String) {
+fn probe_device(r: &mut String, level: GpuLevel) {
     let mut found = None;
     crate::pci::for_each_function(|f| {
         if found.is_none() && f.vendor == VENDOR_NVIDIA && f.device_id == DEVICE_GA106 && f.class == 0x03 {
@@ -232,7 +258,8 @@ fn probe_device(r: &mut String) {
     let _ = writeln!(r, "bar0: mapped UC at {:#x}", v0.as_u64());
     let regs = Bar0 { base: v0.as_mut_ptr(), len: bar0.size };
     let boot0 = nvgpu::Mmio::rd32(&regs, nvgpu::id::PMC_BOOT_0);
-    match ChipId::decode(boot0) {
+    let chip = ChipId::decode(boot0);
+    match chip {
         Some(id) => {
             let _ = writeln!(
                 r,
@@ -278,4 +305,80 @@ fn probe_device(r: &mut String) {
     }
 
     crate::pci::claim(b, d, fun, "nvgpu");
+
+    if level >= GpuLevel::Disp {
+        if chip.and_then(|c| c.name()).is_some() {
+            probe_displays(r, &regs);
+        } else {
+            let _ = writeln!(r, "displays: not a GA106; not probing");
+        }
+    }
+}
+
+/// Phase 2: VBIOS → DCB → connectors → DPCD/EDID (`nvgpu::display`).
+fn probe_displays(r: &mut String, regs: &Bar0) {
+    let t0 = crate::cpu::tsc::read();
+    let rom = match nvgpu::vbios::read_prom(regs) {
+        Ok(rom) => rom,
+        Err(e) => {
+            let _ = writeln!(r, "vbios: PROM read failed: {:?}", e);
+            return;
+        }
+    };
+    let prom_ms = ms_since(t0);
+    // The phase 0 dump (sysfs) holds the first two images: 148 992 bytes.
+    let head = &rom[..rom.len().min(148_992)];
+    let _ = writeln!(
+        r,
+        "vbios: {} bytes from the PROM in {} ms, fnv1a64[..{}] {:016x}",
+        rom.len(),
+        prom_ms,
+        head.len(),
+        nvgpu::display::fnv1a64(head)
+    );
+    let bios = match nvgpu::vbios::Bios::new(rom) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = writeln!(r, "vbios: {:?}", e);
+            return;
+        }
+    };
+    for img in &bios.images {
+        let _ = writeln!(r, "vbios: image @{:#07x} type {:02x} {} bytes{}", img.base, img.kind, img.size, if img.last { " (last)" } else { "" });
+    }
+    match bios.version() {
+        Some(v) => {
+            let _ = writeln!(r, "vbios: version {:02x}.{:02x}.{:02x}.{:02x}.{:02x}", v[0], v[1], v[2], v[3], v[4]);
+        }
+        None => {
+            let _ = writeln!(r, "vbios: no BIT version");
+        }
+    }
+    let dcb = match nvgpu::dcb::Dcb::parse(&bios) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = writeln!(r, "dcb: {:?}", e);
+            return;
+        }
+    };
+    let _ = writeln!(r, "dcb: version {:#x}, {} outputs, {} ccb entries, {} connectors", dcb.version, dcb.outputs.len(), dcb.ccb.len(), dcb.connectors.len());
+    for o in &dcb.outputs {
+        let _ = writeln!(
+            r,
+            "dcb: outp {:02x} type {:02x} loc {} or {} link {} con {:x} edid {:x} bus {} head {:x}",
+            o.index, o.kind, o.location, o.or, o.link, o.connector, o.i2c_index, o.bus, o.heads
+        );
+    }
+    let mut probes = alloc::vec::Vec::new();
+    for c in nvgpu::display::connectors(&dcb) {
+        let t = crate::cpu::tsc::read();
+        let p = nvgpu::display::probe(regs, &c);
+        let _ = writeln!(r, "displays: {} {:?} in {} ms", c.name, p.status, ms_since(t));
+        probes.push(p);
+    }
+    let text = nvgpu::display::render(&probes);
+    for line in text.lines() {
+        crate::serial_println!("displays: {}", line);
+    }
+    DISPLAYS.call_once(|| text);
 }
