@@ -2,9 +2,9 @@
 
 > **Estado (2026-09-26):** **fase 0 cerrada.** Trazas capturadas, válidas y
 > segmentadas (ver "Resultados de la fase 0"); D1 = **570.144** y D6 =
-> **modeset propio sin GSP**, ambas medidas. **Fase 1 implementada y
-> verificada en QEMU; falta el criterio en la Ryzen** (ver "Resultados de la
-> fase 1"). Ninguna fase se da por hecha sin su criterio medido en la Ryzen.
+> **modeset propio sin GSP**, ambas medidas. **Fase 1 cerrada**
+> (a6c221a, Ryzen boot #66; ver "Resultados de la fase 1"). Siguiente:
+> fase 2. Ninguna fase se da por hecha sin su criterio medido en la Ryzen.
 
 ## Objetivo
 
@@ -260,10 +260,22 @@ Estado actual en `docs/reference/gpu.md`. Medido:
   (`09:00.1`). Paso por VFIO a QEMU: posible (ver la propuesta en la
   conversación de la fase 1; sin decidir).
 
-Pendiente para cerrar: `scripts/metal-run.sh --kconf 'gpu=probe'
-scripts/metal-jobs/gpu-probe.sh` en la Ryzen (veredicto OK = dispositivo,
-MSI, `PMC_BOOT_0` = GA106 impl 6, BAR1 WC, firmware idéntico, `IommuEn=0`),
-y un reinicio que vuelva con imagen.
+**En la Ryzen (boot #66, `metal-run.sh --kconf 'gpu=probe'
+scripts/metal-jobs/gpu-probe.sh`, veredicto OK):**
+- `PMC_BOOT_0 = 0xb76000a1` → chipset 0x176, GA100, impl 6, GA106 (igual
+  que nouveau en la fase 0).
+- Capacidades `01@60 05@68 10@78 09@b4`, MSI de 64 bits sin enmascarado, sin
+  MSI-X: igual que el fixture de Linux.
+- **Estado tras el GOP (el que verá el driver):** Command `0x0003` (memoria
+  e I/O, **bus master apagado**) y **MSI deshabilitada** (dirección 0). Las
+  fases que hagan DMA o usen MSI tienen que encender ambos.
+- BARs medidos: BAR0 16 MiB, BAR1 8 GiB, BAR3 32 MiB, I/O 128 B, iguales a
+  lspci. BAR0 mapeado UC, 16 MiB de BAR1 mapeados WC.
+- Firmware idéntico al del host (los tres FNV-1a coinciden).
+- **D4 medido:** IOMMU en `00:00.2`, MMIO `0xfd500000`, control
+  `0x0000220000000400`, `IommuEn=0`. Bus = físico.
+- La máquina reinició a Linux y retomó la sesión: el sondeo no dejó la GPU
+  mal (no hay foto de la pantalla del arranque de constanos).
 
 ## Fases
 
