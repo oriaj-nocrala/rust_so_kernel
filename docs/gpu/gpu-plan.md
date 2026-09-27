@@ -1,9 +1,9 @@
 # Plan: GPU NVIDIA (display, GSP, canales)
 
 > **Estado (2026-09-26):** fase 0 casi cerrada. Trazas capturadas y
-> válidas (ver "Resultados de la fase 0"); D1 fijada en **570.144**, medido.
-> Falta segmentar las trazas por paso y aclarar el fallo de display con GSP
-> (D6). Ninguna fase se da por hecha sin su criterio medido en la Ryzen.
+> válidas (ver "Resultados de la fase 0"); D1 = **570.144** y D6 = **modeset
+> propio sin GSP**, ambas medidas. Falta segmentar las trazas por paso.
+> Ninguna fase se da por hecha sin su criterio medido en la Ryzen.
 
 ## Objetivo
 
@@ -27,8 +27,9 @@ la decisión de cómo abordarla, con sus requisitos.
 - Correr en QEMU. QEMU no emula NVIDIA. Lo que no sea lógica pura se verifica
   en metal (skill `metal-run`).
 - Gestión de energía, relojes de la GPU, ventiladores, reclocking.
-- Soporte sin GSP más allá del display de lectura (fases 2–3). Todo lo que
-  necesite programar el display o la memoria de la GPU pasa por RM.
+- ~~Soporte sin GSP más allá del display de lectura~~: anulado por D6. El
+  display (y probablemente el CE) se hace sin GSP; el GSP queda para la
+  fase 7.
 
 ## Hechos medidos (2026-09-26, desde el Linux de la propia Ryzen)
 
@@ -137,15 +138,25 @@ fase 0) en una etiqueta concreta, anotada aquí al fijarla.
   anterior pierde la imagen (por ejemplo, RM toma el display al arrancar el
   GSP), se registra como hecho medido y la fase 5 pasa a ser la que la
   recupera. No se improvisa un arreglo.
-- **D6: ruta del modeset (abierta, se decide antes de la fase 5).** Medido en
-  la fase 0: nouveau **sin GSP** hace un modeset completo y limpio en esta
-  tarjeta (fbcon a los 11,7 s, sin errores), y nouveau **con GSP** arranca
-  RM bien pero su display falla (ver resultados). Hay dos rutas: modeset vía
-  RM, como está escrita la fase 5, o modeset propio con la traza `nogsp`
-  como oráculo, portando lo que hace nouveau sin GSP (entrenamiento DP y
-  relojes incluidos). Para elegir, primero hay que saber si el fallo con GSP
-  es de nouveau r570 en GA106 o un efecto de mmiotrace. Se mide con un
-  arranque de nouveau con GSP **sin** mmiotrace.
+- **D6: ruta del modeset. DECIDIDA: modeset propio, con la traza `nogsp`
+  como oráculo.** Medido en la fase 0:
+  - Sin GSP, nouveau hace un modeset completo y limpio de las dos pantallas,
+    entrenamiento DP incluido (fbcon a los 11,7 s). También levanta el motor
+    de copia (`drm: MM: using COPY for buffer copies`).
+  - Con GSP, RM arranca, pero el display falla **también sin mmiotrace**
+    (`trace-gspnotrace`, mismos síntomas: `DFP_ASSIGN_SOR` devuelve
+    `0xffff`, `DP_TRAIN` da -EIO en todas las combinaciones, `core notifier
+    timeout`). No lo causa el instrumento: es nouveau r570 en GA106.
+  - La única variable que no se aisló es `debug=gsp=trace` (el volcado de
+    RPC por printk), que estuvo en las dos ejecuciones con GSP. Un fallo
+    devuelto por RM (`0xffff`) no parece de tiempos, así que no se mide más
+    salvo que se quiera volver a la ruta RM.
+
+  Consecuencia en el orden: **el GSP deja de estar en el camino crítico del
+  display.** Orden de ejecución: 0 → 1 → 2 → 3 → **5** (modeset propio) →
+  **6** (canal + CE, si la traza `nogsp` lo confirma sin GSP) → **4** (GSP,
+  como puerta a la fase 7). Los números de fase se mantienen para no romper
+  referencias.
 
 ## Resultados de la fase 0 (2026-09-26)
 
@@ -186,9 +197,8 @@ Hechos medidos:
 Pendiente para cerrar la fase 0:
 1. Segmentar las trazas: anotar aquí los rangos de tiempo de cada paso
    (lectura de VBIOS, AUX/EDID, vblank, FWSEC, booter, RPC de init, modeset).
-2. Medir D6: nouveau con GSP sin mmiotrace (`gpu-oracle.sh`, modo
-   `gspnotrace`: un reinicio, solo el dmesg y con el mismo `debug=`, para
-   que la única diferencia con `trace-gsp` sea mmiotrace).
+2. ~~Medir D6~~ hecho: `trace-gspnotrace` (solo dmesg, 21 111 líneas). El
+   display falla igual que con mmiotrace; decisión en D6.
 
 ## Fases
 
@@ -350,10 +360,19 @@ posterior arranca con imagen.
 
 ---
 
-### Fase 5: Modeset vía RM
+### Fase 5: Modeset (propio, sin GSP; D6)
 
-Con RM, el entrenamiento del enlace DP y los relojes de píxel los hace el
-GSP. El driver asigna los canales de display y les envía métodos.
+> **Reescrita por D6.** Lo que sigue en esta sección describe la ruta RM,
+> descartada. La ruta vigente porta lo que hace nouveau sin GSP, con la
+> traza `nogsp` como oráculo: canal core y de ventana por EVO/NVDisplay
+> directo, relojes de píxel desde las tablas del VBIOS y entrenamiento DP
+> propio por AUX (portado de `nouveau/nvkm/engine/disp/` y
+> `dispnv50/`). Esta sección se reescribe entera al empezar la fase, después
+> de segmentar la traza. El criterio de "hecho" no cambia.
+
+Ruta RM (descartada): con RM, el entrenamiento del enlace DP y los relojes de
+píxel los hace el GSP. El driver asigna los canales de display y les envía
+métodos.
 
 - Asignar por RM el display común (`NV04_DISPLAY_COMMON`) y los canales de
   display de GA10x: core, ventana, ventana inmediata y cursor. Las clases, de
