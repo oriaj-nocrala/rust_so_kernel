@@ -24,6 +24,7 @@ pub mod id;
 pub mod init;
 pub mod mmio;
 pub mod pad;
+pub mod pll;
 pub mod supervisor;
 pub mod vbios;
 pub mod vblank;

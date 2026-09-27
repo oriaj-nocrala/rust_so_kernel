@@ -16,7 +16,11 @@
 > propia, ~1000 flips en 20 s, visto a mano; ver
 > "Resultados de la fase 5.3"). **Fase 5.4 cerrada** (Ryzen #77: SOR-1
 > desenganchado y vuelto a enganchar por supervisores atendidos en el ISR,
-> visto a mano; ver "Resultados de la fase 5.4"). Siguiente: 5.5 (VPLL). Ninguna fase se da por hecha sin su
+> visto a mano; ver "Resultados de la fase 5.4"). **Fase 5.5 implementada**
+> (VPLL en el supervisor 2.1, `gpu=vpll`; host y QEMU verdes). Ryzen #78:
+> **Fase 5.5 cerrada** (Ryzen #80: 50 Hz y vuelta a 60 Hz reprogramando el
+> VPLL; la codificación de `fN` de nouveau está mal en GA106, medido y
+> corregido; ver "Resultados de la fase 5.5"). Siguiente: 5.6 (enlace DP). Ninguna fase se da por hecha sin su
 > criterio medido en la Ryzen.
 
 ## Objetivo
@@ -630,6 +634,81 @@ de HDMI usan más opcodes (condiciones por tabla, sondeos): fase 5.8.
   final.
 
 **Fase 5.4 cerrada.**
+
+## Resultados de la fase 5.5 (2026-09-27)
+
+Código: `nvgpu::pll` (tabla PLL del VBIOS, `gt215_pll_calc` fraccional,
+escrituras de `ga100_devinit_pll_set`), 2.1 en `nvgpu::supervisor` con
+`Config::clocks` (eventos `Clock` / `ClockFailed`; con `gpu=super` sigue
+`ClockNotPorted`), nivel `gpu=vpll` y `clock <kHz>` en `/dev/dispctl`
+(`HEAD_SET_PIXEL_CLOCK_FREQUENCY(_MAX)` + UPDATE, mismo raster). Job:
+`scripts/metal-jobs/gpu-vpll.sh`.
+
+Hechos (del VBIOS y la traza, sin metal):
+- Tabla PLL en `0x4f51`, versión 0x50, 14 entradas; VPLL0-3 iguales:
+  refclk 27 MHz, VCO 800-1620 MHz, entrada 19-38 MHz, M = 1, N 29-255,
+  P 1-63.
+- A 148,5 MHz sale `N=54 fN=0x1000 M=1 P=10`: las escrituras de VPLL1 de
+  la ronda 2 de nouveau, registro a registro (test de réplica sobre
+  `super-round2.txt` con la cabeza 1 como propia).
+- Criterio en metal cambiado: "el mismo modo con el reloj reprogramado" no
+  dispara 2.1 (inferido de la traza: en la ronda 2 nouveau empujó a la
+  cabeza 0 el mismo reloj que tenía y su máscara fue `0x1100`, sin el bit
+  16; la cabeza 1, que pasó de 0 a 148,5 MHz, tuvo `0x11100`).
+  El job pasa la cabeza 0 a 123,75 MHz en el mismo raster (1080p a 50 Hz,
+  dentro del rango 48-180 Hz del ASUS y del enlace 2×HBR del GOP) y la
+  devuelve a 148,5: vblank a 50,0 y luego 60,0 Hz, VPLL0 con los
+  coeficientes calculados.
+
+**Ryzen boot #78 (veredicto FAIL; el log envolvió y se perdió la primera
+mitad, incluida la medida a 50 Hz):**
+- Las dos peticiones (`clock 123750` y `clock 0`) dispararon los
+  supervisores 1-3 con la máscara `0x11100`: **un cambio solo de reloj
+  marca también el bit 12**, así que 2.0/2.2 corren (OffInt2, OnInt2,
+  empaquetado DP recalculado: `h 586 v 2279 wm 19` a 50 Hz). 2.1 programó
+  `N 59 fN 0x2ab P 13` y luego `N 54 fN 0x1000 P 10`; sin errores de script.
+  Límites `118800..=180000` kHz; `clock 1` y `clock 999000`, rechazados.
+- **Tras volver a 148,5 MHz, el vblank iba a 59,4404 Hz**, no a 60,0.
+  Hipótesis: el hardware lee `fN` sin el +0,5 que supone
+  `gt215_pll_calc` → 27 × 54,5 / 10 = 147,15 MHz = 59,45 Hz, que encaja con
+  lo medido (0,014 Hz de diferencia). Alternativa: vblanks perdidos (el
+  58,0 Hz de la 5.2). No se sabe qué dejó el GOP en VPLL0: nouveau nunca lo
+  lee, así que la traza no lo dice.
+- Siguiente vuelta, ya preparada (sin lanzar): el arranque registra los
+  registros VPLL0 del GOP (`vpll: GOP VPLL0`, solo lectura), y el job mide
+  primero la frecuencia del GOP (el ruido del instrumento en el mismo
+  arranque) y repite el resumen al final.
+- El fire posterior: 497 flips, 0 rechazados.
+
+**Ryzen boot #79 (veredicto FAIL; el resumen del final sí sobrevivió):**
+- El mismo contador da **59,9883 Hz con el reloj del GOP**, así que el
+  instrumento sirve (0,02 % por debajo).
+- VPLL0 del GOP: `0xef00 = 0x030a0005`, `0xef04 = 0xa0001` (P 10, M 1),
+  **`0xef18 = 0x370000`: N 55, fN 0** (27 × 55 / 10 = 148,5 MHz exactos);
+  `0xe9c0 = 0`. nouveau escribe `0x02080004` en `0xef00`; el reloj sale
+  igual con ese valor.
+- Con los coeficientes de nouveau: 49,5722 Hz (N 59, fN 0x2ab, P 13) y
+  59,4471 Hz (N 54, fN 0x1000, P 10). Si el hardware lee
+  `refclk · (N + fN/8192) / (M · P)`, **sin el +0,5 de `gt215_pll_calc`**,
+  salen 49,580 y 59,455 Hz; con el 0,02 % del instrumento, coinciden con
+  lo medido. El menú del ASUS mostró 50 y luego 60 (redondea a entero).
+- **Conclusión: la codificación de `fN` de nouveau está mal en GA106**, y su
+  VPLL1 de la traza (HDMI) iría a 147,15 MHz. `nvgpu::pll` usa ahora
+  N = parte entera y fN = fracción × 8192, redondeada (acarreo a N si
+  llega a 8192). 148,5 MHz → `0x370000`, lo mismo que el GOP; 123,75 →
+  `0x3b12ab`. El test de réplica de la traza lo hace constar: solo difiere
+  `0xef58`.
+
+**Ryzen boot #80 (veredicto OK):** con el reloj del GOP 59,9901 Hz y VPLL0
+`0x370000 0xa0001`; `clock 123750` → `0x3b12ab 0xd0001` y **49,9910 Hz**;
+`clock 0` → `0x370000 0xa0001` y **59,9888 Hz** (los dos a 0,02 % del
+nominal, como el GOP). 2+2+2 supervisores, sin errores de script ni de
+CTRL_DISP; fire 507 flips, 0 rechazados. El usuario vio en el menú del ASUS
+50 Hz y luego 60 Hz (boot #78).
+
+**Fase 5.5 cerrada.**
+- El usuario miró el menú del ASUS: 50 Hz y luego 60 Hz (el menú redondea
+  a entero: no distingue 59,44 de 60).
 
 ## Fases
 

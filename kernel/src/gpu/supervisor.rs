@@ -16,7 +16,10 @@
 // Runtime:
 // - `/dev/dispctl` `detach` / `attach` (any CPU, IF=1): one core push,
 //   `SOR_SET_CONTROL(sor)` = 0 or the GOP's value, then UPDATE; not waited
-//   on. Refused (EAGAIN) while the core channel has not finished the last
+//   on. With `gpu=vpll` (phase 5.5) also `clock <kHz>`:
+//   `HEAD_SET_PIXEL_CLOCK_FREQUENCY(_MAX)(head)`, then UPDATE; supervisor
+//   2.1 programs the VPLL. Bounded to the raster at >= 48 Hz (the ASUS's
+//   floor) and to what the GOP's DP link carries: nothing retrains it. Refused (EAGAIN) while the core channel has not finished the last
 //   one. Under `PUSH_AT`, the only user of the core push buffer after boot.
 // - The display then raises supervisors 1, 2, 3, each by MSI to CPU 0:
 //   `vblank::on_msi` acknowledges it (`nvgpu::vblank::service`) and calls
@@ -48,6 +51,17 @@ fn sor_set_control(sor: u8) -> u32 {
     0x300 + sor as u32 * 0x20
 }
 
+/// `HEAD_SET_PIXEL_CLOCK_FREQUENCY(a)` and `_MAX(a)` (`clc67d.h:691,737`):
+/// hertz in bits 0-30; nouveau pushes both with the mode's clock
+/// (`dispnv50/headc57d.c:232-236`).
+fn head_pixel_clock(head: u32) -> (u32, u32) {
+    (0x200c + head * 0x400, 0x2028 + head * 0x400)
+}
+
+/// Lowest refresh `clock` may ask for: the ASUS VG279Q3A's range starts at
+/// 48 Hz (EDID, "Hechos medidos" of the plan).
+const MIN_REFRESH_HZ: u64 = 48;
+
 /// What `setup` found: the head and SOR `/dev/dispctl` detaches and
 /// re-attaches, and the SOR control value the GOP left.
 struct Disp {
@@ -55,6 +69,13 @@ struct Disp {
     head: u32,
     sor: u8,
     ctrl: u32,
+    /// `gpu=vpll`: 2.1 programs VPLLs and `clock` is accepted.
+    clocks: bool,
+    /// The pixel clock the GOP set (Hz) and the bounds `clock` accepts
+    /// (kHz): the raster at 48 Hz, the GOP's DP link's payload.
+    gop_hz: u32,
+    min_khz: u32,
+    max_khz: u32,
 }
 
 static DISP: spin::Once<Disp> = spin::Once::new();
@@ -77,6 +98,8 @@ static NOT_DONE: AtomicU64 = AtomicU64::new(0);
 static CTRL_DISP_ERRORS: AtomicU64 = AtomicU64::new(0);
 static REQUESTS: AtomicU64 = AtomicU64::new(0);
 static REFUSED: AtomicU64 = AtomicU64::new(0);
+/// VPLLs programmed by 2.1 (phase 5.5).
+static CLOCKS_SET: AtomicU64 = AtomicU64::new(0);
 static LAST_US: AtomicU64 = AtomicU64::new(0);
 static MAX_US: AtomicU64 = AtomicU64::new(0);
 
@@ -101,7 +124,7 @@ pub fn ready() -> bool {
 }
 
 /// Boot, `gpu=super`, once `evo::bring_up` ended OK.
-pub fn setup(r: &mut String, regs: &Bar0) {
+pub fn setup(r: &mut String, regs: &Bar0, clocks: bool) {
     let Some((bios, dcb)) = super::VBIOS.get() else {
         let _ = writeln!(r, "super: STOP: no VBIOS/DCB (see vbios:/dcb:)");
         return;
@@ -188,9 +211,41 @@ pub fn setup(r: &mut String, regs: &Bar0) {
         }
     }
 
-    SUPER.with(|s| *s = Some(Supervisor::new(Config { heads, sors, owned: 1 << head, routes })));
+    // `clock` bounds: the raster at MIN_REFRESH_HZ, and the pixel rate the
+    // link's payload carries (lanes x rate x 8 bits per symbol / bpp; the
+    // units of nouveau's `link_kbps`, `nv50.c:1177`).
+    let min_khz = ((t.htotal as u64 * t.vtotal as u64 * MIN_REFRESH_HZ).div_ceil(1000)) as u32;
+    let max_khz = link.map_or(0, |l| (l.nr as u64 * l.bw as u64 * 27_000 * 8 / t.depth_bits() as u64) as u32);
+    if clocks {
+        match nvgpu::pll::parse(bios, nvgpu::pll::PLL_VPLL0 + head as u8) {
+            Ok(l) => {
+                let _ = writeln!(
+                    r,
+                    "vpll: VPLL{} limits {:?}; the GOP's {} kHz gives {:?}; clock accepts {}..={} kHz",
+                    head,
+                    l,
+                    t.hz / 1000,
+                    nvgpu::pll::calc(&l, t.hz / 1000),
+                    min_khz,
+                    max_khz
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(r, "vpll: VPLL{}: no limits ({:?}); 2.1 will fail", head, e);
+            }
+        }
+        // What the GOP left in VPLL<head> (reads only): the registers
+        // `ga100_devinit_pll_set` writes and the rest of its 0x40 block.
+        let _ = write!(r, "vpll: GOP VPLL{} e9c0+h*4 {:#x}, ef00+h*0x40..:", head, regs.rd32(0xe9c0 + head * 4));
+        for i in 0..16 {
+            let _ = write!(r, " {:#x}", regs.rd32(0xef00 + head * 0x40 + i * 4));
+        }
+        let _ = writeln!(r);
+    }
+
+    SUPER.with(|s| *s = Some(Supervisor::new(Config { heads, sors, owned: 1 << head, routes, clocks })));
     PUSH_AT.with(|p| *p = put);
-    DISP.call_once(|| Disp { regs: Bar0 { base: regs.base, len: regs.len }, head, sor, ctrl });
+    DISP.call_once(|| Disp { regs: Bar0 { base: regs.base, len: regs.len }, head, sor, ctrl, clocks, gop_hz: t.hz, min_khz, max_khz });
     sup::arm(regs);
     ENABLED.store(true, Ordering::Release);
     let _ = writeln!(
@@ -223,8 +278,11 @@ pub fn on_pending(regs: &Bar0, pending: u32) {
             Event::Script { result: Err(_), .. } => {
                 SCRIPT_ERRORS.fetch_add(1, Ordering::Relaxed);
             }
-            Event::ClockNotPorted { .. } | Event::AttachNotPorted { .. } | Event::NoOutput { .. } | Event::NoScript { .. } | Event::DpFailed { .. } => {
+            Event::ClockNotPorted { .. } | Event::ClockFailed { .. } | Event::AttachNotPorted { .. } | Event::NoOutput { .. } | Event::NoScript { .. } | Event::DpFailed { .. } => {
                 NOT_DONE.fetch_add(1, Ordering::Relaxed);
+            }
+            Event::Clock { .. } => {
+                CLOCKS_SET.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
         }
@@ -253,25 +311,41 @@ pub fn note_error(info: u32) {
 pub enum Cmd {
     Detach,
     Attach,
+    /// Pixel clock of the primary head, kHz (`gpu=vpll`); 0 = the GOP's.
+    Clock(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestError {
     NotReady,
+    /// `clock` without `gpu=vpll`, or out of bounds.
+    Invalid,
     /// The core channel has not finished the previous push.
     Busy,
     Chan(evo::ChanError),
 }
 
 /// `/dev/dispctl`: pushes `SOR_SET_CONTROL(sor)` (0, or the GOP's value)
-/// and UPDATE on the core channel. Returns the value pushed.
+/// or the head's pixel clock, and UPDATE on the core channel. Returns the
+/// value pushed.
 pub fn request(cmd: Cmd) -> Result<u32, RequestError> {
     let d = DISP.get().filter(|_| ready()).ok_or(RequestError::NotReady)?;
     let (buf, _) = super::evo::core_push().ok_or(RequestError::NotReady)?;
-    let value = match cmd {
-        Cmd::Detach => 0,
-        Cmd::Attach => d.ctrl,
+    let (mthds, n, value) = match cmd {
+        Cmd::Detach => ([sor_set_control(d.sor), 0], 1, 0),
+        Cmd::Attach => ([sor_set_control(d.sor), 0], 1, d.ctrl),
+        Cmd::Clock(khz) => {
+            let khz = if khz == 0 { d.gop_hz / 1000 } else { khz };
+            if !d.clocks || khz < d.min_khz || khz > d.max_khz {
+                REFUSED.fetch_add(1, Ordering::Relaxed);
+                log(alloc::format!("dispctl: {:?} refused: needs gpu=vpll and {}..={} kHz", cmd, d.min_khz, d.max_khz));
+                return Err(RequestError::Invalid);
+            }
+            let (f, max) = head_pixel_clock(d.head);
+            ([f, max], 2, khz * 1000)
+        }
     };
+    let methods = &mthds[..n];
     REQUESTS.fetch_add(1, Ordering::Relaxed);
     let res = PUSH_AT.with(|at| {
         let regs = &d.regs;
@@ -284,17 +358,20 @@ pub fn request(cmd: Cmd) -> Result<u32, RequestError> {
         if p.room_words() < 8 {
             evo::wind(regs, evo::CORE, &mut p).map_err(RequestError::Chan)?;
         }
-        p.mthd(sor_set_control(d.sor), &[value]).and_then(|_| evo::push_update(&mut p)).map_err(RequestError::Chan)?;
+        for &mth in methods {
+            p.mthd(mth, &[value]).map_err(RequestError::Chan)?;
+        }
+        evo::push_update(&mut p).map_err(RequestError::Chan)?;
         evo::submit(regs, evo::CORE, &p);
         *at = p.put_bytes();
         Ok((before, *at))
     });
     let line = match res {
         Ok((a, b)) => alloc::format!(
-            "dispctl: {:?} at {} ms: SOR_SET_CONTROL({}) = {:#x} + UPDATE pushed (core put {:#x} -> {:#x})",
+            "dispctl: {:?} at {} ms: methods {:x?} = {:#x} + UPDATE pushed (core put {:#x} -> {:#x})",
             cmd,
             crate::time::ktime_get() / 1_000_000,
-            d.sor,
+            methods,
             value,
             a,
             b
@@ -314,11 +391,15 @@ pub fn status() -> String {
     let Some(d) = DISP.get() else { return String::from("dispctl: not set up (needs gpu=super)\n") };
     let r = &d.regs;
     alloc::format!(
-        "dispctl: head {} SOR-{} armed control {:#x} (GOP {:#x}) core put {:#x} get {:#x} idle {} vblank seq {}\n",
+        "dispctl: head {} SOR-{} armed control {:#x} (GOP {:#x}) armed pixclk {} (GOP {}) vpll {:#x} {:#x} core put {:#x} get {:#x} idle {} vblank seq {}\n",
         d.head,
         d.sor,
         r.rd32(evo::CORE.armed_base() + sor_set_control(d.sor)),
         d.ctrl,
+        r.rd32(evo::CORE.armed_base() + head_pixel_clock(d.head).0),
+        d.gop_hz,
+        r.rd32(0xef18 + d.head * 0x40),
+        r.rd32(0xef04 + d.head * 0x40),
         r.rd32(evo::CORE.put()),
         r.rd32(evo::CORE.get()),
         evo::CORE.idle(r) as u8,
@@ -344,7 +425,7 @@ pub fn render_kdebug() -> String {
         return String::from("gpu_super: off");
     }
     alloc::format!(
-        "gpu_super: enabled=1 serviced={},{},{} script_errors={} not_done={} ctrl_disp_errors={} requests={} refused={} work_us last={} max={}",
+        "gpu_super: enabled=1 serviced={},{},{} script_errors={} not_done={} ctrl_disp_errors={} requests={} refused={} clocks_set={} work_us last={} max={}",
         SERVICED[0].load(Ordering::Relaxed),
         SERVICED[1].load(Ordering::Relaxed),
         SERVICED[2].load(Ordering::Relaxed),
@@ -353,6 +434,7 @@ pub fn render_kdebug() -> String {
         CTRL_DISP_ERRORS.load(Ordering::Relaxed),
         REQUESTS.load(Ordering::Relaxed),
         REFUSED.load(Ordering::Relaxed),
+        CLOCKS_SET.load(Ordering::Relaxed),
         LAST_US.load(Ordering::Relaxed),
         MAX_US.load(Ordering::Relaxed),
     )

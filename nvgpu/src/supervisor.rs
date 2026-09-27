@@ -12,8 +12,9 @@
 //! - 1: read the heads' and SORs' state (ARM = now, ASSEMBLY = after the
 //!   UPDATE); 1.0: each head losing its SOR runs the output's `OffInt1`
 //!   script (VBIOS IED table);
-//! - 2: 2.0 `OffInt2` for the same; 2.1 the new pixel clock (VPLL, phase
-//!   5.5: reported, not done); 2.2 each head getting a SOR runs `OnInt2`,
+//! - 2: 2.0 `OffInt2` for the same; 2.1 each head whose pixel clock
+//!   changes gets its VPLL programmed ([`crate::pll`], when
+//!   [`Config::clocks`]); 2.2 each head getting a SOR runs `OnInt2`,
 //!   programs the RG clock divider, the DP packing (audio symbols and
 //!   watermark, from the link the SOR runs) and the SOR clock;
 //! - 3: 3.0 `OnInt3`.
@@ -30,6 +31,7 @@ use alloc::vec::Vec;
 
 use crate::dcb::{Dcb, Output, OUTPUT_DP, OUTPUT_TMDS};
 use crate::init::{self, ScriptError, Target};
+use crate::pll::{self, Coeffs, PllError};
 use crate::vbios::Bios;
 use crate::vblank::{HeadTiming, HEADS_MAX};
 use crate::Mmio;
@@ -351,6 +353,9 @@ pub struct Config {
     pub owned: u8,
     /// `(sor, output)`: the output routed to each SOR (`route_get`).
     pub routes: Vec<(u8, Outp)>,
+    /// 2.1 programs the owned heads' VPLLs (phase 5.5); else it only
+    /// reports the clock change.
+    pub clocks: bool,
 }
 
 /// One thing a supervisor did or could not do.
@@ -370,9 +375,13 @@ pub enum Event {
     NoScript { head: u8, stage: u8, sor: u8 },
     /// An IED script ran (`addr` 0 = empty).
     Script { head: u8, stage: u8, sor: u8, addr: u16, result: Result<init::Stats, ScriptError> },
-    /// 2.1: the head's pixel clock changes. VPLL programming is phase 5.5:
+    /// 2.1: the head's pixel clock changes and [`Config::clocks`] is off:
     /// not done.
     ClockNotPorted { head: u8, khz: u32 },
+    /// 2.1: `VPLL<head>` programmed for `khz`.
+    Clock { head: u8, khz: u32, pll: Coeffs },
+    /// 2.1: no coefficients for `khz` (the VPLL is left as it was).
+    ClockFailed { head: u8, khz: u32, error: PllError },
     /// 2.2 on a protocol other than DP: phase 5.8, nothing done after the
     /// script.
     AttachNotPorted { head: u8, sor: u8, proto: Proto },
@@ -461,11 +470,21 @@ impl Supervisor {
             for head in work(&r, HEAD_OUTPUT) {
                 self.ied_off(m, bios, &mut r, head, 2);
             }
+            // 2.1 (`nv50_disp_super_2_1`, `nv50.c:1307-1315`).
             for head in work(&r, HEAD_CLOCK) {
+                let h = head as u8;
                 let khz = self.head_asy[head as usize].hz / 1000;
-                if khz != 0 {
-                    r.events.push(Event::ClockNotPorted { head: head as u8, khz });
+                if khz == 0 {
+                    continue;
                 }
+                if !self.cfg.clocks {
+                    r.events.push(Event::ClockNotPorted { head: h, khz });
+                    continue;
+                }
+                r.events.push(match pll::set_vpll(m, bios, head, khz) {
+                    Ok(pll) => Event::Clock { head: h, khz, pll },
+                    Err(error) => Event::ClockFailed { head: h, khz, error },
+                });
             }
             for head in work(&r, HEAD_OUTPUT) {
                 self.super_2_2(m, bios, &mut r, head);
@@ -628,7 +647,7 @@ mod tests {
     }
 
     fn cfg() -> Config {
-        Config { heads: 0x0f, sors: 0x0f, owned: 0x01, routes: vec![(1, dp3())] }
+        Config { heads: 0x0f, sors: 0x0f, owned: 0x01, routes: vec![(1, dp3())], clocks: true }
     }
 
     fn bios() -> Option<Bios> {
@@ -711,6 +730,49 @@ mod tests {
             ]
         );
         assert_eq!(fmt(&m.writes.borrow()), fmt(&owned_writes(&m)));
+    }
+
+    #[test]
+    fn round2_vpll1_replays_the_trace() {
+        // Head 1 owned (and head 0 not): its 2.1 is nouveau's VPLL1 at
+        // 148.5 MHz, read from the replayed ASSEMBLY state. Its 2.2 (HDMI)
+        // stops at "no output": the only SOR route given is DP-3's.
+        let Some(bios) = bios() else { return };
+        let m = ReplayMmio::from_extract(ROUND2);
+        let mut s = Supervisor::new(Config { owned: 0x02, ..cfg() });
+        s.service(&m, &bios, 1);
+        let r2 = s.service(&m, &bios, 2);
+        // N/fN as the GOP encodes 148.5 MHz, not nouveau's (pll.rs).
+        let pll = Coeffs { n: 55, fn_: 0, m: 1, p: 10 };
+        assert!(r2.events.contains(&Event::Clock { head: 1, khz: 148_500, pll }), "{:?}", r2.events);
+        let vpll = [0xef40, 0xef44, 0xef58, 0xe9c4];
+        let (ours, trace) = m.write_diff(&vpll);
+        assert_eq!(ours, trace.replace("W 0xef58 0x00361000", "W 0xef58 0x00370000"));
+        assert_eq!(ours.lines().count(), 4);
+    }
+
+    #[test]
+    fn clock_change_alone_programs_only_the_vpll() {
+        // What `/dev/dispctl clock` asks: head 0's mask with only the clock
+        // bit, 1080p at 50 Hz on the same raster (123.75 MHz).
+        let Some(bios) = bios() else { return };
+        let hz = 123_750_000;
+        let m = TableMmio::new(&[(SUPER_STAT, 0x10), (SUPER_HEAD, HEAD_CLOCK), (SUPER_HEAD + 4, 0), (SUPER_HEAD + 8, 0), (SUPER_HEAD + 12, 0)]);
+        let mut s = Supervisor::new(cfg());
+        s.head_asy[0].hz = hz;
+        let r = s.service(&m, &bios, 2);
+        let pll = Coeffs { n: 59, fn_: 4779, m: 1, p: 13 };
+        assert_eq!(r.events, vec![Event::Clock { head: 0, khz: 123_750, pll }]);
+        let w = m.writes.borrow();
+        assert_eq!(w[..4], pll::vpll_writes(0, &pll));
+        assert_eq!(w.len(), 4 + 5);
+        // Without `clocks` (gpu=super) the change is reported, not done.
+        let m = TableMmio::new(&[(SUPER_STAT, 0x10), (SUPER_HEAD, HEAD_CLOCK), (SUPER_HEAD + 4, 0), (SUPER_HEAD + 8, 0), (SUPER_HEAD + 12, 0)]);
+        let mut s = Supervisor::new(Config { clocks: false, ..cfg() });
+        s.head_asy[0].hz = hz;
+        let r = s.service(&m, &bios, 2);
+        assert_eq!(r.events, vec![Event::ClockNotPorted { head: 0, khz: 123_750 }]);
+        assert_eq!(m.writes.borrow().len(), 5);
     }
 
     #[test]

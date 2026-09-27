@@ -40,6 +40,10 @@
 //          detaches the primary head's SOR and attaches it back at the same
 //          mode (`supervisor.rs`). Result: `super:` lines in /proc/gpu,
 //          `gpu_super:` in /proc/kdebug.
+//   vpll   (phase 5.5) — also program the heads' pixel clocks (VPLL) in
+//          supervisor 2.1 (`nvgpu::pll`), and let `/dev/dispctl`'s
+//          `clock <kHz>` change the primary head's pixel clock on the same
+//          raster (1080p at 50 Hz, and back). Same lines and counters.
 //
 // Runs once at boot, after `fs::init` (firmware is on `/mnt`) and before the
 // APs are released (BAR sizing turns decoding off for a few microseconds,
@@ -362,7 +366,7 @@ fn probe_device(r: &mut String, level: GpuLevel) {
             }
             if level >= GpuLevel::Super {
                 match put {
-                    Some(_) => supervisor::setup(r, &regs),
+                    Some(_) => supervisor::setup(r, &regs, level >= GpuLevel::Vpll),
                     None => {
                         let _ = writeln!(r, "super: not attempted: the channels are not up (see chan:)");
                     }

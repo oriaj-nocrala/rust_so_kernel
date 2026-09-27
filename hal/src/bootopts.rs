@@ -85,6 +85,10 @@ pub enum GpuLevel {
     /// open `/dev/dispctl`, whose `detach`/`attach` take the primary head's
     /// SOR off and put it back at the same mode.
     Super,
+    /// Phase 5.5: also program the heads' pixel clocks (VPLL) in
+    /// supervisor 2.1, and let `/dev/dispctl`'s `clock <kHz>` change the
+    /// primary head's pixel clock on the same raster.
+    Vpll,
 }
 
 impl GpuLevel {
@@ -101,6 +105,7 @@ impl GpuLevel {
             "chan" => Some(GpuLevel::Chan),
             "scanout" => Some(GpuLevel::Scanout),
             "super" => Some(GpuLevel::Super),
+            "vpll" => Some(GpuLevel::Vpll),
             _ => None,
         }
     }
@@ -141,6 +146,8 @@ mod tests {
         assert_eq!(GpuLevel::parse("chan"), Some(GpuLevel::Chan));
         assert_eq!(GpuLevel::parse("scanout"), Some(GpuLevel::Scanout));
         assert_eq!(GpuLevel::parse("super"), Some(GpuLevel::Super));
+        assert_eq!(GpuLevel::parse("vpll"), Some(GpuLevel::Vpll));
+        assert!(GpuLevel::Vpll > GpuLevel::Super);
         assert!(GpuLevel::Super > GpuLevel::Scanout && GpuLevel::Scanout > GpuLevel::Chan);
         assert!(GpuLevel::Chan > GpuLevel::Dispstate && GpuLevel::Dispstate > GpuLevel::Vblank);
         assert!(GpuLevel::Vblank > GpuLevel::Disp && GpuLevel::Disp > GpuLevel::Probe && GpuLevel::Probe > GpuLevel::Off);

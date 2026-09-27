@@ -7,7 +7,7 @@ Plan and decisions: `docs/gpu/gpu-plan.md`. This page is the current state. Pure
 - UEFI gives no command line. `key=value` words are read once after `fs::init` from `/mnt/etc/kernel.conf`, then `/mnt/autorun/kernel.conf` (later wins; `#` comments). Before that, everything is at its default.
 - `/mnt/autorun/kernel.conf` is written by `scripts/metal-run.sh --kconf '...'` and removed with `autorun/`, so an option applies to one unattended run only.
 - `disk-image-root/etc/kernel.conf` is gitignored: a checkout's own options.
-- `gpu=` (`hal::bootopts::GpuLevel`): `off` (default: the GPU is not touched), `probe`, `disp`, `vblank`, `dispstate`, `chan`, `scanout`, `super`. Each level does everything the previous ones do. An unknown value is logged and read as `off`.
+- `gpu=` (`hal::bootopts::GpuLevel`): `off` (default: the GPU is not touched), `probe`, `disp`, `vblank`, `dispstate`, `chan`, `scanout`, `super`, `vpll`. Each level does everything the previous ones do. An unknown value is logged and read as `off`.
 - `disk-image-root/etc/` is not synced to `disk.img` (only `etc/gui` is). To try a level in QEMU, write the file into the image: `debugfs -w -R "write <file> /etc/kernel.conf" disk.img` (and `rm` it after).
 
 ## `gpu=probe` (phase 1)
@@ -85,11 +85,21 @@ Everything `scanout` does (needs `chan` OK); then `gpu::supervisor::setup`, at b
 - Reads heads/SORs present (`0x610060`), each DP/TMDS output's SOR by pad routing (`nvgpu::supervisor::route_get`, nouveau's `gm200_sor_route_get`), the primary head (lowest lit), the SOR driving it (ARMED `SOR_SET_CONTROL`), the GOP's DP link (`DpLink::read`: `0x612300`/`0x61c10c`) and the IED scripts a detach/attach would run. STOP unless that SOR runs DP with a routed DP output (only a DP attach is ported).
 - Enables CTRL_DISP interrupts for the supervisors only (`0x611cf0`/`0x611db0` = 7; nouveau sets `0x187`).
 - **Interrupt**: `nvgpu::vblank::service(m, true)` acks DISP_INTR bit 12 as `gv100_disp_intr_ctrl_disp` (pending → `0x611860`, error info from `0x611848`); `vblank::on_msi` then calls `supervisor::on_pending` (ISR, CPU 0, global work).
-- **Work** (`nvgpu::supervisor::Supervisor::service`, `gv100_disp_super`): 1 reads head/SOR ARM+ASSEMBLY state, 1.0/2.0 run the output's `OffInt1/2`, 2.1 (clock change) is reported `ClockNotPorted` (phase 5.5), 2.2 runs `OnInt2`, RG divider, DP audio symbols + watermark (nouveau's formula, GA102 has no `activesym`) and the SOR clock; non-DP attach is `AttachNotPorted` (5.8); 3.0 runs `OnInt3`. Heads not owned are released untouched (`Foreign`). Always releases (`0x6107ac+h*4 = 0`, `0x6107a8 = 0x80000000`).
+- **Work** (`nvgpu::supervisor::Supervisor::service`, `gv100_disp_super`): 1 reads head/SOR ARM+ASSEMBLY state, 1.0/2.0 run the output's `OffInt1/2`, 2.1 (clock change) is reported `ClockNotPorted` under `super` and programs the VPLL under `vpll` (below), 2.2 runs `OnInt2`, RG divider, DP audio symbols + watermark (nouveau's formula, GA102 has no `activesym`) and the SOR clock; non-DP attach is `AttachNotPorted` (5.8); 3.0 runs `OnInt3`. Heads not owned are released untouched (`Foreign`). Always releases (`0x6107ac+h*4 = 0`, `0x6107a8 = 0x80000000`).
 - **IED scripts**: `nvgpu::init`, nouveau's VBIOS script interpreter with 9 opcodes (`NOT`, `GENERIC_CONDITION`, `SUB_DIRECT`, `COPY_NV_REG`, `NV_REG`, `DONE`, `RESUME`, `TIME`, `ZM_REG`); any other opcode stops the script (`ScriptError::Unsupported`). Enough for DP-3's scripts; HDMI's need more. `OffInt2` writes `0x21234`, which PRI-faults on this GPU (nouveau does the same; the PRIVRING leaf is blocked here).
 - **`/dev/dispctl`** (`drivers/dev_dispctl.rs`): `write` `detach` / `attach` pushes `SOR_SET_CONTROL(sor)` = 0 / the GOP's value + UPDATE on the core channel (under `PUSH_AT`), not waited on; `EAGAIN` while the core is not idle, `ENODEV` on open unless set up and vblank armed. `read`: one status line (ARMED control, core PUT/GET).
 - Report: `super:` lines in `/proc/gpu` (boot, then one per supervisor and per request, 64 kept) and the klog; `/proc/kdebug` `gpu_super: serviced=s1,s2,s3 script_errors not_done ctrl_disp_errors requests refused work_us`.
 - Metal job: `touch build.rs`, then `scripts/metal-run.sh --kconf 'gpu=super' scripts/metal-jobs/gpu-super.sh`.
+
+## `gpu=vpll` (phase 5.5)
+
+Everything `super` does, with `Config::clocks`: supervisor 2.1 programs `VPLL<head>` for the ASSEMBLY pixel clock (`nvgpu::pll`, nouveau's `ga100_devinit_pll_set`).
+- **Limits**: VBIOS BIT 'C' v2 → PLL table (this board: `0x4f51`, version 0x50, entry = type `0x80 + head`). VPLL0-3: refclk 27 MHz, VCO 800-1620 MHz, input 19-38 MHz, M 1, N 29-255, P 1-63. Only version 0x50 is parsed.
+- **Coefficients**: P and M as `gt215_pll_calc` (P = VCO max / clock, M = 1); the VPLL runs at `refclk * (N + fN/8192) / (M*P)`, so N = whole part, fN = fraction × 8192 rounded. **Not nouveau's encoding** (N one lower, fN `- 4096`): measured on the Ryzen (#78/#79), nouveau's gives 147.15 MHz for 148.5. 148.5 MHz → N 55, fN 0, P 10, which is what the GOP leaves (`0xef18 = 0x370000`).
+- **Writes** (`ga100.c:52-55`): `0xef00+h*0x40 = 0x02080004`, `0xef18 = N<<16|fN`, `0xef04 = P<<16|M`, `0xe9c0+h*4 = 1`.
+- **`/dev/dispctl` `clock <kHz>`** (`0` = the GOP's): pushes `HEAD_SET_PIXEL_CLOCK_FREQUENCY` and `_MAX` (`0x200c`/`0x2028 + h*0x400`, Hz) + UPDATE; same raster, so only the refresh changes. `EINVAL` below 48 Hz on that raster (the ASUS's floor) or above what the GOP's DP link carries (lanes × rate × 8 / bpp: 180 MHz on its 2×HBR); nothing retrains the link.
+- Report: `vpll:` lines at boot (limits, the GOP's clock's coefficients, bounds; the GOP's VPLL registers, read only); `dispctl` status adds ARMED pixel clock and VPLL0's `0xef18`/`0xef04`; `gpu_super: clocks_set=`.
+- Metal job: `touch build.rs`, then `scripts/metal-run.sh --kconf 'gpu=vpll' scripts/metal-jobs/gpu-vpll.sh` (50 Hz for ~20 s, then back to 60).
 
 ## Oracle tools (`scripts/gpu-trace.py`)
 
