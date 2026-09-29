@@ -53,6 +53,13 @@
 //          size: detach, retrain the link if the mode needs it, attach with
 //          the new raster and clock (`modeset.rs`, `nvgpu::mode`). Result:
 //          `modes:`/`mode:` lines in /proc/gpu, `gpu_mode:` in /proc/kdebug.
+//   fwsec  (phase 4c) — also run FWSEC-FRTS on the GSP falcon (`gsp.rs`,
+//          `nvgpu::{falcon,fwsec}`): the VBIOS's signed microcode carves
+//          the protected memory region (WPR2) the GSP's boot needs. Result:
+//          `fwsec:` lines in /proc/gpu, `gpu_fwsec:` in /proc/kdebug.
+//   gsp    (phases 4d + 4e) — also build the memory GSP-RM's boot reads and
+//          boot it: reset into RISC-V mode, booter on SEC2, RISC-V check
+//          (`gsp.rs`, `nvgpu::{gspmem,booter}`). `gsp:` lines, `gpu_gsp:`.
 //
 // Runs once at boot, after `fs::init` (firmware is on `/mnt`) and before the
 // APs are released (BAR sizing turns decoding off for a few microseconds,
@@ -69,6 +76,7 @@ use crate::serial_println;
 
 pub mod dplink;
 pub mod evo;
+pub mod gsp;
 pub mod hdmi;
 pub mod modeset;
 pub mod scanout;
@@ -408,6 +416,29 @@ fn probe_device(r: &mut String, level: GpuLevel) {
                         let _ = writeln!(r, "super: not attempted: the channels are not up (see chan:)");
                     }
                 }
+            }
+            // Before the vblank interrupt is armed: FWSEC busy-waits with IF=0
+            // for a few hundred ms, and no MSI should be in flight meanwhile.
+            if level >= GpuLevel::Fwsec {
+                gsp::setup(
+                    r,
+                    &regs,
+                    (b, d, fun),
+                    level >= GpuLevel::Gsp,
+                    gsp::PciInfo {
+                        bar0: bar0.addr,
+                        bar1: bars[1].map_or(0, |b| b.addr),
+                        bar3: bars[3].map_or(0, |b| b.addr),
+                        bus: b,
+                        device: d,
+                        function: fun,
+                        vendor: f.vendor,
+                        device_id: f.device_id,
+                        sub_vendor: u16::from_le_bytes([cfg[0x2c], cfg[0x2d]]),
+                        sub_device: u16::from_le_bytes([cfg[0x2e], cfg[0x2f]]),
+                        revision: f.revision,
+                    },
+                );
             }
             if level >= GpuLevel::Vblank {
                 vblank::setup(r, &regs, (b, d, fun));

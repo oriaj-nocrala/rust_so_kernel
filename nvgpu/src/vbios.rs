@@ -206,6 +206,18 @@ impl Bios {
         }
         ((a as u64 + size as u64) <= self.data.len() as u64).then_some(a as usize)
     }
+    /// `nvbios_pointer` (`base.c`) plus a length: `len` bytes at VBIOS
+    /// address `addr` (through the same image redirection as the reads), or
+    /// `None` if they are not all in the ROM.
+    pub fn slice(&self, addr: u32, len: u32) -> Option<&[u8]> {
+        let a = self.addr(addr, len)?;
+        Some(&self.data[a..a + len as usize])
+    }
+    /// Where VBIOS address `addr` (`len` bytes) is in the ROM bytes, after
+    /// the image redirection.
+    pub fn raw_offset(&self, addr: u32, len: u32) -> Option<usize> {
+        self.addr(addr, len)
+    }
     pub fn rd08(&self, addr: u32) -> u8 {
         self.addr(addr, 1).map_or(0, |a| self.data[a])
     }

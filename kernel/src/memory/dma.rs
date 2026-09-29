@@ -80,6 +80,17 @@ impl DmaBuf {
         }
     }
 
+    /// Like [`write`](Self::write) for large copies (the 63 MB GSP image):
+    /// plain `memcpy` then a store fence, instead of one volatile store per byte.
+    /// The device must not be reading the range meanwhile.
+    pub fn copy_in(&self, offset: usize, data: &[u8]) {
+        assert!(offset.checked_add(data.len()).is_some_and(|end| end <= self.len()));
+        // SAFETY: in range per the assert; the block is ours and not yet visible to the device.
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), self.virt().add(offset), data.len()) };
+        // SAFETY: a store fence.
+        unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) };
+    }
+
     /// Copies from the block at `offset` into `out`.
     pub fn read(&self, offset: usize, out: &mut [u8]) {
         assert!(offset.checked_add(out.len()).is_some_and(|end| end <= self.len()));

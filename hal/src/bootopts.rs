@@ -101,6 +101,16 @@ pub enum GpuLevel {
     /// with a picture of the kernel's own: `/dev/dispctl`'s `hdmi on` /
     /// `hdmi off`.
     Hdmi,
+    /// Phase 4c: also run FWSEC-FRTS (the VBIOS's signed microcode) on the
+    /// GSP falcon, which carves the protected memory region (WPR2) the GSP's
+    /// own boot needs. Runs once at boot; changes no display state.
+    Fwsec,
+    /// Phases 4d + 4e: also build everything GSP-RM's boot reads (firmware
+    /// behind radix3, WPR meta, LibOS arguments and logs, queues), reset the
+    /// GSP into RISC-V mode, run the booter on SEC2 and check the RISC-V core.
+    /// Needs `gsp-570.144.bin` on the stick (`scripts/sync-usb-data.sh`). No
+    /// RPC yet.
+    Gsp,
 }
 
 impl GpuLevel {
@@ -121,6 +131,8 @@ impl GpuLevel {
             "dplink" => Some(GpuLevel::Dplink),
             "modes" => Some(GpuLevel::Modes),
             "hdmi" => Some(GpuLevel::Hdmi),
+            "fwsec" => Some(GpuLevel::Fwsec),
+            "gsp" => Some(GpuLevel::Gsp),
             _ => None,
         }
     }
@@ -157,7 +169,7 @@ mod tests {
         assert_eq!(GpuLevel::parse("disp"), Some(GpuLevel::Disp));
         assert_eq!(GpuLevel::parse("vblank"), Some(GpuLevel::Vblank));
         assert_eq!(GpuLevel::parse("dispstate"), Some(GpuLevel::Dispstate));
-        assert_eq!(GpuLevel::parse("gsp"), None);
+        assert_eq!(GpuLevel::parse("frobnicate"), None);
         assert_eq!(GpuLevel::parse("chan"), Some(GpuLevel::Chan));
         assert_eq!(GpuLevel::parse("scanout"), Some(GpuLevel::Scanout));
         assert_eq!(GpuLevel::parse("super"), Some(GpuLevel::Super));
@@ -168,6 +180,10 @@ mod tests {
         assert!(GpuLevel::Modes > GpuLevel::Dplink);
         assert_eq!(GpuLevel::parse("hdmi"), Some(GpuLevel::Hdmi));
         assert!(GpuLevel::Hdmi > GpuLevel::Modes);
+        assert_eq!(GpuLevel::parse("fwsec"), Some(GpuLevel::Fwsec));
+        assert!(GpuLevel::Fwsec > GpuLevel::Hdmi);
+        assert_eq!(GpuLevel::parse("gsp"), Some(GpuLevel::Gsp));
+        assert!(GpuLevel::Gsp > GpuLevel::Fwsec);
         assert!(GpuLevel::Vpll > GpuLevel::Super);
         assert!(GpuLevel::Super > GpuLevel::Scanout && GpuLevel::Scanout > GpuLevel::Chan);
         assert!(GpuLevel::Chan > GpuLevel::Dispstate && GpuLevel::Dispstate > GpuLevel::Vblank);

@@ -91,7 +91,13 @@ sudo mount -t ext2 "$REAL_DEV" "$MNT"
 # --itemize-changes: one line per file that differs, so --dry-run actually
 # says what it would write (with only --info=stats1 it printed byte totals
 # and no file names, whatever was about to change).
-RSYNC_ARGS=(-a --delete --exclude 'lost+found' --info=stats1 --itemize-changes)
+# The GSP firmware (63 MB) does not fit disk.img, so it is not in
+# disk-image-root/: it is added below from the host's copy and protected here
+# from --delete (`P` = protect).
+GSP_REL="lib/firmware/nvidia/ga106/gsp/gsp-570.144.bin"
+GSP_ZST="/usr/lib/firmware/nvidia/ga106/gsp/gsp-570.144.bin.zst"
+GSP_CACHE="$REPO_ROOT/target/firmware/gsp-570.144.bin"
+RSYNC_ARGS=(-a --delete --exclude 'lost+found' --filter "P /$GSP_REL" --info=stats1 --itemize-changes)
 [[ $DRY_RUN -eq 1 ]] && RSYNC_ARGS+=(--dry-run)
 
 sudo rsync "${RSYNC_ARGS[@]}" "$SRC"/ "$MNT"/
@@ -99,6 +105,19 @@ sudo rsync "${RSYNC_ARGS[@]}" "$SRC"/ "$MNT"/
 if [[ $DRY_RUN -eq 1 ]]; then
     echo "(dry run — nothing written)"
     exit 0
+fi
+
+# GPU phase 4: gsp-570.144.bin (decompressed once into target/firmware/).
+# rsync compares size and mtime, so an unchanged file is not rewritten.
+if [[ -f "$GSP_ZST" ]]; then
+    if [[ ! -f "$GSP_CACHE" ]]; then
+        mkdir -p "$(dirname "$GSP_CACHE")"
+        zstd -q -d -f -o "$GSP_CACHE" "$GSP_ZST"
+    fi
+    sudo mkdir -p "$MNT/$(dirname "$GSP_REL")"
+    sudo rsync -a --inplace --itemize-changes "$GSP_CACHE" "$MNT/$GSP_REL"
+else
+    echo "note: $GSP_ZST not on the host: gpu=gsp will find no gsp-570.144.bin on the stick" >&2
 fi
 
 sudo sync

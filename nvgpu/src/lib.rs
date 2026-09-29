@@ -14,12 +14,17 @@
 extern crate alloc;
 
 pub mod aux;
+pub mod booter;
 pub mod dcb;
 pub mod display;
 pub mod dp;
 pub mod dispstate;
 pub mod edid;
 pub mod evo;
+pub mod falcon;
+pub mod firmware;
+pub mod gspmem;
+pub mod fwsec;
 pub mod hdmi;
 pub mod i2c;
 pub mod id;
@@ -30,6 +35,7 @@ pub mod mode;
 pub mod pad;
 pub mod pattern;
 pub mod pll;
+pub mod rpc;
 pub mod supervisor;
 pub mod vbios;
 pub mod vblank;
