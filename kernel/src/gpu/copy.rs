@@ -176,19 +176,58 @@ impl Submitter<'_> {
             }
             if crate::cpu::tsc::read().wrapping_sub(t0) > limit {
                 return Err(alloc::format!(
-                    "the fence never reached {:#x} in {} ms: fence {:#x}, USERD GPGet {} GPPut {}, Get {:#x}; 0x2100 {:#x}, 0xb65000 {:#x}",
+                    "the fence never reached {:#x} in {} ms: fence {:#x}, USERD GPGet {} GPPut {}, Get {:#x} Reference {:#x} TopLevelGet {:#x} GetHi {:#x}; 0x2100 {:#x}, 0xb65000 {:#x}",
                     payload,
                     FENCE_TIMEOUT_MS,
                     p.rd32(chan::FENCE_VRAM),
                     p.rd32(chan::USERD_VRAM + chan::USERD_GP_GET),
                     p.rd32(chan::USERD_VRAM + chan::USERD_GP_PUT),
                     p.rd32(chan::USERD_VRAM + 0x44),
+                    p.rd32(chan::USERD_VRAM + 0x48),
+                    p.rd32(chan::USERD_VRAM + 0x58),
+                    p.rd32(chan::USERD_VRAM + 0x60),
                     self.regs.rd32(0x2100),
                     self.regs.rd32(0xb6_5000)
                 ));
             }
         }
     }
+}
+
+/// One rung of the ladder: submit, wait, report.
+fn rung(r: &mut String, rm: &mut Rm, p: &mut Pramin, sub: &mut Submitter, name: &str, push: &[u32], payload: u32) -> Option<Done> {
+    match sub.submit(p, push, payload) {
+        Ok(d) => {
+            let _ = writeln!(
+                r,
+                "copy: rung {}: OK in {} us{}",
+                name,
+                d.ticks * 1_000_000 / crate::cpu::tsc::freq_hz(),
+                if d.second_token { " (only after RM's own token was rung too)" } else { "" }
+            );
+            Some(d)
+        }
+        Err(e) => {
+            let events = rm.drain(50);
+            stop(r, format_args!("rung {}: {}; RM events {:x?}", name, e, events));
+            None
+        }
+    }
+}
+
+/// Fill 4 KiB of VRAM with `f(word index)`.
+fn vram_fill(p: &mut Pramin, at: u64, f: impl Fn(usize) -> u32) {
+    for k in 0..1024 {
+        p.wr32(at + 4 * k as u64, f(k));
+    }
+}
+
+/// The first of 4 KiB of VRAM that differs from `f`: (index, wanted, got).
+fn vram_diff(p: &mut Pramin, at: u64, f: impl Fn(usize) -> u32) -> Option<(usize, u32, u32)> {
+    (0..1024).find_map(|k| {
+        let got = p.rd32(at + 4 * k as u64);
+        (got != f(k)).then(|| (k, f(k), got))
+    })
 }
 
 /// KiB/s for `bytes` in `ticks` of the TSC.
@@ -258,8 +297,39 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, bufs: Buffers) {
     );
 
     let mut sub = Submitter { regs, tokens: [token, rm_token], slot: 0, push_at: 0 };
-    // src (system) -> VRAM
-    let up = sub.submit(&mut p, &chan::copy_push(chan::SRC_VA, chan::DST_VA, COPY_BYTES as u32, chan::FENCE_VA, 1), 1);
+
+    // The bring-up ladder: each rung adds one thing, and the first that fails is
+    // named (boots #102-#104 got as far as the GPU reading the GPFIFO entry).
+    // 1. a bare semaphore release: the channel runs, the fence page is writable.
+    if rung(r, rm, &mut p, &mut sub, "semaphore release", &chan::release_push(chan::FENCE_VA, 1), 1).is_none() {
+        p.restore();
+        return;
+    }
+    // 2. VRAM -> VRAM, 4 KiB: the copy engine and our VRAM mappings.
+    let (v_src, v_dst) = (chan::VRAM_DST, chan::VRAM_DST + 0x10_0000);
+    vram_fill(&mut p, v_src, |k| pattern(0, k));
+    vram_fill(&mut p, v_dst, |_| 0);
+    if rung(r, rm, &mut p, &mut sub, "VRAM -> VRAM 4 KiB", &chan::copy_push(chan::DST_VA, chan::DST_VA + 0x10_0000, 0x1000, chan::FENCE_VA, 2), 2).is_none() {
+        p.restore();
+        return;
+    }
+    if let Some((k, want, got)) = vram_diff(&mut p, v_dst, |k| pattern(0, k)) {
+        p.restore();
+        return stop(r, format_args!("rung VRAM -> VRAM 4 KiB: the fence came but word {} is {:#x}, wanted {:#x}", k, got, want));
+    }
+    // 3. system -> VRAM, 4 KiB: the system-memory mapping and the PCIe path.
+    let v_dst = chan::VRAM_DST + 0x20_0000;
+    vram_fill(&mut p, v_dst, |_| 0);
+    if rung(r, rm, &mut p, &mut sub, "system -> VRAM 4 KiB", &chan::copy_push(chan::SRC_VA, chan::DST_VA + 0x20_0000, 0x1000, chan::FENCE_VA, 3), 3).is_none() {
+        p.restore();
+        return;
+    }
+    if let Some((k, want, got)) = vram_diff(&mut p, v_dst, |k| pattern(0, k)) {
+        p.restore();
+        return stop(r, format_args!("rung system -> VRAM 4 KiB: the fence came but word {} is {:#x}, wanted {:#x}", k, got, want));
+    }
+    // 4. the measured round trip, COPY_BYTES each way.
+    let up = sub.submit(&mut p, &chan::copy_push(chan::SRC_VA, chan::DST_VA, COPY_BYTES as u32, chan::FENCE_VA, 4), 4);
     let up = match up {
         Ok(d) => d,
         Err(e) => {
@@ -268,8 +338,7 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, bufs: Buffers) {
             return stop(r, format_args!("copy up: {}; RM events {:x?}", e, events));
         }
     };
-    // VRAM -> back (system)
-    let down = sub.submit(&mut p, &chan::copy_push(chan::DST_VA, chan::BACK_VA, COPY_BYTES as u32, chan::FENCE_VA, 2), 2);
+    let down = sub.submit(&mut p, &chan::copy_push(chan::DST_VA, chan::BACK_VA, COPY_BYTES as u32, chan::FENCE_VA, 5), 5);
     p.restore();
     let down = match down {
         Ok(d) => d,

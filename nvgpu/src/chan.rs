@@ -255,6 +255,25 @@ pub fn copy_push(src_va: u64, dst_va: u64, len: u32, sem_va: u64, payload: u32) 
     w
 }
 
+/// `LAUNCH_DMA` for a semaphore release with no data transfer: DATA_TRANSFER_TYPE
+/// NONE (0), FLUSH_ENABLE, SEMAPHORE_TYPE RELEASE_ONE_WORD (UVM's
+/// `ce_semaphore_release`).
+pub const LAUNCH_DMA_SEMAPHORE_ONLY: u32 = (1 << 2) | (1 << 3);
+
+/// The push buffer of a bare semaphore release: binds the copy object and writes
+/// `payload` at `sem_va` (no data moves). The first rung of the bring-up ladder:
+/// it shows the channel runs and the semaphore's page is writable.
+pub fn release_push(sem_va: u64, payload: u32) -> Vec<u32> {
+    let mut w = Vec::new();
+    w.push(incr_header(SUBCH_COPY, 0, 1));
+    w.push(CLASS_COPY);
+    w.push(incr_header(SUBCH_COPY, CE_SET_SEMAPHORE_A, 3));
+    w.extend([(sem_va >> 32) as u32, sem_va as u32, payload]);
+    w.push(incr_header(SUBCH_COPY, CE_LAUNCH_DMA, 1));
+    w.push(LAUNCH_DMA_SEMAPHORE_ONLY);
+    w
+}
+
 // ---- the layout the adapter uses -------------------------------------------------------
 
 /// One buffer: where the GPU sees it (VA) and where it is (VRAM address or bus
@@ -578,6 +597,17 @@ mod tests {
         let l = LAUNCH_DMA_COPY_WITH_SEMAPHORE;
         assert_eq!((l & 3, l >> 2 & 1, l >> 3 & 3, l >> 5 & 3, l >> 7 & 1, l >> 8 & 1, l >> 9 & 1, l >> 12 & 3), (2, 1, 1, 0, 1, 1, 0, 0));
         assert_eq!(l, 0x18e);
+    }
+
+    #[test]
+    fn the_bare_release_is_the_copy_push_without_the_transfer() {
+        let w = release_push(0x2_0002_0010, 0x77);
+        let s = SUBCH_COPY;
+        assert_eq!(decode(&w), [(s, 0x000, 0xc7b5), (s, 0x240, 2), (s, 0x244, 0x0002_0010), (s, 0x248, 0x77), (s, 0x300, 0xc)]);
+        assert_eq!(LAUNCH_DMA_SEMAPHORE_ONLY, 0xc);
+        // the same release words as the copy's
+        let c = copy_push(0x1000, 0x2000, 16, 0x2_0002_0010, 0x77);
+        assert_eq!(&c[c.len() - 6..c.len() - 2], &w[w.len() - 6..w.len() - 2][..4]);
     }
 
     #[test]
