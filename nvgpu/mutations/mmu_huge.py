@@ -1,0 +1,25 @@
+# Mutations for the 2 MiB pages of nvgpu::mmu (phase 6d):
+#   scripts/gpu-mutate.py nvgpu/src/mmu.rs mmu:: nvgpu/mutations/mmu_huge.py
+M = [
+    ("pub const HUGE_PAGE: u64 = 2 << 20;", "pub const HUGE_PAGE: u64 = 1 << 20;"),
+    ("pub const HUGE_PAGE: u64 = 2 << 20;", "pub const HUGE_PAGE: u64 = 4 << 20;"),
+    ("if va & (HUGE_PAGE - 1) != 0 || pa & (HUGE_PAGE - 1) != 0 {", "if va & (HUGE_PAGE - 1) != 0 {"),
+    ("if va & (HUGE_PAGE - 1) != 0 || pa & (HUGE_PAGE - 1) != 0 {", "if pa & (HUGE_PAGE - 1) != 0 {"),
+    ("if va & (HUGE_PAGE - 1) != 0 || pa & (HUGE_PAGE - 1) != 0 {", "if va & (HUGE_PAGE - 1) != 0 || pa & (HUGE_PAGE - 1) != 1 {"),
+    ("        let at = ix[3] * 16;\n        if rd64(&self.tables[t], at) != 0 {\n            return Err(MapError::AlreadyMapped);", "        let at = ix[3] * 16 + 8;\n        if rd64(&self.tables[t], at) != 0 {\n            return Err(MapError::AlreadyMapped);"),
+    ("        if rd64(&self.tables[t], at) != 0 {\n            return Err(MapError::AlreadyMapped);\n        }\n        if rd64(&self.tables[t], at + PD0_SMALL) != 0 {", "        if rd64(&self.tables[t], at + PD0_SMALL) != 0 {"),
+    ("        if rd64(&self.tables[t], at + PD0_SMALL) != 0 {\n            return Err(MapError::Overlap);\n        }\n        wr64(&mut self.tables[t], at, pte(pa, target, f));", "        wr64(&mut self.tables[t], at, pte(pa, target, f));"),
+    ("wr64(&mut self.tables[t], at, pte(pa, target, f));\n        Ok(())\n    }\n\n    /// Map `len` bytes (a multiple of 2 MiB)", "wr64(&mut self.tables[t], at + 8, pte(pa, target, f));\n        Ok(())\n    }\n\n    /// Map `len` bytes (a multiple of 2 MiB)"),
+    ("        if rd64(&self.tables[t], ix[3] * 16) != 0 {\n            return Err(MapError::Overlap);", "        if false {\n            return Err(MapError::Overlap);"),
+    ("        if rd64(&self.tables[t], ix[3] * 16) != 0 {\n            return Err(MapError::Overlap);", "        if rd64(&self.tables[t], ix[3] * 16 + 8) != 0 {\n            return Err(MapError::Overlap);"),
+    ("if len & (HUGE_PAGE - 1) != 0 {", "if len & 0xfff != 0 {"),
+    ("            off += HUGE_PAGE;", "            off += 0x1000;"),
+    ("        for &i in &ix[..3] {", "        for &i in &ix[..2] {"),
+    ("        Some((t, ix[3] * 16))\n    }", "        Some((t, ix[3] * 16 + 8))\n    }"),
+    ("return Some((entry_addr(e) | (va & (HUGE_PAGE - 1)), e));", "return Some((entry_addr(e), e));"),
+    ("return Some((entry_addr(e) | (va & (HUGE_PAGE - 1)), e));", "return Some((entry_addr(e) | (va & 0xfff), e));"),
+    ("            if e & PTE_VALID != 0 {\n                return Some((entry_addr(e) | (va & (HUGE_PAGE - 1)), e));", "            if true {\n                return Some((entry_addr(e) | (va & (HUGE_PAGE - 1)), e));"),
+    ("            if rd64(&self.tables[t], at) != 0 {\n                wr64(&mut self.tables[t], at, 0);\n                return true;", "            if rd64(&self.tables[t], at) != 0 {\n                return true;"),
+    ("        if let Some((t, at)) = self.locate_huge(va) {\n            if rd64", "        if let Some((t, at)) = None::<(usize, usize)> {\n            if rd64"),
+    ("        if va >> VA_BITS != 0 {\n            return Err(MapError::OutOfRange);\n        }\n        let ix = indices(va);\n        let mut t = 0;\n        t = self.child(t, ix[0] * 8)?;\n        t = self.child(t, ix[1] * 8)?;\n        t = self.child(t, ix[2] * 8)?;\n        let at", "        let ix = indices(va & ((1 << VA_BITS) - 1));\n        let mut t = 0;\n        t = self.child(t, ix[0] * 8)?;\n        t = self.child(t, ix[1] * 8)?;\n        t = self.child(t, ix[2] * 8)?;\n        let at"),
+]

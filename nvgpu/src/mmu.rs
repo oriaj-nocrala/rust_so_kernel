@@ -26,6 +26,9 @@ pub const PAGE_SHIFT: u32 = 12;
 /// the LPT (`pt[0]`), `data[1]` the SPT (`pt[1]`, `nvkm_vmm_ref_hwpt`: `type = desc->type == SPT`).
 pub const PD0_SMALL: usize = 8;
 
+/// The size of the page a PD0 entry can map by itself (`NV_MMU_VER2_DUAL_PDE_IS_PTE`).
+pub const HUGE_PAGE: u64 = 2 << 20;
+
 /// Where a page or table lives (`nvkm_memory_target`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
@@ -101,6 +104,8 @@ pub enum MapError {
     NoTables,
     /// The VA already has a mapping.
     AlreadyMapped,
+    /// A 2 MiB page and a table of 4 KiB pages cannot share a PD0 slot.
+    Overlap,
 }
 
 /// The index of `va` at each level, root first: [PD3, PD2, PD1, PD0, PT].
@@ -201,7 +206,12 @@ impl PageTables {
         t = self.child(t, ix[0] * 8)?;
         t = self.child(t, ix[1] * 8)?;
         t = self.child(t, ix[2] * 8)?;
-        t = self.child(t, ix[3] * 16 + PD0_SMALL)?; // PD0: 16-byte dual PDE, the small-page PDE is the second half
+        // PD0: 16-byte dual PDE, the small-page PDE is the second half; the first
+        // half holding a PTE means a 2 MiB page covers this VA
+        if rd64(&self.tables[t], ix[3] * 16) != 0 {
+            return Err(MapError::Overlap);
+        }
+        t = self.child(t, ix[3] * 16 + PD0_SMALL)?;
         let at = ix[4] * 8;
         if rd64(&self.tables[t], at) != 0 {
             return Err(MapError::AlreadyMapped);
@@ -223,8 +233,53 @@ impl PageTables {
         Ok(())
     }
 
+    /// Map one 2 MiB page: the PD0 entry itself is the PTE (`gp100_vmm_pd0_pte`,
+    /// `vmmgp100.c:215-227`: `(addr >> 4) | type` in the first 8 bytes of the
+    /// 16-byte entry, 0 in the second; `NV_MMU_VER2_DUAL_PDE_IS_PTE` is bit 0).
+    pub fn map_huge(&mut self, va: u64, pa: u64, target: Target, f: Flags) -> Result<(), MapError> {
+        if va & (HUGE_PAGE - 1) != 0 || pa & (HUGE_PAGE - 1) != 0 {
+            return Err(MapError::Unaligned);
+        }
+        if va >> VA_BITS != 0 {
+            return Err(MapError::OutOfRange);
+        }
+        let ix = indices(va);
+        let mut t = 0;
+        t = self.child(t, ix[0] * 8)?;
+        t = self.child(t, ix[1] * 8)?;
+        t = self.child(t, ix[2] * 8)?;
+        let at = ix[3] * 16;
+        if rd64(&self.tables[t], at) != 0 {
+            return Err(MapError::AlreadyMapped);
+        }
+        if rd64(&self.tables[t], at + PD0_SMALL) != 0 {
+            return Err(MapError::Overlap);
+        }
+        wr64(&mut self.tables[t], at, pte(pa, target, f));
+        Ok(())
+    }
+
+    /// Map `len` bytes (a multiple of 2 MiB) of contiguous physical memory with 2 MiB pages.
+    pub fn map_huge_range(&mut self, va: u64, pa: u64, len: u64, target: Target, f: Flags) -> Result<(), MapError> {
+        if len & (HUGE_PAGE - 1) != 0 {
+            return Err(MapError::Unaligned);
+        }
+        let mut off = 0;
+        while off < len {
+            self.map_huge(va + off, pa + off, target, f)?;
+            off += HUGE_PAGE;
+        }
+        Ok(())
+    }
+
     /// Remove the mapping of one page; `false` if there was none.
     pub fn unmap(&mut self, va: u64) -> bool {
+        if let Some((t, at)) = self.locate_huge(va) {
+            if rd64(&self.tables[t], at) != 0 {
+                wr64(&mut self.tables[t], at, 0);
+                return true;
+            }
+        }
         match self.locate(va) {
             Some((t, at)) if rd64(&self.tables[t], at) != 0 => {
                 wr64(&mut self.tables[t], at, 0);
@@ -232,6 +287,20 @@ impl PageTables {
             }
             _ => false,
         }
+    }
+
+    /// The (PD0 table, byte offset) of the 2 MiB PTE that would cover `va`, if the
+    /// directories above it exist.
+    fn locate_huge(&self, va: u64) -> Option<(usize, usize)> {
+        if va >> VA_BITS != 0 {
+            return None;
+        }
+        let ix = indices(va);
+        let mut t = 0;
+        for &i in &ix[..3] {
+            t = self.table_at(entry_addr(rd64(&self.tables[t], i * 8)))?;
+        }
+        Some((t, ix[3] * 16))
     }
 
     /// The (table, byte offset) of `va`'s PTE, if all its directories exist.
@@ -251,6 +320,12 @@ impl PageTables {
 
     /// Translate `va` through the images: the physical address and the PTE.
     pub fn translate(&self, va: u64) -> Option<(u64, u64)> {
+        if let Some((t, at)) = self.locate_huge(va) {
+            let e = rd64(&self.tables[t], at);
+            if e & PTE_VALID != 0 {
+                return Some((entry_addr(e) | (va & (HUGE_PAGE - 1)), e));
+            }
+        }
         let (t, at) = self.locate(va)?;
         let e = rd64(&self.tables[t], at);
         (e & PTE_VALID != 0).then(|| (entry_addr(e) | (va & 0xfff), e))
@@ -274,6 +349,13 @@ mod tests {
         let shifts_bits = [(47u32, 2u32, 8usize), (38, 9, 8), (29, 9, 8), (21, 8, 16)];
         for (shift, bits, size) in shifts_bits {
             let i = ((va >> shift) & ((1 << bits) - 1)) as usize;
+            if size == 16 {
+                // the big-page half with its bit 0 set is a 2 MiB PTE (NV_MMU_VER2_DUAL_PDE_IS_PTE)
+                let big = get(table, i * 16)?;
+                if big & 1 == 1 {
+                    return Some(((((big >> 8) & 0x00ff_ffff_ffff) << 12) | (va & 0x1f_ffff), big));
+                }
+            }
             let e = get(table, i * size + if size == 16 { 8 } else { 0 })?;
             if e == 0 {
                 return None;
@@ -475,5 +557,81 @@ mod tests {
         let addrs: Vec<u64> = pt.images().map(|(a, _)| a).collect();
         assert_eq!(addrs, [BASE, BASE + 0x1000, BASE + 0x2000, BASE + 0x3000, BASE + 0x4000]);
         assert_eq!((TABLE_SIZE, VA_BITS, ROOT_ENTRIES, PAGE_SHIFT), (0x1000, 49, 4, 12));
+    }
+
+    #[test]
+    fn a_huge_page_is_the_first_half_of_the_pd0_entry() {
+        let mut pt = PageTables::new(BASE, 16, Target::Vram);
+        let va = 0x2_1000_0000u64; // PD0 index 128 of PD1 slot 8
+        let pa = 0x9_0020_0000u64;
+        pt.map_huge(va, pa, Target::Vram, Flags::default()).unwrap();
+        assert_eq!(pt.len(), 4, "PD3 + PD2 + PD1 + PD0, no PT");
+        let ix = indices(va);
+        let (_, pd0) = pt.images().nth(3).unwrap();
+        assert_eq!(rd64(pd0, ix[3] * 16), (pa >> 4) | 1, "the PTE is the FIRST qword");
+        assert_eq!(rd64(pd0, ix[3] * 16 + 8), 0, "the small-page half stays empty");
+        assert_eq!(pt.translate(va).map(|w| w.0), Some(pa));
+        assert_eq!(pt.translate(va + 0x1f_ffff).map(|w| w.0), Some(pa + 0x1f_ffff), "offset inside the page");
+        assert_eq!(pt.translate(va + 0x20_0000), None, "the next 2 MiB is not mapped");
+        assert_eq!(walk(&pt, va + 0x12_3456).map(|w| w.0), Some(pa + 0x12_3456));
+        // host memory, read-only, privileged: the same flag bits as a 4 KiB PTE
+        let f = Flags { read_only: true, privileged: true, kind: 0 };
+        pt.map_huge(va + 0x20_0000, 0x4000_0000, Target::Host, f).unwrap();
+        let (_, e) = pt.translate(va + 0x20_0000).unwrap();
+        assert_eq!(e, pte(0x4000_0000, Target::Host, f));
+        assert_eq!(e & 0xf, 1 | (2 << 1) | (1 << 3));
+    }
+
+    #[test]
+    fn huge_and_small_pages_do_not_share_a_pd0_slot() {
+        let f = Flags::default();
+        let mut pt = PageTables::new(BASE, 16, Target::Vram);
+        pt.map(0x40_1000, 0x5000, Target::Vram, f).unwrap();
+        assert_eq!(pt.map_huge(0x40_0000, 0x20_0000, Target::Vram, f), Err(MapError::Overlap));
+        pt.map_huge(0x60_0000, 0x40_0000, Target::Vram, f).unwrap();
+        assert_eq!(pt.map(0x60_1000, 0x5000, Target::Vram, f), Err(MapError::Overlap));
+        assert_eq!(pt.map(0x80_1000, 0x5000, Target::Vram, f), Ok(()), "the next slot is free");
+        assert_eq!(pt.map_huge(0x60_0000, 0x80_0000, Target::Vram, f), Err(MapError::AlreadyMapped));
+        assert_eq!(pt.translate(0x40_1000).map(|w| w.0), Some(0x5000), "the refused ones changed nothing");
+        assert_eq!(pt.translate(0x60_1000).map(|w| w.0), Some(0x40_1000));
+    }
+
+    #[test]
+    fn huge_page_refusals_and_ranges() {
+        let f = Flags::default();
+        let mut pt = PageTables::new(BASE, 5, Target::Vram);
+        assert_eq!(pt.map_huge(0x1000, 0x20_0000, Target::Vram, f), Err(MapError::Unaligned));
+        assert_eq!(pt.map_huge(0x20_0000, 0x20_1000, Target::Vram, f), Err(MapError::Unaligned));
+        assert_eq!(pt.map_huge(1 << 49, 0x20_0000, Target::Vram, f), Err(MapError::OutOfRange));
+        assert_eq!(pt.map_huge_range(0x20_0000, 0x20_0000, 0x30_0000, Target::Vram, f), Err(MapError::Unaligned));
+        assert_eq!(pt.len(), 1, "refusals allocate nothing");
+        pt.map_huge_range(0x20_0000, 0x80_0000, 3 * HUGE_PAGE, Target::Vram, f).unwrap();
+        assert_eq!(pt.len(), 4, "three pages share one PD0");
+        for i in 0..3u64 {
+            assert_eq!(pt.translate(0x20_0000 + i * HUGE_PAGE + 0x10).map(|w| w.0), Some(0x80_0010 + i * HUGE_PAGE));
+        }
+        assert_eq!(pt.translate(0x20_0000 + 3 * HUGE_PAGE), None);
+        // needs one table more than the pool has
+        assert_eq!(PageTables::new(BASE, 3, Target::Vram).map_huge(0x20_0000, 0x20_0000, Target::Vram, f), Err(MapError::NoTables));
+        assert_eq!(HUGE_PAGE, 0x20_0000);
+    }
+
+    #[test]
+    fn unmap_removes_a_huge_page_whole() {
+        let f = Flags::default();
+        let mut pt = PageTables::new(BASE, 8, Target::Vram);
+        pt.map_huge(0x20_0000, 0x40_0000, Target::Vram, f).unwrap();
+        pt.map_huge(0x40_0000, 0x60_0000, Target::Vram, f).unwrap();
+        assert!(pt.unmap(0x20_4000), "any address inside the page");
+        assert_eq!(pt.translate(0x20_0000), None);
+        assert_eq!(pt.translate(0x3f_ffff), None);
+        assert_eq!(pt.translate(0x40_0000).map(|w| w.0), Some(0x60_0000), "the neighbour stays");
+        assert!(!pt.unmap(0x20_0000), "already gone");
+        pt.map_huge(0x20_0000, 0x80_0000, Target::Vram, f).unwrap();
+        assert_eq!(pt.translate(0x20_0000).map(|w| w.0), Some(0x80_0000));
+        // a 4 KiB page next to it is still unmapped as before
+        pt.map(0x60_0000, 0x1000, Target::Vram, f).unwrap();
+        assert!(pt.unmap(0x60_0000));
+        assert_eq!(pt.translate(0x60_0000), None);
     }
 }

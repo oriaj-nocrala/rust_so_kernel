@@ -199,12 +199,64 @@ pub fn scan_position(m: &dyn Mmio, head: u32) -> (u16, u16) {
 /// is `gv100_disp_init`'s MSK (`engine/disp/gv100.c:1216`, for every head)
 /// and `gv100_head_vblank_get`'s EN (`:253`, for the heads wanted).
 pub fn arm(m: &dyn Mmio, present: u8, enable: u8) {
+    arm_with(m, present, enable, &[]);
+}
+
+/// A tree vector as its leaf and bit mask: `nvkm_intr` puts vector `v` in
+/// leaf `v / 32`, bit `v % 32` (the display, vector 154, is leaf 4 bit 26).
+pub fn vector_leaf(vector: u32) -> (u32, u32) {
+    (vector / 32, 1 << (vector % 32))
+}
+
+/// The status of every leaf.
+pub fn leaf_stats(m: &dyn Mmio) -> [u32; VFN_LEAVES as usize] {
+    let mut s = [0u32; VFN_LEAVES as usize];
+    for (leaf, x) in s.iter_mut().enumerate() {
+        *x = m.rd32(VFN_LEAF_STAT + leaf as u32 * 4);
+    }
+    s
+}
+
+/// Acknowledge every pending leaf bit (write 1 to clear), so the next status read shows only what
+/// arrives afterwards.
+pub fn clear_all_leaves(m: &dyn Mmio) {
+    for leaf in 0..VFN_LEAVES {
+        m.wr32(VFN_LEAF_STAT + leaf * 4, 0xffff_ffff);
+    }
+}
+
+/// The vectors whose bit is set in `after` and was not in `before`, ascending: what a piece of
+/// work raised (`vector = leaf * 32 + bit`, the inverse of [`vector_leaf`]).
+pub fn new_vectors(before: &[u32; VFN_LEAVES as usize], after: &[u32; VFN_LEAVES as usize]) -> alloc::vec::Vec<u32> {
+    let mut v = alloc::vec::Vec::new();
+    for leaf in 0..VFN_LEAVES as usize {
+        let new = after[leaf] & !before[leaf];
+        for bit in 0..32 {
+            if new & (1 << bit) != 0 {
+                v.push(leaf as u32 * 32 + bit);
+            }
+        }
+    }
+    v
+}
+
+/// [`arm`], and also allow more sources, `extra` (tree vectors, phase 6d: the copy engine's
+/// non-stall interrupt, GSP-RM's), the same way the display's bit is: reset the status, then
+/// allow it. A vector beyond the tree is ignored.
+pub fn arm_with(m: &dyn Mmio, present: u8, enable: u8, extra: &[u32]) {
     m.wr32(VFN_UNARM, VFN_ALL_TOP);
     for leaf in 0..VFN_LEAVES {
         m.wr32(VFN_LEAF_BLOCK + leaf * 4, 0xffff_ffff);
     }
     m.wr32(VFN_LEAF_STAT + DISP_LEAF * 4, DISP_BIT);
     m.wr32(VFN_LEAF_ALLOW + DISP_LEAF * 4, DISP_BIT);
+    for &v in extra {
+        let (leaf, bit) = vector_leaf(v);
+        if leaf < VFN_LEAVES {
+            m.wr32(VFN_LEAF_STAT + leaf * 4, bit);
+            m.wr32(VFN_LEAF_ALLOW + leaf * 4, bit);
+        }
+    }
     for head in 0..HEADS_MAX {
         if present & (1 << head) != 0 {
             m.wr32(HEAD_TIMING_MSK + head * 4, HEAD_TIMING_VBLANK);
@@ -245,6 +297,8 @@ pub struct Serviced {
     pub supervisor: u32,
     /// CTRL_DISP's error bit was set; this is what `0x611848` held.
     pub ctrl_disp_error: Option<u32>,
+    /// Bit `i` set: `extra[i]` ([`service_with`]) was pending, and is acknowledged.
+    pub extra: u32,
 }
 
 /// One interrupt, as `nvkm_intr` (`core/intr.c:163-229`) and
@@ -257,6 +311,11 @@ pub struct Serviced {
 /// supervisors are acknowledged and returned, the error bit's information
 /// read back. Without it, that bit is left alone in `disp_other`.
 pub fn service(m: &dyn Mmio, ctrl_disp: bool) -> Serviced {
+    service_with(m, ctrl_disp, &[])
+}
+
+/// [`service`] with more vectors `extra` to acknowledge (`Serviced::extra`).
+pub fn service_with(m: &dyn Mmio, ctrl_disp: bool, extra: &[u32]) -> Serviced {
     let mut out = Serviced::default();
     m.wr32(VFN_UNARM, VFN_ALL_TOP);
     m.wr32(PCI_MSI_REARM, 0);
@@ -279,6 +338,14 @@ pub fn service(m: &dyn Mmio, ctrl_disp: bool) -> Serviced {
         return out;
     }
 
+    for (i, &v) in extra.iter().enumerate().take(32) {
+        let (leaf, bit) = vector_leaf(v);
+        if leaf < VFN_LEAVES && stat[leaf as usize] & bit != 0 {
+            out.extra |= 1 << i;
+            m.wr32(VFN_LEAF_STAT + leaf * 4, bit);
+            stat[leaf as usize] &= !bit;
+        }
+    }
     if stat[DISP_LEAF as usize] & DISP_BIT != 0 {
         out.display = true;
         m.wr32(VFN_LEAF_STAT + DISP_LEAF * 4, DISP_BIT);
@@ -317,12 +384,14 @@ pub fn service(m: &dyn Mmio, ctrl_disp: bool) -> Serviced {
             out.disp_other &= !DISP_INTR_CTRL_DISP;
         }
     } else {
+        // Nothing this driver services (the extra source is already acknowledged): block what is
+        // left, as nouveau does against interrupt storms (`core/intr.c:211-220`).
         for leaf in 0..VFN_LEAVES {
             if stat[leaf as usize] != 0 {
                 m.wr32(VFN_LEAF_BLOCK + leaf * 4, stat[leaf as usize]);
+                out.blocked = true;
             }
         }
-        out.blocked = true;
     }
 
     m.wr32(VFN_REARM, VFN_ALL_TOP);
@@ -466,5 +535,129 @@ mod tests {
             *m.writes.borrow(),
             vec![(0xb81610, 0xf), (0x088704, 0), (0xb81010, DISP_BIT), (0x611808, 4), (0x611808, 0x10), (0xb81608, 0xf)]
         );
+    }
+
+    #[test]
+    fn a_vector_is_a_leaf_and_a_bit() {
+        assert_eq!(vector_leaf(154), (DISP_LEAF, DISP_BIT), "the display, vector 154");
+        assert_eq!(vector_leaf(0), (0, 1));
+        assert_eq!(vector_leaf(31), (0, 0x8000_0000));
+        assert_eq!(vector_leaf(32), (1, 1));
+        assert_eq!(vector_leaf(255), (7, 0x8000_0000));
+    }
+
+    #[test]
+    fn arm_can_allow_one_more_source_after_the_display() {
+        let m = TableMmio::new(&[(0x611d80, 0), (0x611d84, 0x10)]);
+        arm_with(&m, 0b1, 0b1, &[69]); // leaf 2, bit 5
+        let w = m.writes.borrow();
+        let at = w.iter().position(|x| *x == (0xb81210, DISP_BIT)).unwrap();
+        assert_eq!(&w[at + 1..at + 3], &[(0xb81008, 0x20), (0xb81208, 0x20)], "status reset, then allow");
+        // and the plain arm is exactly arm_with(None)
+        let a = TableMmio::new(&[(0x611d80, 0), (0x611d84, 0x10)]);
+        arm(&a, 0b1, 0b1);
+        let b = TableMmio::new(&[(0x611d80, 0), (0x611d84, 0x10)]);
+        arm_with(&b, 0b1, 0b1, &[]);
+        assert_eq!(*a.writes.borrow(), *b.writes.borrow());
+        // a vector beyond the tree is ignored
+        let c = TableMmio::new(&[(0x611d80, 0), (0x611d84, 0x10)]);
+        arm_with(&c, 0b1, 0b1, &[8 * 32]);
+        assert_eq!(*c.writes.borrow(), *a.writes.borrow());
+    }
+
+    #[test]
+    fn the_extra_source_alone_is_acknowledged_and_not_blocked() {
+        // leaf 2 bit 5 pending, top bit 1 (leaves 2 and 3), nothing else
+        let m = TableMmio::new(&[(0xb81600, 0x2), (0xb81008, 0x20), (0xb8100c, 0), (0x000000, 0xb760_00a1)]);
+        let s = service_with(&m, true, &[69]);
+        assert_eq!(s, Serviced { extra: 1, ..Default::default() });
+        assert_eq!(*m.writes.borrow(), vec![(0xb81610, 0xf), (0x088704, 0), (0xb81008, 0x20), (0xb81608, 0xf)]);
+        // without asking for it, the same interrupt is a foreign bit: blocked
+        let m = TableMmio::new(&[(0xb81600, 0x2), (0xb81008, 0x20), (0xb8100c, 0), (0x000000, 0xb760_00a1)]);
+        let s = service(&m, true);
+        assert!(s.blocked && s.extra == 0);
+        assert_eq!(*m.writes.borrow(), vec![(0xb81610, 0xf), (0x088704, 0), (0xb81408, 0x20), (0xb81608, 0xf)]);
+    }
+
+    #[test]
+    fn the_extra_source_beside_the_display_and_beside_foreign_bits() {
+        // both pending: the display is serviced (as the plain service does), the extra acknowledged
+        let m = TableMmio::new(&[
+            (0xb81600, 0x6),
+            (0xb81008, 0x20),
+            (0xb8100c, 0),
+            (0xb81010, DISP_BIT),
+            (0xb81014, 0),
+            (0x000000, 0xb760_00a1),
+            (0x611ec0, 0x1),
+            (0x611800, 0x4),
+        ]);
+        let s = service_with(&m, true, &[69]);
+        assert!(s.extra == 1 && s.display && s.vblank == 1 && !s.blocked);
+        assert!(m.writes.borrow().contains(&(0xb81008, 0x20)));
+        // the extra plus a foreign bit and no display: the extra is acknowledged, the foreign one blocked
+        let m = TableMmio::new(&[(0xb81600, 0x6), (0xb81008, 0x20), (0xb8100c, 0), (0xb81010, 0x4000_0000), (0xb81014, 0), (0x000000, 0xb760_00a1)]);
+        let s = service_with(&m, true, &[69]);
+        assert!(s.extra == 1 && s.blocked && !s.display);
+        let w = m.writes.borrow();
+        assert!(w.contains(&(0xb81008, 0x20)) && w.contains(&(0xb81410, 0x4000_0000)));
+        assert!(!w.iter().any(|x| x.0 == 0xb81408), "the acknowledged bit is not also blocked");
+    }
+
+    #[test]
+    fn new_vectors_are_the_bits_that_appeared() {
+        let mut before = [0u32; 8];
+        let mut after = [0u32; 8];
+        assert!(new_vectors(&before, &after).is_empty());
+        after[2] = 0x20;
+        assert_eq!(new_vectors(&before, &after), [69]);
+        // a bit that was already set is not new; two new ones come out ascending, across leaves
+        before[4] = DISP_BIT;
+        after[4] = DISP_BIT | 1;
+        after[7] = 0x8000_0000;
+        after[0] = 0x8000_0001;
+        assert_eq!(new_vectors(&before, &after), [0, 31, 69, 128, 255]);
+        // each is what vector_leaf inverts
+        for v in new_vectors(&[0; 8], &after) {
+            let (leaf, bit) = vector_leaf(v);
+            assert!(after[leaf as usize] & bit != 0);
+        }
+    }
+
+    #[test]
+    fn leaf_stats_and_clear_touch_the_eight_leaves() {
+        let regs: Vec<(u32, u32)> = (0..8u32).map(|l| (0xb81000 + l * 4, l + 1)).collect();
+        let m = TableMmio::new(&regs);
+        assert_eq!(leaf_stats(&m), [1, 2, 3, 4, 5, 6, 7, 8]);
+        clear_all_leaves(&m);
+        assert_eq!(*m.writes.borrow(), (0..8u32).map(|l| (0xb81000 + l * 4, 0xffff_ffff)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn several_extra_sources_are_told_apart() {
+        // GSP's vector 12 (leaf 0 bit 12) and the copy engine's 69 (leaf 2 bit 5); only the second is pending
+        let m = TableMmio::new(&[(0xb81600, 0x3), (0xb81000, 0), (0xb81004, 0), (0xb81008, 0x20), (0xb8100c, 0), (0x000000, 0xb760_00a1)]);
+        let s = service_with(&m, true, &[12, 69]);
+        assert_eq!(s.extra, 0b10);
+        assert!(!s.blocked);
+        // both pending
+        let m = TableMmio::new(&[(0xb81600, 0x3), (0xb81000, 0x1000), (0xb81004, 0), (0xb81008, 0x20), (0xb8100c, 0), (0x000000, 0xb760_00a1)]);
+        assert_eq!(service_with(&m, true, &[12, 69]).extra, 0b11);
+        assert_eq!(*m.writes.borrow(), vec![(0xb81610, 0xf), (0x088704, 0), (0xb81000, 0x1000), (0xb81008, 0x20), (0xb81608, 0xf)]);
+        // arming allows both
+        let m = TableMmio::new(&[(0x611d80, 0), (0x611d84, 0x10)]);
+        arm_with(&m, 0b1, 0b1, &[12, 69]);
+        let w = m.writes.borrow();
+        assert!(w.contains(&(0xb81200, 0x1000)) && w.contains(&(0xb81208, 0x20)));
+    }
+
+    #[test]
+    fn an_extra_vector_beyond_the_tree_is_never_looked_up() {
+        // vector 256 = leaf 8, one past the last: neither armed nor serviced, and no panic
+        // something is pending (leaf 0 bit 0, foreign) so the extras are looked at
+        let m = TableMmio::new(&[(0xb81600, 0x1), (0xb81000, 0x1), (0xb81004, 0), (0x000000, 0xb760_00a1)]);
+        let s = service_with(&m, true, &[256, 8 * 32 + 5]);
+        assert_eq!(s.extra, 0);
+        assert!(s.blocked, "the foreign bit is blocked as before");
     }
 }

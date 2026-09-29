@@ -1,4 +1,4 @@
-# Phase 6c of docs/gpu/gpu-plan.md, on the Ryzen:
+# Phases 6c and 6d of docs/gpu/gpu-plan.md, on the Ryzen (6d adds the `bench:` lines, kernel/src/gpu/bench.rs):
 #   touch build.rs   # the root build does not watch nvgpu
 #   scripts/metal-run.sh --kconf 'gpu=copy' scripts/metal-jobs/gpu-copy.sh
 # Everything gpu=vaspace does (job gpu-vaspace.sh), plus a GPFIFO channel on the
@@ -14,8 +14,8 @@ cat /proc/gpu
 fail=0
 sum() { echo "$*"; echo "$*" >> /tmp/gpu-copy.sum; }
 : > /tmp/gpu-copy.sum
-grep '^fwsec:\|^gsp:\|^vaspace:\|^copy:' /proc/gpu >> /tmp/gpu-copy.sum
-grep '^chan: STOP\|^super: STOP\|^hdmi: STOP\|^fwsec: STOP\|^gsp: STOP\|^vaspace: STOP\|^copy: STOP' /proc/gpu && fail=1
+grep '^fwsec:\|^gsp:\|^vaspace:\|^copy:\|^bench:\|^bar1:\|^intr:' /proc/gpu >> /tmp/gpu-copy.sum
+grep '^chan: STOP\|^super: STOP\|^hdmi: STOP\|^fwsec: STOP\|^gsp: STOP\|^vaspace: STOP\|^copy: STOP\|^bench: STOP' /proc/gpu && fail=1
 grep -q '^fwsec: OK' /proc/gpu || { sum "gpu-copy: FRTS did not finish OK"; fail=1; }
 if grep -q '^gsp: OK' /proc/gpu; then sum "gpu-copy: gsp OK"; else sum "gpu-copy: gsp did not boot"; fail=1; fi
 field() { echo "$1" | tr ' ' '\n' | grep "^$2=" | cut -d= -f2; }
@@ -28,6 +28,9 @@ grep -q '^vaspace: OK' /proc/gpu || { sum "gpu-copy: the virtual address space d
 c=$(grep '^gpu_copy:' /proc/kdebug)
 sum "gpu-copy: $c"
 grep -q '^copy: OK' /proc/gpu || { sum "gpu-copy: the copy did not complete OK"; fail=1; }
+grep -q '^bench: OK' /proc/gpu || { sum "gpu-copy: the bench did not finish OK"; fail=1; }
+sum "gpu-copy: $(grep '^gpu_bench:' /proc/kdebug)"
+sum "gpu-copy: $(grep '^gpu_intr:' /proc/kdebug)"
 [ "$(field "$c" state)" = ok ] || { sum "gpu-copy: copy state=$(field "$c" state)"; fail=1; }
 [ "$(field "$c" mismatch)" = 0 ] || { sum "gpu-copy: mismatch=$(field "$c" mismatch)"; fail=1; }
 for x in up_kbps down_kbps; do
@@ -39,6 +42,22 @@ done
 echo "$k" | grep -q 'name="NVIDIA GeForce RTX 3050"' || { sum "gpu-copy: the GPU name is not the expected one"; fail=1; }
 echo "$k" | grep -q 'rm_name="NVIDIA GeForce RTX 3050"' || { sum "gpu-copy: no name from our own RM client"; fail=1; }
 [ "$(field "$k" booter_mbox0)" = 0x0 ] || { sum "gpu-copy: booter_mbox0=$(field "$k" booter_mbox0)"; fail=1; }
+
+# Phase 6d: the copy engine's interrupt at run time (rings through BAR1, fence in host memory),
+# against polling; every copy must raise its MSI.
+if echo 'copy irq 50' > /dev/dispctl; then
+  ci=$(grep '^gpu_copyirq:' /proc/kdebug)
+  sum "gpu-copy: $ci"
+  for x in 4k 1m 4m; do
+    [ "$(field "$ci" ${x}_missed)" = 0 ] || { sum "gpu-copy: ${x} copies missed $(field "$ci" ${x}_missed) interrupts"; fail=1; }
+  done
+  [ "$(field "$ci" irqs)" = 150 ] || { sum "gpu-copy: irqs=$(field "$ci" irqs), wanted 150"; fail=1; }
+else
+  sum "gpu-copy: 'copy irq' failed"
+  sum "gpu-copy: $(grep '^gpu_copyirq:' /proc/kdebug)"
+  fail=1
+fi
+sum "gpu-copy: $(grep '^gpu_intr:' /proc/kdebug)"
 
 sample() { grep '^gpu_vblank:' /proc/kdebug; }
 s1=$(sample)

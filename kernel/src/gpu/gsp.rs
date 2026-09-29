@@ -64,6 +64,63 @@ pub struct PciInfo {
     pub revision: u8,
 }
 
+/// The PCI identity of the GPU, kept for the phase 6 code (link status, BAR1).
+static PCI: spin::Once<PciInfo> = spin::Once::new();
+
+pub(super) fn pci_info() -> Option<&'static PciInfo> {
+    PCI.get()
+}
+
+/// `NV_PBUS` BAR configuration: the PRAMIN window (`0x1700`), BAR1's block (`0x1704`, `nvkm_bar`'s
+/// `gf100_bar_bar1_init`), BAR2's (`0x1714`) and the words between, as the firmware left them.
+const BAR_REGS: [u32; 8] = [0x1700, 0x1704, 0x1708, 0x170c, 0x1710, 0x1714, 0x1718, 0x171c];
+
+fn bar_regs(regs: &Bar0) -> [u32; 8] {
+    let mut v = [0u32; 8];
+    for (x, o) in v.iter_mut().zip(BAR_REGS) {
+        *x = regs.rd32(o);
+    }
+    v
+}
+
+pub(super) fn bar_regs_text(v: &[u32; 8]) -> String {
+    let mut s = String::new();
+    for (x, o) in v.iter().zip(BAR_REGS) {
+        let _ = write!(s, "{:#x}={:#x} ", o, x);
+    }
+    s
+}
+
+/// The BAR registers before FWSEC touched anything (BAR1 was identity-mapped VRAM then).
+static BAR_REGS_BEFORE: spin::Once<[u32; 8]> = spin::Once::new();
+
+pub(super) fn bar_regs_before() -> Option<[u32; 8]> {
+    BAR_REGS_BEFORE.get().copied()
+}
+
+pub(super) fn bar_regs_now(regs: &Bar0) -> [u32; 8] {
+    bar_regs(regs)
+}
+
+/// `NV_PBUS_BAR1_BLOCK` (`gf100_bar_bar1_init`, `subdev/bar/gf100.c`).
+const BAR1_BLOCK: u32 = 0x1704;
+
+/// GSP-RM's boot replaces BAR1's block (`0x1704`: the firmware's `0x1fff00`, VRAM identity-mapped,
+/// becomes `0x801f3f90`, a virtual block of RM's): stores through BAR1 then land nowhere and reads
+/// return `0xbad0ac..`/`0xffffffff` (boots #112-#118). Nothing here needs RM's BAR1, so put the
+/// firmware's value back: BAR1 is VRAM from offset 0 again (verified by a store read back through
+/// PRAMIN and through BAR1, boot #118). Returns whether it was changed.
+pub(super) fn restore_bar1(r: &mut String, regs: &Bar0) -> bool {
+    let Some(before) = bar_regs_before() else { return false };
+    let now = regs.rd32(BAR1_BLOCK);
+    if now == before[1] {
+        return false;
+    }
+    regs.wr32(BAR1_BLOCK, before[1]);
+    let _ = writeln!(r, "gsp: BAR1_BLOCK (0x1704) was {:#x} after GSP-RM's boot, {:#x} before it: wrote the old value back, now {:#x}", now, before[1], regs.rd32(BAR1_BLOCK));
+    true
+}
+
 /// The queues' shared memory as [`Shm`]: volatile accesses to the DMA buffer.
 struct ShmBuf<'a>(&'a DmaBuf);
 
@@ -152,7 +209,11 @@ pub fn setup(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8), full: bool, vaspace
         stop(r, format_args!("no VBIOS (gpu=disp did not read it)"));
         return;
     };
+    PCI.call_once(|| pci);
     let gsp = falcon::GSP;
+    let mem_regs_before = bar_regs(regs);
+    BAR_REGS_BEFORE.call_once(|| mem_regs_before);
+    let _ = writeln!(r, "gsp: BAR block registers before anything: {}", bar_regs_text(&mem_regs_before));
 
     // What the GPU looks like before we touch it.
     let (lo, hi) = (regs.rd32(fwsec::WPR2_LO), regs.rd32(fwsec::WPR2_HI));
@@ -737,6 +798,19 @@ fn rpc_phase(r: &mut String, regs: &Bar0, mem: &mut Memory, vaspace: bool, copy:
         }
     }
 
+    // Phase 6d: BAR1 back to identity-mapped VRAM (see `restore_bar1`).
+    restore_bar1(r, rm.regs);
+
+    // Phase 6d: which tree vector does GSP-RM raise when it queues a reply? (run one control, look at
+    // the leaves; twice, the same bit both times)
+    let mut found = [None, None];
+    for f in found.iter_mut() {
+        *f = super::intr::discover(r, regs, &super::intr::GSP, &mut || {
+            let _ = rm.control(rm::H_SUBDEVICE, rm::CTRL_GPU_GET_NAME_STRING, &rm::name_string_params());
+        });
+    }
+    let _ = writeln!(r, "gsp: RM's status-queue interrupt vector: {:?} then {:?}", found[0], found[1]);
+
     // Phase 6b: a GPU virtual address space for that client.
     if vaspace {
         super::vaspace::setup(r, regs, &mut rm, copy);
@@ -796,7 +870,7 @@ impl Rm<'_> {
 pub fn render_kdebug() -> String {
     let base = render_gsp_kdebug();
     let mut out = base;
-    for v in [super::vaspace::render_kdebug(), super::copy::render_kdebug()] {
+    for v in [super::vaspace::render_kdebug(), super::copy::render_kdebug(), super::bench::render_kdebug(), super::intr::render_kdebug(), super::copy::render_irq_kdebug()] {
         if !v.is_empty() {
             out += "\n";
             out += &v;

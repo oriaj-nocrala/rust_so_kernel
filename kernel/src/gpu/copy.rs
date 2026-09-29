@@ -18,6 +18,10 @@
 //      through a semaphore the copy engine releases: src -> VRAM, VRAM -> back.
 //      `back == src` proves the page tables, the channel and the engine.
 //
+// Phase 6d adds `bench.rs` after a successful round trip: bandwidth by size, 2 MiB
+// pages, a CPU write-combined baseline, CPU work overlapped with a copy, the PCIe
+// link's state. Its buffers (2 MiB pages, a host fence page) are made here.
+//
 // VRAM is written through PRAMIN (small pieces only; the data goes by the copy
 // engine). The logic is `nvgpu::chan`, tested on the host against nouveau's RPCs.
 
@@ -70,10 +74,17 @@ pub(super) struct Buffers {
     mthdbuf: DmaBuf,
     src: DmaPages,
     back: DmaPages,
+    /// 6d: contiguous, 2 MiB-aligned copies of `src`/`back`, mapped with 2 MiB pages.
+    pub(super) hsrc: DmaBuf,
+    pub(super) hback: DmaBuf,
+    /// 6d: a fence page in host memory (the copy engine writes it, the CPU polls it from cache).
+    pub(super) hfence: DmaBuf,
+    /// 6d: a framebuffer-sized host buffer (`chan::FRAME_BYTES`, contiguous).
+    pub(super) fsrc: DmaBuf,
 }
 
 /// The pattern of `src`: word `k` of page `i`.
-fn pattern(page: usize, k: usize) -> u32 {
+pub(super) fn pattern(page: usize, k: usize) -> u32 {
     ((page as u32) << 10 | k as u32).wrapping_mul(0x9e37_79b1) ^ 0x5bd1_e995
 }
 
@@ -99,7 +110,29 @@ pub(super) fn prepare(r: &mut String) -> Option<Buffers> {
         }
         src.page(i).copy_in(0, &page);
     }
-    Some(Buffers { mthdbuf, src, back })
+    let (hsrc, hback, hfence) = match (DmaBuf::alloc(COPY_BYTES as usize, DMA_MASK), DmaBuf::alloc(COPY_BYTES as usize, DMA_MASK), DmaBuf::alloc(0x1000, DMA_MASK)) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        (a, b, c) => {
+            stop(r, format_args!("contiguous buffers: {:?} {:?} {:?}", a.err(), b.err(), c.err()));
+            return None;
+        }
+    };
+    // Same pattern as `src` (page i, word k), written in place.
+    for i in 0..COPY_PAGES {
+        let mut page = [0u8; 0x1000];
+        for (k, w) in page.chunks_exact_mut(4).enumerate() {
+            w.copy_from_slice(&pattern(i, k).to_le_bytes());
+        }
+        hsrc.copy_in(i * 0x1000, &page);
+    }
+    let fsrc = match DmaBuf::alloc(chan::FRAME_BYTES as usize, DMA_MASK) {
+        Ok(b) => b,
+        Err(e) => {
+            stop(r, format_args!("{} MiB frame buffer: {:?}", chan::FRAME_BYTES >> 20, e));
+            return None;
+        }
+    };
+    Some(Buffers { mthdbuf, src, back, hsrc, hback, hfence, fsrc })
 }
 
 impl Buffers {
@@ -115,29 +148,82 @@ impl Buffers {
             pt.map(chan::SRC_VA + off, self.src.page(i).bus_addr(), Target::Host, f)?;
             pt.map(chan::BACK_VA + off, self.back.page(i).bus_addr(), Target::Host, f)?;
         }
+        // 6d: the host fence, and the contiguous buffers through 2 MiB pages
+        // (the VRAM destination again, at a second VA)
+        pt.map(chan::HFENCE_VA, self.hfence.bus_addr(), Target::Host, f)?;
+        pt.map_huge_range(chan::HUGE_DST_VA, chan::VRAM_DST, COPY_BYTES, Target::Vram, f)?;
+        pt.map_huge_range(chan::HUGE_SRC_VA, self.hsrc.bus_addr(), COPY_BYTES, Target::Host, f)?;
+        pt.map_huge_range(chan::HUGE_BACK_VA, self.hback.bus_addr(), COPY_BYTES, Target::Host, f)?;
+        pt.map_huge_range(chan::FRAME_SRC_VA, self.fsrc.bus_addr(), chan::FRAME_BYTES, Target::Host, f)?;
+        pt.map_huge_range(chan::FRAME_DST_VA, chan::FRAME_VRAM, chan::FRAME_BYTES, Target::Vram, f)?;
         Ok(())
     }
 }
 
 /// Write `words` to VRAM at `at` through PRAMIN.
-fn vram_write(p: &mut Pramin, at: u64, words: &[u32]) {
+pub(super) fn vram_write(p: &mut Pramin, at: u64, words: &[u32]) {
     for (i, w) in words.iter().enumerate() {
         p.wr32(at + 4 * i as u64, *w);
     }
 }
 
-fn ms_ticks(ms: u64) -> u64 {
+/// Where the channel's rings are written: PRAMIN at boot (BAR0's window, reads work), BAR1
+/// write-combined at run time (no shared window; reads of VRAM through BAR1 fail after GSP-RM,
+/// so it is write-only).
+pub(super) trait VramIo {
+    fn wr32(&mut self, vram: u64, v: u32);
+    /// Everything written so far is on its way to VRAM, in order, before the caller's next store
+    /// (the doorbell).
+    fn flush(&mut self);
+}
+
+impl VramIo for Pramin<'_> {
+    fn wr32(&mut self, vram: u64, v: u32) {
+        Pramin::wr32(self, vram, v)
+    }
+    fn flush(&mut self) {
+        let _ = self.rd32(chan::USERD_VRAM + chan::USERD_GP_PUT);
+    }
+}
+
+/// A write-combined BAR1 mapping of the channel's VRAM page block `[VRAM_CHAN, +64 KiB)`.
+struct Bar1Io {
+    base: *mut u8,
+}
+
+// SAFETY: a device mapping used under `RUNTIME`'s lock.
+unsafe impl Send for Bar1Io {}
+
+const CHAN_BLOCK: u64 = 0x1_0000;
+
+impl VramIo for Bar1Io {
+    fn wr32(&mut self, vram: u64, v: u32) {
+        assert!(vram >= chan::VRAM_CHAN && vram + 4 <= chan::VRAM_CHAN + CHAN_BLOCK);
+        // SAFETY: inside the mapping made in `install`.
+        unsafe { core::ptr::write_volatile(self.base.add((vram - chan::VRAM_CHAN) as usize) as *mut u32, v) };
+    }
+    fn flush(&mut self) {
+        sfence();
+    }
+}
+
+pub(super) fn sfence() {
+    // SAFETY: a store fence has no memory effect beyond ordering.
+    unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) };
+}
+
+pub(super) fn ms_ticks(ms: u64) -> u64 {
     crate::cpu::tsc::freq_hz() / 1000 * ms
 }
 
 /// One submitted copy's result.
-struct Done {
+pub(super) struct Done {
     ticks: u64,
     /// The copy only completed after RM's own token was rung as well.
     second_token: bool,
 }
 
-struct Submitter<'a> {
+pub(super) struct Submitter<'a> {
     regs: &'a Bar0,
     /// The doorbell value we computed, then (rung after 300 ms without progress) RM's own.
     tokens: [u32; 2],
@@ -145,23 +231,82 @@ struct Submitter<'a> {
     push_at: u32,
 }
 
+/// What one submission through a host fence cost.
+pub(super) struct HostDone {
+    /// Writing the push buffer, the GPFIFO entry and GP_PUT (BAR0 through PRAMIN), before the doorbell.
+    pub queue_ticks: u64,
+    /// The doorbell to the CPU seeing the fence.
+    pub ticks: u64,
+    /// The TSC when the doorbell was rung.
+    pub t0: u64,
+}
+
 impl Submitter<'_> {
+    pub(super) fn new<'a>(regs: &'a Bar0, tokens: [u32; 2]) -> Submitter<'a> {
+        Submitter { regs, tokens, slot: 0, push_at: 0 }
+    }
+
+    /// Put `push` in the push buffer and a GPFIFO entry after it, and advance
+    /// GP_PUT; both rings wrap when full (every submission is waited for, so the
+    /// GPU is never behind by more than one).
+    fn queue(&mut self, p: &mut dyn VramIo, push: &[u32]) {
+        let len = (push.len() * 4) as u32;
+        assert!(len <= 0x1000);
+        if self.push_at + len > 0x1000 {
+            self.push_at = 0;
+        }
+        for (i, w) in push.iter().enumerate() {
+            p.wr32(chan::PUSH_VRAM + self.push_at as u64 + 4 * i as u64, *w);
+        }
+        let e = chan::gp_entry(chan::PUSH_VA + self.push_at as u64, len);
+        let at = chan::GPFIFO_VRAM + 8 * (self.slot % chan::GPFIFO_ENTRIES) as u64;
+        p.wr32(at, e as u32);
+        p.wr32(at + 4, (e >> 32) as u32);
+        self.slot = (self.slot + 1) % chan::GPFIFO_ENTRIES;
+        self.push_at += len;
+        p.wr32(chan::USERD_VRAM + chan::USERD_GP_PUT, self.slot);
+        // everything reached VRAM before the doorbell
+        p.flush();
+        core::sync::atomic::fence(Ordering::SeqCst);
+    }
+
+    /// Queue `push` without ringing the doorbell (the caller does, with [`ring`](Self::ring)).
+    pub(super) fn queue_only(&mut self, p: &mut dyn VramIo, push: &[u32]) {
+        self.queue(p, push);
+    }
+
+    pub(super) fn ring(&self) {
+        self.regs.wr32(DOORBELL, self.tokens[0]);
+    }
+
+    /// Like [`submit`](Self::submit) but the copy engine releases `payload` in the
+    /// host fence page `hfence` (`chan::HFENCE_VA`), which the CPU polls from cache.
+    pub(super) fn submit_host(&mut self, p: &mut dyn VramIo, push: &[u32], hfence: *mut u32, payload: u32) -> Result<HostDone, String> {
+        let t_q = crate::cpu::tsc::read();
+        // SAFETY: `hfence` is a live 4 KiB DMA page of ours.
+        unsafe { core::ptr::write_volatile(hfence, 0) };
+        self.queue(p, push);
+        let t0 = crate::cpu::tsc::read();
+        let queue_ticks = t0.wrapping_sub(t_q);
+        self.ring();
+        let limit = ms_ticks(FENCE_TIMEOUT_MS * 2);
+        loop {
+            // SAFETY: as above.
+            if unsafe { core::ptr::read_volatile(hfence) } == payload {
+                return Ok(HostDone { queue_ticks, ticks: crate::cpu::tsc::read().wrapping_sub(t0), t0 });
+            }
+            if crate::cpu::tsc::read().wrapping_sub(t0) > limit {
+                return Err(alloc::format!("the host fence never reached {:#x} in {} ms (page holds {:#x})", payload, FENCE_TIMEOUT_MS * 2, unsafe { core::ptr::read_volatile(hfence) }));
+            }
+        }
+    }
+
     /// Put `push` in the push buffer, a GPFIFO entry after it, advance GP_PUT,
     /// ring the doorbell and wait for the copy engine to release `payload` in
     /// the fence word.
     fn submit(&mut self, p: &mut Pramin, push: &[u32], payload: u32) -> Result<Done, String> {
-        let len = (push.len() * 4) as u32;
-        assert!(self.push_at + len <= 0x1000 && self.slot < chan::GPFIFO_ENTRIES);
-        vram_write(p, chan::PUSH_VRAM + self.push_at as u64, push);
         p.wr32(chan::FENCE_VRAM, 0);
-        let e = chan::gp_entry(chan::PUSH_VA + self.push_at as u64, len);
-        vram_write(p, chan::GPFIFO_VRAM + 8 * self.slot as u64, &[e as u32, (e >> 32) as u32]);
-        self.slot += 1;
-        self.push_at += len;
-        p.wr32(chan::USERD_VRAM + chan::USERD_GP_PUT, self.slot);
-        // everything reached VRAM before the doorbell
-        let _ = p.rd32(chan::USERD_VRAM + chan::USERD_GP_PUT);
-        core::sync::atomic::fence(Ordering::SeqCst);
+        self.queue(p, push);
         let t0 = crate::cpu::tsc::read();
         self.regs.wr32(DOORBELL, self.tokens[0]);
         let limit = ms_ticks(FENCE_TIMEOUT_MS);
@@ -296,7 +441,7 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, bufs: Buffers) {
         chan::H_COPY, runlist, how, token, CHID, rm_token
     );
 
-    let mut sub = Submitter { regs, tokens: [token, rm_token], slot: 0, push_at: 0 };
+    let mut sub = Submitter::new(regs, [token, rm_token]);
 
     // The bring-up ladder: each rung adds one thing, and the first that fails is
     // named (boots #102-#104 got as far as the GPU reading the GPFIFO entry).
@@ -383,8 +528,180 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, bufs: Buffers) {
     }
     STATE.store(1, Ordering::Relaxed);
     let _ = writeln!(r, "copy: OK: {} KiB went system -> VRAM -> system through the copy engine and came back identical", COPY_BYTES / 1024);
+    // Phase 6d: the measurements, on the same channel, then the channel for run-time use.
+    super::bench::run(r, regs, rm, &mut sub, &bufs);
+    install(r, regs, &sub, &bufs);
     // The channel, the buffers and the mappings stay: RM and the GPU own them now.
     core::mem::forget(bufs);
+}
+
+// ---- run time (phase 6d) ----------------------------------------------------------------
+
+/// The channel after the boot: the tokens, the rings' positions, a write-combined BAR1 view of
+/// the channel's VRAM for the CPU to write GPFIFO/push/USERD, and the host fence page.
+struct Runtime {
+    regs: Bar0,
+    tokens: [u32; 2],
+    slot: u32,
+    push_at: u32,
+    io: Bar1Io,
+    hfence: usize,
+}
+
+static RUNTIME: crate::sync::Mutex<Option<Runtime>> = crate::sync::Mutex::new(None);
+
+fn install(r: &mut String, regs: &Bar0, sub: &Submitter, bufs: &Buffers) {
+    let Some(pci) = super::gsp::pci_info().filter(|p| p.bar1 != 0) else {
+        let _ = writeln!(r, "copy: run-time channel not installed: no BAR1");
+        return;
+    };
+    // SAFETY: BAR1 is the VRAM aperture; [VRAM_CHAN, +64 KiB) is the channel's own memory
+    // (`chan` layout), written from here on only through this mapping and PRAMIN at boot.
+    let Some(v) = (unsafe { crate::memory::mmio::map(x86_64::PhysAddr::new(pci.bar1 + chan::VRAM_CHAN), CHAN_BLOCK as usize) }) else {
+        let _ = writeln!(r, "copy: run-time channel not installed: cannot map BAR1");
+        return;
+    };
+    let wc = crate::memory::memtype::set_pat_index_range(v.as_u64(), CHAN_BLOCK, hal::memtype::PAT_WC_INDEX).is_ok();
+    // Do stores through this mapping land at the VRAM address they name? The last words of each page of
+    // the block (unused by a channel that has queued fewer than 500 entries), written through BAR1 and read back through PRAMIN.
+    let mut io = Bar1Io { base: v.as_u64() as *mut u8 };
+    let mut p = Pramin::new(regs);
+    let _ = writeln!(r, "copy: BAR block registers now: {}", super::gsp::bar_regs_text(&super::gsp::bar_regs_now(regs)));
+    let mut bad = 0;
+    for page in 0..(CHAN_BLOCK / 0x1000) {
+        let at = chan::VRAM_CHAN + page * 0x1000 + 0xff0;
+        io.wr32(at, 0xc0de_0000 | page as u32);
+    }
+    io.flush();
+    for page in 0..(CHAN_BLOCK / 0x1000) {
+        let at = chan::VRAM_CHAN + page * 0x1000 + 0xff0;
+        let got = p.rd32(at);
+        if got != 0xc0de_0000 | page as u32 {
+            bad += 1;
+            let _ = writeln!(r, "copy: BAR1 self-check: VRAM {:#x} holds {:#x}, wrote {:#x}", at, got, 0xc0de_0000u32 | page as u32);
+        }
+    }
+    p.restore();
+    let _ = writeln!(r, "copy: BAR1 self-check: {} of {} pages of the channel block did not take the store", bad, CHAN_BLOCK / 0x1000);
+    if bad != 0 {
+        let _ = writeln!(r, "copy: run-time channel NOT installed: BAR1 does not reach VRAM");
+        return;
+    }
+    *RUNTIME.lock() = Some(Runtime {
+        regs: Bar0 { base: regs.base, len: regs.len },
+        tokens: sub.tokens,
+        slot: sub.slot,
+        push_at: sub.push_at,
+        io,
+        hfence: bufs.hfence.virt() as usize,
+    });
+    let _ = writeln!(r, "copy: run-time channel installed: rings written through BAR1 ({}), fence in host memory", if wc { "write-combined" } else { "NOT write-combined" });
+}
+
+static IRQ_REPORT: spin::Mutex<String> = spin::Mutex::new(String::new());
+
+fn median(v: &mut [u64]) -> u64 {
+    v.sort_unstable();
+    v[v.len() / 2]
+}
+
+/// `/dev/dispctl` `copy irq <runs>`: `runs` copies of 4 KiB, 1 MiB and 4 MiB launched with the
+/// non-stall interrupt at run time (IF=1, rings written through BAR1, host fence); for each, when
+/// the CPU saw the fence by polling and when the MSI handler saw the interrupt, both from the
+/// doorbell. Interrupts that never came are counted.
+pub fn selftest_irq(runs: usize) -> Result<(), &'static str> {
+    let runs = runs.clamp(1, 1000);
+    let mut g = RUNTIME.lock();
+    let rt = g.as_mut().ok_or("no run-time channel")?;
+    let hz = crate::cpu::tsc::freq_hz();
+    let ns = |t: u64| (t as u128 * 1_000_000_000 / hz as u128) as u64;
+    let was_on = x86_64::instructions::interrupts::are_enabled();
+    if !was_on {
+        x86_64::instructions::interrupts::enable();
+    }
+    let irq0 = super::intr::CE.count();
+    let mut out = String::new();
+    let _ = write!(out, "gpu_copyirq: runs={}", runs);
+    let mut failed = None;
+    let mut payload = 20_000u32;
+    'sizes: for (name, size) in [("4k", 4u32 << 10), ("1m", 1 << 20), ("4m", 4 << 20)] {
+        let mut poll = alloc::vec![0u64; runs];
+        let mut irq = alloc::vec![0u64; runs];
+        let mut queue = alloc::vec![0u64; runs];
+        let mut missed = 0;
+        for k in 0..runs {
+            payload += 1;
+            let push = chan::with_interrupt(chan::copy_push(chan::SRC_VA, chan::DST_VA, size, chan::HFENCE_VA, payload));
+            let c0 = super::intr::CE.count();
+            let mut sub = Submitter::new(&rt.regs, rt.tokens);
+            sub.slot = rt.slot;
+            sub.push_at = rt.push_at;
+            let d = sub.submit_host(&mut rt.io, &push, rt.hfence as *mut u32, payload);
+            rt.slot = sub.slot;
+            rt.push_at = sub.push_at;
+            let d = match d {
+                Ok(d) => d,
+                Err(e) => {
+                    // What is in VRAM now (PRAMIN: read once, only for this report)
+                    let mut p = Pramin::new(&rt.regs);
+                    let slot_prev = (rt.slot + chan::GPFIFO_ENTRIES - 1) % chan::GPFIFO_ENTRIES;
+                    let gp = [p.rd32(chan::GPFIFO_VRAM + 8 * slot_prev as u64), p.rd32(chan::GPFIFO_VRAM + 8 * slot_prev as u64 + 4)];
+                    let expect = chan::gp_entry(chan::PUSH_VA, 0x1000);
+                    let diag = alloc::format!(
+                        "{}; slot {} push_at {}; GPFIFO[{}] = {:#x}/{:#x}; USERD GPGet {} GPPut {}; fence(VRAM) {:#x}; push words {:x?}; entry for VA {:#x} would be {:#x}; 0x2100 {:#x}",
+                        e,
+                        rt.slot,
+                        rt.push_at,
+                        slot_prev,
+                        gp[0],
+                        gp[1],
+                        p.rd32(chan::USERD_VRAM + chan::USERD_GP_GET),
+                        p.rd32(chan::USERD_VRAM + chan::USERD_GP_PUT),
+                        p.rd32(chan::FENCE_VRAM),
+                        (0..8).map(|i| p.rd32(chan::PUSH_VRAM + 4 * i)).collect::<alloc::vec::Vec<_>>(),
+                        chan::PUSH_VA,
+                        expect,
+                        rt.regs.rd32(0x2100)
+                    );
+                    p.restore();
+                    failed = Some(diag);
+                    break 'sizes;
+                }
+            };
+            poll[k] = d.ticks;
+            queue[k] = d.queue_ticks;
+            let t_wait = crate::cpu::tsc::read();
+            loop {
+                if super::intr::CE.count() > c0 {
+                    irq[k] = super::intr::CE.last_tsc().wrapping_sub(d.t0);
+                    break;
+                }
+                if crate::cpu::tsc::read().wrapping_sub(t_wait) > ms_ticks(20) {
+                    missed += 1;
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+        let got: alloc::vec::Vec<u64> = irq.iter().copied().filter(|&t| t != 0).collect();
+        let mut got = got;
+        let irq_ns = if got.is_empty() { 0 } else { ns(median(&mut got)) };
+        let _ = write!(out, " {}_queue_ns={} {}_poll_ns={} {}_irq_ns={} {}_missed={}", name, ns(median(&mut queue)), name, ns(median(&mut poll)), name, irq_ns, name, missed);
+    }
+    if !was_on {
+        x86_64::instructions::interrupts::disable();
+    }
+    let _ = write!(out, " irqs={} vector={:?}", super::intr::CE.count() - irq0, super::intr::CE.vector());
+    if let Some(e) = &failed {
+        let _ = write!(out, " FAILED=\"{}\"", e);
+    }
+    *IRQ_REPORT.lock() = out;
+    if failed.is_some() { Err("a copy did not complete") } else { Ok(()) }
+}
+
+/// `/proc/kdebug` line of the last run-time self-test.
+pub fn render_irq_kdebug() -> String {
+    IRQ_REPORT.lock().clone()
 }
 
 /// `/proc/kdebug` line (empty when the level was not asked for).

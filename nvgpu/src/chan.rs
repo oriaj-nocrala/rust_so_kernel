@@ -232,10 +232,24 @@ const CE_PITCH_IN: u32 = 0x410;
 /// PITCH bits 7 and 8; SRC/DST_TYPE VIRTUAL (0), one line.
 pub const LAUNCH_DMA_COPY_WITH_SEMAPHORE: u32 = 2 | (1 << 2) | (1 << 3) | (1 << 7) | (1 << 8);
 
+/// `NVC7B5_LAUNCH_DMA_MULTI_LINE_ENABLE` (bit 9): copy `LINE_COUNT` lines of
+/// `LINE_LENGTH_IN` bytes, `PITCH_IN`/`PITCH_OUT` apart (`clc7b5.h:112`).
+pub const LAUNCH_DMA_MULTI_LINE: u32 = 1 << 9;
+
 /// The push buffer of one linear copy of `len` bytes between two virtual
 /// addresses of the channel's space, ending with a one-word semaphore release
 /// (`payload` at `sem_va`) after the data is flushed.
 pub fn copy_push(src_va: u64, dst_va: u64, len: u32, sem_va: u64, payload: u32) -> Vec<u32> {
+    copy_rect_push(src_va, dst_va, len, len, len, 1, sem_va, payload)
+}
+
+/// The push buffer of a pitch-linear 2D copy: `lines` lines of `line_bytes`
+/// bytes, the source's lines `src_pitch` apart and the destination's `dst_pitch`
+/// apart (a rectangle of a framebuffer), then the semaphore release. With one
+/// line it is exactly [`copy_push`]; with more, MULTI_LINE_ENABLE is set.
+#[allow(clippy::too_many_arguments)]
+pub fn copy_rect_push(src_va: u64, dst_va: u64, src_pitch: u32, dst_pitch: u32, line_bytes: u32, lines: u32, sem_va: u64, payload: u32) -> Vec<u32> {
+    assert!(lines > 0 && line_bytes > 0 && line_bytes <= src_pitch.min(dst_pitch));
     let mut w = Vec::new();
     // SET_OBJECT (method 0): the class binds the copy object to the subchannel
     w.push(incr_header(SUBCH_COPY, 0, 1));
@@ -245,14 +259,27 @@ pub fn copy_push(src_va: u64, dst_va: u64, len: u32, sem_va: u64, payload: u32) 
     w.extend([(src_va >> 32) as u32, src_va as u32, (dst_va >> 32) as u32, dst_va as u32]);
     // PITCH_IN, PITCH_OUT, LINE_LENGTH_IN, LINE_COUNT
     w.push(incr_header(SUBCH_COPY, CE_PITCH_IN, 4));
-    w.extend([len, len, len, 1]);
+    w.extend([src_pitch, dst_pitch, line_bytes, lines]);
     // SET_SEMAPHORE_A (upper), _B (lower), _PAYLOAD
     w.push(incr_header(SUBCH_COPY, CE_SET_SEMAPHORE_A, 3));
     w.extend([(sem_va >> 32) as u32, sem_va as u32, payload]);
     // LAUNCH_DMA
     w.push(incr_header(SUBCH_COPY, CE_LAUNCH_DMA, 1));
-    w.push(LAUNCH_DMA_COPY_WITH_SEMAPHORE);
+    w.push(LAUNCH_DMA_COPY_WITH_SEMAPHORE | if lines > 1 { LAUNCH_DMA_MULTI_LINE } else { 0 });
     w
+}
+
+/// `NVC7B5_LAUNCH_DMA_INTERRUPT_TYPE` (bits 6:5) NON_BLOCKING = 2 (`clc7b5.h:102-105`): when the
+/// copy finishes the engine raises its non-stall interrupt and goes on.
+pub const LAUNCH_DMA_INTERRUPT_NON_BLOCKING: u32 = 2 << 5;
+
+/// `push` (ending in a LAUNCH_DMA, as [`copy_push`] and [`release_push`] do) with the non-stall
+/// interrupt added to that launch.
+pub fn with_interrupt(mut push: Vec<u32>) -> Vec<u32> {
+    let n = push.len();
+    assert!(n >= 2 && push[n - 2] == incr_header(SUBCH_COPY, CE_LAUNCH_DMA, 1), "the push does not end in a LAUNCH_DMA");
+    push[n - 1] |= LAUNCH_DMA_INTERRUPT_NON_BLOCKING;
+    push
 }
 
 /// `LAUNCH_DMA` for a semaphore release with no data transfer: DATA_TRANSFER_TYPE
@@ -306,6 +333,19 @@ pub const FENCE_VA: u64 = GPFIFO_VA + 0x20000;
 pub const DST_VA: u64 = 0x2_1000_0000;
 pub const SRC_VA: u64 = 0x2_2000_0000;
 pub const BACK_VA: u64 = 0x2_3000_0000;
+/// Phase 6d: a fence page in host memory (the CPU polls it from cache, no BAR0
+/// read), and the same three buffers seen through 2 MiB pages (`mmu::map_huge`).
+pub const HFENCE_VA: u64 = GPFIFO_VA + 0x30000;
+pub const HUGE_DST_VA: u64 = 0x2_5000_0000;
+pub const HUGE_SRC_VA: u64 = 0x2_6000_0000;
+pub const HUGE_BACK_VA: u64 = 0x2_7000_0000;
+/// Phase 6d, frame-shaped copies: a 16 MiB host buffer (a framebuffer's shadow)
+/// to 16 MiB of VRAM at 160 MiB (where a scanout buffer would be), both through
+/// 2 MiB pages.
+pub const FRAME_BYTES: u64 = 16 << 20;
+pub const FRAME_VRAM: u64 = 160 << 20;
+pub const FRAME_SRC_VA: u64 = 0x2_8000_0000;
+pub const FRAME_DST_VA: u64 = 0x2_9000_0000;
 
 #[cfg(test)]
 mod tests {
@@ -611,6 +651,76 @@ mod tests {
     }
 
     #[test]
+    fn a_rectangle_copy_is_a_pitch_linear_multi_line_copy() {
+        let w = copy_rect_push(0x2_2000_0400, 0x2_1000_0800, 8192, 8192, 1600, 300, 0x2_0002_0010, 0x77);
+        let s = SUBCH_COPY;
+        assert_eq!(
+            decode(&w),
+            [
+                (s, 0x000, 0xc7b5),
+                (s, 0x400, 0x2),
+                (s, 0x404, 0x2000_0400),
+                (s, 0x408, 0x2),
+                (s, 0x40c, 0x1000_0800),
+                (s, 0x410, 8192),
+                (s, 0x414, 8192),
+                (s, 0x418, 1600),
+                (s, 0x41c, 300),
+                (s, 0x240, 2),
+                (s, 0x244, 0x0002_0010),
+                (s, 0x248, 0x77),
+                (s, 0x300, LAUNCH_DMA_COPY_WITH_SEMAPHORE | 0x200),
+            ]
+        );
+        assert_eq!(LAUNCH_DMA_MULTI_LINE, 0x200);
+        // different pitches land in the right words
+        let w = copy_rect_push(0x1000, 0x2000, 4096, 8192, 100, 2, 0x3000, 1);
+        let d = decode(&w);
+        assert_eq!((d[5], d[6], d[7], d[8]), ((s, 0x410, 4096), (s, 0x414, 8192), (s, 0x418, 100), (s, 0x41c, 2)));
+        // one line: identical to the linear copy, no MULTI_LINE
+        assert_eq!(copy_rect_push(0x1000, 0x2000, 64, 64, 64, 1, 0x3000, 5), copy_push(0x1000, 0x2000, 64, 0x3000, 5));
+        assert_eq!(decode(&copy_push(0x1000, 0x2000, 64, 0x3000, 5)).last().unwrap().2, LAUNCH_DMA_COPY_WITH_SEMAPHORE);
+    }
+
+    #[test]
+    #[should_panic]
+    fn a_line_longer_than_the_pitch_is_refused() {
+        copy_rect_push(0x1000, 0x2000, 100, 8192, 101, 2, 0x3000, 1);
+    }
+
+    #[test]
+    fn an_interrupt_is_one_more_launch_bit() {
+        assert_eq!(LAUNCH_DMA_INTERRUPT_NON_BLOCKING, 0x40);
+        let plain = copy_push(0x1000, 0x2000, 64, 0x3000, 5);
+        let irq = with_interrupt(plain.clone());
+        assert_eq!(irq.len(), plain.len());
+        assert_eq!(&irq[..irq.len() - 1], &plain[..plain.len() - 1], "only the launch word changes");
+        assert_eq!(irq[irq.len() - 1], LAUNCH_DMA_COPY_WITH_SEMAPHORE | 0x40);
+        assert_eq!(with_interrupt(release_push(0x3000, 1)).last(), Some(&(LAUNCH_DMA_SEMAPHORE_ONLY | 0x40)));
+        // together with the multi-line bit of a rectangle
+        let r = with_interrupt(copy_rect_push(0x1000, 0x2000, 256, 256, 64, 4, 0x3000, 5));
+        assert_eq!(r[r.len() - 1], LAUNCH_DMA_COPY_WITH_SEMAPHORE | LAUNCH_DMA_MULTI_LINE | 0x40);
+    }
+
+    #[test]
+    #[should_panic]
+    fn an_interrupt_needs_a_launch_to_ride_on() {
+        with_interrupt(vec![incr_header(SUBCH_COPY, 0, 1), CLASS_COPY]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn a_rectangle_needs_at_least_one_line() {
+        copy_rect_push(0x1000, 0x2000, 256, 256, 64, 0, 0x3000, 1);
+    }
+
+    #[test]
+    fn a_1080p_frame_at_pitch_8192_fits_the_frame_buffer() {
+        assert!(FRAME_BYTES >= 8192 * 1080);
+        assert!(FRAME_BYTES.is_power_of_two(), "a DmaBuf is a power-of-two block");
+    }
+
+    #[test]
     fn the_layout_does_not_overlap() {
         // VRAM: the channel's pages, then the destination; the tables (64 MiB) and
         // the 6b test mapping (96 MiB) are below
@@ -626,5 +736,16 @@ mod tests {
         for va in [GPFIFO_VA, PUSH_VA, FENCE_VA, DST_VA, SRC_VA, BACK_VA] {
             assert!(va % 0x1000 == 0 && va >> 49 == 0);
         }
+        // 6d: the host fence page after the VRAM one, and the 2 MiB-page buffers
+        // (2 MiB aligned, 256 MiB apart, above the 4 KiB-page ones)
+        assert!(FENCE_VA + 0x1000 <= HFENCE_VA && HFENCE_VA + 0x1000 <= DST_VA);
+        assert!(BACK_VA + (256 << 20) <= HUGE_DST_VA);
+        assert!(HUGE_DST_VA + (256 << 20) <= HUGE_SRC_VA && HUGE_SRC_VA + (256 << 20) <= HUGE_BACK_VA);
+        for va in [HUGE_DST_VA, HUGE_SRC_VA, HUGE_BACK_VA, FRAME_SRC_VA, FRAME_DST_VA] {
+            assert!(va % (2 << 20) == 0 && va >> 49 == 0);
+        }
+        assert!(HUGE_BACK_VA + (256 << 20) <= FRAME_SRC_VA && FRAME_SRC_VA + (256 << 20) <= FRAME_DST_VA);
+        // the frame's VRAM: after the 4 MiB destination, 2 MiB aligned, below the GSP heap
+        assert!(VRAM_DST + (4 << 20) <= FRAME_VRAM && FRAME_VRAM % (2 << 20) == 0 && FRAME_VRAM + FRAME_BYTES < (1 << 32));
     }
 }

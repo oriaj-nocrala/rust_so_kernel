@@ -85,6 +85,8 @@ pub mod evo;
 pub mod gsp;
 pub mod vaspace;
 pub mod copy;
+pub mod bench;
+pub mod intr;
 pub mod hdmi;
 pub mod modeset;
 pub mod scanout;
@@ -379,7 +381,15 @@ fn probe_device(r: &mut String, level: GpuLevel) {
                     let _ = writeln!(r, "bar1: mapped UC at {:#x}: the PAT has no WC entry", v1.as_u64());
                 } else { match crate::memory::memtype::set_pat_index_range(v1.as_u64(), len, hal::memtype::PAT_WC_INDEX) {
                     Ok(_) => {
-                        let _ = writeln!(r, "bar1: {:#x} bytes mapped WC at {:#x} (not accessed)", len, v1.as_u64());
+                        let _ = writeln!(r, "bar1: {:#x} bytes mapped WC at {:#x}", len, v1.as_u64());
+                        // Read probe (phase 6d): do reads through BAR1 return VRAM, before any GSP-RM? The
+                        // GOP framebuffer at 0 has pixels in it; 144 MiB is unused VRAM.
+                        let rd = |off: u64| -> u32 {
+                            // SAFETY: inside the mapping just made (off + 4 <= len, checked by the caller's list).
+                            unsafe { core::ptr::read_volatile((v1.as_u64() + off) as *const u32) }
+                        };
+                        let offs: [u64; 3] = [0, 0x10_0000, 144 << 20];
+                        let _ = writeln!(r, "bar1: read probe {}", offs.iter().filter(|&&o| o + 4 <= len).map(|&o| alloc::format!("[{:#x}]={:#010x}", o, rd(o))).collect::<alloc::vec::Vec<_>>().join(" "));
                     }
                     Err(e) => {
                         let _ = writeln!(r, "bar1: mapped at {:#x} but not WC: {}", v1.as_u64(), e);

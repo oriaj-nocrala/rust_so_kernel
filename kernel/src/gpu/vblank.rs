@@ -65,7 +65,10 @@ pub fn last_ns() -> u64 {
 /// MSI handler: ISR context, IF=0, CPU 0.
 fn on_msi(_vector: u8) {
     let Some(s) = STATE.get() else { return };
-    let r = vb::service(&s.regs, super::supervisor::enabled());
+    let r = vb::service_with(&s.regs, super::supervisor::enabled(), &super::intr::extras());
+    if r.extra != 0 {
+        super::intr::on_serviced(r.extra);
+    }
     // Supervisors first: the display is stopped until they are released.
     if r.supervisor != 0 {
         super::supervisor::on_pending(&s.regs, r.supervisor);
@@ -233,7 +236,7 @@ pub fn setup(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8)) {
         return;
     };
     STATE.call_once(|| State { regs: Bar0 { base: regs.base, len: regs.len }, vector, primary, heads: lit });
-    vb::arm(regs, present, lit);
+    vb::arm_with(regs, present, lit, &super::intr::extras());
     let (b, d, f) = bdf;
     crate::pci::update_command(b, d, f, hal::pcicfg::COMMAND_MASTER, 0);
     // CPU 0: the boot runs on it (the BSP), and the work is global.
