@@ -6,7 +6,8 @@
 //! [`crate::rm::set_page_directory_params`]). Notes: `docs/gpu/mmu-v3-notes.md`.
 //!
 //! Tree, from the root (49-bit VAs): PD3 2 bits (VA 48:47), PD2 9 (46:38), PD1 9
-//! (37:29), PD0 8 (28:21, 16-byte entries: small-page PDE then big-page PDE), PT
+//! (37:29), PD0 8 (28:21, 16-byte dual PDEs: the big-page PDE in the first 8 bytes,
+//! the small-page PDE in the second: `NV_MMU_VER2_DUAL_PDE`, NVIDIA's `dev_mmu.ref`), PT
 //! 9 (20:12). Every table is one 4 KiB page. Only small pages: the big-page
 //! half of a PD0 entry stays 0.
 
@@ -19,6 +20,11 @@ pub const TABLE_SIZE: usize = 0x1000;
 pub const VA_BITS: u32 = 49;
 pub const ROOT_ENTRIES: u32 = 4;
 pub const PAGE_SHIFT: u32 = 12;
+/// Byte offset of the small-page half of a PD0 dual PDE: `NV_MMU_VER2_DUAL_PDE_APERTURE_SMALL`
+/// is bits 66:65 and `ADDRESS_SMALL` 117:72 (`dev_mmu.ref`, Turing; Ampere is the same
+/// format), the big-page half being bits 0..63. Same as `gp100_vmm_pd0_pde`: `data[0]` is
+/// the LPT (`pt[0]`), `data[1]` the SPT (`pt[1]`, `nvkm_vmm_ref_hwpt`: `type = desc->type == SPT`).
+pub const PD0_SMALL: usize = 8;
 
 /// Where a page or table lives (`nvkm_memory_target`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,7 +201,7 @@ impl PageTables {
         t = self.child(t, ix[0] * 8)?;
         t = self.child(t, ix[1] * 8)?;
         t = self.child(t, ix[2] * 8)?;
-        t = self.child(t, ix[3] * 16)?; // PD0: 16-byte entries, small-page PDE first
+        t = self.child(t, ix[3] * 16 + PD0_SMALL)?; // PD0: 16-byte dual PDE, the small-page PDE is the second half
         let at = ix[4] * 8;
         if rd64(&self.tables[t], at) != 0 {
             return Err(MapError::AlreadyMapped);
@@ -236,7 +242,7 @@ impl PageTables {
         let ix = indices(va);
         let mut t = 0;
         for (level, &i) in ix[..4].iter().enumerate() {
-            let e = rd64(&self.tables[t], i * if level == 3 { 16 } else { 8 });
+            let e = rd64(&self.tables[t], if level == 3 { i * 16 + PD0_SMALL } else { i * 8 });
             // an absent entry is 0, whose address (0) is no table of ours
             t = self.table_at(entry_addr(e))?;
         }
@@ -268,7 +274,7 @@ mod tests {
         let shifts_bits = [(47u32, 2u32, 8usize), (38, 9, 8), (29, 9, 8), (21, 8, 16)];
         for (shift, bits, size) in shifts_bits {
             let i = ((va >> shift) & ((1 << bits) - 1)) as usize;
-            let e = get(table, i * size)?;
+            let e = get(table, i * size + if size == 16 { 8 } else { 0 })?;
             if e == 0 {
                 return None;
             }
@@ -342,14 +348,14 @@ mod tests {
         let va = 3u64 << 21; // PD0 index 3
         pt.map(va, 0x5000, Target::Vram, Flags::default()).unwrap();
         let (_, pd0) = pt.images().nth(3).unwrap();
-        assert_eq!(rd64(pd0, 3 * 16), pde(BASE + 4 * 0x1000, Target::Vram), "small-page half");
-        assert_eq!(rd64(pd0, 3 * 16 + 8), 0, "big-page half stays empty");
+        assert_eq!(rd64(pd0, 3 * 16 + 8), pde(BASE + 4 * 0x1000, Target::Vram), "small-page half is the SECOND qword");
+        assert_eq!(rd64(pd0, 3 * 16), 0, "big-page half (the first qword) stays empty");
         assert!(pd0[..3 * 16].iter().all(|&b| b == 0) && pd0[4 * 16..].iter().all(|&b| b == 0));
         // the last PD0 slot is at offset 255 * 16
         let mut pt = PageTables::new(BASE, 16, Target::Vram);
         pt.map(255 << 21, 0x5000, Target::Vram, Flags::default()).unwrap();
         let (_, pd0) = pt.images().nth(3).unwrap();
-        assert_ne!(rd64(pd0, 255 * 16), 0);
+        assert_ne!(rd64(pd0, 255 * 16 + 8), 0);
     }
 
     #[test]
