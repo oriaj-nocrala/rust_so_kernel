@@ -60,6 +60,9 @@
 //   gsp    (phases 4d + 4e) — also build the memory GSP-RM's boot reads and
 //          boot it: reset into RISC-V mode, booter on SEC2, RISC-V check
 //          (`gsp.rs`, `nvgpu::{gspmem,booter}`). `gsp:` lines, `gpu_gsp:`.
+//   vaspace (phase 6b) — also give our RM client a GPU virtual address space:
+//          page tables in VRAM and an externally owned `FERMI_VASPACE_A`
+//          (`vaspace.rs`, `nvgpu::mmu`). `vaspace:` lines, `gpu_vaspace:`.
 //
 // Runs once at boot, after `fs::init` (firmware is on `/mnt`) and before the
 // APs are released (BAR sizing turns decoding off for a few microseconds,
@@ -77,6 +80,7 @@ use crate::serial_println;
 pub mod dplink;
 pub mod evo;
 pub mod gsp;
+pub mod vaspace;
 pub mod hdmi;
 pub mod modeset;
 pub mod scanout;
@@ -425,6 +429,7 @@ fn probe_device(r: &mut String, level: GpuLevel) {
                     &regs,
                     (b, d, fun),
                     level >= GpuLevel::Gsp,
+                    level >= GpuLevel::Vaspace,
                     gsp::PciInfo {
                         bar0: bar0.addr,
                         bar1: bars[1].map_or(0, |b| b.addr),

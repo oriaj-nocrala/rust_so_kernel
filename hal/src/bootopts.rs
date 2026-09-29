@@ -111,6 +111,10 @@ pub enum GpuLevel {
     /// Needs `gsp-570.144.bin` on the stick (`scripts/sync-usb-data.sh`). No
     /// RPC yet.
     Gsp,
+    /// Phase 6b: also give our RM client a GPU virtual address space: page
+    /// tables built in VRAM (`nvgpu::mmu`) and an externally owned
+    /// `FERMI_VASPACE_A` whose page directory is ours. Implies `gsp`.
+    Vaspace,
 }
 
 impl GpuLevel {
@@ -133,6 +137,7 @@ impl GpuLevel {
             "hdmi" => Some(GpuLevel::Hdmi),
             "fwsec" => Some(GpuLevel::Fwsec),
             "gsp" => Some(GpuLevel::Gsp),
+            "vaspace" => Some(GpuLevel::Vaspace),
             _ => None,
         }
     }
@@ -184,6 +189,8 @@ mod tests {
         assert!(GpuLevel::Fwsec > GpuLevel::Hdmi);
         assert_eq!(GpuLevel::parse("gsp"), Some(GpuLevel::Gsp));
         assert!(GpuLevel::Gsp > GpuLevel::Fwsec);
+        assert_eq!(GpuLevel::parse("vaspace"), Some(GpuLevel::Vaspace));
+        assert!(GpuLevel::Vaspace > GpuLevel::Gsp);
         assert!(GpuLevel::Vpll > GpuLevel::Super);
         assert!(GpuLevel::Super > GpuLevel::Scanout && GpuLevel::Scanout > GpuLevel::Chan);
         assert!(GpuLevel::Chan > GpuLevel::Dispstate && GpuLevel::Dispstate > GpuLevel::Vblank);

@@ -147,7 +147,7 @@ impl Firmware {
     }
 }
 
-pub fn setup(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8), full: bool, pci: PciInfo) {
+pub fn setup(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8), full: bool, vaspace: bool, pci: PciInfo) {
     let Some((bios, _)) = super::VBIOS.get() else {
         stop(r, format_args!("no VBIOS (gpu=disp did not read it)"));
         return;
@@ -330,7 +330,7 @@ pub fn setup(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8), full: bool, pci: Pc
     }
 
     if let (Some(mem), Some((fwset, _))) = (mem, prepared) {
-        boot_gsp(r, regs, &fwset, mem);
+        boot_gsp(r, regs, &fwset, mem, vaspace);
     }
 }
 
@@ -513,7 +513,7 @@ fn build_memory(r: &mut String, fw: &Firmware, layout: &gspmem::FbLayout, gsp: &
 
 /// Phase 4e, after FRTS: reset the GSP into RISC-V mode, give it the LibOS
 /// address, run the booter on SEC2, check the RISC-V core.
-fn boot_gsp(r: &mut String, regs: &Bar0, fw: &Firmware, mut mem: Memory) {
+fn boot_gsp(r: &mut String, regs: &Bar0, fw: &Firmware, mut mem: Memory, vaspace: bool) {
     use nvgpu::booter;
     let gsp = falcon::GSP;
     let b = match Booter::parse(&fw.booter) {
@@ -584,7 +584,7 @@ fn boot_gsp(r: &mut String, regs: &Bar0, fw: &Firmware, mut mem: Memory) {
 
     // Phase 4f: GSP-RM boots on its own, asking the host for register work
     // (RUN_CPU_SEQUENCER) until it says INIT_DONE; then the static configuration.
-    rpc_phase(r, regs, &mut mem);
+    rpc_phase(r, regs, &mut mem, vaspace);
 
     // Then see whether it wrote its logs.
     for _ in 0..50 {
@@ -681,7 +681,7 @@ fn wait_for(regs: &Bar0, shm: &ShmBuf, q: &Queues, env: &rpc::SeqEnv, want: u32,
 }
 
 /// Phase 4f: wait for INIT_DONE, then GET_GSP_STATIC_INFO for the GPU's name.
-fn rpc_phase(r: &mut String, regs: &Bar0, mem: &mut Memory) {
+fn rpc_phase(r: &mut String, regs: &Bar0, mem: &mut Memory, vaspace: bool) {
     let gsp = falcon::GSP;
     let shm = ShmBuf(&mem.shm);
     let env = rpc::SeqEnv {
@@ -731,12 +731,20 @@ fn rpc_phase(r: &mut String, regs: &Bar0, mem: &mut Memory) {
             let _ = writeln!(r, "gsp: RM objects: client {:#x}, device {:#x}, subdevice {:#x} allocated (status 0); GPU_GET_NAME_STRING on the subdevice says \"{}\"", rm::H_CLIENT, rm::H_DEVICE, rm::H_SUBDEVICE, name);
             RM_NAME.call_once(|| name);
         }
-        Err(e) => gsp_stop(r, format_args!("RM objects: {} ({})", e, queue_diag(regs, &rm.shm))),
+        Err(e) => {
+            gsp_stop(r, format_args!("RM objects: {} ({})", e, queue_diag(regs, &rm.shm)));
+            return;
+        }
+    }
+
+    // Phase 6b: a GPU virtual address space for that client.
+    if vaspace {
+        super::vaspace::setup(r, regs, &mut rm);
     }
 }
 
 /// One RPC at a time over the queues, with the boot's event handling.
-struct Rm<'a> {
+pub(super) struct Rm<'a> {
     regs: &'a Bar0,
     shm: ShmBuf<'a>,
     queues: &'a mut Queues,
@@ -753,12 +761,14 @@ impl Rm<'_> {
         wait_for(self.regs, &self.shm, self.queues, &self.env, function, 10_000, &mut events)
     }
 
-    fn alloc(&mut self, parent: u32, object: u32, class: u32, params: &[u8]) -> Result<(), String> {
+    /// The reply's payload (the request echoed with the status and any output fields filled).
+    pub(super) fn alloc(&mut self, parent: u32, object: u32, class: u32, params: &[u8]) -> Result<Vec<u8>, String> {
         let reply = self.call(rm::FN_GSP_RM_ALLOC, &rm::alloc_request(rm::H_CLIENT, parent, object, class, params))?;
-        rm::check_alloc_reply(&reply.payload, rm::H_CLIENT, object).map_err(|e| alloc::format!("alloc class {:#x}: {:?}", class, e))
+        rm::check_alloc_reply(&reply.payload, rm::H_CLIENT, object).map_err(|e| alloc::format!("alloc class {:#x}: {:?}", class, e))?;
+        Ok(reply.payload)
     }
 
-    fn control(&mut self, object: u32, cmd: u32, params: &[u8]) -> Result<alloc::vec::Vec<u8>, String> {
+    pub(super) fn control(&mut self, object: u32, cmd: u32, params: &[u8]) -> Result<alloc::vec::Vec<u8>, String> {
         let reply = self.call(rm::FN_GSP_RM_CONTROL, &rm::control_request(rm::H_CLIENT, object, cmd, params))?;
         rm::check_control_reply(&reply.payload, rm::H_CLIENT, object, cmd).map(|p| p.to_vec()).map_err(|e| alloc::format!("control {:#x}: {:?}", cmd, e))
     }
@@ -775,6 +785,14 @@ impl Rm<'_> {
 
 /// `/proc/kdebug` lines.
 pub fn render_kdebug() -> String {
+    let base = render_gsp_kdebug();
+    match super::vaspace::render_kdebug() {
+        v if v.is_empty() => base,
+        v => base + "\n" + &v,
+    }
+}
+
+fn render_gsp_kdebug() -> String {
     let fw = match STATE.load(Ordering::Relaxed) {
         0 => String::from("gpu_fwsec: off"),
         s => alloc::format!(
