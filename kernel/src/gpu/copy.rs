@@ -133,11 +133,14 @@ fn ms_ticks(ms: u64) -> u64 {
 /// One submitted copy's result.
 struct Done {
     ticks: u64,
+    /// The copy only completed after RM's own token was rung as well.
+    second_token: bool,
 }
 
 struct Submitter<'a> {
     regs: &'a Bar0,
-    token: u32,
+    /// The doorbell value we computed, then (rung after 300 ms without progress) RM's own.
+    tokens: [u32; 2],
     slot: u32,
     push_at: u32,
 }
@@ -160,11 +163,16 @@ impl Submitter<'_> {
         let _ = p.rd32(chan::USERD_VRAM + chan::USERD_GP_PUT);
         core::sync::atomic::fence(Ordering::SeqCst);
         let t0 = crate::cpu::tsc::read();
-        self.regs.wr32(DOORBELL, self.token);
+        self.regs.wr32(DOORBELL, self.tokens[0]);
         let limit = ms_ticks(FENCE_TIMEOUT_MS);
+        let mut second = self.tokens[1] == self.tokens[0];
         loop {
             if p.rd32(chan::FENCE_VRAM) == payload {
-                return Ok(Done { ticks: crate::cpu::tsc::read().wrapping_sub(t0) });
+                return Ok(Done { ticks: crate::cpu::tsc::read().wrapping_sub(t0), second_token: second && self.tokens[1] != self.tokens[0] });
+            }
+            if !second && crate::cpu::tsc::read().wrapping_sub(t0) > ms_ticks(300) {
+                second = true;
+                self.regs.wr32(DOORBELL, self.tokens[1]);
             }
             if crate::cpu::tsc::read().wrapping_sub(t0) > limit {
                 return Err(alloc::format!(
@@ -199,7 +207,7 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, bufs: Buffers) {
     let alloc = ChanAlloc {
         chid: CHID,
         privileged: true,
-        engine_type: chan::ENGINE_COPY0,
+        engine_type: chan::ENGINE_COPY2,
         gpfifo_va: chan::GPFIFO_VA,
         gpfifo_bytes: chan::GPFIFO_ENTRIES * 8,
         inst: chan::INST_VRAM,
@@ -208,18 +216,34 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, bufs: Buffers) {
         vaspace: rm::H_VASPACE,
     };
     let ch = chan::h_chan(CHID);
-    let result = (|| -> Result<u32, String> {
+    let result = (|| -> Result<(u32, u32, u32, &'static str), String> {
         let reply = rm.alloc(rm::H_DEVICE, ch, chan::CLASS_GPFIFO, &chan::alloc_params(&alloc)).map_err(|e| alloc::format!("ALLOC channel: {}", e))?;
         let cid = chan::cid_from_reply(&reply).ok_or_else(|| String::from("ALLOC channel: short reply"))?;
         CID.store(cid, Ordering::Relaxed);
-        let _ = writeln!(r, "copy: channel {:#x} (class {:#x}, engine {:#x}) allocated: RM's channel id {}", ch, chan::CLASS_GPFIFO, chan::ENGINE_COPY0, cid);
-        rm.control(ch, chan::CTRL_BIND, &chan::bind_params(chan::ENGINE_COPY0)).map_err(|e| alloc::format!("BIND: {}", e))?;
+        let _ = writeln!(r, "copy: channel {:#x} (class {:#x}, engine {:#x}) allocated: RM's channel id {}", ch, chan::CLASS_GPFIFO, chan::ENGINE_COPY2, cid);
+        rm.control(ch, chan::CTRL_BIND, &chan::bind_params(chan::ENGINE_COPY2)).map_err(|e| alloc::format!("BIND: {}", e))?;
         rm.control(ch, chan::CTRL_GPFIFO_SCHEDULE, &chan::schedule_params()).map_err(|e| alloc::format!("GPFIFO_SCHEDULE: {}", e))?;
-        rm.alloc(ch, chan::H_COPY, chan::CLASS_COPY, &chan::copy_params(chan::ENGINE_COPY0)).map_err(|e| alloc::format!("ALLOC copy object: {}", e))?;
-        let t = rm.control(ch, chan::CTRL_GET_WORK_SUBMIT_TOKEN, &chan::token_request_params()).map_err(|e| alloc::format!("GET_WORK_SUBMIT_TOKEN: {}", e))?;
-        chan::token_from_params(&t).ok_or_else(|| String::from("GET_WORK_SUBMIT_TOKEN: short reply"))
+        rm.alloc(ch, chan::H_COPY, chan::CLASS_COPY, &chan::copy_params(chan::ENGINE_COPY2)).map_err(|e| alloc::format!("ALLOC copy object: {}", e))?;
+        // GSP's own token is for runlist 0 (boot #102/#103); the doorbell wants the
+        // channel's real runlist: ask RM's device table which one CE2 is on.
+        let rm_token = rm
+            .control(ch, chan::CTRL_GET_WORK_SUBMIT_TOKEN, &chan::token_request_params())
+            .map_err(|e| alloc::format!("GET_WORK_SUBMIT_TOKEN: {}", e))
+            .and_then(|t| chan::token_from_params(&t).ok_or_else(|| String::from("GET_WORK_SUBMIT_TOKEN: short reply")))?;
+        let table = rm.control(rm::H_SUBDEVICE, chan::CTRL_FIFO_GET_DEVICE_INFO_TABLE, &chan::device_info_params());
+        let (runlist, how) = match &table {
+            Ok(t) => match chan::runlist_for_engine(t, chan::ENGINE_COPY2) {
+                Some(r) => (r, "RM's device table"),
+                None => (1, "the trace (engine not in RM's table)"),
+            },
+            Err(e) => {
+                let _ = writeln!(r, "copy: GET_DEVICE_INFO_TABLE on our subdevice: {}", e);
+                (1, "the trace (RM refused the table)")
+            }
+        };
+        Ok((chan::doorbell_token(runlist, CHID), rm_token, runlist, how))
     })();
-    let token = match result {
+    let (token, rm_token, runlist, how) = match result {
         Ok(t) => t,
         Err(e) => {
             p.restore();
@@ -227,9 +251,13 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, bufs: Buffers) {
         }
     };
     TOKEN.store(token, Ordering::Relaxed);
-    let _ = writeln!(r, "copy: channel scheduled, copy object {:#x} allocated, work-submit token {:#x}", chan::H_COPY, token);
+    let _ = writeln!(
+        r,
+        "copy: channel scheduled, copy object {:#x} allocated; CE2 is on runlist {} ({}); doorbell token {:#x} (runlist << 16 | chid {}), RM's own token {:#x}",
+        chan::H_COPY, runlist, how, token, CHID, rm_token
+    );
 
-    let mut sub = Submitter { regs, token, slot: 0, push_at: 0 };
+    let mut sub = Submitter { regs, tokens: [token, rm_token], slot: 0, push_at: 0 };
     // src (system) -> VRAM
     let up = sub.submit(&mut p, &chan::copy_push(chan::SRC_VA, chan::DST_VA, COPY_BYTES as u32, chan::FENCE_VA, 1), 1);
     let up = match up {
@@ -269,6 +297,9 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, bufs: Buffers) {
     let (u, d) = (kbps(COPY_BYTES, up.ticks), kbps(COPY_BYTES, down.ticks));
     UP_KBPS.store(u, Ordering::Relaxed);
     DOWN_KBPS.store(d, Ordering::Relaxed);
+    if up.second_token || down.second_token {
+        let _ = writeln!(r, "copy: NOTE: a copy needed RM's own token (up {}, down {})", up.second_token, down.second_token);
+    }
     let _ = writeln!(
         r,
         "copy: {} KiB system -> VRAM in {} us ({} MB/s), VRAM -> system in {} us ({} MB/s)",

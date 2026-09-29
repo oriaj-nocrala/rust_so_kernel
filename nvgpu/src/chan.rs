@@ -32,9 +32,11 @@ pub fn h_chan(chid: u32) -> u32 {
 /// The copy object's handle in the trace (`fixtures/rm-ph6-ce-alloc-c7b5-req.bin`).
 pub const H_COPY: u32 = 0x0004_c7b5;
 
-/// `NV2080_ENGINE_TYPE_COPY0` (`rm/r535/nvrm/engine.h`; the trace's CE channel
-/// has `engineType = 0xb`, and `r535_ce_alloc` adds the instance to it).
-pub const ENGINE_COPY0: u32 = 0xb;
+/// `NV2080_ENGINE_TYPE_COPY2` = `RM_ENGINE_TYPE_COPY2` (`rm/r535/nvrm/engine.h:136,192`:
+/// COPY0 is 9). The trace's CE channel has `engineType = 0xb` and the device
+/// table puts CE2 alone on runlist 1, while CE0/CE1 share runlist 0 with GR
+/// (`fixtures/rm-ph6-devinfo-rep.bin`): this is the async copy engine.
+pub const ENGINE_COPY2: u32 = 0xb;
 
 /// `NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS` in 570.144: 368 bytes.
 pub const CHAN_PARAMS_SIZE: usize = 368;
@@ -149,6 +151,46 @@ pub fn token_request_params() -> Vec<u8> {
 /// the parameter block, after the 32-byte ALLOC header).
 pub fn cid_from_reply(payload: &[u8]) -> Option<u32> {
     (payload.len() >= crate::rm::ALLOC_HDR + CHAN_PARAMS_SIZE).then(|| get32(payload, crate::rm::ALLOC_HDR + 132))
+}
+
+// ---- the doorbell token -----------------------------------------------------------
+
+/// `NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE` (`r535/nvrm/fifo.h:27`), sent to
+/// the subdevice: `baseIndex`, `numEntries`, `bMore` (12 bytes with padding),
+/// then 32 entries of 100 bytes (`engineData[16]`, `pbdmaIds[2]`,
+/// `pbdmaFaultIds[2]`, `numPbdmas`, `engineName[16]`).
+pub const CTRL_FIFO_GET_DEVICE_INFO_TABLE: u32 = 0x2080_1112;
+pub const DEVICE_INFO_PARAMS_SIZE: usize = 12 + 32 * DEVICE_ENTRY_SIZE;
+const DEVICE_ENTRY_SIZE: usize = 100;
+/// Indices into `engineData` (`ENGINE_INFO_TYPE_*`, `fifo.h:44-116`).
+const ENGINE_INFO_RM_ENGINE_TYPE: usize = 2;
+const ENGINE_INFO_RUNLIST: usize = 3;
+
+pub fn device_info_params() -> Vec<u8> {
+    vec![0u8; DEVICE_INFO_PARAMS_SIZE]
+}
+
+/// The runlist an engine (`RM_ENGINE_TYPE_*`) is on, from the reply's parameter
+/// block (what `r535_fifo_runl_ctor` reads, `r535/fifo.c:451-470`).
+pub fn runlist_for_engine(params: &[u8], engine_type: u32) -> Option<u32> {
+    if params.len() < DEVICE_INFO_PARAMS_SIZE {
+        return None;
+    }
+    let n = (get32(params, 4) as usize).min(32);
+    (0..n).find_map(|i| {
+        let e = 12 + i * DEVICE_ENTRY_SIZE;
+        (get32(params, e + 4 * ENGINE_INFO_RM_ENGINE_TYPE) == engine_type).then(|| get32(params, e + 4 * ENGINE_INFO_RUNLIST))
+    })
+}
+
+/// The doorbell value on Turing and later with GSP-RM (`tu102_chan_doorbell_handle`,
+/// `engine/fifo/tu102.c:35`; `NV_CTRL_VF_DOORBELL` = runlist id above bit 16, the
+/// channel id in the low bits). RM's own `GET_WORK_SUBMIT_TOKEN` reply is
+/// not it: CPU-RM recomputes the token after the RPC with the channel's real
+/// runlist (`kchannelCtrlCmdGpfifoGetWorkSubmitToken`), while GSP builds one
+/// for runlist 0 (boot #102-#103: 0x2 for chid 2 on runlist 1).
+pub fn doorbell_token(runlist: u32, chid: u32) -> u32 {
+    (runlist << 16) | chid
 }
 
 // ---- USERD -----------------------------------------------------------------------
@@ -277,7 +319,7 @@ mod tests {
         ChanAlloc {
             chid: 2,
             privileged: true,
-            engine_type: ENGINE_COPY0,
+            engine_type: ENGINE_COPY2,
             gpfifo_va: 0x2c000,
             gpfifo_bytes: 0x2000,
             inst: 0x1_f07c_7000,
@@ -354,16 +396,56 @@ mod tests {
     #[test]
     fn the_controls_and_the_copy_object_match_the_trace() {
         let ch = h_chan(2);
-        assert_eq!(rm::control_request(rm::H_CLIENT, ch, CTRL_BIND, &bind_params(ENGINE_COPY0)), BIND_REQ);
+        assert_eq!(rm::control_request(rm::H_CLIENT, ch, CTRL_BIND, &bind_params(ENGINE_COPY2)), BIND_REQ);
         assert_eq!(rm::control_request(rm::H_CLIENT, ch, CTRL_GPFIFO_SCHEDULE, &schedule_params()), SCHED_REQ);
-        assert_eq!(rm::alloc_request(rm::H_CLIENT, ch, H_COPY, CLASS_COPY, &copy_params(ENGINE_COPY0)), CE_ALLOC_REQ);
+        assert_eq!(rm::alloc_request(rm::H_CLIENT, ch, H_COPY, CLASS_COPY, &copy_params(ENGINE_COPY2)), CE_ALLOC_REQ);
         assert_eq!(CE_ALLOC_REP, CE_ALLOC_REQ);
         assert_eq!(rm::check_alloc_reply(CE_ALLOC_REP, rm::H_CLIENT, H_COPY), Ok(()));
         assert_eq!((CLASS_GPFIFO, CLASS_COPY, CTRL_BIND, CTRL_GPFIFO_SCHEDULE, CTRL_GET_WORK_SUBMIT_TOKEN), (0xc56f, 0xc7b5, 0xa06f0104, 0xa06f0103, 0xc36f0108));
-        assert_eq!((h_chan(2), H_COPY, ENGINE_COPY0), (0xf1f0_0002, 0x4c7b5, 0xb));
+        assert_eq!((h_chan(2), H_COPY, ENGINE_COPY2), (0xf1f0_0002, 0x4c7b5, 0xb));
         assert_eq!(token_request_params(), [0; 4]);
         assert_eq!(token_from_params(&[0x78, 0x56, 0x34, 0x12]), Some(0x1234_5678));
         assert_eq!(token_from_params(&[1, 2, 3]), None);
+    }
+
+    const DEVINFO_REQ: &[u8] = include_bytes!("../fixtures/rm-ph6-devinfo-req.bin");
+    const DEVINFO_REP: &[u8] = include_bytes!("../fixtures/rm-ph6-devinfo-rep.bin");
+
+    #[test]
+    fn the_device_table_puts_ce2_alone_on_runlist_1() {
+        let p = &DEVINFO_REP[rm::CTRL_HDR..];
+        assert_eq!((p.len(), DEVICE_INFO_PARAMS_SIZE), (3212, 3212));
+        assert_eq!(&DEVINFO_REQ[rm::CTRL_HDR..], &device_info_params()[..], "the request is all zeros");
+        assert_eq!(rm::check_control_reply(DEVINFO_REP, 0xc200_0006, 0xabcd_2080, CTRL_FIFO_GET_DEVICE_INFO_TABLE), Ok(p));
+        // the table of this board: GR0 1 -> runlist 0, CE0 9 -> 0, CE1 0xa -> 0, CE2 0xb -> 1, CE3 0xc -> 2,
+        // CE4 0xd -> 8, NVDEC0 0x1d -> 3, SEC2 0x31 -> 5, NVENC0 0x25 -> 6, OFA 0x3e -> 7
+        for (eng, rl) in [(1, 0), (9, 0), (0xa, 0), (0xb, 1), (0xc, 2), (0xd, 8), (0x1d, 3), (0x31, 5), (0x25, 6), (0x3e, 7)] {
+            assert_eq!(runlist_for_engine(p, eng), Some(rl), "engine {eng:#x}");
+        }
+        assert_eq!(runlist_for_engine(p, ENGINE_COPY2), Some(1));
+        assert_eq!(runlist_for_engine(p, 0x77), None);
+        assert_eq!(runlist_for_engine(&p[..3000], 1), None, "a short reply");
+        assert_eq!(runlist_for_engine(&p[..3211], 1), None, "one byte short");
+    }
+
+    #[test]
+    fn a_table_entry_is_only_read_when_it_is_counted() {
+        let mut p = DEVINFO_REP[rm::CTRL_HDR..].to_vec();
+        p[4..8].copy_from_slice(&6u32.to_le_bytes()); // six entries: CE2 is the seventh
+        assert_eq!(runlist_for_engine(&p, 0xb), None);
+        p[4..8].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(runlist_for_engine(&p, 0xb), Some(1));
+        p[4..8].copy_from_slice(&1000u32.to_le_bytes()); // a count past the table is clamped
+        assert_eq!(runlist_for_engine(&p, 0xb), Some(1));
+        assert_eq!(runlist_for_engine(&p, 0x77), None, "and never read past the 32 entries");
+    }
+
+    #[test]
+    fn the_doorbell_token_is_runlist_over_channel() {
+        assert_eq!(doorbell_token(1, 2), 0x1_0002);
+        assert_eq!(doorbell_token(0, 2), 2, "what GSP-RM's own token said");
+        assert_eq!(doorbell_token(8, 0x7ff), 0x8_07ff);
+        assert_eq!(CTRL_FIFO_GET_DEVICE_INFO_TABLE, 0x2080_1112);
     }
 
     #[test]
