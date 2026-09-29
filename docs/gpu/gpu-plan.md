@@ -922,6 +922,15 @@ Código: nivel `gpu=vaspace` (`hal::bootopts::GpuLevel::Vaspace`), `kernel/src/g
 - **Lo que NO prueba**: que las tablas sean correctas para la MMU: RM solo guarda la dirección de la raíz. La prueba real es 6c (un canal que lea/escriba por VA).
 - **Siguiente (6c)**: canal GPFIFO (`0xc56f`, 400 B de `NV_CHANNEL_ALLOC_PARAMS`) con `hVASpace` = el nuestro, memoria de instancia/USERD/RAMFC/GPFIFO, `BIND` + `GPFIFO_SCHEDULE`, objeto `0xc7b5`; flush TLB (`tu102_vmm_flush`) antes de arrancar el canal. Empezar decodificando `rm-ph6-chan-c56f-*-req.bin` con clang contra `r570/nvrm/fifo.h` (ver `phase6-oracle.md`).
 
+## Resultados de la fase 6c (2026-09-29, EN CURSO)
+
+Código: `nvgpu::chan` (parámetros del canal `0xc56f`, BIND/SCHEDULE, objeto `0xc7b5`, token del doorbell, entrada GPFIFO, push buffers; 29 tests, ~120 mutaciones sin supervivientes), `kernel/src/gpu/copy.rs` (nivel `gpu=copy`, implica `vaspace`), job `scripts/metal-jobs/gpu-copy.sh`. Los dos ALLOC de canal de nouveau (GR y CE) se reproducen **byte a byte**; `fixtures/rm-ph6-devinfo-*.bin` es la tabla de dispositivos de RM (`NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE`).
+
+- **Boot #102 (FAIL, informativo)**: RM acepta el ALLOC del canal (chid pedido 2; el `cid` 3 de la respuesta es un contador de sesión), BIND, GPFIFO_SCHEDULE, el objeto de copia y devuelve un token; la GPU nunca lee el GPFIFO (`GPGet 0`). Causa 1: el doorbell estaba en la ventana usermode de Volta (`0x810090`); en Ampere es `0xb80000 + 0x30000 + 0x90` (`vfn/ga100.c:41`).
+- **Boot #103 (FAIL)**: mismo síntoma. Causa 2: el token de `GET_WORK_SUBMIT_TOKEN` (`0x2`) lo genera GSP para el runlist 0 y CPU-RM lo recalcula con el runlist real. El motor `0xb` es **COPY2** (COPY0 = 9) y está solo en el **runlist 1** (CE0/CE1 comparten runlist 0 con GR): token = `(runlist << 16) | chid` = `0x10002`.
+- **Boot #104 (FAIL, avance)**: con ese token **la GPU lee la entrada del GPFIFO (`GPGet 1`)**: doorbell, token, USERD y las tablas de páginas (GPFIFO_VA) funcionan. Pero el fence nunca llega (1 s), `Get` sigue en 0 y RM no envía eventos. `0x2100` y `0xb65000` leen `0xbadf....` (PRI): no sirven de diagnóstico con GSP-RM.
+- **Siguiente (sin ejecutar: se acabó el presupuesto de reanudaciones)**: `copy.rs` tiene una escalera de cuatro peldaños, cada uno con su línea `copy: rung ...` y, si falla, un STOP con los registros del USERD y los eventos de RM: (1) solo liberar el semáforo, (2) VRAM->VRAM 4 KiB, (3) sistema->VRAM 4 KiB, (4) el viaje de 4 MiB. Lanzar `scripts/metal-run.sh --kconf 'gpu=copy' scripts/metal-jobs/gpu-copy.sh` y leer `grep '^\[fb\] copy:' boot.log`. **Antes de adivinar más, contrastar con nova-core** (el driver Rust actual de Linux para GPUs con GSP) y la documentación pública: qué hace tras crear el canal, cómo se atienden los fallos de MMU y las interrupciones con GSP-RM vivo.
+
 ## Fases
 
 Calendario orientativo en días de trabajo. El riesgo está en la fase 4.

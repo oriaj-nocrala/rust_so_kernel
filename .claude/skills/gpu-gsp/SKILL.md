@@ -51,6 +51,10 @@ Our own RM client exists after boot: `create_client` = `NV01_ROOT` (`0xc1d00000`
 
 `nvgpu::mmu` (page tables, pure) and `gpu=vaspace` (`kernel/src/gpu/vaspace.rs`): external `FERMI_VASPACE_A` + our tables in VRAM 64 MiB + `SET_PAGE_DIRECTORY`, measured (boot #101). Everything still runs at boot with IF=0 and `Rm::call` polling the status queue: no long-lived `Rm` yet. `Rm::alloc` returns the reply payload, `alloc`/`control` are `pub(super)`. Job pattern: copy `scripts/metal-jobs/gpu-vaspace.sh`.
 
+## 6c in progress (channel + copy)
+
+`nvgpu::chan` + `kernel/src/gpu/copy.rs`; status in `docs/gpu/gpu-plan.md` "Resultados de la fase 6c". Traps found: the doorbell is `0xbb0090` on Ampere (Volta's `0x810090` does nothing); the token is `(runlist<<16)|chid` with the runlist from `NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE` (GSP's own token is for runlist 0); engine `0xb` is COPY2; `cid` in the ALLOC reply is a session counter; PFIFO registers read `0xbadf....` under GSP-RM. Reference drivers: nouveau r570 (used so far) and, per the user, **nova-core** (the current Rust driver) plus public documentation: check them before guessing.
+
 ## Next: phase 6c (channel) — read `docs/gpu/phase6-oracle.md` first
 
 Also read `docs/gpu/mmu-v3-notes.md` (page-table format, PTE/PDE bit layout, the external VA-space recipe, TLB flush, free VRAM range, suggested `nvgpu/src/mmu.rs` design). `phase6-oracle.md` lists exactly what the trace contains (VASpace, two GPFIFO channels `0xc56f`, the copy engine `0xc7b5`, BIND/SCHEDULE controls, with `#index` and fixture names already extracted in `nvgpu/fixtures/rm-ph6-*`), the tool to re-extract or extract more (`scripts/gpu-rpc.py list|recv|dump|text`), the nouveau reading order (`r570/fifo.c` -> `r535/fifo.c` -> `r535/vmm.c` -> `ce.c`/`bar.c`), the build order (queue servicing -> VA space + MMU v3 page tables -> channel -> submission/doorbell/fence -> job) and the loose ends (no teardown, `Rm` not long-lived).
