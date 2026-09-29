@@ -81,7 +81,7 @@ Runs inside the boot's RPC phase (IF=0, `Rm::call` polls the status queue); no l
 
 ## Next: 6d (what is left of phase 6; details in the plan)
 
-1. Stability: 5 consecutive `gpu=copy` boots (`echo 5 > target/metal/budget`; job `scripts/metal-jobs/gpu-copy.sh`).
+1. ~~Stability~~ DONE: 5 consecutive `gpu=copy` boots OK (#105-#109, 6.14/6.40 GB/s, noise < 0.2 %). Recipe: `echo 5 > target/metal/budget`, launch `scripts/metal-run.sh --kconf 'gpu=copy' scripts/metal-jobs/gpu-copy.sh` once; each resume relaunches it.
 2. Long-lived `Rm` + servicing the status queue at run time (`Memory` is `mem::forget`-ed at the end of `boot_gsp`; events such as RC/MMU faults arrive at any time).
 3. Fence by interrupt instead of polling: read `ampere_interrupt_map.csv`, nouveau's `r535_engn_nonstall` / `tu102_vfn_intr`, and `LAUNCH_DMA` `INTERRUPT_TYPE` in `clc7b5.h` first.
 4. Map the scanout buffers into the VA space (`Target::Vram`) and copy the compositor's shadow buffer into them; 2 MiB pages need a PTE at PD0: check `NV_MMU_VER2_DUAL_PDE_IS_PTE` in `dev_mmu.ref.txt` before writing it.
