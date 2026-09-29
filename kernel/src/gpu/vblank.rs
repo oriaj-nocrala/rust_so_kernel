@@ -100,7 +100,12 @@ fn on_msi(_vector: u8) {
         // Timestamp before the sequence number: a reader that sees the new
         // number (Acquire) sees this vblank's time.
         LAST_NS.store(crate::time::ktime_get(), Ordering::Release);
-        SEQ.fetch_add(1, Ordering::Release);
+        let n = SEQ.fetch_add(1, Ordering::Release) + 1;
+        // Phase 6d: GSP-RM raises no interrupt for what it queues (`gpu_intr`), so its status queue is
+        // served from here, ten times a second, when no process is in the middle of an RPC.
+        if n % 6 == 0 {
+            super::gsp::poll_events_isr();
+        }
         crate::process::syscall::poll_wakeup_for_input(crate::drivers::evdev::QUEUE_VBLANK);
     }
 }

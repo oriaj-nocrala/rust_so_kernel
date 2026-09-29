@@ -27,6 +27,27 @@ pub const FN_GSP_SET_SYSTEM_INFO: u32 = 72;
 pub const FN_SET_REGISTRY: u32 = 73;
 pub const EVENT_GSP_INIT_DONE: u32 = 0x1001;
 pub const EVENT_GSP_RUN_CPU_SEQUENCER: u32 = 0x1002;
+pub const EVENT_POST_EVENT: u32 = 0x1003;
+pub const EVENT_RC_TRIGGERED: u32 = 0x1004;
+pub const EVENT_MMU_FAULT_QUEUED: u32 = 0x1005;
+pub const EVENT_OS_ERROR_LOG: u32 = 0x1006;
+pub const EVENT_UCODE_LIBOS_PRINT: u32 = 0x100c;
+pub const EVENT_GSP_POST_NOCAT_RECORD: u32 = 0x1020;
+
+/// The name of an event RM sends (`nvrm/msgfn.h`, r570's `rpc_global_enums.h`), for reports.
+pub fn event_name(function: u32) -> &'static str {
+    match function {
+        EVENT_GSP_INIT_DONE => "INIT_DONE",
+        EVENT_GSP_RUN_CPU_SEQUENCER => "RUN_CPU_SEQUENCER",
+        EVENT_POST_EVENT => "POST_EVENT",
+        EVENT_RC_TRIGGERED => "RC_TRIGGERED",
+        EVENT_MMU_FAULT_QUEUED => "MMU_FAULT_QUEUED",
+        EVENT_OS_ERROR_LOG => "OS_ERROR_LOG",
+        EVENT_UCODE_LIBOS_PRINT => "UCODE_LIBOS_PRINT",
+        EVENT_GSP_POST_NOCAT_RECORD => "POST_NOCAT_RECORD",
+        _ => "?",
+    }
+}
 
 // ---- the queues -----------------------------------------------------------
 
@@ -1159,5 +1180,22 @@ mod tests {
         assert_eq!(run(text(&|t| t.replace("R 0x111388 0x00000080", "R 0x111388 0x00000000"))), Err(SeqError::RiscvInactive));
         // SEC2 never signals
         assert_eq!(run(text(&|t| t.replace("0x17100000", "0x13100000"))), Err(SeqError::Sec2Timeout));
+    }
+
+    #[test]
+    fn event_numbers_and_names() {
+        // nvrm/msgfn.h counts from FIRST_EVENT = 0x1000; r570 adds NOCAT at 0x1020
+        assert_eq!((EVENT_POST_EVENT, EVENT_RC_TRIGGERED, EVENT_MMU_FAULT_QUEUED, EVENT_OS_ERROR_LOG), (0x1003, 0x1004, 0x1005, 0x1006));
+        assert_eq!((EVENT_UCODE_LIBOS_PRINT, EVENT_GSP_POST_NOCAT_RECORD), (0x100c, 0x1020));
+        assert_eq!(event_name(0x1001), "INIT_DONE");
+        assert_eq!(event_name(0x1002), "RUN_CPU_SEQUENCER");
+        assert_eq!(event_name(0x1003), "POST_EVENT");
+        assert_eq!(event_name(0x1004), "RC_TRIGGERED");
+        assert_eq!(event_name(0x1005), "MMU_FAULT_QUEUED");
+        assert_eq!(event_name(0x1006), "OS_ERROR_LOG");
+        assert_eq!(event_name(0x100c), "UCODE_LIBOS_PRINT");
+        assert_eq!(event_name(0x1020), "POST_NOCAT_RECORD");
+        assert_eq!(event_name(0x1000), "?");
+        assert_eq!(event_name(0x9999), "?");
     }
 }

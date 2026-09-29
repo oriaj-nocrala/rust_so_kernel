@@ -935,7 +935,35 @@ Código: `nvgpu::chan` (parámetros del canal `0xc56f`, BIND/SCHEDULE, objeto `0
 - **Criterio "Hecho cuando" de la fase 6**: la primera mitad (copia de N MiB por CE verificada y con GB/s medidos) **cumplida**. Falta la segunda: el compositor sube su búfer por CE y `fb_flush` baja respecto a la cifra actual de `docs/gui/perf-plan.md` (CPU con WC: 5,6 GB/s), y el fence "con un mecanismo de bloqueo correcto" (hoy se sondea con IF=0 en el arranque).
 - **Medida honesta**: 6,1-6,4 GB/s con páginas de 4 KiB y 4 MiB por copia no supera al blit de CPU con WC (5,6 GB/s); la CE gana si el copiado deja libre la CPU, si se usan páginas de 2 MiB / copias mayores y si el destino es la VRAM de scanout (aún no mapeada). Medir antes de integrar.
 - **6d (1) estabilidad, medida 2026-09-29: 5 arranques seguidos OK en la Ryzen (#105-#109, `gpu=copy`)**: sistema->VRAM 6142-6149 MB/s y VRAM->sistema 6399-6407 MB/s (ruido < 0,2 %), `mismatch=0`, `cid=3`, token `0x10002` a la primera, sin STOP, ASUS a 59,990-59,994 Hz sin vblanks espurios.
-- **Siguiente (6d, pendiente)**: (2) `Rm` de larga vida y servicio de la cola de estado en ejecución (hoy solo en el arranque); (3) fence por interrupción (MSI/VFN, hoy sondeo); (4) mapear el framebuffer de scanout en el VA space y copiar hacia él; (5) tamaños/páginas de 2 MiB para el GB/s real; (6) decidir si el compositor lo usa.
+## Resultados de la fase 6d (2026-09-29)
+
+Código: `kernel/src/gpu/bench.rs` (mediciones), `kernel/src/gpu/intr.rs` (fuentes de interrupción), `copy.rs` (canal de ejecución: anillos por BAR1, fence en memoria del host, `copy irq`, `copy fault`), `gsp.rs` (`Runtime`: `with_rm`, `poll_events`, `restore_bar1`), `nvgpu::{mmu::map_huge, chan::{copy_rect_push,with_interrupt}, vblank::{arm_with,service_with,new_vectors}, rpc::event_name}` (nuevos tests; mutaciones en `nvgpu/mutations/{mmu_huge,chan_rect_irq,vblank_extra}.py`, 0 supervivientes reales). Job `scripts/metal-jobs/gpu-copy.sh`. Arranques #110-#121 de la Ryzen.
+
+**Mediciones** (todas con copia verificada por comparación de datos; el CE mueve sistema -> VRAM):
+
+| Qué | Resultado |
+|---|---|
+| Enlace PCIe de la GPU | **8 GT/s x8** (Linux, en reposo, lo baja a 2,5 GT/s; capacidad x16): 7,88 GB/s teóricos, ~79 % de eficiencia útil = el techo |
+| Barrido por tamaño (CE, páginas 4 KiB) | 4 KiB 3 us (1,0 GB/s); 64 KiB 13 us (4,8); 256 KiB 43 us (5,8); 1 MiB 164 us (6,1); 4 MiB 648 us (6,17 GB/s) |
+| 16 x 4 MiB en un solo envío | 6,19 GB/s con páginas de 4 KiB **y** con páginas de 2 MiB (10,34 ms): **las páginas de 2 MiB no ganan nada**, el límite es el enlace, no la MMU |
+| CPU: `copy_nonoverlapping` + `sfence` a BAR1 WC | **5,44 GB/s** (verificado: filas emborronadas antes, leídas por PRAMIN y BAR1 después); el CE gana un 13,6 % |
+| Pantalla completa 1920x1080 (pitch 8192, 8100 KiB) | CE 1278 us (6,19 GB/s) frente a CPU 1452 us (5,44) |
+| Rectángulos (CE 2D vs CPU fila a fila) | 32x32 3 vs 6 us; 64x64 5 vs 12; 128x128 12 vs 27; 256x256 43 vs 58; 512x512 163 vs 183; 640x400 160 vs 179; 1024x768 486 vs 550: el CE va por delante en todos (pero ver "CPU por envío") |
+| CPU libre mientras el CE copia 64 MiB | 95 % (`free_permille` 953-961): el resto es el sondeo del fence; encolar el trabajo cuesta 0,73 us por BAR1 (5-7 us por PRAMIN) |
+| Interrupción de fin de copia (MSI, 150 de 150 llegan) | vector **7** (hoja 0, bit `0x80`) = el `0x104424 + inst*0x80` que lee nouveau (`0xc0000007`); latencia doorbell -> handler: 4 KiB 9,5 us (fence por sondeo 4,2 us), 1 MiB 168,7 us (164,4), 4 MiB 653,0 us (648,7): **la interrupción llega ~4,3-5,3 us después de que el sondeo ve el fence** |
+| RM en ejecución (`gsp name`, IF=1) | una llamada de control tarda **459-466 us** |
+| Cola de estado de RM | **GSP-RM no levanta ninguna interrupción de la CPU al encolar una respuesta** (ningún bit nuevo en las hojas VFN): se sirve por sondeo, 10 Hz desde el handler del vblank (`poll_events_isr`, `try_lock`) |
+| Fallo de MMU a propósito (`copy fault`, destino sin mapear) | el fence no llega, el CE no interrumpe; a los ~70-90 ms RM envía `MMU_FAULT_QUEUED` (0x1005), 5 x `POST_NOCAT_RECORD` (0x1020, 1212 B) y `RC_TRIGGERED` (0x1004, 9864 B); en las hojas quedan bits nuevos, vectores 132 y 161; **RM sigue contestando** después |
+
+**Hallazgos que cambian cosas:**
+
+1. **GSP-RM cambia `NV_PBUS_BAR1_BLOCK` (`0x1704`)**: de `0x1fff00` (firmware, VRAM en identidad) a `0x801f3f90` (bloque virtual de RM); BAR2 (`0x1714`) de `0x40000000` a `0xc01f3f91`. Con eso las escrituras por BAR1 **no llegan a ningún sitio** y las lecturas devuelven `0xbad0ac..`/`0xffffffff` (arranques #111-#118). Escribir de vuelta el valor del firmware (`gsp::restore_bar1`, tras el INIT_DONE) devuelve BAR1 a "VRAM desde 0": escritura y lectura verificadas (#118, #119). Consecuencia: **sin ese arreglo, `gpu=scanout` + `gpu=gsp` habría dejado la pantalla sin actualizar** (el flush del compositor iría a un BAR1 muerto; deducido de las escrituras, no visto a ojo). Las primeras cifras de CPU de esta fase (#110-#117) eran inválidas por eso (comparaban con datos que el CE ya había dejado idénticos); las de arriba son las verificadas de #119-#121.
+2. **BAR1 no sirve para el CE por sí mismo**: el techo lo pone el enlace, el mismo para la CPU y el CE.
+3. El anillo del canal se escribe ahora por BAR1 en ejecución (sin ventana PRAMIN compartida); PRAMIN sigue en el arranque.
+
+**Decisión (6): el compositor NO usa el CE por ahora.** Ganancia: +13,6 % de ancho de banda y ~1,4 ms de CPU por pantalla completa (a 60 fps completos, ~8,5 % de un núcleo; a 180 Hz, ~26 %); las actualizaciones pequeñas (ventanas de 640x400 a 35 fps) cuestan <1 % de un núcleo. Coste de integrarlo: mapear el shadow y los búferes de scanout en el VA space, un canal para todo el sistema con su cerrojo, fence sin bloqueo (o por MSI, +5 us), manejo de RC (un fallo mata el canal y hay que recrearlo) y un camino CPU de reserva. **Revisar la decisión si** el compositor presenta a >100 Hz, hay dos monitores, o la CPU pasa a ser el cuello de botella de `fb_flush` (`docs/gui/perf-plan.md`). Lo necesario ya está medido y probado: 2D con pitch (`chan::copy_rect_push`), fence en memoria del host, interrupción de fin de copia, anillos por BAR1.
+
+**Hecho / no hecho de la lista de 6d:** (1) estabilidad hecha (#105-#109 y #120-#121); (2) `Rm` de larga vida hecho, servicio de eventos por sondeo (no hay interrupción); (3) fence por interrupción medido (funciona, no gana al sondeo en latencia, sí libera la CPU); (4) los búferes de scanout **no** se mapearon: el banco de rectángulos usa VRAM 160 MiB con la misma geometría (nada del CE/MMU depende de qué dirección de VRAM sea), y el mapeo real se hará cuando se integre; (5) 2 MiB medido (sin ganancia); (6) decidido (no). Queda del plan de la fase 6 el criterio "el compositor sube su búfer por CE y `fb_flush` baja": **no se cumple por decisión**, con datos.
 
 ## Fases
 

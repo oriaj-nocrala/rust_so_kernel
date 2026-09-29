@@ -59,6 +59,26 @@ else
 fi
 sum "gpu-copy: $(grep '^gpu_intr:' /proc/kdebug)"
 
+# Phase 6d: RM at run time (a control after the boot, IF=1), its status queue served from the vblank
+# handler, then a deliberate MMU fault of the copy channel (LAST: RM resets it) and RM must still answer.
+for i in 1 2 3; do
+  echo 'gsp name' > /dev/dispctl || { sum "gpu-copy: 'gsp name' #$i failed"; fail=1; }
+done
+sum "gpu-copy: $(grep '^gpu_gsprt:' /proc/kdebug)"
+echo 'gsp poll' > /dev/dispctl || { sum "gpu-copy: 'gsp poll' failed"; fail=1; }
+sleep 1
+sum "gpu-copy: $(grep '^gpu_gsprt:' /proc/kdebug) (a second later)"
+if echo 'copy fault' > /dev/dispctl; then
+  sum "gpu-copy: $(grep '^gpu_copyfault:' /proc/kdebug)"
+else
+  sum "gpu-copy: 'copy fault' failed"; fail=1
+fi
+sleep 2
+echo 'gsp poll' > /dev/dispctl
+sum "gpu-copy: $(grep '^gpu_gsprt:' /proc/kdebug) (after the fault)"
+sum "gpu-copy: $(grep '^gpu_intr:' /proc/kdebug) (after the fault)"
+echo 'gsp name' > /dev/dispctl && sum "gpu-copy: RM still answers after the fault" || { sum "gpu-copy: RM does not answer after the fault"; fail=1; }
+
 sample() { grep '^gpu_vblank:' /proc/kdebug; }
 s1=$(sample)
 sleep 10

@@ -684,8 +684,130 @@ fn boot_gsp(r: &mut String, regs: &Bar0, fw: &Firmware, mut mem: Memory, vaspace
         regs.rd32(gsp.base + 0x044),
         regs.rd32(gsp.base + 0x080)
     );
-    // Everything stays allocated: the GSP reads and writes it from now on.
-    core::mem::forget(mem);
+    // Everything stays allocated: the GSP reads and writes it from now on. Phase 6d: and stays
+    // reachable, so RPCs and events can be served at run time (`with_rm`, `poll_events`).
+    let env = seq_env(regs, &mem);
+    *RUNTIME.lock() = Some(Runtime { regs: Bar0 { base: regs.base, len: regs.len }, mem, env, stats: Stats::default() });
+}
+
+// ---- run time (phase 6d) ----------------------------------------------------------------
+
+/// GSP-RM's state after the boot: its buffers and queues, and the counters of what happened since.
+struct Runtime {
+    regs: Bar0,
+    mem: Memory,
+    env: rpc::SeqEnv,
+    stats: Stats,
+}
+
+/// The last events kept: (function, payload length).
+const EVENT_LOG: usize = 16;
+
+#[derive(Default)]
+struct Stats {
+    calls: u64,
+    /// The last call's round trip, in ns.
+    last_rtt_ns: u64,
+    events: u64,
+    log: alloc::collections::VecDeque<(u32, usize)>,
+    /// Polls from the vblank handler, and how many found the lock taken.
+    isr_polls: u64,
+}
+
+static RUNTIME: crate::sync::Mutex<Option<Runtime>> = crate::sync::Mutex::new(None);
+
+/// Run `f` with RM at run time (IF as the caller has it; RPCs busy-wait, so this is for process
+/// context). `None` when the boot did not leave GSP-RM running.
+pub(super) fn with_rm<T>(f: impl FnOnce(&mut Rm) -> T) -> Option<T> {
+    let mut g = RUNTIME.lock();
+    let rt = g.as_mut()?;
+    let mut rm = Rm { regs: &rt.regs, shm: ShmBuf(&rt.mem.shm), queues: &mut rt.mem.queues, env: rt.env };
+    let t0 = crate::cpu::tsc::read();
+    let out = f(&mut rm);
+    rt.stats.calls += 1;
+    rt.stats.last_rtt_ns = (crate::cpu::tsc::read().wrapping_sub(t0) as u128 * 1_000_000_000 / crate::cpu::tsc::freq_hz() as u128) as u64;
+    Some(out)
+}
+
+/// The GPU's name asked of RM now (a control on our subdevice): a round trip at run time.
+pub fn runtime_name() -> Result<String, String> {
+    with_rm(|rm| {
+        let p = rm.control(rm::H_SUBDEVICE, rm::CTRL_GPU_GET_NAME_STRING, &rm::name_string_params())?;
+        rm::name_from_params(&p).map(String::from).ok_or_else(|| String::from("no name in the reply"))
+    })
+    .unwrap_or_else(|| Err(String::from("GSP-RM is not running")))
+}
+
+/// Read what GSP-RM has queued, without waiting: events are counted and logged (a sequencer
+/// command is run, as at boot). Returns how many arrived.
+fn drain(rt: &mut Runtime) -> usize {
+    let shm = ShmBuf(&rt.mem.shm);
+    let mut n = 0;
+    while let Ok(Some(m)) = rt.mem.queues.recv(&shm) {
+        n += 1;
+        rt.stats.events += 1;
+        EVENTS_SEEN.fetch_add(1, Ordering::Release);
+        if rt.stats.log.len() == EVENT_LOG {
+            rt.stats.log.pop_front();
+        }
+        rt.stats.log.push_back((m.function, m.payload.len()));
+        if m.function == rpc::EVENT_GSP_RUN_CPU_SEQUENCER {
+            if let Ok((ops, mut save)) = rpc::decode_sequencer(&m.payload) {
+                let _ = rpc::run_sequencer(&rt.regs, &rt.env, &ops, &mut save);
+            }
+        }
+        if n >= 64 {
+            break;
+        }
+    }
+    n
+}
+
+/// Events read so far (a run-time counter, lock-free for a test that waits for one).
+static EVENTS_SEEN: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn events_seen() -> u64 {
+    EVENTS_SEEN.load(Ordering::Acquire)
+}
+
+/// `/dev/dispctl` `gsp poll`: serve the status queue now (process context).
+pub fn poll_events() -> Option<usize> {
+    let mut g = RUNTIME.lock();
+    let rt = g.as_mut()?;
+    Some(drain(rt))
+}
+
+/// From the vblank handler (ISR, IF=0): serve the status queue unless a process holds the lock.
+pub(super) fn poll_events_isr() {
+    let Some(mut g) = RUNTIME.try_lock() else {
+        // A process is in the middle of an RPC (or a poll); it reads the queue itself.
+        if let Some(mut s) = STATS_BUSY.try_lock() {
+            *s += 1;
+        }
+        return;
+    };
+    if let Some(rt) = g.as_mut() {
+        rt.stats.isr_polls += 1;
+        drain(rt);
+    }
+}
+
+/// Polls from the ISR that found the runtime lock taken (the counter cannot live under that lock).
+static STATS_BUSY: crate::sync::Mutex<u64> = crate::sync::Mutex::new(0);
+
+/// `/proc/kdebug` line.
+pub fn render_runtime_kdebug() -> String {
+    let g = RUNTIME.lock();
+    let Some(rt) = g.as_ref() else { return String::new() };
+    alloc::format!(
+        "gpu_gsprt: calls={} last_rtt_ns={} events={} isr_polls={} isr_busy={} last_events={}",
+        rt.stats.calls,
+        rt.stats.last_rtt_ns,
+        rt.stats.events,
+        rt.stats.isr_polls,
+        *STATS_BUSY.lock(),
+        rt.stats.log.iter().map(|(f, len)| alloc::format!("{}({:#x}):{}", rpc::event_name(*f), f, len)).collect::<alloc::vec::Vec<_>>().join(",")
+    )
 }
 
 /// The queues' state, for a report when the RPC phase stops.
@@ -741,17 +863,20 @@ fn wait_for(regs: &Bar0, shm: &ShmBuf, q: &Queues, env: &rpc::SeqEnv, want: u32,
     }
 }
 
-/// Phase 4f: wait for INIT_DONE, then GET_GSP_STATIC_INFO for the GPU's name.
-fn rpc_phase(r: &mut String, regs: &Bar0, mem: &mut Memory, vaspace: bool, copy: bool) {
-    let gsp = falcon::GSP;
-    let shm = ShmBuf(&mem.shm);
-    let env = rpc::SeqEnv {
-        gsp,
+fn seq_env(regs: &Bar0, mem: &Memory) -> rpc::SeqEnv {
+    rpc::SeqEnv {
+        gsp: falcon::GSP,
         sec2: nvgpu::booter::SEC2,
         libos_addr: mem.libos.bus_addr(),
         app_version: mem.app_version,
         bar0_len: regs.len as u32,
-    };
+    }
+}
+
+/// Phase 4f: wait for INIT_DONE, then GET_GSP_STATIC_INFO for the GPU's name.
+fn rpc_phase(r: &mut String, regs: &Bar0, mem: &mut Memory, vaspace: bool, copy: bool) {
+    let shm = ShmBuf(&mem.shm);
+    let env = seq_env(regs, mem);
     let mut seen = alloc::vec::Vec::new();
     let t0 = crate::cpu::tsc::read();
     if let Err(e) = wait_for(regs, &shm, &mem.queues, &env, rpc::EVENT_GSP_INIT_DONE, 20_000, &mut seen) {
@@ -870,7 +995,7 @@ impl Rm<'_> {
 pub fn render_kdebug() -> String {
     let base = render_gsp_kdebug();
     let mut out = base;
-    for v in [super::vaspace::render_kdebug(), super::copy::render_kdebug(), super::bench::render_kdebug(), super::intr::render_kdebug(), super::copy::render_irq_kdebug()] {
+    for v in [super::vaspace::render_kdebug(), super::copy::render_kdebug(), super::bench::render_kdebug(), super::intr::render_kdebug(), super::copy::render_irq_kdebug(), super::copy::render_fault_kdebug(), render_runtime_kdebug()] {
         if !v.is_empty() {
             out += "\n";
             out += &v;

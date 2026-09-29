@@ -62,6 +62,17 @@ impl FileHandle for DispctlDevice {
                 Err(SetError::NotReady | SetError::Failed) => Err(FileError::IOError),
             };
         }
+        if let Some(what) = text.strip_prefix("gsp ") {
+            // `gsp name`: a control on RM at run time; `gsp poll`: serve RM's status queue now (gpu=gsp)
+            return match what.trim() {
+                "name" => crate::gpu::gsp::runtime_name().map(|_| buf.len()).map_err(|_| FileError::IOError),
+                "poll" => crate::gpu::gsp::poll_events().map(|_| buf.len()).ok_or(FileError::IOError),
+                _ => Err(FileError::InvalidArgument),
+            };
+        }
+        if text == "copy fault" {
+            return crate::gpu::copy::selftest_fault().map(|_| buf.len()).map_err(|_| FileError::IOError);
+        }
         if let Some(args) = text.strip_prefix("copy ") {
             // `copy irq <runs>`: the copy engine's interrupt against polling, at run time (gpu=copy)
             let runs = match args.trim().strip_prefix("irq") {

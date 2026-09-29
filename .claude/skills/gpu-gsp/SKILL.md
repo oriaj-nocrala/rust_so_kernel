@@ -1,6 +1,6 @@
 ---
 name: gpu-gsp
-description: Playbook for GSP-RM work on the NVIDIA GA106 (phases 4, 6a-6c done): the falcon / FWSEC / booter / WPR2 / RPC queue code (nvgpu + kernel/src/gpu/gsp.rs), the RM object RPCs, and phase 6 - GPU page tables (nvgpu::mmu), the GPFIFO channel and copy engine (nvgpu::chan, gpu=vaspace, gpu=copy, kernel/src/gpu/{vaspace,copy}.rs), the VRAM/VA memory map, the bring-up ladder, doorbell and token, where the NVIDIA hardware manuals are, the mutation-testing tool and the metal-run protocol. Read it before touching those modules, gpu=fwsec / gsp / vaspace / copy, adding an RM client or object, or debugging a channel that does nothing. Keywords: GSP, RM_ALLOC, VASpace, GPFIFO, doorbell, runlist, USERD, PDE, PTE, copy engine, c7b5, c56f, open-gpu-doc.
+description: Playbook for GSP-RM work on the NVIDIA GA106 (phases 4, 6a-6d done): the falcon / FWSEC / booter / WPR2 / RPC queue code (nvgpu + kernel/src/gpu/gsp.rs), the RM object RPCs, and phase 6 - GPU page tables (nvgpu::mmu), the GPFIFO channel and copy engine (nvgpu::chan, gpu=vaspace, gpu=copy, kernel/src/gpu/{vaspace,copy}.rs), the VRAM/VA memory map, the bring-up ladder, doorbell and token, where the NVIDIA hardware manuals are, the mutation-testing tool and the metal-run protocol. Read it before touching those modules, gpu=fwsec / gsp / vaspace / copy, adding an RM client or object, or debugging a channel that does nothing. Keywords: GSP, RM_ALLOC, VASpace, GPFIFO, doorbell, runlist, USERD, PDE, PTE, copy engine, c7b5, c56f, open-gpu-doc.
 ---
 
 # GSP-RM work on the GA106 (phase 4: `gpu=fwsec` / `gpu=gsp`; phase 6: `gpu=vaspace` / `gpu=copy`)
@@ -47,7 +47,7 @@ State: `docs/reference/gpu.md` sections "`gpu=fwsec`", "`gpu=gsp`", "GSP firmwar
 
 Our own RM client exists after boot: `create_client` = `NV01_ROOT` (`0xc1d00000`) -> `NV01_DEVICE_0` (`0xde1d0000`) -> `NV20_SUBDEVICE_0` (`0x5d1d0000`) + `NV2080_CTRL_CMD_GPU_GET_NAME_STRING`. RPC payloads: `GSP_RM_ALLOC` fn 103 (32-byte header), `GSP_RM_CONTROL` fn 76 (24-byte header), `FREE` fn 10; a reply echoes the request with `status` filled (`0x55/0x66` busy, `0x51` no memory). Fixtures `rm-*-{req,rep}.bin` (extract sent/received RPCs from the trace dmesg as in step 3 above). `Rm::call` = send + `wait_for` (the receive loop that also runs sequencer events). The objects and buffers are never freed; the queues are only serviced at boot.
 
-## Phase 6: VA space, channel, copy engine (`gpu=vaspace` boot #101, `gpu=copy` boot #105)
+## Phase 6: VA space, channel, copy engine (`gpu=vaspace` boot #101, `gpu=copy` boots #105-#121)
 
 Runs inside the boot's RPC phase (IF=0, `Rm::call` polls the status queue); no long-lived `Rm` yet. State and evidence: `docs/gpu/gpu-plan.md` "Resultados de las fases 6a/6b/6c"; module summary: `docs/reference/gpu.md`.
 
@@ -79,10 +79,20 @@ Runs inside the boot's RPC phase (IF=0, `Rm::call` polls the status queue); no l
 - A metal reboot can empty `/tmp` (the session scratchpad): keep helper scripts in the repo (`scripts/gpu-mutate.py`, examples in `nvgpu/mutations/`).
 - Mutation testing: `scripts/gpu-mutate.py FILE FILTER MUTATIONS.py`; write a fresh list per change.
 
-## Next: 6d (what is left of phase 6; details in the plan)
+## Phase 6d, done (numbers and decisions: `docs/gpu/gpu-plan.md` "Resultados de la fase 6d")
 
-1. ~~Stability~~ DONE: 5 consecutive `gpu=copy` boots OK (#105-#109, 6.14/6.40 GB/s, noise < 0.2 %). Recipe: `echo 5 > target/metal/budget`, launch `scripts/metal-run.sh --kconf 'gpu=copy' scripts/metal-jobs/gpu-copy.sh` once; each resume relaunches it.
-2. Long-lived `Rm` + servicing the status queue at run time (`Memory` is `mem::forget`-ed at the end of `boot_gsp`; events such as RC/MMU faults arrive at any time).
-3. Fence by interrupt instead of polling: read `ampere_interrupt_map.csv`, nouveau's `r535_engn_nonstall` / `tu102_vfn_intr`, and `LAUNCH_DMA` `INTERRUPT_TYPE` in `clc7b5.h` first.
-4. Map the scanout buffers into the VA space (`Target::Vram`) and copy the compositor's shadow buffer into them; 2 MiB pages need a PTE at PD0: check `NV_MMU_VER2_DUAL_PDE_IS_PTE` in `dev_mmu.ref.txt` before writing it.
-5. Measure against the CPU write-combined blit (5.6 GB/s, `docs/gui/perf-plan.md`); the round trip measured 6.1-6.4 GB/s with 4 KiB pages and 4 MiB copies, so integrate into the compositor only if it wins or frees the CPU.
+Code map additions: `kernel/src/gpu/bench.rs` (measurements after the ladder), `kernel/src/gpu/intr.rs` (interrupt sources found by leaf-status diff), run-time channel in `copy.rs` (`install`, `selftest_irq`, `selftest_fault`), `gsp.rs` `Runtime` (`with_rm`, `poll_events`, `restore_bar1`), `nvgpu::{mmu::map_huge, chan::{copy_rect_push, with_interrupt}, vblank::{arm_with, service_with}}`. `/dev/dispctl` commands (need `gpu=copy`): `copy irq <runs>`, `copy fault` (kills the channel: run last), `gsp name`, `gsp poll`. Job: `scripts/metal-jobs/gpu-copy.sh` runs all of it; `gpu_bench:`, `gpu_copyirq:`, `gpu_copyfault:`, `gpu_gsprt:`, `gpu_intr:` in /proc/kdebug.
+
+**Rules learned (each cost metal rounds):**
+- **GSP-RM's boot rewrites `NV_PBUS_BAR1_BLOCK` (`0x1704`)**: BAR1 stops mapping VRAM (stores lost, reads `0xbad0ac..`/`0xffffffff`). `gsp::restore_bar1` puts the firmware's value back; anything that writes VRAM through BAR1 after the GSP boot (the compositor's `fb_flush`, scanout buffers) depends on it. If a BAR1 access "works" but nothing shows, read `0x1704`.
+- **A verification that can pass on data left there earlier proves nothing**: scribble the destination first (through PRAMIN, which always works), then copy, then read back through a *different* path. Boots #110-#117 measured a dead BAR1 as if it worked.
+- The link (PCIe 8 GT/s x8, ~6.2 GB/s useful) is the ceiling for both the CPU's WC stores and the copy engine; 2 MiB pages and bigger copies do not help. Measure the link before optimising the copy.
+- Interrupts: the CE's completion interrupt is a VFN leaf bit (vector 7 for CE2); find a vector by clearing every leaf status, doing the work and diffing (`intr::discover`), the status latches even when the source is not allowed. GSP-RM queues replies and events **without any CPU interrupt**: serve its status queue by polling.
+- RC: a channel fault makes RM reset the channel and send `MMU_FAULT_QUEUED` + `POST_NOCAT_RECORD` x5 + `RC_TRIGGERED` (r570: `POST_NOCAT_RECORD` = 0x1020); RM keeps answering. The channel must be recreated to be used again (not done: nothing needs it yet).
+- Run-time ring writes go through BAR1 (write-only view; no shared PRAMIN window); the doorbell is a BAR0 write; the fence is a host-memory page.
+
+## Next (what is left of phase 6)
+
+1. Only if the compositor is to use the copy engine (decision in the plan: not now): map the shadow and the scanout buffers (VRAM 16/32 MiB) in the VA space at boot (`Buffers::map` shows how; `map_huge_range` for 2 MiB-aligned contiguous ranges), a system-wide submit lock, a CPU fallback, recreating the channel after an RC, `Framebuffer::copy_out` calling `chan::copy_rect_push`.
+2. Recreate a channel after RC (dispatch `RC_TRIGGERED` from `poll_events`).
+3. Phase 7 of the plan (see `docs/gpu/gpu-plan.md`).

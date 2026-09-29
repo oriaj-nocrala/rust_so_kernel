@@ -546,6 +546,8 @@ struct Runtime {
     push_at: u32,
     io: Bar1Io,
     hfence: usize,
+    /// A run-time test faulted the channel on purpose (`selftest_fault`): RM tore it down.
+    dead: bool,
 }
 
 static RUNTIME: crate::sync::Mutex<Option<Runtime>> = crate::sync::Mutex::new(None);
@@ -594,6 +596,7 @@ fn install(r: &mut String, regs: &Bar0, sub: &Submitter, bufs: &Buffers) {
         push_at: sub.push_at,
         io,
         hfence: bufs.hfence.virt() as usize,
+        dead: false,
     });
     let _ = writeln!(r, "copy: run-time channel installed: rings written through BAR1 ({}), fence in host memory", if wc { "write-combined" } else { "NOT write-combined" });
 }
@@ -613,6 +616,9 @@ pub fn selftest_irq(runs: usize) -> Result<(), &'static str> {
     let runs = runs.clamp(1, 1000);
     let mut g = RUNTIME.lock();
     let rt = g.as_mut().ok_or("no run-time channel")?;
+    if rt.dead {
+        return Err("the channel was faulted on purpose");
+    }
     let hz = crate::cpu::tsc::freq_hz();
     let ns = |t: u64| (t as u128 * 1_000_000_000 / hz as u128) as u64;
     let was_on = x86_64::instructions::interrupts::are_enabled();
@@ -697,6 +703,76 @@ pub fn selftest_irq(runs: usize) -> Result<(), &'static str> {
     }
     *IRQ_REPORT.lock() = out;
     if failed.is_some() { Err("a copy did not complete") } else { Ok(()) }
+}
+
+static FAULT_REPORT: spin::Mutex<String> = spin::Mutex::new(String::new());
+
+/// `/dev/dispctl` `copy fault`: a copy whose destination is not mapped, at run time. The copy
+/// engine's MMU fault makes RM reset the channel (RC) and tell the host: this shows what reaches
+/// the CPU (interrupt vectors, the events in RM's status queue). Kills the channel: run it last.
+pub fn selftest_fault() -> Result<(), &'static str> {
+    use nvgpu::vblank as vb;
+    let mut g = RUNTIME.lock();
+    let rt = g.as_mut().ok_or("no run-time channel")?;
+    if rt.dead {
+        return Err("the channel was faulted already");
+    }
+    let hz = crate::cpu::tsc::freq_hz();
+    let was_on = x86_64::instructions::interrupts::are_enabled();
+    if !was_on {
+        x86_64::instructions::interrupts::enable();
+    }
+    // nothing of ours is mapped just below DST_VA
+    const HOLE_VA: u64 = chan::DST_VA - 0x100_0000;
+    let payload = 30_000u32;
+    let push = chan::with_interrupt(chan::copy_push(chan::SRC_VA, HOLE_VA, 4096, chan::HFENCE_VA, payload));
+    let ce0 = super::intr::CE.count();
+    let ev0 = super::gsp::events_seen();
+    let before = vb::leaf_stats(&rt.regs);
+    let mut sub = Submitter::new(&rt.regs, rt.tokens);
+    sub.slot = rt.slot;
+    sub.push_at = rt.push_at;
+    // SAFETY: the host fence page is ours.
+    unsafe { core::ptr::write_volatile(rt.hfence as *mut u32, 0) };
+    sub.queue_only(&mut rt.io, &push);
+    let t0 = crate::cpu::tsc::read();
+    sub.ring();
+    rt.slot = sub.slot;
+    rt.push_at = sub.push_at;
+    rt.dead = true;
+    // wait: the fence must NOT arrive; RM's events (polled by the vblank handler and by us) may
+    let mut fence_at = None;
+    let mut first_event_us = None;
+    while crate::cpu::tsc::read().wrapping_sub(t0) < ms_ticks(1500) {
+        // SAFETY: as above.
+        if fence_at.is_none() && unsafe { core::ptr::read_volatile(rt.hfence as *const u32) } == payload {
+            fence_at = Some(crate::cpu::tsc::read().wrapping_sub(t0));
+        }
+        if first_event_us.is_none() && super::gsp::events_seen() > ev0 {
+            first_event_us = Some(crate::cpu::tsc::read().wrapping_sub(t0) * 1_000_000 / hz);
+        }
+        core::hint::spin_loop();
+    }
+    let after = vb::leaf_stats(&rt.regs);
+    let new = vb::new_vectors(&before, &after);
+    if !was_on {
+        x86_64::instructions::interrupts::disable();
+    }
+    let out = alloc::format!(
+        "gpu_copyfault: fence_arrived={:?} ce_irqs={} rm_events_new={} first_event_us={:?} new_vectors={:?} leaves_after={:x?}",
+        fence_at,
+        super::intr::CE.count() - ce0,
+        super::gsp::events_seen() - ev0,
+        first_event_us,
+        new,
+        after
+    );
+    *FAULT_REPORT.lock() = out;
+    Ok(())
+}
+
+pub fn render_fault_kdebug() -> String {
+    FAULT_REPORT.lock().clone()
 }
 
 /// `/proc/kdebug` line of the last run-time self-test.
