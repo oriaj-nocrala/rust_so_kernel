@@ -211,6 +211,10 @@ Pure parsers, nothing sent to the GPU yet. Formats measured on the 570.144 files
 - `nvgpu` mocks: `TableMmio` (fixed values), `ReplayMmio` (per-register read queues from a trace extract + write log to compare), `i2c::tests::DdcSim` (open-drain bus with a DDC EEPROM).
 - QEMU: `hw_tests::edu_mmio_dma_msi` (`scripts/run-kernel-tests.sh`; the runner adds `-device edu,dma_mask=0xffffffffffff`): MMIO, MSI to CPU 1 (the test boot keeps IF=0 on CPU 0), DMA both ways, mask refusal. The `edu` driver (`kernel/src/edu.rs`) is test-only.
 
-## GPU page tables (phase 6a, `nvgpu::mmu`, pure; not yet used by the kernel)
+## GPU page tables (phase 6a `nvgpu::mmu`, used by `gpu=vaspace`, 6b)
 
 `PageTables::new(base, capacity, target)` builds a 5-level tree (PD3/PD2/PD1/PD0/PT, 4 KiB tables, 4 KiB pages) whose root is at physical `base`; `map`/`map_range`/`unmap`/`translate`; `images()` yields `(phys, [u8; 4096])` for the adapter to write to VRAM. `pte`/`pde` are the entry encodings (PTE aperture VRAM 0/host 2/non-coherent 3; PDE VRAM 1/host 2+VOL/non-coherent 3). RM side (`nvgpu::rm`): `vaspace_params` (externally owned), `vaspace_from_reply` (usable VAs from 64 MiB to 2^49), `set_page_directory_params` (`NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY` on the device). Details and the format's sources: `docs/gpu/mmu-v3-notes.md`; evidence in `docs/gpu/gpu-plan.md` "Resultados de la fase 6a".
+
+## `gpu=vaspace` (phase 6b, `kernel/src/gpu/vaspace.rs`)
+
+Implies `gpu=gsp`. In the RPC phase after `create_client`: `ALLOC FERMI_VASPACE_A` (`0x90f10000`, under the device, externally owned) -> `PageTables` (5 tables at VRAM 64 MiB, `POOL_TABLES` 16) with a test mapping of 1 MiB (VRAM 96 MiB at VA 4 GiB) written through PRAMIN and read back -> `SET_PAGE_DIRECTORY` (root, 4 entries, aperture VRAM). `vaspace:` lines in /proc/gpu, `gpu_vaspace:` in /proc/kdebug; job `scripts/metal-jobs/gpu-vaspace.sh`. Measured in boot #101. The MMU has not walked the tables yet (6c) and the TLB is not flushed yet.

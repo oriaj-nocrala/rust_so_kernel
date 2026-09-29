@@ -47,6 +47,10 @@ State: `docs/reference/gpu.md` sections "`gpu=fwsec`", "`gpu=gsp`", "GSP firmwar
 
 Our own RM client exists after boot: `create_client` = `NV01_ROOT` (`0xc1d00000`) -> `NV01_DEVICE_0` (`0xde1d0000`) -> `NV20_SUBDEVICE_0` (`0x5d1d0000`) + `NV2080_CTRL_CMD_GPU_GET_NAME_STRING`. RPC payloads: `GSP_RM_ALLOC` fn 103 (32-byte header), `GSP_RM_CONTROL` fn 76 (24-byte header), `FREE` fn 10; a reply echoes the request with `status` filled (`0x55/0x66` busy, `0x51` no memory). Fixtures `rm-*-{req,rep}.bin` (extract sent/received RPCs from the trace dmesg as in step 3 above). `Rm::call` = send + `wait_for` (the receive loop that also runs sequencer events). The objects and buffers are never freed; the queues are only serviced at boot.
 
-## Next: phase 6 — read `docs/gpu/phase6-oracle.md` first
+## Done in 6a/6b
+
+`nvgpu::mmu` (page tables, pure) and `gpu=vaspace` (`kernel/src/gpu/vaspace.rs`): external `FERMI_VASPACE_A` + our tables in VRAM 64 MiB + `SET_PAGE_DIRECTORY`, measured (boot #101). Everything still runs at boot with IF=0 and `Rm::call` polling the status queue: no long-lived `Rm` yet. `Rm::alloc` returns the reply payload, `alloc`/`control` are `pub(super)`. Job pattern: copy `scripts/metal-jobs/gpu-vaspace.sh`.
+
+## Next: phase 6c (channel) — read `docs/gpu/phase6-oracle.md` first
 
 Also read `docs/gpu/mmu-v3-notes.md` (page-table format, PTE/PDE bit layout, the external VA-space recipe, TLB flush, free VRAM range, suggested `nvgpu/src/mmu.rs` design). `phase6-oracle.md` lists exactly what the trace contains (VASpace, two GPFIFO channels `0xc56f`, the copy engine `0xc7b5`, BIND/SCHEDULE controls, with `#index` and fixture names already extracted in `nvgpu/fixtures/rm-ph6-*`), the tool to re-extract or extract more (`scripts/gpu-rpc.py list|recv|dump|text`), the nouveau reading order (`r570/fifo.c` -> `r535/fifo.c` -> `r535/vmm.c` -> `ce.c`/`bar.c`), the build order (queue servicing -> VA space + MMU v3 page tables -> channel -> submission/doorbell/fence -> job) and the loose ends (no teardown, `Rm` not long-lived).
