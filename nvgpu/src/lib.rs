@@ -15,6 +15,7 @@ extern crate alloc;
 
 pub mod aux;
 pub mod booter;
+pub mod chan;
 pub mod dcb;
 pub mod display;
 pub mod dp;
