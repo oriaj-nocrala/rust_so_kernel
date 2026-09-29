@@ -35,6 +35,7 @@ pub mod mode;
 pub mod pad;
 pub mod pattern;
 pub mod pll;
+pub mod rm;
 pub mod rpc;
 pub mod supervisor;
 pub mod vbios;

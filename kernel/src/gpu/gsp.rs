@@ -31,6 +31,7 @@ use nvgpu::falcon::{self, FalconError};
 use nvgpu::firmware::{Booter, Bootloader, GspImage, SIG_SECTION_GA10X};
 use nvgpu::fwsec::{self, Command, Fwsec, FwsecError};
 use nvgpu::gspmem;
+use nvgpu::rm;
 use nvgpu::rpc::{self, Queues, Shm};
 use nvgpu::Mmio;
 
@@ -91,7 +92,7 @@ static SIG_INDEX: AtomicU32 = AtomicU32::new(0);
 static MS: AtomicU64 = AtomicU64::new(0);
 static CODE: AtomicU32 = AtomicU32::new(0);
 /// GSP boot: 0 = not run, 1 = memory prepared, 2 = booter ran, 3 = RISC-V
-/// active, 4 = INIT_DONE, 5 = GPU name from RM, 9 = failed.
+/// active, 4 = INIT_DONE, 5 = GPU name from RM, 6 = RM client objects, 9 = failed.
 static GSP_STAGE: AtomicU32 = AtomicU32::new(0);
 static BOOTER_MS: AtomicU64 = AtomicU64::new(0);
 static BOOTER_MBOX0: AtomicU32 = AtomicU32::new(0);
@@ -101,6 +102,8 @@ static LOGINIT_PP: AtomicU64 = AtomicU64::new(0);
 static RPC_EVENTS: AtomicU32 = AtomicU32::new(0);
 static INIT_MS: AtomicU64 = AtomicU64::new(0);
 static GPU_NAME: spin::Once<String> = spin::Once::new();
+/// The name RM gives through our own client's subdevice (phase 4g).
+static RM_NAME: spin::Once<String> = spin::Once::new();
 
 fn stop(r: &mut String, why: core::fmt::Arguments) {
     STATE.store(2, Ordering::Relaxed);
@@ -700,22 +703,73 @@ fn rpc_phase(r: &mut String, regs: &Bar0, mem: &mut Memory) {
     GSP_STAGE.store(4, Ordering::Relaxed);
     let _ = writeln!(r, "gsp: INIT_DONE after {} ms (trace-gsp: 1.24 s after the booter); {} events before it: {:x?}", init_ms, seen.len(), seen);
 
-    let sent = mem.queues.send(&shm, regs, &gsp, rpc::FN_GET_GSP_STATIC_INFO, &alloc::vec![0u8; rpc::STATIC_INFO_SIZE], false);
-    if let Err(e) = sent {
-        gsp_stop(r, format_args!("sending GET_GSP_STATIC_INFO: {:?}", e));
-        return;
-    }
-    let mut more = alloc::vec::Vec::new();
-    match wait_for(regs, &shm, &mem.queues, &env, rpc::FN_GET_GSP_STATIC_INFO, 10_000, &mut more) {
+    // From here on the channel is a plain request/reply one: one RPC at a time.
+    let mut rm = Rm { regs, shm: ShmBuf(&mem.shm), queues: &mut mem.queues, env };
+    match rm.call(rpc::FN_GET_GSP_STATIC_INFO, &alloc::vec![0u8; rpc::STATIC_INFO_SIZE]) {
         Ok(reply) => match rpc::gpu_name(&reply.payload) {
             Some(name) => {
                 GPU_NAME.call_once(|| String::from(name));
                 GSP_STAGE.store(5, Ordering::Relaxed);
-                let _ = writeln!(r, "gsp: GET_GSP_STATIC_INFO: {} bytes, the GPU is \"{}\" (RM's own answer; events meanwhile {:x?})", reply.payload.len(), name, more);
+                let _ = writeln!(r, "gsp: GET_GSP_STATIC_INFO: {} bytes, the GPU is \"{}\" (RM's own answer)", reply.payload.len(), name);
             }
-            None => gsp_stop(r, format_args!("GET_GSP_STATIC_INFO answered {} bytes with no GPU name", reply.payload.len())),
+            None => {
+                gsp_stop(r, format_args!("GET_GSP_STATIC_INFO answered {} bytes with no GPU name", reply.payload.len()));
+                return;
+            }
         },
-        Err(e) => gsp_stop(r, format_args!("waiting for GET_GSP_STATIC_INFO: {} ({})", e, queue_diag(regs, &shm))),
+        Err(e) => {
+            gsp_stop(r, format_args!("GET_GSP_STATIC_INFO: {} ({})", e, queue_diag(regs, &rm.shm)));
+            return;
+        }
+    }
+
+    // Phase 4g: our own RM client: root -> device -> subdevice, then one control
+    // on the subdevice (`r570_gsp_client_ctor`, `r535_gsp_device_ctor`).
+    match rm.create_client() {
+        Ok(name) => {
+            GSP_STAGE.store(6, Ordering::Relaxed);
+            let _ = writeln!(r, "gsp: RM objects: client {:#x}, device {:#x}, subdevice {:#x} allocated (status 0); GPU_GET_NAME_STRING on the subdevice says \"{}\"", rm::H_CLIENT, rm::H_DEVICE, rm::H_SUBDEVICE, name);
+            RM_NAME.call_once(|| name);
+        }
+        Err(e) => gsp_stop(r, format_args!("RM objects: {} ({})", e, queue_diag(regs, &rm.shm))),
+    }
+}
+
+/// One RPC at a time over the queues, with the boot's event handling.
+struct Rm<'a> {
+    regs: &'a Bar0,
+    shm: ShmBuf<'a>,
+    queues: &'a mut Queues,
+    env: rpc::SeqEnv,
+}
+
+impl Rm<'_> {
+    /// Send `function` and wait for its reply (events meanwhile are handled or dropped).
+    fn call(&mut self, function: u32, payload: &[u8]) -> Result<rpc::Message, String> {
+        self.queues
+            .send(&self.shm, self.regs, &falcon::GSP, function, payload, false)
+            .map_err(|e| alloc::format!("sending fn {}: {:?}", function, e))?;
+        let mut events = alloc::vec::Vec::new();
+        wait_for(self.regs, &self.shm, self.queues, &self.env, function, 10_000, &mut events)
+    }
+
+    fn alloc(&mut self, parent: u32, object: u32, class: u32, params: &[u8]) -> Result<(), String> {
+        let reply = self.call(rm::FN_GSP_RM_ALLOC, &rm::alloc_request(rm::H_CLIENT, parent, object, class, params))?;
+        rm::check_alloc_reply(&reply.payload, rm::H_CLIENT, object).map_err(|e| alloc::format!("alloc class {:#x}: {:?}", class, e))
+    }
+
+    fn control(&mut self, object: u32, cmd: u32, params: &[u8]) -> Result<alloc::vec::Vec<u8>, String> {
+        let reply = self.call(rm::FN_GSP_RM_CONTROL, &rm::control_request(rm::H_CLIENT, object, cmd, params))?;
+        rm::check_control_reply(&reply.payload, rm::H_CLIENT, object, cmd).map(|p| p.to_vec()).map_err(|e| alloc::format!("control {:#x}: {:?}", cmd, e))
+    }
+
+    /// The client, its device and subdevice, then the GPU's name from RM once more.
+    fn create_client(&mut self) -> Result<String, String> {
+        self.alloc(rm::H_CLIENT, rm::H_CLIENT, rm::NV01_ROOT, &rm::root_params(rm::H_CLIENT))?;
+        self.alloc(rm::H_CLIENT, rm::H_DEVICE, rm::NV01_DEVICE_0, &rm::device_params(rm::H_CLIENT))?;
+        self.alloc(rm::H_DEVICE, rm::H_SUBDEVICE, rm::NV20_SUBDEVICE_0, &rm::subdevice_params())?;
+        let p = self.control(rm::H_SUBDEVICE, rm::CTRL_GPU_GET_NAME_STRING, &rm::name_string_params())?;
+        rm::name_from_params(&p).map(String::from).ok_or_else(|| String::from("GPU_GET_NAME_STRING returned no name"))
     }
 }
 
@@ -744,6 +798,7 @@ pub fn render_kdebug() -> String {
                 3 => "riscv",
                 4 => "init_done",
                 5 => "name",
+                6 => "objects",
                 _ => "failed",
             },
             BOOTER_MS.load(Ordering::Relaxed),
@@ -751,10 +806,11 @@ pub fn render_kdebug() -> String {
             BOOTER_MBOX1.load(Ordering::Relaxed),
             LOGINIT_PP.load(Ordering::Relaxed)
         ) + &alloc::format!(
-            " init_ms={} events={} name=\"{}\"",
+            " init_ms={} events={} name=\"{}\" rm_name=\"{}\"",
             INIT_MS.load(Ordering::Relaxed),
             RPC_EVENTS.load(Ordering::Relaxed),
-            GPU_NAME.get().map(|s| s.as_str()).unwrap_or("")
+            GPU_NAME.get().map(|s| s.as_str()).unwrap_or(""),
+            RM_NAME.get().map(|s| s.as_str()).unwrap_or("")
         ),
     }
 }

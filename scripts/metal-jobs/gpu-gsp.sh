@@ -1,4 +1,4 @@
-# Phases 4d + 4e + 4f of docs/gpu/gpu-plan.md, on the Ryzen:
+# Phases 4d + 4e + 4f + 4g of docs/gpu/gpu-plan.md, on the Ryzen:
 #   touch build.rs   # the root build does not watch nvgpu
 #   scripts/metal-run.sh --kconf 'gpu=gsp' scripts/metal-jobs/gpu-gsp.sh
 # (metal-run syncs the data partition, which puts gsp-570.144.bin, 63 MB, on the
@@ -10,10 +10,12 @@
 # GSP's RISC-V core is active; then the RPC channel (4f): SET_SYSTEM_INFO and
 # SET_REGISTRY queued before boot, the sequencer commands GSP-RM sends while
 # it boots run on the host, INIT_DONE, and GET_GSP_STATIC_INFO whose reply
-# carries the GPU's name (`gsp:` lines of /proc/gpu, `gpu_gsp:` in
-# /proc/kdebug). Fails unless:
-# - "gsp: OK" is in /proc/gpu and /proc/kdebug says stage=name with
-#   name="NVIDIA GeForce RTX 3050" (RM's own answer);
+# carries the GPU's name; then (4g) our own RM client (root -> device ->
+# subdevice) and a GPU_GET_NAME_STRING control on the subdevice (`gsp:` lines
+# of /proc/gpu, `gpu_gsp:` in /proc/kdebug). Fails unless:
+# - "gsp: OK" is in /proc/gpu and /proc/kdebug says stage=objects with
+#   name="NVIDIA GeForce RTX 3050" (static info) and the same rm_name (the
+#   control on our own subdevice);
 # - the booter left mailbox 0 = 0 (booter_mbox0=0x0);
 # - "fwsec: OK" (FRTS) as in gpu-fwsec.sh, and no STOP line anywhere;
 # - the ASUS still gets vblanks at 60 Hz (GSP-RM must not disturb the display).
@@ -30,8 +32,9 @@ field() { echo "$1" | tr ' ' '\n' | grep "^$2=" | cut -d= -f2; }
 k=$(grep '^gpu_gsp:' /proc/kdebug)
 sum "gpu-gsp: $(grep '^gpu_fwsec:' /proc/kdebug)"
 sum "gpu-gsp: $k"
-[ "$(field "$k" stage)" = name ] || { sum "gpu-gsp: stage=$(field "$k" stage)"; fail=1; }
+[ "$(field "$k" stage)" = objects ] || { sum "gpu-gsp: stage=$(field "$k" stage)"; fail=1; }
 echo "$k" | grep -q 'name="NVIDIA GeForce RTX 3050"' || { sum "gpu-gsp: the GPU name is not the expected one"; fail=1; }
+echo "$k" | grep -q 'rm_name="NVIDIA GeForce RTX 3050"' || { sum "gpu-gsp: no name from our own RM client"; fail=1; }
 [ "$(field "$k" booter_mbox0)" = 0x0 ] || { sum "gpu-gsp: booter_mbox0=$(field "$k" booter_mbox0)"; fail=1; }
 
 sample() { grep '^gpu_vblank:' /proc/kdebug; }

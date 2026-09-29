@@ -1,6 +1,6 @@
 ---
 name: gpu-gsp
-description: Playbook for GSP work on the NVIDIA GA106 (phase 4 of docs/gpu/gpu-plan.md, done; 4g and phase 6 next): the falcon / FWSEC / booter / WPR2 memory / RPC queue code in crates nvgpu + kernel/src/gpu/gsp.rs, how each piece was verified against nouveau's trace and clang, the RM object RPCs (RM_ALLOC, RM_CONTROL) still to port, the mutation-testing routine, and the metal-run stability protocol. Read it before touching nvgpu::{falcon,fwsec,firmware,gspmem,booter,rpc}, gpu=fwsec / gpu=gsp, or adding an RM client.
+description: Playbook for GSP work on the NVIDIA GA106 (phase 4 incl. 4g, done; phase 6 next): the falcon / FWSEC / booter / WPR2 memory / RPC queue code in crates nvgpu + kernel/src/gpu/gsp.rs, how each piece was verified against nouveau's trace and clang, the RM object RPCs (RM_ALLOC, RM_CONTROL, done in nvgpu::rm), the mutation-testing routine, and the metal-run stability protocol. Read it before touching nvgpu::{falcon,fwsec,firmware,gspmem,booter,rpc}, gpu=fwsec / gpu=gsp, or adding an RM client.
 ---
 
 # GSP-RM work on the GA106 (phase 4, `gpu=fwsec` / `gpu=gsp`)
@@ -43,13 +43,10 @@ State: `docs/reference/gpu.md` sections "`gpu=fwsec`", "`gpu=gsp`", "GSP firmwar
 - `heap_size_min` (170 "MB" vs bytes) never applies in nouveau; kept.
 - Messages: cmdq/msgq entries are 4 KiB pages, 63 each, one kept free; the doorbell is any write to GSP `0xc00`; message checksum = XOR of u64 words folded to 32 bits.
 
-## Next: 4g (RM objects) and phase 6
+## Done in 4g (`nvgpu/src/rm.rs`, `Rm` in `gsp.rs`)
 
-**4g** = an RM client: `NV01_ROOT` (client) -> `NV01_DEVICE_0` -> `NV20_SUBDEVICE_0`, via the two RPCs nouveau uses after `INIT_DONE`:
-- `GSP_RM_ALLOC` (fn **103**, payload `rpc_gsp_rm_alloc_v03_00`: hClient, hParent, hObject, hClass, status, paramsSize, params) — `rm/r535/alloc.c`, `client.c` (root alloc), `device.c`;
-- `GSP_RM_CONTROL` (fn **76**, `rpc_gsp_rm_control_v03_00`: hClient, hObject, cmd, status, paramsSize, params) — `rm/r535/ctrl.c`; `RM_FREE` fn 10.
-- Oracle: `trace-gsp/dmesg.txt` right after `GET_GSP_STATIC_INFO` (10.088-10.115 s): `rpc fn:76 len:0x3c`, `fn:103 len:0xb8/0x78/0x44/0x70` and the `gsp:msg fn:...` replies (extract as fixtures the same way). The static info reply already carries `hInternalClient/Device/Subdevice` (offsets 1600/1604/1608, clang: `nvgpu/gen/staticinfo.c`) and `bar1PdeBase/bar2PdeBase`.
-- Structure: pure builders/decoders in a new `nvgpu/src/rm.rs` (alloc/control/free messages + status -> errno mapping `r535_rpc_status_to_errno`), reply matching by function in the receive loop (the loop is `wait_for` in `gsp.rs`; move the queue+sequencer handling into a reusable `Rm` struct in the kernel adapter so later phases can send RPCs after boot, from a syscall/driver, not only at boot).
-- "Done when": an `RM_CONTROL` on the subdevice (e.g. `NV2080_CTRL_CMD_GPU_GET_NAME_STRING`) answered by RM, in the metal job.
+Our own RM client exists after boot: `create_client` = `NV01_ROOT` (`0xc1d00000`) -> `NV01_DEVICE_0` (`0xde1d0000`) -> `NV20_SUBDEVICE_0` (`0x5d1d0000`) + `NV2080_CTRL_CMD_GPU_GET_NAME_STRING`. RPC payloads: `GSP_RM_ALLOC` fn 103 (32-byte header), `GSP_RM_CONTROL` fn 76 (24-byte header), `FREE` fn 10; a reply echoes the request with `status` filled (`0x55/0x66` busy, `0x51` no memory). Fixtures `rm-*-{req,rep}.bin` (extract sent/received RPCs from the trace dmesg as in step 3 above). `Rm::call` = send + `wait_for` (the receive loop that also runs sequencer events). The objects and buffers are never freed; the queues are only serviced at boot.
 
-**Phase 6** (`docs/gpu/gpu-plan.md`): VA space (`FERMI_VASPACE_A`), GPFIFO channel + copy-engine class for GA10x, USERD + doorbell, semaphore fence; first use: copy system -> VRAM by CE and measure GB/s. All by RM RPCs, so 4g's `Rm` struct is the prerequisite. Also open before it: keeping GSP-RM alive after boot means the queues must be serviced (events keep arriving: `POST_EVENT`, `OS_ERROR_LOG`...) — decide where (a kernel thread / the MSI handler) before adding runtime RPCs.
+## Next: phase 6 (channel + copy engine, all through RM)
+
+`docs/gpu/gpu-plan.md` "Fase 6". In the trace, right after the subdevice (10.1103-10.1107 s): `ALLOC FERMI_VASPACE_A` (class `0x90f1`, 48-byte params, parent = device, handle `0x90f10000`, request/reply in `rm-vaspace-*.bin`) and a `CONTROL 0x801813` on the device (32 B, in `rm-ctrl801813-*.bin`). Then: map VRAM/system memory into the VA space, GPFIFO channel with the Ampere copy class (`AMPERE_DMA_COPY_A` 0xc6b5 / `..._B` 0xc7b5; check `nouveau/include/nvif/class.h` and the CE engine in `rm/r535/ce.c`), USERD + doorbell, semaphore fence; first use: copy system -> VRAM and measure GB/s. Before adding runtime RPCs decide who services the status queue with GSP-RM alive (events like `POST_EVENT`, `OS_ERROR_LOG` keep arriving): a kernel thread or the MSI handler; today only the boot polls. Also open: `mem::forget` of the GSP buffers means no teardown path (`FREE` objects, `booter_unload`) — needed before a clean shutdown/reload.

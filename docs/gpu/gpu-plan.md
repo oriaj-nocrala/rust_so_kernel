@@ -897,6 +897,15 @@ Código: `nvgpu::rpc` (colas `Queues` sobre `Shm`, mensajes, `SystemInfo`, `regi
 - **Ryzen boot #95 (OK, a la primera)**: `SET_SYSTEM_INFO` y `SET_REGISTRY` encoladas antes de FWSEC; FRTS 218 ms; booter 250 ms; RISC-V activo; el sequencer corrió sin polls agotados; **`INIT_DONE` a los 1 231 ms del booter** (nouveau: 1,24 s), tras los eventos `[0x1020, 0x1002, 0x1020, 0x100c, 0x100c]` (los de la traza: `0x1020`, `0x1002`, `0x100c`); **`GET_GSP_STATIC_INFO` (1 656 B) devuelve "NVIDIA GeForce RTX 3050"**: el criterio "RM devuelve el nombre de la GPU" de la fase 4 se cumple. La pantalla no se alteró: ASUS a 60,002 Hz, sin interrupciones espurias. Linux arrancó después con el driver `nvidia` sano.
 - **Estabilidad (fase 4 cerrada)**: 5 arranques seguidos de `metal-run.sh --kconf 'gpu=gsp' scripts/metal-jobs/gpu-gsp.sh` (boots #95-#99), todos OK sin ninguna línea `STOP`: FRTS 218 ms; booter 250 ms; `INIT_DONE` a 1 231-1 251 ms; RM devuelve "NVIDIA GeForce RTX 3050"; el ASUS a 59,97-60,01 Hz. Cada arranque viene de un reinicio en caliente desde Linux con el driver `nvidia` cargado y muestra imagen; la GPU queda sana en Linux tras cada ronda (`nvidia-smi` la ve): el reinicio limpia el estado de GSP-RM y de WPR2. Criterios de "Hecho cuando" de la fase 4 cumplidos. 4g (objetos RM `NV01_ROOT` -> `NV01_DEVICE_0` -> `NV20_SUBDEVICE_0`) ya no es necesaria para el hito del nombre, pero sí para la fase 6 (espacio de direcciones y canales por RM).
 
+## Resultados de la fase 4g (2026-09-29)
+
+Código: `nvgpu::rm` (mensajes `GSP_RM_ALLOC`/`GSP_RM_CONTROL`/`FREE`, bloques de parámetros `NV0000`/`NV0080`/`NV2080`, comprobación de respuestas, mapa de estados de RM), `Rm` en `kernel/src/gpu/gsp.rs` (una RPC a la vez, `create_client`), fixtures `rm-{root,device,subdev,vaspace}-{req,rep}.bin` y `rm-ctrl801813-*.bin`. Estado en `docs/reference/gpu.md`.
+
+- **Oráculo**: los RPC que nouveau envió tras `GET_GSP_STATIC_INFO` en `trace-gsp` (10,109-10,110 s): las tres peticiones ALLOC (root 152 B, device 88 B, subdevice 36 B) se **reproducen byte a byte** con las mismas manijas (`0xc1d00000`, `0xde1d0000`, `0x5d1d0000`); las respuestas son la petición con `status = 0`; un CONTROL real (`0x801813`) valida el constructor de controles. Descubierto en la traza: nouveau r570 usa el cliente *interno* del RM para sus controles de arranque (`0xc2000006`/`0xabcd2080`) y crea aparte el suyo (root -> device -> subdevice -> `FERMI_VASPACE_A`).
+- **Tests de host**: nvgpu 217 (rm 9). Sabotaje: 40 mutaciones, 0 supervivientes.
+- **Ryzen boot #100 (OK, a la primera)**: tras `GET_GSP_STATIC_INFO`, RM acepta las tres altas con `status 0` y `NV2080_CTRL_CMD_GPU_GET_NAME_STRING` sobre **nuestro propio subdevice** devuelve "NVIDIA GeForce RTX 3050". ASUS a 60,027 Hz, Linux sano después.
+- **Siguiente (fase 6)**: `FERMI_VASPACE_A` (`0x90f1`, 48 B de parámetros en la traza, hijo del device) y el CONTROL sobre el device que le sigue; canal GPFIFO + motor de copia; y decidir cómo se atienden las colas con GSP-RM vivo (hoy solo en el arranque).
+
 ## Fases
 
 Calendario orientativo en días de trabajo. El riesgo está en la fase 4.
