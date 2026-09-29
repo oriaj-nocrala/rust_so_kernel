@@ -58,7 +58,7 @@ impl PushMem for PushBuf {
 
 /// Below 4 GiB if the buddy has it (the plan's choice), else below 40 bits
 /// (EVO's limit, `dispnv50/disp.c:242-250`).
-fn alloc_push() -> Result<PushBuf, crate::memory::dma::DmaError> {
+pub(super) fn alloc_push() -> Result<PushBuf, crate::memory::dma::DmaError> {
     DmaBuf::alloc(4096, 0xffff_ffff).or_else(|_| DmaBuf::alloc(4096, (1 << 40) - 1)).map(PushBuf)
 }
 
@@ -101,7 +101,11 @@ fn diff_line(r: &mut String, what: &str, before: &[(u32, u32)], after: &[(u32, u
 
 /// Returns window 0's push position (PUT, bytes) when every step went as
 /// expected, so page flips (`scanout.rs`) carry on in the same buffer.
-pub fn bring_up(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8)) -> Option<u32> {
+///
+/// `hdmi` (`gpu=hdmi`, phase 5.8): the RAMHT also names the surface for the
+/// HP's window (`nvgpu::hdmi::window_chan`), whose channel `hdmi.rs` brings
+/// up when the HP is switched on.
+pub fn bring_up(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8), hdmi: bool) -> Option<u32> {
     let t0 = crate::cpu::tsc::read();
     let core_methods: Vec<u32> = nvgpu::dispstate::core_methods().collect();
     // nouveau's window list plus the ILUT methods (`clc67e.h:500-514`),
@@ -165,7 +169,11 @@ pub fn bring_up(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8)) -> Option<u32> {
 
     // --- Instance memory through PRAMIN, then the display init nouveau
     // does before its first channel.
-    let table = Ramht { objects: alloc::vec![(w0.user, evo::HANDLE_WNDW_CTX, evo::vram_ctxdma(vram))] };
+    let mut objects = alloc::vec![(w0.user, evo::HANDLE_WNDW_CTX, evo::vram_ctxdma(vram))];
+    if hdmi {
+        objects.extend(nvgpu::hdmi::ramht_objects(vram));
+    }
+    let table = Ramht { objects };
     let mut p = Pramin::new(regs);
     let wrote = table.write(&mut p, evo::INST_VRAM);
     let saved = p.saved();

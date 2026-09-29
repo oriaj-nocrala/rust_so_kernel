@@ -70,6 +70,10 @@ const SOR_CTRL_ARM: u32 = SOR_CTRL_ASY + 0x8000;
 const SOR_CTRL_STRIDE: u32 = 0x20;
 pub const SORS_MAX: u32 = 8;
 
+/// Above this pixel clock a TMDS link is HDMI 2.0's high speed one
+/// (`gm200.c:78`).
+pub const TMDS_HIGH_SPEED_KHZ: u32 = 340_000;
+
 /// Enables the supervisor interrupts (see [`CTRL_DISP_EN`]).
 pub fn arm(m: &dyn Mmio) {
     m.wr32(CTRL_DISP_MSK, CTRL_DISP_SUPERVISORS);
@@ -389,8 +393,8 @@ pub enum Event {
     Clock { head: u8, khz: u32, pll: Coeffs },
     /// 2.1: no coefficients for `khz` (the VPLL is left as it was).
     ClockFailed { head: u8, khz: u32, error: PllError },
-    /// 2.2 on a protocol other than DP: phase 5.8, nothing done after the
-    /// script.
+    /// 2.2 on a protocol other than DP or TMDS (LVDS): not ported, nothing
+    /// done after the script.
     AttachNotPorted { head: u8, sor: u8, proto: Proto },
     /// 2.2: DP packing programmed for this link.
     Dp { head: u8, sor: u8, link: DpLink, config: DpConfig },
@@ -609,28 +613,33 @@ impl Supervisor {
         let asy = self.sor_asy[sor as usize];
         let t = self.head_asy[head as usize];
         self.ied_on(m, bios, r, head, sor, 0, t.hz / 1000);
-        if asy.proto != Proto::Dp {
+        if !matches!(asy.proto, Proto::Dp | Proto::Tmds) {
             r.events.push(Event::AttachNotPorted { head: h, sor, proto: asy.proto });
             return;
         }
         // RG clock divider (`gf119_head_rgclk`, `gf119.c:416-420`): a GV100+
         // SOR state never sets `rgdiv`, so 0 (`nv50.c:126` is the PIOR's).
         m.mask(0x61_2200 + head * 0x800, 0x0000_000f, 0);
-        let link = DpLink::read(m, sor as u32, asy.link);
-        match link.filter(|l| !l.mst).and_then(|l| dp_config(&t, &l).map(|c| (l, c))) {
-            Some((link, c)) => {
-                // `gv100_sor_dp_audio_sym` / `_watermark` (`gv100.c:53-70`).
-                let hoff = head * 0x800;
-                m.mask(0x61_6568 + hoff, 0x0000_ffff, c.h as u32);
-                m.mask(0x61_656c + hoff, 0x00ff_ffff, c.v);
-                m.mask(0x61_6550 + hoff, 0x0c00_003f, 0x0800_0000 | c.watermark as u32);
-                r.events.push(Event::Dp { head: h, sor, link, config: c });
+        if asy.proto == Proto::Dp {
+            let link = DpLink::read(m, sor as u32, asy.link);
+            match link.filter(|l| !l.mst).and_then(|l| dp_config(&t, &l).map(|c| (l, c))) {
+                Some((link, c)) => {
+                    // `gv100_sor_dp_audio_sym` / `_watermark` (`gv100.c:53-70`).
+                    let hoff = head * 0x800;
+                    m.mask(0x61_6568 + hoff, 0x0000_ffff, c.h as u32);
+                    m.mask(0x61_656c + hoff, 0x00ff_ffff, c.v);
+                    m.mask(0x61_6550 + hoff, 0x0c00_003f, 0x0800_0000 | c.watermark as u32);
+                    r.events.push(Event::Dp { head: h, sor, link, config: c });
+                }
+                None => r.events.push(Event::DpFailed { head: h, sor, link }),
             }
-            None => r.events.push(Event::DpFailed { head: h, sor, link }),
         }
-        // `ga102_sor_clock` (`ga102.c:104-116`): DP, so no TMDS divider.
+        // `ga102_sor_clock` (`ga102.c:104-116`): the TMDS divider is 2 above
+        // 340 MHz (`tmds.high_speed`, `gm200_sor_hdmi_scdc`, `gm200.c:78`:
+        // HDMI 2.0 rates, which this port does not drive), 0 otherwise.
+        let div2 = (asy.proto == Proto::Tmds && t.hz / 1000 > TMDS_HIGH_SPEED_KHZ) as u32;
         m.wr32(0x00_ec08 + sor as u32 * 0x10, 0);
-        m.wr32(0x00_ec04 + sor as u32 * 0x10, 0);
+        m.wr32(0x00_ec04 + sor as u32 * 0x10, div2);
         r.events.push(Event::Clocks { head: h, sor });
     }
 }
@@ -756,6 +765,59 @@ mod tests {
         let (ours, trace) = m.write_diff(&vpll);
         assert_eq!(ours, trace.replace("W 0xef58 0x00361000", "W 0xef58 0x00370000"));
         assert_eq!(ours.lines().count(), 4);
+    }
+
+    fn hdmi() -> Outp {
+        Outp { dcb: 7, kind: OUTPUT_TMDS, or: 2, link: 1, hasht: 0x0002, hashm: 0x0f42, conn: Some(0x61), aux: None, pad: None }
+    }
+
+    #[test]
+    fn round2_hdmi_attach_replays_the_trace_for_head1() {
+        // Head 1 owned, SOR-0 routed to the HP's output (DCB 07, TMDS): the
+        // supervisors' work on it as nouveau did it, register for register:
+        // VPLL1, the OnInt2 script (0x5f10: SOR-0's lane setup and the PLL
+        // poll), RG divider, SOR clock, OnInt3.
+        let Some(bios) = bios() else { return };
+        let m = ReplayMmio::from_extract(ROUND2);
+        let mut s = Supervisor::new(Config { owned: 0x02, routes: vec![(0, hdmi())], ..cfg() });
+        let r1 = s.service(&m, &bios, 1);
+        assert_eq!(r1.events, vec![Event::Foreign { head: 0, mask: 0x1100 }, Event::NothingAttached { head: 1, stage: 10 }]);
+        let r2 = s.service(&m, &bios, 2);
+        let pll = Coeffs { n: 55, fn_: 0, m: 1, p: 10 };
+        assert_eq!(
+            r2.events,
+            vec![
+                Event::Foreign { head: 0, mask: 0x1100 },
+                Event::NothingAttached { head: 1, stage: 20 },
+                Event::Clock { head: 1, khz: 148_500, pll },
+                Event::Script { head: 1, stage: 22, sor: 0, addr: 0x5f10, result: Ok(init::Stats { opcodes: 55, writes: 41, ..Default::default() }) },
+                Event::Clocks { head: 1, sor: 0 },
+            ]
+        );
+        let r3 = s.service(&m, &bios, 4);
+        assert_eq!(
+            r3.events,
+            vec![
+                Event::Foreign { head: 0, mask: 0x1100 },
+                Event::Script { head: 1, stage: 30, sor: 0, addr: 0x5878, result: Ok(init::Stats { opcodes: 9, writes: 2, ..Default::default() }) },
+            ]
+        );
+        // The trace's writes to head 1's and SOR-0's registers, and the
+        // three releases; VPLL1 as the GOP encodes 148.5 MHz (pll.rs).
+        let mine = |o: u32| {
+            (0x61_c000..0x61_c800).contains(&o)
+                || [0xef40, 0xef44, 0xef58, 0xe9c4, 0x61_2300, 0x61_2408, 0x61_2a00, 0xec08, 0xec04, 0x61_6d40].contains(&o)
+                || (0x61_07a8..=0x61_07b8).contains(&o)
+                || (0x61_07ac..=0x61_07b8).contains(&o)
+        };
+        let expected: Vec<(u32, u32)> = m
+            .expected_writes
+            .iter()
+            .copied()
+            .filter(|(o, _)| mine(*o))
+            .map(|(o, v)| if (o, v) == (0xef58, 0x0036_1000) { (o, 0x0037_0000) } else { (o, v) })
+            .collect();
+        assert_eq!(fmt(&m.writes.borrow()), fmt(&expected));
     }
 
     #[test]

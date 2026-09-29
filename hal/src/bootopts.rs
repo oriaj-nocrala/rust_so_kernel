@@ -97,6 +97,10 @@ pub enum GpuLevel {
     /// head to one of the monitor's EDID modes or a CVT-RB2 one (same size
     /// as the framebuffer), retraining the DP link when the mode needs it.
     Modes,
+    /// Phase 5.8: also bring up the HP on HDMI (head 1, SOR-0, window 2)
+    /// with a picture of the kernel's own: `/dev/dispctl`'s `hdmi on` /
+    /// `hdmi off`.
+    Hdmi,
 }
 
 impl GpuLevel {
@@ -116,6 +120,7 @@ impl GpuLevel {
             "vpll" => Some(GpuLevel::Vpll),
             "dplink" => Some(GpuLevel::Dplink),
             "modes" => Some(GpuLevel::Modes),
+            "hdmi" => Some(GpuLevel::Hdmi),
             _ => None,
         }
     }
@@ -161,6 +166,8 @@ mod tests {
         assert!(GpuLevel::Dplink > GpuLevel::Vpll);
         assert_eq!(GpuLevel::parse("modes"), Some(GpuLevel::Modes));
         assert!(GpuLevel::Modes > GpuLevel::Dplink);
+        assert_eq!(GpuLevel::parse("hdmi"), Some(GpuLevel::Hdmi));
+        assert!(GpuLevel::Hdmi > GpuLevel::Modes);
         assert!(GpuLevel::Vpll > GpuLevel::Super);
         assert!(GpuLevel::Super > GpuLevel::Scanout && GpuLevel::Scanout > GpuLevel::Chan);
         assert!(GpuLevel::Chan > GpuLevel::Dispstate && GpuLevel::Dispstate > GpuLevel::Vblank);

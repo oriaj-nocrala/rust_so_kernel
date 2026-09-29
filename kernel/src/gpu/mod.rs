@@ -69,6 +69,7 @@ use crate::serial_println;
 
 pub mod dplink;
 pub mod evo;
+pub mod hdmi;
 pub mod modeset;
 pub mod scanout;
 pub mod supervisor;
@@ -383,7 +384,7 @@ fn probe_device(r: &mut String, level: GpuLevel) {
             if level >= GpuLevel::Dispstate {
                 read_dispstate(r, &regs, bars[1].map(|b| (b.addr, b.size)));
             }
-            let put = if level >= GpuLevel::Chan { evo::bring_up(r, &regs, (b, d, fun)) } else { None };
+            let put = if level >= GpuLevel::Chan { evo::bring_up(r, &regs, (b, d, fun), level >= GpuLevel::Hdmi) } else { None };
             if level >= GpuLevel::Scanout {
                 match put {
                     Some(put) => scanout::setup(r, &regs, bars[1].map(|b| (b.addr, b.size)), put),
@@ -398,6 +399,9 @@ fn probe_device(r: &mut String, level: GpuLevel) {
                         supervisor::setup(r, &regs, level >= GpuLevel::Vpll, level >= GpuLevel::Dplink);
                         if level >= GpuLevel::Modes {
                             modeset::setup(r, &regs);
+                        }
+                        if level >= GpuLevel::Hdmi {
+                            hdmi::setup(r, &regs, bars[1].map(|b| (b.addr, b.size)));
                         }
                     }
                     None => {

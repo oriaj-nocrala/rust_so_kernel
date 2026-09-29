@@ -219,6 +219,7 @@ impl Exec<'_> {
                 0x48 => self.or_reg()?,
                 0x52 => self.cr(),
                 0x56 => self.condition_time()?,
+                0x58 => self.zm_reg_sequence()?,
                 0x5b => self.sub_direct()?,
                 0x5f => self.copy_nv_reg()?,
                 0x6e => self.nv_reg()?,
@@ -454,6 +455,22 @@ impl Exec<'_> {
         if self.on() {
             self.m.udelay(if usec < 1000 { usec } else { (usec + 900) / 1000 * 1000 });
         }
+    }
+
+    /// INIT_ZM_REG_SEQUENCE, 0x58 (`init.c:1281-1299`): `count` words
+    /// written to consecutive registers from `base` (HDMI's lane setup,
+    /// `0x61c040..0x61c07c`).
+    fn zm_reg_sequence(&mut self) -> Result<(), ScriptError> {
+        let mut base = self.rd32b(1);
+        let count = self.rd08(5);
+        self.offset += 6;
+        for _ in 0..count {
+            let data = self.rd32b(0);
+            self.offset += 4;
+            self.wr32(base, data)?;
+            base = base.wrapping_add(4);
+        }
+        Ok(())
     }
 
     /// INIT_ZM_REG, 0x7a (`init.c:1892-1905`).

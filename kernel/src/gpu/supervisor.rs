@@ -110,6 +110,8 @@ static SUPER: IrqMutex<Option<Supervisor>, KernelIrq> = IrqMutex::new(None);
 /// Where the core channel's next push goes (bytes).
 static PUSH_AT: IrqMutex<u32, KernelIrq> = IrqMutex::new(0);
 static ENABLED: AtomicBool = AtomicBool::new(false);
+/// The core's ASSEMBLY window interlock flags are non-zero (`push_core`).
+static WINDOW_INTERLOCK: AtomicBool = AtomicBool::new(false);
 
 /// Recent supervisor reports and dispctl requests, for /proc/gpu.
 static LOG: IrqMutex<VecDeque<String>, KernelIrq> = IrqMutex::new(VecDeque::new());
@@ -457,7 +459,6 @@ pub enum RequestError {
 /// Returns the last value pushed.
 pub fn request(cmd: Cmd) -> Result<u32, RequestError> {
     let d = DISP.get().filter(|_| ready()).ok_or(RequestError::NotReady)?;
-    let (buf, _) = super::evo::core_push().ok_or(RequestError::NotReady)?;
     let mut methods: Vec<(u32, u32)> = Vec::new();
     match cmd {
         Cmd::Detach => methods.push((sor_set_control(d.sor), 0)),
@@ -480,6 +481,34 @@ pub fn request(cmd: Cmd) -> Result<u32, RequestError> {
         }
     }
     let value = methods.last().map_or(0, |&(_, v)| v);
+    push_core(&cmd.name(), &methods, cmd != Cmd::Detach).map(|_| value)
+}
+
+/// Pushes `methods` and UPDATE on the core channel, not waited on: the one
+/// place the core push buffer is written after boot. `may_attach` clears
+/// [`LINK_FREE`] (anything but a detach may attach the SOR again).
+/// `Busy` while the core has not fetched the last push or a link training
+/// runs; logged either way.
+pub(super) fn push_core(name: &str, methods: &[(u32, u32)], may_attach: bool) -> Result<(), RequestError> {
+    // The core's interlock flags persist in its ASSEMBLY state: a push that
+    // set a window interlock (`hdmi.rs`, nouveau's first UPDATE of a new
+    // window) leaves every later core UPDATE waiting for that window
+    // (Ryzen #91: `hdmi off` never latched). The next push clears them.
+    let mut with_flags;
+    let methods = match methods.iter().rev().find(|m| m.0 == evo::CORE_SET_WINDOW_INTERLOCK_FLAGS) {
+        Some(&(_, v)) => {
+            WINDOW_INTERLOCK.store(v != 0, Ordering::Release);
+            methods
+        }
+        None if WINDOW_INTERLOCK.swap(false, Ordering::AcqRel) => {
+            with_flags = alloc::vec![(evo::CORE_SET_INTERLOCK_FLAGS, 0), (evo::CORE_SET_WINDOW_INTERLOCK_FLAGS, 0)];
+            with_flags.extend_from_slice(methods);
+            &with_flags[..]
+        }
+        None => methods,
+    };
+    let d = DISP.get().filter(|_| ready()).ok_or(RequestError::NotReady)?;
+    let (buf, _) = super::evo::core_push().ok_or(RequestError::NotReady)?;
     REQUESTS.fetch_add(1, Ordering::Relaxed);
     let res = PUSH_AT.with(|at| {
         let regs = &d.regs;
@@ -487,7 +516,7 @@ pub fn request(cmd: Cmd) -> Result<u32, RequestError> {
         if get != *at || !evo::CORE.idle(regs) || TRAINING.load(Ordering::Acquire) {
             return Err(RequestError::Busy);
         }
-        if cmd != Cmd::Detach {
+        if may_attach {
             LINK_FREE.store(false, Ordering::Release);
         }
         let before = *at;
@@ -495,7 +524,7 @@ pub fn request(cmd: Cmd) -> Result<u32, RequestError> {
         if p.room_words() < 2 * methods.len() + 8 {
             evo::wind(regs, evo::CORE, &mut p).map_err(RequestError::Chan)?;
         }
-        for &(mth, v) in &methods {
+        for &(mth, v) in methods {
             p.mthd(mth, &[v]).map_err(RequestError::Chan)?;
         }
         evo::push_update(&mut p).map_err(RequestError::Chan)?;
@@ -506,7 +535,7 @@ pub fn request(cmd: Cmd) -> Result<u32, RequestError> {
     let line = match res {
         Ok((a, b)) => alloc::format!(
             "dispctl: {} at {} ms: methods {:x?} + UPDATE pushed (core put {:#x} -> {:#x})",
-            cmd.name(),
+            name,
             crate::time::ktime_get() / 1_000_000,
             methods,
             a,
@@ -514,12 +543,40 @@ pub fn request(cmd: Cmd) -> Result<u32, RequestError> {
         ),
         Err(e) => {
             REFUSED.fetch_add(1, Ordering::Relaxed);
-            alloc::format!("dispctl: {} refused: {:?}", cmd.name(), e)
+            alloc::format!("dispctl: {} refused: {:?}", name, e)
         }
     };
     crate::serial_println!("{}", line);
     log(line);
-    res.map(|_| value)
+    res.map(|_| ())
+}
+
+/// The supervisors also work on `head`, whose SOR `sor` drives `outp`
+/// (`hdmi.rs`): its stage work runs from now on (`Config::owned`,
+/// `Config::routes`).
+pub(super) fn own_head(head: u32, sor: u8, outp: Outp) {
+    SUPER.with(|s| {
+        if let Some(s) = s.as_mut() {
+            s.cfg.owned |= 1 << head;
+            s.cfg.routes.retain(|(r, _)| *r != sor);
+            s.cfg.routes.push((sor, outp));
+        }
+    });
+}
+
+/// Back to what [`own_head`] changed.
+pub(super) fn disown_head(head: u32, sor: u8) {
+    SUPER.with(|s| {
+        if let Some(s) = s.as_mut() {
+            s.cfg.owned &= !(1 << head);
+            s.cfg.routes.retain(|(r, _)| *r != sor);
+        }
+    });
+}
+
+/// The BAR0 window `setup` kept, for the modules that run on top of it.
+pub(super) fn regs() -> Option<&'static Bar0> {
+    disp().map(|d| &d.regs)
 }
 
 /// One status line (`/dev/dispctl` read, the job's evidence).

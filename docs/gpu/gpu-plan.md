@@ -20,7 +20,7 @@
 > (VPLL en el supervisor 2.1, `gpu=vpll`; host y QEMU verdes). Ryzen #78:
 > **Fase 5.5 cerrada** (Ryzen #80: 50 Hz y vuelta a 60 Hz reprogramando el
 > VPLL; la codificación de `fN` de nouveau está mal en GA106, medido y
-> corregido; ver "Resultados de la fase 5.5"). **Fase 5.6 cerrada** (Ryzen #82: reentrenado a 4×HBR2 y de vuelta a 2×HBR al mismo modo, 60 Hz, visto a mano; ver "Resultados de la fase 5.6"). **Fase 5.7 cerrada** (Ryzen #85: 180 Hz, 120 Hz CVT-RB2 y vuelta a 60 Hz sin reiniciar; 180 Hz visto en el menú del ASUS; ver "Resultados de la fase 5.7"). Siguiente: 5.8 (el HP por HDMI). Ninguna fase se da por hecha sin su
+> corregido; ver "Resultados de la fase 5.5"). **Fase 5.6 cerrada** (Ryzen #82: reentrenado a 4×HBR2 y de vuelta a 2×HBR al mismo modo, 60 Hz, visto a mano; ver "Resultados de la fase 5.6"). **Fase 5.7 cerrada** (Ryzen #85: 180 Hz, 120 Hz CVT-RB2 y vuelta a 60 Hz sin reiniciar; 180 Hz visto en el menú del ASUS; ver "Resultados de la fase 5.7"). **Fase 5.8 cerrada** (Ryzen #92: el HP por HDMI a 1080p60 con imagen propia, `hdmi on`/`off` repetidos; ver "Resultados de la fase 5.8"). Ninguna fase se da por hecha sin su
 > criterio medido en la Ryzen.
 
 ## Objetivo
@@ -833,6 +833,29 @@ Hechos (del EDID, la traza y las referencias, sin metal):
 
 **Fase 5.7 cerrada** (solo mismo tamaño; el cambio de resolución queda
 como 5.7b si hace falta).
+
+## Resultados de la fase 5.8 (2026-09-29)
+
+Código: `nvgpu::hdmi` (SOR, ruta, codificador HDMI, infoframe AVI, métodos de cabeza 1 y ventana 2), `nvgpu::pattern`, `ZM_REG_SEQUENCE` en `nvgpu::init`, atención TMDS en `nvgpu::supervisor`, `kernel/src/gpu/hdmi.rs`, `hdmi on|off` en `/dev/dispctl`, nivel `gpu=hdmi`. Job: `scripts/metal-jobs/gpu-hdmi.sh`.
+
+Hechos (de la traza y las referencias, sin metal):
+- El HDMI enable de nouveau (`fixtures/hdmi-enable.txt`, entrelazado con el entrenamiento DP a las 11,8789 s) = ruta `0x612408 = 1`, GCP/ACR/ctrl (`gv100_sor_hdmi_ctrl`), SCDC, AVI (VIC 16, 16:9, underscan), sin VSI. Reproducido acceso por acceso.
+- Los supervisores de la cabeza 1 (2.1 VPLL1, 2.2 script `0x5f10` con 55 opcodes/41 escrituras, 3.0 script `0x5878`) reproducen la traza escritura por escritura, con el mismo VPLL1 que el GOP codifica para 148,5 MHz. Faltaba un opcode (0x58).
+- Los métodos de cabeza 1 y de la ventana 2 = el push de la ronda 2 (`modeset-push.txt`), método a método, sin LUT, notificador ni interlock (nouveau interbloquea con el core; aquí cada canal hace su UPDATE).
+- Audio (ELD, HDA) no se porta.
+- Tests de host: 105; sabotajes probados (9 mutaciones, todas detectadas tras añadir el caso de sublink A). QEMU: `run-kernel-tests.sh` PASS.
+
+**Ryzen boot #88 (FAIL, primera vuelta):** lo que ya funciona en metal: SOR-0 encendido (power `0x10000000`), ruta `0x801`, codificador (ctrl `0x41060038`, AVI `0x201`), core UPDATE de la cabeza 1 aplicado en 19 ms (ARMED = 1080p60, SOR-0 `0x102`, VPLL1 `0x370000 0xa0001`), supervisores 1-3 con los guiones TMDS `Ok` (55 opcodes/41 escrituras y 9/2), `off` con OffInt1/2 `Ok`, sin errores de script ni de CTRL_DISP, y el ASUS sigue a 60,006 Hz con la cabeza 1 en marcha. Falla el canal de la ventana 2: tras el primer push GET llega a PUT pero el estado (`0x610670`) queda en `0xa0050b07` (bits 16-19 = 5, no 4 = idle), y el segundo intento se queda con GET parado. Diagnóstico añadido (`window_diag`: excepción, ASSEMBLY frente a lo empujado, raster de la cabeza 1) para la siguiente vuelta.
+
+**Ryzen boot #89 (FAIL):** `window_diag` dio la causa: EXC_WIN bit 2, ranura de excepción de la ventana 2 = `0x5080 0x1 0x2d` = tipo 5 INVALID_STATE en el método `0x200` (UPDATE) (`gv100_disp_exception`, `nv50_disp_intr_error_type`); el ASSEMBLY tenía todo lo empujado (no es un método rechazado), la cabeza 1 corre (raster 62 → 738 en 10 ms) y el core marca `WINDOW_SET_CONTROL(2) = 1`. La ventana 0 con ILUT a 0 funciona, así que no es el ILUT. Diferencia con nouveau: su primer UPDATE de una ventana recién asignada va interbloqueado con el core (`SET_INTERLOCK_FLAGS = 1`, `SET_WINDOW_INTERLOCK_FLAGS = 5`; luego core UPDATE con la misma máscara). Cambio: la ventana empuja su estado + UPDATE con interlock y sin esperar, después un core UPDATE con `SET_WINDOW_INTERLOCK_FLAGS` = su bit (`nvgpu::hdmi::core_interlock_methods`, comparado con la traza).
+
+**Ryzen boot #90 (FAIL):** con el interlock idéntico excepción idéntica (`0x5080 0x1 0x2d`, INVALID_STATE en el UPDATE de la ventana 2): no era el interlock. Lo que nouveau empuja y este driver aún no: el notificador de la ventana (`SET_CONTEXT_DMA_NOTIFIER f0000000`, `SET_NOTIFIER_CONTROL 0xe0`), la LUT de entrada (`SET_ILUT_CONTROL 0x40508`, ctxdma `f0000001`, offset) y la LUT de salida de la cabeza 1 (`HEAD_SET_OLUT_CONTROL 0x40509`, `FP_NORM_SCALE`, ctxdma, offset), con LUTs identidad en VRAM. Se replican (`nvgpu::lut`, `nvgpu::hdmi::{ramht_objects, window_lut_methods, olut_methods}`, valores comparados con `modeset-push.txt`); el estado reset del ILUT es válido para la ventana 0 (GOP), así que es una hipótesis (el `data` 1 de la excepción podría ser la cabeza).
+
+**Ryzen boot #91 (`on` OK, `off` FAIL):** con notificador + ILUT + OLUT la excepción desaparece: `hdmi on` en 389 ms, ventana 2 latcheada (offset `0x30000`, ctxdma `0xfb000000`), cabeza 1 a 59,999 Hz (head 0 por el mismo instrumento 59,999), sin faltas; **el usuario vio la imagen en el HP**. `hdmi off` no se confirmó: `SET_WINDOW_INTERLOCK_FLAGS` del core queda en su ASSEMBLY (4) y todo core UPDATE posterior espera el UPDATE de la ventana 2; el usuario vio solo un parpadeo (el codificador se apagó y el `on` siguiente, rechazado por Busy, lo volvió a escribir). Arreglo: `push_core` limpia los flags de interlock en el push siguiente al que los puso.
+
+**Ryzen boot #92 (OK):** `on` (≈385 ms) / `off` (24-29 ms) / `on` / `off`: 4 supervisores por fase (1,1,1 por operación), 0 errores de script y de CTRL_DISP, `ok=2 failed=0`; cabeza 1 a 59,998-59,999 Hz medida por el raster (cabeza 0 con el mismo instrumento: igual); el ASUS a 60,02 → 59,98 Hz con el HP encendido (dentro del ruido del instrumento; el job tolera 0,3); el usuario vio la imagen del HP y el apagado.
+
+**Fase 5.8 cerrada** (audio, HDMI 2.0, cambio de tamaño y compositor sobre la cabeza 1 quedan fuera). Lecciones: (1) el primer UPDATE de una ventana recién asignada necesita el notificador, el ILUT y el OLUT de la cabeza como nouveau (sin ellos, INVALID_STATE en el UPDATE; el interlock solo no basta); (2) el interlock del core persiste en su ASSEMBLY y hay que limpiarlo en el push siguiente.
 
 ## Fases
 

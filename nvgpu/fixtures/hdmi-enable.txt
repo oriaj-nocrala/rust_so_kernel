@@ -1,0 +1,26 @@
+# trace-nogsp: nouveau's HDMI enable for the HP on SOR-0 / head 1 (dmesg 11.87888..11.87894, scripts/gpu-trace.py extract trace-nogsp 11.878880 11.878940, offsets relative to BAR0)
+# R|W BAR0-offset value; left out: the DP-3 route write (0x612488 = 0x1900 then 0x1912) and an AUX poll the DP training interleaves around it
+# route set (gm200_sor_route_set), HDMI GCP + ACR + ctrl (gv100_sor_hdmi_ctrl), SCDC (gm200_sor_hdmi_scdc), AVI infoframe, no vendor infoframe
+R 0x612408 0x00000800
+W 0x612408 0x00000801
+R 0x6f04c0 0x00000000
+W 0x6f04c0 0x00000000
+W 0x6f04cc 0x00000010
+R 0x6f04c0 0x00000000
+W 0x6f04c0 0x00000001
+W 0x6f0480 0x82000000
+R 0x616dc0 0x01020038
+W 0x616dc0 0x41060038
+R 0x61c5bc 0x02140080
+W 0x61c5bc 0x02140080
+R 0x6f0400 0x00000200
+W 0x6f0400 0x00000200
+W 0x6f0408 0x000d0282
+W 0x6f040c 0x00281225
+W 0x6f0410 0x00000010
+W 0x6f0414 0x00000000
+W 0x6f0418 0x00000000
+R 0x6f0400 0x00000200
+W 0x6f0400 0x00000201
+R 0x6f0500 0x00010200
+W 0x6f0500 0x00000200

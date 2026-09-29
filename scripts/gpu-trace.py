@@ -34,6 +34,8 @@ A trace dir is what scripts/gpu-oracle.sh leaves: mmiotrace.txt + dmesg.txt.
                                             0x80000000), as a replay fixture ("R|W offset value");
                                             accesses of other contexts (interrupt handlers, timer,
                                             AUX polling) are left out, see SUPER_OTHER
+  gpu-trace.py fixture DIR T0 T1 [OUT [SKIP..]]  every BAR0 access in the window as "R|W 0xOFF 0xVAL"
+                                            (replay fixture; SKIP = offsets of other contexts to drop)
   gpu-trace.py train   DIR T0 T1 CH [OUT]   every BAR0 access between dmesg times T0..T1 as a
                                             replay fixture ("R|W offset value"), for a DP link
                                             training on AUX channel CH: PTIMER, other AUX
@@ -677,6 +679,32 @@ def train(d, t0, t1, ch, out=None):
         sys.stdout.write(text)
 
 
+def fixture(d, t0, t1, out=None, skip=()):
+    """Every BAR0 access between dmesg times t0..t1 as a replay fixture
+    ("R|W 0xOFFSET 0xVALUE", BAR0-relative). `skip` = register offsets to
+    leave out (other contexts' accesses interleaved in the window)."""
+    off, base = align(d, quiet=True)
+    lines = []
+    for k, t, a, v in iter_trace(d):
+        if t > t1 + off:
+            break
+        if t < t0 + off or not base <= a < base + 0x1000000:
+            continue
+        o = a - base
+        if o in skip or 0x9400 <= o < 0x9420:
+            continue
+        lines.append(f"{k} {o:#08x} {v:#010x}")
+    text = "\n".join(lines) + "\n"
+    if out:
+        name = d.rsplit('/', 1)[-1]
+        with open(out, "w") as f:
+            f.write(f"# {name}: dmesg {t0}..{t1} (scripts/gpu-trace.py fixture {name} {t0} {t1} OUT [SKIP_OFFSET..])\n")
+            f.write("# R|W BAR0-offset value\n" + text)
+        print(f"{len(lines)} accesses -> {out}")
+    else:
+        sys.stdout.write(text)
+
+
 def main(argv):
     if len(argv) < 3:
         sys.exit(__doc__)
@@ -712,6 +740,9 @@ def main(argv):
             push(d, float(argv[3]), float(argv[4]), argv[5] if len(argv) > 5 else None)
         else:
             push(d)
+    elif cmd == "fixture":
+        fixture(d, float(argv[3]), float(argv[4]), argv[5] if len(argv) > 5 else None,
+                {int(x, 0) for x in argv[6:]})
     elif cmd == "train":
         train(d, float(argv[3]), float(argv[4]), int(argv[5], 0), argv[6] if len(argv) > 6 else None)
     elif cmd == "supers":

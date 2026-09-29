@@ -24,6 +24,7 @@ cd kernel && cargo build --target x86_64-unknown-none  # the kernel crate alone
 | `qemu-debug` | Running the kernel headless, typing into it, gdb, boot-matrix, reproducing Ryzen bugs, `ktrace!`/`/proc/kdebug` |
 | `metal-run` | Anything on the Ryzen: deploying to the USB stick, unattended jobs, reading the log partition |
 | `userspace-programs` | Adding a program, `kernel/build.rs` lists, `disk.img`, mlibc and BusyBox changes |
+| `gpu-display` | Display work on the NVIDIA GA106 (`nvgpu`, `kernel/src/gpu/`): recipe (oracle → fixture → pure code → replay test → sabotage → adapter → `gpu=` level → job), code map, nouveau reference map |
 | `kernel-drivers` | Writing or porting a driver (`hal` seams, `/dev` entries, driver tests) |
 
 ## Code map

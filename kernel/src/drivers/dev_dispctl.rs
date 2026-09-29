@@ -19,6 +19,9 @@
 //   EDID or CVT-RB2 mode (same size only), synchronously: detach, retrain
 //   if needed, attach at the new mode (`gpu/modeset.rs`); EINVAL if refused
 //   before touching anything, EAGAIN if busy, EIO if it failed after.
+//   With `gpu=hdmi` (phase 5.8), `hdmi on` / `hdmi off` light the HP on
+//   HDMI with the kernel's own picture, or switch it off (`gpu/hdmi.rs`);
+//   EINVAL if already so, EAGAIN if busy, EIO if it failed.
 // - `read`: one status line (the SOR's ARMED control, the core channel's
 //   PUT/GET), with `gpu=modes` a second (`mode: ...`), then EOF.
 
@@ -26,6 +29,7 @@ use alloc::boxed::Box;
 
 use crate::fs::types::{Errno, Stat};
 use crate::gpu::dplink::{self, TrainError};
+use crate::gpu::hdmi::{self, HdmiError};
 use crate::gpu::modeset::{self, SetError};
 use crate::gpu::supervisor::{self, Cmd, RequestError};
 use crate::process::file::{FileError, FileHandle, FileResult};
@@ -41,6 +45,7 @@ impl FileHandle for DispctlDevice {
         }
         let mut s = supervisor::status();
         s.push_str(&modeset::status());
+        s.push_str(&hdmi::status());
         let n = s.len().min(buf.len());
         buf[..n].copy_from_slice(&s.as_bytes()[..n]);
         self.read_done = true;
@@ -55,6 +60,19 @@ impl FileHandle for DispctlDevice {
                 Err(SetError::Busy) => Err(FileError::Again),
                 Err(SetError::Invalid) => Err(FileError::InvalidArgument),
                 Err(SetError::NotReady | SetError::Failed) => Err(FileError::IOError),
+            };
+        }
+        if let Some(which) = text.strip_prefix("hdmi ") {
+            let res = match which.trim() {
+                "on" => hdmi::on(),
+                "off" => hdmi::off(),
+                _ => return Err(FileError::InvalidArgument),
+            };
+            return match res {
+                Ok(()) => Ok(buf.len()),
+                Err(HdmiError::Busy) => Err(FileError::Again),
+                Err(HdmiError::State) => Err(FileError::InvalidArgument),
+                Err(HdmiError::NotReady | HdmiError::Failed) => Err(FileError::IOError),
             };
         }
         if let Some(args) = text.strip_prefix("train ") {
