@@ -24,7 +24,7 @@ description: Playbook for verifying a change to rust_so_kernel: which test suite
 
 ## Rules for tests
 
-- **A test never seen to fail is decoration.** Prove each new test by sabotage: break the invariant in a copy of the crate (use a **short** `/tmp` path, not the repo) and show that the test fails or hangs. `cargo-mutants` is not installed, and it can't express "reorder two statements", which is the shape of most invariants here.
+- **A test never seen to fail is decoration.** Prove each new test by sabotage: break the invariant in a copy of the crate (use a **short** `/tmp` path, not the repo) and show that the test fails or hangs. `cargo-mutants` is not installed, and it can't express "reorder two statements", which is the shape of most invariants here. For the `nvgpu` crate use `scripts/gpu-mutate.py FILE FILTER MUTATIONS.py` (one `cargo test` per mutation, restores the file, lists survivors; examples in `nvgpu/mutations/`).
 - **Label concurrency tests by family** in their doc comment:
   - **A — reentrancy probes**: no threads, deterministic; the same thread re-enters a non-reentrant lock, and a hang *is* the signal.
   - **B — contention probes** with `std::thread`: make contention observable so instruments can be validated.

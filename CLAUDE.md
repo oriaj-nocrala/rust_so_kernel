@@ -25,7 +25,7 @@ cd kernel && cargo build --target x86_64-unknown-none  # the kernel crate alone
 | `metal-run` | Anything on the Ryzen: deploying to the USB stick, unattended jobs, reading the log partition |
 | `userspace-programs` | Adding a program, `kernel/build.rs` lists, `disk.img`, mlibc and BusyBox changes |
 | `gpu-display` | Display work on the NVIDIA GA106 (`nvgpu`, `kernel/src/gpu/`): recipe (oracle → fixture → pure code → replay test → sabotage → adapter → `gpu=` level → job), code map, nouveau reference map |
-| `gpu-gsp` | GSP-RM boot on the GA106 (`nvgpu::{falcon,fwsec,firmware,gspmem,booter,rpc}`, `kernel/src/gpu/gsp.rs`, `gpu=fwsec`/`gpu=gsp`): code map, how each piece was verified (trace fixtures, clang ABI oracle, mutation testing), metal stability protocol, and the plan for 4g (RM objects via RM_ALLOC/RM_CONTROL) and phase 6 |
+| `gpu-gsp` | GSP-RM on the GA106 and phase 6: `nvgpu::{falcon,fwsec,firmware,gspmem,booter,rpc,rm}`, `kernel/src/gpu/gsp.rs` (`gpu=fwsec`/`gpu=gsp`), GPU page tables `nvgpu::mmu`, GPFIFO channel + copy engine `nvgpu::chan` (`gpu=vaspace`/`gpu=copy`): code map, VRAM/VA memory map, bring-up ladder, doorbell/token, where NVIDIA's hardware manuals are (`~/src/gpu-ref/open-gpu-doc`), mutation-testing tool, metal stability protocol, and what is left (6d) |
 | `kernel-drivers` | Writing or porting a driver (`hal` seams, `/dev` entries, driver tests) |
 
 ## Code map

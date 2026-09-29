@@ -9,6 +9,7 @@ State of the project: `docs/reference/gpu.md` (one section per `gpu=` level, cur
 
 ## The recipe (every subphase followed it)
 
+0. **Manuals before inference.** NVIDIA's hardware manuals are saved at `~/src/gpu-ref/open-gpu-doc` (`grep` them; index in the `gpu-gsp` skill): a bit layout read from them beats one inferred from nouveau.
 1. **Oracle first.** Find what nouveau does in `~/src/gpu-ref/linux/drivers/gpu/drm/nouveau/` (table below), then find it in the trace (`~/constanos-gpu-oracle/trace-nogsp`, or `trace-nogsp-vrampush` for push-buffer methods).
 2. **Fixture.** `python3 scripts/gpu-trace.py disp DIR T0 T1` lists labelled writes (use it to find the time window; filter with awk on the register column). `fixture DIR T0 T1 OUT [SKIP_OFFSETS..]` writes every access in a window as `R|W 0xOFFSET 0xVALUE` (drops PTIMER; pass other contexts' registers as SKIP; `extract` prints raw mmiotrace lines instead). `supers`/`train`/`push`/`core` write fixtures directly. Put it in `nvgpu/fixtures/`.
 3. **Pure code in `nvgpu/src/<x>.rs`**, generic over `Mmio` (`rd32/wr32/mask/udelay`; `mask` always reads and writes). Every constant cites `file:line` of nouveau/`clc67*.h`. No logging, nothing blocks.

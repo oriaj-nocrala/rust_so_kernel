@@ -1,9 +1,9 @@
 ---
 name: gpu-gsp
-description: Playbook for GSP work on the NVIDIA GA106 (phase 4 incl. 4g, done; phase 6 next): the falcon / FWSEC / booter / WPR2 memory / RPC queue code in crates nvgpu + kernel/src/gpu/gsp.rs, how each piece was verified against nouveau's trace and clang, the RM object RPCs (RM_ALLOC, RM_CONTROL, done in nvgpu::rm), the mutation-testing routine, and the metal-run stability protocol. Read it before touching nvgpu::{falcon,fwsec,firmware,gspmem,booter,rpc}, gpu=fwsec / gpu=gsp, or adding an RM client.
+description: Playbook for GSP-RM work on the NVIDIA GA106 (phases 4, 6a-6c done): the falcon / FWSEC / booter / WPR2 / RPC queue code (nvgpu + kernel/src/gpu/gsp.rs), the RM object RPCs, and phase 6 - GPU page tables (nvgpu::mmu), the GPFIFO channel and copy engine (nvgpu::chan, gpu=vaspace, gpu=copy, kernel/src/gpu/{vaspace,copy}.rs), the VRAM/VA memory map, the bring-up ladder, doorbell and token, where the NVIDIA hardware manuals are, the mutation-testing tool and the metal-run protocol. Read it before touching those modules, gpu=fwsec / gsp / vaspace / copy, adding an RM client or object, or debugging a channel that does nothing. Keywords: GSP, RM_ALLOC, VASpace, GPFIFO, doorbell, runlist, USERD, PDE, PTE, copy engine, c7b5, c56f, open-gpu-doc.
 ---
 
-# GSP-RM work on the GA106 (phase 4, `gpu=fwsec` / `gpu=gsp`)
+# GSP-RM work on the GA106 (phase 4: `gpu=fwsec` / `gpu=gsp`; phase 6: `gpu=vaspace` / `gpu=copy`)
 
 State: `docs/reference/gpu.md` sections "`gpu=fwsec`", "`gpu=gsp`", "GSP firmware files". Evidence per subphase: `docs/gpu/gpu-plan.md` "Resultados de las fases 4b / 4a y 4c / 4d y 4e / 4f". Project skills: `gpu-display` (same recipe, display side), `metal-run`, `kernel-testing`.
 
@@ -47,14 +47,42 @@ State: `docs/reference/gpu.md` sections "`gpu=fwsec`", "`gpu=gsp`", "GSP firmwar
 
 Our own RM client exists after boot: `create_client` = `NV01_ROOT` (`0xc1d00000`) -> `NV01_DEVICE_0` (`0xde1d0000`) -> `NV20_SUBDEVICE_0` (`0x5d1d0000`) + `NV2080_CTRL_CMD_GPU_GET_NAME_STRING`. RPC payloads: `GSP_RM_ALLOC` fn 103 (32-byte header), `GSP_RM_CONTROL` fn 76 (24-byte header), `FREE` fn 10; a reply echoes the request with `status` filled (`0x55/0x66` busy, `0x51` no memory). Fixtures `rm-*-{req,rep}.bin` (extract sent/received RPCs from the trace dmesg as in step 3 above). `Rm::call` = send + `wait_for` (the receive loop that also runs sequencer events). The objects and buffers are never freed; the queues are only serviced at boot.
 
-## Done in 6a/6b
+## Phase 6: VA space, channel, copy engine (`gpu=vaspace` boot #101, `gpu=copy` boot #105)
 
-`nvgpu::mmu` (page tables, pure) and `gpu=vaspace` (`kernel/src/gpu/vaspace.rs`): external `FERMI_VASPACE_A` + our tables in VRAM 64 MiB + `SET_PAGE_DIRECTORY`, measured (boot #101). Everything still runs at boot with IF=0 and `Rm::call` polling the status queue: no long-lived `Rm` yet. `Rm::alloc` returns the reply payload, `alloc`/`control` are `pub(super)`. Job pattern: copy `scripts/metal-jobs/gpu-vaspace.sh`.
+Runs inside the boot's RPC phase (IF=0, `Rm::call` polls the status queue); no long-lived `Rm` yet. State and evidence: `docs/gpu/gpu-plan.md` "Resultados de las fases 6a/6b/6c"; module summary: `docs/reference/gpu.md`.
 
-## 6c done (channel + copy, boot #105)
+| Module | What |
+|---|---|
+| `nvgpu/src/mmu.rs` | `PageTables` (5 levels, 4 KiB pages; `map`/`map_range`/`unmap`/`translate`, `images()` for the adapter), `pte`/`pde` encodings |
+| `nvgpu/src/chan.rs` | channel ALLOC params (368 B), BIND/SCHEDULE/copy-object params, `runlist_for_engine`, `doorbell_token`, `gp_entry`, `incr_header`, `copy_push`/`release_push`, the VRAM/VA layout constants |
+| `nvgpu/src/rm.rs` | + `vaspace_params`, `vaspace_from_reply`, `set_page_directory_params` |
+| `kernel/src/gpu/vaspace.rs` | `gpu=vaspace`: ALLOC 0x90f1, tables through PRAMIN (read back), SET_PAGE_DIRECTORY; calls `copy::{prepare,map,run}` when `gpu=copy` |
+| `kernel/src/gpu/copy.rs` | `gpu=copy`: buffers, channel, doorbell, the ladder, the measured round trip |
 
-`nvgpu::chan` + `kernel/src/gpu/copy.rs`; measured: 4 MiB round trip identical at ~6.2 GB/s (`docs/gpu/gpu-plan.md` "Resultados de la fase 6c"). Traps found (three bugs stacked, each hid the next; the ladder in `copy.rs` finds the failing layer): PD0's dual PDE has the BIG-page half first, small second; the doorbell is `0xbb0090` on Ampere (Volta's `0x810090` does nothing); the token is `(runlist<<16)|chid` with the runlist from `NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE` (GSP's own token is for runlist 0); engine `0xb` is COPY2; `cid` in the ALLOC reply is a session counter; PFIFO registers read `0xbadf....` under GSP-RM. Reference sources, in order of trust: NVIDIA's hardware manuals (saved at `~/src/gpu-ref/open-gpu-doc`, commit in `~/src/gpu-ref/PINNED`; upstream `github.com/NVIDIA/open-gpu-doc`, `grep` them locally instead of fetching: `manuals/ampere/ga100/dev_{ram,pbdma,runlist,ctrl,vm}.ref.txt`, `manuals/turing/tu104/dev_mmu.ref.txt`; fetch with curl from raw.githubusercontent.com), OpenRM 570.144 source, nouveau r570. **nova-core** (the user's suggestion, the current Rust driver) is in the tree but only boots the GSP; FIFO/MMU/VFN IRQ are still TODO upstream. The user's rule: do not invent, cite a source. Lesson: my mmu notes had PD0's dual PDE halves reversed (a wrong inference from `pt[0]`); the manual settles such things in seconds.
+**Memory map** (constants in `nvgpu::chan` and `vaspace.rs`; a test checks they do not overlap). VRAM: 0 GOP fb; 16/32 MiB scanout; 48 MiB HDMI; **64 MiB page tables** (pool of 64 x 4 KiB); 96 MiB 6b test mapping (1 MiB); **128 MiB channel** (instance +0, USERD +0x1000, GPFIFO +0x2000, push buffer +0x4000, fence +0x5000); **144 MiB copy destination**; `0x1f4000000..` GSP heap + WPR2; `0x1ffc90000` display instance memory. VA (all mapped by our tables): 4 GiB 6b test; `0x2_0000_0000` GPFIFO, `+0x10000` push, `+0x20000` fence; `0x2_1000_0000` dst; `0x2_2000_0000` src (system pages); `0x2_3000_0000` back (system pages).
 
-## Next: phase 6c (channel) — read `docs/gpu/phase6-oracle.md` first
+**Bring-up ladder** (`copy.rs::run`): each rung adds one layer and the first that fails is named: (1) bare semaphore release, (2) VRAM -> VRAM 4 KiB, (3) system -> VRAM 4 KiB, (4) the 4 MiB round trip. Keep the ladder when changing anything: three bugs were stacked and each hid the next.
+- The **only proof** that the GPU ran something is the semaphore the copy engine releases. `USERD` `GP_GET`/`Get` are written back **periodically** (`dev_ram.ref`, "RAMUSERD is updated at regular intervals"): a stale value proves nothing.
+- After a failure RM sends **no event**, and PFIFO registers (`0x2100`, `0xb65000`) read `0xbadf....` under GSP-RM: there is no host-side view of the PBDMA. Diagnose by rungs, not by registers.
 
-Also read `docs/gpu/mmu-v3-notes.md` (page-table format, PTE/PDE bit layout, the external VA-space recipe, TLB flush, free VRAM range, suggested `nvgpu/src/mmu.rs` design). `phase6-oracle.md` lists exactly what the trace contains (VASpace, two GPFIFO channels `0xc56f`, the copy engine `0xc7b5`, BIND/SCHEDULE controls, with `#index` and fixture names already extracted in `nvgpu/fixtures/rm-ph6-*`), the tool to re-extract or extract more (`scripts/gpu-rpc.py list|recv|dump|text`), the nouveau reading order (`r570/fifo.c` -> `r535/fifo.c` -> `r535/vmm.c` -> `ce.c`/`bar.c`), the build order (queue servicing -> VA space + MMU v3 page tables -> channel -> submission/doorbell/fence -> job) and the loose ends (no teardown, `Rm` not long-lived).
+**Rules learned (each one cost a metal round):**
+- PD0 is a 16-byte dual PDE: **big-page half first, small-page half second** (`PD0_SMALL = 8`). I once inferred it backwards from nouveau's `pt[0]`; `dev_mmu.ref` and `nvkm_vmm_ref_hwpt` (`type = desc->type == SPT`) settle it.
+- Doorbell = BAR0 `0xb80000 + 0x30000 + 0x90`, value `(runlist << 16) | chid` (`NV_VIRTUAL_FUNCTION_DOORBELL`; Volta's `0x810090` does nothing). GSP's own `GET_WORK_SUBMIT_TOKEN` reply is for runlist 0 (CPU-RM recomputes it): take the runlist from `NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE` on **our own subdevice** (works), engine `0xb` = COPY2 = runlist 1 (COPY0 is 9, CE0/CE1 share runlist 0 with GR).
+- The requested chid is the hardware chid (the USERD slot flags say so); the `cid` in the ALLOC reply is a session counter.
+- Board facts come from the trace fixtures (`nvgpu/fixtures/rm-ph6-*`); the two channel ALLOCs of nouveau are reproduced byte for byte by `chan::alloc_params`.
+
+**Sources, in order of trust** (the user's rule: do not invent, cite): NVIDIA's hardware manuals saved at `~/src/gpu-ref/open-gpu-doc` (commit in `~/src/gpu-ref/PINNED`; `grep` them: `manuals/ampere/ga100/dev_{ram,pbdma,runlist,ctrl,vm}.ref.txt`, `manuals/turing/tu104/dev_mmu.ref.txt`, `manuals/ampere/ga102/dev_ce.ref.txt`, `classes/dma-copy/clc7b5.h`, `ampere/host/ampere_interrupt_map.csv`), then OpenRM 570.144 (`~/src/gpu-ref/open-gpu-kernel-modules`, `src/nvidia/src/kernel/gpu/fifo/`), then nouveau r570. **nova-core** (the current Rust driver) only boots the GSP in v7.2.2; FIFO, MMU and VFN IRQ are still TODO upstream, so it is no reference for this phase.
+
+**Metal practicalities:**
+- `cat target/metal/budget` before a round; each failed round consumes one automatic resume; at 0 stop and report (the user may raise it: `echo 5 > target/metal/budget`).
+- The reboot ends the session mid-command: after the resume read `target/metal/runs/<nonce>/{verdict,boot.log}` (`grep -a '\] copy:'`), do not relaunch.
+- A metal reboot can empty `/tmp` (the session scratchpad): keep helper scripts in the repo (`scripts/gpu-mutate.py`, examples in `nvgpu/mutations/`).
+- Mutation testing: `scripts/gpu-mutate.py FILE FILTER MUTATIONS.py`; write a fresh list per change.
+
+## Next: 6d (what is left of phase 6; details in the plan)
+
+1. Stability: 5 consecutive `gpu=copy` boots (`echo 5 > target/metal/budget`; job `scripts/metal-jobs/gpu-copy.sh`).
+2. Long-lived `Rm` + servicing the status queue at run time (`Memory` is `mem::forget`-ed at the end of `boot_gsp`; events such as RC/MMU faults arrive at any time).
+3. Fence by interrupt instead of polling: read `ampere_interrupt_map.csv`, nouveau's `r535_engn_nonstall` / `tu102_vfn_intr`, and `LAUNCH_DMA` `INTERRUPT_TYPE` in `clc7b5.h` first.
+4. Map the scanout buffers into the VA space (`Target::Vram`) and copy the compositor's shadow buffer into them; 2 MiB pages need a PTE at PD0: check `NV_MMU_VER2_DUAL_PDE_IS_PTE` in `dev_mmu.ref.txt` before writing it.
+5. Measure against the CPU write-combined blit (5.6 GB/s, `docs/gui/perf-plan.md`); the round trip measured 6.1-6.4 GB/s with 4 KiB pages and 4 MiB copies, so integrate into the compositor only if it wins or frees the CPU.
