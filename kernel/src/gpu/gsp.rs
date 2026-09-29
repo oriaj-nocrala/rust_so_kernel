@@ -147,7 +147,7 @@ impl Firmware {
     }
 }
 
-pub fn setup(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8), full: bool, vaspace: bool, pci: PciInfo) {
+pub fn setup(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8), full: bool, vaspace: bool, copy: bool, pci: PciInfo) {
     let Some((bios, _)) = super::VBIOS.get() else {
         stop(r, format_args!("no VBIOS (gpu=disp did not read it)"));
         return;
@@ -330,7 +330,7 @@ pub fn setup(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8), full: bool, vaspace
     }
 
     if let (Some(mem), Some((fwset, _))) = (mem, prepared) {
-        boot_gsp(r, regs, &fwset, mem, vaspace);
+        boot_gsp(r, regs, &fwset, mem, vaspace, copy);
     }
 }
 
@@ -513,7 +513,7 @@ fn build_memory(r: &mut String, fw: &Firmware, layout: &gspmem::FbLayout, gsp: &
 
 /// Phase 4e, after FRTS: reset the GSP into RISC-V mode, give it the LibOS
 /// address, run the booter on SEC2, check the RISC-V core.
-fn boot_gsp(r: &mut String, regs: &Bar0, fw: &Firmware, mut mem: Memory, vaspace: bool) {
+fn boot_gsp(r: &mut String, regs: &Bar0, fw: &Firmware, mut mem: Memory, vaspace: bool, copy: bool) {
     use nvgpu::booter;
     let gsp = falcon::GSP;
     let b = match Booter::parse(&fw.booter) {
@@ -584,7 +584,7 @@ fn boot_gsp(r: &mut String, regs: &Bar0, fw: &Firmware, mut mem: Memory, vaspace
 
     // Phase 4f: GSP-RM boots on its own, asking the host for register work
     // (RUN_CPU_SEQUENCER) until it says INIT_DONE; then the static configuration.
-    rpc_phase(r, regs, &mut mem, vaspace);
+    rpc_phase(r, regs, &mut mem, vaspace, copy);
 
     // Then see whether it wrote its logs.
     for _ in 0..50 {
@@ -681,7 +681,7 @@ fn wait_for(regs: &Bar0, shm: &ShmBuf, q: &Queues, env: &rpc::SeqEnv, want: u32,
 }
 
 /// Phase 4f: wait for INIT_DONE, then GET_GSP_STATIC_INFO for the GPU's name.
-fn rpc_phase(r: &mut String, regs: &Bar0, mem: &mut Memory, vaspace: bool) {
+fn rpc_phase(r: &mut String, regs: &Bar0, mem: &mut Memory, vaspace: bool, copy: bool) {
     let gsp = falcon::GSP;
     let shm = ShmBuf(&mem.shm);
     let env = rpc::SeqEnv {
@@ -739,7 +739,7 @@ fn rpc_phase(r: &mut String, regs: &Bar0, mem: &mut Memory, vaspace: bool) {
 
     // Phase 6b: a GPU virtual address space for that client.
     if vaspace {
-        super::vaspace::setup(r, regs, &mut rm);
+        super::vaspace::setup(r, regs, &mut rm, copy);
     }
 }
 
@@ -759,6 +759,15 @@ impl Rm<'_> {
             .map_err(|e| alloc::format!("sending fn {}: {:?}", function, e))?;
         let mut events = alloc::vec::Vec::new();
         wait_for(self.regs, &self.shm, self.queues, &self.env, function, 10_000, &mut events)
+    }
+
+    /// Read whatever RM has queued for up to `budget_ms`, running sequencer
+    /// commands and dropping the rest as `wait_for` does; the function numbers
+    /// of what arrived (for a report when something did not complete).
+    pub(super) fn drain(&mut self, budget_ms: u64) -> alloc::vec::Vec<u32> {
+        let mut seen = alloc::vec::Vec::new();
+        let _ = wait_for(self.regs, &self.shm, self.queues, &self.env, u32::MAX, budget_ms, &mut seen);
+        seen
     }
 
     /// The reply's payload (the request echoed with the status and any output fields filled).
@@ -786,10 +795,14 @@ impl Rm<'_> {
 /// `/proc/kdebug` lines.
 pub fn render_kdebug() -> String {
     let base = render_gsp_kdebug();
-    match super::vaspace::render_kdebug() {
-        v if v.is_empty() => base,
-        v => base + "\n" + &v,
+    let mut out = base;
+    for v in [super::vaspace::render_kdebug(), super::copy::render_kdebug()] {
+        if !v.is_empty() {
+            out += "\n";
+            out += &v;
+        }
     }
+    out
 }
 
 fn render_gsp_kdebug() -> String {

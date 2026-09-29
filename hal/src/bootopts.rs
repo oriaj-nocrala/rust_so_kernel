@@ -115,6 +115,9 @@ pub enum GpuLevel {
     /// tables built in VRAM (`nvgpu::mmu`) and an externally owned
     /// `FERMI_VASPACE_A` whose page directory is ours. Implies `gsp`.
     Vaspace,
+    /// Phase 6c: also a GPFIFO channel on the Ampere copy engine and a
+    /// measured system -> VRAM -> system copy through it. Implies `vaspace`.
+    Copy,
 }
 
 impl GpuLevel {
@@ -138,6 +141,7 @@ impl GpuLevel {
             "fwsec" => Some(GpuLevel::Fwsec),
             "gsp" => Some(GpuLevel::Gsp),
             "vaspace" => Some(GpuLevel::Vaspace),
+            "copy" => Some(GpuLevel::Copy),
             _ => None,
         }
     }
@@ -191,6 +195,8 @@ mod tests {
         assert!(GpuLevel::Gsp > GpuLevel::Fwsec);
         assert_eq!(GpuLevel::parse("vaspace"), Some(GpuLevel::Vaspace));
         assert!(GpuLevel::Vaspace > GpuLevel::Gsp);
+        assert_eq!(GpuLevel::parse("copy"), Some(GpuLevel::Copy));
+        assert!(GpuLevel::Copy > GpuLevel::Vaspace);
         assert!(GpuLevel::Vpll > GpuLevel::Super);
         assert!(GpuLevel::Super > GpuLevel::Scanout && GpuLevel::Scanout > GpuLevel::Chan);
         assert!(GpuLevel::Chan > GpuLevel::Dispstate && GpuLevel::Dispstate > GpuLevel::Vblank);

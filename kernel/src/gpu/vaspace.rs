@@ -32,8 +32,9 @@ use super::Bar0;
 /// display instance memory is at `0x1ffc90000` and WPR2 at the top
 /// (`docs/gpu/mmu-v3-notes.md`).
 pub const TABLE_VRAM: u64 = 64 << 20;
-/// The pool: 16 tables is plenty for a few MiB of mappings (5 for the first).
-const POOL_TABLES: usize = 16;
+/// The pool: 64 tables (256 KiB, VRAM 64 MiB ..): the 6b test mapping needs 5;
+/// `gpu=copy` adds the channel's pages and two 4 MiB buffers (a PT per 2 MiB).
+const POOL_TABLES: usize = 64;
 
 /// The test mapping: `TEST_PAGES` pages of VRAM at 96 MiB, seen at VA 4 GiB
 /// (the start of the window nouveau reserves for RM: `SPLIT_VAS_SERVER_RM_MANAGED_VA_START`
@@ -54,7 +55,7 @@ fn stop(r: &mut String, why: core::fmt::Arguments) {
     let _ = writeln!(r, "vaspace: STOP: {}", why);
 }
 
-pub(super) fn setup(r: &mut String, regs: &Bar0, rm: &mut Rm) {
+pub(super) fn setup(r: &mut String, regs: &Bar0, rm: &mut Rm, copy: bool) {
     let t0 = crate::cpu::tsc::read();
 
     // 1. The space itself.
@@ -72,11 +73,20 @@ pub(super) fn setup(r: &mut String, regs: &Bar0, rm: &mut Rm) {
         return stop(r, format_args!("the test mapping at {:#x} is outside RM's range", TEST_VA));
     }
 
-    // 2. Tables with one test mapping, into VRAM.
+    // 2. Tables with one test mapping (and, for gpu=copy, the channel's), into VRAM.
     let mut pt = PageTables::new(TABLE_VRAM, POOL_TABLES, Target::Vram);
     if let Err(e) = pt.map_range(TEST_VA, TEST_PA, TEST_PAGES * 0x1000, Target::Vram, Flags::default()) {
         return stop(r, format_args!("building the tables: {:?}", e));
     }
+    let bufs = if copy {
+        let Some(b) = super::copy::prepare(r) else { return };
+        if let Err(e) = b.map(&mut pt) {
+            return stop(r, format_args!("mapping the copy buffers: {:?}", e));
+        }
+        Some(b)
+    } else {
+        None
+    };
     let mut p = Pramin::new(regs);
     let mut bad = None;
     'write: for (pa, img) in pt.images() {
@@ -117,6 +127,11 @@ pub(super) fn setup(r: &mut String, regs: &Bar0, rm: &mut Rm) {
     MS.store(ms, Ordering::Relaxed);
     STATE.store(1, Ordering::Relaxed);
     let _ = writeln!(r, "vaspace: OK: RM accepted the page directory at VRAM {:#x} ({} entries) in {} ms", pt.root(), ROOT_ENTRIES, ms);
+
+    // 4. Phase 6c: a channel over these tables.
+    if let Some(b) = bufs {
+        super::copy::run(r, regs, rm, b);
+    }
 }
 
 /// `/proc/kdebug` line (empty when the level was not asked for).
