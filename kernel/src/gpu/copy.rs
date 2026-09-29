@@ -42,9 +42,11 @@ const DMA_MASK: u64 = (1 << 40) - 1;
 pub const COPY_BYTES: u64 = 4 << 20;
 const COPY_PAGES: usize = (COPY_BYTES / 0x1000) as usize;
 
-/// `NV_USERMODE_NOTIFY_CHANNEL_PENDING` (`clc361.h:33`) in the usermode window
-/// (`vfn/gv100.c:28`: BAR0 `0x810000`): the value is the work-submit token.
-const DOORBELL: u32 = 0x81_0000 + 0x90;
+/// `NVC361_NOTIFY_CHANNEL_PENDING` (`clc361.h:33`, offset 0x90) in the usermode
+/// window of the Ampere VFN: `0xb80000 + 0x30000` (`vfn/ga100.c:41,49`;
+/// Volta's was `0x810000`, `vfn/gv100.c:28`). The value is the work-submit
+/// token (`tu102_chan_start`, `engine/fifo/tu102.c:46`).
+const DOORBELL: u32 = 0xb8_0000 + 0x3_0000 + 0x90;
 /// The channel id nouveau's CE channel has in the trace (handle `0xf1f00002`,
 /// privileged, USERD slot 2).
 const CHID: u32 = 2;
@@ -166,13 +168,15 @@ impl Submitter<'_> {
             }
             if crate::cpu::tsc::read().wrapping_sub(t0) > limit {
                 return Err(alloc::format!(
-                    "the fence never reached {:#x} in {} ms: fence {:#x}, USERD GPGet {} GPPut {}, Get {:#x}",
+                    "the fence never reached {:#x} in {} ms: fence {:#x}, USERD GPGet {} GPPut {}, Get {:#x}; 0x2100 {:#x}, 0xb65000 {:#x}",
                     payload,
                     FENCE_TIMEOUT_MS,
                     p.rd32(chan::FENCE_VRAM),
                     p.rd32(chan::USERD_VRAM + chan::USERD_GP_GET),
                     p.rd32(chan::USERD_VRAM + chan::USERD_GP_PUT),
-                    p.rd32(chan::USERD_VRAM + 0x44)
+                    p.rd32(chan::USERD_VRAM + 0x44),
+                    self.regs.rd32(0x2100),
+                    self.regs.rd32(0xb6_5000)
                 ));
             }
         }
