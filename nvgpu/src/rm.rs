@@ -24,18 +24,28 @@ pub const FN_GSP_RM_ALLOC: u32 = 103;
 pub const NV01_ROOT: u32 = 0x0;
 pub const NV01_DEVICE_0: u32 = 0x80;
 pub const NV20_SUBDEVICE_0: u32 = 0x2080;
+/// `FERMI_VASPACE_A` (`nvif/class.h`): a GPU virtual address space.
+pub const FERMI_VASPACE_A: u32 = 0x90f1;
 
 /// The handles nouveau uses (`NVKM_RM_*`, `rm/handles.h`; the client's is
 /// `0xc1d00000 | id` with id 0). Any values work as long as they are distinct.
 pub const H_CLIENT: u32 = 0xc1d0_0000;
 pub const H_DEVICE: u32 = 0xde1d_0000;
 pub const H_SUBDEVICE: u32 = 0x5d1d_0000;
+/// `NVKM_RM_VASPACE` (`rm/handles.h`): the VA space's object handle. The trace
+/// (`fixtures/rm-vaspace-req.bin`) uses it under `H_DEVICE`.
+pub const H_VASPACE: u32 = 0x90f1_0000;
 
 /// `NV2080_CTRL_CMD_GPU_GET_NAME_STRING` and its parameter block
 /// (`ctrl2080gpu.h:291-311`): flags (0 = ASCII) then 64 ASCII bytes or 64
 /// UTF-16 units.
 pub const CTRL_GPU_GET_NAME_STRING: u32 = 0x2080_0110;
 pub const NAME_STRING_PARAMS_SIZE: usize = 4 + 128;
+
+/// `NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY` / `..._UNSET_PAGE_DIRECTORY`
+/// (`r535/nvrm/vmm.h:96`), sent to the device object.
+pub const CTRL_DMA_SET_PAGE_DIRECTORY: u32 = 0x0080_1813;
+pub const CTRL_DMA_SET_PAGE_DIRECTORY_SIZE: usize = 32;
 
 /// `sizeof(rpc_gsp_rm_alloc_v03_00)` and of `rpc_gsp_rm_control_v03_00`.
 pub const ALLOC_HDR: usize = 32;
@@ -164,6 +174,51 @@ pub fn name_from_params(params: &[u8]) -> Option<&str> {
     core::str::from_utf8(&s[..end]).ok().filter(|n| !n.is_empty())
 }
 
+// ---- the VA space (phase 6a) ------------------------------------------------------
+
+/// `NV_VASPACE_ALLOCATION_PARAMETERS` (`vmm.h:12-22`, 48 bytes) for an
+/// *externally owned* space (`r535_mmu_vaspace_new(.., external = true)`,
+/// `vmm.c:53-65`): `index` 0 (`GPU_NEW`), `flags` = `IS_EXTERNALLY_OWNED`
+/// (bit 3), everything else 0. RM fills the rest in its reply.
+pub const VASPACE_PARAMS_SIZE: usize = 48;
+pub const VASPACE_FLAG_EXTERNALLY_OWNED: u32 = 1 << 3;
+
+pub fn vaspace_params() -> Vec<u8> {
+    let mut p = vec![0u8; VASPACE_PARAMS_SIZE];
+    put32(&mut p, 4, VASPACE_FLAG_EXTERNALLY_OWNED);
+    p
+}
+
+/// What RM says about the space it made (the reply's parameter block): `vaSize`
+/// at offset 8 and `vaBase` at 40. Both are RM's; a mapping must lie in
+/// `[base, base + size)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VaSpace {
+    pub base: u64,
+    pub size: u64,
+}
+
+pub fn vaspace_from_reply(payload: &[u8]) -> Option<VaSpace> {
+    let p = payload.get(ALLOC_HDR..ALLOC_HDR + VASPACE_PARAMS_SIZE)?;
+    Some(VaSpace {
+        size: u64::from_le_bytes(p[8..16].try_into().unwrap()),
+        base: u64::from_le_bytes(p[40..48].try_into().unwrap()),
+    })
+}
+
+/// `NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_PARAMS` (`vmm.h:99-107`, 32 bytes):
+/// `physAddress` u64, `numEntries`, `flags` (aperture: 0 = video memory, 1 =
+/// coherent system, 2 = non-coherent; `NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_APERTURE`
+/// bits 1:0), `hVASpace`, `chId`, `subDeviceId`, `pasid`.
+pub fn set_page_directory_params(root: u64, entries: u32, aperture: u32, vaspace: u32) -> Vec<u8> {
+    let mut p = vec![0u8; CTRL_DMA_SET_PAGE_DIRECTORY_SIZE];
+    p[0..8].copy_from_slice(&root.to_le_bytes());
+    put32(&mut p, 8, entries);
+    put32(&mut p, 12, aperture);
+    put32(&mut p, 16, vaspace);
+    p
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +293,37 @@ mod tests {
         assert_eq!(check_control_reply(&m, H_CLIENT, H_DEVICE, 0x0080_1813).unwrap().len(), 32);
         put32(&mut m, 16, 8);
         assert_eq!(check_control_reply(&m, H_CLIENT, H_DEVICE, 0x0080_1813).unwrap().len(), 8);
+    }
+
+    const VAS_REQ: &[u8] = include_bytes!("../fixtures/rm-vaspace-req.bin");
+    const VAS_REP: &[u8] = include_bytes!("../fixtures/rm-vaspace-rep.bin");
+
+    #[test]
+    fn the_external_vaspace_matches_nouveaus_rpc() {
+        assert_eq!(alloc_request(H_CLIENT, H_DEVICE, H_VASPACE, FERMI_VASPACE_A, &vaspace_params()), VAS_REQ);
+        assert_eq!(VAS_REQ.len(), ALLOC_HDR + 48);
+        assert_eq!(check_alloc_reply(VAS_REP, H_CLIENT, H_VASPACE), Ok(()));
+        // RM's answer: the space starts at 64 MiB and runs to the 49-bit top
+        let v = vaspace_from_reply(VAS_REP).unwrap();
+        assert_eq!((v.base, v.size), (0x400_0000, (1 << 49) - 0x400_0000));
+        assert_eq!(vaspace_from_reply(&VAS_REP[..ALLOC_HDR + 47]), None);
+        // the request itself carries no size yet
+        assert_eq!(vaspace_from_reply(VAS_REQ), Some(VaSpace { base: 0, size: 0 }));
+    }
+
+    #[test]
+    fn set_page_directory_matches_nouveaus_control() {
+        // the trace: root 0x1_f07d_1000 in VRAM, 4 root entries
+        let p = set_page_directory_params(0x1_f07d_1000, 4, 0, H_VASPACE);
+        assert_eq!(p, &CTRL_REQ[CTRL_HDR..]);
+        assert_eq!(control_request(H_CLIENT, H_DEVICE, CTRL_DMA_SET_PAGE_DIRECTORY, &p), CTRL_REQ);
+        assert_eq!(p.len(), CTRL_DMA_SET_PAGE_DIRECTORY_SIZE);
+        // every field where the C struct has it
+        let q = set_page_directory_params(0x1122_3344_5566_7788, 5, 6, 7);
+        assert_eq!(q[0..8], 0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!((get32(&q, 8), get32(&q, 12), get32(&q, 16)), (5, 6, 7));
+        assert!(q[20..].iter().all(|&b| b == 0));
+        assert_eq!((CTRL_DMA_SET_PAGE_DIRECTORY, FERMI_VASPACE_A, H_VASPACE), (0x80_1813, 0x90f1, 0x90f1_0000));
     }
 
     #[test]

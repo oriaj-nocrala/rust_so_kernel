@@ -31,6 +31,7 @@ pub mod id;
 pub mod init;
 pub mod lut;
 pub mod mmio;
+pub mod mmu;
 pub mod mode;
 pub mod pad;
 pub mod pattern;

@@ -906,6 +906,15 @@ Código: `nvgpu::rm` (mensajes `GSP_RM_ALLOC`/`GSP_RM_CONTROL`/`FREE`, bloques d
 - **Ryzen boot #100 (OK, a la primera)**: tras `GET_GSP_STATIC_INFO`, RM acepta las tres altas con `status 0` y `NV2080_CTRL_CMD_GPU_GET_NAME_STRING` sobre **nuestro propio subdevice** devuelve "NVIDIA GeForce RTX 3050". ASUS a 60,027 Hz, Linux sano después.
 - **Siguiente (fase 6)**: `FERMI_VASPACE_A` (`0x90f1`, 48 B de parámetros en la traza, hijo del device) y el CONTROL sobre el device que le sigue; canal GPFIFO + motor de copia; y decidir cómo se atienden las colas con GSP-RM vivo (hoy solo en el arranque).
 
+## Resultados de la fase 6a (2026-09-29)
+
+Código puro, sin metal todavía: `nvgpu::mmu` (tablas de páginas GA10x = formato GP100 v2, páginas de 4 KiB) y, en `nvgpu::rm`, `vaspace_params` (externo, flags `0x8`), `vaspace_from_reply` y `set_page_directory_params`.
+
+- **Formato** (de `vmmgp100.c`/`vmmtu102.c`, notas en `docs/gpu/mmu-v3-notes.md`): PD3 2 bits, PD2 9, PD1 9, PD0 8 (entradas de 16 B, PDE de página pequeña en la primera mitad), PT 9; PTE `(pa>>4) | VALID | apertura<<1 | VOL (host) | PRIV | RO | kind<<56`; PDE `(pa>>4) | apertura` con la VRAM numerada 1 (distinto de la PTE). `PageTables` construye las imágenes de las tablas en memoria para un rango físico que le da el llamante (`images()` da dirección + 4 KiB); el adaptador las copia a VRAM.
+- **Oráculo**: `alloc_request(.., FERMI_VASPACE_A, vaspace_params())` y `control_request(.., 0x801813, set_page_directory_params(0x1_f07d_1000, 4, 0, H_VASPACE))` **reproducen byte a byte** los RPC de nouveau (`rm-vaspace-req.bin`, `rm-ctrl801813-req.bin`). La respuesta del ALLOC dice que el espacio va de **64 MiB (`vaBase`) a 2^49**: los mapeos deben caer ahí. Los bits de las tablas no tienen traza (nouveau las escribe por BAR2/PRAMIN): el oráculo es el formato citado + un recorrido independiente en los tests + (en 6b/6c) que RM acepte la raíz y que una copia por el canal lea/escriba un patrón conocido.
+- **Tests de host**: nvgpu 232 (mmu 13). Sabotaje: 68 mutaciones (constantes, apertura, índices, máscaras, ramas), 0 supervivientes reales. Huecos que destapó: bits altos de la dirección de la entrada, el tope del pool de tablas (`>=`), y el seguimiento de una entrada de directorio corrupta (ahora se prueba corrompiendo una imagen).
+- **Siguiente (6b)**: `Rm` de larga vida + servicio de colas (las RPC ya no son solo de arranque); adaptador `gpu=vaspace`: reservar `[64 MiB, 128 MiB)` de VRAM para tablas, `PageTables` -> PRAMIN, ALLOC `0x90f1` + `SET_PAGE_DIRECTORY`, flush TLB.
+
 ## Fases
 
 Calendario orientativo en días de trabajo. El riesgo está en la fase 4.
