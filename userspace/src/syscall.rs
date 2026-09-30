@@ -420,7 +420,8 @@ pub fn sigprocmask(how: i32, mask: u64, old_mask: Option<&mut u64>) -> i64 {
 // ── Time ─────────────────────────────────────────────────────────────────
 
 pub fn nanosleep(ns: u64) -> i64 {
-    unsafe { syscall1(SYS_NANOSLEEP, ns) }
+    let req = [(ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64];
+    unsafe { syscall2(SYS_NANOSLEEP, req.as_ptr() as u64, 0) }
 }
 
 pub fn sleep_ms(ms: u64) -> i64 {

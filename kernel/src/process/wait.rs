@@ -47,16 +47,32 @@ pub struct Wait {
     /// rewind it before blocking).
     pub ret_rip: u64,
     pub policy: RestartPolicy,
+    /// A sleep that reports what is left of it when a handler ends it early (`nanosleep`'s `rem`).
+    pub rem: Option<SleepRem>,
+}
+
+/// A relative sleep's deadline (`ktime` ns) and the user `timespec` that receives the time left; written when the interruption
+/// becomes `EINTR` (`signal::finish_interrupted_call`), not when a restart re-executes the call.
+#[derive(Debug, Clone, Copy)]
+pub struct SleepRem {
+    pub expiry: u64,
+    pub rem_ptr: u64,
 }
 
 impl Wait {
     pub const fn uninterruptible() -> Self {
-        Self { how: Interruptible::No, nr: 0, ret_rip: 0, policy: RestartPolicy::NoHandlerOnly }
+        Self { how: Interruptible::No, nr: 0, ret_rip: 0, policy: RestartPolicy::NoHandlerOnly, rem: None }
+    }
+
+    /// This wait, reporting the time left through `rem`.
+    pub const fn with_rem(mut self, rem: SleepRem) -> Self {
+        self.rem = Some(rem);
+        self
     }
 
     /// A cell-backed wait of syscall `nr`, returning to `ret_rip`.
     pub const fn cell(nr: u64, ret_rip: u64, policy: RestartPolicy, cleanup: Cleanup) -> Self {
-        Self { how: Interruptible::Cell(cleanup), nr, ret_rip, policy }
+        Self { how: Interruptible::Cell(cleanup), nr, ret_rip, policy, rem: None }
     }
 }
 
@@ -75,4 +91,5 @@ pub struct Interrupted {
     pub nr: u64,
     pub ret_rip: u64,
     pub policy: RestartPolicy,
+    pub rem: Option<SleepRem>,
 }

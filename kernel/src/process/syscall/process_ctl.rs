@@ -103,24 +103,34 @@ pub(super) fn sys_yield() -> SyscallResult {
     unsafe { crate::process::trapframe::jump_to_user(next_tf) }
 }
 
-/// sys_nanosleep — block the calling process for at least `ns` nanoseconds.
+/// nanosleep(35): int nanosleep(const struct timespec *req, struct timespec *rem)
 ///
-/// Returns 0 when the sleep completes. Returns immediately (0) if ns == 0.
-pub(super) fn sys_nanosleep(ns: u64) -> SyscallResult {
-    if ns == 0 {
-        return 0;
+/// The Linux ABI: `req` is a `timespec`, and if a handler ends the sleep early `rem` (optional) gets the time left.
+pub(super) fn sys_nanosleep(req: u64, rem: u64) -> SyscallResult {
+    match read_sleep_args(req, rem) {
+        Ok(ns) if ns == 0 => 0,
+        Ok(ns) => sleep_until(crate::time::ktime_get().saturating_add(ns), 35, rem),
+        Err(e) => e,
     }
-    sleep_until(crate::time::ktime_get().saturating_add(ns), 35)
+}
+
+/// Validate a sleep's `req` (a `timespec`, `EINVAL` if malformed) and optional `rem` (writable) and return the request in ns.
+fn read_sleep_args(req: u64, rem: u64) -> Result<u64, SyscallResult> {
+    if validate_user_buffer(req, 16).is_err() || (rem != 0 && validate_user_buffer(rem, 16).is_err()) {
+        return Err(errno::EFAULT);
+    }
+    // SAFETY: validated as a user-space range; a fault demand-pages or kills the caller, as for any user store.
+    let (sec, nsec) = unsafe { (*(req as *const i64), *((req + 8) as *const i64)) };
+    timespec_ns(sec, nsec).ok_or(errno::EINVAL)
 }
 
 /// clock_nanosleep(230): int clock_nanosleep(clockid_t, int flags, const struct timespec *req, struct timespec *rem)
 ///
-/// The Linux ABI (`req` is a `timespec`), unlike `nanosleep(35)` above, which keeps this port's plain-nanoseconds form for
-/// mlibc. `TIMER_ABSTIME` sleeps until an absolute time on the clock named: the monotonic ones are `ktime`, `CLOCK_REALTIME`
+/// `TIMER_ABSTIME` sleeps until an absolute time on the clock named: the monotonic ones are `ktime`, `CLOCK_REALTIME`
 /// is `ktime` shifted by the wall clock (the same reading `clock_gettime` gives). A time already past returns 0 at once.
-/// `rem` is never written: an interrupted sleep reports `EINTR` without the time left (a loop that retries with the same
-/// `req`, as Rust's `thread::sleep` does, then sleeps the whole time again).
-pub(super) fn sys_clock_nanosleep(clock: u64, flags: u32, req: u64, _rem: u64) -> SyscallResult {
+/// `rem` is written for a relative sleep a handler ended (`EINTR`), never for an absolute one: Rust's `thread::sleep` retries
+/// with it.
+pub(super) fn sys_clock_nanosleep(clock: u64, flags: u32, req: u64, rem: u64) -> SyscallResult {
     const TIMER_ABSTIME: u32 = 1;
     const CLOCK_REALTIME: u64 = 0;
     const CLOCK_MONOTONIC: u64 = 1;
@@ -132,12 +142,10 @@ pub(super) fn sys_clock_nanosleep(clock: u64, flags: u32, req: u64, _rem: u64) -
     if !matches!(clock, CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME) {
         return errno::EINVAL;
     }
-    if validate_user_buffer(req, 16).is_err() {
-        return errno::EFAULT;
-    }
-    // SAFETY: validated as a user-space range; a fault demand-pages or kills the caller, as for any user store.
-    let (sec, nsec) = unsafe { (*(req as *const i64), *((req + 8) as *const i64)) };
-    let Some(ns) = timespec_ns(sec, nsec) else { return errno::EINVAL };
+    let ns = match read_sleep_args(req, rem) {
+        Ok(ns) => ns,
+        Err(e) => return e,
+    };
     let up = crate::time::ktime_get();
     let expiry = if flags & TIMER_ABSTIME == 0 {
         up.saturating_add(ns)
@@ -151,7 +159,7 @@ pub(super) fn sys_clock_nanosleep(clock: u64, flags: u32, req: u64, _rem: u64) -
     if expiry <= up {
         return 0;
     }
-    sleep_until(expiry, 230)
+    sleep_until(expiry, 230, if flags & TIMER_ABSTIME == 0 { rem } else { 0 })
 }
 
 /// A `timespec` as nanoseconds; `None` for a negative or out-of-range field (`EINVAL` in Linux).
@@ -167,7 +175,7 @@ fn timespec_ns(sec: i64, nsec: i64) -> Option<u64> {
 /// LOCKING (see hrtimer.rs for full analysis):
 ///   cli → scheduler lock → QUEUE lock (hrtimer::start) → QUEUE released →
 ///   block_current → never returns here.
-fn sleep_until(expiry: u64, syscall_nr: u64) -> SyscallResult {
+fn sleep_until(expiry: u64, syscall_nr: u64, rem: u64) -> SyscallResult {
     let tf_ptr = current_tf_ptr();
 
     // `_irq` is deliberately never dropped — see sys_yield above.
@@ -192,13 +200,16 @@ fn sleep_until(expiry: u64, syscall_nr: u64) -> SyscallResult {
         let cell = scheduler.begin_wait();
         let timer = crate::time::hrtimer::start(expiry, crate::time::hrtimer::HrTimerAction::Wake { pid, cell });
 
-        // A signal ends the sleep with EINTR once a handler runs (no
-        // remaining time is reported).
+        // A signal ends the sleep with EINTR once a handler runs, and `rem` (if given) gets the time left.
         let ret_rip = unsafe { (*tf_ptr).rip };
-        scheduler.block_current(tf_ptr, crate::process::wait::Wait::cell(
+        let mut wait = crate::process::wait::Wait::cell(
             syscall_nr, ret_rip, crate::process::wait::RestartPolicy::NoHandlerOnly,
             crate::process::wait::Cleanup::Timer(timer),
-        ))
+        );
+        if rem != 0 {
+            wait = wait.with_rem(crate::process::wait::SleepRem { expiry, rem_ptr: rem });
+        }
+        scheduler.block_current(tf_ptr, wait)
         // scheduler lock dropped here
     };
 
@@ -1068,6 +1079,7 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
                     nr: 61,
                     ret_rip,
                     policy: crate::process::wait::RestartPolicy::SaRestart,
+                    rem: None,
                 }))
             }
         }

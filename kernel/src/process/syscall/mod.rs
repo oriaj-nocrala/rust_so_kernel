@@ -637,7 +637,7 @@ pub fn syscall_handler(
         SyscallNumber::Ioctl => fs::sys_ioctl(arg1 as i32, arg2 as u64, arg3),
         SyscallNumber::Writev => fs::sys_writev(arg1 as i32, arg2, arg3 as usize),
         SyscallNumber::Yield => process_ctl::sys_yield(),
-        SyscallNumber::Nanosleep => process_ctl::sys_nanosleep(arg1),
+        SyscallNumber::Nanosleep => process_ctl::sys_nanosleep(arg1, arg2),
         SyscallNumber::GetPid => process_ctl::sys_getpid(),
         SyscallNumber::GetPpid => process_ctl::sys_getppid(),
         SyscallNumber::Socket  => ipc::sys_socket(arg1 as i32, arg2 as i32, arg3 as i32),

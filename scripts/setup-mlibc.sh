@@ -95,6 +95,59 @@ PYEOF
     echo "setup-mlibc: patched do_scanf's suppressed-conversion count bug"
 fi
 
+# ── 1a. nanosleep() must report the time left in `rem` (idempotent) ─────────
+#
+# mlibc's `nanosleep` (options/ansi/generic/time.cpp) names its `rem`
+# parameter nothing and never writes it, so a sleep a signal handler ended
+# always looked as if no time was left. `sys_sleep` already returns the
+# remainder in `tmp` (the kernel fills a timespec: Linux's nanosleep ABI).
+if ! grep -q "constanos: report the time left in rem" mlibc/options/ansi/generic/time.cpp; then
+    python3 - "$REPO_ROOT/mlibc/options/ansi/generic/time.cpp" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+
+old_sig = "int nanosleep(const struct timespec *req, struct timespec *) {"
+old_tail = """	int e = mlibc::sys_sleep(&tmp.tv_sec, &tmp.tv_nsec);
+	if (!e) {
+		return 0;
+	} else {
+		errno = e;
+		return -1;
+	}
+}
+
+int clock_getres"""
+new_sig = "int nanosleep(const struct timespec *req, struct timespec *rem) {"
+new_tail = """	int e = mlibc::sys_sleep(&tmp.tv_sec, &tmp.tv_nsec);
+	if (!e) {
+		return 0;
+	} else {
+		// constanos: report the time left in rem
+		if (rem)
+			*rem = tmp;
+		errno = e;
+		return -1;
+	}
+}
+
+int clock_getres"""
+
+if old_sig not in content or old_tail not in content:
+    print("error: mlibc's nanosleep doesn't match the expected text (upstream "
+          "mlibc changed) -- setup-mlibc.sh's nanosleep patch needs updating",
+          file=sys.stderr)
+    sys.exit(1)
+
+content = content.replace(old_sig, new_sig, 1).replace(old_tail, new_tail, 1)
+with open(path, "w") as f:
+    f.write(content)
+PYEOF
+    echo "setup-mlibc: patched nanosleep to fill rem"
+fi
+
 # ── 1b. Declare memfd_create outside the Linux option (idempotent) ────────
 #
 # mlibc declares (sys/mman.h) and defines (sys-mman.cpp) `memfd_create` only

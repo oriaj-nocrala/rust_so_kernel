@@ -41,4 +41,4 @@ State and the list of what is still missing: `docs/reference/syscalls.md` (rows,
 
 ## Still missing (check `rust_std_gaps` first)
 
-`rem` of `nanosleep`/`clock_nanosleep` on EINTR (needs a hook in `process::wait`), `si_uid` (no uid model) and `CLD_CONTINUED`, `CLONE_VFORK` does not suspend the parent, epoll instances hold 16 watches.
+a relative sleep restarted after SIGSTOP/SIGCONT sleeps the whole time again (Linux: the rest), `si_uid` (no uid model) and `CLD_CONTINUED`, `CLONE_VFORK` does not suspend the parent, epoll instances hold 16 watches.

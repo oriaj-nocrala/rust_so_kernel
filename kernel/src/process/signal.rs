@@ -306,6 +306,14 @@ fn finish_interrupted_call(proc: &Process, tf: *mut TrapFrame, i: super::wait::I
         "interrupted: PID {} syscall {} -> {}",
         proc.pid.0, i.nr, if restart { "restart" } else { "EINTR" }
     );
+    // A sleep ended by a handler reports the time it had left (`nanosleep`/`clock_nanosleep`'s `rem`).
+    if let (false, Some(r)) = (restart, i.rem) {
+        let left = r.expiry.saturating_sub(crate::time::ktime_get());
+        let mut ts = [0u8; 16];
+        ts[..8].copy_from_slice(&((left / 1_000_000_000) as i64).to_ne_bytes());
+        ts[8..].copy_from_slice(&((left % 1_000_000_000) as i64).to_ne_bytes());
+        unsafe { proc.address_space.copy_to_user(r.rem_ptr, &ts); }
+    }
     unsafe {
         if restart {
             // Back onto the `syscall` instruction with its number in rax,

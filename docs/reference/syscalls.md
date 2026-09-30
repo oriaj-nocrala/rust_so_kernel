@@ -11,7 +11,6 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 
 ## ABI quirks (differences from Linux)
 
-- `nanosleep` takes plain nanoseconds, not a `timespec`.
 - `sigset_t` arrives in Linux layout (bit N-1 = signal N) and is shifted to the kernel's bit-N masks by `signal::mask_from_user`.
 - termios/winsize use this port's own layout (`tty` crate), not Linux's.
 - Custom numbers above the Linux range: 400 `uptime_ms`, 401 `uptime_sec`, 402 `meminfo_kb`, 403 `kdebug_ctl`, 404 `statvfs`.
@@ -35,7 +34,7 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 | 24 | yield | |
 | 32/33/292 | dup/dup2/dup3 | Shared offset. `dup`/`dup2` clear `FD_CLOEXEC` on the new fd; `dup3` sets it with `O_CLOEXEC` (`oldfd == newfd` → `EINVAL`) |
 | 34 | pause | `rt_sigsuspend` with the current mask; always `EINTR` |
-| 35 | nanosleep | hrtimer; `EINTR` on a signal |
+| 35 | nanosleep | Linux ABI (`timespec`, optional `rem`). hrtimer; `EINTR` when a handler runs, with the time left in `rem` (`Wait::rem`, written by `signal::finish_interrupted_call`). A sleep restarted after SIGSTOP/SIGCONT (`RestartPolicy::NoHandlerOnly`) sleeps the whole time again |
 | 39/110 | getpid/getppid | getpid is the thread-group id (`Process::tgid`), the same in every thread. ppid is the *process's* (a thread carries its group's), 1 after reparenting, 0 for PID 1 |
 | 41–55, 288 | socket … accept4 | AF_UNIX only (`AF_INET` → `EAFNOSUPPORT`). See `ipc.md` |
 | 56/57 | clone/fork | **clone is Linux's** `(flags, stack, ptid, ctid, tls)`. `CLONE_THREAD` (needs `VM`+`SIGHAND`): a thread that shares the address space and fds, resumes after the `syscall` with the caller's registers and `rax=0`, honours `SETTLS`, `PARENT_SETTID`, `CHILD_SETTID`, `CHILD_CLEARTID`. Without `CLONE_THREAD`: a COW fork on `stack` (musl's `posix_spawn`; the parent is not suspended). A thread is a process with its own pid (its tid) and its creator's `tgid`; a forked child's parent is the forker's tgid, so any thread's child is waitable from any thread. mlibc's `sys_clone` calls it through `__constanos_clone` (`thread_entry.S`) |
@@ -59,7 +58,7 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 | 131 | sigaltstack | Per thread, Linux's `stack_t`. `SA_ONSTACK` handlers run on it; `SS_DISABLE`, `SS_ONSTACK` in `old_ss`, `EPERM` while on it, `ENOMEM` under 2048 bytes. `fork` copies it, a thread starts without one, `exec` clears it |
 | 186/200/234 | gettid/tkill/tgkill | gettid = the pid of the thread's `Process`. `tkill` signals exactly that thread; `tgkill` also needs it to be in group `tgid` (`ESRCH` otherwise) |
 | 202 | futex | `WAIT` (relative timeout, `ETIMEDOUT`), `WAIT_BITSET` (absolute `CLOCK_MONOTONIC`, or `CLOCK_REALTIME` with the flag; Rust `std` waits with it), `WAKE`, `WAKE_BITSET`, `REQUEUE`/`CMP_REQUEUE`. Not `WAKE_OP`/PI. A timeout already past returns `ETIMEDOUT` without arming a timer |
-| 230 | clock_nanosleep | Linux ABI (`timespec`), unlike 35. `TIMER_ABSTIME` on realtime/monotonic/boottime; `rem` is never written, so an interrupted sleep restarts with the whole time when retried |
+| 230 | clock_nanosleep | Linux ABI. `TIMER_ABSTIME` on realtime/monotonic/boottime. `rem` as for 35, but never written for an absolute sleep |
 | 318 | getrandom | `crate::random` (ChaCha20, seeded on first use from RDSEED/RDRAND, TSC, clock, jitter). Never blocks; flags validated. Also `/dev/urandom`, `/dev/random` |
 | 204 | sched_getaffinity | The scheduling CPUs; returns 8. No setaffinity |
 | 213/232/233 | epoll_create/wait/ctl | Shares poll's readiness |

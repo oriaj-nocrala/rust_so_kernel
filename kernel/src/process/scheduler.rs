@@ -1900,6 +1900,7 @@ fn finish_interrupt(p: &mut Process) {
         nr: w.wait.nr,
         ret_rip: w.wait.ret_rip,
         policy: w.wait.policy,
+        rem: w.wait.rem,
     });
 }
 
