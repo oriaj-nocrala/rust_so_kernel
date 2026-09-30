@@ -603,7 +603,7 @@ pub fn syscall_handler(
         SyscallNumber::Stat => fs::sys_stat(arg1 as usize, arg2 as usize),
         SyscallNumber::Fstat => fs::sys_fstat(arg1 as i32, arg2 as usize),
         SyscallNumber::Lstat => fs::sys_lstat(arg1 as usize, arg2 as usize),
-        SyscallNumber::Sigaction => signal::sys_sigaction(arg1 as u32, arg2, arg3),
+        SyscallNumber::Sigaction => signal::sys_sigaction(arg1 as u32, arg2, arg3, arg4),
         SyscallNumber::Sigprocmask => signal::sys_sigprocmask(arg1 as i32, arg2, arg3),
         SyscallNumber::Sigreturn => signal::sys_sigreturn(),
         SyscallNumber::RtSigsuspend => signal::sys_rt_sigsuspend(arg1, arg2),

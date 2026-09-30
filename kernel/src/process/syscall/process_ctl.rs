@@ -418,7 +418,7 @@ fn fork_impl(child_stack: u64, tls: Option<u64>) -> SyscallResult {
                     // stale if `arch_prctl` ran since — same reasoning as the
                     // live `fpu::save` above.
                     Ok(child_as) => (child_as, proc.pid, crate::process::scheduler::read_fs_base(), proc.files.lock().clone(), tf_copy, proc.cwd.clone(), (proc.pgid, proc.sid, proc.ctty), proc.exe_name.clone(),
-                        (proc.signal_handlers, proc.sig_restart, proc.blocked_signals), (proc.name, proc.cmdline.clone())),
+                        (proc.signal_handlers, proc.sig_restart, proc.blocked_signals, proc.sig_extra, proc.altstack), (proc.name, proc.cmdline.clone())),
                     Err(e) => {
                         serial_println!("fork: address_space.fork() failed: {}", e);
                         return errno::ENOMEM;
@@ -450,7 +450,7 @@ fn fork_impl(child_stack: u64, tls: Option<u64>) -> SyscallResult {
         // between fork and the child's own sigaction ran the default action
         // (SIGINT killed a child its shell had set to ignore it) and one
         // the parent had blocked around fork arrived in the child anyway.
-        (child.signal_handlers, child.sig_restart, child.blocked_signals) = parent_signals;
+        (child.signal_handlers, child.sig_restart, child.blocked_signals, child.sig_extra, child.altstack) = parent_signals;
         // Linux: a child keeps its parent's `comm` and command line until
         // it execs. Every child used to be named "child", so `ps` showed a
         // shell's subshells, and any program that forks without exec'ing,
@@ -516,7 +516,7 @@ pub(super) fn sys_clone(flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) 
         let sched = crate::process::scheduler::local_scheduler();
         match sched.running_ref() {
             Some(proc) => (proc.pid, proc.address_space.clone(), proc.files.clone(), proc.cwd.clone(), (proc.pgid, proc.sid, proc.ctty), proc.exe_name.clone(),
-                (proc.signal_handlers, proc.sig_restart, proc.blocked_signals), (proc.name, proc.cmdline.clone())),
+                (proc.signal_handlers, proc.sig_restart, proc.blocked_signals, proc.sig_extra), (proc.name, proc.cmdline.clone())),
             None => return errno::ESRCH,
         }
     };
@@ -557,7 +557,7 @@ pub(super) fn sys_clone(flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) 
     // A copy, not Linux's shared table (CLONE_SIGHAND): enough that a
     // signal landing on a new thread runs the handler its process
     // installed, rather than the default action.
-    (thread.signal_handlers, thread.sig_restart, thread.blocked_signals) = parent_signals;
+    (thread.signal_handlers, thread.sig_restart, thread.blocked_signals, thread.sig_extra) = parent_signals;
     thread.ctty = parent_ctty;
     // A thread starts with its creator's name and command line, as on Linux.
     thread.name = parent_comm;
@@ -781,12 +781,15 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
                 // sleep 1'` execs `sleep` in place, `true`'s SIGCHLD then
                 // jumped into ash's handler inside `sleep`, before ash's
                 // globals existed — SIGSEGV writing to 0x45, every time.
-                for action in proc.signal_handlers.iter_mut() {
+                for (sig, action) in proc.signal_handlers.iter_mut().enumerate() {
                     if let crate::process::SignalAction::Handler(_) = action {
                         *action = crate::process::SignalAction::Default;
+                        proc.sig_extra[sig] = crate::process::signal::SigExtra::NONE;
                     }
                 }
                 proc.sig_restart = 0;
+                // The alternate stack lives in the old image too.
+                proc.altstack = crate::process::signal::AltStack::NONE;
                 // `set_tid_address`'s pointer belongs to the old image.
                 proc.clear_child_tid = 0;
                 crate::ktrace!(crate::debug::SCHED, "exec: dropping old AS");

@@ -398,13 +398,11 @@ pub fn kill(pid: i64, sig: u32) -> i64 {
 
 /// Installs `handler` (an `extern "C" fn(i32)`, cast to a function-pointer
 /// bit pattern) for `sig`. Pass `0` for the default action or `1` to
-/// ignore. Simplified ABI: the kernel reads/writes a single `u64` handler
-/// address, not the full `struct sigaction` (see `kernel/src/process/
-/// syscall.rs::sys_sigaction`'s doc comment) — hence the pointer-to-local
-/// indirection here.
+/// ignore. `rt_sigaction`'s Linux struct with no flags, no mask and no
+/// `SA_RESTORER`: the kernel returns the handler through its own trampoline.
 pub fn sigaction(sig: u32, handler: u64) -> i64 {
-    let act: u64 = handler;
-    unsafe { syscall3(SYS_SIGACTION, sig as u64, &act as *const u64 as u64, 0) }
+    let act: [u64; 4] = [handler, 0, 0, 0];
+    unsafe { syscall4(SYS_SIGACTION, sig as u64, act.as_ptr() as u64, 0, 8) }
 }
 
 /// `how` is one of `SIG_BLOCK`/`SIG_UNBLOCK`/`SIG_SETMASK`; `mask` is a

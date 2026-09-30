@@ -303,6 +303,11 @@ pub struct Process {
     /// `SA_RESTART`, one bit per signal (bit N = signal N), from
     /// `sigaction`. Reset with the handlers on `exec`.
     pub sig_restart: u64,
+    /// `sa_flags`, `sa_restorer` and `sa_mask` per signal, from `sigaction`. Inherited by `fork`/`clone` and reset with the
+    /// handlers on `exec`.
+    pub sig_extra: [signal::SigExtra; signal::NUM_SIGNALS],
+    /// The alternate signal stack (`sigaltstack`). Copied by `fork`; a thread starts without one; `exec` clears it.
+    pub altstack: signal::AltStack,
 
     /// CPU time in ticks (`sched::cputime`): user/system sampled by the
     /// timer, one tick at a time, to whatever each CPU interrupted; plus
@@ -417,6 +422,8 @@ impl Process {
             wait: None,
             interrupted: None,
             sig_restart: 0,
+            sig_extra: [signal::SigExtra::NONE; signal::NUM_SIGNALS],
+            altstack: signal::AltStack::NONE,
             times: sched::cputime::ProcTimes::default(),
             dead_threads: sched::cputime::ProcTimes::default(),
             dead_threads_ns: 0,
@@ -508,6 +515,8 @@ impl Process {
             wait: None,
             interrupted: None,
             sig_restart: 0,
+            sig_extra: [signal::SigExtra::NONE; signal::NUM_SIGNALS],
+            altstack: signal::AltStack::NONE,
             times: sched::cputime::ProcTimes::default(),
             dead_threads: sched::cputime::ProcTimes::default(),
             dead_threads_ns: 0,
@@ -590,6 +599,8 @@ impl Process {
             wait: None,
             interrupted: None,
             sig_restart: 0,
+            sig_extra: [signal::SigExtra::NONE; signal::NUM_SIGNALS],
+            altstack: signal::AltStack::NONE,
             times: sched::cputime::ProcTimes::default(),
             dead_threads: sched::cputime::ProcTimes::default(),
             dead_threads_ns: 0,
@@ -699,6 +710,8 @@ impl Process {
             wait: None,
             interrupted: None,
             sig_restart: 0,
+            sig_extra: [signal::SigExtra::NONE; signal::NUM_SIGNALS],
+            altstack: signal::AltStack::NONE,
             times: sched::cputime::ProcTimes::default(),
             dead_threads: sched::cputime::ProcTimes::default(),
             dead_threads_ns: 0,

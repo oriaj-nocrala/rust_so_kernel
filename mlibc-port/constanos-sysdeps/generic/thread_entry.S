@@ -21,5 +21,16 @@ __constanos_clone:
 	jmp __mlibc_start_thread
 1:	ret
 
+# A signal handler returns here (sa_restorer): rt_sigreturn(15) with rsp at the ucontext.
+.global __mlibc_signal_restore
+.type __mlibc_signal_restore, @function
+__mlibc_signal_restore:
+.global __mlibc_signal_restore_rt
+.type __mlibc_signal_restore_rt, @function
+__mlibc_signal_restore_rt:
+	mov $15, %rax
+	syscall
+	ud2
+
 .section .note.GNU-stack,"",%progbits
 

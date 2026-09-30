@@ -92,6 +92,7 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "linux_abi_test",
     "mprotect_test",
     "cloexec_test",
+    "sigabi_test",
     "argv_test",
     "jobctl_test",
     "ext2_robust_test",

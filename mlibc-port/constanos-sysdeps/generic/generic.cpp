@@ -69,11 +69,8 @@ constexpr long SYS_sigaction = 13;
 constexpr long SYS_sigprocmask = 14;
 constexpr long SYS_rt_sigsuspend = 130;
 constexpr long SYS_pause = 34;
-// SYS_sigreturn(15) is never called directly by userspace — only the
-// kernel-mapped trampoline page uses it (see kernel/src/memory/
-// signal_trampoline.rs); mlibc's sigaction() doesn't need to know it
-// exists, since this kernel injects the trampoline transparently instead
-// of relying on a userspace-supplied sa_restorer.
+// SYS_sigreturn(15) is issued by `__mlibc_signal_restore` (thread_entry.S), the sa_restorer sys_sigaction installs.
+constexpr long SYS_sigaltstack = 131;
 constexpr long SYS_poll = 7;
 constexpr long SYS_lseek = 8;
 constexpr long SYS_mmap = 9;
@@ -1182,28 +1179,50 @@ int sys_kill(int pid, int sig) {
 	return ret < 0 ? (int)-ret : 0;
 }
 
-// This kernel's sigaction(13) reads/writes a single `u64` handler address
-// at offset 0 of `act`/`oldact` (SIG_DFL=0, SIG_IGN=1, or a handler
-// pointer) rather than the full ABI struct — but `sa_handler` (a
-// `void (*)(int)`) already IS `struct sigaction`'s first member (see
-// include/abi-bits/signal.h), so the raw struct pointer is binary-
-// compatible as-is. `sa_mask`/`sa_flags`/`sa_restorer` are silently
-// ignored: this kernel injects its own sigreturn trampoline transparently
-// (see kernel/src/process/signal.rs), so no restorer needs to be supplied,
-// and per-handler blocking during delivery is unconditional rather than
-// configurable via sa_mask.
+// rt_sigaction(13) is Linux's: a `kernel_sigaction` { handler, flags, restorer, mask } and the sigset size in r10. The handler
+// returns through `sa_restorer` (`__mlibc_signal_restore(_rt)`, thread_entry.S: `mov $15, %rax; syscall`), so SA_RESTORER is
+// always set; the kernel's own fallback trampoline is for programs that do not have one (the Rust userspace crate).
+extern "C" void __mlibc_signal_restore(void);
+extern "C" void __mlibc_signal_restore_rt(void);
+
 int sys_sigaction(int sig, const struct sigaction *__restrict act,
 		struct sigaction *__restrict oldact) {
-	long ret = raw_syscall(SYS_sigaction, sig, (long)act, (long)oldact);
+	struct ksigaction {
+		void (*handler)(int);
+		unsigned long flags;
+		void (*restorer)(void);
+		unsigned long mask;
+	};
+	struct ksigaction kact, kold;
+	if (act) {
+		kact.handler = act->sa_handler;
+		kact.flags = act->sa_flags | SA_RESTORER;
+		kact.restorer = (act->sa_flags & SA_SIGINFO) ? __mlibc_signal_restore_rt : __mlibc_signal_restore;
+		kact.mask = act->sa_mask.sig[0];
+	}
+	long ret = raw_syscall(SYS_sigaction, sig, (long)(act ? &kact : nullptr), (long)(oldact ? &kold : nullptr), 8);
+	if (ret < 0)
+		return (int)-ret;
+	if (oldact) {
+		oldact->sa_handler = kold.handler;
+		oldact->sa_flags = kold.flags;
+		oldact->sa_restorer = kold.restorer;
+		__builtin_memset(&oldact->sa_mask, 0, sizeof(oldact->sa_mask));
+		oldact->sa_mask.sig[0] = kold.mask;
+	}
+	return 0;
+}
+
+// sigset_t is Linux's 1024-bit set; the kernel reads and writes its first 8 bytes (bit N-1 = signal N) and converts to its own
+// bit-N numbering at the syscall boundary.
+int sys_sigprocmask(int how, const sigset_t *__restrict set,
+		sigset_t *__restrict old) {
+	long ret = raw_syscall(SYS_sigprocmask, how, (long)set, (long)old, 8);
 	return ret < 0 ? (int)-ret : 0;
 }
 
-// sigset_t is a plain uint64_t in this port (abi-bits/signal.h) in Linux's
-// layout (bit N-1 = signal N, as mlibc's sigaddset writes it); the kernel
-// converts to its own bit-N numbering at the syscall boundary.
-int sys_sigprocmask(int how, const sigset_t *__restrict set,
-		sigset_t *__restrict old) {
-	long ret = raw_syscall(SYS_sigprocmask, how, (long)set, (long)old);
+int sys_sigaltstack(const stack_t *ss, stack_t *oss) {
+	long ret = raw_syscall(SYS_sigaltstack, (long)ss, (long)oss);
 	return ret < 0 ? (int)-ret : 0;
 }
 
@@ -1212,7 +1231,7 @@ int sys_sigprocmask(int how, const sigset_t *__restrict set,
 // Without this, sigsuspend() was ENOSYS and BusyBox ash's `wait` spun
 // forever with every signal blocked (waitproc's sigsuspend loop).
 int sys_sigsuspend(const sigset_t *set) {
-	long ret = raw_syscall(SYS_rt_sigsuspend, (long)set, (long)sizeof(sigset_t));
+	long ret = raw_syscall(SYS_rt_sigsuspend, (long)set, 8L);
 	return ret < 0 ? (int)-ret : 0;
 }
 

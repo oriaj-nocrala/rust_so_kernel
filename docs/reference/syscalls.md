@@ -12,7 +12,6 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 ## ABI quirks (differences from Linux)
 
 - `nanosleep` takes plain nanoseconds, not a `timespec`.
-- `struct sigaction`: `sa_flags` is at offset 16, and `SA_RESTART` = `1<<3`. Only `SA_RESTART` is honoured.
 - `sigset_t` arrives in Linux layout (bit N-1 = signal N) and is shifted to the kernel's bit-N masks by `signal::mask_from_user`.
 - termios/winsize use this port's own layout (`tty` crate), not Linux's.
 - Custom numbers above the Linux range: 400 `uptime_ms`, 401 `uptime_sec`, 402 `meminfo_kb`, 403 `kdebug_ctl`, 404 `statvfs`.
@@ -28,7 +27,7 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 | 9/11 | mmap/munmap | Private anonymous, `MAP_SHARED` of a memfd, or `MAP_SHARED\|MAP_ANONYMOUS`. A nonzero `addr` is treated as `MAP_FIXED` (and fails over an existing mapping). `prot` 0 is a real `PROT_NONE`. `munmap` takes any page-aligned range: cuts VMAs, spans several, holes are fine |
 | 10 | mprotect | Splits VMAs at the range's ends and rejoins equal neighbours; hole in the range → `ENOMEM`. A `Huge2M` VMA can only be cut on 2 MiB boundaries. `PROT_EXEC` is ignored (NX is off) |
 | 12 | brk | |
-| 13/14/15 | sigaction/sigprocmask/sigreturn | fork and clone inherit dispositions, `SA_RESTART` and the mask |
+| 13/14/15 | rt_sigaction/rt_sigprocmask/rt_sigreturn | **Linux's ABI** (`{handler, flags, restorer, mask}`, sigsetsize 8; `abi-bits/signal.h` is Linux's). Honoured: `SA_SIGINFO` (handler gets `siginfo*` and a Linux `ucontext*`), `SA_RESTORER`, `SA_ONSTACK`, `SA_RESTART`, `SA_NODEFER`, `SA_RESETHAND`, `sa_mask`. Without `SA_RESTORER` the handler returns through a fixed trampoline page. `rt_sigreturn` takes the registers and mask back from the (editable) `ucontext`. fork and clone inherit dispositions, flags and the mask. **Only signals sent to a process reach handlers; a hardware fault (`SIGSEGV` from a page fault, `#GP`…) still kills it**, and `si_pid`/`si_code` are always 0 (`SI_USER`) |
 | 16 | ioctl | termios, `TIOCGWINSZ`, `TIOCG/SPGRP`. On any fd: `FIONBIO`, `FIOCLEX`/`FIONCLEX`. On a pty the handle answers every tty ioctl. `/dev/fb`: `FBIO_BLIT` 0x4642_0001. `/dev/fb0`: `FBIO_GET_INFO` 0x4642_0010, `FBIO_FLUSH` 0x4642_0011 |
 | 20 | writev | |
 | 21 | access | `F_OK`/`R_OK`/`X_OK` = "the path resolves". `W_OK` really probes: opens `O_WRONLY` and writes 0 bytes |
@@ -57,7 +56,7 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 | 158 | arch_prctl | `ARCH_SET_FS` |
 | 162 | sync | Flushes the kernel log to the USB log partition (ext2 writes are synchronous). Errors: `ENODEV`/`EBUSY`/`EIO` |
 | 169 | reboot | Flushes the log, then resets: FADT `RESET_REG` → port 0xCF9 → 8042 0xFE → triple fault (`reboot.rs`). `HALT`/`POWER_OFF` just stop |
-| 131 | sigaltstack | Accepts and reports `SS_DISABLE`; handlers still run on the interrupted stack (`SA_ONSTACK` is not honoured) |
+| 131 | sigaltstack | Per thread, Linux's `stack_t`. `SA_ONSTACK` handlers run on it; `SS_DISABLE`, `SS_ONSTACK` in `old_ss`, `EPERM` while on it, `ENOMEM` under 2048 bytes. `fork` copies it, a thread starts without one, `exec` clears it |
 | 186/200/234 | gettid/tkill/tgkill | A thread is a process with its own pid, so tid = pid and `tkill` = `kill` on it; `tgkill` does not check the group |
 | 202 | futex | `WAIT` (relative timeout, `ETIMEDOUT`), `WAIT_BITSET` (absolute `CLOCK_MONOTONIC`, or `CLOCK_REALTIME` with the flag; Rust `std` waits with it), `WAKE`, `WAKE_BITSET`, `REQUEUE`/`CMP_REQUEUE`. Not `WAKE_OP`/PI. A timeout already past returns `ETIMEDOUT` without arming a timer |
 | 230 | clock_nanosleep | Linux ABI (`timespec`), unlike 35. `TIMER_ABSTIME` on realtime/monotonic/boottime; `rem` is never written, so an interrupted sleep restarts with the whole time when retried |
