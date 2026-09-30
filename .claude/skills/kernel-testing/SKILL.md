@@ -52,3 +52,12 @@ description: Playbook for verifying a change to rust_so_kernel: which test suite
 
 - `userspace/c/<thing>_test.c`, in `DISK_C_PROGRAMS` (see the `userspace-programs` skill). Each one prints its cases and a pass/fail summary. Run it in a booted kernel and grep serial.log.
 - Existing ones cover sockets, ptys, shm, pipes, signals and waits, sessions, CPU time, RSS, timestamps, FPU and input polling. Look for the matching test before writing a new one.
+
+## Traps found while doing G5 (each cost time)
+
+- **`scripts/run-abi-suite.sh` runs the previous binary when a C test fails to build.** The build error scrolls past above `matched: #`; if a new check does not appear in `/tmp/qemu-debug-rust_so_kernel/serial.log`, run `cargo build 2>&1 | grep error -A4` first. A new name that clashes with libc (`bind`, `send`, ...) is the usual cause.
+- **A file staged in `disk-image-root/bin/` needs `touch build.rs`** before `cargo build` copies it into `disk.img`; check with `debugfs -R "ls -l /bin" disk.img`. And `dumpe2fs -h disk.img | grep Free`: 15 MB Vulkan programs filled the old 160 MiB image (now 288 MiB).
+- **Sabotage a kernel change through a QEMU test in one command:** `scripts/gpu-mutate-qemu.py LIST.py` (a python file with `TEST` and `MUTS = [(file, name, old, new)]`; example `nvgpu/mutations/sharing_kernel.py`). It rebuilds each mutant, runs the test, prints DETECTED/SURVIVED/BUILD-ERROR and restores the files even on ^C. A BUILD-ERROR is not a detection.
+- **The software GPU device (QEMU) completes every EXEC at once.** It cannot show "work queued, not finished, nobody calling in" races. Put those in an `nvgpu_hw_test` section and prove them on metal; say so when a mutant survives in QEMU for that reason.
+- **A flaky test that appears only in the full suite** (here: "the slot is still busy right after waitpid") can be a real pre-existing race made likelier by the change: repeat the single test in one boot first (`for i in ...; do /mnt/bin/x; done` through `qemu-debug.sh send`), then read the kernel path (`wait4` settled only on entry) before editing the test. Fix the kernel, then run the whole suite three times.
+- Tests that count concurrent resources across `fork` must make every child open, report, and wait for a "go" byte: in QEMU a child finishes and releases its slot before the next one opens.

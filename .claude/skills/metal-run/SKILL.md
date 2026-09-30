@@ -72,3 +72,9 @@ Then Read the image (upscale first with `ffmpeg -i x.jpg -vf scale=1600:-1 x.png
 ## What only metal shows
 
 Write-combining and VRAM speed, APERF/MPERF, k10temp, RAPL, torn xHCI event TRBs, HDA/NVMe/RTL8111 (no drivers yet), a composite USB mouse, and all RAM above 512 MiB.
+
+## When the user reports a glitch seen on the screen ("a stutter at 2 seconds")
+
+An average hides it (58.6 fps vs 60.1). What worked, in two rounds: (1) make the program log every frame interval over 25 ms with its time since start **and** the absolute `CLOCK_MONOTONIC` of its start; stamp each phase of the job with `cut -d' ' -f1 /proc/uptime` (same clock base); run the program alone first as a baseline; (2) add a kernel-side record of what it suspects (a ring of lock holds over 2 ms: operation, when, how long: `gpu_uapi_slow:` in /proc/kdebug) and print it in the job's summary. Lining the two up located the cause (a global lock held across RM calls) and, after the fix, showed it gone (0 intervals over 25 ms). Pattern: measure first, one round per hypothesis, put every independent diagnostic in the same boot.
+
+Job summary lines are printed twice and the log wraps (64 KiB): print the whole summary at the end of the job (`cat /tmp/<job>.sum`) and read it with `grep -a <job-name> boot.log | awk '!seen[$0]++'`. `scripts/metal-jobs/gpu-multi.sh` is a template for a multi-program job with phases, baselines and a leak check (`gpu_share:` must read 0/0/0 at the end).

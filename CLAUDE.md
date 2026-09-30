@@ -27,6 +27,7 @@ cd kernel && cargo build --target x86_64-unknown-none  # the kernel crate alone
 | `gpu-display` | Display work on the NVIDIA GA106 (`nvgpu`, `kernel/src/gpu/`): recipe (oracle → fixture → pure code → replay test → sabotage → adapter → `gpu=` level → job), code map, nouveau reference map |
 | `gpu-gsp` | GSP-RM on the GA106 and phase 6: `nvgpu::{falcon,fwsec,firmware,gspmem,booter,rpc,rm}`, `kernel/src/gpu/gsp.rs` (`gpu=fwsec`/`gpu=gsp`), GPU page tables `nvgpu::mmu`, GPFIFO channel + copy engine `nvgpu::chan` (`gpu=vaspace`/`gpu=copy`): code map, VRAM/VA memory map, bring-up ladder, doorbell/token, where NVIDIA's hardware manuals are (`~/src/gpu-ref/open-gpu-doc`), mutation-testing tool, metal stability protocol, phase 6d measurements/rules (BAR1 after GSP-RM, link ceiling, CE interrupt, RC events) |
 | `linux-abi` | Making Linux/musl/Rust-std binaries run: running a std program on the kernel, testing a syscall with a raw C test proven by sabotage, the traps (opt-level-0 stack copies, IF=0, fork masking PTE bugs), what is still missing |
+| `gpu-g5` | Many GPU clients, sharing buffers/timelines between processes, the GPU lock discipline, Mesa import/export, `vk_share`, `gpu-multi.sh`, and where the WSI (layer 3) starts |
 | `kernel-drivers` | Writing or porting a driver (`hal` seams, `/dev` entries, driver tests) |
 
 ## Code map
