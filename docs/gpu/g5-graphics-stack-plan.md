@@ -16,7 +16,7 @@ Decisión (2026-09-30, usuario + análisis): **WSI estándar de Vulkan como cimi
 
 ## Ya hecho y reutilizable
 
-`NVG_IOC_{SCANOUT_INFO,PRESENT,FLIP_STATE}`; `Framebuffer::{present_external,restore_front}`; `/dev/vblank` (poll, un `read` por espera); canales GR por contexto con RC aislado (`uapi.rs` `create_rt`/`destroy_rt`); `vk_draw` (`VK_DRAW_PRESENT` copia por CPU a `/dev/fb0`, `VK_DRAW_SCANOUT` triple buffer sin copia); job `scripts/metal-jobs/gpu-vk.sh` (todo en un arranque); extensión de Mesa en `mesa-port/overlay`.
+`NVG_IOC_{SCANOUT_INFO,PRESENT,FLIP_STATE}`; `Framebuffer::{present_external,restore_front}`; `/dev/vblank` (poll, un `read` por espera); canales GR por contexto con RC aislado (`uapi.rs` `create_rt`/`destroy_rt`); `vk_draw` (`VK_DRAW_PRESENT` copia por CPU a `/dev/fb0`, `VK_DRAW_SCANOUT` triple buffer sin copia); job `scripts/metal-jobs/gpu-vk.sh` (todo en un arranque); `snake3d` (`probes/nvk/vk_snake.c`, shaders `snake3d.{vert,frag}` -> `gen-spv.sh`; job `gpu-snake.sh`): primera app 3D real sobre NVK (profundidad, mezcla aditiva/alfa, push constants de 160 B, sin buffers de vértices ni descriptores), se prueba en el host con `probes/nvk/host-snake.sh` (mismo fuente, `-DSNAKE_HOST`, vuelca PPM) y en QEMU con `SNAKE3D_HEADLESS=1` (dispositivo software: compila con NAK y recorre todo Vulkan sin ejecutar); extensión de Mesa en `mesa-port/overlay`.
 
 ## Primer paso de la próxima sesión
 

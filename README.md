@@ -143,6 +143,7 @@ foto.
 | `uname` | Info del sistema |
 | `uptime` / `tsc` | Demos de tiempo (hrtimer, TSC) — `sleep` real ahora lo da BusyBox |
 | `snake` | El clásico en color de 32 bits (320x200, serpiente de neón que se desliza entre celdas, partículas, HUD en fuente de píxeles); en ventana bajo el compositor y a pantalla completa en la consola, vía `userspace::gfx` |
+| `snake3d` | El snake en 3D real sobre la GPU (Vulkan en NVK, `probes/nvk/vk_snake.c`; solo con `gpu=uapi` en la Ryzen): cámara en perspectiva (vista general o persecución, `C`), serpiente de esferas iluminadas con sombras, comida orbital que ilumina el suelo, partículas aditivas, buffer de profundidad y HUD de glifos; scanout sin copia a 60 fps. El `snake` 2D sigue siendo la versión sin GPU. Se despliega a mano (16 MB): ver `scripts/metal-jobs/gpu-snake.sh` |
 | `ipc_ping` | Demo de IPC: fork + servidor + cliente, 100 round-trips por canal |
 | `mmap_test` / `poll_test` | Ejercitan `mmap`/`munmap` y `poll` end-to-end |
 | `hello` | Programa en **C real**, compilado y linkeado contra mlibc — `printf("Hello from user!\n")` pasando por todo el stack de stdio de libc |
