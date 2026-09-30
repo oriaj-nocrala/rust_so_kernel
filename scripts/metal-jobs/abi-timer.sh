@@ -21,8 +21,10 @@ for t in $tests; do
   if [ $rc != 0 ] || grep -q FAIL /tmp/t.out; then
     bad=$((bad + 1))
     sum "abi: $t exit=$rc"
-    grep -E 'FAIL|fail|error' /tmp/t.out | head -4 | while read l; do sum "abi:   $l"; done
-    tail -2 /tmp/t.out | while read l; do sum "abi:   | $l"; done
+    # No `read` loops here: this ash's `read` builtin hangs (from a file) or prints nothing (in a pipeline).
+    grep -E 'FAIL|fail|error' /tmp/t.out | head -n 4 >> /tmp/abi-timer.sum
+    grep -E 'FAIL|fail|error' /tmp/t.out | head -n 4
+    tail -n 2 /tmp/t.out >> /tmp/abi-timer.sum
   fi
 done
 sum "abi: $total tests, $bad bad"
@@ -39,8 +41,8 @@ for p in tkprobe tkstress; do
   nb=$(grep -c 'ok=false' /tmp/$p.out)
   done_=$(grep -c 'TK DONE' /tmp/$p.out)
   sum "tokio: $p exit=$rc ${el}s ok=false:$nb done:$done_"
-  grep 'ok=false' /tmp/$p.out | head -5 | while read l; do sum "tokio:   $l"; done
-  [ "$rc" = 0 ] && [ "$nb" = 0 ] && [ "$done_" = 1 ] || { fail=1; tail -3 /tmp/$p.out | while read l; do sum "tokio:   | $l"; done; }
+  grep 'ok=false' /tmp/$p.out | head -n 5 >> /tmp/abi-timer.sum
+  [ "$rc" = 0 ] && [ "$nb" = 0 ] && [ "$done_" = 1 ] || { fail=1; tail -n 3 /tmp/$p.out >> /tmp/abi-timer.sum; }
 done
 
 echo "---- summary (the log wraps) ----"
