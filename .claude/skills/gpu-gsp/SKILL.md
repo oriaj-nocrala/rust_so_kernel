@@ -96,3 +96,26 @@ Code map additions: `kernel/src/gpu/bench.rs` (measurements after the ladder), `
 1. Only if the compositor is to use the copy engine (decision in the plan: not now): map the shadow and the scanout buffers (VRAM 16/32 MiB) in the VA space at boot (`Buffers::map` shows how; `map_huge_range` for 2 MiB-aligned contiguous ranges), a system-wide submit lock, a CPU fallback, recreating the channel after an RC, `Framebuffer::copy_out` calling `chan::copy_rect_push`.
 2. Recreate a channel after RC (dispatch `RC_TRIGGERED` from `poll_events`).
 3. Phase 7 of the plan (see `docs/gpu/gpu-plan.md`).
+
+## Phase 7a: GR context and compute class (`gpu=compute`), done on the Ryzen #136 (details: `docs/gpu/gpu-plan.md` "Resultados de la fase 7a")
+
+Code: `nvgpu::gr` (context buffers from `GET_CONTEXT_BUFFERS_INFO`, `entries`/`promote_params`, `plan`/`mappings`, compute pushes), `nvgpu::mmu::map_big` (64 KiB pages), `kernel/src/gpu/compute.rs` (`prepare` before the tables, `run` after `copy`; the golden context `golden`/`try_golden`/`golden_tables`, then the GR channel and three rungs), `Rm::free`, `gsp::take_events`. Job `gpu-compute.sh`. Oracle: `nvgpu/fixtures/rm-ph7-gr-*` (trace RPCs #21-#25).
+
+Rules learned:
+- **The golden channel needs an RM-managed VA space over our own tables** (`FERMI_VASPACE_A` without `EXTERNALLY_OWNED`, then `COPY_SERVER_RESERVED_PDES` naming the root, PD2 and PD1 on VA 0's path: `PageTables::directories(0)`), with the context buffers already mapped there (trace VAs, `gr::trace_placement`). In our externally owned space the golden `PROMOTE_CTX` refuses (31) any MAIN entry with a VA (#126-#134); handing RM zeroed directory pages (#128) fails the same way, since nothing is mapped. The normal GR channel's promote in the external space is accepted.
+- A push buffer of 4 KiB cannot carry 4 KiB of inline data: split writes (`gr::INLINE_CHUNK_WORDS`).
+- A failed promote can leave GSP-RM unresponsive for the rest of the boot ("nothing from GSP-RM in 10000 ms"): put the most informative attempt first, keep the number of channel alloc/free cycles small.
+- An unmapped VA in a MAIN entry makes RM walk it: MMU fault + RC (channel error 87) events.
+- GSP-RM's `POST_NOCAT_RECORD` about `GFW_BOOT_PROGRESS` is noise; the firmware has no log ELF, so its logs are undecodable here. When RM answers 31 with no message, compare the call's *context* with nouveau's (what the objects point to in memory), not only the bytes of the RPC.
+- r570 `ENGINE_ID_COUNT` is 0x1a (26 buffers per engine), the r535 header in nouveau's tree says 0x19.
+
+## Phase 7b: a compute shader (`gpu=compute`, rungs 4-6), done on the Ryzen #139 (details: `docs/gpu/gpu-plan.md` "Resultados de la fase 7b", `docs/reference/gpu.md`)
+
+Code: `nvgpu::qmd` (QMD V03_00 `build`, `sm_config`, the shaders' constants), `nvgpu::gr::{dispatch_push, l2_flush_push, KERN_*}`, `compute.rs` (`launch`, `check_output`, `l2_flush`). Oracles: `nvgpu/gen/qmd.c` (words + `MW` ranges from `clc6c0qmd.h`; commands in its header), SASS from the host's `/opt/cuda/bin/{nvcc,nvdisasm}` (`nvgpu/gen/shader/`, `extract.py`).
+
+Rules learned:
+- To add a shader: write the `.cu`, `nvcc -arch=sm_86 -cubin`, `extract.py cubin kernel OUT.bin` (prints registers and constant-bank size), `include_bytes!` it, pin its instructions in a test (`nvdisasm -c -hex`). Parameters come from `c[0x0][0x160]` (CUDA ABI); a QMD needs cbuf 0 of at least `.nv.constant0` bytes.
+- A launch is: `SET_OBJECT`, memory windows, `INVALIDATE_SKED_CACHES`, `SEND_PCAS_A`, `SEND_SIGNALING_PCAS2_B`; wait with `WAIT_FOR_IDLE` + a semaphore, or with the QMD's own `RELEASE0`. It worked the first time it ran (#137): no `SET_SHADER_LOCAL_MEMORY`, no SPA version, when the shader uses no local memory.
+- **Verify output with a scribbled destination and read it by another path.** For host memory the CPU is that path. For VRAM, PRAMIN does **not** show the SM's stores (open finding: not after waits, MMIO or `MEM_OP` L2 flushes, or `STG.E.STRONG.SYS`), so read VRAM with a `copy` shader into a host page.
+- BAR1 reads of VRAM fail after GSP-RM (write-only view): not an alternative CPU read path.
+- Metal budget: three boots (#137-#139) were spent on a 5-line question (the PRAMIN view); when a check fails, add every independent diagnostic to the same boot before relaunching.

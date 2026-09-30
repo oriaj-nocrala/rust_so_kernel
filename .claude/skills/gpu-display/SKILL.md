@@ -37,7 +37,7 @@ Nouveau reference (`nvkm/engine/disp/` unless noted): `gv100.c` (channels, SOR s
 
 ## Where the project stands / what is next
 
-Done and measured: fases 0-3, 5.0-5.8 (own display driver on head 0 at up to 180 Hz and on head 1 through HDMI). Not started: 5.7b (resolution change: window/framebuffer/console/compositor resize), a compositor that drives both heads (window 2 scans a static picture today; `/dev/fb1` + mmap or a second `Scanout` would be the way; see `docs/gui/gui-plan.md`), fase 4 (GSP, riskiest: firmware 570.144, `gsp-570.144.bin` 63 MB does not fit `disk.img`), fase 6 (channel + copy engine), fase 7 (3D stack decision, a document).
+Done and measured: fases 0-3, 5.0-5.8 (own display driver on head 0 at up to 180 Hz and on head 1 through HDMI). Not started: 5.7b (resolution change: window/framebuffer/console/compositor resize), a compositor that drives both heads (window 2 scans a static picture today; `/dev/fb1` + mmap or a second `Scanout` would be the way; see `docs/gui/gui-plan.md`), fase 4 (GSP, riskiest: firmware 570.144, `gsp-570.144.bin` 63 MB does not fit `disk.img`), fase 6 (channel + copy engine: done), fase 7 (3D stack decision: done, `docs/gpu/phase7-3d-decision.md`; 7a `gpu=compute` (GR channel + compute class) and 7b (a real shader through a QMD) are done, see `gpu-gsp`).
 
 ## Rules learned the hard way
 

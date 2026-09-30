@@ -20,7 +20,7 @@
 > (VPLL en el supervisor 2.1, `gpu=vpll`; host y QEMU verdes). Ryzen #78:
 > **Fase 5.5 cerrada** (Ryzen #80: 50 Hz y vuelta a 60 Hz reprogramando el
 > VPLL; la codificación de `fN` de nouveau está mal en GA106, medido y
-> corregido; ver "Resultados de la fase 5.5"). **Fase 5.6 cerrada** (Ryzen #82: reentrenado a 4×HBR2 y de vuelta a 2×HBR al mismo modo, 60 Hz, visto a mano; ver "Resultados de la fase 5.6"). **Fase 5.7 cerrada** (Ryzen #85: 180 Hz, 120 Hz CVT-RB2 y vuelta a 60 Hz sin reiniciar; 180 Hz visto en el menú del ASUS; ver "Resultados de la fase 5.7"). **Fase 5.8 cerrada** (Ryzen #92: el HP por HDMI a 1080p60 con imagen propia, `hdmi on`/`off` repetidos; ver "Resultados de la fase 5.8"). Ninguna fase se da por hecha sin su
+> corregido; ver "Resultados de la fase 5.5"). **Fase 5.6 cerrada** (Ryzen #82: reentrenado a 4×HBR2 y de vuelta a 2×HBR al mismo modo, 60 Hz, visto a mano; ver "Resultados de la fase 5.6"). **Fase 5.7 cerrada** (Ryzen #85: 180 Hz, 120 Hz CVT-RB2 y vuelta a 60 Hz sin reiniciar; 180 Hz visto en el menú del ASUS; ver "Resultados de la fase 5.7"). **Fase 5.8 cerrada** (Ryzen #92: el HP por HDMI a 1080p60 con imagen propia, `hdmi on`/`off` repetidos; ver "Resultados de la fase 5.8"). **Fase 7 cerrada** (2026-09-29, documento de decisión sobre fuentes, sin código de GPU: camino C = NVK con backend `nvkmd` propio; ver "Resultados de la fase 7"). **Fase 7a cerrada** (Ryzen #136: contexto dorado, canal GR con objeto de cómputo `0xc7c0` y tres empujes verificados; ver "Resultados de la fase 7a"). **Fase 7b cerrada** (Ryzen #139: un shader SASS lanzado por QMD escribe 256 palabras verificadas en memoria del host y en VRAM; ver "Resultados de la fase 7b"). Ninguna fase de código se da por hecha sin su
 > criterio medido en la Ryzen.
 
 ## Objetivo
@@ -965,6 +965,44 @@ Código: `kernel/src/gpu/bench.rs` (mediciones), `kernel/src/gpu/intr.rs` (fuent
 
 **Hecho / no hecho de la lista de 6d:** (1) estabilidad hecha (#105-#109 con el código de 6c y **#120-#124, cinco seguidos, con el de 6d completo**: 150/150 interrupciones, RM contesta tras el fallo provocado, ASUS a 59,98-60,00 Hz; `gpu=gsp` sin `copy` sigue bien, #125); (2) `Rm` de larga vida hecho, servicio de eventos por sondeo (no hay interrupción); (3) fence por interrupción medido (funciona, no gana al sondeo en latencia, sí libera la CPU); (4) los búferes de scanout **no** se mapearon: el banco de rectángulos usa VRAM 160 MiB con la misma geometría (nada del CE/MMU depende de qué dirección de VRAM sea), y el mapeo real se hará cuando se integre; (5) 2 MiB medido (sin ganancia); (6) decidido (no). Queda del plan de la fase 6 el criterio "el compositor sube su búfer por CE y `fb_flush` baja": **no se cumple por decisión**, con datos.
 
+## Resultados de la fase 7 (2026-09-29)
+
+Documento: `docs/gpu/phase7-3d-decision.md` (comparación con cifras de las fuentes fijadas; Mesa `main` 20f48abe clonado *sparse* en `~/src/gpu-ref/mesa`). Es una puerta: no hay código ni arranque en la Ryzen.
+
+- **Decisión: NVK con un backend `nvkmd` propio de constanos.** NVK toca el kernel solo por `winsys` (1311 líneas) y `nvkmd/nouveau` (1471), y `nvkmd` es un punto de extensión de Mesa: un backend propio (~1,5 k líneas, est.) evita `/dev/dri`, sysfs y libdrm, que es lo que encarecería la uAPI DRM de nouveau.
+- **Módulos abiertos de NVIDIA descartados:** 1,15 M de líneas en `src/nvidia` que duplican `nvgpu`, ~13 k de pegamento con Linux por reescribir, espacio de usuario cerrado con glibc dinámico y versión exacta (`NV_ESC_CHECK_VERSION_STR`; firmware 570.144 frente a 610.57.04 en el host).
+- **La pared es el espacio de usuario**, no la GPU: faltan `mprotect`/`getrandom`/`clock_nanosleep`/…, `futex` sin timeout, enlazado (Zink hace `dlopen`), C++ para Zink (53 477 líneas), y **NAK es Rust con `std` (53 988 líneas) y habría que enlazarlo con mlibc: riesgo sin resolver**.
+- **Siguiente paso de GPU: 7a** = sonda de cómputo (`gpu=compute`: GR `PROMOTE_CTX` + objeto `0xc7c0` + un cómputo trivial sobre el canal de 6c). Es lo único que se puede probar ya sin Mesa.
+- Sin medir: el cargador Vulkan de Khronos; si NAK compila sin `std`. Los costes son estimaciones.
+
+## Resultados de la fase 7a (2026-09-29, CERRADA: Ryzen #136)
+
+Código: `nvgpu::gr` (contexto GR, parámetros de `PROMOTE_CTX`, plan de VRAM/VA, `trace_placement`/`golden_mappings` para el VA space dorado, empujes de la clase de cómputo `0xc7c0`), `nvgpu::mmu` (páginas de 64 KiB `map_big`; `directories` = raíz/PD2/PD1 de una VA), `kernel/src/gpu/compute.rs` (nivel `gpu=compute`, implica `copy`), `Rm::free`, captura de eventos de RM (`gsp::take_events`), job `scripts/metal-jobs/gpu-compute.sh`. Fixtures `rm-ph7-gr-*` (RPCs #21-#25 de la traza: canal dorado, `GET_CONTEXT_BUFFERS_INFO`, `PROMOTE_CTX`, alloc `0xc797`).
+
+**Medido en la Ryzen (#136, `gpu=compute`):** contexto dorado construido (`PROMOTE_CTX` de 9 entradas + objeto 3D `0xc797`, 24 ms en total); canal GR `0xc56f` (chid 1, runlist 0, token 0x1) con `BIND`, `GPFIFO_SCHEDULE`, `PROMOTE_CTX` propio (8 entradas) y objeto de cómputo `0xc7c0` en 4 ms; los tres peldaños: liberación de semáforo (64 µs), escritura inline de 64 B a memoria del host verificada por la CPU, 4 KiB a VRAM (4 empujes de 1 KiB) verificados por PRAMIN; RM sigue contestando después. `gpu=copy` y el banco, sin cambios.
+
+**La causa del bloqueo (#126-#134):** el canal dorado tiene que vivir en un VA space **gestionado por RM** (`FERMI_VASPACE_A` sin `EXTERNALLY_OWNED`) cuyo directorio sean **nuestras** tablas con los buffers ya mapeados: `COPY_SERVER_RESERVED_PDES` recibe la raíz, la PD2 y la PD1 del camino de la VA 0 (`vmm.c:122-131`: `pd->pt[0]`, luego `pd->pde[0]`), RM mete en PD1[8] su ventana de 4 GiB y el PDB del canal es nuestra raíz. Los buffers van en las VAs de la traza (< 32 MiB), con el tamaño de página de nouveau. En #128 ese camino se probó pasando tres páginas **puestas a cero**: nada estaba mapeado en el espacio del canal y RM devolvió 31 igual que en el VA space externo. En nuestro VA space externo, `MAIN` con VA da siempre 31 (#126-#134, VAs altas o bajas, páginas de 4 o 64 KiB) para el canal dorado; para el canal normal, en cambio, `PROMOTE_CTX` con VA en el espacio externo se acepta (como en nouveau con los VMM de usuario).
+
+- `GET_CONTEXT_BUFFERS_INFO` funciona sobre **nuestro** subdevice y da lo mismo que la traza (r570: 26 buffers por motor, 1664 B, no 25). Nueve buffers, 12,8 MiB.
+- Una VA **sin mapear** en la entrada de `MAIN` hace que RM/GPU la recorra: `MMU_FAULT_QUEUED` + `POST_NOCAT_RECORD` x5 + `RC_TRIGGERED` y el canal queda en error de RC (87); después GSP-RM a menudo deja de contestar (10 s sin respuesta): **cada intento fallido arriesga un cuelgue de GSP-RM hasta el siguiente arranque**.
+- Los `POST_NOCAT_RECORD` que llegan son ruido conocido (un `ASSERT` periódico sobre `NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT_PROGRESS_N`); el 31 no deja ningún mensaje y el firmware no trae el ELF de logs.
+- Un empuje no cabe en el push buffer de 4 KiB si lleva 4 KiB de datos inline (pánico en #135, después de que los peldaños 1 y 2 pasaran): `gr::INLINE_CHUNK_WORDS` = 256 palabras por empuje.
+- Bug real encontrado por el camino (`nvgpu::mmu`): `entry_addr` incluía los bits de PRIV/RO/ATOMIC en la dirección de una PTE.
+
+**Siguiente:** la 7b (abajo).
+
+## Resultados de la fase 7b (2026-09-29, CERRADA: Ryzen #137-#139)
+
+Un shader de verdad sobre el canal GR de 7a. Código: `nvgpu::qmd` (QMD V03_00, configuración de shared memory de SM86, constantes de los shaders), `nvgpu::gr::{dispatch_push, l2_flush_push, KERN_*}`, `kernel/src/gpu/compute.rs` (peldaños 4-6), `nvgpu/gen/qmd.c` (oráculo en C: `fixtures/qmd-fill.txt` = las 64 palabras, `fixtures/qmd-fields.txt` = los rangos `MW(hi:lo)` de la cabecera), `nvgpu/gen/shader/{fill,copy,fillwt}.cu` + `extract.py` (SASS de `nvcc -arch=sm_86` → `fixtures/shader-*-sm86.bin`, 0x180 bytes cada uno, 8 registros). Job `gpu-compute.sh` (ahora exige `rungs>=5`).
+
+- **Fuentes**: el lanzamiento es el de `nak/hw_runner.rs` de Mesa (`SET_OBJECT`, ventanas de shared `0xfe000000` y local `0xff000000`, `INVALIDATE_SKED_CACHES`, `SEND_PCAS_A` = QMD >> 8, `SEND_SIGNALING_PCAS2_B` = INVALIDATE_COPY_SCHEDULE); el QMD es `Qmd3_0` de `nak/qmd.rs` sobre `clc6c0qmd.h` (versión 3.0 vale para `0xc7c0`); el ABI del shader es el de CUDA (parámetros desde `c[0x0][0x160]`, cbuf 0 de 0x200 bytes). A esto se añade `WAIT_FOR_IDLE` + un semáforo de la clase, y el `RELEASE0` del propio QMD (semáforo de la rejilla, `FE_SYSMEMBAR`, una palabra).
+- **Medido en la Ryzen (#137, primera ejecución del shader)**: `fill` (8 CTAs x 32 hilos, hilo i escribe `(i*0x9e3779b1) ^ 0xc0de0000` en `out[i]`) con la salida en **memoria del host**: 256 palabras correctas, las otras 768 de la página (garabato previo) intactas, semáforo de la clase en 8 us y el de la rejilla visto. Sin RC ni eventos de RM.
+- **Destino en VRAM** (peldaño 5): el semáforo llega (5 us) y un segundo shader (`copy`: `dst[i] = ld.global.cg(src[i])`) **lee esa página de VRAM desde la GPU y la deja en el host con las 256 palabras correctas**: las stores del SM sí aterrizaron. Verificación cruzada válida: el destino del readback se emborrona antes.
+- **Hallazgo abierto (rung 6, #137-#139)**: la CPU, leyendo por **PRAMIN**, sigue viendo solo el garabato: llano, tras 20 ms, tras el volcado de L2 por MMIO (`0x70010` y `0x70000`, ambos "hechos" en 1 us), tras `MEM_OP_D L2_FLUSH_DIRTY` por el canal, y con un shader de store de alcance de sistema (`STG.E.STRONG.SYS`, `__stwt`, palabras distintas). En cambio las escrituras del FE (`LAUNCH_DMA` inline) y de la CE a esa misma VA/VRAM sí se ven por PRAMIN (rung 3, 6c). BAR1 no sirve de vista alternativa (sus lecturas de VRAM fallan tras GSP-RM). Hipótesis sin probar: el camino SM→VRAM no es el que PRAMIN lee (otra dirección física efectiva, p. ej. otro PTE/`kind` para el cliente GPC) o la vista de PRAMIN no es coherente con la L2 en Ampere de un modo que ninguno de estos volcados arregla. Experimento siguiente: escribir con el SM en una VA y con el FE en otra que apunten a **páginas VRAM distintas** de la misma región y ver cuál aparece dónde; o leer esa página con la CE (VRAM → host) para ver si el DRAM la tiene. No bloquea nada: Mesa/NVK no lee VRAM con la CPU.
+- **Tests**: 321 en `nvgpu`; `qmd.rs` con oráculo de palabras + oráculo de rangos (todos los campos y los 8 cbufs), extremos de entrada, límites de un CTA, configuraciones de shared memory SM86; sabotaje 103 mutaciones en `qmd.rs` (8 supervivientes equivalentes: rangos que `put` o el producto de hilos vuelven a exigir, máscara `0x7ff` del garabato con i < 1024) y 32 en `gr.rs` (0). Un bug real salió del test de extremos: el producto de dimensiones `u16` desbordaba `u32`.
+- **Lecciones**: (1) cuando una verificación por un camino falla, verificar por **otro** camino de la GPU (aquí el readback con `ld.global.cg`) separa "no se escribió" de "la CPU no lo ve"; (2) `ptxas`/`nvdisasm` del host son un oráculo de SASS para SM86 (no hace falta codificar a mano); (3) el shader corrió a la primera (#137); los tres arranques (#137-#139) se gastaron en la pregunta de PRAMIN: al fallar una comprobación conviene meter todos los diagnósticos independientes en el mismo arranque.
+- **Siguiente**: estabilidad (varios arranques seguidos, `budget` estaba en 0 al cerrar), el experimento de PRAMIN de arriba si importa, y de la decisión de la fase 7: G1 (ABI Linux para `std`), G3 (enlazado) y G4 (backend `nvkmd`).
+
 ## Fases
 
 Calendario orientativo en días de trabajo. El riesgo está en la fase 4.
@@ -1193,6 +1231,9 @@ Documento con la comparación medida entre dos caminos:
 
 Cada requisito se lista con su coste estimado y con lo que ya hay (memoria
 `rust_std_gaps`).
+
+**Hecho 2026-09-29:** `docs/gpu/phase7-3d-decision.md`. Resultado: NVK con backend
+`nvkmd` propio; siguiente paso de GPU 7a (sonda de cómputo).
 
 ---
 
