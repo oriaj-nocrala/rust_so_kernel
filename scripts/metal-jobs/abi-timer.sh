@@ -9,6 +9,11 @@ sum() { echo "$*"; echo "$*" >> /tmp/abi-timer.sum; }
 : > /tmp/abi-timer.sum
 tests=$(sed -n '/^    tests="/,/^fi/p' /mnt/abi-suite.sh | sed -e 's/^    tests="//' -e 's/"$//' -e '/^fi/d' | tr '\n' ' ')
 total=0; bad=0
+# On the stick /mnt is read-only: tests that create files there cannot pass (link_test failed on the Ryzen for this reason, 2026-09-30).
+if touch /mnt/.rwprobe 2>/dev/null; then rm -f /mnt/.rwprobe; else
+  sum "abi: /mnt is read-only, skipping link_test"
+  tests=$(echo $tests | sed 's/link_test//')
+fi
 for t in $tests; do
   total=$((total + 1))
   /mnt/bin/$t > /tmp/t.out 2>&1
