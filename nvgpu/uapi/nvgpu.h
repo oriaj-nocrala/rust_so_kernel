@@ -6,7 +6,7 @@
  * size and offset below against this file compiled by clang (nvgpu/gen/uapi.c).
  *
  * Rules: every struct is a multiple of 8 bytes with 8-byte members on 8-byte offsets (no implicit padding), all fields are
- * little-endian, an ioctl returns 0 or a negative errno (-EINVAL, -ENOENT, -ENOMEM, -EBUSY, -ETIMEDOUT, -EFAULT), and one process
+ * little-endian, an ioctl returns 0 or a negative errno (-EINVAL, -ENOENT, -ENOMEM, -ENOSPC, -EBUSY, -EEXIST, -EAGAIN, -EFAULT), and one process
  * at a time may hold the device open (a second open() fails with -EBUSY).
  */
 #ifndef NVGPU_UAPI_H
@@ -141,8 +141,9 @@ struct nvg_sync_ref {
    uint64_t value;            /* timeline value */
 };
 
-/* Wait (on the CPU, before queuing) until every `waits` timeline reached its value, run `pushes` in order, then set each `signals`
- * timeline to its value when they have completed. */
+/* If every `waits` timeline has reached its value, queue `pushes` in order and set each `signals` timeline to its value when they
+ * have completed; if not, do nothing and return -EAGAIN (the caller waits with NVG_IOC_SYNC_WAIT and tries again). The kernel never
+ * blocks in an ioctl. */
 struct nvg_exec {
    uint32_t ctx;
    uint32_t push_count;
@@ -176,12 +177,12 @@ struct nvg_sync_signal {   /* signal from the CPU; the value must not go backwar
 };
 #define NVG_IOC_SYNC_SIGNAL NVG_IOC(13, sizeof(struct nvg_sync_signal))
 
-#define NVG_WAIT_ANY (1u << 0) /* return when any reached its value (default: all) */
+#define NVG_WAIT_ANY (1u << 0) /* succeed when any reference reached its value (default: all of them) */
+/* Never blocks: 0 with `first_ready` set if the condition holds, -EAGAIN if not yet (the caller sleeps and asks again). */
 struct nvg_sync_wait {
    uint64_t refs;             /* user pointer to count x struct nvg_sync_ref */
    uint32_t count;
    uint32_t flags;            /* NVG_WAIT_* */
-   int64_t timeout_ns;        /* relative; 0 = poll once; -1 = no limit. Returns -ETIMEDOUT */
    uint32_t first_ready;      /* out: index of a ready reference */
    uint32_t _pad;
 };

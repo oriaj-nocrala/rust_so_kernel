@@ -10,6 +10,7 @@
 
 pub(crate) mod evdev;
 pub mod dev_dispctl;
+pub mod dev_nvgpu;
 pub mod dev_dsp;
 pub mod dev_fb0;
 pub mod dev_input_event;
@@ -57,6 +58,8 @@ static DEVICES: &[DeviceEntry] = &[
     DeviceEntry { path: "/dev/vblank", open: dev_vblank::open },
     // Display supervisors' exerciser (gpu=super): detach/attach the SOR.
     DeviceEntry { path: "/dev/dispctl", open: dev_dispctl::open },
+    // The GPU for user space (Mesa's NVK): exclusive; a software device until the hardware backend (G4c).
+    DeviceEntry { path: "/dev/nvgpu", open: dev_nvgpu::open },
     // Pseudo-terminals (ipc/pty.rs): each open of ptmx is a new pair; the
     // slaves are /dev/pts/<n> (fs/devfs.rs's PtsDirInode). /dev/tty is the
     // caller's controlling terminal (ENXIO without one).

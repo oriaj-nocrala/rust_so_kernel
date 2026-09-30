@@ -67,6 +67,8 @@ pub struct ShmObject {
     /// away: the framebuffer's RAM copy behind `/dev/fb0` (see
     /// [`ShmObject::pinned`]).
     pinned: bool,
+    /// Largest size `set_size` accepts: `MAX_SIZE`, or what [`with_limit`](ShmObject::with_limit) asked for.
+    max: u64,
 }
 
 impl core::fmt::Debug for ShmObject {
@@ -96,7 +98,16 @@ impl ShmObject {
             inner: IrqMutex::new(Inner { pages: Vec::new(), size: 0 }),
             mappings: AtomicUsize::new(0),
             pinned: false,
+            max: MAX_SIZE,
         }
+    }
+
+    /// An empty object that may grow up to `max` bytes (a driver's arena: `/dev/nvgpu` hands out sub-ranges of one). The per-object
+    /// page table costs 16 bytes per page of the *size*, allocated on `set_size`.
+    pub fn with_limit(max: u64) -> Self {
+        let mut o = Self::new();
+        o.max = max;
+        o
     }
 
     /// An object over frames that already exist and belong to someone
@@ -124,6 +135,7 @@ impl ShmObject {
             inner: IrqMutex::new(Inner { pages: frames.into_iter().map(Some).collect(), size }),
             mappings: AtomicUsize::new(0),
             pinned: true,
+            max: MAX_SIZE,
         }
     }
 
@@ -147,7 +159,7 @@ impl ShmObject {
     /// unmapped; the dropped frames are released, and the bytes past `len`
     /// in the last page are zeroed so a later grow reads zeros there too).
     pub fn set_size(&self, len: u64) -> Result<(), ShmError> {
-        if len > MAX_SIZE {
+        if len > self.max {
             return Err(ShmError::TooBig);
         }
         if self.pinned {
@@ -179,6 +191,24 @@ impl ShmObject {
         }
         i.size = len;
         Ok(())
+    }
+
+    /// Give back the object's own reference on every page in `[off, off + len)` (both multiples of a page) and forget them: the next
+    /// touch allocates a fresh zeroed page. Mappings that already hold a page keep it (each PTE has its own reference), so a process
+    /// that still has the range mapped sees the old contents, never freed memory. The object's size does not change.
+    pub fn discard(&self, off: u64, len: u64) {
+        assert!(off % PAGE == 0 && len % PAGE == 0, "shm: discard of an unaligned range");
+        if self.pinned {
+            return;
+        }
+        self.inner.with(|i| {
+            let end = ((off + len) / PAGE).min(i.pages.len() as u64) as usize;
+            for idx in (off / PAGE) as usize..end {
+                if let Some(frame) = i.pages[idx].take() {
+                    release_frame(frame);
+                }
+            }
+        });
     }
 
     /// The frame for page `idx`, allocated and zeroed if this is its first
@@ -250,7 +280,7 @@ impl ShmObject {
             return Err(ShmError::Busy);
         }
         let end = off.checked_add(buf.len() as u64).ok_or(ShmError::TooBig)?;
-        if end > MAX_SIZE {
+        if end > self.max {
             return Err(ShmError::TooBig);
         }
         let mut bounce = [0u8; 512];

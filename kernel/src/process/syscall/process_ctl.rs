@@ -1135,6 +1135,10 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
         if let Err(e) = validate_user_buffer(status_ptr as u64, 4) { return e; }
     }
 
+    // A child killed by a signal has its files closed by whichever CPU drains `dead_files` first; make sure that is finished before
+    // this call can hand the child back (no lock is held here).
+    crate::process::dead_files::settle();
+
     let tf_ptr = current_tf_ptr();
 
     let irq = crate::process::irq_guard::InterruptGuard::new();

@@ -22,7 +22,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use diag::IrqMutex;
 
@@ -37,6 +37,8 @@ static DEAD: IrqMutex<Vec<Table>, KernelIrq> = IrqMutex::new(Vec::new());
 static DEAD_PIDS: IrqMutex<Vec<usize>, KernelIrq> = IrqMutex::new(Vec::new());
 /// Something is queued: lets [`drain`] skip the lock on every syscall.
 static PENDING: AtomicBool = AtomicBool::new(false);
+/// Drains that have taken the queue and are still closing what they took.
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// Queues a dead process's table. Callable under `SCHEDULER` and from the
 /// timer ISR: it only takes `DEAD` (an `IrqMutex`, after `SCHEDULER` in
@@ -58,15 +60,35 @@ pub fn defer_exit(pid: usize) {
 /// must never be taken with IF=1 (the idle loop, one caller, runs with it
 /// on).
 pub fn drain() {
-    if !PENDING.swap(false, Ordering::AcqRel) {
+    if !PENDING.load(Ordering::Acquire) {
         return;
     }
+    // The whole thing with interrupts off, the count included: the idle loop calls this with IF=1, and a tick between the increment
+    // and the decrement would switch away from a per-CPU idle process that never runs again, leaving `settle` waiting for ever.
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let tables = DEAD.with(core::mem::take);
-        drop(tables);
-        for pid in DEAD_PIDS.with(core::mem::take) {
-            crate::process::pidfd::mark_exited(pid);
-            crate::process::syscall::poll_wakeup_for_pidfd(pid);
+        // Announced before the queue is taken, so anyone who then finds `PENDING` clear can tell a drain is still closing files.
+        IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        if PENDING.swap(false, Ordering::SeqCst) {
+            let tables = DEAD.with(core::mem::take);
+            drop(tables);
+            for pid in DEAD_PIDS.with(core::mem::take) {
+                crate::process::pidfd::mark_exited(pid);
+                crate::process::syscall::poll_wakeup_for_pidfd(pid);
+            }
         }
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
     });
+}
+
+/// [`drain`], then wait for any drain another CPU has started to finish. What `wait4` needs: when it hands a child back, that
+/// child's files must be closed (Linux closes them in `do_exit`, before the zombie exists), and the CPU that took the queue may
+/// still be running their `Drop`s. Without this a parent could `wait` for a dead holder of an exclusive device (`/dev/nvgpu`,
+/// `/dev/fb0`) and find it still busy. Call with no lock held.
+pub fn settle() {
+    drain();
+    while IN_FLIGHT.load(Ordering::SeqCst) != 0 {
+        // A drainer may be waiting for a TLB shootdown this CPU has not answered.
+        crate::memory::tlb::service_pending();
+        core::hint::spin_loop();
+    }
 }

@@ -79,6 +79,7 @@ Code: `kernel/src/process/` (`scheduler.rs`, `timer_preempt.rs`, `trapframe.rs`,
 ## Process death
 
 - `kill_current` (every death path) moves the fd table to `process::dead_files`, which is drained with no lock held at every syscall entry and in the idle loop. Never drop files under `SCHEDULER`: a socket's `Drop` takes it again.
+- `sys_waitpid` starts with `dead_files::settle()`: drain, then wait for a drain another CPU has started (`IN_FLIGHT`), so a child handed back by `wait4` has its files closed, as in Linux (a parent could otherwise find an exclusive device its dead child held, `/dev/nvgpu` or `/dev/fb0`, still busy). The count goes up and down with interrupts off: the idle loop drains with IF=1 and is pinned to its CPU, so a tick in between would leave the count raised for ever.
 - Children are reparented to PID 1 (`reparent_children`).
 - A zombie whose blocked parent is woken for it is reaped right there (`reap_zombie`).
 - Test: `lifecycle_test`.

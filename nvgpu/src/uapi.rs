@@ -218,7 +218,6 @@ pub struct SyncWait {
     pub refs: u64,
     pub count: u32,
     pub flags: u32,
-    pub timeout_ns: i64,
     pub first_ready: u32,
     pub _pad: u32,
 }
@@ -261,7 +260,7 @@ mod tests {
         assert_eq!(size_of::<SyncCreate>(), 16, "nvg_sync_create");
         assert_eq!(size_of::<SyncDestroy>(), 8, "nvg_sync_destroy");
         assert_eq!(size_of::<SyncSignal>(), 16, "nvg_sync_signal");
-        assert_eq!(size_of::<SyncWait>(), 32, "nvg_sync_wait");
+        assert_eq!(size_of::<SyncWait>(), 24, "nvg_sync_wait");
         assert_eq!(size_of::<SyncQuery>(), 16, "nvg_sync_query");
         assert_eq!(size_of::<Timestamp>(), 8, "nvg_timestamp");
         assert_eq!(offset_of!(Info, abi_version), 0, "nvg_info.abi_version");
@@ -305,8 +304,7 @@ mod tests {
         assert_eq!(offset_of!(SyncSignal, value), 8, "nvg_sync_signal.value");
         assert_eq!(offset_of!(SyncWait, count), 8, "nvg_sync_wait.count");
         assert_eq!(offset_of!(SyncWait, flags), 12, "nvg_sync_wait.flags");
-        assert_eq!(offset_of!(SyncWait, timeout_ns), 16, "nvg_sync_wait.timeout_ns");
-        assert_eq!(offset_of!(SyncWait, first_ready), 24, "nvg_sync_wait.first_ready");
+        assert_eq!(offset_of!(SyncWait, first_ready), 16, "nvg_sync_wait.first_ready");
         assert_eq!(offset_of!(SyncQuery, value), 8, "nvg_sync_query.value");
     }
 
@@ -325,7 +323,7 @@ mod tests {
         assert_eq!(IOC_SYNC_CREATE, 0xc0104e0b, "NVG_IOC_SYNC_CREATE");
         assert_eq!(IOC_SYNC_DESTROY, 0xc0084e0c, "NVG_IOC_SYNC_DESTROY");
         assert_eq!(IOC_SYNC_SIGNAL, 0xc0104e0d, "NVG_IOC_SYNC_SIGNAL");
-        assert_eq!(IOC_SYNC_WAIT, 0xc0204e0e, "NVG_IOC_SYNC_WAIT");
+        assert_eq!(IOC_SYNC_WAIT, 0xc0184e0e, "NVG_IOC_SYNC_WAIT");
         assert_eq!(IOC_SYNC_QUERY, 0xc0104e0f, "NVG_IOC_SYNC_QUERY");
         assert_eq!(IOC_TIMESTAMP, 0xc0084e10, "NVG_IOC_TIMESTAMP");
     }

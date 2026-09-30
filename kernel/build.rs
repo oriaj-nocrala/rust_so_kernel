@@ -117,6 +117,7 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "statx_test",
     "link_test",
     "poll_file_test",
+    "nvgpu_sw_test",
     "vmshare_test",
     "seqpacket_test",
     "ext2_robust_test",
@@ -266,6 +267,7 @@ fn main() {
         workspace_root.join("scripts/build-doom.sh"),
         workspace_root.join("scripts/fetch-freedoom.sh"),
         workspace_root.join("scripts/build-quake.sh"),
+        workspace_root.join("nvgpu/uapi/nvgpu.h"),
         workspace_root.join("scripts/fetch-quake-shareware.sh"),
     ] {
         println!("cargo:rerun-if-changed={}", entry.display());
@@ -376,6 +378,8 @@ fn main() {
                 "-nostdlib",
                 "-isystem", sysroot_inc.to_str().unwrap(),
                 "-I", c_include.to_str().unwrap(),
+                // /dev/nvgpu's interface header (nvgpu/uapi/nvgpu.h), shared with the kernel's Rust mirror and Mesa's backend.
+                "-I", workspace_root.join("nvgpu/uapi").to_str().unwrap(),
                 crt1.to_str().unwrap(),
                 src.to_str().unwrap(),
                 libc_a.to_str().unwrap(),

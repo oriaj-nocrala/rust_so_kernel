@@ -42,6 +42,10 @@ Cabecera única `nvgpu/uapi/nvgpu.h` (la usan el kernel, en espejo Rust con test
 | **G4d** | Un dispatch de cómputo Vulkan de verdad en la Ryzen (SPIR-V -> NAK -> GPU) y verificación de resultados. | Ryzen |
 | **G4e** | Varios contextos (canales en caliente), cola de copia, robustez (RC tras fallo), y luego gráficos (clase 3D `0xc797`) y presentación. | según el caso |
 
+## Bloqueo dentro de `ioctl` (aplazado, rodaja propia después de G4d)
+
+Hoy el kernel **nunca bloquea** en `SYNC_WAIT`/`EXEC`: devuelven `-EAGAIN` y el espacio de usuario duerme (`nanosleep`) y reintenta. Motivo: `sys_ioctl` llama a `FileHandle::ioctl` con el cerrojo de la tabla de fds tomado (los hilos comparten la tabla), bloquear es aparcar con `rip -= 2` (un `-> !`), y los syscalls entran con IF=0, así que esperar en un bucle deja sin CPU a quien debería señalar. Para bloquear de verdad: (1) `FileHandle::ioctl` devuelve "bloquearía" y `sys_ioctl` actúa como `sys_read` (suelta el cerrojo, registra la espera, aparca con reinicio); (2) una cola de espera de timelines despertada por `SYNC_SIGNAL` y por los fences que se completan; (3) `/dev/nvgpu` con `poll`. La cabecera no cambia.
+
 ## Riesgos
 
 - **Canales en caliente** (G4e): cada canal GR necesita buffers de contexto en VRAM y llamadas RM en tiempo de ejecución; hoy solo se hace un canal en el arranque. G4c/G4d usan ese único canal.
