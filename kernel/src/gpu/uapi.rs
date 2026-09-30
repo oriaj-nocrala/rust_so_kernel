@@ -174,6 +174,102 @@ struct Rt {
     mapped: Vec<(u64, u64)>,
 }
 
+/// A BAR1 mapping of a slot's VRAM, copied out of [`Hw::spans`] (the mappings live as long as the GPU state) so the clearing can run without the lock.
+#[derive(Clone, Copy)]
+struct SpanRef {
+    vram: u64,
+    len: u64,
+    base: *mut u8,
+}
+
+// SAFETY: a device mapping that is never unmapped; the slot it covers is reserved for one creator while it is written.
+unsafe impl Send for SpanRef {}
+
+/// What the RM phase of a run-time channel's creation needs, copied out of `Hw` by `prepare_rt`.
+struct RtPlan {
+    slot: usize,
+    chid: u32,
+    inst: u64,
+    userd: u64,
+    gpfifo: u64,
+    push: u64,
+    gpfifo_va: u64,
+    push_va: u64,
+    sem_va: u64,
+    mem: Vec<Mem>,
+    bufs: Vec<CtxBuf>,
+    threed: bool,
+    grcopy: bool,
+    mthd: DmaBuf,
+    host: DmaBuf,
+    /// Ranges mapped in our tables for it: (va, len, page shift).
+    mapped: Vec<(u64, u64, u8)>,
+    /// VRAM ranges still to clear (through the BAR1 span; empty when `prepare_rt` already did it through PRAMIN).
+    zero: Vec<(u64, u64)>,
+    span: Option<SpanRef>,
+}
+
+// SAFETY: the DMA buffers are kernel memory owned by the plan; `SpanRef` is covered above.
+unsafe impl Send for RtPlan {}
+
+/// The RM phase of creating a run-time GR channel, **without the `HW` lock**: clear the slot's VRAM (BAR1, write-combined), then the RM channel
+/// with BIND, SCHEDULE, PROMOTE_CTX and the compute, 3D and copy objects. Returns the doorbell token. Only this creator touches the slot
+/// (it is reserved), and GSP-RM serialises itself (`gsp::with_rm`).
+fn run_rt(plan: &RtPlan) -> Result<u32, String> {
+    if let Some(sp) = plan.span {
+        for &(at, len) in &plan.zero {
+            debug_assert!(at >= sp.vram && at + len <= sp.vram + sp.len);
+            let mut off = 0;
+            while off < len {
+                // SAFETY: inside the mapping (`prepare_rt` checked the slot is covered), 8-byte aligned (ring block and buffers are page aligned).
+                unsafe { core::ptr::write_volatile(sp.base.add((at - sp.vram + off) as usize) as *mut u64, 0) };
+                off += 8;
+            }
+        }
+        super::copy::sfence();
+    }
+    let (slot, chid) = (plan.slot, plan.chid);
+    let ch = chan::h_chan(chid);
+    let hobj = |k: u32| 0x7a00_0000 | (slot as u32) << 4 | k;
+    let (threed, grcopy, bufs, mem) = (plan.threed, plan.grcopy, &plan.bufs, &plan.mem);
+    let made = super::gsp::with_rm(|rm| -> Result<u32, String> {
+        let alloc = chan::ChanAlloc {
+            chid,
+            privileged: false,
+            engine_type: gr::ENGINE_GR0,
+            gpfifo_va: plan.gpfifo_va,
+            gpfifo_bytes: gr::GPFIFO_ENTRIES * 8,
+            inst: plan.inst,
+            userd: plan.userd,
+            mthdbuf: plan.mthd.bus_addr(),
+            vaspace: rm::H_VASPACE,
+        };
+        rm.alloc(rm::H_DEVICE, ch, chan::CLASS_GPFIFO, &chan::alloc_params(&alloc)).map_err(|e| alloc::format!("ALLOC channel: {}", e))?;
+        let rest = (|| -> Result<(), String> {
+            rm.control(ch, chan::CTRL_BIND, &chan::bind_params(gr::ENGINE_GR0)).map_err(|e| alloc::format!("BIND: {}", e))?;
+            rm.control(ch, chan::CTRL_GPFIFO_SCHEDULE, &chan::schedule_params()).map_err(|e| alloc::format!("GPFIFO_SCHEDULE: {}", e))?;
+            let e = gr::entries(bufs, false, mem);
+            rm.control(rm::H_SUBDEVICE, gr::CTRL_PROMOTE_CTX, &gr::promote_params(rm::H_CLIENT, ch, &e)).map_err(|e| alloc::format!("PROMOTE_CTX: {}", e))?;
+            rm.alloc(ch, hobj(1), gr::CLASS_COMPUTE, &[]).map_err(|e| alloc::format!("compute object: {}", e))?;
+            if threed {
+                rm.alloc(ch, hobj(2), gr::CLASS_THREED, &[]).map_err(|e| alloc::format!("3D object: {}", e))?;
+            }
+            if grcopy {
+                rm.alloc(ch, hobj(3), chan::CLASS_COPY, &chan::copy_params(chan::ENGINE_COPY0)).map_err(|e| alloc::format!("copy object: {}", e))?;
+            }
+            Ok(())
+        })();
+        match rest {
+            Ok(()) => Ok(chan::doorbell_token(0, chid)),
+            Err(e) => {
+                let _ = rm.free(ch);
+                Err(e)
+            }
+        }
+    });
+    made.unwrap_or_else(|| Err(String::from("GSP-RM is not running")))
+}
+
 /// One channel's ring, doorbell and fence.
 struct Chan {
     kind: ChanKind,
@@ -229,6 +325,8 @@ struct Hw {
     host: DmaBuf,
     /// The device as a whole is wedged (the TLB flush never completed): nothing more is touched.
     dead: bool,
+    /// Run-time channel slots whose creation is under way (bit per slot): chosen by `prepare_rt`, not yet a channel.
+    rt_reserved: u32,
     /// RC_TRIGGERED channel ids RM reported that no channel has claimed yet (bit per chid).
     rc_pending: u64,
     /// The GPU may still touch bound memory (a channel hung without RM resetting it, or did not go idle at close): never give it back.
@@ -258,6 +356,13 @@ static CHANS_MADE: AtomicU64 = AtomicU64::new(0);
 /// The last run-time channel creation that failed, for /proc/kdebug.
 static LAST_ERR: spin::Mutex<String> = spin::Mutex::new(String::new());
 static CHANS_FREED: AtomicU64 = AtomicU64::new(0);
+/// How long the run-time channel calls and the lock itself hold up everyone else (microseconds, worst case): a session creating or destroying a
+/// channel talks to GSP-RM with `HW` held, and every other session's submit and fence query waits for it.
+static CREATE_US_MAX: AtomicU64 = AtomicU64::new(0);
+/// The part of a creation that does hold the lock (`prepare_rt`).
+static PREPARE_US_MAX: AtomicU64 = AtomicU64::new(0);
+static DESTROY_US_MAX: AtomicU64 = AtomicU64::new(0);
+static LOCK_WAIT_US_MAX: AtomicU64 = AtomicU64::new(0);
 static SPANS_BAR1: AtomicU32 = AtomicU32::new(0);
 static SPANS_PRAMIN: AtomicU32 = AtomicU32::new(0);
 
@@ -397,6 +502,7 @@ pub(super) fn install(r: &mut String, regs: &Bar0, mut pt: PageTables, ch: Chann
         topo: ch.topo,
         host: ch.host,
         dead: false,
+        rt_reserved: 0,
         rc_pending: 0,
         leak: false,
     });
@@ -504,11 +610,15 @@ impl Hw {
         crate::serial_print!("{}", log);
     }
 
-    /// Make a GR channel at run time, like `compute::run` did at boot: its ring and instance block in its own VRAM slot, its own context
-    /// buffers (the global ones are the golden's), the RM channel with BIND, SCHEDULE, PROMOTE_CTX and the compute, 3D and copy objects.
-    /// Returns its index in `chans` (with no user yet).
-    fn create_rt(&mut self) -> Result<ChanId, String> {
-        let slot = (0..MAX_RT).find(|&j| self.chans[RT_FIRST + j].is_none()).ok_or_else(|| String::from("all run-time channel slots are in use"))?;
+    /// First of the three phases that make a GR channel at run time (like `compute::run` did at boot), with `HW` held: pick a slot and reserve
+    /// it, lay out its VRAM and VA, allocate its host pages, put the ring and the context buffers into our tables (and flush the GPU's
+    /// TLB), and make sure BAR1 reaches the slot. What takes long (clearing the slot's VRAM, and the RM calls that make the channel)
+    /// is left for [`run_rt`], which runs **without** the lock: with it held every other session's `submit` and fence query waited for the
+    /// whole creation (80-93 ms measured on the Ryzen: a 180 ms hitch in another client's frame pacing, Ryzen #163).
+    fn prepare_rt(&mut self) -> Result<RtPlan, String> {
+        let slot = (0..MAX_RT)
+            .find(|&j| self.chans[RT_FIRST + j].is_none() && self.rt_reserved & (1 << j) == 0)
+            .ok_or_else(|| String::from("all run-time channel slots are in use"))?;
         let j = slot as u64;
         let chid = RT_CHID0 + slot as u32;
         let vram = RT_VRAM + j * RT_SLOT;
@@ -528,20 +638,12 @@ impl Hw {
             }
         };
         // a clean start: the ring block, and the context buffers RM initialises (nouveau allocates them zeroed)
-        {
-            let mut p = Pramin::new(&self.regs);
-            let mut zero = |at: u64, len: u64| {
-                for off in (0..len).step_by(4) {
-                    p.wr32(at + off, 0);
-                }
-            };
-            zero(vram, 0x6000);
-            for (b, m) in self.gr_bufs.iter().zip(&mem) {
-                if !b.global && b.init {
-                    zero(m.pa, gr::mapped_len(b));
-                }
+        let mut zero: Vec<(u64, u64)> = Vec::new();
+        zero.push((vram, 0x6000));
+        for (b, m) in self.gr_bufs.iter().zip(&mem) {
+            if !b.global && b.init {
+                zero.push((m.pa, gr::mapped_len(b)));
             }
-            p.restore();
         }
         // the ring and the buffers into our tables
         let mut mapped: Vec<(u64, u64, u8)> = Vec::new();
@@ -578,65 +680,53 @@ impl Hw {
         }
         if !self.publish_tables() {
             undo(self, &mapped);
+            mthd.free();
+            host.free();
             return Err(String::from("the TLB flush after mapping the channel did not complete"));
         }
-        self.ensure_span(vram, 0x1_0000, vram + 0x8000);
-
-        // RM: the channel and its objects
-        let ch = chan::h_chan(chid);
-        let hobj = |k: u32| 0x7a00_0000 | (slot as u32) << 4 | k;
-        let (threed, grcopy) = (self.threed, self.grcopy);
-        let bufs = &self.gr_bufs;
-        let made = super::gsp::with_rm(|rm| -> Result<u32, String> {
-            let alloc = chan::ChanAlloc {
-                chid,
-                privileged: false,
-                engine_type: gr::ENGINE_GR0,
-                gpfifo_va,
-                gpfifo_bytes: gr::GPFIFO_ENTRIES * 8,
-                inst,
-                userd,
-                mthdbuf: mthd.bus_addr(),
-                vaspace: rm::H_VASPACE,
-            };
-            rm.alloc(rm::H_DEVICE, ch, chan::CLASS_GPFIFO, &chan::alloc_params(&alloc)).map_err(|e| alloc::format!("ALLOC channel: {}", e))?;
-            let rest = (|| -> Result<(), String> {
-                rm.control(ch, chan::CTRL_BIND, &chan::bind_params(gr::ENGINE_GR0)).map_err(|e| alloc::format!("BIND: {}", e))?;
-                rm.control(ch, chan::CTRL_GPFIFO_SCHEDULE, &chan::schedule_params()).map_err(|e| alloc::format!("GPFIFO_SCHEDULE: {}", e))?;
-                let e = gr::entries(bufs, false, &mem);
-                rm.control(rm::H_SUBDEVICE, gr::CTRL_PROMOTE_CTX, &gr::promote_params(rm::H_CLIENT, ch, &e)).map_err(|e| alloc::format!("PROMOTE_CTX: {}", e))?;
-                rm.alloc(ch, hobj(1), gr::CLASS_COMPUTE, &[]).map_err(|e| alloc::format!("compute object: {}", e))?;
-                if threed {
-                    rm.alloc(ch, hobj(2), gr::CLASS_THREED, &[]).map_err(|e| alloc::format!("3D object: {}", e))?;
-                }
-                if grcopy {
-                    rm.alloc(ch, hobj(3), chan::CLASS_COPY, &chan::copy_params(chan::ENGINE_COPY0)).map_err(|e| alloc::format!("copy object: {}", e))?;
-                }
-                Ok(())
-            })();
-            match rest {
-                Ok(()) => Ok(chan::doorbell_token(0, chid)),
-                Err(e) => {
-                    let _ = rm.free(ch);
-                    Err(e)
+        // BAR1 over the whole slot, so the clearing below is a burst of write-combined stores (PRAMIN, a 4-byte window of BAR0 that every
+        // user shares, is the fallback and needs the lock)
+        self.ensure_span(vram, RT_SLOT, vram + 0x8000);
+        let span = self.spans.iter().find(|s| s.vram <= vram && vram + RT_SLOT <= s.vram + s.len).map(|s| SpanRef { vram: s.vram, len: s.len, base: s.base });
+        if span.is_none() {
+            // the old way, with the lock held: through PRAMIN
+            let mut p = Pramin::new(&self.regs);
+            for &(at, len) in &zero {
+                for off in (0..len).step_by(4) {
+                    p.wr32(at + off, 0);
                 }
             }
-        });
+            p.restore();
+            zero.clear();
+        }
+        self.rt_reserved |= 1 << slot;
+        Ok(RtPlan { slot, chid, inst, userd, gpfifo, push, gpfifo_va, push_va, sem_va, mem, bufs: self.gr_bufs.clone(), threed: self.threed, grcopy: self.grcopy, mthd, host, mapped, zero, span })
+    }
+
+    /// Give a reservation back with everything `prepare_rt` did undone (the RM phase failed, or never ran).
+    fn abandon_rt(&mut self, plan: RtPlan) {
+        for &(va, len, page) in &plan.mapped {
+            hwq::unbind_pages(&mut self.pt, va, len, page);
+        }
+        self.publish_tables();
+        if !self.leak {
+            plan.mthd.free();
+            plan.host.free();
+        }
+        self.rt_reserved &= !(1 << plan.slot);
+    }
+
+    /// Last phase, with `HW` held: the RM phase's answer becomes a channel in its slot with one user.
+    fn finish_rt(&mut self, plan: RtPlan, made: Result<u32, String>) -> Result<ChanId, String> {
         let token = match made {
-            Some(Ok(t)) => t,
-            Some(Err(e)) => {
-                undo(self, &mapped);
-                mthd.free();
-                host.free();
+            Ok(t) => t,
+            Err(e) => {
+                self.abandon_rt(plan);
                 return Err(e);
             }
-            None => {
-                undo(self, &mapped);
-                mthd.free();
-                host.free();
-                return Err(String::from("GSP-RM is not running"));
-            }
         };
+        let RtPlan { slot, chid, userd, gpfifo, push, push_va, sem_va, mthd, host, mapped, .. } = plan;
+        let (ch, hobj) = (chan::h_chan(chid), |k: u32| 0x7a00_0000 | (slot as u32) << 4 | k);
         let id = RT_FIRST + slot;
         self.chans[id] = Some(Chan {
             kind: ChanKind::Gr,
@@ -651,42 +741,26 @@ impl Hw {
             slots: push,
             progress: crate::cpu::tsc::read(),
             dead: false,
-            users: 0,
+            users: 1,
             rt: Some(Rt { slot, handles: [ch, hobj(1), hobj(2), hobj(3)], mthd, host, mapped: mapped.iter().map(|&(va, len, page)| (va, len | (page as u64) << 56)).collect() }),
         });
+        self.rt_reserved &= !(1 << slot);
         CHANS_MADE.fetch_add(1, Ordering::Relaxed);
         crate::serial_println!("[nvgpu] GR channel made at run time: slot {}, chid {}, token {:#x}", slot, chid, token);
         Ok(id)
     }
 
-    /// Give a run-time channel back: wait for its work (unless it is dead), free its RM objects and channel, unmap what was mapped for it,
-    /// free its host pages. A channel that does not go idle stays as it is (and the memory stays leaked).
-    fn destroy_rt(&mut self, id: ChanId) {
-        let t0 = crate::cpu::tsc::read();
-        loop {
-            self.poll(id);
-            let Some(c) = self.chans[id].as_ref() else { return };
-            if c.dead || c.queue.in_flight() == 0 {
-                break;
-            }
-            if crate::cpu::tsc::read().wrapping_sub(t0) > super::copy::ms_ticks(QUIESCE_MS) {
-                self.leak = true;
-                crate::serial_println!("[nvgpu] channel {} did not go idle at close: kept", id);
-                return;
-            }
-            crate::memory::tlb::service_pending();
-            core::hint::spin_loop();
-        }
-        let Some(mut c) = self.chans[id].take() else { return };
-        let Some(rt) = c.rt.take() else { return };
-        let [ch, h1, h2, h3] = rt.handles;
-        // a channel RM reset after a fault is freed like any other
-        let _ = super::gsp::with_rm(|rm| {
-            for h in [h3, h2, h1] {
-                let _ = rm.free(h);
-            }
-            let _ = rm.free(ch);
-        });
+    /// Give a run-time channel back, phase 2 of 3 (see [`ctx_destroy`]): take it out of its slot, which stays reserved until
+    /// [`finish_destroy_rt`](Self::finish_destroy_rt), so nobody makes a channel over RM objects that are still there.
+    fn take_rt(&mut self, id: ChanId) -> Option<Rt> {
+        let mut c = self.chans[id].take()?;
+        let rt = c.rt.take()?;
+        self.rt_reserved |= 1 << rt.slot;
+        Some(rt)
+    }
+
+    /// Phase 3, with `HW` held: unmap what was mapped for the channel, free its host pages (unless the GPU may still touch them), give the slot back.
+    fn finish_destroy_rt(&mut self, rt: Rt) {
         for &(va, packed) in &rt.mapped {
             hwq::unbind_pages(&mut self.pt, va, packed & ((1 << 56) - 1), (packed >> 56) as u8);
         }
@@ -695,8 +769,8 @@ impl Hw {
             rt.mthd.free();
             rt.host.free();
         }
+        self.rt_reserved &= !(1 << rt.slot);
         CHANS_FREED.fetch_add(1, Ordering::Relaxed);
-        let _ = rt.slot;
     }
 
     /// Write the tables a bind or unbind touched into VRAM, then flush the GPU's TLB.
@@ -740,8 +814,69 @@ impl Hw {
 
 // ---- what `dev_nvgpu` calls -------------------------------------------------------------------------------------------------
 
-fn with<T>(f: impl FnOnce(&mut Hw) -> Result<T, Error>) -> Result<T, Error> {
-    let mut g = HW.lock();
+/// Holds of the GPU lock longer than this are recorded (`gpu_uapi_slow:` in /proc/kdebug).
+const SLOW_HOLD_US: u64 = 2_000;
+/// How many of them are kept (the latest).
+const SLOW_KEEP: usize = 16;
+
+/// One long hold: what held the lock, when it let go (`ktime_get`, the clock `CLOCK_MONOTONIC` reads), for how long, and how long it had waited.
+#[derive(Clone, Copy)]
+struct SlowHold {
+    op: &'static str,
+    released_ns: u64,
+    hold_us: u64,
+    wait_us: u64,
+}
+
+static SLOW: crate::sync::Mutex<alloc::collections::VecDeque<SlowHold>> = crate::sync::Mutex::new(alloc::collections::VecDeque::new());
+
+/// The GPU state, locked. Records the wait for the lock, and on release the hold if it was long: with one lock for every session, the
+/// longest hold is the longest another client's frame can be stalled, and this says which operation it was.
+struct HwGuard {
+    g: spin::mutex::MutexGuard<'static, Option<Hw>>,
+    op: &'static str,
+    acquired: u64,
+    wait_us: u64,
+}
+
+impl core::ops::Deref for HwGuard {
+    type Target = Option<Hw>;
+    fn deref(&self) -> &Option<Hw> {
+        &self.g
+    }
+}
+
+impl core::ops::DerefMut for HwGuard {
+    fn deref_mut(&mut self) -> &mut Option<Hw> {
+        &mut self.g
+    }
+}
+
+impl Drop for HwGuard {
+    fn drop(&mut self) {
+        let hold_us = ticks_to_us(crate::cpu::tsc::read().wrapping_sub(self.acquired));
+        if hold_us >= SLOW_HOLD_US {
+            let mut q = SLOW.lock();
+            if q.len() == SLOW_KEEP {
+                q.pop_front();
+            }
+            q.push_back(SlowHold { op: self.op, released_ns: crate::time::ktime_get(), hold_us, wait_us: self.wait_us });
+        }
+    }
+}
+
+/// Take the GPU state for `op`, recording how long the lock made the caller wait.
+fn lock_hw(op: &'static str) -> HwGuard {
+    let t0 = crate::cpu::tsc::read();
+    let g = HW.lock();
+    let acquired = crate::cpu::tsc::read();
+    let wait_us = ticks_to_us(acquired.wrapping_sub(t0));
+    LOCK_WAIT_US_MAX.fetch_max(wait_us, Ordering::Relaxed);
+    HwGuard { g, op, acquired, wait_us }
+}
+
+fn with<T>(op: &'static str, f: impl FnOnce(&mut Hw) -> Result<T, Error>) -> Result<T, Error> {
+    let mut g = lock_hw(op);
     let hw = g.as_mut().ok_or(Error::Io)?;
     if hw.dead {
         return Err(Error::Io);
@@ -752,7 +887,7 @@ fn with<T>(f: impl FnOnce(&mut Hw) -> Result<T, Error>) -> Result<T, Error> {
 /// Map `size` bytes of `backing` (from `bo_off`) at `va`. System pages are pinned (one reference each, taken from the arena) while
 /// they are mapped.
 pub fn bind(arena: &ShmObject, va: u64, size: u64, backing: Backing, bo_off: u64, kind: u32) -> Result<(), Error> {
-    with(|hw| {
+    with("bind", |hw| {
         let kind = u8::try_from(kind).map_err(|_| Error::Inval)?;
         let mut pinned: Vec<u64> = Vec::new();
         let r = match backing {
@@ -788,7 +923,7 @@ pub fn bind(arena: &ShmObject, va: u64, size: u64, backing: Backing, bo_off: u64
 /// Unmap `[va, va + size)` (gaps are fine) and give the pins back. After the TLB flush the GPU cannot reach the pages any more, unless
 /// it is wedged, in which case they are never released.
 pub fn unbind(va: u64, size: u64) {
-    let mut g = HW.lock();
+    let mut g = lock_hw("unbind");
     let Some(hw) = g.as_mut() else { return };
     let mut frames: Vec<u64> = Vec::new();
     let mut off = 0;
@@ -820,7 +955,14 @@ pub fn leaking() -> bool {
 /// upload queue) shares the copy channel. 2D and M2MF are not offered.
 pub fn ctx_create(engines: u32) -> Result<ChanId, Error> {
     use nvgpu::uapi::{ENGINE_3D, ENGINE_COMPUTE, ENGINE_COPY};
-    with(|hw| {
+    /// What the decision (made with the lock) came to.
+    enum Choice {
+        /// A channel that exists: its user count is already taken.
+        Have(ChanId),
+        /// A new run-time channel, to be made by `run_rt` without the lock.
+        Make(RtPlan),
+    }
+    let choice = with("ctx_create", |hw| {
         let id = match engines {
             e if e & ENGINE_COMPUTE != 0 && e & !(ENGINE_COMPUTE | ENGINE_COPY | ENGINE_3D) == 0 => {
                 if e & ENGINE_3D != 0 && !hw.threed {
@@ -828,11 +970,19 @@ pub fn ctx_create(engines: u32) -> Result<ChanId, Error> {
                 }
                 match hw.chans[GR_BOOT].as_ref() {
                     Some(c) if c.users == 0 && !c.dead => GR_BOOT,
-                    _ => hw.create_rt().map_err(|e| {
-                        crate::serial_println!("[nvgpu] a new GR channel: {}", e);
-                        *LAST_ERR.lock() = e;
-                        Error::NoSpc
-                    })?,
+                    _ => {
+                        let t0 = crate::cpu::tsc::read();
+                        let prepared = hw.prepare_rt();
+                        PREPARE_US_MAX.fetch_max(ticks_to_us(crate::cpu::tsc::read().wrapping_sub(t0)), Ordering::Relaxed);
+                        return match prepared {
+                            Ok(plan) => Ok(Choice::Make(plan)),
+                            Err(e) => {
+                                crate::serial_println!("[nvgpu] a new GR channel: {}", e);
+                                *LAST_ERR.lock() = e;
+                                Err(Error::NoSpc)
+                            }
+                        };
+                    }
                 }
             }
             ENGINE_COPY => CE,
@@ -840,24 +990,86 @@ pub fn ctx_create(engines: u32) -> Result<ChanId, Error> {
         };
         let c = hw.chans[id].as_mut().ok_or(Error::Inval)?;
         c.users += 1;
-        Ok(id)
-    })
+        Ok(Choice::Have(id))
+    })?;
+    match choice {
+        Choice::Have(id) => Ok(id),
+        Choice::Make(plan) => {
+            // GSP-RM makes the channel while the other sessions go on submitting
+            let t0 = crate::cpu::tsc::read();
+            let made = run_rt(&plan);
+            CREATE_US_MAX.fetch_max(ticks_to_us(crate::cpu::tsc::read().wrapping_sub(t0)), Ordering::Relaxed);
+            let mut g = lock_hw("finish_rt");
+            let Some(hw) = g.as_mut() else { return Err(Error::Io) };
+            hw.finish_rt(plan, made).map_err(|e| {
+                crate::serial_println!("[nvgpu] a new GR channel: {}", e);
+                *LAST_ERR.lock() = e;
+                Error::NoSpc
+            })
+        }
+    }
 }
 
-/// A context is gone: its channel is given back when it was a run-time one nobody else uses.
+/// A context is gone: its channel is given back when it was a run-time one nobody else uses. In three steps so that the slow part does not hold
+/// the GPU lock (freeing the RM objects took up to 25 ms with it held, stalling every other session's submits, Ryzen #165): count the user
+/// out and wait for the channel's work to finish, taking the lock only for each look; take the channel out of its slot; free its RM objects
+/// **without** the lock; then unmap and free under it.
 pub fn ctx_destroy(id: ChanId) {
-    let mut g = HW.lock();
-    let Some(hw) = g.as_mut() else { return };
-    let Some(c) = hw.chans.get_mut(id).and_then(|c| c.as_mut()) else { return };
-    c.users = c.users.saturating_sub(1);
-    if id >= RT_FIRST && c.users == 0 {
-        hw.destroy_rt(id);
+    {
+        let mut g = lock_hw("ctx_destroy");
+        let Some(hw) = g.as_mut() else { return };
+        let Some(c) = hw.chans.get_mut(id).and_then(|c| c.as_mut()) else { return };
+        c.users = c.users.saturating_sub(1);
+        if !(id >= RT_FIRST && c.users == 0) {
+            return;
+        }
+    }
+    let t0 = crate::cpu::tsc::read();
+    loop {
+        {
+            let mut g = lock_hw("ctx_destroy_wait");
+            let Some(hw) = g.as_mut() else { return };
+            hw.poll(id);
+            let Some(c) = hw.chans[id].as_ref() else { return };
+            if c.dead || c.queue.in_flight() == 0 {
+                break;
+            }
+            if crate::cpu::tsc::read().wrapping_sub(t0) > super::copy::ms_ticks(QUIESCE_MS) {
+                hw.leak = true;
+                crate::serial_println!("[nvgpu] channel {} did not go idle at close: kept", id);
+                return;
+            }
+        }
+        crate::memory::tlb::service_pending();
+        core::hint::spin_loop();
+    }
+    let rt = {
+        let mut g = lock_hw("ctx_destroy_take");
+        let Some(hw) = g.as_mut() else { return };
+        match hw.take_rt(id) {
+            Some(rt) => rt,
+            None => return,
+        }
+    };
+    let t1 = crate::cpu::tsc::read();
+    let [ch, h1, h2, h3] = rt.handles;
+    // a channel RM reset after a fault is freed like any other
+    let _ = super::gsp::with_rm(|rm| {
+        for h in [h3, h2, h1] {
+            let _ = rm.free(h);
+        }
+        let _ = rm.free(ch);
+    });
+    DESTROY_US_MAX.fetch_max(ticks_to_us(crate::cpu::tsc::read().wrapping_sub(t1)), Ordering::Relaxed);
+    let mut g = lock_hw("ctx_destroy_finish");
+    if let Some(hw) = g.as_mut() {
+        hw.finish_destroy_rt(rt);
     }
 }
 
 /// Queue `pushes` (already validated) on channel `id` with the fence after them; returns the sequence number the fence completes as.
 pub fn submit(id: ChanId, pushes: &[Push]) -> Result<u64, Error> {
-    with(|hw| {
+    with("submit", |hw| {
         hw.poll(id);
         let c = hw.chans.get_mut(id).and_then(|c| c.as_mut()).ok_or(Error::Io)?;
         if c.dead {
@@ -902,24 +1114,24 @@ pub fn submit(id: ChanId, pushes: &[Push]) -> Result<u64, Error> {
 /// Whether the fence of `seq` on channel `id` has completed. A dead channel (or device) reports everything done, so waiters drain and the
 /// next `EXEC` on it says EIO.
 pub fn fence_done(id: ChanId, seq: u64) -> bool {
-    let mut g = HW.lock();
+    let mut g = lock_hw("fence_done");
     let Some(hw) = g.as_mut() else { return true };
     hw.poll(id);
     hw.dead || hw.chans.get(id).and_then(|c| c.as_ref()).is_none_or(|c| c.dead || c.queue.is_done(seq))
 }
 
-/// Wait for the work in flight on every channel to finish (the device is closing). `false`: it did not, and what user space had bound
-/// stays leaked.
-pub fn quiesce() -> bool {
+/// Wait for the work in flight on the channels `ids` (those of a session that is closing) to finish. Other sessions go on running:
+/// their channels are not waited for. `false`: the work did not finish, and what user space had bound stays leaked.
+pub fn quiesce(ids: &[ChanId]) -> bool {
     let t0 = crate::cpu::tsc::read();
     loop {
         {
-            let mut g = HW.lock();
+            let mut g = lock_hw("quiesce");
             let Some(hw) = g.as_mut() else { return true };
-            for id in 0..hw.chans.len() {
+            for &id in ids {
                 hw.poll(id);
             }
-            if hw.chans.iter().flatten().all(|c| c.dead || c.queue.in_flight() == 0) {
+            if ids.iter().all(|&id| hw.chans.get(id).and_then(|c| c.as_ref()).is_none_or(|c| c.dead || c.queue.in_flight() == 0)) {
                 return !hw.dead;
             }
             if crate::cpu::tsc::read().wrapping_sub(t0) > super::copy::ms_ticks(QUIESCE_MS) {
@@ -947,12 +1159,28 @@ pub fn timestamp_ns() -> Option<u64> {
     }
 }
 
-/// `/proc/kdebug` line (empty when the level was not asked for).
+/// `/proc/kdebug` line (empty when the level was not asked for), then `gpu_uapi_slow:` with the latest long holds of the GPU lock.
 pub fn render_kdebug() -> String {
+    let mut out = render_state_kdebug();
+    if !out.is_empty() {
+        let q = SLOW.lock();
+        let mut line = String::from("\ngpu_uapi_slow:");
+        for h in q.iter() {
+            let _ = write!(line, " [{} at {}.{:03} held {}.{:01} ms, had waited {} us]", h.op, h.released_ns / 1_000_000_000, (h.released_ns / 1_000_000) % 1000, h.hold_us / 1000, (h.hold_us % 1000) / 100, h.wait_us);
+        }
+        if q.is_empty() {
+            line.push_str(" none");
+        }
+        out.push_str(&line);
+    }
+    out
+}
+
+fn render_state_kdebug() -> String {
     match STATE.load(Ordering::Relaxed) {
         0 => String::new(),
         s => alloc::format!(
-            "gpu_uapi: state={} spans_bar1={} spans_pramin={} binds={} unbinds={} pages_bound={} tables_written={} tlb_flushes={} tlb_us_max={} execs={} ce_execs={} again={} fences={} dead={} chans_made={} chans_freed={} chans_dead={} last_chan_err=\"{}\"",
+            "gpu_uapi: state={} spans_bar1={} spans_pramin={} binds={} unbinds={} pages_bound={} tables_written={} tlb_flushes={} tlb_us_max={} execs={} ce_execs={} again={} fences={} dead={} chans_made={} chans_freed={} chans_dead={} create_us_max={} prepare_us_max={} destroy_us_max={} lock_wait_us_max={} last_chan_err=\"{}\"",
             if s == 1 { "ok" } else { "failed" },
             SPANS_BAR1.load(Ordering::Relaxed),
             SPANS_PRAMIN.load(Ordering::Relaxed),
@@ -970,6 +1198,10 @@ pub fn render_kdebug() -> String {
             CHANS_MADE.load(Ordering::Relaxed),
             CHANS_FREED.load(Ordering::Relaxed),
             CHANS_DEAD.load(Ordering::Relaxed),
+            CREATE_US_MAX.load(Ordering::Relaxed),
+            PREPARE_US_MAX.load(Ordering::Relaxed),
+            DESTROY_US_MAX.load(Ordering::Relaxed),
+            LOCK_WAIT_US_MAX.load(Ordering::Relaxed),
             LAST_ERR.lock().replace('"', "'")
         ),
     }

@@ -53,6 +53,10 @@ pub const IOC_TIMESTAMP: u32 = ioc(16, size_of::<Timestamp>());
 pub const IOC_SCANOUT_INFO: u32 = ioc(17, size_of::<ScanoutInfo>());
 pub const IOC_PRESENT: u32 = ioc(18, size_of::<Present>());
 pub const IOC_FLIP_STATE: u32 = ioc(19, size_of::<FlipState>());
+pub const IOC_BO_EXPORT: u32 = ioc(20, size_of::<BoExport>());
+pub const IOC_BO_IMPORT: u32 = ioc(21, size_of::<BoImport>());
+pub const IOC_SYNC_EXPORT: u32 = ioc(22, size_of::<SyncExport>());
+pub const IOC_SYNC_IMPORT: u32 = ioc(23, size_of::<SyncImport>());
 
 /// `NVG_SCANOUT_XRGB8888`.
 pub const SCANOUT_XRGB8888: u32 = 0;
@@ -128,6 +132,44 @@ pub struct BoCreate {
     pub handle: u32,
     pub mmap_offset: u64,
     pub size_out: u64,
+}
+
+/// `struct nvg_bo_export`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct BoExport {
+    pub handle: u32,
+    pub flags: u32,
+}
+
+/// `struct nvg_bo_import`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct BoImport {
+    pub fd: i32,
+    pub flags: u32,
+    pub handle: u32,
+    pub _pad: u32,
+    pub mmap_offset: u64,
+    pub size_out: u64,
+}
+
+/// `struct nvg_sync_export`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SyncExport {
+    pub handle: u32,
+    pub flags: u32,
+}
+
+/// `struct nvg_sync_import`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SyncImport {
+    pub fd: i32,
+    pub flags: u32,
+    pub handle: u32,
+    pub _pad: u32,
 }
 
 /// `struct nvg_bo_free`.
@@ -304,6 +346,18 @@ mod tests {
         assert_eq!(size_of::<ScanoutInfo>(), 32, "nvg_scanout_info");
         assert_eq!(size_of::<Present>(), 16, "nvg_present");
         assert_eq!(size_of::<FlipState>(), 16, "nvg_flip_state");
+        assert_eq!(size_of::<BoExport>(), 8, "nvg_bo_export");
+        assert_eq!(size_of::<BoImport>(), 32, "nvg_bo_import");
+        assert_eq!(size_of::<SyncExport>(), 8, "nvg_sync_export");
+        assert_eq!(size_of::<SyncImport>(), 16, "nvg_sync_import");
+        assert_eq!(offset_of!(SyncExport, flags), 4, "nvg_sync_export.flags");
+        assert_eq!(offset_of!(SyncImport, flags), 4, "nvg_sync_import.flags");
+        assert_eq!(offset_of!(SyncImport, handle), 8, "nvg_sync_import.handle");
+        assert_eq!(offset_of!(BoExport, flags), 4, "nvg_bo_export.flags");
+        assert_eq!(offset_of!(BoImport, flags), 4, "nvg_bo_import.flags");
+        assert_eq!(offset_of!(BoImport, handle), 8, "nvg_bo_import.handle");
+        assert_eq!(offset_of!(BoImport, mmap_offset), 16, "nvg_bo_import.mmap_offset");
+        assert_eq!(offset_of!(BoImport, size_out), 24, "nvg_bo_import.size_out");
         assert_eq!(offset_of!(FlipState, vblank_seq), 8, "nvg_flip_state.vblank_seq");
         assert_eq!(offset_of!(ScanoutInfo, pitch_b), 8, "nvg_scanout_info.pitch_B");
         assert_eq!(offset_of!(ScanoutInfo, format), 12, "nvg_scanout_info.format");
@@ -377,6 +431,10 @@ mod tests {
         assert_eq!(IOC_SCANOUT_INFO, 0xc0204e11, "NVG_IOC_SCANOUT_INFO");
         assert_eq!(IOC_PRESENT, 0xc0104e12, "NVG_IOC_PRESENT");
         assert_eq!(IOC_FLIP_STATE, 0xc0104e13, "NVG_IOC_FLIP_STATE");
+        assert_eq!(IOC_BO_EXPORT, 0xc0084e14, "NVG_IOC_BO_EXPORT");
+        assert_eq!(IOC_BO_IMPORT, 0xc0204e15, "NVG_IOC_BO_IMPORT");
+        assert_eq!(IOC_SYNC_EXPORT, 0xc0084e16, "NVG_IOC_SYNC_EXPORT");
+        assert_eq!(IOC_SYNC_IMPORT, 0xc0104e17, "NVG_IOC_SYNC_IMPORT");
     }
 
     #[test]
@@ -386,6 +444,7 @@ mod tests {
             size_of::<VaBind>(), size_of::<VaUnbind>(), size_of::<CtxCreate>(), size_of::<CtxDestroy>(), size_of::<Push>(),
             size_of::<SyncRef>(), size_of::<Exec>(), size_of::<SyncCreate>(), size_of::<SyncDestroy>(), size_of::<SyncSignal>(),
             size_of::<SyncWait>(), size_of::<SyncQuery>(), size_of::<Timestamp>(), size_of::<ScanoutInfo>(), size_of::<Present>(), size_of::<FlipState>(),
+            size_of::<BoExport>(), size_of::<BoImport>(), size_of::<SyncExport>(), size_of::<SyncImport>(),
         ] {
             assert_eq!(s % 8, 0);
         }
@@ -396,7 +455,7 @@ mod tests {
         let all = [
             IOC_INFO, IOC_BO_CREATE, IOC_BO_FREE, IOC_VA_ALLOC, IOC_VA_FREE, IOC_VA_BIND, IOC_VA_UNBIND, IOC_CTX_CREATE,
             IOC_CTX_DESTROY, IOC_EXEC, IOC_SYNC_CREATE, IOC_SYNC_DESTROY, IOC_SYNC_SIGNAL, IOC_SYNC_WAIT, IOC_SYNC_QUERY,
-            IOC_TIMESTAMP, IOC_SCANOUT_INFO, IOC_PRESENT, IOC_FLIP_STATE,
+            IOC_TIMESTAMP, IOC_SCANOUT_INFO, IOC_PRESENT, IOC_FLIP_STATE, IOC_BO_EXPORT, IOC_BO_IMPORT, IOC_SYNC_EXPORT, IOC_SYNC_IMPORT,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {

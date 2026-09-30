@@ -123,6 +123,13 @@ impl RangeAlloc {
 
 // ---- backend seam ---------------------------------------------------------------------------------------------------------
 
+/// The two kinds of storage a buffer object can have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Heap {
+    System,
+    Vram,
+}
+
 /// What a buffer object's storage is, as the backend needs to find it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backing {
@@ -152,6 +159,46 @@ pub trait Backend {
     fn quiesce(&mut self) -> bool {
         true
     }
+    /// Whether the two heaps (system memory arena offsets, VRAM offsets) are shared with other devices (several sessions on one GPU):
+    /// then [`heap_alloc`](Self::heap_alloc), [`heap_hold`](Self::heap_hold) and [`heap_free`](Self::heap_free) decide where a BO's storage
+    /// is and how long it lives, and the model's own heaps (`Layout::arena_bytes`, `vram_bytes`) are not used. Buffer sharing
+    /// ([`Device::bo_import`]) needs it.
+    fn shared_heaps(&self) -> bool {
+        false
+    }
+    /// `size` bytes of `heap` (page aligned), as an offset into it, with one reference held by the caller; `None` when it is full.
+    fn heap_alloc(&mut self, _heap: Heap, _size: u64) -> Option<u64> {
+        None
+    }
+    /// Another holder of the storage that starts at `off` (an import, an export): it lives until every holder has called
+    /// [`heap_free`](Self::heap_free).
+    fn heap_hold(&mut self, _heap: Heap, _off: u64) {}
+    /// One holder lets go of the storage `[off, off + size)`; the last one gives it back.
+    fn heap_free(&mut self, _heap: Heap, _off: u64, _size: u64) {}
+
+    // ---- timelines shared between devices ([`Device::sync_share`]). A shared timeline lives in the backend, not in one device: its value
+    // moves as the fences of the work that signals it complete, and whichever device reads it finds out, so the device that queued the
+    // work need not be calling in. The defaults refuse (no sharing).
+
+    /// A shared timeline with this `value` and `pending` (the highest value queued work will signal), one holder (the creator's). `None`: the
+    /// backend cannot share timelines.
+    fn shared_sync_create(&mut self, _value: u64, _pending: u64) -> Option<u64> {
+        None
+    }
+    /// Another holder of shared timeline `id`; `false` if there is no such timeline.
+    fn shared_sync_hold(&mut self, _id: u64) -> bool {
+        false
+    }
+    /// One holder lets go; the last one frees the timeline.
+    fn shared_sync_release(&mut self, _id: u64) {}
+    /// `(value, pending)` of shared timeline `id`, after applying every queued signal whose fence has completed.
+    fn shared_sync_value(&mut self, _id: u64) -> (u64, u64) {
+        (0, 0)
+    }
+    /// A CPU signal: `value` and `pending` rise to at least `value`.
+    fn shared_sync_signal(&mut self, _id: u64, _value: u64) {}
+    /// Work submitted on `ctx` (fence `seq`, as [`submit`](Self::submit) returned it) will set shared timeline `id` to `value` when it has run.
+    fn shared_sync_queue(&mut self, _id: u64, _ctx: u32, _seq: u64, _value: u64) {}
 }
 
 /// A backend with no hardware behind it: it accepts everything the model validated and completes work when told to.
@@ -257,6 +304,8 @@ struct Binding {
 struct Timeline {
     value: u64,
     pending: u64,
+    /// The backend's shared timeline this one stands for (`value` and `pending` are then the backend's, not these).
+    shared: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -284,6 +333,8 @@ pub struct Device<B: Backend> {
     next_bo: u32,
     arena: RangeAlloc,
     vram: RangeAlloc,
+    /// Bytes of each of the backend's shared heaps this device holds, indexed by [`Heap`] (unused when the heaps are the model's own).
+    held: [u64; 2],
     va: RangeAlloc,
     /// allocated VA ranges: start -> length
     va_allocs: BTreeMap<u64, u64>,
@@ -309,6 +360,7 @@ impl<B: Backend> Device<B> {
             next_bo: 1,
             arena: RangeAlloc::new(0, layout.arena_bytes),
             vram: RangeAlloc::new(0, layout.vram_bytes),
+            held: [0; 2],
             va: RangeAlloc::new(layout.va_start, layout.va_end),
             va_allocs: BTreeMap::new(),
             bound: BTreeMap::new(),
@@ -320,8 +372,13 @@ impl<B: Backend> Device<B> {
         }
     }
 
+    /// VRAM this device holds in BOs.
     pub fn vram_used(&self) -> u64 {
-        self.vram.used()
+        if self.backend.shared_heaps() {
+            self.held[Heap::Vram as usize]
+        } else {
+            self.vram.used()
+        }
     }
 
     // ---- buffer objects ---------------------------------------------------------------------------------------------------
@@ -334,11 +391,23 @@ impl<B: Backend> Device<B> {
         let size = round_up(size).ok_or(Error::Inval)?;
         let (backing, mmap) = match flags {
             uapi::BO_SYSTEM => {
-                let off = self.arena.alloc(size, PAGE).ok_or(Error::NoMem)?;
+                let off = if self.backend.shared_heaps() {
+                    let off = self.backend.heap_alloc(Heap::System, size).ok_or(Error::NoMem)?;
+                    self.held[Heap::System as usize] += size;
+                    off
+                } else {
+                    self.arena.alloc(size, PAGE).ok_or(Error::NoMem)?
+                };
                 (Backing::System { arena_off: off }, off)
             }
             uapi::BO_VRAM => {
-                let off = self.vram.alloc(size, PAGE).ok_or(Error::NoMem)?;
+                let off = if self.backend.shared_heaps() {
+                    let off = self.backend.heap_alloc(Heap::Vram, size).ok_or(Error::NoMem)?;
+                    self.held[Heap::Vram as usize] += size;
+                    off
+                } else {
+                    self.vram.alloc(size, PAGE).ok_or(Error::NoMem)?
+                };
                 (Backing::Vram { vram_off: off }, u64::MAX)
             }
             _ => return Err(Error::Inval),
@@ -358,10 +427,44 @@ impl<B: Backend> Device<B> {
     }
 
     fn release_range(&mut self, backing: Backing, size: u64) {
-        match backing {
-            Backing::System { arena_off } => self.arena.free(arena_off, size),
-            Backing::Vram { vram_off } => self.vram.free(vram_off, size),
+        let (heap, off) = match backing {
+            Backing::System { arena_off } => (Heap::System, arena_off),
+            Backing::Vram { vram_off } => (Heap::Vram, vram_off),
+        };
+        if self.backend.shared_heaps() {
+            self.backend.heap_free(heap, off, size);
+            self.held[heap as usize] -= size;
+        } else if heap == Heap::System {
+            self.arena.free(off, size);
+        } else {
+            self.vram.free(off, size);
         }
+    }
+
+    /// Take a BO another device made (its `backing` and `size`, as [`bo_backing`](Self::bo_backing) said) into this one, under a handle of
+    /// this device's own. Only on shared heaps. The storage stays until every device that holds it has released it, so the exporter may
+    /// close its handle, or its whole session, while this device still uses the memory. Returns what `bo_create` does.
+    pub fn bo_import(&mut self, backing: Backing, size: u64) -> Result<(u32, u64, u64), Error> {
+        if !self.backend.shared_heaps() || size == 0 || size % PAGE != 0 {
+            return Err(Error::Inval);
+        }
+        let (heap, off, mmap) = match backing {
+            Backing::System { arena_off } => (Heap::System, arena_off, arena_off),
+            Backing::Vram { vram_off } => (Heap::Vram, vram_off, u64::MAX),
+        };
+        self.backend.heap_hold(heap, off);
+        if let Err(e) = self.backend.bo_create(backing, size) {
+            self.backend.heap_free(heap, off, size);
+            return Err(e);
+        }
+        self.held[heap as usize] += size;
+        let mut handle = self.next_bo;
+        while handle == 0 || self.bos.contains_key(&handle) {
+            handle = handle.wrapping_add(1);
+        }
+        self.next_bo = handle.wrapping_add(1);
+        self.bos.insert(handle, Bo { size, backing, binds: 0, closed: false });
+        Ok((handle, mmap, size))
     }
 
     fn bo(&self, handle: u32) -> Result<&Bo, Error> {
@@ -569,30 +672,99 @@ impl<B: Backend> Device<B> {
         while self.syncs.contains_key(&h) || h == 0 {
             h = h.wrapping_add(1);
         }
-        self.syncs.insert(h, Timeline { value: initial, pending: initial });
+        self.syncs.insert(h, Timeline { value: initial, pending: initial, shared: None });
         self.next_sync = h.wrapping_add(1);
         Ok(h)
     }
 
     pub fn sync_destroy(&mut self, handle: u32) -> Result<(), Error> {
-        self.syncs.remove(&handle).map(|_| ()).ok_or(Error::NoEnt)
+        let t = self.syncs.remove(&handle).ok_or(Error::NoEnt)?;
+        if let Some(id) = t.shared {
+            self.backend.shared_sync_release(id);
+        }
+        Ok(())
+    }
+
+    /// The timeline's `(value, pending)`: its own, or the backend's when it is shared.
+    fn tl(&mut self, handle: u32) -> Result<(u64, u64), Error> {
+        let t = *self.syncs.get(&handle).ok_or(Error::NoEnt)?;
+        Ok(match t.shared {
+            Some(id) => self.backend.shared_sync_value(id),
+            None => (t.value, t.pending),
+        })
     }
 
     /// CPU signal: the value must not go backwards (Vulkan timeline semantics).
     pub fn sync_signal(&mut self, handle: u32, value: u64) -> Result<(), Error> {
-        let t = self.syncs.get_mut(&handle).ok_or(Error::NoEnt)?;
-        if value < t.value {
+        let (cur, _) = self.tl(handle)?;
+        if value < cur {
             return Err(Error::Inval);
         }
-        t.value = value;
-        t.pending = t.pending.max(value);
+        let t = self.syncs.get_mut(&handle).ok_or(Error::NoEnt)?;
+        match t.shared {
+            Some(id) => self.backend.shared_sync_signal(id, value),
+            None => {
+                t.value = value;
+                t.pending = t.pending.max(value);
+            }
+        }
         Ok(())
     }
 
     /// `(value, pending)`.
     pub fn sync_query(&mut self, handle: u32) -> Result<(u64, u64), Error> {
         self.poll();
-        self.syncs.get(&handle).map(|t| (t.value, t.pending)).ok_or(Error::NoEnt)
+        self.tl(handle)
+    }
+
+    /// Make the timeline shareable (it stays this device's handle, now backed by a timeline the backend keeps) and take one more hold on it
+    /// for the caller, who turns it into a descriptor. Returns the shared id; asking again for the same timeline returns the same id.
+    /// `Inval` when the backend cannot share timelines.
+    pub fn sync_share(&mut self, handle: u32) -> Result<u64, Error> {
+        let t = *self.syncs.get(&handle).ok_or(Error::NoEnt)?;
+        let id = match t.shared {
+            Some(id) => id,
+            None => {
+                let id = self.backend.shared_sync_create(t.value, t.pending).ok_or(Error::Inval)?;
+                self.syncs.get_mut(&handle).expect("the timeline was just read").shared = Some(id);
+                // Work already queued against it (the usual order: submit, then export) is the backend's to resolve from now on, for whoever
+                // reads the timeline. Left here it would be applied only when this device next calls in, and a device that queued its
+                // work and went idle would never complete it for anyone else. The entry stays (`busy` counts it) without the signal.
+                for p in self.pending.iter_mut() {
+                    let (ctx, seq) = (p.ctx, p.seq);
+                    let backend = &mut self.backend;
+                    p.signals.retain(|sig| {
+                        if sig.handle != handle {
+                            return true;
+                        }
+                        backend.shared_sync_queue(id, ctx, seq, sig.value);
+                        false
+                    });
+                }
+                id
+            }
+        };
+        if !self.backend.shared_sync_hold(id) {
+            return Err(Error::NoEnt);
+        }
+        Ok(id)
+    }
+
+    /// Take shared timeline `id` into this device under a handle of its own (one more hold on it).
+    pub fn sync_import(&mut self, id: u64) -> Result<u32, Error> {
+        if self.syncs.len() >= 1 << 16 {
+            return Err(Error::NoSpc);
+        }
+        if !self.backend.shared_sync_hold(id) {
+            return Err(Error::NoEnt);
+        }
+        let mut h = self.next_sync;
+        while self.syncs.contains_key(&h) || h == 0 {
+            h = h.wrapping_add(1);
+        }
+        self.syncs.insert(h, Timeline { value: 0, pending: 0, shared: Some(id) });
+        self.next_sync = h.wrapping_add(1);
+        Ok(h)
     }
 
     /// The index of a ready reference (`any`), or of the first one when all are (`!any`, `Some(0)` for none); `None` while not ready.
@@ -602,8 +774,8 @@ impl<B: Backend> Device<B> {
         self.poll();
         let mut first = None;
         for (i, r) in refs.iter().enumerate() {
-            let t = *self.syncs.get(&r.handle).ok_or(Error::NoEnt)?;
-            let v = if pending { t.pending } else { t.value };
+            let (value, pend) = self.tl(r.handle)?;
+            let v = if pending { pend } else { value };
             let ready = v >= r.value;
             if any && ready {
                 return Ok(Some(i));
@@ -621,8 +793,12 @@ impl<B: Backend> Device<B> {
     fn advance(&mut self, s: SyncRef) {
         // a timeline destroyed while work was in flight simply loses the signal
         if let Some(t) = self.syncs.get_mut(&s.handle) {
-            // `exec` raised `pending` to this value when the work was queued, so `pending >= value` still holds.
-            t.value = t.value.max(s.value);
+            match t.shared {
+                // shared after the work was queued: the backend's timeline takes the signal
+                Some(id) => self.backend.shared_sync_signal(id, s.value),
+                // `exec` raised `pending` to this value when the work was queued, so `pending >= value` still holds.
+                None => t.value = t.value.max(s.value),
+            }
         }
     }
 
@@ -676,13 +852,23 @@ impl<B: Backend> Device<B> {
         }
         // An EXEC with nothing to run still orders after earlier work on the context: signals wait for its fence too.
         let seq = self.backend.submit(ctx, pushes)?;
-        if !signals.is_empty() {
-            for s in signals {
-                if let Some(t) = self.syncs.get_mut(&s.handle) {
-                    t.pending = t.pending.max(s.value);
+        // A signal on a shared timeline goes to the backend, which resolves it from the fence whoever asks; the others wait here for `poll`.
+        let mut local: Vec<SyncRef> = Vec::new();
+        for s in signals {
+            match self.syncs.get_mut(&s.handle) {
+                Some(Timeline { shared: Some(id), .. }) => {
+                    let id = *id;
+                    self.backend.shared_sync_queue(id, ctx, seq, s.value);
                 }
+                Some(t) => {
+                    t.pending = t.pending.max(s.value);
+                    local.push(*s);
+                }
+                None => {}
             }
-            self.pending.push(Pending { ctx, seq, signals: signals.to_vec() });
+        }
+        if !local.is_empty() {
+            self.pending.push(Pending { ctx, seq, signals: local });
         }
         self.poll();
         Ok(())
@@ -710,7 +896,11 @@ impl<B: Backend> Device<B> {
         for c in ctxs {
             let _ = self.ctx_destroy(c);
         }
-        self.syncs.clear();
+        for t in core::mem::take(&mut self.syncs).into_values() {
+            if let Some(id) = t.shared {
+                self.backend.shared_sync_release(id);
+            }
+        }
         self.pending.clear();
         let allocs: Vec<(u64, u64)> = self.va_allocs.iter().map(|(&s, &l)| (s, l)).collect();
         for (s, l) in allocs {
@@ -1389,6 +1579,495 @@ mod tests {
         }
         d.va_unbind(va, pages * PAGE).unwrap();
         assert!(d.backend.bound.is_empty());
+    }
+
+    // ---- several devices on one VRAM heap (G5 layer 1) ---------------------------------------------------------------------
+
+    /// A soft backend whose heaps are shared with other instances (what the kernel does across `/dev/nvgpu` sessions): one `RangeAlloc`
+    /// per heap and a reference count per allocation.
+    struct SharedHeaps {
+        heaps: [RangeAlloc; 2],
+        refs: alloc::collections::BTreeMap<(Heap, u64), u32>,
+        syncs: alloc::collections::BTreeMap<u64, TSync>,
+        next_sync: u64,
+        /// Fence state the shared timelines are resolved against: (device tag, ctx) -> the highest completed `seq`.
+        done: alloc::collections::BTreeMap<(u32, u32), u64>,
+    }
+
+    /// A shared timeline in the test backend: what the kernel adapter keeps in its registry.
+    struct TSync {
+        value: u64,
+        pending: u64,
+        refs: u32,
+        /// Queued signals: (device tag, ctx, seq, value).
+        pend: Vec<(u32, u32, u64, u64)>,
+    }
+
+    type Pool = alloc::rc::Rc<core::cell::RefCell<SharedHeaps>>;
+
+    fn pool(system: u64, vram: u64) -> Pool {
+        alloc::rc::Rc::new(core::cell::RefCell::new(SharedHeaps {
+            heaps: [RangeAlloc::new(0, system), RangeAlloc::new(0, vram)],
+            refs: Default::default(),
+            syncs: Default::default(),
+            next_sync: 1,
+            done: Default::default(),
+        }))
+    }
+
+    struct Shared {
+        soft: SoftBackend,
+        pool: Pool,
+        /// Which device this backend is: the fences it resolves are its own.
+        tag: u32,
+    }
+
+    impl Backend for Shared {
+        fn bo_create(&mut self, b: Backing, s: u64) -> Result<(), Error> {
+            self.soft.bo_create(b, s)
+        }
+        fn bo_release(&mut self, b: Backing, s: u64) {
+            self.soft.bo_release(b, s)
+        }
+        fn bind(&mut self, va: u64, size: u64, b: Backing, o: u64, k: u32) -> Result<(), Error> {
+            self.soft.bind(va, size, b, o, k)
+        }
+        fn unbind(&mut self, va: u64, size: u64) {
+            self.soft.unbind(va, size)
+        }
+        fn ctx_create(&mut self, c: u32, e: u32) -> Result<(), Error> {
+            self.soft.ctx_create(c, e)
+        }
+        fn ctx_destroy(&mut self, c: u32) {
+            self.soft.ctx_destroy(c)
+        }
+        fn submit(&mut self, c: u32, p: &[Push]) -> Result<u64, Error> {
+            self.soft.submit(c, p)
+        }
+        fn fence_done(&mut self, c: u32, s: u64) -> bool {
+            self.soft.fence_done(c, s)
+        }
+        fn shared_heaps(&self) -> bool {
+            true
+        }
+        fn heap_alloc(&mut self, heap: Heap, size: u64) -> Option<u64> {
+            let mut p = self.pool.borrow_mut();
+            let off = p.heaps[heap as usize].alloc(size, PAGE)?;
+            p.refs.insert((heap, off), 1);
+            Some(off)
+        }
+        fn heap_hold(&mut self, heap: Heap, off: u64) {
+            *self.pool.borrow_mut().refs.get_mut(&(heap, off)).expect("holding storage that is not allocated") += 1;
+        }
+        fn heap_free(&mut self, heap: Heap, off: u64, size: u64) {
+            let mut p = self.pool.borrow_mut();
+            let n = p.refs.get_mut(&(heap, off)).expect("freeing storage that is not allocated");
+            *n -= 1;
+            if *n == 0 {
+                p.refs.remove(&(heap, off));
+                p.heaps[heap as usize].free(off, size);
+            }
+        }
+        fn shared_sync_create(&mut self, value: u64, pending: u64) -> Option<u64> {
+            let mut p = self.pool.borrow_mut();
+            let id = p.next_sync;
+            p.next_sync += 1;
+            p.syncs.insert(id, TSync { value, pending, refs: 1, pend: Vec::new() });
+            Some(id)
+        }
+        fn shared_sync_hold(&mut self, id: u64) -> bool {
+            match self.pool.borrow_mut().syncs.get_mut(&id) {
+                Some(t) => {
+                    t.refs += 1;
+                    true
+                }
+                None => false,
+            }
+        }
+        fn shared_sync_release(&mut self, id: u64) {
+            let mut p = self.pool.borrow_mut();
+            let t = p.syncs.get_mut(&id).expect("releasing a timeline that does not exist");
+            t.refs -= 1;
+            if t.refs == 0 {
+                p.syncs.remove(&id);
+            }
+        }
+        fn shared_sync_value(&mut self, id: u64) -> (u64, u64) {
+            let mut p = self.pool.borrow_mut();
+            let p = &mut *p;
+            let t = p.syncs.get_mut(&id).expect("reading a timeline that does not exist");
+            let done = &p.done;
+            t.pend.retain(|&(tag, ctx, seq, v)| {
+                if done.get(&(tag, ctx)).is_some_and(|&d| d >= seq) {
+                    t.value = t.value.max(v);
+                    false
+                } else {
+                    true
+                }
+            });
+            (t.value, t.pending)
+        }
+        fn shared_sync_signal(&mut self, id: u64, value: u64) {
+            let mut p = self.pool.borrow_mut();
+            let t = p.syncs.get_mut(&id).expect("signalling a timeline that does not exist");
+            t.value = t.value.max(value);
+            t.pending = t.pending.max(value);
+        }
+        fn shared_sync_queue(&mut self, id: u64, ctx: u32, seq: u64, value: u64) {
+            let tag = self.tag;
+            let mut p = self.pool.borrow_mut();
+            let t = p.syncs.get_mut(&id).expect("queueing on a timeline that does not exist");
+            t.pending = t.pending.max(value);
+            t.pend.push((tag, ctx, seq, value));
+        }
+    }
+
+    fn slot_layout(slot: u64) -> Layout {
+        // each device's own heap sizes are 0: they must not matter
+        Layout { arena_bytes: 0, vram_bytes: 0, va_start: VA0 + slot * (1 << 30), va_end: VA0 + (slot + 1) * (1 << 30) }
+    }
+
+    fn shared_pair(system: u64, vram: u64) -> (Device<Shared>, Device<Shared>, Pool) {
+        let p = pool(system, vram);
+        let mk = |slot| Device::new(Shared { soft: SoftBackend::default(), pool: p.clone(), tag: slot as u32 }, slot_layout(slot));
+        (mk(0), mk(1), p)
+    }
+
+    fn used(p: &Pool, h: Heap) -> u64 {
+        p.borrow().heaps[h as usize].used()
+    }
+
+    #[test]
+    fn devices_on_shared_heaps_get_disjoint_storage() {
+        let (mut a, mut b, _) = shared_pair(1 << 20, 1 << 20);
+        let (ha, _, _) = a.bo_create(0x40000, BO_VRAM).unwrap();
+        let (hb, _, _) = b.bo_create(0x40000, BO_VRAM).unwrap();
+        let (oa, sa) = a.vram_bo(ha).unwrap();
+        let (ob, sb) = b.vram_bo(hb).unwrap();
+        assert!(oa + sa <= ob || ob + sb <= oa, "{oa:#x}+{sa:#x} overlaps {ob:#x}+{sb:#x}");
+        assert_eq!((a.vram_used(), b.vram_used()), (0x40000, 0x40000), "each device counts its own");
+        let (_, ma, _) = a.bo_create(0x10000, BO_SYSTEM).unwrap();
+        let (_, mb, _) = b.bo_create(0x10000, BO_SYSTEM).unwrap();
+        assert!(ma + 0x10000 <= mb || mb + 0x10000 <= ma, "system BOs of two devices share an arena offset: {ma:#x} {mb:#x}");
+    }
+
+    #[test]
+    fn a_shared_heap_is_one_pool_and_gives_back_on_free_and_teardown() {
+        let (mut a, mut b, p) = shared_pair(1 << 20, 1 << 20);
+        let (ha, _, _) = a.bo_create(0xc0000, BO_VRAM).unwrap();
+        assert_eq!(b.bo_create(0x80000, BO_VRAM), Err(Error::NoMem), "what a holds is not b's to take");
+        a.bo_free(ha).unwrap();
+        let (hb, _, _) = b.bo_create(0x80000, BO_VRAM).unwrap();
+        assert_eq!(used(&p, Heap::Vram), 0x80000);
+        b.bo_create(0x40000, BO_VRAM).unwrap();
+        b.bo_create(0x40000, BO_SYSTEM).unwrap();
+        assert!(b.teardown());
+        assert_eq!((used(&p, Heap::Vram), used(&p, Heap::System)), (0, 0), "teardown returns every byte");
+        assert_eq!((a.vram_used(), b.vram_used()), (0, 0));
+        assert_eq!(b.vram_bo(hb), None);
+    }
+
+    /// A backend that refuses every `bo_create`, over a `Shared` one.
+    struct Refuses(Shared);
+
+    impl Backend for Refuses {
+        fn bo_create(&mut self, _: Backing, _: u64) -> Result<(), Error> {
+            Err(Error::NoMem)
+        }
+        fn bo_release(&mut self, b: Backing, s: u64) {
+            self.0.bo_release(b, s)
+        }
+        fn bind(&mut self, va: u64, size: u64, b: Backing, o: u64, k: u32) -> Result<(), Error> {
+            self.0.bind(va, size, b, o, k)
+        }
+        fn unbind(&mut self, va: u64, size: u64) {
+            self.0.unbind(va, size)
+        }
+        fn ctx_create(&mut self, c: u32, e: u32) -> Result<(), Error> {
+            self.0.ctx_create(c, e)
+        }
+        fn ctx_destroy(&mut self, c: u32) {
+            self.0.ctx_destroy(c)
+        }
+        fn submit(&mut self, c: u32, p: &[Push]) -> Result<u64, Error> {
+            self.0.submit(c, p)
+        }
+        fn fence_done(&mut self, c: u32, s: u64) -> bool {
+            self.0.fence_done(c, s)
+        }
+        fn shared_heaps(&self) -> bool {
+            true
+        }
+        fn heap_alloc(&mut self, h: Heap, size: u64) -> Option<u64> {
+            self.0.heap_alloc(h, size)
+        }
+        fn heap_hold(&mut self, h: Heap, o: u64) {
+            self.0.heap_hold(h, o)
+        }
+        fn heap_free(&mut self, h: Heap, o: u64, s: u64) {
+            self.0.heap_free(h, o, s)
+        }
+    }
+
+    #[test]
+    fn a_backend_failure_gives_shared_storage_back() {
+        let p = pool(1 << 20, 1 << 20);
+        let mut d = Device::new(Refuses(Shared { soft: SoftBackend::default(), pool: p.clone(), tag: 0 }), layout());
+        assert_eq!(d.bo_create(0x1000, BO_VRAM), Err(Error::NoMem));
+        assert_eq!(d.bo_create(0x1000, BO_SYSTEM), Err(Error::NoMem));
+        assert_eq!((used(&p, Heap::Vram), used(&p, Heap::System)), (0, 0));
+        assert_eq!(d.vram_used(), 0);
+    }
+
+    // ---- sharing buffers between devices (G5 layer 2) ----------------------------------------------------------------------
+
+    fn export(d: &Device<Shared>, h: u32) -> (Backing, u64) {
+        d.bo_backing(h).unwrap()
+    }
+
+    #[test]
+    fn an_imported_bo_is_the_same_storage_under_a_handle_of_its_own() {
+        let (mut a, mut b, p) = shared_pair(1 << 20, 1 << 20);
+        let (ha, ma, sa) = a.bo_create(0x8000, BO_SYSTEM).unwrap();
+        let (backing, size) = export(&a, ha);
+        let (hb, mb, sb) = b.bo_import(backing, size).unwrap();
+        assert_eq!((mb, sb), (ma, sa), "the importer maps the same arena offset");
+        assert_eq!(b.bo_backing(hb).unwrap(), (backing, size));
+        // both devices can bind it, each at its own addresses
+        let va_a = a.va_alloc(0x8000, 0x1000).unwrap();
+        let va_b = b.va_alloc(0x8000, 0x1000).unwrap();
+        assert_ne!(va_a, va_b);
+        a.va_bind(&VaBind { va: va_a, size: 0x8000, bo_offset: 0, handle: ha, pte_kind: 0 }).unwrap();
+        b.va_bind(&VaBind { va: va_b, size: 0x8000, bo_offset: 0, handle: hb, pte_kind: 0 }).unwrap();
+        assert_eq!(a.backend.soft.mapped[0].2, b.backend.soft.mapped[0].2, "same backing in both page-table writes");
+        // one allocation in the pool, however many holders
+        assert_eq!(used(&p, Heap::System), 0x8000);
+    }
+
+    #[test]
+    fn the_storage_lives_until_the_last_holder_lets_go() {
+        let (mut a, mut b, p) = shared_pair(1 << 20, 1 << 20);
+        let (ha, _, _) = a.bo_create(0x4000, BO_VRAM).unwrap();
+        let (backing, size) = export(&a, ha);
+        let (hb, _, _) = b.bo_import(backing, size).unwrap();
+        a.bo_free(ha).unwrap();
+        assert_eq!(used(&p, Heap::Vram), 0x4000, "the exporter's handle is gone, the importer still holds the memory");
+        assert_eq!(b.vram_bo(hb), Some((match backing { Backing::Vram { vram_off } => vram_off, _ => unreachable!() }, 0x4000)));
+        assert_eq!((a.vram_used(), b.vram_used()), (0, 0x4000));
+        // a fresh BO cannot land on the memory b still holds
+        let (hc, _, _) = a.bo_create(0x4000, BO_VRAM).unwrap();
+        assert_ne!(a.vram_bo(hc).unwrap().0, b.vram_bo(hb).unwrap().0);
+        b.bo_free(hb).unwrap();
+        assert_eq!(used(&p, Heap::Vram), 0x4000, "only hc is left");
+        a.bo_free(hc).unwrap();
+        assert_eq!(used(&p, Heap::Vram), 0);
+    }
+
+    #[test]
+    fn the_exporters_whole_session_can_end_first() {
+        let (mut a, mut b, p) = shared_pair(1 << 20, 1 << 20);
+        let (ha, _, _) = a.bo_create(0x4000, BO_SYSTEM).unwrap();
+        let (backing, size) = export(&a, ha);
+        let (hb, mb, _) = b.bo_import(backing, size).unwrap();
+        let va = a.va_alloc(0x4000, 0x1000).unwrap();
+        a.va_bind(&VaBind { va, size: 0x4000, bo_offset: 0, handle: ha, pte_kind: 0 }).unwrap();
+        assert!(a.teardown());
+        assert_eq!(used(&p, Heap::System), 0x4000, "b's hold keeps it");
+        assert_eq!(b.bo_backing(hb).unwrap().0, backing);
+        assert_eq!(Backing::System { arena_off: mb }, backing);
+        assert!(b.teardown());
+        assert_eq!(used(&p, Heap::System), 0, "and its teardown frees it");
+    }
+
+    #[test]
+    fn a_bo_can_be_imported_twice_into_one_device() {
+        let (mut a, mut b, p) = shared_pair(1 << 20, 1 << 20);
+        let (ha, _, _) = a.bo_create(0x2000, BO_VRAM).unwrap();
+        let (backing, size) = export(&a, ha);
+        let (h1, _, _) = b.bo_import(backing, size).unwrap();
+        let (h2, _, _) = b.bo_import(backing, size).unwrap();
+        assert_ne!(h1, h2);
+        assert_eq!(b.vram_used(), 0x4000, "each import is a holder");
+        b.bo_free(h1).unwrap();
+        a.bo_free(ha).unwrap();
+        assert_eq!(used(&p, Heap::Vram), 0x2000, "h2 still holds it");
+        b.bo_free(h2).unwrap();
+        assert_eq!(used(&p, Heap::Vram), 0);
+    }
+
+    #[test]
+    fn an_import_is_refused_off_shared_heaps_and_for_bad_sizes() {
+        let mut solo = dev();
+        let (h, _, _) = solo.bo_create(0x1000, BO_VRAM).unwrap();
+        let (backing, size) = solo.bo_backing(h).unwrap();
+        assert_eq!(solo.bo_import(backing, size), Err(Error::Inval), "a device with heaps of its own has nobody to share with");
+        let (mut a, mut b, p) = shared_pair(1 << 20, 1 << 20);
+        let (ha, _, _) = a.bo_create(0x2000, BO_VRAM).unwrap();
+        let (backing, _) = export(&a, ha);
+        assert_eq!(b.bo_import(backing, 0), Err(Error::Inval));
+        assert_eq!(b.bo_import(backing, 0x1800), Err(Error::Inval));
+        // nothing was held by the refused attempts
+        a.bo_free(ha).unwrap();
+        assert_eq!(used(&p, Heap::Vram), 0);
+    }
+
+    #[test]
+    fn a_failed_import_lets_go_of_its_hold() {
+        let p = pool(1 << 20, 1 << 20);
+        let mut a = Device::new(Shared { soft: SoftBackend::default(), pool: p.clone(), tag: 0 }, slot_layout(0));
+        let mut r = Device::new(Refuses(Shared { soft: SoftBackend::default(), pool: p.clone(), tag: 0 }), slot_layout(1));
+        let (ha, _, _) = a.bo_create(0x2000, BO_VRAM).unwrap();
+        let (backing, size) = a.bo_backing(ha).unwrap();
+        assert_eq!(r.bo_import(backing, size), Err(Error::NoMem));
+        assert_eq!(r.vram_used(), 0);
+        a.bo_free(ha).unwrap();
+        assert_eq!(used(&p, Heap::Vram), 0, "the hold taken for the failed import did not leak the memory");
+    }
+
+    // ---- sharing timelines between devices (G5 layer 2) ----------------------------------------------------------------------
+
+    /// The GPU finished everything `d` had submitted: its soft fences complete and the pool's fence state says so.
+    fn complete(d: &mut Device<Shared>) {
+        d.backend.soft.complete_all();
+        let tag = d.backend.tag;
+        let done: Vec<((u32, u32), u64)> = d.backend.soft.done.iter().map(|(&c, &s)| ((tag, c), s)).collect();
+        d.backend.pool.borrow_mut().done.extend(done);
+    }
+
+    fn holding_device(slot: u64, p: &Pool) -> Device<Shared> {
+        let mut soft = SoftBackend::default();
+        soft.hold = true;
+        Device::new(Shared { soft, pool: p.clone(), tag: slot as u32 }, slot_layout(slot))
+    }
+
+    /// A device with a context and a bound page to push from.
+    fn ready(d: &mut Device<Shared>) -> u32 {
+        let (h, _, _) = d.bo_create(0x1000, BO_SYSTEM).unwrap();
+        let va = d.va_alloc(0x1000, 0x1000).unwrap();
+        d.va_bind(&VaBind { va, size: 0x1000, bo_offset: 0, handle: h, pte_kind: 0 }).unwrap();
+        d.backend.soft.table_ops = va as usize; // remembered for `push_at`
+        d.ctx_create(uapi::ENGINE_COMPUTE).unwrap()
+    }
+
+    fn push_at(d: &Device<Shared>) -> Push {
+        push(d.backend.soft.table_ops as u64, 16)
+    }
+
+    #[test]
+    fn a_shared_timeline_is_resolved_for_a_reader_while_the_signaller_is_idle() {
+        let p = pool(1 << 20, 1 << 20);
+        let (mut a, mut b) = (holding_device(0, &p), holding_device(1, &p));
+        let ca = ready(&mut a);
+        let ta = a.sync_create(0).unwrap();
+        let id = a.sync_share(ta).unwrap();
+        let tb = b.sync_import(id).unwrap();
+        // a queues work that signals 5 and then does not call in again
+        a.exec(ca, &[push_at(&a)], &[], &[sr(ta, 5)]).unwrap();
+        assert_eq!(b.sync_query(tb).unwrap(), (0, 5), "b sees the queued value as pending, not yet as completed");
+        assert_eq!(b.waits_ready(&[sr(tb, 5)], false, false).unwrap(), None);
+        assert_eq!(b.waits_ready(&[sr(tb, 5)], false, true).unwrap(), Some(0), "WAIT_PENDING is satisfied by the queued value");
+        complete(&mut a);
+        assert_eq!(b.sync_query(tb).unwrap(), (5, 5), "the work completed and b found out without a doing anything");
+        assert_eq!(b.waits_ready(&[sr(tb, 5)], false, false).unwrap(), Some(0));
+        assert_eq!(a.sync_query(ta).unwrap(), (5, 5), "and a's own handle says the same");
+    }
+
+    #[test]
+    fn a_timeline_shared_after_work_was_queued_still_completes() {
+        let p = pool(1 << 20, 1 << 20);
+        let (mut a, mut b) = (holding_device(0, &p), holding_device(1, &p));
+        let ca = ready(&mut a);
+        let ta = a.sync_create(0).unwrap();
+        a.exec(ca, &[push_at(&a)], &[], &[sr(ta, 7)]).unwrap();
+        let id = a.sync_share(ta).unwrap();
+        let tb = b.sync_import(id).unwrap();
+        assert_eq!(b.sync_query(tb).unwrap().1, 7, "the pending value came along");
+        complete(&mut a);
+        // no `a.poll()`: a queued the work and went idle, and b still finds it complete
+        assert_eq!(b.sync_query(tb).unwrap(), (7, 7));
+        assert!(a.busy(), "the device still knows it has a submission outstanding until it polls");
+        a.poll();
+        assert!(!a.busy());
+        assert_eq!(a.sync_query(ta).unwrap(), (7, 7), "and polling later changes nothing");
+    }
+
+    #[test]
+    fn sharing_one_timeline_moves_only_its_own_queued_signals() {
+        let p = pool(1 << 20, 1 << 20);
+        let (mut a, mut b) = (holding_device(0, &p), holding_device(1, &p));
+        let ca = ready(&mut a);
+        let (shared, private) = (a.sync_create(0).unwrap(), a.sync_create(0).unwrap());
+        // one submission signals both timelines: 4 on the one that will be shared, 6 on the one that will not
+        a.exec(ca, &[push_at(&a)], &[], &[sr(shared, 4), sr(private, 6)]).unwrap();
+        let id = a.sync_share(shared).unwrap();
+        let tb = b.sync_import(id).unwrap();
+        complete(&mut a);
+        assert_eq!(b.sync_query(tb).unwrap(), (4, 4), "the shared timeline got its own signal, and not the other's 6");
+        assert_eq!(a.sync_query(private).unwrap(), (6, 6), "the private one still completes through the device's own poll");
+        assert_eq!(a.sync_query(shared).unwrap(), (4, 4));
+    }
+
+    #[test]
+    fn a_cpu_signal_on_one_side_is_seen_on_the_other_and_cannot_go_backwards() {
+        let (mut a, mut b, _) = shared_pair(1 << 20, 1 << 20);
+        let ta = a.sync_create(3).unwrap();
+        let id = a.sync_share(ta).unwrap();
+        let tb = b.sync_import(id).unwrap();
+        assert_eq!(b.sync_query(tb).unwrap(), (3, 3), "the value the timeline had when it was shared");
+        b.sync_signal(tb, 9).unwrap();
+        assert_eq!(a.sync_query(ta).unwrap(), (9, 9));
+        assert_eq!(a.sync_signal(ta, 4), Err(Error::Inval), "a value below the current one is refused on either side");
+        assert_eq!(b.sync_signal(tb, 8), Err(Error::Inval));
+    }
+
+    #[test]
+    fn a_shared_timeline_lives_until_its_last_holder_lets_go() {
+        let (mut a, mut b, p) = shared_pair(1 << 20, 1 << 20);
+        let ta = a.sync_create(0).unwrap();
+        let id = a.sync_share(ta).unwrap();   // the descriptor's hold
+        let again = a.sync_share(ta).unwrap();
+        assert_eq!(again, id, "sharing twice names the same timeline");
+        a.backend.shared_sync_release(again);  // a second descriptor, closed
+        let tb = b.sync_import(id).unwrap();
+        a.backend.shared_sync_release(id);     // the first descriptor, closed
+        assert!(a.teardown());
+        assert_eq!(p.borrow().syncs.len(), 1, "a's session is gone; b's handle keeps the timeline");
+        b.sync_signal(tb, 2).unwrap();
+        b.sync_destroy(tb).unwrap();
+        assert_eq!(p.borrow().syncs.len(), 0, "the last holder's destroy frees it");
+        let t2 = b.sync_create(0).unwrap();
+        let id2 = b.sync_share(t2).unwrap();
+        b.backend.shared_sync_release(id2);
+        assert!(b.teardown());
+        assert_eq!(p.borrow().syncs.len(), 0, "teardown releases what the device holds");
+    }
+
+    #[test]
+    fn sharing_is_refused_without_a_backend_that_can_and_for_unknown_things() {
+        let mut solo = dev();
+        let t = solo.sync_create(0).unwrap();
+        assert_eq!(solo.sync_share(t), Err(Error::Inval), "a backend with no shared timelines");
+        assert_eq!(solo.sync_import(1), Err(Error::NoEnt));
+        let (mut a, mut b, _) = shared_pair(1 << 20, 1 << 20);
+        assert_eq!(a.sync_share(77), Err(Error::NoEnt));
+        assert_eq!(b.sync_import(12345), Err(Error::NoEnt), "a timeline that does not exist");
+    }
+
+    #[test]
+    fn a_wait_on_an_imported_timeline_is_satisfied_by_the_other_devices_work() {
+        let p = pool(1 << 20, 1 << 20);
+        let (mut a, mut b) = (holding_device(0, &p), holding_device(1, &p));
+        let ca = ready(&mut a);
+        let cb = ready(&mut b);
+        let ta = a.sync_create(0).unwrap();
+        let id = a.sync_share(ta).unwrap();
+        let tb = b.sync_import(id).unwrap();
+        a.exec(ca, &[push_at(&a)], &[], &[sr(ta, 1)]).unwrap();
+        // b's EXEC waits for a's work: not ready, then ready once a's fence completes
+        assert_eq!(b.waits_ready(&[sr(tb, 1)], false, false).unwrap(), None);
+        complete(&mut a);
+        assert_eq!(b.waits_ready(&[sr(tb, 1)], false, false).unwrap(), Some(0));
+        b.exec(cb, &[push_at(&b)], &[sr(tb, 1)], &[]).unwrap();
     }
 
     #[test]

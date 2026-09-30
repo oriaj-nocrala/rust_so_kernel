@@ -19,7 +19,7 @@ NVK hoy usa DRM de nouveau (`VM_INIT/VM_BIND/EXEC`, syncobj). Nosotros damos un 
 - **La CPU no lee VRAM.** BAR1 es de solo escritura tras GSP-RM y PRAMIN no ve las stores del SM. Por tanto no hay memoria "visible por host" en VRAM: `bar_size_B = 0` en la info del dispositivo, y NVK ya trata ese caso (VRAM solo del dispositivo, subidas por memoria de sistema + copy engine). La memoria de sistema sí se mapea en la CPU.
 - **Toda la pila de GPU vive hoy en el arranque** (`gpu=compute`): tablas de páginas locales a `compute::run`, un canal GR fijo, `Submitter` con un bloque de VRAM fijo. Solo `copy` deja un `Runtime`. G4 obliga a hacer persistente ese estado (tablas + asignador de VRAM + canal + cerrojo).
 - **No hay GPU en QEMU.** Cada prueba sobre hardware cuesta una vuelta en la Ryzen. De ahí el orden: contrato y NVK primero contra un dispositivo *software*.
-- El VA space es único y de RM-externo (tablas nuestras); GR necesita el contexto dorado creado en el arranque. Primera versión: **un solo proceso de GPU a la vez** (`open` exclusivo, como un DRM master) y un VA space global.
+- El VA space es único y de RM-externo (tablas nuestras); GR necesita el contexto dorado creado en el arranque. Primera versión: **un solo proceso de GPU a la vez** (`open` exclusivo, como un DRM master) y un VA space global. [G5 capa 1 levantó ambas: sesiones con un trozo de VA cada una, ver `docs/reference/gpu.md`.]
 
 ## Interfaz del kernel (`/dev/nvgpu`, ioctl)
 

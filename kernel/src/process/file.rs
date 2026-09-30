@@ -15,7 +15,7 @@ use alloc::boxed::Box;
 // to change. `FileDescriptorTable` below stays here: it needs
 // `crate::drivers` (the device registry) and `crate::serial_println!`
 // (debug logging), neither of which `vfs` can reach.
-pub use vfs::file::{compute_seek, FileError, FileHandle, FileResult};
+pub use vfs::file::{compute_seek, FileError, FileHandle, FileResult, IoctlOut};
 
 // ============================================================================
 // FILE DESCRIPTOR TABLE

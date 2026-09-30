@@ -170,6 +170,36 @@ constanos_sync_get_value(struct vk_device *device, struct vk_sync *sync, uint64_
    return VK_SUCCESS;
 }
 
+/* Opaque-fd semaphores (VK_KHR_external_semaphore_fd) are NVG_IOC_SYNC_EXPORT / SYNC_IMPORT descriptors: the timeline then lives in the
+ * kernel and every session that holds it sees the same value, moved by the fences of whoever's work signals it. SYNC_EXPORT answers with
+ * the new descriptor as the ioctl's result. Importing replaces this sync's own timeline (a permanent import, as Vulkan defines it). */
+static VkResult
+constanos_sync_export_opaque_fd(struct vk_device *device, struct vk_sync *sync, int *fd_out)
+{
+   struct nvg_sync_export e = { .handle = to_sync(sync)->handle };
+   int r;
+   do {
+      r = ioctl(device_fd(device), NVG_IOC_SYNC_EXPORT, &e);
+   } while (r < 0 && errno == EINTR);
+   if (r < 0)
+      return vk_errorf(device, VK_ERROR_TOO_MANY_OBJECTS, "SYNC_EXPORT failed: %s", strerror(errno));
+   *fd_out = r;
+   return VK_SUCCESS;
+}
+
+static VkResult
+constanos_sync_import_opaque_fd(struct vk_device *device, struct vk_sync *sync, int fd)
+{
+   struct nvg_sync_import im = { .fd = fd };
+   const int r = constanos_ioctl(device_fd(device), NVG_IOC_SYNC_IMPORT, &im);
+   if (r != 0)
+      return vk_errorf(device, VK_ERROR_INVALID_EXTERNAL_HANDLE, "SYNC_IMPORT failed: %s", strerror(-r));
+   struct nvkmd_constanos_sync *s = to_sync(sync);
+   sync_destroy_handle(device, s->handle);
+   s->handle = im.handle;
+   return VK_SUCCESS;
+}
+
 /* A timeline cannot go backwards, so resetting a binary sync gives it a fresh one. */
 static VkResult
 constanos_sync_reset(struct vk_device *device, struct vk_sync *sync)
@@ -279,6 +309,8 @@ constanos_sync_type(void)
       .reset = constanos_sync_reset,
       .move = constanos_sync_move,
       .wait_many = constanos_sync_wait_many,
+      .import_opaque_fd = constanos_sync_import_opaque_fd,
+      .export_opaque_fd = constanos_sync_export_opaque_fd,
    };
 }
 
@@ -346,7 +378,7 @@ nvkmd_constanos_try_create_pdev(struct vk_object_base *log_obj, enum nvk_debug d
    pdev->base.debug_flags = debug_flags;
    fill_dev_info(&pdev->base.dev_info, &info);
    pdev->base.kmd_info = (struct nvkmd_info){
-      .has_dma_buf = false,
+      .has_dma_buf = true,
       .has_get_vram_used = false,
       .has_alloc_tiled = false,
       .has_map_fixed = false,
@@ -656,10 +688,75 @@ constanos_alloc_tiled_mem(struct nvkmd_dev *dev, struct vk_object_base *log_obj,
    return vk_error(log_obj, VK_ERROR_FEATURE_NOT_PRESENT);
 }
 
+/* A BO another process (or this one, through another device) exported with NVG_IOC_BO_EXPORT: the descriptor stands for the BO, however it
+ * reached this process (SCM_RIGHTS, dup, fork). The import is a BO of this device's session, at VAs of this session's own, bound like any
+ * other memory; the descriptor may be closed afterwards (the imported handle holds the storage). */
 static VkResult
-constanos_import_dma_buf(struct nvkmd_dev *dev, struct vk_object_base *log_obj, int fd, struct nvkmd_mem **mem_out)
+constanos_import_dma_buf(struct nvkmd_dev *_dev, struct vk_object_base *log_obj, int fd, struct nvkmd_mem **mem_out)
 {
-   return vk_error(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   struct nvkmd_constanos_dev *dev = nvkmd_constanos_dev(_dev);
+
+   struct nvg_bo_import im = { .fd = fd };
+   const int r = constanos_ioctl(dev->fd, NVG_IOC_BO_IMPORT, &im);
+   if (r != 0)
+      return vk_errorf(log_obj, VK_ERROR_INVALID_EXTERNAL_HANDLE, "BO_IMPORT failed: %s", strerror(-r));
+
+   struct nvkmd_constanos_mem *mem = CALLOC_STRUCT(nvkmd_constanos_mem);
+   if (mem == NULL) {
+      struct nvg_bo_free f = { .handle = im.handle };
+      constanos_ioctl(dev->fd, NVG_IOC_BO_FREE, &f);
+      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
+   /* Where the storage is, is what the kernel says (a mapping offset: system memory; none: VRAM). Shared memory is coherent when the
+    * CPU can map it, as for our own allocations. */
+   const bool mappable = im.mmap_offset != ~0ull;
+   enum nvkmd_mem_flags flags = NVKMD_MEM_SHARED | NVKMD_MEM_COHERENT;
+   flags |= mappable ? (NVKMD_MEM_GART | NVKMD_MEM_CAN_MAP) : NVKMD_MEM_LOCAL;
+
+   nvkmd_mem_init(&dev->base, &mem->base, &nvkmd_constanos_mem_ops, flags, im.size_out, _dev->pdev->bind_align_B);
+   mem->handle = im.handle;
+   mem->mmap_offset = im.mmap_offset;
+
+   VkResult result = nvkmd_dev_alloc_va(&dev->base, log_obj, mappable ? NVKMD_VA_GART : 0, 0 /* pte_kind */, im.size_out,
+                                        _dev->pdev->bind_align_B, 0 /* fixed_addr */, &mem->base.va);
+   if (result != VK_SUCCESS)
+      goto fail_mem;
+
+   result = nvkmd_va_bind_mem(mem->base.va, log_obj, 0, &mem->base, 0, im.size_out);
+   if (result != VK_SUCCESS)
+      goto fail_va;
+
+   *mem_out = &mem->base;
+   return VK_SUCCESS;
+
+fail_va:
+   nvkmd_va_free(mem->base.va);
+fail_mem: {
+   struct nvg_bo_free f = { .handle = im.handle };
+   constanos_ioctl(dev->fd, NVG_IOC_BO_FREE, &f);
+   FREE(mem);
+   return result;
+}
+}
+
+/* BO_EXPORT answers with the new descriptor as the ioctl's result (>= 0), which constanos_ioctl() does not pass on. */
+static VkResult
+constanos_mem_export_dma_buf(struct nvkmd_mem *_mem, struct vk_object_base *log_obj, int *fd_out)
+{
+   struct nvkmd_constanos_mem *mem = nvkmd_constanos_mem(_mem);
+   struct nvkmd_constanos_dev *dev = nvkmd_constanos_dev(_mem->dev);
+
+   struct nvg_bo_export e = { .handle = mem->handle };
+   int r;
+   do {
+      r = ioctl(dev->fd, NVG_IOC_BO_EXPORT, &e);
+   } while (r < 0 && errno == EINTR);
+   if (r < 0)
+      return vk_errorf(log_obj, VK_ERROR_TOO_MANY_OBJECTS, "BO_EXPORT failed: %s", strerror(errno));
+
+   *fd_out = r;
+   return VK_SUCCESS;
 }
 
 static void
@@ -720,6 +817,7 @@ const struct nvkmd_mem_ops nvkmd_constanos_mem_ops = {
    .free = constanos_mem_free,
    .map = constanos_mem_map,
    .unmap = constanos_mem_unmap,
+   .export_dma_buf = constanos_mem_export_dma_buf,
    .log_handle = constanos_mem_log_handle,
 };
 

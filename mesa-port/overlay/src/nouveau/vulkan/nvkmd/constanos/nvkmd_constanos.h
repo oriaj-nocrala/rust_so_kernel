@@ -24,7 +24,7 @@ struct nvkmd_constanos_pdev {
 
 NVKMD_DECL_SUBCLASS(pdev, constanos);
 
-/* Opens the device just long enough to read its description (it is exclusive: one holder at a time). */
+/* Opens the device just long enough to read its description (a session is taken and given back; up to 12 processes can hold one at once). */
 VkResult nvkmd_constanos_try_create_pdev(struct vk_object_base *log_obj,
                                          enum nvk_debug debug_flags,
                                          struct nvkmd_pdev **pdev_out);

@@ -6,6 +6,12 @@
 //   - rebinding: a VA moved from one buffer to another (system and VRAM) must reach the new buffer, never the old one (the TLB flush);
 //   - the ring: 700 submissions (the ring has 1024 entries, the kernel keeps 64 fences in flight) and 32 real launches in flight together;
 //   - the device handed back: close and reopen, and a holder that dies with work in flight.
+//   - a buffer shared between two processes (G5 layer 2): a system region and a VRAM page exported as descriptors, sent by SCM_RIGHTS and
+//     imported by a child in its own session; each process's GPU writes into the same pages through its own VA and the other side reads them;
+//   - a timeline shared between two processes (explicit sync): each side queues GPU work that signals it and then sits idle (blocked on a
+//     socket, no GPU call) while the other waits on it and reads what that work wrote: the kernel resolves the pending fences for whoever asks;
+//   - several clients at once (G5 layer 1): four processes, each its own session (its own slice of the VA space), each with its own compute
+//     context, launching at the same time; every output checked, every session's range distinct.
 // On the software device (QEMU: no GPU) the execution checks are skipped and only the interface is exercised.
 #define _GNU_SOURCE
 #include <errno.h>
@@ -13,6 +19,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -65,7 +73,7 @@ static uint64_t va_alloc(uint64_t size, uint64_t align) {
    return call(NVG_IOC_VA_ALLOC, &a) == 0 ? a.va : 0;
 }
 
-static int bind(uint64_t va, uint64_t size, uint32_t handle, uint64_t bo_off) {
+static int va_bind_call(uint64_t va, uint64_t size, uint32_t handle, uint64_t bo_off) {
    struct nvg_va_bind b = { .va = va, .size = size, .bo_offset = bo_off, .handle = handle };
    return call(NVG_IOC_VA_BIND, &b);
 }
@@ -145,7 +153,67 @@ static int region_make(struct region *r, uint64_t size) {
    if (r->cpu == MAP_FAILED) return -1;
    r->va = va_alloc(size, 0x10000);
    if (!r->va) return -1;
-   return bind(r->va, size, r->bo, 0);
+   return va_bind_call(r->va, size, r->bo, 0);
+}
+
+// ---- sharing BOs: descriptors by SCM_RIGHTS, imports ---------------------------------------------------------------------------------
+
+static int send_fd(int sock, int what) {
+   char data = 'x';
+   struct iovec iov = { .iov_base = &data, .iov_len = 1 };
+   char control[CMSG_SPACE(sizeof(int))];
+   memset(control, 0, sizeof control);
+   struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof control };
+   struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+   c->cmsg_level = SOL_SOCKET;
+   c->cmsg_type = SCM_RIGHTS;
+   c->cmsg_len = CMSG_LEN(sizeof(int));
+   memcpy(CMSG_DATA(c), &what, sizeof(int));
+   return sendmsg(sock, &msg, 0) == 1 ? 0 : -1;
+}
+
+static int recv_fd(int sock) {
+   char data = 0;
+   struct iovec iov = { .iov_base = &data, .iov_len = 1 };
+   char control[CMSG_SPACE(sizeof(int))];
+   memset(control, 0, sizeof control);
+   struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof control };
+   if (recvmsg(sock, &msg, 0) != 1) return -1;
+   struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+   int got = -1;
+   if (c && c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) memcpy(&got, CMSG_DATA(c), sizeof(int));
+   return got;
+}
+
+static int sync_export(uint32_t handle) {
+   struct nvg_sync_export e = { .handle = handle };
+   return call(NVG_IOC_SYNC_EXPORT, &e);
+}
+
+static uint32_t sync_import(int sfd) {
+   struct nvg_sync_import im = { .fd = sfd };
+   return call(NVG_IOC_SYNC_IMPORT, &im) == 0 ? im.handle : 0;
+}
+
+static int bo_export(uint32_t handle) {
+   struct nvg_bo_export e = { .handle = handle };
+   return call(NVG_IOC_BO_EXPORT, &e);
+}
+
+/// Import the BO behind descriptor `bofd` into the current session and make a region of it: mapped, at a VA of this session's own, bound.
+static int region_import(struct region *r, int bofd) {
+   struct nvg_bo_import im = { .fd = bofd };
+   memset(r, 0, sizeof *r);
+   if (call(NVG_IOC_BO_IMPORT, &im) != 0) return -1;
+   r->bo = im.handle;
+   r->size = im.size_out;
+   if (im.mmap_offset != ~0ull) {
+      r->cpu = mmap(NULL, r->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, im.mmap_offset);
+      if (r->cpu == MAP_FAILED) return -1;
+   }
+   r->va = va_alloc(r->size, 0x10000);
+   if (!r->va) return -1;
+   return va_bind_call(r->va, r->size, r->bo, 0);
 }
 
 // ---- compute launches ------------------------------------------------------------------------------------------------------------
@@ -232,6 +300,30 @@ static int out_is(struct region *r, unsigned slot, uint32_t (*want)(uint32_t), i
    return 1;
 }
 
+/// One client of the several-sessions test, in whatever session `fd` is: its own context, timeline and region; `rounds` launches, each
+/// read back and checked (clients with an odd `tag` run the other shader, so a mixed-up page shows). `*va0` is the session's first VA.
+/// Returns 0, or the number of the step that failed.
+static int client(int tag, int rounds, uint64_t *va0) {
+   struct nvg_info inf;
+   if (call(NVG_IOC_INFO, &inf) != 0) return 1;
+   *va0 = inf.va_start;
+   uint32_t c = ctx_create(NVG_ENGINE_3D | NVG_ENGINE_COMPUTE | NVG_ENGINE_COPY), t = sync_create(0);
+   if (!c || !t) return 2;
+   struct region r;
+   if (region_make(&r, SLOT_BYTES) != 0) return 3;
+   if (r.va < inf.va_start || r.va + SLOT_BYTES > inf.va_end) return 4;
+   const uint8_t *sh = (tag & 1) ? nvg_shader_fillwt : nvg_shader_fill;
+   uint32_t (*want)(uint32_t) = (tag & 1) ? fillwt_word : fill_word;
+   for (int i = 0; i < rounds; i++) {
+      struct nvg_push q = launch_prepare(&r, 0, sh, slot_out_va(&r, 0), 0, 0x700 + i);
+      if (exec_signal(c, &q, 1, t, i + 1) != 0) return 5;
+      if (wait_timeline(t, i + 1, 10000) != 0) return 6;
+      int first;
+      if (hw && !out_is(&r, 0, want, &first)) return 7;
+   }
+   return ctx_destroy(c) == 0 ? 0 : 8;
+}
+
 /// `nvgpu_hw_test grcopy[-bind]` (an experiment, run last in the metal job: a copy push the GR channel cannot take faults it for good): NVK's
 /// graphics queue pushes image copies on subchannel 4 of the GR channel. Does a copy host -> VRAM -> host through a compute + copy context
 /// (the GR channel), with nothing binding the copy class (`grcopy`) or with a SET_OBJECT of it in the push first (`grcopy-bind`).
@@ -248,7 +340,7 @@ static int grcopy(int with_bind) {
    CHECK(ctx && tl && region_make(&r, 4 * SLOT_BYTES) == 0, "a compute + copy context and a region");
    uint32_t vb = bo_create(4096, NVG_BO_VRAM, NULL);
    uint64_t vva = va_alloc(4096, 4096);
-   CHECK(vb && vva && bind(vva, 4096, vb, 0) == 0, "a VRAM page");
+   CHECK(vb && vva && va_bind_call(vva, 4096, vb, 0) == 0, "a VRAM page");
    uint32_t *src = (uint32_t *)(r.cpu + OFF_OUT), *dst = (uint32_t *)(r.cpu + SLOT_BYTES + OFF_OUT);
    for (uint32_t i = 0; i < 1024; i++) { src[i] = fill_word(i) ^ 0x0c0c0c0cu; dst[i] = scribble(i); }
    uint32_t w[40], n = 0;
@@ -372,7 +464,7 @@ int main(int argc, char **argv) {
    // ---- 2. fill -> VRAM, read back by the GPU in the same EXEC (two push segments)
    uint32_t vb = bo_create(4096, NVG_BO_VRAM, NULL);
    uint64_t vva = va_alloc(4096, 4096);
-   CHECK(vb && vva && bind(vva, 4096, vb, 0) == 0, "a VRAM page bound");
+   CHECK(vb && vva && va_bind_call(vva, 4096, vb, 0) == 0, "a VRAM page bound");
    struct nvg_push two[2];
    two[0] = launch_prepare(&host, 1, nvg_shader_fill, vva, 0, 0x4243);
    two[1] = launch_prepare(&host, 2, nvg_shader_copy, slot_out_va(&host, 2), vva, 0x4244);
@@ -389,7 +481,7 @@ int main(int argc, char **argv) {
       CHECK(ctx_create(NVG_ENGINE_3D | NVG_ENGINE_COMPUTE | NVG_ENGINE_COPY) != 0, "a 3D + compute + copy context (what NVK's queue families ask for)");
       uint32_t cb = bo_create(4096, NVG_BO_VRAM, NULL);
       uint64_t cva = va_alloc(4096, 4096);
-      CHECK(cb && cva && bind(cva, 4096, cb, 0) == 0, "a VRAM page for the copy");
+      CHECK(cb && cva && va_bind_call(cva, 4096, cb, 0) == 0, "a VRAM page for the copy");
       uint32_t *csrc = (uint32_t *)(host.cpu + 37ull * SLOT_BYTES + OFF_OUT), *cdst = (uint32_t *)(host.cpu + 38ull * SLOT_BYTES + OFF_OUT);
       for (uint32_t i = 0; i < 1024; i++) { csrc[i] = fill_word(i) ^ 0x0badf00du; cdst[i] = scribble(i); }
       uint32_t w[32];
@@ -410,7 +502,7 @@ int main(int argc, char **argv) {
    {
       uint32_t x = bo_create(4096, NVG_BO_VRAM, NULL), y = bo_create(4096, NVG_BO_VRAM, NULL);
       uint64_t vx = va_alloc(4096, 4096), vt = va_alloc(4096, 4096);
-      CHECK(x && y && vx && vt && bind(vx, 4096, x, 0) == 0 && bind(vt, 4096, x, 0) == 0, "X bound at two VAs");
+      CHECK(x && y && vx && vt && va_bind_call(vx, 4096, x, 0) == 0 && va_bind_call(vt, 4096, x, 0) == 0, "X bound at two VAs");
       // X gets fillwt's words through VX
       struct nvg_push a = launch_prepare(&host, 3, nvg_shader_fillwt, vx, 0, 1);
       // and is read through VT once, so the GPU has VT's translation cached
@@ -419,7 +511,7 @@ int main(int argc, char **argv) {
       CHECK(exec_signal(ctx, ab, 2, tl, ++seq) == 0 && wait_timeline(tl, seq, 5000) == 0, "fillwt -> X (via VX), copy X (via VT)");
       HWCHECK(out_is(&host, 4, fillwt_word, &first), "VT reads X's fillwt words (first bad word %d)", first);
       // now VT moves to Y: unbind, bind Y, fill (the fill words) through VT
-      CHECK(unbind(vt, 4096) == 0 && bind(vt, 4096, y, 0) == 0, "VT unbound and bound to Y");
+      CHECK(unbind(vt, 4096) == 0 && va_bind_call(vt, 4096, y, 0) == 0, "VT unbound and bound to Y");
       struct nvg_push c = launch_prepare(&host, 5, nvg_shader_fill, vt, 0, 3);
       struct nvg_push d = launch_prepare(&host, 6, nvg_shader_copy, slot_out_va(&host, 6), vt, 4);
       struct nvg_push e = launch_prepare(&host, 7, nvg_shader_copy, slot_out_va(&host, 7), vx, 5);
@@ -436,7 +528,7 @@ int main(int argc, char **argv) {
       uint64_t vs = va_alloc(SLOT_BYTES, 0x10000);
       CHECK(vs != 0 && unbind(b1.va, b1.size) == 0 && unbind(b2.va, b2.size) == 0, "their own VAs unbound to make room for a shared one");
       // the launch's own pages travel with the region, so keep them at b1/b2's slots and put only the *output* behind the shared VA
-      CHECK(bind(vs, SLOT_BYTES, b1.bo, 0) == 0, "VS bound to the first buffer");
+      CHECK(va_bind_call(vs, SLOT_BYTES, b1.bo, 0) == 0, "VS bound to the first buffer");
       struct nvg_push a = launch_prepare(&host, 8, nvg_shader_fill, vs + OFF_OUT, 0, 6);
       memset(b1.cpu, 0, SLOT_BYTES);
       uint32_t *o1 = (uint32_t *)(b1.cpu + OFF_OUT);
@@ -446,7 +538,7 @@ int main(int argc, char **argv) {
       for (uint32_t i = 0; i < 256; i++) ok1 &= o1[i] == fill_word(i);
       HWCHECK(ok1, "the first buffer holds the fill words");
       for (uint32_t i = 0; i < 1024; i++) o1[i] = scribble(i);
-      CHECK(unbind(vs, SLOT_BYTES) == 0 && bind(vs, SLOT_BYTES, b2.bo, 0) == 0, "VS moved to the second buffer");
+      CHECK(unbind(vs, SLOT_BYTES) == 0 && va_bind_call(vs, SLOT_BYTES, b2.bo, 0) == 0, "VS moved to the second buffer");
       uint32_t *o2 = (uint32_t *)(b2.cpu + OFF_OUT);
       for (uint32_t i = 0; i < 1024; i++) o2[i] = scribble(i);
       struct nvg_push a2 = launch_prepare(&host, 9, nvg_shader_fill, vs + OFF_OUT, 0, 7);
@@ -494,7 +586,7 @@ int main(int argc, char **argv) {
       uint64_t big = 32ull << 20;
       uint32_t ba = bo_create(big, NVG_BO_VRAM, NULL), bb = bo_create(big, NVG_BO_VRAM, NULL);
       uint64_t va_a = va_alloc(big, 0x10000), va_b = va_alloc(big, 0x10000);
-      CHECK(cctx && ba && bb && va_a && va_b && bind(va_a, big, ba, 0) == 0 && bind(va_b, big, bb, 0) == 0, "two 32 MiB VRAM buffers");
+      CHECK(cctx && ba && bb && va_a && va_b && va_bind_call(va_a, big, ba, 0) == 0 && va_bind_call(va_b, big, bb, 0) == 0, "two 32 MiB VRAM buffers");
       uint32_t w[16];
       uint32_t n = copy_push(w, va_a, va_b, (uint32_t)big);
       memcpy(host.cpu + 36ull * SLOT_BYTES + OFF_PUSH, w, n * 4);
@@ -609,6 +701,184 @@ int main(int argc, char **argv) {
       struct nvg_push q = launch_prepare(&r, 0, nvg_shader_fill, slot_out_va(&r, 0), 0, 10);
       CHECK(exec_signal(c, &q, 1, t, 1) == 0 && wait_timeline(t, 1, 5000) == 0, "a launch after the holder died runs");
       HWCHECK(out_is(&r, 0, fill_word, &first), "and its output is right (first bad word %d)", first);
+   }
+
+   // ---- 6. several clients at once (G5 layer 1): this process and three children, each with a session of its own, launch together.
+   //         Every child opens its session and reports its first VA, then waits for the go byte: all four sessions are open at the same
+   //         time before any work starts, and the launches overlap.
+   {
+      enum { KIDS = 3, ROUNDS = 40 };
+      pid_t kid[KIDS];
+      int rd[KIDS], go[KIDS];
+      int forked = 1;
+      for (int k = 0; k < KIDS; k++) {
+         int pp[2], gp[2];
+         if (pipe(pp) != 0 || pipe(gp) != 0) { forked = 0; break; }
+         kid[k] = fork();
+         if (kid[k] == 0) {
+            close(pp[0]);
+            close(gp[1]);
+            close(fd);
+            fd = open("/dev/nvgpu", O_RDWR);   // its own session: the parent's description is not this child's client
+            struct nvg_info mine;
+            uint64_t va0 = 0;
+            if (fd < 0 || call(NVG_IOC_INFO, &mine) != 0) _exit(100);
+            va0 = mine.va_start;
+            char b;
+            if (write(pp[1], &va0, sizeof va0) != sizeof va0 || read(gp[0], &b, 1) != 1) _exit(101);
+            _exit(client(k + 1, ROUNDS, &va0));
+         }
+         close(pp[1]);
+         close(gp[0]);
+         rd[k] = pp[0];
+         go[k] = gp[1];
+      }
+      CHECK(forked, "three children forked");
+      uint64_t va_first[KIDS + 1] = { 0 };
+      struct nvg_info me;
+      CHECK(call(NVG_IOC_INFO, &me) == 0, "INFO of this process's session");
+      va_first[0] = me.va_start;
+      for (int k = 0; forked && k < KIDS; k++) {
+         uint64_t v = 0;
+         if (read(rd[k], &v, sizeof v) != sizeof v) v = 0;
+         va_first[k + 1] = v;
+      }
+      for (int k = 0; forked && k < KIDS; k++) { char b = 1; if (write(go[k], &b, 1) != 1) forked = 0; close(go[k]); }
+      uint64_t unused = 0;
+      int rc0 = client(0, ROUNDS, &unused);
+      CHECK(rc0 == 0, "this process's own client: step %d failed", rc0);
+      int all_ok = 1;
+      for (int k = 0; forked && k < KIDS; k++) {
+         int stc = 0;
+         waitpid(kid[k], &stc, 0);
+         int code = WIFEXITED(stc) ? WEXITSTATUS(stc) : -1;
+         CHECK(code == 0, "child %d's client: exit %d (the step that failed; 100 = open or INFO, 101 = pipe)", k + 1, code);
+         all_ok &= code == 0;
+         close(rd[k]);
+      }
+      int distinct = 1;
+      for (int a = 0; a <= KIDS; a++)
+         for (int b = a + 1; b <= KIDS; b++) distinct &= va_first[a] != va_first[b] && va_first[a] && va_first[b];
+      CHECK(distinct, "the four sessions have four different VA ranges (%#llx %#llx %#llx %#llx)", (unsigned long long)va_first[0],
+            (unsigned long long)va_first[1], (unsigned long long)va_first[2], (unsigned long long)va_first[3]);
+      CHECK(all_ok, "%d launches each, all right, in four sessions at once", ROUNDS);
+      struct nvg_info i4;
+      CHECK(call(NVG_IOC_INFO, &i4) == 0, "INFO after the children are gone");
+   }
+
+   // ---- 7. a buffer shared between two processes (G5 layer 2). The parent's GPU fills a page of a shared system region and a VRAM page; a child,
+   //         in a session of its own, imports both through descriptors it receives by SCM_RIGHTS, reads the region with its CPU (the parent's GPU
+   //         wrote it), copies the VRAM page into the region with its own GPU (through a VA of its own), and writes its own result into the
+   //         region with a second launch; the parent then reads what the child's GPU put in its pages.
+   {
+      struct region sh;
+      uint32_t c7 = ctx_create(NVG_ENGINE_3D | NVG_ENGINE_COMPUTE | NVG_ENGINE_COPY), t7 = sync_create(0);
+      uint32_t vbs = bo_create(4096, NVG_BO_VRAM, NULL);
+      uint64_t vvs = va_alloc(4096, 4096);
+      REQUIRE(region_make(&sh, 3 * SLOT_BYTES) == 0 && c7 && t7 && vbs && vvs && va_bind_call(vvs, 4096, vbs, 0) == 0, "a shared region, a VRAM page and a context");
+      struct nvg_push q7[2];
+      q7[0] = launch_prepare(&sh, 2, nvg_shader_fill, slot_out_va(&sh, 2), 0, 0x71);   // fill_word into the region's slot 2 output
+      q7[1] = launch_prepare(&sh, 1, nvg_shader_fill, vvs, 0, 0x72);                   // fill_word into the VRAM page
+      CHECK(exec_signal(c7, q7, 2, t7, 1) == 0 && wait_timeline(t7, 1, 10000) == 0, "the parent's two launches (region, VRAM page)");
+      int e_region = bo_export(sh.bo), e_vram = bo_export(vbs);
+      CHECK(e_region >= 0 && e_vram >= 0, "both exported (%d %d)", e_region, e_vram);
+      int sv[2];
+      REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "a socketpair");
+      pid_t kid = fork();
+      if (kid == 0) {
+         close(sv[0]);
+         close(fd);   // the parent's session (inherited): this process works in one of its own
+         int r1 = recv_fd(sv[1]), r2 = recv_fd(sv[1]);
+         fd = open("/dev/nvgpu", O_RDWR);
+         if (r1 < 0 || r2 < 0 || fd < 0) _exit(10);
+         struct region a, b;
+         if (region_import(&a, r1) != 0 || region_import(&b, r2) != 0) _exit(11);
+         int bad = 0;
+         if (hw && !out_is(&a, 2, fill_word, &bad)) _exit(12);   // what the parent's GPU wrote, read by this CPU
+         uint32_t cx = ctx_create(NVG_ENGINE_3D | NVG_ENGINE_COMPUTE | NVG_ENGINE_COPY), tx = sync_create(0);
+         if (!cx || !tx) _exit(13);
+         struct nvg_push qc[2];
+         qc[0] = launch_prepare(&a, 0, nvg_shader_fillwt, slot_out_va(&a, 0), 0, 0x73);      // this GPU writes into the shared region
+         qc[1] = launch_prepare(&a, 1, nvg_shader_copy, slot_out_va(&a, 1), b.va, 0x74);     // this GPU copies the shared VRAM page into it
+         if (exec_signal(cx, qc, 2, tx, 1) != 0 || wait_timeline(tx, 1, 10000) != 0) _exit(14);
+         if (hw && !out_is(&a, 0, fillwt_word, &bad)) _exit(15);
+         if (hw && !out_is(&a, 1, fill_word, &bad)) _exit(16);   // the parent's GPU wrote this VRAM, this GPU read it through its own VA
+         _exit(0);
+      }
+      close(sv[1]);
+      CHECK(send_fd(sv[0], e_region) == 0 && send_fd(sv[0], e_vram) == 0, "both descriptors sent");
+      close(e_region);
+      close(e_vram);
+      int st7 = 0;
+      waitpid(kid, &st7, 0);
+      int code7 = WIFEXITED(st7) ? WEXITSTATUS(st7) : -1;
+      CHECK(code7 == 0, "the child imported both and ran its launches: exit %d (10 = setup, 11 = import, 12 = saw the parent's GPU output, 13 = context, 14 = exec, 15/16 = its own results)", code7);
+      HWCHECK(out_is(&sh, 0, fillwt_word, &first), "the child's GPU wrote into the parent's pages (first bad word %d)", first);
+      HWCHECK(out_is(&sh, 1, fill_word, &first), "and its copy of the parent's VRAM page is there too (first bad word %d)", first);
+      HWCHECK(out_is(&sh, 2, fill_word, &first), "the parent's own output is intact (first bad word %d)", first);
+      close(sv[0]);
+      // the exporter's memory outlives the exporter: nothing is held once both processes are done with it
+      ctx_destroy(c7);
+   }
+
+   // ---- 8. a timeline shared between two processes (G5 layer 2, explicit sync). The parent queues a launch that fills a shared region and
+   //         signals a shared timeline to 1, sends both descriptors and then only waits on a socket: no GPU call, so nothing of the parent's
+   //         advances the timeline. The child imports both, waits for the timeline and reads the region (what the parent's GPU wrote must be
+   //         there once the timeline says 1), launches its own work signalling 2 and sits idle on the socket in turn; the parent, waiting on its
+   //         original handle, must find 2 and the child's result in its pages. Neither side is "calling in" for the other.
+   {
+      struct region sh8;
+      uint32_t c8 = ctx_create(NVG_ENGINE_3D | NVG_ENGINE_COMPUTE | NVG_ENGINE_COPY), t8 = sync_create(0);
+      REQUIRE(c8 && t8 && region_make(&sh8, 2 * SLOT_BYTES) == 0, "a context, a timeline and a shared region");
+      struct nvg_push q8 = launch_prepare(&sh8, 0, nvg_shader_fill, slot_out_va(&sh8, 0), 0, 0x81);
+      int e_bo = bo_export(sh8.bo);
+      int sv[2];
+      REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "a socketpair");
+      pid_t kid = fork();
+      if (kid == 0) {
+         close(sv[0]);
+         close(fd);
+         int r1 = recv_fd(sv[1]), r2 = recv_fd(sv[1]);
+         fd = open("/dev/nvgpu", O_RDWR);
+         if (r1 < 0 || r2 < 0 || fd < 0) _exit(10);
+         struct region a;
+         if (region_import(&a, r1) != 0) _exit(11);
+         uint32_t h = sync_import(r2);
+         if (!h) _exit(12);
+         int bad = 0;
+         if (wait_timeline(h, 1, 10000) != 0) _exit(13);                 // the parent is idle: only a reader can see its fence complete
+         if (hw && !out_is(&a, 0, fill_word, &bad)) _exit(14);           // and when it says 1, the parent's output is there
+         uint32_t cx = ctx_create(NVG_ENGINE_3D | NVG_ENGINE_COMPUTE | NVG_ENGINE_COPY);
+         if (!cx) _exit(15);
+         struct nvg_push qc = launch_prepare(&a, 1, nvg_shader_fillwt, slot_out_va(&a, 1), 0, 0x82);
+         if (exec_signal(cx, &qc, 1, h, 2) != 0) _exit(16);              // queued, not waited for
+         char b = 'D';
+         if (write(sv[1], &b, 1) != 1) _exit(17);
+         if (read(sv[1], &b, 1) != 1) _exit(18);                         // idle until the parent has seen the result
+         _exit(0);
+      }
+      close(sv[1]);
+      CHECK(exec_signal(c8, &q8, 1, t8, 1) == 0, "the parent's launch, signalling the timeline, queued and not waited for");
+      // exported AFTER the work was queued (the order a Vulkan program has: submit, then vkGetSemaphoreFdKHR): the signal queued before the
+      // export must still be resolved for the child while the parent is idle
+      int e_sync = sync_export(t8);
+      CHECK(e_bo >= 0 && e_sync >= 0, "the region and the timeline exported (%d %d)", e_bo, e_sync);
+      CHECK(send_fd(sv[0], e_bo) == 0 && send_fd(sv[0], e_sync) == 0, "both descriptors sent");
+      close(e_bo);
+      close(e_sync);
+      char got = 0;
+      CHECK(read(sv[0], &got, 1) == 1 && got == 'D', "the child has queued its own launch (it saw the parent's complete)");
+      CHECK(wait_timeline(t8, 2, 10000) == 0, "the parent sees the child's launch complete on the shared timeline while the child is idle");
+      HWCHECK(out_is(&sh8, 1, fillwt_word, &first), "and the child's output is in the parent's pages (first bad word %d)", first);
+      HWCHECK(out_is(&sh8, 0, fill_word, &first), "the parent's own output is intact (first bad word %d)", first);
+      char k = 'k';
+      CHECK(write(sv[0], &k, 1) == 1, "the child is released");
+      int st8 = 0;
+      waitpid(kid, &st8, 0);
+      int code8 = WIFEXITED(st8) ? WEXITSTATUS(st8) : -1;
+      CHECK(code8 == 0, "the child's run: exit %d (10 setup, 11 region, 12 timeline, 13 never saw 1, 14 the parent's output was not there at 1, 15 context, 16 exec, 17-18 socket)", code8);
+      close(sv[0]);
+      ctx_destroy(c8);
    }
 
    bad = failures;

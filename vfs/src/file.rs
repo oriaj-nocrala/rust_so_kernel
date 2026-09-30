@@ -14,6 +14,14 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::any::Any;
 
+/// What an `ioctl` answers with (`FileHandle::ioctl_ex`).
+pub enum IoctlOut {
+    /// The ioctl's return value (or a negative errno).
+    Value(i64),
+    /// A new open file for the caller's descriptor table; the ioctl returns its descriptor number.
+    NewFile(Box<dyn FileHandle>),
+}
+
 // ============================================================================
 // ERRORS
 // ============================================================================
@@ -214,6 +222,28 @@ pub trait FileHandle: Send {
     /// window size, ...). Called with no scheduler lock held.
     fn ioctl(&mut self, _request: u64, _arg: u64) -> Option<i64> {
         None
+    }
+
+    /// Which descriptor the request `request` (with argument `arg`) names, if it names one (DRM's PRIME_FD_TO_HANDLE: an import takes
+    /// the descriptor of the thing to import). The caller (`sys_ioctl`) looks that descriptor up in the same table, asks it for its
+    /// [`device_ref`](Self::device_ref) and passes the result to [`ioctl_ex`](Self::ioctl_ex) as `peer`: a handle cannot reach the
+    /// table itself, which is locked while it runs. `None` (the default): the request names no descriptor.
+    fn ioctl_fd_arg(&self, _request: u64, _arg: u64) -> Option<usize> {
+        None
+    }
+
+    /// The object this descriptor stands for, for a device's `ioctl` that takes a descriptor (`ioctl_fd_arg`): the same technique as
+    /// [`shm_object`](Self::shm_object), an `Arc<dyn Any>` the driver downcasts. Default `None`.
+    fn device_ref(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
+
+    /// `ioctl` with the two things it cannot do alone: receive the object of the descriptor it named (`peer`, see
+    /// [`ioctl_fd_arg`](Self::ioctl_fd_arg)) and answer with a **new open file** (`IoctlOut::NewFile`, which the caller installs at the
+    /// first free descriptor, close-on-exec, and returns the descriptor number as the result), as DRM's PRIME_HANDLE_TO_FD does. `sys_ioctl`
+    /// calls this, not `ioctl`; the default forwards to `ioctl`.
+    fn ioctl_ex(&mut self, request: u64, arg: u64, _peer: Option<Arc<dyn Any + Send + Sync>>) -> Option<IoctlOut> {
+        self.ioctl(request, arg).map(IoctlOut::Value)
     }
 
     /// Whether this open file description is in non-blocking mode.
@@ -428,6 +458,32 @@ mod tests {
     fn default_event_source_is_none() {
         assert_eq!(MinimalHandle.event_source(), None);
         assert_eq!(MinimalHandle.pty_end(), None);
+    }
+
+    #[test]
+    fn default_ioctl_ex_forwards_to_ioctl_and_ignores_the_peer() {
+        struct Answers;
+        impl FileHandle for Answers {
+            fn read(&mut self, _: &mut [u8]) -> FileResult<usize> {
+                Ok(0)
+            }
+            fn write(&mut self, b: &[u8]) -> FileResult<usize> {
+                Ok(b.len())
+            }
+            fn ioctl(&mut self, request: u64, arg: u64) -> Option<i64> {
+                (request == 7).then_some(arg as i64 + 1)
+            }
+        }
+        let mut h = Answers;
+        assert!(matches!(h.ioctl_ex(7, 41, None), Some(IoctlOut::Value(42))));
+        assert!(matches!(h.ioctl_ex(7, 1, Some(Arc::new(5u32))), Some(IoctlOut::Value(2))), "a peer changes nothing for a handle that does not use it");
+        assert!(h.ioctl_ex(8, 0, None).is_none(), "an unknown request falls through");
+    }
+
+    #[test]
+    fn default_ioctl_fd_arg_and_device_ref_are_none() {
+        assert_eq!(MinimalHandle.ioctl_fd_arg(1, 2), None);
+        assert!(MinimalHandle.device_ref().is_none());
     }
 
     /// A handle that overrides `seek`/`dup`, to prove the defaults tested

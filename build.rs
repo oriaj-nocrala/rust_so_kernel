@@ -120,16 +120,16 @@ fn ensure_ext2_disk_image() -> PathBuf {
         assert!(status.success(), "scripts/build-terminfo.sh failed");
     }
 
-    // 160MiB (was 96MiB, which the ~45 statically-linked C test programs at ~0.55MB each filled up, truncating the
+    // 288MiB (was 160MiB, which the four ~15MB static Vulkan programs (vk_probe, vk_draw, snake3d, vk_share) filled up; before that 96MiB, which the ~45 statically-linked C test programs at ~0.55MB each filled up, truncating the
     // last ones copied in): freedoom1.wad (~29MB) + id1/pak0.pak (~18MB) alone are
     // ~47MB — the previous 48MiB image (sized back when freedoom1.wad was
     // the only large asset) would leave almost no headroom for ext2
     // metadata overhead or anything ext2_robust_test/regular use creates
     // afterward.
-    println!("cargo:warning=disk.img missing — creating a 160MiB ext2 image seeded from disk-image-root/...");
+    println!("cargo:warning=disk.img missing — creating a 288MiB ext2 image seeded from disk-image-root/...");
 
     let status = Command::new("dd")
-        .args(["if=/dev/zero", "bs=1M", "count=160"])
+        .args(["if=/dev/zero", "bs=1M", "count=288"])
         .arg(format!("of={}", disk_path.display()))
         .status()
         .expect("Failed to spawn dd for disk.img");

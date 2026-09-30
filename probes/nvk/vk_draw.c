@@ -451,9 +451,20 @@ int main(void) {
       clock_gettime(CLOCK_MONOTONIC, &t0);
       unsigned frames = 0, busy = 0, shown = 0, slept = 0;
       int frame_ok = 1, present_ok = 1;
+      // Frame pacing: every interval between two frames longer than 25 ms (a 60 Hz display takes 16.7) is a hitch, reported with when it
+      // happened (seconds since the loop began, and the absolute CLOCK_MONOTONIC of the start so other programs' logs can be lined up).
+      double prev_el = 0, worst = 0, worst_at = 0;
+      unsigned hitches = 0, hitch_logged = 0;
+      printf("VK scanout: loop starts at monotonic %.3f\n", t0.tv_sec + t0.tv_nsec / 1e9);
       for (;;) {
          clock_gettime(CLOCK_MONOTONIC, &t1);
          double el = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+         if (frames > 0 && el - prev_el > 0.025) {
+            hitches++;
+            if (hitch_logged < 12) { hitch_logged++; printf("VK scanout: hitch at +%.3f s (frame %u): %.1f ms since the previous frame\n", el, frames, (el - prev_el) * 1e3); }
+         }
+         if (frames > 0 && el - prev_el > worst) { worst = el - prev_el; worst_at = el; }
+         prev_el = el;
          if (el >= seconds && frames > 0) break;
          int k = frames % 3;   // triple buffering: the buffer drawn into was on screen two presents ago and has been replaced since
          float angle = (float)el * 1.5f;
@@ -495,6 +506,7 @@ int main(void) {
       if (vfd >= 0) close(vfd);
       CHECK(frame_ok, "every frame rendered and fenced");
       CHECK(present_ok && shown == frames, "every frame was put on the screen (%u of %u)", shown, frames);
+      printf("VK scanout: %u hitches over 25 ms; longest %.1f ms at +%.3f s\n", hitches, worst * 1e3, worst_at);
       printf("VK scanout: %u frames shown in %.1f s (%.1f per second), %u waits for the previous flip (%u slept through a vblank)\n", frames, seconds, frames / (seconds > 0 ? seconds : 1), busy, slept);
       VKOK(vkDeviceWaitIdle(device));
    }

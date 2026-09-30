@@ -1428,9 +1428,34 @@ pub(super) fn sys_ioctl(fd: i32, request: u64, argp: u64) -> SyscallResult {
             None => return errno::ESRCH,
         }
     };
-    let handled = match files.lock().get_mut(fd as usize) {
-        Ok(file) => file.ioctl(request, argp),
-        Err(_) => return errno::EBADF,
+    let handled = {
+        let mut table = files.lock();
+        // A request that names another descriptor (an import): look that one up now, while the table is ours, and hand its object in.
+        let peer = match table.get(fd as usize) {
+            Ok(file) => match file.ioctl_fd_arg(request, argp) {
+                Some(n) => match table.get(n) {
+                    Ok(other) => other.device_ref(),
+                    Err(_) => return errno::EBADF,
+                },
+                None => None,
+            },
+            Err(_) => return errno::EBADF,
+        };
+        match table.get_mut(fd as usize) {
+            Ok(file) => match file.ioctl_ex(request, argp, peer) {
+                Some(crate::process::file::IoctlOut::Value(v)) => Some(v),
+                // The ioctl made a file (a buffer exported as a descriptor): it is installed here, because only here is the table at hand.
+                Some(crate::process::file::IoctlOut::NewFile(h)) => Some(match table.allocate(h) {
+                    Ok(n) => {
+                        let _ = table.set_cloexec(n, true);
+                        n as i64
+                    }
+                    Err(_) => errno::EMFILE,
+                }),
+                None => None,
+            },
+            Err(_) => return errno::EBADF,
+        }
     };
     if let Some(r) = handled {
         return r;

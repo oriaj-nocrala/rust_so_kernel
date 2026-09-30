@@ -40,6 +40,28 @@ pub fn user_vram_pa(vram_off: u64) -> u64 {
     USER_VRAM_BASE + vram_off
 }
 
+// ---- the GPU virtual address space shared by sessions -----------------------------------------------------------------------
+
+/// The GPU virtual addresses user space may allocate: `[64 GiB, 256 GiB)`. Below 2^40 because some methods take 40-bit addresses
+/// (`SET_VERTEX_STREAM_SUBSTITUTE_A` keeps the upper part in 8 bits; nouveau's own heap ends at 2^38), and above the fixed mappings the
+/// boot-time GPU code makes (4 GiB, 8 GiB.., the run-time channels below 17 GiB).
+pub const USER_VA_START: u64 = 1 << 36;
+pub const USER_VA_END: u64 = 1 << 38;
+
+/// `/dev/nvgpu` sessions that can be open at once. There is one set of GPU page tables, so each session gets a slice of the user range
+/// of its own (no isolation between processes yet: a session that binds an address outside its slice is refused by its model, but the
+/// GPU does not enforce it).
+pub const SESSIONS: usize = 12;
+/// Bytes of GPU virtual address space per session (16 GiB).
+pub const SESSION_VA_BYTES: u64 = (USER_VA_END - USER_VA_START) / SESSIONS as u64;
+
+/// The `[start, end)` virtual address range of session `slot` (`slot < SESSIONS`).
+pub fn session_va(slot: usize) -> (u64, u64) {
+    assert!(slot < SESSIONS, "session slot out of range");
+    let start = USER_VA_START + slot as u64 * SESSION_VA_BYTES;
+    (start, start + SESSION_VA_BYTES)
+}
+
 // ---- page tables at run time ------------------------------------------------------------------------------------------------
 
 /// Where the pages of a bind come from.
@@ -798,5 +820,33 @@ mod tests {
         pt.map_big_range(VA + 0x10_0000, 0x5000_0000, 2 * crate::mmu::BIG_PAGE, Target::Vram, f).unwrap();
         pt.map_range(VA, 0x4000_0000, 0x3000, Target::Vram, f).unwrap();
         assert!(resolve(&pt, VA + 0x2000).is_some() && resolve(&pt, VA + 0x11_0000).is_some());
+    }
+
+    #[test]
+    fn session_ranges_tile_the_user_range_without_overlap() {
+        assert_eq!(session_va(0).0, USER_VA_START);
+        assert_eq!(session_va(SESSIONS - 1).1, USER_VA_END);
+        for k in 1..SESSIONS {
+            assert_eq!(session_va(k - 1).1, session_va(k).0, "slice {k} starts where the previous one ends");
+        }
+        for k in 0..SESSIONS {
+            let (s, e) = session_va(k);
+            assert_eq!(e - s, SESSION_VA_BYTES);
+            assert_eq!(s % (1 << 30), 0, "slices start on a GiB");
+        }
+        assert_eq!(SESSION_VA_BYTES, 16 << 30);
+    }
+
+    #[test]
+    fn session_ranges_stay_clear_of_the_boot_mappings_and_below_2_to_40() {
+        // the highest address the boot-time code maps: the last run-time channel slot (see kernel/src/gpu/uapi.rs: RT_VA + 8 * RT_VA_SLOT)
+        assert!(0x3_9000_0000u64 + 8 * 0x1000_0000 <= USER_VA_START);
+        assert!(USER_VA_END <= 1 << 40);
+    }
+
+    #[test]
+    #[should_panic(expected = "slot out of range")]
+    fn session_va_refuses_a_slot_past_the_end() {
+        session_va(SESSIONS);
     }
 }

@@ -6,8 +6,9 @@
  * size and offset below against this file compiled by clang (nvgpu/gen/uapi.c).
  *
  * Rules: every struct is a multiple of 8 bytes with 8-byte members on 8-byte offsets (no implicit padding), all fields are
- * little-endian, an ioctl returns 0 or a negative errno (-EINVAL, -ENOENT, -ENOMEM, -ENOSPC, -EBUSY, -EEXIST, -EAGAIN, -EFAULT), and one process
- * at a time may hold the device open (a second open() fails with -EBUSY).
+ * little-endian, an ioctl returns 0 or a negative errno (-EINVAL, -ENOENT, -ENOMEM, -ENOSPC, -EBUSY, -EEXIST, -EAGAIN, -EFAULT), and each open()
+ * is a session of its own (its BOs, contexts and timelines; its own 16 GiB slice of the GPU virtual address space, INFO's va_start/va_end; VRAM
+ * from one heap shared by all sessions) and at most 12 can be open at once (the 13th open() fails with -EBUSY). dup()/fork() share a session.
  */
 #ifndef NVGPU_UAPI_H
 #define NVGPU_UAPI_H
@@ -73,7 +74,7 @@ struct nvg_bo_free {
 };
 #define NVG_IOC_BO_FREE NVG_IOC(3, sizeof(struct nvg_bo_free))
 
-/* ---- GPU virtual address space (one, shared by every context) --------------------------------------------------------------- */
+/* ---- GPU virtual address space (one per session, shared by its contexts) ---------------------------------------------------- */
 
 struct nvg_va_alloc {
    uint64_t size;             /* in: bytes, rounded up to 4096 */
@@ -245,5 +246,53 @@ struct nvg_flip_state {
    uint64_t vblank_seq;
 };
 #define NVG_IOC_FLIP_STATE NVG_IOC(19, sizeof(struct nvg_flip_state))
+
+/* ---- sharing buffers between sessions (processes) --------------------------------------------------------------------------- */
+
+/* Make a descriptor out of a BO (dma-buf's role). The descriptor is an ordinary file descriptor (close-on-exec): it can be sent to another
+ * process with SCM_RIGHTS over an AF_UNIX socket, dup()'d or inherited, and it keeps the BO's storage alive by itself: the exporter may
+ * BO_FREE its handle, or exit, and the memory stays until every descriptor and every imported handle is gone. The ioctl's RETURN VALUE is the
+ * new descriptor (>= 0), not 0. `flags` must be 0. -ENOENT: no such BO. */
+struct nvg_bo_export {
+   uint32_t handle;           /* in */
+   uint32_t flags;            /* in: 0 */
+};
+#define NVG_IOC_BO_EXPORT NVG_IOC(20, sizeof(struct nvg_bo_export))
+
+/* Take the BO behind a descriptor from BO_EXPORT (received by SCM_RIGHTS, or the exporter's own) into this session, as a BO of its own: a new
+ * `handle`, the same storage, the same `size_out`. A system BO maps with mmap(2) on the device fd at `mmap_offset` (every session maps the same
+ * memory: writes by one are seen by the others), a VRAM BO has none (~0). Bind it at this session's own VAs. The descriptor can be closed after
+ * the import (the imported handle holds the storage). -EBADF: not a descriptor; -EINVAL: not a BO descriptor or flags != 0. Each import is a
+ * handle of its own (importing twice gives two). */
+struct nvg_bo_import {
+   int32_t fd;                /* in: the descriptor */
+   uint32_t flags;            /* in: 0 */
+   uint32_t handle;           /* out */
+   uint32_t _pad;
+   uint64_t mmap_offset;      /* out */
+   uint64_t size_out;         /* out */
+};
+#define NVG_IOC_BO_IMPORT NVG_IOC(21, sizeof(struct nvg_bo_import))
+
+/* Timelines between sessions, the same way. SYNC_EXPORT makes a descriptor of a timeline (the ioctl's RETURN VALUE is the new descriptor,
+ * close-on-exec, for SCM_RIGHTS/dup/fork); from then on the timeline lives in the kernel, not in the exporter's session: its value moves as
+ * the fences of the work that signals it complete, and whichever session reads it finds out, so the session that queued the work does not
+ * have to be calling in (or even be alive: a descriptor or an imported handle keeps the timeline). Exporting twice names the same timeline.
+ * SYNC_IMPORT gives the importer a timeline handle of its own for it: SYNC_QUERY/WAIT/SIGNAL and the waits and signals of EXEC work on it as
+ * on any timeline, in both sessions, with the same value. Values never go back (SYNC_SIGNAL below the current value is -EINVAL).
+ * -ENOENT: no such timeline; -EBADF/-EINVAL as for BO_IMPORT (a BO descriptor is not a timeline). */
+struct nvg_sync_export {
+   uint32_t handle;           /* in */
+   uint32_t flags;            /* in: 0 */
+};
+#define NVG_IOC_SYNC_EXPORT NVG_IOC(22, sizeof(struct nvg_sync_export))
+
+struct nvg_sync_import {
+   int32_t fd;                /* in: the descriptor */
+   uint32_t flags;            /* in: 0 */
+   uint32_t handle;           /* out */
+   uint32_t _pad;
+};
+#define NVG_IOC_SYNC_IMPORT NVG_IOC(23, sizeof(struct nvg_sync_import))
 
 #endif /* NVGPU_UAPI_H */
