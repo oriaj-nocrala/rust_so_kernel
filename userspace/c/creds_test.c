@@ -200,8 +200,8 @@ static int check_exec(void) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--check-exec")) return check_exec();
+    setvbuf(stdout, NULL, _IOLBF, 0);   // before the first output: mlibc panics if the mode changes after I/O (stdout a file)
     printf("creds_test:\n");
-    setvbuf(stdout, NULL, _IOLBF, 0);
     in_child("root defaults", s_root_defaults);
     in_child("setresuid", s_setresuid);
     in_child("setuid (root drops for good)", s_setuid);

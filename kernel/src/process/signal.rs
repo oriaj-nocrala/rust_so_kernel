@@ -225,13 +225,18 @@ pub fn deliver_pending(proc: &mut Process, tf: *mut TrapFrame) -> SignalOutcome 
     if let Some(i) = proc.interrupted.take() {
         finish_interrupted_call(proc, tf, i);
     }
-    let outcome = deliver_one(proc, tf);
+    let mut outcome = deliver_one(proc, tf);
     // Returning to user mode without a handler frame to carry it: whatever
     // `rt_sigsuspend` replaced goes back now (a pushed frame took it with
     // `saved_sigmask.take()`; Terminate makes it moot).
     if !matches!(outcome, SignalOutcome::Delivered | SignalOutcome::Terminate(_)) {
         if let Some(mask) = proc.saved_sigmask.take() {
             proc.blocked_signals = mask;
+            // A signal the temporary mask held back (`epoll_pwait`, `ppoll`) is deliverable again: run it
+            // on this return, as Linux does, not at the next kernel entry.
+            if matches!(outcome, SignalOutcome::None) {
+                outcome = deliver_one(proc, tf);
+            }
         }
     }
     outcome
