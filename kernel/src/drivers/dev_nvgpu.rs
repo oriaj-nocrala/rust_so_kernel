@@ -52,7 +52,7 @@ struct KernelBackend {
     /// A GPU is behind this session: page tables, the channels and the fences are its.
     hw: bool,
     /// Which channel each context runs on (hardware only).
-    kinds: alloc::collections::BTreeMap<u32, gpu::uapi::ChanKind>,
+    kinds: alloc::collections::BTreeMap<u32, gpu::uapi::ChanId>,
 }
 
 impl Backend for KernelBackend {
@@ -86,29 +86,31 @@ impl Backend for KernelBackend {
 
     fn ctx_create(&mut self, ctx: u32, engines: u32) -> Result<(), Error> {
         if self.hw {
-            let kind = gpu::uapi::ctx_create(engines)?;
-            self.kinds.insert(ctx, kind);
+            let id = gpu::uapi::ctx_create(engines)?;
+            self.kinds.insert(ctx, id);
         }
         self.soft.ctx_create(ctx, engines)
     }
 
     fn ctx_destroy(&mut self, ctx: u32) {
-        self.kinds.remove(&ctx);
+        if let Some(id) = self.kinds.remove(&ctx) {
+            gpu::uapi::ctx_destroy(id);
+        }
         self.soft.ctx_destroy(ctx);
     }
 
     fn submit(&mut self, ctx: u32, pushes: &[Push]) -> Result<u64, Error> {
         if self.hw {
             // the model's fence numbers are the GPU's; the soft log is not kept
-            let kind = *self.kinds.get(&ctx).ok_or(Error::NoEnt)?;
-            return gpu::uapi::submit(kind, pushes);
+            let id = *self.kinds.get(&ctx).ok_or(Error::NoEnt)?;
+            return gpu::uapi::submit(id, pushes);
         }
         self.soft.submit(ctx, pushes)
     }
 
     fn fence_done(&mut self, ctx: u32, seq: u64) -> bool {
         if self.hw {
-            return self.kinds.get(&ctx).is_none_or(|&kind| gpu::uapi::fence_done(kind, seq));
+            return self.kinds.get(&ctx).is_none_or(|&id| gpu::uapi::fence_done(id, seq));
         }
         self.soft.fence_done(ctx, seq)
     }

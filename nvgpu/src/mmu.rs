@@ -347,7 +347,9 @@ impl PageTables {
     /// Remove the mapping of one page; `false` if there was none.
     pub fn unmap(&mut self, va: u64) -> bool {
         if let Some((t, at)) = self.locate_huge(va) {
-            if rd64(&self.tables[t], at) != 0 {
+            // a 2 MiB PTE is valid; a first half that only points at a table of 64 KiB PTEs is not one, and a 4 KiB page of the same 2 MiB
+            // must not wipe it
+            if rd64(&self.tables[t], at) & PTE_VALID != 0 {
                 self.put(t, at, 0);
                 return true;
             }
@@ -359,6 +361,29 @@ impl PageTables {
             }
             _ => false,
         }
+    }
+
+    /// Remove the mapping of one 64 KiB page (`map_big`'s); `false` if there was none.
+    pub fn unmap_big(&mut self, va: u64) -> bool {
+        if va >> VA_BITS != 0 {
+            return false;
+        }
+        let ix = indices(va);
+        let mut t = 0;
+        for &i in &ix[..3] {
+            match self.table_at(entry_addr(rd64(&self.tables[t], i * 8))) {
+                Some(n) => t = n,
+                None => return false,
+            }
+        }
+        // the big-page half of the PD0 entry points at the table of 32 PTEs
+        let Some(bt) = self.table_at(entry_addr(rd64(&self.tables[t], ix[3] * 16))) else { return false };
+        let at = ((va >> 16) as usize & (BIG_ENTRIES - 1)) * 8;
+        if rd64(&self.tables[bt], at) == 0 {
+            return false;
+        }
+        self.put(bt, at, 0);
+        true
     }
 
     /// The (PD0 table, byte offset) of the 2 MiB PTE that would cover `va`, if the

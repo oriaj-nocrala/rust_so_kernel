@@ -116,14 +116,20 @@ grep -E 'VK present|FAIL|ASSERT|DRAW DONE' /tmp/vk_present.out | while read -r l
 grep -q 'VK present: [0-9]* frames' /tmp/vk_present.out || { sum "gpu-vk: no frames were presented"; fail=1; }
 sum "gpu-vk: after the presentation: $(grep '^gpu_uapi:' /proc/kdebug)"
 
-# G4e robustness, the very last thing (it kills the GPU channel on purpose): a launch whose program is an unbound VA. RM must tell us (RC_TRIGGERED)
-# and the kernel must declare the device dead within tens of ms, wake the waiter and answer the next EXEC with EIO; RM itself must live on.
+# G4e robustness, the very last thing (it kills one GPU channel on purpose): a launch whose program is an unbound VA, on one of two contexts.
+# RM must tell us (RC_TRIGGERED, naming the channel) and the kernel must declare that channel dead within tens of ms, wake its waiter and answer the
+# next EXEC on it with EIO; the other context and a new one must go on running, and the device as a whole must not be dead; RM must live on.
 /mnt/bin/nvgpu_hw_test rc > /tmp/rc.out 2>&1
 rrc=$?
 grep -E 'FAIL|woke|failure' /tmp/rc.out | while read -r l; do sum "gpu-vk: rc: $l"; done
-[ $rrc = 0 ] || { sum "gpu-vk: the RC test exit=$rrc"; fail=1; tail -n 12 /tmp/rc.out >> /tmp/gpu-vk.sum; }
-sum "gpu-vk: after the fault: $(grep '^gpu_uapi:' /proc/kdebug)"
-[ "$(field "$(grep '^gpu_uapi:' /proc/kdebug)" dead)" = 1 ] || { sum "gpu-vk: the device was not declared dead after the fault"; fail=1; }
+sum "gpu-vk: rc output: $(tr '\n' '|' < /tmp/rc.out | cut -c1-900)"
+[ $rrc = 0 ] || { sum "gpu-vk: the RC test exit=$rrc"; fail=1; }
+u4=$(grep '^gpu_uapi:' /proc/kdebug)
+sum "gpu-vk: after the fault: $u4"
+[ "$(field "$u4" dead)" = 0 ] || { sum "gpu-vk: the whole device was declared dead (only the faulting channel should be)"; fail=1; }
+[ "$(field "$u4" chans_dead)" -ge 1 ] 2>/dev/null || { sum "gpu-vk: no channel was declared dead after the fault"; fail=1; }
+[ "$(field "$u4" chans_made)" -gt 0 ] 2>/dev/null || { sum "gpu-vk: no run-time channel was ever made (chans_made=$(field "$u4" chans_made))"; fail=1; }
+[ "$(field "$u4" chans_freed)" -gt 0 ] 2>/dev/null || { sum "gpu-vk: no run-time channel was ever given back"; fail=1; }
 sum "gpu-vk: $(grep '^gpu_gsprt:' /proc/kdebug)"
 
 # RM still answers after all this, and the display is unharmed.

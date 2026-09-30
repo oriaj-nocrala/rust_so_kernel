@@ -35,6 +35,11 @@ pub const EVENT_UCODE_LIBOS_PRINT: u32 = 0x100c;
 pub const EVENT_GSP_POST_NOCAT_RECORD: u32 = 0x1020;
 
 /// The name of an event RM sends (`nvrm/msgfn.h`, r570's `rpc_global_enums.h`), for reports.
+/// The channel id in an `RC_TRIGGERED` payload (`rpc_rc_triggered_v17_02`: `nv2080EngineType` u32, then `chid` u32).
+pub fn rc_chid(payload: &[u8]) -> Option<u32> {
+    (payload.len() >= 8).then(|| u32::from_le_bytes(payload[4..8].try_into().unwrap()))
+}
+
 pub fn event_name(function: u32) -> &'static str {
     match function {
         EVENT_GSP_INIT_DONE => "INIT_DONE",
@@ -1197,5 +1202,14 @@ mod tests {
         assert_eq!(event_name(0x1020), "POST_NOCAT_RECORD");
         assert_eq!(event_name(0x1000), "?");
         assert_eq!(event_name(0x9999), "?");
+    }
+
+    #[test]
+    fn an_rc_names_its_channel() {
+        let mut p = vec![0u8; 64];
+        p[0..4].copy_from_slice(&1u32.to_le_bytes()); // engine GR0
+        p[4..8].copy_from_slice(&5u32.to_le_bytes());
+        assert_eq!(rc_chid(&p), Some(5));
+        assert_eq!(rc_chid(&p[..7]), None);
     }
 }

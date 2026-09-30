@@ -352,6 +352,41 @@ pub fn plan(bufs: &[CtxBuf]) -> Plan {
     Plan { golden, chan, vram_end: pa, va_end: va }
 }
 
+/// Where a further GR channel's own (non-global) buffers go (G4e, a channel per context): one after another from `pa`/`va`, with the
+/// same alignment rules as [`plan`]; the global ones stay at `chan0`'s (the golden's) memory. Returns the memory of every buffer and
+/// where the layout ended (physical, virtual).
+pub fn chan_layout(bufs: &[CtxBuf], chan0: &[Mem], pa: u64, va: u64) -> (Vec<Mem>, u64, u64) {
+    assert_eq!(bufs.len(), chan0.len());
+    let (mut pa, mut va) = (pa, va);
+    let mem = bufs
+        .iter()
+        .zip(chan0)
+        .map(|(b, g)| {
+            if b.global {
+                return *g;
+            }
+            let pa_align = if b.page >= 21 { HUGE } else { 0x1_0000 };
+            let len = mapped_len(b);
+            pa = round_up(pa, pa_align);
+            va = round_up(va, (1u64 << b.align).max(pa_align));
+            let m = Mem { pa, va };
+            pa += len;
+            va += len;
+            m
+        })
+        .collect();
+    (mem, pa, va)
+}
+
+/// The mappings a further channel needs for its own buffers (`chan_layout`'s): the non-global ones only, privileged as the boot's.
+pub fn chan_mappings(bufs: &[CtxBuf], mem: &[Mem]) -> Vec<Mapping> {
+    bufs.iter()
+        .zip(mem)
+        .filter(|(b, _)| !b.global)
+        .map(|(b, m)| Mapping { id: b.id, va: m.va, pa: m.pa, len: mapped_len(b), page: b.page, ro: b.ro })
+        .collect()
+}
+
 /// Every mapping the two promotes need, each once.
 pub fn mappings(bufs: &[CtxBuf], plan: &Plan) -> Vec<Mapping> {
     let mut out = Vec::new();
@@ -1081,5 +1116,43 @@ mod tests {
         assert_eq!(topology(0b111, &[0b1111, 0b111, 0b1011]), Topology { gpcs: 3, tpcs: 10 });
         // a GPC missing from the mask does not count (the caller only asks for the enabled ones)
         assert_eq!(topology(0b101, &[0b11, 0b1]), Topology { gpcs: 2, tpcs: 3 });
+    }
+
+    #[test]
+    fn a_further_channels_buffers_are_its_own_and_aligned() {
+        let bufs = info();
+        let p = plan(&bufs);
+        let (mem, pa_end, va_end) = chan_layout(&bufs, &p.chan, 0x1_e000_0000 + 0x10000, 0x3_9000_0000 + 0x100000);
+        assert_eq!(mem.len(), bufs.len());
+        let mut spans = Vec::new();
+        for ((b, m), g) in bufs.iter().zip(&mem).zip(&p.chan) {
+            if b.global {
+                // the global buffers are the golden's
+                assert_eq!(m, g, "buffer {}", b.id);
+                continue;
+            }
+            assert_eq!(m.pa % if b.page >= 21 { HUGE } else { 0x1_0000 }, 0, "buffer {} physical alignment", b.id);
+            assert_eq!(m.va % (1u64 << b.align), 0, "buffer {} virtual alignment", b.id);
+            assert!(m.pa >= 0x1_e001_0000 && m.pa + mapped_len(b) <= pa_end);
+            assert!(m.va >= 0x3_9010_0000 && m.va + mapped_len(b) <= va_end);
+            // nowhere near the golden channel's memory
+            assert!(m.pa >= p.vram_end || m.pa + mapped_len(b) <= VRAM_CTX, "buffer {}", b.id);
+            spans.push((m.pa, m.pa + mapped_len(b), m.va, m.va + mapped_len(b)));
+        }
+        spans.sort();
+        for w in spans.windows(2) {
+            assert!(w[0].1 <= w[1].0, "physical overlap {:x?}", w);
+        }
+        let mut by_va = spans.clone();
+        by_va.sort_by_key(|s| s.2);
+        for w in by_va.windows(2) {
+            assert!(w[0].3 <= w[1].2, "virtual overlap {:x?}", w);
+        }
+        // one channel's own memory is about a megabyte (MAIN + PATCH), so a 2 MiB slot holds it with its ring pages
+        assert!(pa_end - 0x1_e001_0000 <= 0x1f_0000, "{:#x}", pa_end - 0x1_e001_0000);
+        // the mappings are exactly the non-global buffers
+        let maps = chan_mappings(&bufs, &mem);
+        assert_eq!(maps.len(), bufs.iter().filter(|b| !b.global).count());
+        assert!(maps.iter().all(|m| m.len > 0 && m.va % 0x1000 == 0));
     }
 }

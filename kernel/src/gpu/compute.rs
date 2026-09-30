@@ -341,6 +341,9 @@ pub(super) struct Channel {
     pub copy: bool,
     /// What floorsweeping left (RM's GPC/TPC masks), when RM answered.
     pub topo: Option<gr::Topology>,
+    /// The context buffers and where the GR channel has them: what `/dev/nvgpu` builds further GR channels from.
+    pub bufs: Vec<CtxBuf>,
+    pub chan0: Vec<gr::Mem>,
 }
 
 fn fail(r: &mut String, why: core::fmt::Arguments) -> Option<Channel> {
@@ -627,6 +630,7 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, c: Compute) -> Optio
     // The channel, its memory and the mappings stay: RM and the GPU own them now. The host page (the fence semaphore of
     // `gpu=uapi` is in it) and the ring's position go on to `uapi::install`.
     let slot = sub.slot;
+    let (bufs, chan0) = (c.bufs.clone(), c.plan.chan.clone());
     let Compute { host, kern, mthd_golden, mthd_chan, .. } = c;
     core::mem::forget((kern, mthd_golden, mthd_chan));
     // G4d: last of all, so that if RM refuses (and goes quiet, as a refused call can) everything above has already been measured. The
@@ -674,7 +678,7 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, c: Compute) -> Optio
             None
         }
     };
-    Some(Channel { token, slot, host, threed, copy, topo })
+    Some(Channel { token, slot, host, threed, copy, topo, bufs, chan0 })
 }
 
 /// One way of asking for the golden context. Boot #126 (`gpu=compute`, the first run) got `NV_ERR_INVALID_ARGUMENT` from

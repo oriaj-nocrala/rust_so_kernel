@@ -109,6 +109,24 @@ pub fn unbind_range(pt: &mut PageTables, va: u64, size: u64) -> u64 {
     n
 }
 
+/// Unmap a range that was mapped with pages of `2^page_shift` bytes (12, 16 or 21: what a GR context buffer uses): `len` bytes from `va`.
+/// Returns how many pages were unmapped.
+pub fn unbind_pages(pt: &mut PageTables, va: u64, len: u64, page_shift: u8) -> u64 {
+    let step = 1u64 << page_shift;
+    let mut n = 0;
+    let mut off = 0;
+    while off < len {
+        let hit = match page_shift {
+            16 => pt.unmap_big(va + off),
+            // 4 KiB and 2 MiB entries both go through `unmap` (which looks for the 2 MiB one first)
+            _ => pt.unmap(va + off),
+        };
+        n += hit as u64;
+        off += step;
+    }
+    n
+}
+
 /// The bus address of the page a bind mapped at `va`, and the aperture, through the images: what the GPU will walk. For tests and
 /// for the adapter's self-check.
 pub fn resolve(pt: &PageTables, va: u64) -> Option<(u64, Target)> {
@@ -741,5 +759,44 @@ mod tests {
         assert!(USER_VRAM_BASE > crate::chan::FRAME_VRAM + crate::chan::FRAME_BYTES);
         assert!(USER_VRAM_BASE > 64 << 20);
         assert_eq!(USER_VRAM_BYTES, 0x1_e000_0000 - (1 << 30));
+    }
+
+    #[test]
+    fn pages_of_every_size_unmap_with_their_own_call() {
+        let mut pt = tables();
+        let f = Flags::default();
+        pt.map_big_range(VA, 0x4000_0000, 4 * crate::mmu::BIG_PAGE, Target::Vram, f).unwrap();
+        pt.map_huge_range(VA + 0x4000_0000, 0x6000_0000, crate::mmu::HUGE_PAGE, Target::Vram, f).unwrap();
+        pt.map_range(VA + 0x8000_0000, 0x7000_0000, 0x3000, Target::Vram, f).unwrap();
+        assert!(resolve(&pt, VA + 0x1_0000).is_some() && resolve(&pt, VA + 0x4000_0000).is_some() && resolve(&pt, VA + 0x8000_1000).is_some());
+        assert_eq!(unbind_pages(&mut pt, VA, 4 * crate::mmu::BIG_PAGE, 16), 4);
+        assert_eq!(unbind_pages(&mut pt, VA + 0x4000_0000, crate::mmu::HUGE_PAGE, 21), 1);
+        assert_eq!(unbind_pages(&mut pt, VA + 0x8000_0000, 0x3000, 12), 3);
+        for va in [VA, VA + 0x3_0000, VA + 0x4000_0000, VA + 0x401f_f000, VA + 0x8000_2000] {
+            assert_eq!(resolve(&pt, va), None, "{:#x}", va);
+        }
+        // and the same ranges map again (a channel slot is reused)
+        pt.map_big_range(VA, 0x4000_0000, 4 * crate::mmu::BIG_PAGE, Target::Vram, f).unwrap();
+        pt.map_huge_range(VA + 0x4000_0000, 0x6000_0000, crate::mmu::HUGE_PAGE, Target::Vram, f).unwrap();
+        // unmapping what is not there is fine
+        assert_eq!(unbind_pages(&mut pt, VA + 0x10_0000_0000, 0x1_0000, 16), 0);
+    }
+
+    #[test]
+    fn a_4k_unmap_does_not_wipe_a_64k_table_in_the_same_2_mib() {
+        // a GR channel's ring pages (4 KiB) and its context buffers (64 KiB pages) share a 2 MiB region
+        let mut pt = tables();
+        let f = Flags::default();
+        pt.map_range(VA, 0x4000_0000, 0x3000, Target::Vram, f).unwrap();
+        pt.map_big_range(VA + 0x10_0000, 0x5000_0000, 2 * crate::mmu::BIG_PAGE, Target::Vram, f).unwrap();
+        assert_eq!(unbind_pages(&mut pt, VA, 0x3000, 12), 3);
+        // the big pages are still mapped, and unmap with their own call
+        assert!(resolve(&pt, VA + 0x10_0000).is_some() && resolve(&pt, VA + 0x11_0000).is_some());
+        assert_eq!(unbind_pages(&mut pt, VA + 0x10_0000, 2 * crate::mmu::BIG_PAGE, 16), 2);
+        assert_eq!(resolve(&pt, VA + 0x10_0000), None);
+        // the same region maps again, in either order
+        pt.map_big_range(VA + 0x10_0000, 0x5000_0000, 2 * crate::mmu::BIG_PAGE, Target::Vram, f).unwrap();
+        pt.map_range(VA, 0x4000_0000, 0x3000, Target::Vram, f).unwrap();
+        assert!(resolve(&pt, VA + 0x2000).is_some() && resolve(&pt, VA + 0x11_0000).is_some());
     }
 }

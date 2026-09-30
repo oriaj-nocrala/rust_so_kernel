@@ -753,6 +753,9 @@ fn drain(rt: &mut Runtime) -> usize {
         rt.stats.log.push_back((m.function, m.payload.len()));
         if m.function == rpc::EVENT_RC_TRIGGERED {
             RC_EVENTS.fetch_add(1, Ordering::Release);
+            // which channel: one bit per hardware chid; bit 63 when the payload does not say
+            let bit = rpc::rc_chid(&m.payload).map_or(63, |c| c & 63);
+            RC_MASK.fetch_or(1u64 << bit, Ordering::Release);
         }
         if m.function == rpc::EVENT_GSP_RUN_CPU_SEQUENCER {
             if let Ok((ops, mut save)) = rpc::decode_sequencer(&m.payload) {
@@ -778,6 +781,13 @@ static RC_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn rc_events() -> u64 {
     RC_EVENTS.load(Ordering::Acquire)
+}
+
+/// The channels RM has reset since the last call (bit per hardware chid, bit 63 = one it did not name), and forget them.
+static RC_MASK: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn take_rc_mask() -> u64 {
+    RC_MASK.swap(0, Ordering::AcqRel)
 }
 
 /// Serve the status queue now unless someone holds the runtime (never waits: callable with other locks held).

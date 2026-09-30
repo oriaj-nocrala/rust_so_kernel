@@ -24,6 +24,8 @@ extern int ioctl(int fd, unsigned long request, ...);
 
 static int failures;
 #define CHECK(cond, ...) do { if (cond) printf("  ok   %s\n", #cond); else { failures++; printf("  FAIL %s (line %d): ", #cond, __LINE__); printf(__VA_ARGS__); printf(" [errno %d]\n", errno); } } while (0)
+// A check without which nothing after it means anything: end the run.
+#define REQUIRE(cond, ...) do { if (!(cond)) { failures++; printf("  FAIL %s (line %d): ", #cond, __LINE__); printf(__VA_ARGS__); printf(" [errno %d]\n", errno); printf("nvgpu_hw_test: stopped, %d failure(s)\n", failures); return 1; } else printf("  ok   %s\n", #cond); } while (0)
 // A check about what the GPU did: meaningless on the software device.
 #define HWCHECK(cond, ...) do { if (hw) CHECK(cond, __VA_ARGS__); else printf("  skip %s (software device)\n", #cond); } while (0)
 
@@ -91,6 +93,11 @@ static uint32_t ctx_create(uint32_t engines) {
 }
 
 static unsigned long eagains;   // EXECs the kernel answered with EAGAIN (ring or fence slots full) before accepting them
+
+static int ctx_destroy(uint32_t ctx) {
+   struct nvg_ctx_destroy d = { .ctx = ctx };
+   return call(NVG_IOC_CTX_DESTROY, &d);
+}
 
 /// EXEC signalling `sync` = `value` when its pushes and the kernel's fence have run; retried while the ring is full (EAGAIN).
 static int exec_signal(uint32_t ctx, const struct nvg_push *p, uint32_t np, uint32_t sync, uint64_t value) {
@@ -261,8 +268,8 @@ static int grcopy(int with_bind) {
 
 /// `nvgpu_hw_test rc` (an experiment for the end of the metal job: it kills the GPU channel on purpose): a launch whose program address
 /// is a VA nothing is bound at. The GPU takes an MMU fault, RM resets the channel (RC_TRIGGERED) and it never releases the fence. The kernel
-/// must notice through RM's event within tens of milliseconds (not the 10 s hang limit), report every fence as done so the waiter wakes,
-/// and answer the next EXEC with EIO.
+/// must notice through RM's event (which names the channel) within tens of milliseconds, not the 10 s hang limit, report that channel's
+/// fences as done so the waiter wakes, answer the next EXEC on it with EIO, and leave every other context (and new ones) alone.
 static int rc_test(void) {
    printf("nvgpu_hw_test rc:\n");
    fd = open("/dev/nvgpu", O_RDWR);
@@ -271,9 +278,16 @@ static int rc_test(void) {
    struct nvg_info info;
    call(NVG_IOC_INFO, &info);
    hw = !(info.flags & NVG_INFO_SOFTWARE);
-   uint32_t ctx = ctx_create(NVG_ENGINE_COMPUTE), tl = sync_create(0);
+   // two contexts: each has a channel of its own (the first takes the boot's, the second is made here)
+   uint32_t ca = ctx_create(NVG_ENGINE_COMPUTE), cb = ctx_create(NVG_ENGINE_COMPUTE), tl = sync_create(0), tb = sync_create(0);
    struct region r;
-   CHECK(ctx && tl && region_make(&r, 2 * SLOT_BYTES) == 0, "a compute context and a region");
+   REQUIRE(ca && cb && tl && tb && region_make(&r, 8 * SLOT_BYTES) == 0, "two compute contexts (%u %u), two timelines and a region", ca, cb);
+   int first = 0;
+   // B works before the fault
+   struct nvg_push pb0 = launch_prepare(&r, 2, nvg_shader_fill, slot_out_va(&r, 2), 0, 3);
+   CHECK(exec_signal(cb, &pb0, 1, tb, 1) == 0 && wait_timeline(tb, 1, 5000) == 0, "B runs a launch before the fault");
+   HWCHECK(out_is(&r, 2, fill_word, &first), "and its output is right (first bad %d)", first);
+   // A faults: a launch whose program is a VA nothing is bound at
    uint64_t bad = va_alloc(0x10000, 0x10000);   // allocated, never bound
    CHECK(bad != 0, "a VA range nothing is bound at");
    struct nvg_push p = launch_prepare(&r, 0, nvg_shader_fill, r.va + OFF_OUT, 0, 1);
@@ -282,14 +296,24 @@ static int rc_test(void) {
    nvg_qmd_build(q, &l);
    memcpy(r.cpu + OFF_QMD, q, 256);
    int64_t t0 = now_ms();
-   CHECK(exec_signal(ctx, &p, 1, tl, 1) == 0, "EXEC of the faulting launch is accepted");
+   CHECK(exec_signal(ca, &p, 1, tl, 1) == 0, "EXEC of the faulting launch on A is accepted");
    int woke = wait_timeline(tl, 1, 20000) == 0;
    int64_t ms = now_ms() - t0;
    printf("  the waiter woke after %lld ms\n", (long long)ms);
-   HWCHECK(woke && ms < 3000, "the fault was noticed and the fence released in %lld ms (the hang limit is 10000)", (long long)ms);
-   struct nvg_push q2 = launch_prepare(&r, 1, nvg_shader_fill, r.va + SLOT_BYTES + OFF_OUT, 0, 2);
-   int rr = exec_signal(ctx, &q2, 1, tl, 2);
-   HWCHECK(rr < 0 && errno == EIO, "the next EXEC says EIO (%d, errno %d)", rr, errno);
+   HWCHECK(woke && ms < 3000, "the fault was noticed and A's fence released in %lld ms (the hang limit is 10000)", (long long)ms);
+   struct nvg_push q2 = launch_prepare(&r, 1, nvg_shader_fill, slot_out_va(&r, 1), 0, 2);
+   int rr = exec_signal(ca, &q2, 1, tl, 2);
+   HWCHECK(rr < 0 && errno == EIO, "the next EXEC on A says EIO (%d, errno %d)", rr, errno);
+   // the fault killed A's channel only: B goes on, and a new context gets a fresh channel
+   struct nvg_push pb1 = launch_prepare(&r, 3, nvg_shader_fill, slot_out_va(&r, 3), 0, 4);
+   CHECK(exec_signal(cb, &pb1, 1, tb, 2) == 0 && wait_timeline(tb, 2, 5000) == 0, "B still runs a launch after A's fault");
+   HWCHECK(out_is(&r, 3, fill_word, &first), "B's output is right (first bad %d)", first);
+   uint32_t cc = ctx_create(NVG_ENGINE_COMPUTE), tc = sync_create(0);
+   CHECK(cc != 0 && tc != 0, "a new context after the fault");
+   struct nvg_push pc = launch_prepare(&r, 4, nvg_shader_fill, slot_out_va(&r, 4), 0, 5);
+   CHECK(exec_signal(cc, &pc, 1, tc, 1) == 0 && wait_timeline(tc, 1, 5000) == 0, "C runs a launch on its fresh channel");
+   HWCHECK(out_is(&r, 4, fill_word, &first), "C's output is right (first bad %d)", first);
+   CHECK(ctx_destroy(ca) == 0 && ctx_destroy(cb) == 0 && ctx_destroy(cc) == 0, "all three contexts destroyed (their channels are given back)");
    printf("nvgpu_hw_test rc: %d failure(s)\n", failures);
    return failures ? 1 : 0;
 }
@@ -486,6 +510,34 @@ int main(int argc, char **argv) {
       unbind(va_a, big); unbind(va_b, big);
       struct nvg_bo_free f1 = { .handle = ba }, f2 = { .handle = bb };
       call(NVG_IOC_BO_FREE, &f1); call(NVG_IOC_BO_FREE, &f2);
+   }
+
+   // ---- 4c. one channel per context: four compute contexts at once (the first takes the boot's channel, the others are made here), a launch
+   // on each in flight together, every output checked; then the contexts are destroyed (channels given back) and made again (slots reused)
+   {
+      enum { K = 4 };
+      for (int round = 0; round < 2; round++) {
+         uint32_t cx[K], tx[K];
+         int made = 1;
+         for (int i = 0; i < K; i++) {
+            cx[i] = ctx_create(NVG_ENGINE_3D | NVG_ENGINE_COMPUTE | NVG_ENGINE_COPY);
+            tx[i] = sync_create(0);
+            made &= cx[i] != 0 && tx[i] != 0;
+         }
+         REQUIRE(made, "round %d: %d 3D+compute+copy contexts (%u %u %u %u)", round, K, cx[0], cx[1], cx[2], cx[3]);
+         struct nvg_push pp[K];
+         for (int i = 0; i < K; i++) pp[i] = launch_prepare(&host, 5 + i, nvg_shader_fill, slot_out_va(&host, 5 + i), 0, 200 + i);
+         int okx = 1;
+         for (int i = 0; i < K; i++) okx &= exec_signal(cx[i], &pp[i], 1, tx[i], 1) == 0;
+         for (int i = 0; i < K; i++) okx &= wait_timeline(tx[i], 1, 10000) == 0;
+         CHECK(okx, "round %d: a launch on each context, all fences come", round);
+         int good4 = 0;
+         for (int i = 0; i < K; i++) good4 += out_is(&host, 5 + i, fill_word, &first);
+         HWCHECK(good4 == K, "round %d: %d of %d outputs are right", round, good4, K);
+         int gone = 1;
+         for (int i = 0; i < K; i++) gone &= ctx_destroy(cx[i]) == 0;
+         CHECK(gone, "round %d: the contexts are destroyed", round);
+      }
    }
 
    // ---- 5. the device is handed back: close, reopen, and a holder that dies with work in flight
