@@ -7,5 +7,6 @@ void main() {
     float c = cos(pc.angle), s = sin(pc.angle);
     p = vec2(c * p.x - s * p.y, s * p.x + c * p.y);
     p.x /= pc.aspect;
-    gl_Position = vec4(p, 0.0, 1.0);
+    // Vulkan clip space has +y pointing DOWN the screen: flip it so the triangle stands on its base
+    gl_Position = vec4(p.x, -p.y, 0.0, 1.0);
 }

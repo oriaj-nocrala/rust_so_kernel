@@ -18,6 +18,7 @@
 #include "tri_spv.h"
 
 #include <fcntl.h>
+#include <poll.h>
 #include <math.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -442,9 +443,13 @@ int main(void) {
       VkRect2D sc3 = { { 0, 0 }, { SW, SH } };
       // the buffer's rows are `pitch` bytes apart: bufferRowLength is in texels
       VkBufferImageCopy reg3 = { .bufferRowLength = si.pitch_B / 4, .bufferImageHeight = SH, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { SW, SH, 1 } };
+      // Sleeping until the next vblank is what /dev/vblank is for: poll() blocks until one has happened after the last one this handle read
+      // (read() never blocks and gives 16 bytes: sequence number, ns). Without it (the device is unarmed) the wait polls every 200 us.
+      int vfd = open("/dev/vblank", O_RDONLY | O_NONBLOCK);
+      printf("VK scanout: waiting for the flip %s\n", vfd >= 0 ? "by poll() on /dev/vblank" : "by polling every 200 us (no /dev/vblank)");
       struct timespec t0, t1;
       clock_gettime(CLOCK_MONOTONIC, &t0);
-      unsigned frames = 0, busy = 0, shown = 0;
+      unsigned frames = 0, busy = 0, shown = 0, slept = 0;
       int frame_ok = 1, present_ok = 1;
       for (;;) {
          clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -472,16 +477,25 @@ int main(void) {
          // the picture is in VRAM. The previous present must have taken effect before the next one (the display latches at a vblank): ask the kernel
          // rather than sleep a frame, then point the display at this buffer. Meanwhile the next frame could already be drawn into the third buffer.
          int pr, tries = 0;
-         while (nvk_constanos_flip_pending(device) > 0 && tries++ < 200) { busy++; usleep(200); }
+         while (nvk_constanos_flip_pending(device) > 0 && tries++ < 200) {
+            busy++;
+            if (vfd >= 0) {
+               struct pollfd pf = { .fd = vfd, .events = POLLIN };
+               if (poll(&pf, 1, 100) > 0) { uint64_t ev[2]; /* one read marks the live vblank seen (it never blocks and always answers): looping on it never ends */ if (read(vfd, ev, sizeof ev) == (ssize_t)sizeof ev) slept++; }
+            } else {
+               usleep(200);
+            }
+         }
          tries = 0;
          while ((pr = nvk_constanos_present(device, smem[k], 0)) == -16 /* EBUSY */ && tries++ < 100) { busy++; usleep(200); }
          if (pr != 0) { present_ok = 0; printf("VK scanout: PRESENT failed (%d) at frame %u\n", pr, frames); break; }
          shown++;
          frames++;
       }
+      if (vfd >= 0) close(vfd);
       CHECK(frame_ok, "every frame rendered and fenced");
       CHECK(present_ok && shown == frames, "every frame was put on the screen (%u of %u)", shown, frames);
-      printf("VK scanout: %u frames shown in %.1f s (%.1f per second), %u waits for the previous flip\n", frames, seconds, frames / (seconds > 0 ? seconds : 1), busy);
+      printf("VK scanout: %u frames shown in %.1f s (%.1f per second), %u waits for the previous flip (%u slept through a vblank)\n", frames, seconds, frames / (seconds > 0 ? seconds : 1), busy, slept);
       VKOK(vkDeviceWaitIdle(device));
    }
 
