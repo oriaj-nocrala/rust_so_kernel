@@ -98,6 +98,7 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "tgid_test",
     "siginfo_test",
     "nanosleep_rem_test",
+    "epoll_scale_test",
     "pipe_poll_test",
     "fdlimit_test",
     "argv_test",

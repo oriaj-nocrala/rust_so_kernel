@@ -1,5 +1,6 @@
 // kernel/src/process/syscall/poll.rs
 //
+use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 use crate::sync::Mutex;
 use crate::process::TrapFrame;
@@ -114,6 +115,9 @@ fn snapshot_sockets() -> SocketMap {
 
 // ── Poll bitmasks (POSIX ABI) ──────────────────────────────────────────────
 
+/// Linux's `EP_MAX_EVENTS`: `INT_MAX / sizeof(struct epoll_event)`.
+const MAX_EVENTS: i32 = i32::MAX / 12;
+
 const POLLIN:   i16 = 0x0001;
 const POLLOUT:  i16 = 0x0004;
 const POLLERR:  i16 = 0x0008;
@@ -163,46 +167,54 @@ struct EpollWatch {
     et_delivered:   bool,
 }
 
-/// A single epoll instance (the object behind an epoll FD).
-#[derive(Clone, Copy)]
+/// A single epoll instance (the object behind an epoll FD). The interest list is a `Vec` (at most `MAX_WATCHES`), kept in the
+/// order the watches were added: that is the order ready events are reported in.
 struct EpollInstance {
-    watches:   [Option<EpollWatch>; 16],
+    watches:   Vec<EpollWatch>,
     owner_pid: usize,
 }
 
+/// Interest-list entries one epoll instance may hold (`ENOSPC` beyond), and epoll instances the system may hold (`EMFILE`).
+const MAX_WATCHES: usize = 4096;
+const MAX_INSTANCES: usize = 256;
+
 pub type EpollInstanceId = usize; // 0 = invalid
 
+/// Instances by 1-based id (0 = invalid); a freed slot is reused, so ids stay small.
 struct EpollInstanceTable {
-    slots: [Option<EpollInstance>; 16],
+    slots: Vec<Option<EpollInstance>>,
 }
 
 impl EpollInstanceTable {
     const fn new() -> Self {
-        Self { slots: [None; 16] }
+        Self { slots: Vec::new() }
     }
 
     fn alloc(&mut self, owner_pid: usize) -> Option<EpollInstanceId> {
-        for (i, slot) in self.slots.iter_mut().enumerate() {
-            if slot.is_none() {
-                *slot = Some(EpollInstance { watches: [None; 16], owner_pid });
-                return Some(i + 1); // 1-based IDs; 0 = invalid
-            }
+        let inst = EpollInstance { watches: Vec::new(), owner_pid };
+        if let Some(i) = self.slots.iter().position(|s| s.is_none()) {
+            self.slots[i] = Some(inst);
+            return Some(i + 1);
         }
-        None
+        if self.slots.len() >= MAX_INSTANCES {
+            return None;
+        }
+        self.slots.push(Some(inst));
+        Some(self.slots.len())
     }
 
     fn free(&mut self, id: EpollInstanceId) {
-        if id >= 1 && id <= 16 {
-            self.slots[id - 1] = None;
+        if let Some(slot) = id.checked_sub(1).and_then(|i| self.slots.get_mut(i)) {
+            *slot = None;
         }
     }
 
     fn get(&self, id: EpollInstanceId) -> Option<&EpollInstance> {
-        if id >= 1 && id <= 16 { self.slots[id - 1].as_ref() } else { None }
+        id.checked_sub(1).and_then(|i| self.slots.get(i)).and_then(|s| s.as_ref())
     }
 
     fn get_mut(&mut self, id: EpollInstanceId) -> Option<&mut EpollInstance> {
-        if id >= 1 && id <= 16 { self.slots[id - 1].as_mut() } else { None }
+        id.checked_sub(1).and_then(|i| self.slots.get_mut(i)).and_then(|s| s.as_mut())
     }
 }
 
@@ -404,9 +416,9 @@ fn deliver_poll_result_phys(waiter: &PollWaiter, phys_offset: u64, write: bool) 
                 None => return 0,
             };
             let mut written = 0usize;
-            for watch_opt in inst.watches.iter() {
+            for watch in inst.watches.iter() {
                 if written >= maxevents { break; }
-                if let Some(watch) = watch_opt {
+                {
                     let mut poll_ev: i16 = 0;
                     if watch.events & EPOLLIN  != 0 { poll_ev |= POLLIN; }
                     if watch.events & EPOLLOUT != 0 { poll_ev |= POLLOUT; }
@@ -463,7 +475,7 @@ fn poll_waiter_watches(
         PollWaiterKind::EpollWait { epoll_id, .. } => {
             let instances = EPOLL_INSTANCES.lock();
             instances.get(epoll_id).is_some_and(|inst| {
-                inst.watches.iter().flatten()
+                inst.watches.iter()
                     .any(|w| w.events & (EPOLLIN | EPOLLOUT) != 0 && wanted(waiter, w.fd))
             })
         }
@@ -675,9 +687,9 @@ fn epoll_ready(
         None    => return 0,
     };
     let mut written = 0usize;
-    for watch_opt in inst.watches.iter() {
+    for watch in inst.watches.iter() {
         if written >= maxevents { break; }
-        if let Some(watch) = watch_opt {
+        {
             let mut poll_ev: i16 = 0;
             if watch.events & EPOLLIN  != 0 { poll_ev |= POLLIN; }
             if watch.events & EPOLLOUT != 0 { poll_ev |= POLLOUT; }
@@ -850,15 +862,31 @@ fn block_poll_waiter(
 
 /// epoll_create(213) — create an epoll instance.
 ///
-/// `size` is ignored (Linux ≥ 2.6.8 ignores it too, kept for ABI).
+/// `size` is ignored (Linux ≥ 2.6.8 ignores it too, kept for ABI), but must be positive.
 /// Returns a file descriptor referring to the new epoll instance.
-pub(super) fn sys_epoll_create(_size: i32) -> SyscallResult {
+pub(super) fn sys_epoll_create(size: i32) -> SyscallResult {
+    if size <= 0 {
+        return errno::EINVAL;
+    }
+    epoll_create_impl(false)
+}
+
+/// epoll_create1(291): `EPOLL_CLOEXEC` (= `O_CLOEXEC`) is the only flag.
+pub(super) fn sys_epoll_create1(flags: i32) -> SyscallResult {
+    const EPOLL_CLOEXEC: i32 = 0x80000;
+    if flags & !EPOLL_CLOEXEC != 0 {
+        return errno::EINVAL;
+    }
+    epoll_create_impl(flags & EPOLL_CLOEXEC != 0)
+}
+
+fn epoll_create_impl(cloexec: bool) -> SyscallResult {
     let epoll_id = {
         let pid = crate::process::scheduler::current_pid().unwrap_or(0);
         let mut instances = EPOLL_INSTANCES.lock();
         match instances.alloc(pid) {
             Some(id) => id,
-            None => return errno::ENOMEM,
+            None => return errno::EMFILE,
         }
     };
 
@@ -874,6 +902,9 @@ pub(super) fn sys_epoll_create(_size: i32) -> SyscallResult {
             let alloc_result = proc.files.lock().allocate(handle);
             match alloc_result {
                 Ok(fd) => {
+                    if cloexec {
+                        let _ = proc.files.lock().set_cloexec(fd, true);
+                    }
                     drop(sched);
                     set_epoll_fd(pid, fd, epoll_id);
                     fd as i64
@@ -919,41 +950,36 @@ pub(super) fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> Sysc
 
     match op {
         EPOLL_CTL_ADD => {
-            match inst.watches.iter_mut().find(|s| s.is_none()) {
-                Some(slot) => {
-                    let ev = event.unwrap();
-                    *slot = Some(EpollWatch {
-                        fd,
-                        events: ev.events,
-                        data:   ev.data,
-                        edge_triggered: (ev.events & EPOLLET) != 0,
-                        et_delivered:   false,
-                    });
-                    0
-                }
-                None => errno::ENOMEM,
+            if inst.watches.iter().any(|w| w.fd == fd) {
+                return errno::EEXIST;
             }
-        }
-        EPOLL_CTL_DEL => {
-            match inst.watches.iter_mut().find(|s| s.as_ref().map(|w| w.fd == fd).unwrap_or(false)) {
-                Some(slot) => { *slot = None; 0 }
-                None       => errno::ENOENT,
+            if inst.watches.len() >= MAX_WATCHES {
+                return errno::ENOSPC;
             }
+            let ev = event.unwrap();
+            inst.watches.push(EpollWatch {
+                fd,
+                events: ev.events,
+                data:   ev.data,
+                edge_triggered: (ev.events & EPOLLET) != 0,
+                et_delivered:   false,
+            });
+            0
         }
-        EPOLL_CTL_MOD => {
-            match inst.watches.iter_mut().find(|s| s.as_ref().map(|w| w.fd == fd).unwrap_or(false)) {
-                Some(slot) => {
-                    let ev = event.unwrap();
-                    if let Some(w) = slot {
-                        w.events         = ev.events;
-                        w.data           = ev.data;
-                        w.edge_triggered = (ev.events & EPOLLET) != 0;
-                    }
-                    0
-                }
-                None => errno::ENOENT,
+        EPOLL_CTL_DEL => match inst.watches.iter().position(|w| w.fd == fd) {
+            Some(i) => { inst.watches.remove(i); 0 }
+            None    => errno::ENOENT,
+        },
+        EPOLL_CTL_MOD => match inst.watches.iter_mut().find(|w| w.fd == fd) {
+            Some(w) => {
+                let ev = event.unwrap();
+                w.events         = ev.events;
+                w.data           = ev.data;
+                w.edge_triggered = (ev.events & EPOLLET) != 0;
+                0
             }
-        }
+            None => errno::ENOENT,
+        },
         _ => errno::EINVAL,
     }
 }
@@ -964,10 +990,10 @@ pub(super) fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> Sysc
 ///
 /// `epfd`       — epoll file descriptor.
 /// `events_ptr` — user pointer to array of `struct epoll_event`.
-/// `maxevents`  — max events to return (1..=16).
+/// `maxevents`  — max events to return (any positive count; a blocked wait is woken with as many as fit in one page).
 /// `timeout_ms` — -1 = forever, 0 = non-blocking, >0 = ms.
 pub(super) fn sys_epoll_wait(epfd: i32, events_ptr: u64, maxevents: i32, timeout_ms: i32) -> SyscallResult {
-    if maxevents <= 0 || maxevents > 16 { return errno::EINVAL; }
+    if maxevents <= 0 || maxevents > MAX_EVENTS { return errno::EINVAL; }
     let buf_size = maxevents as usize * 12; // sizeof(EpollEvent)
     if let Err(e) = validate_user_buffer(events_ptr, buf_size) { return e; }
 
@@ -994,6 +1020,13 @@ pub(super) fn sys_epoll_wait(epfd: i32, events_ptr: u64, maxevents: i32, timeout
     // ── Slow path: block ──────────────────────────────────────────────────
     let tf_ptr = current_tf_ptr();
 
+    // The waker writes the events through a physical address, so what it may write must lie in one page: a blocked wait
+    // returns at most that many (fewer than `maxevents` is always allowed).
+    let maxevents = (maxevents as usize).min((0x1000 - (events_ptr & 0xFFF) as usize) / 12);
+    let buf_size = maxevents * 12;
+    if maxevents == 0 {
+        return errno::EFAULT;
+    }
     let phys_buf = match translate_user_buf_phys(events_ptr, buf_size) {
         Some(pa) => pa,
         None => return errno::EFAULT,
@@ -1003,12 +1036,12 @@ pub(super) fn sys_epoll_wait(epfd: i32, events_ptr: u64, maxevents: i32, timeout
         pid,
         phys_buf,
         phys_len: buf_size,
-        kind: PollWaiterKind::EpollWait { epoll_id, maxevents: maxevents as usize },
+        kind: PollWaiterKind::EpollWait { epoll_id, maxevents },
         timer_id: None,
         socks,
         cell: None,
     };
     block_poll_waiter(tf_ptr, waiter, timeout_ms, |socks| {
-        epoll_ready(epoll_id, socks, None, maxevents as usize) > 0
+        epoll_ready(epoll_id, socks, None, maxevents) > 0
     })
 }

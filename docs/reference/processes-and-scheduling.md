@@ -105,4 +105,4 @@ Code: `kernel/src/process/` (`scheduler.rs`, `timer_preempt.rs`, `trapframe.rs`,
 ## Descriptor table
 
 - `FileDescriptorTable` (`process/file.rs`) is two `Vec`s (handles, close-on-exec flags) that grow on demand to `MAX_FILES` = 256; a full table is `EMFILE`. **Never make it an inline array or put a per-fd array in a `BTreeMap` value**: at opt-level 0 those are copied by value several times and overflowed the boot stack (PID 1) and a kernel stack (`EPOLL_FD_MAP`, now keyed by `(pid, fd)`).
-- `poll`/`epoll` snapshot the table into a boxed slice sized to the highest open fd (`open_extent`); epoll instances still hold 16 watches each.
+- `poll`/`epoll` snapshot the table into a boxed slice sized to the highest open fd (`open_extent`).

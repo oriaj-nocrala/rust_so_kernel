@@ -41,4 +41,4 @@ State and the list of what is still missing: `docs/reference/syscalls.md` (rows,
 
 ## Still missing (check `rust_std_gaps` first)
 
-a relative sleep restarted after SIGSTOP/SIGCONT sleeps the whole time again (Linux: the rest), `si_uid` (no uid model) and `CLD_CONTINUED`, `CLONE_VFORK` does not suspend the parent, epoll instances hold 16 watches.
+a relative sleep restarted after SIGSTOP/SIGCONT sleeps the whole time again (Linux: the rest), `si_uid` (no uid model) and `CLD_CONTINUED`, `CLONE_VFORK` does not suspend the parent, `epoll_pwait` (281) is missing, epoll is level-triggered only (`EPOLLET`/`EPOLLONESHOT` stored, not honoured).
