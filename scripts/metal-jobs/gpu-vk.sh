@@ -72,7 +72,7 @@ sum "gpu-vk: after the test: $u1"
 for x in binds unbinds tlb_flushes execs fences; do
   [ "$(field "$u1" $x)" -gt 0 ] 2>/dev/null || { sum "gpu-vk: $x=$(field "$u1" $x)"; fail=1; }
 done
-[ "$(field "$u1" again)" -gt 0 ] 2>/dev/null && sum "gpu-vk: the ring filled $(field "$u1" again) times (EAGAIN handled)" || sum "gpu-vk: the ring never filled (again=0): the EAGAIN path was not exercised"
+[ "$(field "$u1" again)" -gt 0 ] 2>/dev/null && sum "gpu-vk: the ring filled $(field "$u1" again) times (EAGAIN handled)" || { sum "gpu-vk: the ring never filled (again=0): the EAGAIN path was not exercised"; fail=1; }
 
 # G4d: Vulkan on the hardware.
 VK_PROBE_REQUIRE_EXEC=1 NVK_CONSTANOS_DEBUG=1 /mnt/bin/vk_probe > /tmp/vk_probe.out 2>&1

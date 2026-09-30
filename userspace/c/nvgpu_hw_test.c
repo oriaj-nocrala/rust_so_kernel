@@ -90,6 +90,8 @@ static uint32_t ctx_create(uint32_t engines) {
    return call(NVG_IOC_CTX_CREATE, &c) == 0 ? c.ctx : 0;
 }
 
+static unsigned long eagains;   // EXECs the kernel answered with EAGAIN (ring or fence slots full) before accepting them
+
 /// EXEC signalling `sync` = `value` when its pushes and the kernel's fence have run; retried while the ring is full (EAGAIN).
 static int exec_signal(uint32_t ctx, const struct nvg_push *p, uint32_t np, uint32_t sync, uint64_t value) {
    struct nvg_sync_ref sig = { .handle = sync, .value = value };
@@ -98,6 +100,7 @@ static int exec_signal(uint32_t ctx, const struct nvg_push *p, uint32_t np, uint
    for (;;) {
       int r = call(NVG_IOC_EXEC, &e);
       if (r == 0 || errno != EAGAIN) return r;
+      eagains++;
       if (now_ms() > deadline) { errno = ETIMEDOUT; return -1; }
       nap_us(50);
    }
@@ -386,6 +389,31 @@ int main(void) {
       for (unsigned k = 0; k < N; k++) good += out_is(&host, 10 + k, fill_word, &first);
       HWCHECK(good == N, "%d of %d output pages are right", good, N);
       printf("  %d launches in flight: %lld us in all\n", N, (long long)(now_us() - s));
+   }
+
+   // ---- 4b. a full ring on purpose: 300 copies of 32 MiB VRAM -> VRAM on the copy channel, submitted far faster than they run, so the kernel's
+   // 64 fence slots fill and it answers EAGAIN (what the retry loop in exec_signal is for)
+   {
+      uint32_t cctx = ctx_create(NVG_ENGINE_COPY);
+      uint64_t big = 32ull << 20;
+      uint32_t ba = bo_create(big, NVG_BO_VRAM, NULL), bb = bo_create(big, NVG_BO_VRAM, NULL);
+      uint64_t va_a = va_alloc(big, 0x10000), va_b = va_alloc(big, 0x10000);
+      CHECK(cctx && ba && bb && va_a && va_b && bind(va_a, big, ba, 0) == 0 && bind(va_b, big, bb, 0) == 0, "two 32 MiB VRAM buffers");
+      uint32_t w[16];
+      uint32_t n = copy_push(w, va_a, va_b, (uint32_t)big);
+      memcpy(host.cpu + 36ull * SLOT_BYTES + OFF_PUSH, w, n * 4);
+      struct nvg_push cp = { .va = host.va + 36ull * SLOT_BYTES + OFF_PUSH, .bytes = n * 4, .flags = 0 };
+      uint32_t t2 = sync_create(0);
+      unsigned long before = eagains;
+      int64_t s0 = now_us();
+      int fails3 = 0;
+      for (int i = 1; i <= 300; i++) fails3 += exec_signal(cctx, &cp, 1, t2, i) != 0;
+      CHECK(fails3 == 0 && wait_timeline(t2, 300, 20000) == 0, "300 big copies all complete (%d rejected)", fails3);
+      printf("  300 x 32 MiB VRAM copies: %lld us in all, %lu EAGAINs\n", (long long)(now_us() - s0), eagains - before);
+      HWCHECK(eagains > before, "the ring/fence slots filled at least once (EAGAIN seen %lu times)", eagains - before);
+      unbind(va_a, big); unbind(va_b, big);
+      struct nvg_bo_free f1 = { .handle = ba }, f2 = { .handle = bb };
+      call(NVG_IOC_BO_FREE, &f1); call(NVG_IOC_BO_FREE, &f2);
    }
 
    // ---- 5. the device is handed back: close, reopen, and a holder that dies with work in flight
