@@ -45,6 +45,11 @@ pub trait Scanout: Send {
     /// The last flip has taken effect: the buffer it left is no longer
     /// scanned out and may be written.
     fn flip_done(&mut self) -> bool;
+    /// Show the linear surface at VRAM offset `vram` (a buffer that is not one of the two: a GPU's rendering, `/dev/nvgpu`'s `PRESENT`) from
+    /// the next vblank on. Same contract as `flip`.
+    fn flip_external(&mut self, _vram: u64) -> Result<(), &'static str> {
+        Err("this display cannot scan out an external buffer")
+    }
 }
 
 /// Page flipping state. The RAM shadow stays the only thing drawn into;
@@ -303,6 +308,39 @@ impl Framebuffer {
         }
         self.flip = Some(f);
         res.map_err(PresentError::Failed)
+    }
+
+    /// Show an external VRAM buffer (a GPU's rendering laid out as the screen: `stride * bytes_per_pixel` bytes per row, `height` rows) without
+    /// copying anything: the display scans it out where it is. The two buffers keep their place: the next `present` flips back to one of them
+    /// with what the shadow holds, and [`restore_front`](Self::restore_front) puts the picture that was in front back. `Busy` while the
+    /// previous flip is pending.
+    pub fn present_external(&mut self, vram: u64) -> Result<(), PresentError> {
+        if self.flip.is_none() {
+            return Err(PresentError::Failed("no page flipping: gpu=scanout is off"));
+        }
+        if !self.flip_settled() {
+            return Err(PresentError::Busy);
+        }
+        let f = self.flip.as_mut().unwrap();
+        f.scanout.flip_external(vram).map_err(PresentError::Failed)?;
+        f.pending = true;
+        Ok(())
+    }
+
+    /// Flip back to the buffer that was in front before an external one was shown (what the console and `/dev/fb0` drew into since is there).
+    pub fn restore_front(&mut self) -> Result<(), PresentError> {
+        if self.flip.is_none() {
+            return Err(PresentError::Failed("no page flipping"));
+        }
+        self.flush();
+        if !self.flip_settled() {
+            return Err(PresentError::Busy);
+        }
+        let f = self.flip.as_mut().unwrap();
+        let front = f.front;
+        f.scanout.flip(front).map_err(PresentError::Failed)?;
+        f.pending = true;
+        Ok(())
     }
 
     /// Limpia toda la pantalla con el color especificado
@@ -677,6 +715,11 @@ impl Framebuffer {
     /// out any of this, and every cost here is proportional to it.
     pub fn stride(&self) -> usize {
         self.stride
+    }
+
+    /// Whether a display driver flips between two VRAM buffers (`gpu=scanout`): what `present_external` needs.
+    pub fn page_flipping(&self) -> bool {
+        self.flip.is_some()
     }
 
     pub fn bytes_per_pixel(&self) -> usize {

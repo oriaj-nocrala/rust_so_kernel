@@ -50,6 +50,11 @@ pub const IOC_SYNC_SIGNAL: u32 = ioc(13, size_of::<SyncSignal>());
 pub const IOC_SYNC_WAIT: u32 = ioc(14, size_of::<SyncWait>());
 pub const IOC_SYNC_QUERY: u32 = ioc(15, size_of::<SyncQuery>());
 pub const IOC_TIMESTAMP: u32 = ioc(16, size_of::<Timestamp>());
+pub const IOC_SCANOUT_INFO: u32 = ioc(17, size_of::<ScanoutInfo>());
+pub const IOC_PRESENT: u32 = ioc(18, size_of::<Present>());
+
+/// `NVG_SCANOUT_XRGB8888`.
+pub const SCANOUT_XRGB8888: u32 = 0;
 
 /// `struct nvg_info`.
 #[repr(C)]
@@ -81,6 +86,27 @@ pub struct Info {
     pub va_end: u64,
     pub device_name: [u8; 64],
     pub chipset_name: [u8; 16],
+}
+
+/// `struct nvg_scanout_info`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ScanoutInfo {
+    pub width: u32,
+    pub height: u32,
+    pub pitch_b: u32,
+    pub format: u32,
+    pub size_b: u64,
+    pub flags: u64,
+}
+
+/// `struct nvg_present`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Present {
+    pub handle: u32,
+    pub flags: u32,
+    pub offset: u64,
 }
 
 /// `struct nvg_bo_create`.
@@ -265,6 +291,13 @@ mod tests {
         assert_eq!(size_of::<SyncWait>(), 24, "nvg_sync_wait");
         assert_eq!(size_of::<SyncQuery>(), 24, "nvg_sync_query");
         assert_eq!(size_of::<Timestamp>(), 8, "nvg_timestamp");
+        assert_eq!(size_of::<ScanoutInfo>(), 32, "nvg_scanout_info");
+        assert_eq!(size_of::<Present>(), 16, "nvg_present");
+        assert_eq!(offset_of!(ScanoutInfo, pitch_b), 8, "nvg_scanout_info.pitch_B");
+        assert_eq!(offset_of!(ScanoutInfo, format), 12, "nvg_scanout_info.format");
+        assert_eq!(offset_of!(ScanoutInfo, size_b), 16, "nvg_scanout_info.size_B");
+        assert_eq!(offset_of!(ScanoutInfo, flags), 24, "nvg_scanout_info.flags");
+        assert_eq!(offset_of!(Present, offset), 8, "nvg_present.offset");
         assert_eq!(offset_of!(Info, abi_version), 0, "nvg_info.abi_version");
         assert_eq!(offset_of!(Info, flags), 4, "nvg_info.flags");
         assert_eq!(offset_of!(Info, device_id), 8, "nvg_info.device_id");
@@ -329,6 +362,8 @@ mod tests {
         assert_eq!(IOC_SYNC_WAIT, 0xc0184e0e, "NVG_IOC_SYNC_WAIT");
         assert_eq!(IOC_SYNC_QUERY, 0xc0184e0f, "NVG_IOC_SYNC_QUERY");
         assert_eq!(IOC_TIMESTAMP, 0xc0084e10, "NVG_IOC_TIMESTAMP");
+        assert_eq!(IOC_SCANOUT_INFO, 0xc0204e11, "NVG_IOC_SCANOUT_INFO");
+        assert_eq!(IOC_PRESENT, 0xc0104e12, "NVG_IOC_PRESENT");
     }
 
     #[test]
@@ -337,7 +372,7 @@ mod tests {
             size_of::<Info>(), size_of::<BoCreate>(), size_of::<BoFree>(), size_of::<VaAlloc>(), size_of::<VaFree>(),
             size_of::<VaBind>(), size_of::<VaUnbind>(), size_of::<CtxCreate>(), size_of::<CtxDestroy>(), size_of::<Push>(),
             size_of::<SyncRef>(), size_of::<Exec>(), size_of::<SyncCreate>(), size_of::<SyncDestroy>(), size_of::<SyncSignal>(),
-            size_of::<SyncWait>(), size_of::<SyncQuery>(), size_of::<Timestamp>(),
+            size_of::<SyncWait>(), size_of::<SyncQuery>(), size_of::<Timestamp>(), size_of::<ScanoutInfo>(), size_of::<Present>(),
         ] {
             assert_eq!(s % 8, 0);
         }
@@ -348,7 +383,7 @@ mod tests {
         let all = [
             IOC_INFO, IOC_BO_CREATE, IOC_BO_FREE, IOC_VA_ALLOC, IOC_VA_FREE, IOC_VA_BIND, IOC_VA_UNBIND, IOC_CTX_CREATE,
             IOC_CTX_DESTROY, IOC_EXEC, IOC_SYNC_CREATE, IOC_SYNC_DESTROY, IOC_SYNC_SIGNAL, IOC_SYNC_WAIT, IOC_SYNC_QUERY,
-            IOC_TIMESTAMP,
+            IOC_TIMESTAMP, IOC_SCANOUT_INFO, IOC_PRESENT,
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {

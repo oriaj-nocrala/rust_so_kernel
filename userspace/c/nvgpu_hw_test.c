@@ -540,6 +540,35 @@ int main(int argc, char **argv) {
       }
    }
 
+   // ---- 4d. the screen: SCANOUT_INFO and the refusals of PRESENT (the real thing, with a rendered buffer, is vk_draw's)
+   {
+      struct nvg_scanout_info si;
+      memset(&si, 0, sizeof si);
+      int sr = call(NVG_IOC_SCANOUT_INFO, &si);
+      if (hw) {
+         CHECK(sr == 0 && si.width >= 640 && si.height >= 480 && si.pitch_B >= si.width * 4 && si.size_B == (uint64_t)si.pitch_B * si.height && si.format == NVG_SCANOUT_XRGB8888,
+               "the display is %ux%u, pitch %u, %llu bytes (%d)", si.width, si.height, si.pitch_B, (unsigned long long)si.size_B, sr);
+      } else {
+         CHECK(sr < 0 && errno == ENODEV, "no display behind the software device (ENODEV)");
+      }
+      uint32_t big = bo_create(si.size_B ? si.size_B : 4096, NVG_BO_VRAM, NULL), small = bo_create(4096, NVG_BO_VRAM, NULL), sys = bo_create(4096, NVG_BO_SYSTEM, NULL);
+      struct nvg_present pr = { .handle = small, .offset = 0 };
+      int err_small = call(NVG_IOC_PRESENT, &pr) < 0 ? errno : 0;
+      pr = (struct nvg_present){ .handle = sys, .offset = 0 };
+      int err_sys = call(NVG_IOC_PRESENT, &pr) < 0 ? errno : 0;
+      pr = (struct nvg_present){ .handle = big, .offset = 8 };
+      int err_align = call(NVG_IOC_PRESENT, &pr) < 0 ? errno : 0;
+      pr = (struct nvg_present){ .handle = big, .flags = 1, .offset = 0 };
+      int err_flags = call(NVG_IOC_PRESENT, &pr) < 0 ? errno : 0;
+      pr = (struct nvg_present){ .handle = 0xdead, .offset = 0 };
+      int err_none = call(NVG_IOC_PRESENT, &pr) < 0 ? errno : 0;
+      int want = hw ? EINVAL : ENODEV;
+      CHECK(big && small && sys, "buffers for the PRESENT refusals");
+      CHECK(err_small == want && err_sys == want && err_align == want && err_flags == want && err_none == want,
+            "PRESENT refuses a buffer smaller than the screen (%d), a system BO (%d), a misaligned offset (%d), flags (%d) and an unknown handle (%d): all %d",
+            err_small, err_sys, err_align, err_flags, err_none, want);
+   }
+
    // ---- 5. the device is handed back: close, reopen, and a holder that dies with work in flight
    uint64_t before_vram = 0;
    {
@@ -547,7 +576,7 @@ int main(int argc, char **argv) {
       call(NVG_IOC_INFO, &i2);
       before_vram = i2.vram_used_B;
    }
-   CHECK(before_vram == 4 * 4096, "VRAM in use before closing: %llu (four pages: the read-back page, the copy page, X and Y)", (unsigned long long)before_vram);
+   CHECK(before_vram >= 4 * 4096, "VRAM in use before closing: %llu (at least four pages: the read-back page, the copy page, X and Y; the screen test adds more)", (unsigned long long)before_vram);
    close(fd);
    fd = open("/dev/nvgpu", O_RDWR);
    CHECK(fd >= 0, "the device opens again after a close");

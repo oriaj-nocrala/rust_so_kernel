@@ -208,4 +208,32 @@ struct nvg_timestamp {
 };
 #define NVG_IOC_TIMESTAMP NVG_IOC(16, sizeof(struct nvg_timestamp))
 
+/* ---- the screen -------------------------------------------------------------------------------------------------------------- */
+
+#define NVG_SCANOUT_XRGB8888 0u   /* bytes B, G, R, X: what VK_FORMAT_B8G8R8A8_UNORM writes */
+
+/* What the display scans out: a linear surface of `height` rows of `pitch_B` bytes (at least `width` pixels of 4 bytes). A buffer to present must
+ * hold `size_B` bytes from its offset, in VRAM. -ENODEV when there is no display driver (the software device, or `gpu=scanout` off). */
+struct nvg_scanout_info {
+   uint32_t width;
+   uint32_t height;
+   uint32_t pitch_B;
+   uint32_t format;           /* NVG_SCANOUT_* */
+   uint64_t size_B;           /* pitch_B * height */
+   uint64_t flags;            /* 0 */
+};
+#define NVG_IOC_SCANOUT_INFO NVG_IOC(17, sizeof(struct nvg_scanout_info))
+
+/* Show a VRAM buffer object on the screen from the next vblank on, with no copy: the display engine scans it out where it is. The buffer is laid
+ * out as NVG_IOC_SCANOUT_INFO says (render, copy the image into it with `bufferRowLength = pitch_B / 4`). `offset` is a multiple of 256 and
+ * `offset + size_B` must lie inside the BO. -EBUSY if the previous flip has not taken effect yet (try again after a vblank); -EINVAL for a BO that is
+ * not VRAM or a range that does not fit. The buffer stays on screen until another present or until the device is closed, which puts the
+ * console's own picture back: do not free the BO while it is shown. */
+struct nvg_present {
+   uint32_t handle;
+   uint32_t flags;            /* 0 */
+   uint64_t offset;
+};
+#define NVG_IOC_PRESENT NVG_IOC(18, sizeof(struct nvg_present))
+
 #endif /* NVGPU_UAPI_H */

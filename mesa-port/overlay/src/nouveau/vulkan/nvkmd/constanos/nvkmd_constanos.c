@@ -17,6 +17,7 @@
 #include "nvkmd_constanos.h"
 
 #include "nvk_device.h"
+#include "nvk_device_memory.h"
 
 #include "vk_alloc.h"
 #include "vk_log.h"
@@ -1068,4 +1069,28 @@ nvkmd_constanos_create_ctx(struct nvkmd_dev *_dev, struct vk_object_base *log_ob
 
    *ctx_out = &ctx->base;
    return VK_SUCCESS;
+}
+
+/* ---- constanos extension (not Vulkan): putting a VRAM buffer on the screen ----------------------------------------------------------- */
+
+/* What the display scans out; 0 or a negative errno. */
+int
+nvk_constanos_scanout_info(VkDevice _device, struct nvg_scanout_info *out)
+{
+   VK_FROM_HANDLE(nvk_device, dev, _device);
+   struct nvkmd_constanos_dev *cdev = nvkmd_constanos_dev(dev->nvkmd);
+   return constanos_ioctl(cdev->fd, NVG_IOC_SCANOUT_INFO, out);
+}
+
+/* Show `memory` (a device-local allocation) at byte `offset` on the screen from the next vblank on, with no copy: the display engine scans
+ * it out where it is. 0, -EBUSY (the previous flip has not taken effect: retry after a vblank) or another negative errno. */
+int
+nvk_constanos_present(VkDevice _device, VkDeviceMemory _memory, uint64_t offset)
+{
+   VK_FROM_HANDLE(nvk_device, dev, _device);
+   VK_FROM_HANDLE(nvk_device_memory, memory, _memory);
+   struct nvkmd_constanos_dev *cdev = nvkmd_constanos_dev(dev->nvkmd);
+   struct nvkmd_constanos_mem *mem = nvkmd_constanos_mem(memory->mem);
+   struct nvg_present p = { .handle = mem->handle, .offset = offset };
+   return constanos_ioctl(cdev->fd, NVG_IOC_PRESENT, &p);
 }

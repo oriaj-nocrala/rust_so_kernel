@@ -42,6 +42,11 @@ void abort(void) {
 
 extern PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance instance, const char *name);
 
+/* constanos extension of the statically linked NVK (mesa-port: nvkmd_constanos.c): the screen. */
+struct nvg_scanout_info { uint32_t width, height, pitch_B, format; uint64_t size_B, flags; };
+extern int nvk_constanos_scanout_info(VkDevice device, struct nvg_scanout_info *out);
+extern int nvk_constanos_present(VkDevice device, VkDeviceMemory memory, uint64_t offset);
+
 static int failures;
 #define CHECK(cond, ...) do { if (cond) printf("VK ok   %s\n", #cond); else { failures++; printf("VK FAIL %s (line %d): ", #cond, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 #define VKOK(call) do { VkResult r_ = (call); if (r_ != VK_SUCCESS) { failures++; printf("VK FAIL %s -> %d (line %d)\n", #call, (int)r_, __LINE__); goto done; } else printf("VK ok   %s\n", #call); } while (0)
@@ -88,6 +93,13 @@ int main(void) {
    VkShaderModule vmod2 = VK_NULL_HANDLE, fmod2 = VK_NULL_HANDLE;
    VkPipelineLayout pl2 = VK_NULL_HANDLE;
    VkPipeline pipe2 = VK_NULL_HANDLE;
+   VkImage image3 = VK_NULL_HANDLE;
+   VkDeviceMemory imem3 = VK_NULL_HANDLE, smem[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+   VkImageView view3 = VK_NULL_HANDLE;
+   VkBuffer sbuf[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+   VkShaderModule vmod3 = VK_NULL_HANDLE, fmod3 = VK_NULL_HANDLE;
+   VkPipelineLayout pl3 = VK_NULL_HANDLE;
+   VkPipeline pipe3 = VK_NULL_HANDLE;
 
    GLOBAL(vkCreateInstance);
    if (!vkCreateInstance) return 1;
@@ -369,11 +381,124 @@ int main(void) {
       VKOK(vkDeviceWaitIdle(device));
    }
 
+   // ---- G4e zero-copy scanout: VK_DRAW_SCANOUT=<seconds>. The triangle is rendered at the screen's size into an image, copied by the GPU into a
+   // device-local buffer laid out as the display scans out (pitch from the kernel), and that buffer is put on the screen with NO copy by the CPU
+   // or the kernel: the display engine is pointed at it (nvk_constanos_present). Two buffers: one is drawn while the other is on screen.
+   if (getenv("VK_DRAW_SCANOUT") && executed) {
+      double seconds = atof(getenv("VK_DRAW_SCANOUT"));
+      struct nvg_scanout_info si;
+      int sr = nvk_constanos_scanout_info(device, &si);
+      CHECK(sr == 0, "the display's layout (%d)", sr);
+      if (sr != 0) goto done;
+      printf("VK scanout: %ux%u, pitch %u bytes, format %u, %llu bytes\n", si.width, si.height, si.pitch_B, si.format, (unsigned long long)si.size_B);
+      const uint32_t SW = si.width, SH = si.height;
+      imci.extent = (VkExtent3D){ SW, SH, 1 };
+      VKOK(vkCreateImage(device, &imci, NULL, &image3));
+      vkGetImageMemoryRequirements(device, image3, &req);
+      mai.allocationSize = req.size;
+      mai.memoryTypeIndex = it;
+      VKOK(vkAllocateMemory(device, &mai, NULL, &imem3));
+      VKOK(vkBindImageMemory(device, image3, imem3, 0));
+      ivci.image = image3;
+      VKOK(vkCreateImageView(device, &ivci, NULL, &view3));
+      // the two display buffers: device-local, not host-visible (VRAM), the size the display scans out
+      VkBufferCreateInfo sbci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = si.size_B, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+      for (int k = 0; k < 2; k++) {
+         VKOK(vkCreateBuffer(device, &sbci, NULL, &sbuf[k]));
+         vkGetBufferMemoryRequirements(device, sbuf[k], &req);
+         mai.allocationSize = req.size;
+         mai.memoryTypeIndex = it;
+         VKOK(vkAllocateMemory(device, &mai, NULL, &smem[k]));
+         VKOK(vkBindBufferMemory(device, sbuf[k], smem[k], 0));
+      }
+      VkShaderModuleCreateInfo tvs = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = tri_vert_spv_len, .pCode = (const uint32_t *)tri_vert_spv };
+      VkShaderModuleCreateInfo tfs = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = tri_frag_spv_len, .pCode = (const uint32_t *)tri_frag_spv };
+      VKOK(vkCreateShaderModule(device, &tvs, NULL, &vmod3));
+      VKOK(vkCreateShaderModule(device, &tfs, NULL, &fmod3));
+      VkPushConstantRange pcr = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32 };
+      VkPipelineLayoutCreateInfo plci3 = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
+      VKOK(vkCreatePipelineLayout(device, &plci3, NULL, &pl3));
+      stages[0].module = vmod3;
+      stages[1].module = fmod3;
+      gpci.layout = pl3;
+      VKOK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gpci, NULL, &pipe3));
+      VkCommandBuffer cmd3;
+      VKOK(vkAllocateCommandBuffers(device, &cbai, &cmd3));
+      VkFence fence3;
+      VKOK(vkCreateFence(device, &fci, NULL, &fence3));
+      PFN_vkResetFences vkResetFences = (PFN_vkResetFences)vkGetDeviceProcAddr(device, "vkResetFences");
+      PFN_vkResetCommandBuffer vkResetCommandBuffer = (PFN_vkResetCommandBuffer)vkGetDeviceProcAddr(device, "vkResetCommandBuffer");
+      PFN_vkCmdPushConstants vkCmdPushConstants = (PFN_vkCmdPushConstants)vkGetDeviceProcAddr(device, "vkCmdPushConstants");
+      VkImageMemoryBarrier b1 = to_color, b2 = to_src;
+      b1.image = b2.image = image3;
+      VkRenderingAttachmentInfo ca3 = ca;
+      ca3.imageView = view3;
+      ca3.clearValue.color.float32[0] = 0.02f; ca3.clearValue.color.float32[1] = 0.05f; ca3.clearValue.color.float32[2] = 0.12f; ca3.clearValue.color.float32[3] = 1.0f;
+      VkRenderingInfo ri3 = ri;
+      ri3.renderArea.extent = (VkExtent2D){ SW, SH };
+      ri3.pColorAttachments = &ca3;
+      VkViewport vp3 = { 0, 0, SW, SH, 0.0f, 1.0f };
+      VkRect2D sc3 = { { 0, 0 }, { SW, SH } };
+      // the buffer's rows are `pitch` bytes apart: bufferRowLength is in texels
+      VkBufferImageCopy reg3 = { .bufferRowLength = si.pitch_B / 4, .bufferImageHeight = SH, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { SW, SH, 1 } };
+      struct timespec t0, t1;
+      clock_gettime(CLOCK_MONOTONIC, &t0);
+      unsigned frames = 0, busy = 0, shown = 0;
+      int frame_ok = 1, present_ok = 1;
+      for (;;) {
+         clock_gettime(CLOCK_MONOTONIC, &t1);
+         double el = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+         if (el >= seconds && frames > 0) break;
+         int k = frames & 1;
+         float angle = (float)el * 1.5f;
+         float pc[8] = { angle, (float)SW / (float)SH, 0, 0, 0.5f + 0.5f * sinf(angle), 0.5f + 0.5f * sinf(angle + 2.1f), 0.5f + 0.5f * sinf(angle + 4.2f), 1.0f };
+         vkResetCommandBuffer(cmd3, 0);
+         vkBeginCommandBuffer(cmd3, &bbi);
+         vkCmdPipelineBarrier(cmd3, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &b1);
+         vkCmdBeginRendering(cmd3, &ri3);
+         vkCmdSetViewport(cmd3, 0, 1, &vp3);
+         vkCmdSetScissor(cmd3, 0, 1, &sc3);
+         vkCmdBindPipeline(cmd3, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe3);
+         vkCmdPushConstants(cmd3, pl3, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, pc);
+         vkCmdDraw(cmd3, 3, 1, 0, 0);
+         vkCmdEndRendering(cmd3);
+         vkCmdPipelineBarrier(cmd3, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b2);
+         vkCmdCopyImageToBuffer(cmd3, image3, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sbuf[k], 1, &reg3);
+         vkEndCommandBuffer(cmd3);
+         vkResetFences(device, 1, &fence3);
+         VkSubmitInfo si3 = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd3 };
+         if (vkQueueSubmit(queue, 1, &si3, fence3) != VK_SUCCESS || vkWaitForFences(device, 1, &fence3, VK_TRUE, 10000000000ull) != VK_SUCCESS) { frame_ok = 0; break; }
+         // the picture is in VRAM: point the display at it (a flip is pending until the next vblank: retry while the kernel says EBUSY)
+         int pr;
+         int tries = 0;
+         while ((pr = nvk_constanos_present(device, smem[k], 0)) == -16 /* EBUSY */ && tries++ < 100) { busy++; usleep(1000); }
+         if (pr != 0) { present_ok = 0; printf("VK scanout: PRESENT failed (%d) at frame %u\n", pr, frames); break; }
+         shown++;
+         frames++;
+         usleep(17000);   // the flip lands at the next vblank; the other buffer is free to draw into once it has
+      }
+      CHECK(frame_ok, "every frame rendered and fenced");
+      CHECK(present_ok && shown == frames, "every frame was put on the screen (%u of %u)", shown, frames);
+      printf("VK scanout: %u frames shown in %.1f s, %u EBUSY retries\n", frames, seconds, busy);
+      VKOK(vkDeviceWaitIdle(device));
+   }
+
 done:
    if (device) {
       PFN_vkDeviceWaitIdle wi = (PFN_vkDeviceWaitIdle)vkGetDeviceProcAddr(device, "vkDeviceWaitIdle");
       if (wi) wi(device);
 #define GONE(handle, fn) do { PFN_##fn f_ = (PFN_##fn)vkGetDeviceProcAddr(device, #fn); if (handle && f_) f_(device, handle, NULL); } while (0)
+      GONE(pipe3, vkDestroyPipeline);
+      GONE(pl3, vkDestroyPipelineLayout);
+      GONE(fmod3, vkDestroyShaderModule);
+      GONE(vmod3, vkDestroyShaderModule);
+      GONE(sbuf[0], vkDestroyBuffer);
+      GONE(sbuf[1], vkDestroyBuffer);
+      GONE(view3, vkDestroyImageView);
+      GONE(image3, vkDestroyImage);
+      GONE(smem[0], vkFreeMemory);
+      GONE(smem[1], vkFreeMemory);
+      GONE(imem3, vkFreeMemory);
       GONE(pipe2, vkDestroyPipeline);
       GONE(pl2, vkDestroyPipelineLayout);
       GONE(fmod2, vkDestroyShaderModule);

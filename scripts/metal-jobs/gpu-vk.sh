@@ -116,6 +116,21 @@ grep -E 'VK present|FAIL|ASSERT|DRAW DONE' /tmp/vk_present.out | while read -r l
 grep -q 'VK present: [0-9]* frames' /tmp/vk_present.out || { sum "gpu-vk: no frames were presented"; fail=1; }
 sum "gpu-vk: after the presentation: $(grep '^gpu_uapi:' /proc/kdebug)"
 
+# G4e zero-copy scanout: the same triangle rendered at the screen's size into a VRAM buffer laid out as the display scans out, and the display engine
+# pointed at that buffer (NVG_IOC_PRESENT, no copy by the CPU or the kernel), 20 s. Two buffers, one drawn while the other is on screen. The kernel puts the
+# console's picture back when the program ends.
+f0=$(grep '^gpu_flip:' /proc/kdebug)
+VK_DRAW_SCANOUT=20 VK_PROBE_REQUIRE_EXEC=1 NVK_CONSTANOS_DEBUG=1 /mnt/bin/vk_draw > /tmp/vk_scanout.out 2>&1
+src=$?
+grep -E 'VK scanout|FAIL|ASSERT|DRAW DONE' /tmp/vk_scanout.out | while read -r l; do sum "gpu-vk: scanout: $l"; done
+[ $src = 0 ] || { sum "gpu-vk: the scanout run exit=$src"; fail=1; tail -n 20 /tmp/vk_scanout.out >> /tmp/gpu-vk.sum; }
+grep -q 'VK scanout: [0-9]* frames shown' /tmp/vk_scanout.out || { sum "gpu-vk: no frames were put on the screen"; fail=1; }
+f1=$(grep '^gpu_flip:' /proc/kdebug)
+sum "gpu-vk: flips before: $f0"
+sum "gpu-vk: flips after: $f1"
+[ "$(field "$f1" external)" -gt 0 ] 2>/dev/null || { sum "gpu-vk: no flip to an external buffer was submitted"; fail=1; }
+[ "$(field "$f1" refused)" = 0 ] || { sum "gpu-vk: the display refused flips (refused=$(field "$f1" refused))"; fail=1; }
+
 # G4e robustness, the very last thing (it kills one GPU channel on purpose): a launch whose program is an unbound VA, on one of two contexts.
 # RM must tell us (RC_TRIGGERED, naming the channel) and the kernel must declare that channel dead within tens of ms, wake its waiter and answer the
 # next EXEC on it with EIO; the other context and a new one must go on running, and the device as a whole must not be dead; RM must live on.

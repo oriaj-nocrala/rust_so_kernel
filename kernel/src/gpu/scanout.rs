@@ -46,6 +46,8 @@ const BUF_MAX: u64 = 16 << 20;
 const W0: Chan = evo::window(0);
 
 static SUBMITTED: AtomicU64 = AtomicU64::new(0);
+/// Flips to an external buffer (`/dev/nvgpu` `PRESENT`).
+static EXTERNAL: AtomicU64 = AtomicU64::new(0);
 static LATCHED: AtomicU64 = AtomicU64::new(0);
 /// `flip_done` answered "not yet" (a caller got `Busy`).
 static NOT_YET: AtomicU64 = AtomicU64::new(0);
@@ -69,8 +71,9 @@ pub fn render_kdebug() -> String {
     }
     let latched = LATCHED.load(Ordering::Relaxed);
     alloc::format!(
-        "gpu_flip: submitted={} latched={} not_yet={} refused={} shown={} latency_us last={} max={} avg={} vblanks_per_flip sum={} max={}",
+        "gpu_flip: submitted={} external={} latched={} not_yet={} refused={} shown={} latency_us last={} max={} avg={} vblanks_per_flip sum={} max={}",
         SUBMITTED.load(Ordering::Relaxed),
+        EXTERNAL.load(Ordering::Relaxed),
         latched,
         NOT_YET.load(Ordering::Relaxed),
         REFUSED.load(Ordering::Relaxed),
@@ -106,6 +109,31 @@ impl crate::framebuffer::Scanout for GpuScanout {
                 self.kick_ns = crate::time::ktime_get();
                 self.kick_seq = super::vblank::seq();
                 SUBMITTED.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                REFUSED.fetch_add(1, Ordering::Relaxed);
+                Err(match e {
+                    FlipError::Busy { .. } => "window 0 has not fetched the previous push",
+                    FlipError::Misaligned { .. } => "misaligned surface",
+                    FlipError::Chan(_) => "window 0 channel stalled",
+                })
+            }
+        }
+    }
+
+    fn flip_external(&mut self, vram: u64) -> Result<(), &'static str> {
+        let mut push = Push::new(self.mem, self.put);
+        let res = evo::flip(&self.regs, W0, &mut push, vram);
+        self.put = push.put_bytes();
+        match res {
+            Ok(origin) => {
+                // buffer index 2: "an external one" (`SHOWN` says so)
+                self.requested = Some((origin, 2));
+                self.kick_ns = crate::time::ktime_get();
+                self.kick_seq = super::vblank::seq();
+                SUBMITTED.fetch_add(1, Ordering::Relaxed);
+                EXTERNAL.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
             Err(e) => {

@@ -720,6 +720,17 @@ impl<B: Backend> Device<B> {
         quiet
     }
 
+    /// The VRAM heap offset and size of a live BO that lives in VRAM (what `PRESENT` scans out); `None` for a system BO, a freed or unknown handle.
+    pub fn vram_bo(&self, handle: u32) -> Option<(u64, u64)> {
+        match self.bos.get(&handle) {
+            Some(b) if !b.closed => match b.backing {
+                Backing::Vram { vram_off } => Some((vram_off, b.size)),
+                Backing::System { .. } => None,
+            },
+            _ => None,
+        }
+    }
+
     pub fn layout(&self) -> Layout {
         self.layout
     }
@@ -1378,5 +1389,19 @@ mod tests {
         }
         d.va_unbind(va, pages * PAGE).unwrap();
         assert!(d.backend.bound.is_empty());
+    }
+
+    #[test]
+    fn a_vram_bo_says_where_it_is_and_a_system_one_does_not() {
+        let mut d = Device::new(SoftBackend::default(), layout());
+        let (v, _, vs) = d.bo_create(0x5000, BO_VRAM).unwrap();
+        let (s, _, _) = d.bo_create(0x1000, BO_SYSTEM).unwrap();
+        let (off, size) = d.vram_bo(v).unwrap();
+        assert_eq!(size, vs);
+        assert_eq!(off % PAGE, 0);
+        assert_eq!(d.vram_bo(s), None);
+        assert_eq!(d.vram_bo(0xdead), None);
+        d.bo_free(v).unwrap();
+        assert_eq!(d.vram_bo(v), None);
     }
 }

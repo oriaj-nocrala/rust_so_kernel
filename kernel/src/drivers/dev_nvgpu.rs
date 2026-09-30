@@ -124,10 +124,35 @@ struct Session {
     dev: crate::sync::Mutex<Device<KernelBackend>>,
     arena: Arc<ShmObject>,
     hw: bool,
+    /// A buffer of this session is (or was) on the screen: closing the device flips the console's picture back.
+    presented: AtomicBool,
+}
+
+/// What the display scans out, if a driver flips buffers (`gpu=scanout`).
+fn scanout_info() -> Option<uapi::ScanoutInfo> {
+    let g = crate::framebuffer::FRAMEBUFFER.lock();
+    let fb = g.as_ref().filter(|fb| fb.page_flipping() && fb.bytes_per_pixel() == 4)?;
+    let (w, h) = fb.dimensions();
+    let pitch = (fb.stride() * 4) as u32;
+    Some(uapi::ScanoutInfo { width: w as u32, height: h as u32, pitch_b: pitch, format: uapi::SCANOUT_XRGB8888, size_b: pitch as u64 * h as u64, flags: 0 })
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if self.presented.load(Ordering::SeqCst) {
+            // the console's picture back (the flip of an earlier present may still be pending: a vblank or two)
+            let t0 = crate::cpu::tsc::read();
+            loop {
+                let r = crate::framebuffer::FRAMEBUFFER.lock().as_mut().map(|fb| fb.restore_front());
+                match r {
+                    Some(Err(crate::framebuffer::PresentError::Busy)) if crate::cpu::tsc::read().wrapping_sub(t0) < crate::cpu::tsc::freq_hz() / 5 => {
+                        crate::memory::tlb::service_pending();
+                        core::hint::spin_loop();
+                    }
+                    _ => break,
+                }
+            }
+        }
         let quiet = self.dev.lock().teardown();
         if !quiet {
             // the GPU did not go idle: it may still be writing into the arena's pages, so they are never freed
@@ -159,7 +184,7 @@ pub fn open() -> Result<Box<dyn FileHandle>, Errno> {
     let layout = Layout { arena_bytes: ARENA_BYTES, vram_bytes: if hw { HW_VRAM_BYTES } else { SOFT_VRAM_BYTES }, va_start: VA_START, va_end: VA_END };
     let backend = KernelBackend { soft: SoftBackend::default(), arena: arena.clone(), hw, kinds: Default::default() };
     let dev = Device::new(backend, layout);
-    Ok(Box::new(NvgpuHandle { session: Arc::new(Session { dev: crate::sync::Mutex::new(dev), arena, hw }) }))
+    Ok(Box::new(NvgpuHandle { session: Arc::new(Session { dev: crate::sync::Mutex::new(dev), arena, hw, presented: AtomicBool::new(false) }) }))
 }
 
 // ---- user memory ----------------------------------------------------------------------------------------------------------
@@ -356,6 +381,34 @@ impl NvgpuHandle {
                 let mut r: uapi::SyncQuery = read_user(arg)?;
                 (r.value, r.pending) = dev.sync_query(r.handle).map_err(errno_of)?;
                 write_user(arg, r)?;
+            }
+            uapi::IOC_SCANOUT_INFO => {
+                if !self.session.hw {
+                    return Err(errno::ENODEV);
+                }
+                write_user(arg, scanout_info().ok_or(errno::ENODEV)?)?;
+            }
+            uapi::IOC_PRESENT => {
+                let r: uapi::Present = read_user(arg)?;
+                if !self.session.hw {
+                    return Err(errno::ENODEV);
+                }
+                if r.flags != 0 {
+                    return Err(errno::EINVAL);
+                }
+                let si = scanout_info().ok_or(errno::ENODEV)?;
+                let (vram_off, size) = dev.vram_bo(r.handle).ok_or(errno::EINVAL)?;
+                if r.offset % 256 != 0 || r.offset.checked_add(si.size_b).is_none_or(|e| e > size) {
+                    return Err(errno::EINVAL);
+                }
+                let pa = nvgpu::hwq::user_vram_pa(vram_off) + r.offset;
+                let res = crate::framebuffer::FRAMEBUFFER.lock().as_mut().map(|fb| fb.present_external(pa));
+                match res {
+                    Some(Ok(())) => self.session.presented.store(true, Ordering::SeqCst),
+                    Some(Err(crate::framebuffer::PresentError::Busy)) => return Err(errno::EBUSY),
+                    Some(Err(crate::framebuffer::PresentError::Failed(_))) => return Err(errno::EIO),
+                    None => return Err(errno::ENODEV),
+                }
             }
             uapi::IOC_TIMESTAMP => {
                 if self.session.hw {
