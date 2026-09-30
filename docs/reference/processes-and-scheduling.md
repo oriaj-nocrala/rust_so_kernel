@@ -96,3 +96,8 @@ Code: `kernel/src/process/` (`scheduler.rs`, `timer_preempt.rs`, `trapframe.rs`,
 - Load average: sampled on CPU 0 every 501 ticks; runnable = running + ready.
 - Consumers: `/proc/stat`, `/proc/loadavg`, `times`, `getrusage`, `sysinfo`, BusyBox `top`/`ps`/`uptime`, `cpumon`.
 - Test: `cputime_test`.
+
+## Fault entries (`init/devices.rs`)
+
+- #DE, #UD, #GP and #PF enter through `fault_entry!` asm stubs, not `x86-interrupt` shims: they build a full `TrapFrame` on the kernel stack (`xchg rax,[rsp]` turns the error-code slot into the `rax` slot; a fault without an error code gets a dummy first) and call `*_rust(tf, error_code)`. The pops and `iretq` resume whatever the frame holds, which is how a signal handler is run on the faulting context (`signal::deliver_fault`). A new stub must `cld`.
+- Kernel-mode faults panic as before. `kill_current_user_process(reason, sig)` records the signal that killed the process (`SIGSEGV`, `SIGILL`, `SIGFPE`).

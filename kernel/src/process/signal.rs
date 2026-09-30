@@ -9,7 +9,9 @@
 // `SA_RESTORER`, `SA_SIGINFO`, `SA_ONSTACK` (with `sigaltstack`),
 // `SA_NODEFER`, `SA_RESETHAND` and `sa_mask` are honoured. No real-time
 // signal queueing. Only signals sent to a process are delivered to
-// handlers: a hardware fault (page fault, #GP…) still kills it.
+// handlers, plus the hardware faults of user code (`deliver_fault`: SIGSEGV
+// for a page fault or #GP, SIGILL for #UD, SIGFPE for #DE) when a handler
+// can take them; without one the process is killed, as before.
 //
 // DELIVERY
 //
@@ -43,6 +45,8 @@ use crate::memory::signal_trampoline::TRAMPOLINE_VA;
 pub const SIGHUP: u32 = 1;
 pub const SIGINT: u32 = 2;
 pub const SIGQUIT: u32 = 3;
+pub const SIGILL: u32 = 4;
+pub const SIGFPE: u32 = 8;
 pub const SIGKILL: u32 = 9;
 pub const SIGUSR1: u32 = 10;
 pub const SIGSEGV: u32 = 11;
@@ -324,8 +328,12 @@ fn deliver_one(proc: &mut Process, tf: *mut TrapFrame) -> SignalOutcome {
             }
         }
         SignalAction::Handler(addr) => {
-            unsafe { push_signal_frame(proc, tf, sig, addr) };
-            SignalOutcome::Delivered
+            if unsafe { push_signal_frame(proc, tf, sig, addr, None) } {
+                SignalOutcome::Delivered
+            } else {
+                // No room for the frame: SIGSEGV, unconditionally, as Linux's force_sigsegv.
+                SignalOutcome::Terminate(SIGSEGV)
+            }
         }
     }
 }
@@ -429,7 +437,7 @@ fn tf_from_gregs(tf: &mut TrapFrame, g: &[u64]) {
 /// `tf` must point at a valid, live TrapFrame whose `rsp` is a valid user
 /// stack pointer in `proc`'s *currently active* address space (true at
 /// every call site — see module doc comment).
-unsafe fn push_signal_frame(proc: &mut Process, tf: *mut TrapFrame, sig: u32, handler_addr: u64) {
+unsafe fn push_signal_frame(proc: &mut Process, tf: *mut TrapFrame, sig: u32, handler_addr: u64, fault: Option<(i32, u64)>) -> bool {
     let old_tf = unsafe { core::ptr::read(tf) };
     let extra = proc.sig_extra[sig as usize];
 
@@ -466,9 +474,14 @@ unsafe fn push_signal_frame(proc: &mut Process, tf: *mut TrapFrame, sig: u32, ha
     uc[UC_GREGS..UC_GREGS + 23].copy_from_slice(&gregs_from_tf(&old_tf));
     uc[UC_SIGMASK] = mask_to_user(saved_mask);
 
-    // siginfo: si_signo, si_errno 0, si_code SI_USER, and a zero sender (not tracked).
+    // siginfo: si_signo, si_errno 0, then `si_code` and, for a fault, `si_addr`; otherwise SI_USER and a zero
+    // sender (not tracked).
     let mut info = [0u64; 16];
     info[0] = sig as u64;
+    if let Some((code, addr)) = fault {
+        info[1] = code as u32 as u64;
+        info[2] = addr;
+    }
 
     let frame = RtFrame { uc, info, private: SignalFrame { fpu, saved_tf: old_tf } };
 
@@ -478,7 +491,11 @@ unsafe fn push_signal_frame(proc: &mut Process, tf: *mut TrapFrame, sig: u32, ha
     // a fresh stack), or still be COW-shared. The fault handler would
     // resolve either, but this runs under the scheduler lock, where a
     // fault is best avoided.
-    proc.address_space.prepare_user_write(ret_slot, frame_size + 8);
+    // A stack that cannot take the frame (a stack overflow with no alternate stack, a wild `rsp`) is the one case where
+    // delivering is impossible: the caller kills the process, as Linux does.
+    if !proc.address_space.prepare_user_write(ret_slot, frame_size + 8) {
+        return false;
+    }
 
     crate::ktrace!(
         crate::debug::PROC,
@@ -512,6 +529,23 @@ unsafe fn push_signal_frame(proc: &mut Process, tf: *mut TrapFrame, sig: u32, ha
         proc.signal_handlers[sig as usize] = SignalAction::Default;
         proc.sig_extra[sig as usize] = SigExtra::NONE;
         proc.sig_restart &= !(1u64 << sig);
+    }
+    true
+}
+
+/// A hardware fault in user code (`init::devices`' entries): run the handler for `sig` with `si_code`/`si_addr`, if the process
+/// has one and has not blocked the signal (a fault inside a `SIGSEGV` handler finds it blocked and kills, as on Linux).
+/// Returns whether a frame was pushed; if not the caller kills the process.
+///
+/// # Safety
+/// As `push_signal_frame`: `tf` is the faulting user context, live and mapped in the active address space.
+pub unsafe fn deliver_fault(proc: &mut Process, tf: *mut TrapFrame, sig: u32, si_code: i32, addr: u64) -> bool {
+    if proc.blocked_signals & (1u64 << sig) != 0 {
+        return false;
+    }
+    match proc.signal_handlers[sig as usize] {
+        SignalAction::Handler(h) => unsafe { push_signal_frame(proc, tf, sig, h, Some((si_code, addr))) },
+        _ => false,
     }
 }
 

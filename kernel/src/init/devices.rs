@@ -14,6 +14,8 @@
 
 use spin::Once;
 
+use crate::process::TrapFrame;
+
 use crate::{
     framebuffer::{self, Color},
     interrupts::{
@@ -33,8 +35,10 @@ static IDT: Once<InterruptDescriptorTable> = Once::new();
 pub fn init_idt() {
     IDT.call_once(|| {
         let mut idt = InterruptDescriptorTable::new();
-        idt.add_handler(0, divide_by_zero_handler);
-        idt.add_handler(6, invalid_opcode_handler);
+        // Raw entries for the faults of user code (`fault_entry!`): they hand the Rust side a full TrapFrame, so a signal
+        // handler can be run on the faulting context.
+        idt.entries[0].set_handler_addr(divide_error_entry as u64);
+        idt.entries[6].set_handler_addr(invalid_opcode_entry as u64);
         // IST index is 1-based in the IDT entry.  TSS defines
         // DOUBLE_FAULT_IST_INDEX = 0 (array index), so CPU IST = 0 + 1 = 1.
         idt.add_double_fault_handler(
@@ -42,8 +46,8 @@ pub fn init_idt() {
             double_fault_handler,
             (crate::process::tss::DOUBLE_FAULT_IST_INDEX + 1) as u16,
         );
-        idt.add_handler_with_error(13, general_protection_fault_handler);
-        idt.add_handler_with_error(14, page_fault_handler);
+        idt.entries[13].set_handler_addr(general_protection_entry as u64);
+        idt.entries[14].set_handler_addr(page_fault_entry as u64);
         idt.entries[32].set_handler_addr(crate::process::timer_preempt::timer_interrupt_entry as u64);
         idt.add_handler(33, keyboard_interrupt_handler);
         idt.add_handler(36, serial_interrupt_handler);
@@ -230,20 +234,117 @@ extern "x86-interrupt" fn wake_ipi_handler(_: ExceptionStackFrame) {
     crate::interrupts::apic::eoi();
 }
 
-extern "x86-interrupt" fn divide_by_zero_handler(sf: ExceptionStackFrame) {
-    if sf.code_segment & 0x3 != 0 {
-        kill_current_user_process("DIVIDE BY ZERO");
-        // unreachable — kill_current_user_process diverges
-    }
-    panic!("DIVIDE BY ZERO at {:#x}", sf.instruction_pointer);
+/// A CPU exception entry that hands Rust the faulting context as a `TrapFrame`.
+///
+/// The CPU pushes `[err][rip][cs][rflags][rsp][ss]` (a fault without an error code gets a dummy 0 first, so both shapes are
+/// alike). `xchg` puts the error code in RAX and the caller's RAX in that slot, which then is the `rax` field of the
+/// `TrapFrame` the pushes below build: `[r15 … rbx][rax][rip][cs][rflags][rsp][ss]`. `$handler(frame, error_code)` may edit the
+/// frame (a signal handler is run by rewriting it); the pops and `iretq` resume whatever it holds. Interrupts stay off (an
+/// interrupt gate), as in the `x86-interrupt` shims this replaces, and `cld` is ours to do.
+macro_rules! fault_entry {
+    ($entry:literal, $handler:literal, error_code) => {
+        fault_entry!(@emit $entry, $handler, "");
+    };
+    ($entry:literal, $handler:literal, no_error_code) => {
+        fault_entry!(@emit $entry, $handler, "push 0");
+    };
+    (@emit $entry:literal, $handler:literal, $dummy:literal) => {
+        core::arch::global_asm!(
+            concat!(".global ", $entry),
+            concat!($entry, ":"),
+            $dummy,
+            "cld",
+            "xchg rax, [rsp]",
+            "push rbx",
+            "push rcx",
+            "push rdx",
+            "push rsi",
+            "push rdi",
+            "push rbp",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+            "mov rdi, rsp",
+            "mov rsi, rax",
+            concat!("call ", $handler),
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rbp",
+            "pop rdi",
+            "pop rsi",
+            "pop rdx",
+            "pop rcx",
+            "pop rbx",
+            "pop rax",
+            "iretq",
+        );
+    };
 }
 
-extern "x86-interrupt" fn invalid_opcode_handler(sf: ExceptionStackFrame) {
-    if sf.code_segment & 0x3 != 0 {
-        kill_current_user_process("INVALID OPCODE");
+fault_entry!("divide_error_entry", "divide_error_rust", no_error_code);
+fault_entry!("invalid_opcode_entry", "invalid_opcode_rust", no_error_code);
+fault_entry!("general_protection_entry", "general_protection_rust", error_code);
+fault_entry!("page_fault_entry", "page_fault_rust", error_code);
+
+extern "C" {
+    fn divide_error_entry();
+    fn invalid_opcode_entry();
+    fn general_protection_entry();
+    fn page_fault_entry();
+}
+
+const USER_CS: u64 = 0x23;
+
+/// A fault of user code that nothing resolves: run the process's handler for `sig` if it has one, else kill it. Kernel-mode
+/// faults never come here (they panic).
+fn user_fault(tf: &mut TrapFrame, sig: u32, si_code: i32, addr: u64, reason: &str) {
+    let delivered = {
+        let mut sched = crate::process::scheduler::local_scheduler();
+        match sched.running_mut() {
+            Some(proc) => unsafe { crate::process::signal::deliver_fault(proc, tf, sig, si_code, addr) },
+            None => false,
+        }
+    };
+    if !delivered {
+        kill_current_user_process(reason, sig);
         // unreachable — kill_current_user_process diverges
     }
-    panic!("INVALID OPCODE at {:#x}", sf.instruction_pointer);
+}
+
+// siginfo `si_code`s of a fault.
+const SEGV_MAPERR: i32 = 1;
+const SEGV_ACCERR: i32 = 2;
+const SI_KERNEL: i32 = 0x80;
+const ILL_ILLOPN: i32 = 2;
+const FPE_INTDIV: i32 = 1;
+
+#[no_mangle]
+extern "C" fn divide_error_rust(tf: &mut TrapFrame, _error_code: u64) {
+    if tf.cs == USER_CS {
+        user_fault(tf, crate::process::signal::SIGFPE, FPE_INTDIV, tf.rip, "DIVIDE BY ZERO");
+        return;
+    }
+    panic!("DIVIDE BY ZERO at {:#x}", tf.rip);
+}
+
+#[no_mangle]
+extern "C" fn invalid_opcode_rust(tf: &mut TrapFrame, _error_code: u64) {
+    if tf.cs == USER_CS {
+        user_fault(tf, crate::process::signal::SIGILL, ILL_ILLOPN, tf.rip, "INVALID OPCODE");
+        return;
+    }
+    panic!("INVALID OPCODE at {:#x}", tf.rip);
 }
 
 extern "x86-interrupt" fn double_fault_handler(
@@ -253,15 +354,13 @@ extern "x86-interrupt" fn double_fault_handler(
     panic!("DOUBLE FAULT (error: {}) at {:#x}", error_code, sf.instruction_pointer);
 }
 
-extern "x86-interrupt" fn general_protection_fault_handler(
-    sf: ExceptionStackFrame,
-    error_code: u64
-) {
-    if sf.code_segment & 0x3 != 0 {
-        kill_current_user_process("GENERAL PROTECTION FAULT");
-        // unreachable — kill_current_user_process diverges
+#[no_mangle]
+extern "C" fn general_protection_rust(tf: &mut TrapFrame, error_code: u64) {
+    if tf.cs == USER_CS {
+        user_fault(tf, crate::process::signal::SIGSEGV, SI_KERNEL, 0, "GENERAL PROTECTION FAULT");
+        return;
     }
-    panic!("GENERAL PROTECTION FAULT (error: {}) at {:#x}", error_code, sf.instruction_pointer);
+    panic!("GENERAL PROTECTION FAULT (error: {}) at {:#x}", error_code, tf.rip);
 }
 
 /// Page fault handler — bridges memory and process layers.
@@ -271,17 +370,14 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 ///   2. VMA lookup via scheduler
 ///   3. Map page via demand_paging::map_demand_page
 ///   4. On failure: kill user process OR panic (kernel fault)
-extern "x86-interrupt" fn page_fault_handler(
-    sf: ExceptionStackFrame,
-    error_code: u64
-) {
+#[no_mangle]
+extern "C" fn page_fault_rust(tf: &mut TrapFrame, error_code: u64) {
     use crate::memory::demand_paging;
 
     let fault_addr = demand_paging::read_cr2();
     let is_user = error_code & PF_USER != 0;
     let is_write = error_code & PF_WRITE != 0;
 
-    let _ = &sf; // (was "unreliable for user-mode PFs": that was the by-reference ABI bug, see idt.rs)
 
     // ── COW write fault: page present + write, no reserved bit ───
     //
@@ -325,7 +421,11 @@ extern "x86-interrupt" fn page_fault_handler(
             "⚠️  COW fault failed at {:#x} (error {:#b})",
             fault_addr, error_code
         );
-        kill_current_user_process("COW FAULT FAILED");
+        if is_user {
+            user_fault(tf, crate::process::signal::SIGSEGV, SEGV_ACCERR, fault_addr, "COW FAULT FAILED");
+            return;
+        }
+        kill_current_user_process("COW FAULT FAILED", crate::process::signal::SIGSEGV);
         // unreachable
     }
 
@@ -336,13 +436,14 @@ extern "x86-interrupt" fn page_fault_handler(
                 "⚠️  User page fault at {:#x} (error {:#b}): {}",
                 fault_addr, error_code, reason
             );
-            kill_current_user_process("PAGE FAULT (not demand-pageable)");
-            // unreachable — kill_current_user_process diverges
+            let code = if error_code & PF_PRESENT != 0 { SEGV_ACCERR } else { SEGV_MAPERR };
+            user_fault(tf, crate::process::signal::SIGSEGV, code, fault_addr, "PAGE FAULT (not demand-pageable)");
+            return;
         }
         let (cr3, _) = x86_64::registers::control::Cr3::read();
         panic!(
             "PAGE FAULT (kernel)\n  Address: {:#x}\n  Error: {:#b}\n  Reason: {}\n  RIP: {:#x}\n  CS: {:#x}\n  RSP: {:#x}\n  CR3: {:#x}\n  running PID: {}",
-            fault_addr, error_code, reason, sf.instruction_pointer, sf.code_segment, sf.stack_pointer,
+            fault_addr, error_code, reason, tf.rip, tf.cs, tf.rsp,
             cr3.start_address().as_u64(),
             crate::process::scheduler::current_pid_fast()
         );
@@ -363,15 +464,15 @@ extern "x86-interrupt" fn page_fault_handler(
                 serial_println!(
                     "⚠️  Segfault: PID {} accessed {:#x} (no VMA) at rip {:#x} (error {:#b})",
                     crate::process::scheduler::current_pid_fast(), fault_addr,
-                    sf.instruction_pointer, error_code
+                    tf.rip, error_code
                 );
-                dump_user_stack(sf.stack_pointer);
-                kill_current_user_process("SEGFAULT (no VMA for address)");
-                // unreachable — kill_current_user_process diverges
+                dump_user_stack(tf.rsp);
+                user_fault(tf, crate::process::signal::SIGSEGV, SEGV_MAPERR, fault_addr, "SEGFAULT (no VMA for address)");
+                return;
             }
             panic!(
                 "PAGE FAULT (kernel, no VMA)\n  Address: {:#x}\n  Error: {:#b}\n  RIP: {:#x}",
-                fault_addr, error_code, sf.instruction_pointer
+                fault_addr, error_code, tf.rip
             );
         }
         Err(crate::memory::address_space::FaultError::Failed(reason)) => {
@@ -380,12 +481,12 @@ extern "x86-interrupt" fn page_fault_handler(
                     "⚠️  Demand paging failed for PID {}: {} (addr {:#x})",
                     crate::process::scheduler::current_pid_fast(), reason, fault_addr
                 );
-                kill_current_user_process("DEMAND PAGING FAILED");
-                // unreachable — kill_current_user_process diverges
+                user_fault(tf, crate::process::signal::SIGSEGV, SEGV_ACCERR, fault_addr, "DEMAND PAGING FAILED");
+                return;
             }
             panic!(
                 "PAGE FAULT (kernel, map failed)\n  Address: {:#x}\n  Reason: {}\n  RIP: {:#x}",
-                fault_addr, reason, sf.instruction_pointer
+                fault_addr, reason, tf.rip
             );
         }
     }
@@ -462,7 +563,7 @@ fn dump_user_stack(rsp: u64) {
     }
 }
 
-fn kill_current_user_process(reason: &str) -> ! {
+fn kill_current_user_process(reason: &str, sig: u32) -> ! {
     let tf_ptr = {
         let mut scheduler = crate::process::scheduler::local_scheduler();
 
@@ -475,7 +576,7 @@ fn kill_current_user_process(reason: &str) -> ! {
         // `self.running`.
         let (dead_pid, parent_pid) = match scheduler.running_mut() {
             Some(proc) => {
-                proc.killed_by_signal = Some(crate::process::signal::SIGSEGV);
+                proc.killed_by_signal = Some(sig);
                 let parent = if proc.is_thread { None } else { proc.parent_pid };
 
                 // Say it on screen too, not just over serial. On hardware
