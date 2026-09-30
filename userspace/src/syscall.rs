@@ -365,10 +365,8 @@ pub fn waitpid(child_pid: i64) -> i64 {
     unsafe { syscall3(SYS_WAITPID, child_pid as u64, 0, 0) }
 }
 
-/// `waitpid` that also returns the child's raw wait status — this kernel's
-/// encoding, not Linux's: `0x200 | code` for an exit, `0x400 | sig << 24`
-/// for a kill (`Process::wait_status_word`, mlibc-port's `abi-bits/wait.h`).
-/// Returns `(waitpid's return value, status)`.
+/// `waitpid` that also returns the child's raw wait status, in Linux's encoding: `code << 8` for an exit, the signal number
+/// in the low 7 bits for a kill (`Process::wait_status_word`). Returns `(waitpid's return value, status)`.
 pub fn waitpid_status(child_pid: i64) -> (i64, i32) {
     let mut status: i32 = 0;
     let r = unsafe { syscall3(SYS_WAITPID, child_pid as u64, &mut status as *mut i32 as u64, 0) };
@@ -378,8 +376,7 @@ pub fn waitpid_status(child_pid: i64) -> (i64, i32) {
 /// Reaps any one exited child without blocking: its pid, 0 if children
 /// are still running, negative (`ECHILD`) if there are none.
 pub fn reap_any() -> i64 {
-    // This port's value (mlibc-port abi-bits/wait.h), not Linux's 1.
-    const WNOHANG: u64 = 2;
+    const WNOHANG: u64 = 1;
     unsafe { syscall3(SYS_WAITPID, -1i64 as u64, 0, WNOHANG) }
 }
 

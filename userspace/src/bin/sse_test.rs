@@ -174,17 +174,17 @@ fn case_b() -> bool {
         *slot = pid;
     }
     // Each child's exit code is how many registers came back changed.
-    // This kernel's status word: `0x200 | code` for a normal exit.
+    // Linux's status word: `code << 8` for a normal exit.
     let mut bad = 0;
     let mut regs = 0;
     for pid in pids {
         let (_, status) = syscall::waitpid_status(pid);
-        if status & 0x200 == 0 {
+        if status & 0x7F != 0 {
             println!("sse_test: B child {} did not exit normally (status {:#x})", pid, status);
             bad += 1;
-        } else if status & 0xFF != 0 {
+        } else if (status >> 8) & 0xFF != 0 {
             bad += 1;
-            regs += status & 0xFF;
+            regs += (status >> 8) & 0xFF;
         }
     }
     let switches = switches_total().saturating_sub(switches_before);
@@ -513,9 +513,9 @@ fn case_e() -> bool {
     let (mut bad, mut regs) = (0, 0);
     for pid in pids {
         let (_, status) = syscall::waitpid_status(pid);
-        if status & 0x200 == 0 || status & 0xFF != 0 {
+        if status & 0x7F != 0 || (status >> 8) & 0xFF != 0 {
             bad += 1;
-            regs += status & 0xFF;
+            regs += (status >> 8) & 0xFF;
         }
     }
     println!(

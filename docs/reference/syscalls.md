@@ -15,7 +15,6 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 - `struct sigaction`: `sa_flags` is at offset 16, and `SA_RESTART` = `1<<3`. Only `SA_RESTART` is honoured.
 - `sigset_t` arrives in Linux layout (bit N-1 = signal N) and is shifted to the kernel's bit-N masks by `signal::mask_from_user`.
 - termios/winsize use this port's own layout (`tty` crate), not Linux's.
-- `WNOHANG` is 2 (Linux: 1).
 - Custom numbers above the Linux range: 400 `uptime_ms`, 401 `uptime_sec`, 402 `meminfo_kb`, 403 `kdebug_ctl`, 404 `statvfs`.
 
 ## Table
@@ -30,22 +29,22 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 | 10 | mprotect | Splits VMAs at the range's ends and rejoins equal neighbours; hole in the range → `ENOMEM`. A `Huge2M` VMA can only be cut on 2 MiB boundaries. `PROT_EXEC` is ignored (NX is off) |
 | 12 | brk | |
 | 13/14/15 | sigaction/sigprocmask/sigreturn | fork and clone inherit dispositions, `SA_RESTART` and the mask |
-| 16 | ioctl | termios, `TIOCGWINSZ`, `TIOCG/SPGRP`. On a pty the handle answers every tty ioctl. `/dev/fb`: `FBIO_BLIT` 0x4642_0001. `/dev/fb0`: `FBIO_GET_INFO` 0x4642_0010, `FBIO_FLUSH` 0x4642_0011 |
+| 16 | ioctl | termios, `TIOCGWINSZ`, `TIOCG/SPGRP`. On any fd: `FIONBIO`, `FIOCLEX`/`FIONCLEX`. On a pty the handle answers every tty ioctl. `/dev/fb`: `FBIO_BLIT` 0x4642_0001. `/dev/fb0`: `FBIO_GET_INFO` 0x4642_0010, `FBIO_FLUSH` 0x4642_0011 |
 | 20 | writev | |
 | 21 | access | `F_OK`/`R_OK`/`X_OK` = "the path resolves". `W_OK` really probes: opens `O_WRONLY` and writes 0 bytes |
-| 22 | pipe | |
+| 22/293 | pipe/pipe2 | `pipe2`: `O_CLOEXEC`, `O_NONBLOCK`. A non-blocking end fails a would-block read/write with `EAGAIN`; `poll` still reports pipes always ready (a poll loop over one spins) |
 | 24 | yield | |
-| 32/33 | dup/dup2 | Shared offset |
+| 32/33/292 | dup/dup2/dup3 | Shared offset. `dup`/`dup2` clear `FD_CLOEXEC` on the new fd; `dup3` sets it with `O_CLOEXEC` (`oldfd == newfd` → `EINVAL`) |
 | 34 | pause | `rt_sigsuspend` with the current mask; always `EINTR` |
 | 35 | nanosleep | hrtimer; `EINTR` on a signal |
 | 39/110 | getpid/getppid | ppid is 1 after reparenting, 0 for PID 1 |
 | 41–55, 288 | socket … accept4 | AF_UNIX only (`AF_INET` → `EAFNOSUPPORT`). See `ipc.md` |
 | 56/57 | clone/fork | **clone is Linux's** `(flags, stack, ptid, ctid, tls)`. `CLONE_THREAD` (needs `VM`+`SIGHAND`): a thread that shares the address space and fds, resumes after the `syscall` with the caller's registers and `rax=0`, honours `SETTLS`, `PARENT_SETTID`, `CHILD_SETTID`, `CHILD_CLEARTID`. Without `CLONE_THREAD`: a COW fork on `stack` (musl's `posix_spawn`; the parent is not suspended). A thread is a process with its own pid: no tgid, `getpid()` returns the tid. mlibc's `sys_clone` calls it through `__constanos_clone` (`thread_entry.S`) |
-| 59 | exec | `(path, argv, envp)`. Resolved through the VFS with symlinks followed. Caught signals go back to `SIG_DFL`; ignored stay ignored; mask and pending carry over |
+| 59 | exec | `(path, argv, envp)`. Closes the `FD_CLOEXEC` fds once the image has loaded (a failed exec keeps them). `open(O_CLOEXEC)`, `pipe2`, `dup3`, `memfd_create(MFD_CLOEXEC)` and `SOCK_CLOEXEC` set it. Resolved through the VFS with symlinks followed. Caught signals go back to `SIG_DFL`; ignored stay ignored; mask and pending carry over |
 | 60 | exit | See Process death in `processes-and-scheduling.md` |
-| 61 | waitpid | POSIX pid forms, `WNOHANG`/`WUNTRACED`, `WIFSIGNALED`. No matching child → `ECHILD`, even with `WNOHANG` |
+| 61 | waitpid | Linux's `wait4` ABI: `WNOHANG`=1, `WUNTRACED`=2, status = `code<<8` / signal in the low 7 bits / `0x7f\|sig<<8` for a stop (`Process::wait_status_word`); the rusage argument is ignored. POSIX pid forms. No matching child → `ECHILD`, even with `WNOHANG` |
 | 62 | kill | pid >0, 0, <-1. Interrupts an interruptible wait. `SIGCONT` and `SIGKILL` resume a stopped target. Signal 0 only probes that the pid exists (`ESRCH` otherwise) |
-| 72 | fcntl | Only `F_DUPFD`/`F_DUPFD_CLOEXEC` do something |
+| 72 | fcntl | `F_DUPFD`/`F_DUPFD_CLOEXEC`, `F_GETFD`/`F_SETFD` (`FD_CLOEXEC`), `F_GETFL`/`F_SETFL` (`O_NONBLOCK` only) |
 | 77 | ftruncate | memfds only (`EINVAL` otherwise); shrinking a mapped one → `EBUSY` |
 | 82/83/84/87 | rename/mkdir/rmdir/unlink | ramfs and ext2; `EROFS` elsewhere |
 | 88/89 | symlink/readlink | Target stored verbatim. ramfs and ext2 |

@@ -734,33 +734,28 @@ impl Process {
         self.effective_priority = p;
     }
 
-    /// Encodes this (dead) process's exit condition into this kernel's
-    /// wait(2)-ABI status word.
-    ///
-    /// `mlibc-port/constanos-sysdeps/include/abi-bits/wait.h` uses the
-    /// dripos-style encoding (`WIFEXITED` = bit `0x200`, `WIFSIGNALED` =
-    /// bit `0x400` with the signal number in bits 24-31) rather than
-    /// Linux's `WTERMSIG(x) == 0` trick — see the mlibc-port ABI-bug
-    /// history for why this port follows that header instead of assuming
-    /// Linux's layout here.
+    /// Encodes this (dead) process's exit condition as Linux's wait(2)
+    /// status word: `code << 8` for an exit, the signal number in the low
+    /// 7 bits for a kill (no core-dump bit). Matches `abi-bits/wait.h`,
+    /// which is Linux's, and what musl and Rust's `std` decode.
     pub fn wait_status_word(&self) -> i32 {
         match self.killed_by_signal {
-            Some(sig) => (((sig as i32) & 0xFF) << 24) | 0x400,
-            None => 0x200 | (self.exit_status & 0xFF),
+            Some(sig) => (sig as i32) & 0x7F,
+            None => (self.exit_status & 0xFF) << 8,
         }
     }
 
     /// Encodes this (currently `Stopped`) process's condition into a
-    /// `WUNTRACED` wait status: `WIFSTOPPED` = bit `0x800`, stop signal in
-    /// bits 16-23 (`WSTOPSIG`) — see `abi-bits/wait.h`. Returns a plain
+    /// `WUNTRACED` wait status: `0x7f` in the low byte (`WIFSTOPPED`), the
+    /// stop signal in the next (`WSTOPSIG`). Returns a plain
     /// exited(0) word if called on a process that isn't actually stopped
     /// (shouldn't happen — callers only reach this via a `Stopped`-state
     /// match — but this avoids a bogus status word if that invariant is
     /// ever violated).
     pub fn stop_status_word(&self) -> i32 {
         match self.stopped_by_signal {
-            Some(sig) => 0x800 | (((sig as i32) & 0xFF) << 16),
-            None => 0x200,
+            Some(sig) => 0x7F | (((sig as i32) & 0xFF) << 8),
+            None => 0,
         }
     }
 }

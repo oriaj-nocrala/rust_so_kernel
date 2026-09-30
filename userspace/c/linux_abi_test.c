@@ -382,7 +382,55 @@ static void test_exit_group_and_fork_clone(void) {
     CHECK(marker == 5, "its write did not reach the parent (%d)", marker);
 }
 
+// wait4(61) with Linux's option values and status word, read raw (not through the WIF* macros, which could hide a shared mistake).
+static void test_wait_abi(void) {
+    printf("wait status and options\n");
+    int st = -1;
+    pid_t p = fork();
+    if (p == 0) _exit(5);
+    CHECK(sc(61, p, (long)&st, 0, 0, 0, 0) == p, "wait4 returned");
+    CHECK(st == 0x0500, "exit(5) is status %#x, wanted 0x500", st);
+
+    int fds[2];
+    pipe(fds);
+    p = fork();
+    if (p == 0) {
+        char c;
+        read(fds[0], &c, 1);                         // holds the child until the parent says so
+        _exit(0);
+    }
+    st = -1;
+    CHECK(sc(61, p, (long)&st, 1 /* WNOHANG */, 0, 0, 0) == 0, "WNOHANG (1) on a running child returns 0");
+    write(fds[1], "x", 1);
+    CHECK(sc(61, p, (long)&st, 0, 0, 0, 0) == p && st == 0, "exit(0) is status %#x, wanted 0", st);
+
+    p = fork();
+    if (p == 0) {
+        for (;;) pause();
+    }
+    usleep(20000);
+    kill(p, SIGKILL);
+    st = -1;
+    CHECK(sc(61, p, (long)&st, 0, 0, 0, 0) == p, "wait4 for the killed child");
+    CHECK(st == 9, "killed by SIGKILL is status %#x, wanted 9", st);
+
+    p = fork();
+    if (p == 0) {
+        for (;;) pause();
+    }
+    usleep(20000);
+    kill(p, SIGSTOP);
+    st = -1;
+    CHECK(sc(61, p, (long)&st, 2 /* WUNTRACED */, 0, 0, 0) == p, "WUNTRACED (2) reports the stopped child");
+    CHECK(st == (0x7f | (SIGSTOP << 8)), "stopped by SIGSTOP is status %#x, wanted %#x", st, 0x7f | (SIGSTOP << 8));
+    kill(p, SIGKILL);
+    waitpid(p, &st, 0);
+    close(fds[0]);
+    close(fds[1]);
+}
+
 int main(void) {
+    test_wait_abi();
     test_getrandom();
     test_tid_and_signals();
     test_sigaltstack();

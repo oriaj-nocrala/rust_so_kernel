@@ -338,11 +338,25 @@ pub(super) fn sys_open(path_ptr: usize, flags: i32) -> SyscallResult {
 
     // Only take scheduler lock for the FD table insertion
     with_current_process(|proc| {
-        match proc.files.lock().allocate(handle) {
-            Ok(fd) => fd as i64,
+        let mut files = proc.files.lock();
+        match files.allocate(handle) {
+            Ok(fd) => {
+                if flags & O_CLOEXEC != 0 {
+                    let _ = files.set_cloexec(fd, true);
+                }
+                fd as i64
+            }
             Err(_) => errno::EINVAL,
         }
     })
+}
+
+/// Mark an fd of the calling process close-on-exec (`SOCK_CLOEXEC`, `MFD_CLOEXEC`, …).
+pub(super) fn set_cloexec_current(fd: usize) {
+    with_current_process(|proc| {
+        let _ = proc.files.lock().set_cloexec(fd, true);
+        0
+    });
 }
 
 pub(super) fn sys_stat(path_ptr: usize, stat_ptr: usize) -> SyscallResult {
@@ -814,6 +828,25 @@ pub(super) fn sys_dup2(oldfd: i32, newfd: i32) -> SyscallResult {
     }
 }
 
+/// dup3(292): like dup2, but `oldfd == newfd` is `EINVAL` and the only flag is `O_CLOEXEC`, which the new descriptor gets.
+pub(super) fn sys_dup3(oldfd: i32, newfd: i32, flags: i32) -> SyscallResult {
+    if oldfd < 0 || newfd < 0 { return errno::EBADF; }
+    if flags & !O_CLOEXEC != 0 || oldfd == newfd { return errno::EINVAL; }
+
+    let files = {
+        let guard = crate::process::irq_guard::SchedGuard::lock();
+        guard.running_ref().map(|proc| proc.files.clone())
+    };
+    let Some(files) = files else { return errno::ESRCH };
+
+    let _irq = crate::process::irq_guard::InterruptGuard::new();
+    let result = files.lock().dup3(oldfd as usize, newfd as usize, flags & O_CLOEXEC != 0);
+    match result {
+        Ok(nf) => nf as SyscallResult,
+        Err(_) => errno::EBADF,
+    }
+}
+
 // fcntl(2) commands this kernel understands — real Linux x86-64 values.
 const F_DUPFD: i32 = 0;
 const F_GETFD: i32 = 1;
@@ -821,6 +854,9 @@ const F_SETFD: i32 = 2;
 const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
 const F_DUPFD_CLOEXEC: i32 = 1030;
+/// `F_GETFD`/`F_SETFD`'s one bit, and `open`/`pipe2`/`dup3`'s `O_CLOEXEC`.
+const FD_CLOEXEC: u64 = 1;
+pub(super) const O_CLOEXEC: i32 = 0o2000000;
 /// `O_NONBLOCK`, the one status flag `F_SETFL` acts on for real.
 const O_NONBLOCK: i64 = 0o4000;
 
@@ -840,7 +876,7 @@ pub(super) fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             with_current_process(|proc| {
-                match proc.files.lock().dup(fd as usize, arg as usize) {
+                match proc.files.lock().dup_with(fd as usize, arg as usize, cmd == F_DUPFD_CLOEXEC) {
                     Ok(newfd) => newfd as SyscallResult,
                     Err(_) => errno::EBADF,
                 }
@@ -873,10 +909,19 @@ pub(super) fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
                 }
             })
         }
-        F_GETFD | F_SETFD => {
+        // FD_CLOEXEC is the descriptor's only flag; `exec` closes the ones that have it.
+        F_GETFD => {
             with_current_process(|proc| {
-                match proc.files.lock().get(fd as usize) {
-                    Ok(_)  => 0,
+                match proc.files.lock().cloexec(fd as usize) {
+                    Ok(on) => on as SyscallResult,
+                    Err(_) => errno::EBADF,
+                }
+            })
+        }
+        F_SETFD => {
+            with_current_process(|proc| {
+                match proc.files.lock().set_cloexec(fd as usize, arg & FD_CLOEXEC != 0) {
+                    Ok(()) => 0,
                     Err(_) => errno::EBADF,
                 }
             })
@@ -892,11 +937,24 @@ pub(super) fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
 /// `FileHandle::dup` / `FileDescriptorTable::clone`), `clone()` (threads)
 /// shares them automatically via the shared fd table.
 pub(super) fn sys_pipe(pipefd_ptr: u64) -> SyscallResult {
+    sys_pipe2(pipefd_ptr, 0)
+}
+
+/// pipe2(293): `pipe` with `O_CLOEXEC` and `O_NONBLOCK` for both ends.
+pub(super) fn sys_pipe2(pipefd_ptr: u64, flags: i32) -> SyscallResult {
+    if flags & !(O_CLOEXEC | O_NONBLOCK as i32) != 0 {
+        return errno::EINVAL;
+    }
     if let Err(e) = validate_user_buffer(pipefd_ptr, 8) {
         return e;
     }
 
     let (read_end, write_end) = crate::process::pipe::create();
+    if flags & O_NONBLOCK as i32 != 0 {
+        use crate::process::file::FileHandle;
+        read_end.set_nonblocking(true);
+        write_end.set_nonblocking(true);
+    }
 
     with_current_process(|proc| {
         let mut files = proc.files.lock();
@@ -918,6 +976,10 @@ pub(super) fn sys_pipe(pipefd_ptr: u64) -> SyscallResult {
                 return errno::EINVAL;
             }
         };
+        if flags & O_CLOEXEC != 0 {
+            let _ = files.set_cloexec(rfd, true);
+            let _ = files.set_cloexec(wfd, true);
+        }
         drop(files);
 
         unsafe {
@@ -995,8 +1057,7 @@ pub(super) fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, o
 ///
 /// A new shared-memory object of size 0 behind a new fd (`ipc::memfd`).
 /// `name` is only for Linux's `/proc/<pid>/fd` display, which this kernel
-/// does not have, so it is not kept. `MFD_CLOEXEC` is accepted and, like
-/// every close-on-exec flag here, not acted on; `MFD_ALLOW_SEALING` is
+/// does not have, so it is not kept. `MFD_CLOEXEC` marks the fd close-on-exec; `MFD_ALLOW_SEALING` is
 /// accepted, but seals themselves (`F_ADD_SEALS`) are not implemented.
 pub(super) fn sys_memfd_create(name_ptr: u64, flags: u32) -> SyscallResult {
     const MFD_CLOEXEC: u32 = 1;
@@ -1008,9 +1069,17 @@ pub(super) fn sys_memfd_create(name_ptr: u64, flags: u32) -> SyscallResult {
         return e;
     }
     let handle = alloc::boxed::Box::new(crate::ipc::memfd::MemfdHandle::new());
-    with_current_process(|proc| match proc.files.lock().allocate(handle) {
-        Ok(fd) => fd as i64,
-        Err(_) => errno::EMFILE,
+    with_current_process(|proc| {
+        let mut files = proc.files.lock();
+        match files.allocate(handle) {
+            Ok(fd) => {
+                if flags & MFD_CLOEXEC != 0 {
+                    let _ = files.set_cloexec(fd, true);
+                }
+                fd as i64
+            }
+            Err(_) => errno::EMFILE,
+        }
     })
 }
 
@@ -1167,10 +1236,35 @@ pub(super) fn sys_ioctl(fd: i32, request: u64, argp: u64) -> SyscallResult {
         Ok(file) => file.ioctl(request, argp),
         Err(_) => return errno::EBADF,
     };
-    drop(files);
     if let Some(r) = handled {
         return r;
     }
+
+    // Requests that mean the same on every descriptor. (`FileHandle::ioctl` above got the first look: a pty has its own FIONBIO.)
+    const FIONBIO: u64 = 0x5421;
+    const FIOCLEX: u64 = 0x5451;
+    const FIONCLEX: u64 = 0x5450;
+    match request {
+        FIONBIO => {
+            if validate_user_buffer(argp, 4).is_err() {
+                return errno::EFAULT;
+            }
+            let want = unsafe { *(argp as *const i32) } != 0;
+            let r = match files.lock().get(fd as usize) {
+                Ok(h) => if h.set_nonblocking(want) || !want { 0 } else { errno::ENOTTY },
+                Err(_) => errno::EBADF,
+            };
+            return r;
+        }
+        FIOCLEX | FIONCLEX => {
+            return match files.lock().set_cloexec(fd as usize, request == FIOCLEX) {
+                Ok(()) => 0,
+                Err(_) => errno::EBADF,
+            };
+        }
+        _ => {}
+    }
+    drop(files);
 
     #[derive(Clone, Copy, PartialEq)]
     enum FdKind { Serial, Fb, Other }

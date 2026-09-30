@@ -26,6 +26,9 @@ const MAX_FILES: usize = 16;
 /// Per-process table of open file descriptors.
 pub struct FileDescriptorTable {
     files: [Option<Box<dyn FileHandle>>; MAX_FILES],
+    /// `FD_CLOEXEC` per slot: `exec` closes the flagged ones (`take_cloexec`). A property of the descriptor, not of the handle,
+    /// so `dup` gives the copy a clear flag and `fork` copies it as it is.
+    cloexec: [bool; MAX_FILES],
 }
 
 impl FileDescriptorTable {
@@ -34,6 +37,7 @@ impl FileDescriptorTable {
         const NONE: Option<Box<dyn FileHandle>> = None;
         Self {
             files: [NONE; MAX_FILES],
+            cloexec: [false; MAX_FILES],
         }
     }
 
@@ -104,6 +108,7 @@ impl FileDescriptorTable {
         for (i, slot) in self.files.iter_mut().enumerate() {
             if slot.is_none() {
                 *slot = Some(handle);
+                self.cloexec[i] = false;
                 return Ok(i);
             }
         }
@@ -117,11 +122,17 @@ impl FileDescriptorTable {
     /// that's only directory handles (opendir), which nothing needs to
     /// dup in practice.
     pub fn dup(&mut self, fd: usize, min_fd: usize) -> FileResult<usize> {
+        self.dup_with(fd, min_fd, false)
+    }
+
+    /// `dup` with `F_DUPFD_CLOEXEC`'s choice of the new descriptor's flag.
+    pub fn dup_with(&mut self, fd: usize, min_fd: usize, cloexec: bool) -> FileResult<usize> {
         let cloned = self.get(fd)?.dup().ok_or(FileError::NotSupported)?;
 
         for i in min_fd..MAX_FILES {
             if self.files[i].is_none() {
                 self.files[i] = Some(cloned);
+                self.cloexec[i] = cloexec;
                 return Ok(i);
             }
         }
@@ -131,8 +142,15 @@ impl FileDescriptorTable {
     /// dup2(2): install a clone of `oldfd`'s handle at exactly `newfd`,
     /// closing whatever was already there first. `oldfd == newfd` is a
     /// POSIX-mandated no-op (returns `newfd` without touching anything),
-    /// as long as `oldfd` is actually open.
+    /// as long as `oldfd` is actually open. The new descriptor is not
+    /// close-on-exec.
     pub fn dup2(&mut self, oldfd: usize, newfd: usize) -> FileResult<usize> {
+        self.dup3(oldfd, newfd, false)
+    }
+
+    /// dup3(2)'s core (and dup2's): as `dup2`, with the new descriptor's `FD_CLOEXEC`. The caller rejects `oldfd == newfd` for
+    /// dup3 itself; here that stays `dup2`'s no-op and leaves the flag alone.
+    pub fn dup3(&mut self, oldfd: usize, newfd: usize, cloexec: bool) -> FileResult<usize> {
         if newfd >= MAX_FILES {
             return Err(FileError::BadFileDescriptor);
         }
@@ -147,7 +165,36 @@ impl FileDescriptorTable {
             let _ = old.close();
         }
         self.files[newfd] = Some(cloned);
+        self.cloexec[newfd] = cloexec;
         Ok(newfd)
+    }
+
+    /// `FD_CLOEXEC` of an open descriptor.
+    pub fn cloexec(&self, fd: usize) -> FileResult<bool> {
+        self.get(fd)?;
+        Ok(self.cloexec[fd])
+    }
+
+    /// Set or clear `FD_CLOEXEC` of an open descriptor.
+    pub fn set_cloexec(&mut self, fd: usize, on: bool) -> FileResult<()> {
+        self.get(fd)?;
+        self.cloexec[fd] = on;
+        Ok(())
+    }
+
+    /// Take out every close-on-exec handle, for `exec`. The caller closes and drops them once it holds no scheduler lock (a
+    /// handle's `Drop` may take it).
+    pub fn take_cloexec(&mut self) -> alloc::vec::Vec<Box<dyn FileHandle>> {
+        let mut out = alloc::vec::Vec::new();
+        for i in 0..MAX_FILES {
+            if self.cloexec[i] {
+                self.cloexec[i] = false;
+                if let Some(h) = self.files[i].take() {
+                    out.push(h);
+                }
+            }
+        }
+        out
     }
 
     /// Close a file descriptor.
@@ -156,6 +203,7 @@ impl FileDescriptorTable {
             return Err(FileError::BadFileDescriptor);
         }
 
+        self.cloexec[fd] = false;
         if let Some(mut handle) = self.files[fd].take() {
             handle.close()?;
         }
@@ -211,6 +259,7 @@ impl Clone for FileDescriptorTable {
                 new_table.files[i] = handle.dup();
             }
         }
+        new_table.cloexec = self.cloexec;
 
         new_table
     }

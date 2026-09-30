@@ -730,6 +730,19 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
     // instrumentation this fix was diagnosed with).
     drop(elf_owned);
 
+    // `execve` closes the close-on-exec descriptors — only now, once the image has loaded: a failed exec must leave them open.
+    // The handles are taken out under the table's lock and closed after it, with no scheduler lock held (a `Drop` may take it).
+    // The interrupt guard below is dropped at the end of this block, before exec's own `cli`.
+    let files = crate::process::irq_guard::SchedGuard::lock().running_ref().map(|p| p.files.clone());
+    if let Some(files) = files {
+        // IF=0 for the closes: a pipe or socket end wakes its peer through `local_scheduler()`, which insists on it.
+        let _irq = crate::process::irq_guard::InterruptGuard::new();
+        let closing = files.lock().take_cloexec();
+        for mut h in closing {
+            let _ = h.close();
+        }
+    }
+
     crate::ktrace!(crate::debug::SCHED, "exec: load_elf done, going cli");
     // `_irq` is deliberately never dropped on the success path — this
     // function always ends in `jump_to_user` (`-> !`), so interrupts
@@ -924,15 +937,15 @@ fn resolve_exec_path(name: &str) -> Result<alloc::string::String, i64> {
 /// selector matches no live-or-zombie child of the caller at all, this
 /// returns `ECHILD` instead of blocking forever.
 ///
-/// `options`: `WNOHANG` (2) returns 0 immediately instead of blocking when
-/// nothing is reapable yet. `WUNTRACED` (4) also matches a `Stopped` child
+/// `options` (Linux's values): `WNOHANG` (1) returns 0 immediately instead of blocking when
+/// nothing is reapable yet. `WUNTRACED` (2) also matches a `Stopped` child
 /// (job control), reporting it once (see `Process::stop_reported`) without
 /// removing it from the wait queue — a later real exit, or another
 /// stop/continue cycle, can still be observed. No `WCONTINUED` support
 /// (this kernel doesn't track SIGCONT-resume events for reporting).
 pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> SyscallResult {
-    const WNOHANG: i32 = 2;
-    const WUNTRACED: i32 = 4;
+    const WNOHANG: i32 = 1;
+    const WUNTRACED: i32 = 2;
 
     if status_ptr != 0 {
         if let Err(e) = validate_user_buffer(status_ptr as u64, 4) { return e; }

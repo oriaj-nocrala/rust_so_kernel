@@ -93,10 +93,10 @@ fn run_autorun_job() {
                 break status;
             }
         };
-        if status & 0x400 != 0 {
-            println!("METAL-DONE {} signal={}", nonce, (status >> 24) & 0xff);
-        } else if status & 0x200 != 0 {
-            println!("METAL-DONE {} exit={}", nonce, status & 0xff);
+        if status & 0x7f != 0 && status & 0x7f != 0x7f {
+            println!("METAL-DONE {} signal={}", nonce, status & 0x7f);
+        } else if status & 0x7f == 0 {
+            println!("METAL-DONE {} exit={}", nonce, (status >> 8) & 0xff);
         } else {
             println!("METAL-DONE {} status={:#x}", nonce, status);
         }

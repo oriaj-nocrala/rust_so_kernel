@@ -221,19 +221,29 @@ fn wake_writer_error(waiter: PipeWaiter, errno: i64) {
     deliver_and_wake(waiter.pid, |_| errno as u64);
 }
 
+/// `O_NONBLOCK` belongs to the open file description, so every `dup` of an end shares one flag. A read that would block (empty,
+/// writers left) or a write that would (full) then fails with `EAGAIN` instead of waiting. `poll` still reports a pipe ready
+/// at all times (`PollSource::Other`), so a poll loop over one spins until data arrives.
+type NonBlock = Arc<core::sync::atomic::AtomicBool>;
+
 pub struct PipeReadEnd {
     buf: Arc<Mutex<PipeBuffer>>,
+    nonblock: NonBlock,
 }
 
 pub struct PipeWriteEnd {
     buf: Arc<Mutex<PipeBuffer>>,
+    nonblock: NonBlock,
 }
 
 /// Create a connected pipe (read end, write end) with one open reference
 /// on each side, matching what `pipe(2)` hands back.
 pub fn create() -> (PipeReadEnd, PipeWriteEnd) {
     let buf = Arc::new(Mutex::new(PipeBuffer::new()));
-    (PipeReadEnd { buf: buf.clone() }, PipeWriteEnd { buf })
+    (
+        PipeReadEnd { buf: buf.clone(), nonblock: NonBlock::default() },
+        PipeWriteEnd { buf, nonblock: NonBlock::default() },
+    )
 }
 
 impl FileHandle for PipeReadEnd {
@@ -284,6 +294,9 @@ impl FileHandle for PipeReadEnd {
         if pb.writers == 0 {
             return Ok(0); // EOF
         }
+        if self.nonblock.load(core::sync::atomic::Ordering::Relaxed) {
+            return Err(FileError::Again);
+        }
 
         let (waiter, cell) = PipeWaiter::new(pid, buf.as_ptr() as u64, buf.len());
         pb.read_waiters.push_back(waiter);
@@ -300,7 +313,16 @@ impl FileHandle for PipeReadEnd {
 
     fn dup(&self) -> Option<Box<dyn FileHandle>> {
         self.buf.lock().readers += 1;
-        Some(Box::new(PipeReadEnd { buf: self.buf.clone() }))
+        Some(Box::new(PipeReadEnd { buf: self.buf.clone(), nonblock: self.nonblock.clone() }))
+    }
+
+    fn nonblocking(&self) -> bool {
+        self.nonblock.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set_nonblocking(&self, on: bool) -> bool {
+        self.nonblock.store(on, core::sync::atomic::Ordering::Relaxed);
+        true
     }
 }
 
@@ -335,6 +357,9 @@ impl FileHandle for PipeWriteEnd {
         }
 
         // Buffer full — block until a reader frees space.
+        if self.nonblock.load(core::sync::atomic::Ordering::Relaxed) {
+            return Err(FileError::Again);
+        }
         let (waiter, cell) = PipeWaiter::new(pid, buf.as_ptr() as u64, buf.len());
         pb.write_waiters.push_back(waiter);
         drop(pb);
@@ -346,7 +371,16 @@ impl FileHandle for PipeWriteEnd {
 
     fn dup(&self) -> Option<Box<dyn FileHandle>> {
         self.buf.lock().writers += 1;
-        Some(Box::new(PipeWriteEnd { buf: self.buf.clone() }))
+        Some(Box::new(PipeWriteEnd { buf: self.buf.clone(), nonblock: self.nonblock.clone() }))
+    }
+
+    fn nonblocking(&self) -> bool {
+        self.nonblock.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set_nonblocking(&self, on: bool) -> bool {
+        self.nonblock.store(on, core::sync::atomic::Ordering::Relaxed);
+        true
     }
 }
 

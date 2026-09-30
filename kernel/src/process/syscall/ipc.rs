@@ -200,7 +200,12 @@ pub(super) fn sys_socket(domain: i32, ty: i32, protocol: i32) -> SyscallResult {
     };
 
     match install_fd(id, nonblock) {
-        Ok(fd) => fd as i64,
+        Ok(fd) => {
+            if ty & SOCK_CLOEXEC != 0 {
+                super::fs::set_cloexec_current(fd as usize);
+            }
+            fd as i64
+        }
         Err(e) => e,
     }
 }
@@ -241,6 +246,10 @@ pub(super) fn sys_socketpair(domain: i32, ty: i32, protocol: i32, sv: u64) -> Sy
         }
     };
 
+    if ty & SOCK_CLOEXEC != 0 {
+        super::fs::set_cloexec_current(fd_a as usize);
+        super::fs::set_cloexec_current(fd_b as usize);
+    }
     unsafe {
         let p = sv as *mut i32;
         *p = fd_a;
@@ -398,7 +407,12 @@ pub(super) fn sys_accept4(fd: i32, addr_ptr: u64, len_ptr: u64, flags: i32) -> S
     }
 
     match install_fd(child, flags & SOCK_NONBLOCK != 0) {
-        Ok(new_fd) => new_fd as i64,
+        Ok(new_fd) => {
+            if flags & SOCK_CLOEXEC != 0 {
+                super::fs::set_cloexec_current(new_fd as usize);
+            }
+            new_fd as i64
+        }
         Err(e) => e,
     }
 }

@@ -1238,7 +1238,7 @@ impl Scheduler {
         // stance that nothing meaningful ever `waitpid()`s a thread's tid.
         let dead = self.core.wait_queue().iter()
             .find(|p| p.pid.0 == dead_pid && matches!(p.state, ProcessState::Zombie));
-        let status_word = dead.map(|p| p.wait_status_word()).unwrap_or(0x200);
+        let status_word = dead.map(|p| p.wait_status_word()).unwrap_or(0);
         let dead_pgid = dead.map(|p| p.pgid).unwrap_or(0);
 
         // Only the real parent can be woken — `WaitTarget::AnyChild`/`Pgid`
@@ -1347,7 +1347,7 @@ impl Scheduler {
             return;
         };
 
-        const WUNTRACED: i32 = 4;
+        const WUNTRACED: i32 = 2;
         let mut waker_pid: Option<usize> = None;
         for proc in self.core.wait_queue_mut().iter_mut() {
             if Some(proc.pid) == parent_pid
