@@ -26,7 +26,8 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 | 4/5/6 | stat/fstat/lstat | `lstat` does not follow a final symlink. `fstat` runs `FileHandle::stat` under the scheduler lock |
 | 7 | poll | ≤16 fds. Real readiness for sockets, stdin, ptys, `/dev/input/event*` (`FileHandle::event_source`); other devices are always ready. `POLLHUP`/`POLLERR` are reported even if not asked for (by epoll too) |
 | 8 | lseek | |
-| 9/11 | mmap/munmap | Private anonymous, `MAP_SHARED` of a memfd, or `MAP_SHARED\|MAP_ANONYMOUS`. A nonzero `addr` is treated as `MAP_FIXED`. `munmap` must name one whole VMA |
+| 9/11 | mmap/munmap | Private anonymous, `MAP_SHARED` of a memfd, or `MAP_SHARED\|MAP_ANONYMOUS`. A nonzero `addr` is treated as `MAP_FIXED` (and fails over an existing mapping). `prot` 0 is a real `PROT_NONE`. `munmap` takes any page-aligned range: cuts VMAs, spans several, holes are fine |
+| 10 | mprotect | Splits VMAs at the range's ends and rejoins equal neighbours; hole in the range → `ENOMEM`. A `Huge2M` VMA can only be cut on 2 MiB boundaries. `PROT_EXEC` is ignored (NX is off) |
 | 12 | brk | |
 | 13/14/15 | sigaction/sigprocmask/sigreturn | fork and clone inherit dispositions, `SA_RESTART` and the mask |
 | 16 | ioctl | termios, `TIOCGWINSZ`, `TIOCG/SPGRP`. On a pty the handle answers every tty ioctl. `/dev/fb`: `FBIO_BLIT` 0x4642_0001. `/dev/fb0`: `FBIO_GET_INFO` 0x4642_0010, `FBIO_FLUSH` 0x4642_0011 |

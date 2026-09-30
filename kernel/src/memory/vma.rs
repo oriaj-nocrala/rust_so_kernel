@@ -22,7 +22,7 @@ use super::shm::ShmObject;
 // ============================================================================
 
 /// Maximum VMAs per process (code + stack + heap + extras).
-pub const MAX_VMAS_PER_PROCESS: usize = 64;
+pub const MAX_VMAS_PER_PROCESS: usize = 256;
 
 /// How far below a `GrowableStack` VMA's current low boundary a fault is
 /// still treated as legitimate stack growth rather than a wild pointer —
@@ -242,6 +242,107 @@ impl VmaList {
         slot.start = page_addr;
         slot.size_pages = new_size_pages;
         Some(slot.clone())
+    }
+
+    /// True if `[start, end)` is covered end to end by VMAs, with no hole.
+    pub fn covers(&self, start: u64, end: u64) -> bool {
+        let mut addr = start;
+        while addr < end {
+            match self.find(addr) {
+                Some(v) => addr = v.end(),
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// Make `addr` a VMA boundary: a VMA that straddles it is cut in two
+    /// (both halves keep kind and flags; a `Shared` right half starts at
+    /// the matching object page). No-op if `addr` is already a boundary or
+    /// inside no VMA. A `Huge2M` VMA can only be cut at a 2 MiB boundary
+    /// (its pages are whole huge pages), and `addr` must be page-aligned.
+    ///
+    /// The PTEs are untouched: a split changes bookkeeping, not mappings.
+    pub fn split_at(&mut self, addr: u64) -> Result<(), &'static str> {
+        if addr & 0xFFF != 0 {
+            return Err("split: address not page-aligned");
+        }
+        let Some(i) = self.entries.iter().position(|v| v.start < addr && addr < v.end()) else {
+            return Ok(());
+        };
+        if self.entries[i].kind == VmaKind::Huge2M && addr & 0x1F_FFFF != 0 {
+            return Err("split: inside a 2 MiB page");
+        }
+        if self.entries.len() >= MAX_VMAS_PER_PROCESS {
+            return Err("VMA list full");
+        }
+        self.entries.try_reserve(1).map_err(|_| "VMA list: out of memory")?;
+        let left_pages = ((addr - self.entries[i].start) / 4096) as usize;
+        let v = &mut self.entries[i];
+        let right = Vma {
+            start: addr,
+            size_pages: v.size_pages - left_pages,
+            flags: v.flags,
+            kind: v.kind,
+            shm: v.shm.as_ref().map(|m| ShmMapping::new(m.obj.clone(), m.offset_pages + left_pages)),
+        };
+        v.size_pages = left_pages;
+        self.entries.insert(i + 1, right);
+        Ok(())
+    }
+
+    /// Visit every VMA lying wholly inside `[start, end)`. Call
+    /// `split_at(start)` and `split_at(end)` first so none straddles.
+    pub fn for_each_in_range_mut(&mut self, start: u64, end: u64, mut f: impl FnMut(&mut Vma)) {
+        for v in self.entries.iter_mut().filter(|v| v.start >= start && v.end() <= end) {
+            f(v);
+        }
+    }
+
+    /// Take out every VMA lying wholly inside `[start, end)` (after the two
+    /// `split_at` calls) and return them, so the caller can free their pages.
+    pub fn remove_range(&mut self, start: u64, end: u64) -> Vec<Vma> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < self.entries.len() {
+            let v = &self.entries[i];
+            if v.start >= start && v.end() <= end {
+                out.push(self.entries.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Join neighbouring `Anonymous` VMAs with equal flags back into one, so
+    /// a run of `mprotect`s that ends up with a uniform range does not
+    /// leave it cut in pieces (the list is capped). Other kinds are never
+    /// joined: a `Shared` pair would need contiguous object pages, `Code`
+    /// and `GrowableStack` carry meaning of their own.
+    pub fn merge_adjacent(&mut self) {
+        let mut i = 0;
+        while i < self.entries.len() {
+            let a = &self.entries[i];
+            let next = if a.kind == VmaKind::Anonymous {
+                self.entries.iter().position(|b| {
+                    b.kind == VmaKind::Anonymous && b.start == a.end() && b.flags == a.flags
+                })
+            } else {
+                None
+            };
+            match next {
+                Some(j) => {
+                    let b = self.entries.remove(j);
+                    // `remove(j)` shifted the tail down; `i` is still `a`
+                    // unless `j` was before it.
+                    let i2 = if j < i { i - 1 } else { i };
+                    self.entries[i2].size_pages += b.size_pages;
+                    i = i2; // try to absorb the next neighbour too
+                }
+                None => i += 1,
+            }
+        }
     }
 
     /// Remove all VMAs (for process exit).

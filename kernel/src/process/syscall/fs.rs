@@ -1045,8 +1045,8 @@ pub(super) fn sys_ftruncate(fd: i32, length: i64) -> SyscallResult {
 
 /// munmap(11): int munmap(void *addr, size_t length)
 ///
-/// Removes the VMA at `addr` and frees any demand-paged frames.
-/// Requires exact match on addr and length (no partial unmap).
+/// Any page-aligned range: it may cut a mapping in pieces, span several, or
+/// include holes (`AddressSpace::sys_munmap`).
 pub(super) fn sys_munmap(addr: u64, length: u64) -> SyscallResult {
     with_current_process(|proc| {
         let r = unsafe { proc.address_space.sys_munmap(addr, length) };
@@ -1054,6 +1054,22 @@ pub(super) fn sys_munmap(addr: u64, length: u64) -> SyscallResult {
         match r {
             Ok(())  => 0,
             Err(_)  => errno::EINVAL,
+        }
+    })
+}
+
+/// mprotect(10): int mprotect(void *addr, size_t length, int prot)
+pub(super) fn sys_mprotect(addr: u64, length: u64, prot: u32) -> SyscallResult {
+    use crate::memory::address_space::MprotectError;
+    with_current_process(|proc| {
+        let r = unsafe { proc.address_space.sys_mprotect(addr, length, prot) };
+        crate::ktrace!(crate::debug::MM, "mprotect pid={:?} addr={:#x} len={:#x} prot={} -> {}",
+            proc.pid, addr, length, prot, if r.is_ok() { "ok" } else { "err" });
+        match r {
+            Ok(()) => 0,
+            Err(MprotectError::Invalid) => errno::EINVAL,
+            Err(MprotectError::NoMem) => errno::ENOMEM,
+            Err(MprotectError::Failed(_)) => errno::ENOMEM,
         }
     })
 }

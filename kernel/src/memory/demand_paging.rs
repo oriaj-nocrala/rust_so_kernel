@@ -110,6 +110,11 @@ pub(super) unsafe fn map_demand_page(
     vma: &Vma,
     is_write: bool,
 ) -> Result<(), &'static str> {
+    // PROT_NONE: not even the zero frame. The fault stays unresolved and
+    // the process is killed, which is what touching one must do.
+    if !vma.page_table_flags().contains(PageTableFlags::USER_ACCESSIBLE) {
+        return Err("PROT_NONE mapping");
+    }
     match vma.kind {
         VmaKind::Code => {
             return Err("Code page not present (should be pre-mapped)");

@@ -16,12 +16,14 @@ Code: `kernel/src/memory/`, `kernel/src/allocator/`, crate `mm/` (host tests: `c
 
 - `OwnedPageTable` (`page_table_manager.rs`) wraps `OffsetPageTable`. `new_user()` copies the kernel's (non-user) PML4 entries into a fresh PML4.
 - `AddressSpace` (`address_space.rs`) = page table + `VmaList`. Each process holds one through an `Arc` (threads share it).
-- **VMAs** (`vma.rs`): at most 64 per process, in a `Vec`. Kinds:
+- **VMAs** (`vma.rs`): at most 256 per process, in a `Vec`. Kinds:
   - `Code`: loaded up front, not demand-paged.
   - `Anonymous`: zero-filled on demand.
   - `GrowableStack`: starts at 64 KiB and grows down on a fault in the guard gap, up to 8 MiB (`VmaList::grow_stack`, called from the fault path).
   - `Huge2M`: any anonymous `mmap` of 2 MiB or more. Whole 2 MiB pages; touching one byte makes all 512 resident. There is no huge zero page.
   - `Shared`: see Shared memory below.
+- **Protection:** a VMA's `flags` are its PTE flags. `PROT_NONE` = `PRESENT` without `USER_ACCESSIBLE`; `map_demand_page` refuses such a VMA (not even the zero frame), so touching one kills the process. `mmap` of `PROT_NONE` is never `Huge2M` (a reservation that `mprotect` will cut).
+- **`mprotect`/`munmap` cut VMAs** (`VmaList::split_at`, `remove_range`, `merge_adjacent`; only `Anonymous` neighbours are rejoined). `mprotect` leaves a read-only PTE read-only even when the VMA becomes writable: the first write goes through the COW path, which is what makes a zero-frame or shared page private. Lowering clears `WRITABLE`/`USER` in every present PTE at once. `fork` derives the child's PTEs from the VMA flags, so a test that forks first cannot see whether `mprotect` updated the parent's PTEs (`mprotect_test` maps and lowers inside the child for that).
 - **The address-space lock** (`AddressSpace::vmas`, an `IrqMutex`) covers every VMA lookup and every PTE change: faults, COW, fork's write-protect, `mmap`/`munmap`. A fault that finds its page already mapped (another thread won) counts as success.
   - Lock order: scheduler → address space → `BUDDY`/`SLAB_ALLOCATOR`.
   - Never touch user memory by virtual address while holding it: the fault would take the lock again.

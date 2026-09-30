@@ -321,6 +321,25 @@ impl OwnedPageTable {
         Ok(())
     }
 
+    /// `update_page_flags` for a 2 MiB leaf. Returns `Ok(false)` if the huge
+    /// page is not mapped (never touched), `Ok(true)` once its flags changed.
+    pub unsafe fn update_huge_page_flags(
+        &self,
+        page: Page<Size2MiB>,
+        flags: PageTableFlags,
+    ) -> Result<bool, &'static str> {
+        let mut mapper = self.create_mapper();
+        if mapper.translate_page(page).is_err() {
+            return Ok(false);
+        }
+        mapper
+            .update_flags(page, flags)
+            .map_err(|_| "update_huge_page_flags: failed")?
+            .ignore();
+        crate::memory::tlb::invalidate_page(self.pml4_phys(), page.start_address());
+        Ok(true)
+    }
+
     /// Unmap a single user page and free its backing physical frame.
     ///
     /// If the page is not mapped (not yet demand-paged), this is a no-op.

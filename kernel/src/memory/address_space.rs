@@ -25,6 +25,16 @@ pub enum FaultError {
     Failed(&'static str),
 }
 
+/// Why `AddressSpace::sys_mprotect` refused.
+pub enum MprotectError {
+    /// Misaligned address, unknown `prot` bits (`EINVAL`).
+    Invalid,
+    /// The range has a hole, or a VMA could not be split (`ENOMEM`).
+    NoMem,
+    /// A page table update failed halfway.
+    Failed(&'static str),
+}
+
 /// An address space's memory, in 4 KiB pages — `AddressSpace::mem_stats`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MemStats {
@@ -569,6 +579,7 @@ impl AddressSpace {
     /// If `addr != 0`: used as MAP_FIXED — must be page-aligned and non-overlapping.
     ///
     /// `prot` bits: PROT_READ=1, PROT_WRITE=2 (PROT_EXEC ignored — NX not enabled).
+    /// `PROT_NONE` (no bits) maps pages the user cannot touch at all.
     /// `length` is rounded up to the next page boundary.
     ///
     /// Returns the mapped virtual address on success.
@@ -584,15 +595,14 @@ impl AddressSpace {
             return Err("mmap: zero length");
         }
 
-        const PROT_WRITE: u32 = 2;
-        let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-        if prot & PROT_WRITE != 0 {
-            flags |= PageTableFlags::WRITABLE;
-        }
+        let flags = Self::prot_to_flags(prot);
 
         // ── Huge pages (2 MiB) for large allocations ──────────────────
+        // Not for PROT_NONE: that is a reservation (a thread stack with its
+        // guard, an allocator arena) that `mprotect` will cut into pieces,
+        // and a huge page cannot be cut below 2 MiB.
         const HUGE_2M: u64 = 0x200_000;
-        if length >= HUGE_2M {
+        if length >= HUGE_2M && prot & 7 != 0 {
             let length_aligned = (length + HUGE_2M - 1) & !(HUGE_2M - 1);
             let size_pages = (length_aligned / 4096) as usize; // in 4 KiB units
 
@@ -687,11 +697,7 @@ impl AddressSpace {
         if obj.mappings() >= super::shm::MAX_MAPPINGS {
             return Err("mmap: shared object mapped too many times");
         }
-        const PROT_WRITE: u32 = 2;
-        let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-        if prot & PROT_WRITE != 0 {
-            flags |= PageTableFlags::WRITABLE;
-        }
+        let flags = Self::prot_to_flags(prot);
         let size_pages = length.div_ceil(4096) as usize;
         self.vmas.with(|vmas| {
             let vaddr = if addr == 0 {
@@ -716,59 +722,139 @@ impl AddressSpace {
         })
     }
 
-    /// Unmap an anonymous region previously created by `sys_mmap_anon`.
+    /// Page-table flags of a mapping with the given `PROT_*` bits. Any of
+    /// read/write/exec makes the page user-accessible (x86 has no write-only
+    /// or exec-only page, and NX is off); none makes it `PROT_NONE`: present
+    /// but supervisor-only, so a user access faults and the fault handler
+    /// (which refuses to demand-map such a VMA) kills the process.
+    fn prot_to_flags(prot: u32) -> PageTableFlags {
+        const PROT_WRITE: u32 = 2;
+        let mut flags = PageTableFlags::PRESENT;
+        if prot & 7 != 0 {
+            flags |= PageTableFlags::USER_ACCESSIBLE;
+        }
+        if prot & PROT_WRITE != 0 {
+            flags |= PageTableFlags::WRITABLE;
+        }
+        flags
+    }
+
+    /// `[addr, addr + length)` as page-aligned bounds, or `None` if `addr`
+    /// is unaligned, the length is zero or the range wraps or leaves the
+    /// lower half.
+    fn page_range(addr: u64, length: u64) -> Option<(u64, u64)> {
+        if addr & 0xFFF != 0 || length == 0 {
+            return None;
+        }
+        let end = addr.checked_add(length.checked_add(4095)? & !4095)?;
+        (end <= 0x0000_8000_0000_0000).then_some((addr, end))
+    }
+
+    /// `munmap`: remove every mapping in `[addr, addr + length)`.
     ///
-    /// Currently requires an exact match on `addr` (the VMA start address).
-    /// The `length` must also match the VMA size, rounded up to pages.
-    /// Partial unmapping returns `Err`.
-    ///
-    /// For each page that was demand-paged (physically mapped), decrements
-    /// the COW refcount and frees the frame to Buddy if the count reaches zero.
+    /// The range need not match a mapping: VMAs it cuts through are split
+    /// (a `Huge2M` one only at a 2 MiB boundary), several may be removed at
+    /// once, and holes are fine (`munmap` of unmapped memory succeeds, as in
+    /// Linux). For each page that was demand-paged (physically mapped) the
+    /// COW refcount drops and the frame goes back to Buddy at zero.
     ///
     /// # Safety
     /// Must be called with interrupts disabled (cli).
     pub unsafe fn sys_munmap(&self, addr: u64, length: u64) -> Result<(), &'static str> {
-        if addr & 0xFFF != 0 {
-            return Err("munmap: addr not page-aligned");
-        }
-        if length == 0 {
-            return Err("munmap: zero length");
-        }
-
-        let size_pages = ((length + 4095) / 4096) as usize;
+        let (start, end) = Self::page_range(addr, length).ok_or("munmap: bad range")?;
         // Under the lock from the VMA removal to the last PTE: a sibling
         // thread's fault must not map a page of this range in between.
         self.vmas.with(|vmas| {
-            let vma = vmas.remove(addr).map_err(|_| "munmap: VMA not found")?;
-
-            if vma.size_pages != size_pages {
-                // Re-insert and signal partial munmap is unsupported.
-                let _ = vmas.add(vma);
-                return Err("munmap: partial unmap not supported");
-            }
-
-            match vma.kind {
-                // `Shared`: each PTE holds its own reference; the object's
-                // survives until `vma` (and with it the object) drops.
-                VmaKind::Anonymous | VmaKind::Code | VmaKind::GrowableStack | VmaKind::Shared => {
-                    for i in 0..vma.size_pages {
-                        let va = vma.start + i as u64 * 4096;
-                        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
-                        self.page_table.unmap_page_and_free(page)?;
+            vmas.split_at(start)?;
+            vmas.split_at(end)?;
+            for vma in vmas.remove_range(start, end) {
+                match vma.kind {
+                    // `Shared`: each PTE holds its own reference; the object's
+                    // survives until `vma` (and with it the object) drops.
+                    VmaKind::Anonymous | VmaKind::Code | VmaKind::GrowableStack | VmaKind::Shared => {
+                        for i in 0..vma.size_pages {
+                            let va = vma.start + i as u64 * 4096;
+                            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
+                            self.page_table.unmap_page_and_free(page)?;
+                        }
                     }
-                }
-                VmaKind::Huge2M => {
-                    // size_pages is in 4 KiB units; each huge page covers 512 of them.
-                    let n_huge = vma.size_pages / 512;
-                    for i in 0..n_huge {
-                        let va = vma.start + i as u64 * 0x200_000;
-                        let page = Page::<Size2MiB>::containing_address(VirtAddr::new(va));
-                        self.page_table.unmap_page_and_free_2m(page)?;
+                    VmaKind::Huge2M => {
+                        // size_pages is in 4 KiB units; each huge page covers 512 of them.
+                        let n_huge = vma.size_pages / 512;
+                        for i in 0..n_huge {
+                            let va = vma.start + i as u64 * 0x200_000;
+                            let page = Page::<Size2MiB>::containing_address(VirtAddr::new(va));
+                            self.page_table.unmap_page_and_free_2m(page)?;
+                        }
                     }
                 }
             }
-
             Ok(())
+        })
+    }
+
+    /// `mprotect`: change the protection of `[addr, addr + length)`.
+    ///
+    /// The range must be covered by VMAs without a hole (`NoMem` otherwise,
+    /// Linux's answer). VMAs it cuts through are split and the pieces get the
+    /// new flags; equal neighbours are joined again afterwards.
+    ///
+    /// For pages already mapped the PTE follows the VMA, except that a PTE
+    /// that is read-only stays so: it is a COW-shared or zero-frame page (or
+    /// a never-written one), and the first write fault gives it a private
+    /// frame through the normal COW path. So raising a range to writable
+    /// costs nothing and lowering it clears WRITABLE at once. `Shared`
+    /// pages have no COW: their PTE takes the VMA's flags as they are.
+    ///
+    /// # Safety
+    /// Interrupts disabled, like [`Self::sys_munmap`].
+    pub unsafe fn sys_mprotect(&self, addr: u64, length: u64, prot: u32) -> Result<(), MprotectError> {
+        if prot & !7 != 0 {
+            return Err(MprotectError::Invalid);
+        }
+        if length == 0 {
+            return if addr & 0xFFF == 0 { Ok(()) } else { Err(MprotectError::Invalid) };
+        }
+        let (start, end) = Self::page_range(addr, length).ok_or(MprotectError::Invalid)?;
+        let new_flags = Self::prot_to_flags(prot);
+
+        self.vmas.with(|vmas| {
+            if !vmas.covers(start, end) {
+                return Err(MprotectError::NoMem);
+            }
+            vmas.split_at(start).map_err(|_| MprotectError::NoMem)?;
+            vmas.split_at(end).map_err(|_| MprotectError::NoMem)?;
+
+            let mut result = Ok(());
+            vmas.for_each_in_range_mut(start, end, |vma| {
+                vma.flags = new_flags.bits();
+                if vma.kind == VmaKind::Huge2M {
+                    for i in 0..(vma.size_pages / 512) as u64 {
+                        let page = Page::<Size2MiB>::containing_address(VirtAddr::new(vma.start + i * 0x200_000));
+                        if let Err(e) = self.page_table.update_huge_page_flags(page, new_flags) {
+                            result = Err(MprotectError::Failed(e));
+                        }
+                    }
+                    return;
+                }
+                for i in 0..vma.size_pages as u64 {
+                    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vma.start + i * 4096));
+                    let pte = self.page_table.get_pte_raw(page);
+                    if pte & PageTableFlags::PRESENT.bits() == 0 {
+                        continue;
+                    }
+                    let flags = if vma.kind != VmaKind::Shared && pte & PageTableFlags::WRITABLE.bits() == 0 {
+                        new_flags & !PageTableFlags::WRITABLE
+                    } else {
+                        new_flags
+                    };
+                    if let Err(e) = self.page_table.update_page_flags(page, flags) {
+                        result = Err(MprotectError::Failed(e));
+                    }
+                }
+            });
+            vmas.merge_adjacent();
+            result
         })
     }
 
