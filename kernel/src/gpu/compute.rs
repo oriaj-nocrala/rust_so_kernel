@@ -329,8 +329,21 @@ fn launch(sub: &mut Sub, p: &mut Pramin, c: &Compute, shader: (&[u8], u8), cbuf0
     Ok((us, u32::from_le_bytes(w) == grid_payload))
 }
 
-pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, c: Compute) {
-    let Some(gv) = golden(r, rm, regs, &c) else { return };
+/// What `run` leaves running: the GR channel's doorbell token, where its GPFIFO ring stands (`GP_PUT`; every push of the boot was
+/// waited for) and the host page the semaphores are in.
+pub(super) struct Channel {
+    pub token: u32,
+    pub slot: u32,
+    pub host: DmaBuf,
+}
+
+fn fail(r: &mut String, why: core::fmt::Arguments) -> Option<Channel> {
+    stop(r, why);
+    None
+}
+
+pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, c: Compute) -> Option<Channel> {
+    let Some(gv) = golden(r, rm, regs, &c) else { return None };
     let _ = writeln!(r, "compute: going on with the golden context from variant \"{}\"", gv.name);
     let t0 = crate::cpu::tsc::read();
     let mut p = Pramin::new(regs);
@@ -381,7 +394,7 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, c: Compute) {
         Err(e) => {
             p.restore();
             let events = rm.drain(50);
-            return stop(r, format_args!("{}; RM events {:x?}", e, events));
+            return fail(r, format_args!("{}; RM events {:x?}", e, events));
         }
     };
     let ms = super::ms_since(t0);
@@ -401,7 +414,7 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, c: Compute) {
         Err(e) => {
             p.restore();
             let events = rm.drain(50);
-            return stop(r, format_args!("rung semaphore release: {}; RM events {:x?}", e, events));
+            return fail(r, format_args!("rung semaphore release: {}; RM events {:x?}", e, events));
         }
     }
 
@@ -416,7 +429,7 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, c: Compute) {
             let bad = got.chunks_exact(4).enumerate().find(|(i, w)| u32::from_le_bytes((*w).try_into().unwrap()) != data[*i]);
             if let Some((i, w)) = bad {
                 p.restore();
-                return stop(r, format_args!("rung inline write to host memory: the semaphore came but word {} is {:#x}, wanted {:#x}", i, u32::from_le_bytes(w.try_into().unwrap()), data[i]));
+                return fail(r, format_args!("rung inline write to host memory: the semaphore came but word {} is {:#x}, wanted {:#x}", i, u32::from_le_bytes(w.try_into().unwrap()), data[i]));
             }
             let _ = writeln!(r, "compute: rung inline write 64 B -> host memory: OK in {} us, 16 words verified", us);
             RUNGS.store(2, Ordering::Relaxed);
@@ -424,7 +437,7 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, c: Compute) {
         Err(e) => {
             p.restore();
             let events = rm.drain(50);
-            return stop(r, format_args!("rung inline write to host memory: {}; RM events {:x?}", e, events));
+            return fail(r, format_args!("rung inline write to host memory: {}; RM events {:x?}", e, events));
         }
     }
 
@@ -441,7 +454,7 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, c: Compute) {
             Err(e) => {
                 p.restore();
                 let events = rm.drain(50);
-                return stop(r, format_args!("rung inline write to VRAM, chunk {}: {}; RM events {:x?}", k, e, events));
+                return fail(r, format_args!("rung inline write to VRAM, chunk {}: {}; RM events {:x?}", k, e, events));
             }
         }
     }
@@ -451,7 +464,7 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, c: Compute) {
     });
     if let Some((i, got)) = bad {
         p.restore();
-        return stop(r, format_args!("rung inline write to VRAM: the semaphores came but word {} is {:#x}, wanted {:#x}", i, got, data[i]));
+        return fail(r, format_args!("rung inline write to VRAM: the semaphores came but word {} is {:#x}, wanted {:#x}", i, got, data[i]));
     }
     let _ = writeln!(r, "compute: rung inline write 4 KiB -> VRAM: OK in {} us ({} pushes), 1024 words verified through PRAMIN", us, 1024 / gr::INLINE_CHUNK_WORDS);
     RUNGS.store(3, Ordering::Relaxed);
@@ -482,7 +495,7 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, c: Compute) {
                 }
                 p.restore();
                 let events = rm.drain(50);
-                return stop(r, format_args!("rung shader -> host memory: the semaphore came ({} us, grid release {}) but {}; {}; RM events {:x?}", us, if grid { "seen" } else { "NOT seen" }, why, if late { "the words did arrive within 20 ms (the release overtook the stores)" } else { "still wrong after 20 ms" }, events));
+                return fail(r, format_args!("rung shader -> host memory: the semaphore came ({} us, grid release {}) but {}; {}; RM events {:x?}", us, if grid { "seen" } else { "NOT seen" }, why, if late { "the words did arrive within 20 ms (the release overtook the stores)" } else { "still wrong after 20 ms" }, events));
             }
             let _ = writeln!(r, "compute: rung shader -> host memory: OK in {} us, {} words written by {} CTAs verified, the other {} untouched, the grid's own release {}", us, qmd::FILL_WORDS, qmd::FILL_CTAS, 1024 - qmd::FILL_WORDS, if grid { "seen" } else { "NOT seen" });
             RUNGS.store(4, Ordering::Relaxed);
@@ -490,7 +503,7 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, c: Compute) {
         Err(e) => {
             p.restore();
             let events = rm.drain(50);
-            return stop(r, format_args!("rung shader -> host memory: {}; RM events {:x?}", e, events));
+            return fail(r, format_args!("rung shader -> host memory: {}; RM events {:x?}", e, events));
         }
     }
 
@@ -511,7 +524,7 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, c: Compute) {
         Err(e) => {
             p.restore();
             let events = rm.drain(50);
-            return stop(r, format_args!("rung shader -> VRAM: {}; RM events {:x?}", e, events));
+            return fail(r, format_args!("rung shader -> VRAM: {}; RM events {:x?}", e, events));
         }
     };
     c.kern.copy_in(gr::KERN_OUT_OFF as usize, &scribble);
@@ -525,7 +538,7 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, c: Compute) {
             if let Some(why) = check_output(&mut host_word, qmd::fill_word) {
                 p.restore();
                 let events = rm.drain(50);
-                return stop(r, format_args!("rung GPU read of the VRAM page: {} (the shader -> VRAM launch took {} us); RM events {:x?}", why, vram_us, events));
+                return fail(r, format_args!("rung GPU read of the VRAM page: {} (the shader -> VRAM launch took {} us); RM events {:x?}", why, vram_us, events));
             }
             let _ = writeln!(r, "compute: rung shader -> VRAM, read back by the GPU: OK in {} us: a second shader reads the page and the host page holds the {} words, the other {} untouched (grid release {})", us, qmd::FILL_WORDS, 1024 - qmd::FILL_WORDS, if grid { "seen" } else { "NOT seen" });
             RUNGS.store(5, Ordering::Relaxed);
@@ -533,7 +546,7 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, c: Compute) {
         Err(e) => {
             p.restore();
             let events = rm.drain(50);
-            return stop(r, format_args!("rung GPU read of the VRAM page: {}; RM events {:x?}", e, events));
+            return fail(r, format_args!("rung GPU read of the VRAM page: {}; RM events {:x?}", e, events));
         }
     }
 
@@ -605,8 +618,12 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, c: Compute) {
     p.restore();
     STATE.store(1, Ordering::Relaxed);
     let _ = writeln!(r, "compute: OK: the GR pipeline ran a semaphore release, two inline writes and a compute shader (to host memory and to VRAM) through the compute class");
-    // The channel, its memory and the mappings stay: RM and the GPU own them now.
-    core::mem::forget(c);
+    // The channel, its memory and the mappings stay: RM and the GPU own them now. The host page (the fence semaphore of
+    // `gpu=uapi` is in it) and the ring's position go on to `uapi::install`.
+    let slot = sub.slot;
+    let Compute { host, kern, mthd_golden, mthd_chan, .. } = c;
+    core::mem::forget((kern, mthd_golden, mthd_chan));
+    Some(Channel { token, slot, host })
 }
 
 /// One way of asking for the golden context. Boot #126 (`gpu=compute`, the first run) got `NV_ERR_INVALID_ARGUMENT` from

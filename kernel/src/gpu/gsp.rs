@@ -204,7 +204,7 @@ impl Firmware {
     }
 }
 
-pub fn setup(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8), full: bool, vaspace: bool, copy: bool, compute: bool, pci: PciInfo) {
+pub fn setup(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8), full: bool, vaspace: bool, copy: bool, compute: bool, uapi: bool, pci: PciInfo) {
     let Some((bios, _)) = super::VBIOS.get() else {
         stop(r, format_args!("no VBIOS (gpu=disp did not read it)"));
         return;
@@ -391,7 +391,7 @@ pub fn setup(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8), full: bool, vaspace
     }
 
     if let (Some(mem), Some((fwset, _))) = (mem, prepared) {
-        boot_gsp(r, regs, &fwset, mem, vaspace, copy, compute);
+        boot_gsp(r, regs, &fwset, mem, vaspace, copy, compute, uapi);
     }
 }
 
@@ -574,7 +574,7 @@ fn build_memory(r: &mut String, fw: &Firmware, layout: &gspmem::FbLayout, gsp: &
 
 /// Phase 4e, after FRTS: reset the GSP into RISC-V mode, give it the LibOS
 /// address, run the booter on SEC2, check the RISC-V core.
-fn boot_gsp(r: &mut String, regs: &Bar0, fw: &Firmware, mut mem: Memory, vaspace: bool, copy: bool, compute: bool) {
+fn boot_gsp(r: &mut String, regs: &Bar0, fw: &Firmware, mut mem: Memory, vaspace: bool, copy: bool, compute: bool, uapi: bool) {
     use nvgpu::booter;
     let gsp = falcon::GSP;
     let b = match Booter::parse(&fw.booter) {
@@ -645,7 +645,7 @@ fn boot_gsp(r: &mut String, regs: &Bar0, fw: &Firmware, mut mem: Memory, vaspace
 
     // Phase 4f: GSP-RM boots on its own, asking the host for register work
     // (RUN_CPU_SEQUENCER) until it says INIT_DONE; then the static configuration.
-    rpc_phase(r, regs, &mut mem, vaspace, copy, compute);
+    rpc_phase(r, regs, &mut mem, vaspace, copy, compute, uapi);
 
     // Then see whether it wrote its logs.
     for _ in 0..50 {
@@ -891,7 +891,7 @@ fn seq_env(regs: &Bar0, mem: &Memory) -> rpc::SeqEnv {
 }
 
 /// Phase 4f: wait for INIT_DONE, then GET_GSP_STATIC_INFO for the GPU's name.
-fn rpc_phase(r: &mut String, regs: &Bar0, mem: &mut Memory, vaspace: bool, copy: bool, compute: bool) {
+fn rpc_phase(r: &mut String, regs: &Bar0, mem: &mut Memory, vaspace: bool, copy: bool, compute: bool, uapi: bool) {
     let shm = ShmBuf(&mem.shm);
     let env = seq_env(regs, mem);
     let mut seen = alloc::vec::Vec::new();
@@ -955,7 +955,7 @@ fn rpc_phase(r: &mut String, regs: &Bar0, mem: &mut Memory, vaspace: bool, copy:
 
     // Phase 6b: a GPU virtual address space for that client.
     if vaspace {
-        super::vaspace::setup(r, regs, &mut rm, copy, compute);
+        super::vaspace::setup(r, regs, &mut rm, copy, compute, uapi);
     }
 }
 
@@ -1026,7 +1026,7 @@ impl Rm<'_> {
 pub fn render_kdebug() -> String {
     let base = render_gsp_kdebug();
     let mut out = base;
-    for v in [super::vaspace::render_kdebug(), super::copy::render_kdebug(), super::compute::render_kdebug(), super::bench::render_kdebug(), super::intr::render_kdebug(), super::copy::render_irq_kdebug(), super::copy::render_fault_kdebug(), render_runtime_kdebug()] {
+    for v in [super::vaspace::render_kdebug(), super::copy::render_kdebug(), super::compute::render_kdebug(), super::uapi::render_kdebug(), super::bench::render_kdebug(), super::intr::render_kdebug(), super::copy::render_irq_kdebug(), super::copy::render_fault_kdebug(), render_runtime_kdebug()] {
         if !v.is_empty() {
             out += "\n";
             out += &v;

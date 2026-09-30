@@ -121,6 +121,9 @@ pub enum GpuLevel {
     /// Phase 7a: also a GR channel with a golden context and the Ampere compute
     /// class, and a semaphore release and inline writes through it. Implies `copy`.
     Compute,
+    /// G4c: also keep that GR channel and the GPU page tables for `/dev/nvgpu`: user space binds its own buffers at run time and
+    /// submits pushes to the channel (`kernel/src/gpu/uapi.rs`). Implies `compute`.
+    Uapi,
 }
 
 impl GpuLevel {
@@ -146,6 +149,7 @@ impl GpuLevel {
             "vaspace" => Some(GpuLevel::Vaspace),
             "copy" => Some(GpuLevel::Copy),
             "compute" => Some(GpuLevel::Compute),
+            "uapi" => Some(GpuLevel::Uapi),
             _ => None,
         }
     }
@@ -203,6 +207,8 @@ mod tests {
         assert!(GpuLevel::Copy > GpuLevel::Vaspace);
         assert_eq!(GpuLevel::parse("compute"), Some(GpuLevel::Compute));
         assert!(GpuLevel::Compute > GpuLevel::Copy);
+        assert_eq!(GpuLevel::parse("uapi"), Some(GpuLevel::Uapi));
+        assert!(GpuLevel::Uapi > GpuLevel::Compute);
         assert!(GpuLevel::Vpll > GpuLevel::Super);
         assert!(GpuLevel::Super > GpuLevel::Scanout && GpuLevel::Scanout > GpuLevel::Chan);
         assert!(GpuLevel::Chan > GpuLevel::Dispstate && GpuLevel::Dispstate > GpuLevel::Vblank);

@@ -276,6 +276,77 @@ mod tests {
         assert_eq!(bytes(&got).len(), QMD_BYTES);
     }
 
+    // ---- the C side of the /dev/nvgpu hardware test (userspace/c/nvgpu_qmd.h, nvgpu_shaders.h) ----
+
+    const C_HEADER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../userspace/c/nvgpu_qmd.h");
+    const C_SHADERS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../userspace/c/nvgpu_shaders.h");
+
+    /// The launches the C header is compared on: the oracle's, and ones that move every field it sets.
+    fn c_launches() -> Vec<Launch> {
+        let mut v = vec![fill_launch()];
+        v.push(Launch { program: 0x1_0000_0080, registers: 16, grid: [1, 1, 1], block: [1, 1, 1], smem: 0, local: 0, cbuf0: (0x12_3456_7000, 0x10), release: None });
+        v.push(Launch { program: 0x40_0000_0000 + 0x100, registers: 255, grid: [65535, 3, 7], block: [16, 8, 4], smem: 0, local: 0, cbuf0: (0xff_ffff_f000, 0x1ff0), release: Some((0xab_cdef_0010, 0xdead_beef)) });
+        v.push(Launch { program: 0x2000_0000, registers: 40, grid: [0x7fff_ffff, 1, 1], block: [1024, 1, 1], smem: 0, local: 0, cbuf0: (0x2_0000_0000, 0x200), release: Some((0x3_8004_2010, 0x4242)) });
+        v
+    }
+
+    fn run_clang(dir: &std::path::Path, src: &str) -> String {
+        let c = dir.join("t.c");
+        std::fs::write(&c, src).unwrap();
+        let exe = dir.join("t");
+        let out = std::process::Command::new("clang").arg("-w").arg("-o").arg(&exe).arg(&c).output().expect("clang is needed for the C oracle tests (the repo builds C anyway)");
+        assert!(out.status.success(), "clang: {}", String::from_utf8_lossy(&out.stderr));
+        let run = std::process::Command::new(&exe).output().unwrap();
+        assert!(run.status.success());
+        String::from_utf8(run.stdout).unwrap()
+    }
+
+    #[test]
+    fn the_c_header_builds_the_same_words_as_the_rust_qmd() {
+        let launches = c_launches();
+        let mut src = format!("#include <stdio.h>\n#include \"{}\"\nint main(void) {{ uint32_t q[64]; struct nvg_qmd_launch l;\n", C_HEADER);
+        for l in &launches {
+            let (rel, pay) = l.release.unwrap_or((0, 0));
+            src += &format!(
+                "l = (struct nvg_qmd_launch){{ .program = {}ull, .registers = {}, .grid = {{{}, {}, {}}}, .block = {{{}, {}, {}}}, .cbuf0 = {}ull, .cbuf0_size = {}, .release = {}ull, .release_payload = {} }};\nnvg_qmd_build(q, &l); for (int i = 0; i < 64; i++) printf(\"%08x\\n\", q[i]);\n",
+                l.program, l.registers, l.grid[0], l.grid[1], l.grid[2], l.block[0], l.block[1], l.block[2], l.cbuf0.0, l.cbuf0.1, rel, pay
+            );
+        }
+        src += "return 0; }\n";
+        let dir = std::env::temp_dir().join(format!("nvgpu-qmd-c-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = run_clang(&dir, &src);
+        let words: Vec<u32> = out.lines().map(|l| u32::from_str_radix(l, 16).unwrap()).collect();
+        assert_eq!(words.len(), launches.len() * QMD_WORDS);
+        for (n, l) in launches.iter().enumerate() {
+            let want = build(l);
+            for i in 0..QMD_WORDS {
+                assert_eq!(words[n * QMD_WORDS + i], want[i], "launch {} word {}", n, i);
+            }
+        }
+        // and the first is the oracle's (`nvgpu/gen/qmd.c`, from NVIDIA's header)
+        let oracle = oracle();
+        for i in 0..QMD_WORDS {
+            assert_eq!(words[i], oracle[i], "oracle word {}", i);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn c_array(name: &str) -> Vec<u8> {
+        let text = std::fs::read_to_string(C_SHADERS).unwrap();
+        let start = text.find(&format!("nvg_shader_{}[", name)).unwrap_or_else(|| panic!("nvg_shader_{} is not in {}", name, C_SHADERS));
+        let body = &text[text[start..].find('{').unwrap() + start + 1..];
+        let body = &body[..body.find('}').unwrap()];
+        body.split(',').map(str::trim).filter(|x| !x.is_empty()).map(|x| u8::from_str_radix(x.trim_start_matches("0x"), 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn the_c_test_carries_the_kernels_shaders() {
+        assert_eq!(c_array("fill"), FILL, "userspace/c/nvgpu_shaders.h is stale: run scripts/gen-nvgpu-shader-header.py");
+        assert_eq!(c_array("copy"), COPY, "userspace/c/nvgpu_shaders.h is stale: run scripts/gen-nvgpu-shader-header.py");
+        assert_eq!(c_array("fillwt"), FILLWT, "userspace/c/nvgpu_shaders.h is stale: run scripts/gen-nvgpu-shader-header.py");
+    }
+
     const FIELDS: &str = include_str!("../fixtures/qmd-fields.txt");
 
     /// `NAME hi lo` of the header, or `NAME value` for an enum.

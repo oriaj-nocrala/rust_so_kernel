@@ -11,9 +11,10 @@
 //   it, so `mmap(fd, bo.mmap_offset)` maps that BO like any shared mapping, and `BO_FREE` gives its pages back (`discard`).
 // - **Nothing blocks.** `SYNC_WAIT`, and an `EXEC` whose waits are not satisfied, return `EAGAIN`; the caller sleeps and retries
 //   (`sys_ioctl` calls in with the fd-table lock held, so parking here would stall the process's other threads; see the plan).
-// - **Today the device is a software one** (`NVG_INFO_SOFTWARE`): memory and bookkeeping are real, execution completes at
-//   once without running anything. It exists so the whole user-space stack can be built and tested in QEMU, which has no GPU. The
-//   hardware backend replaces `KernelBackend` behind the same interface (G4c).
+// - **Two devices behind one interface.** With `gpu=uapi` and a GPU that came up (`gpu::uapi::installed`), BOs bind into the GPU's
+//   page tables and an `EXEC` runs on its GR channel (G4c, `gpu/uapi.rs`); the fences are the GPU's. Otherwise the device is a
+//   software one (`NVG_INFO_SOFTWARE`): memory and bookkeeping are real, execution completes at once without running anything, so the
+//   whole user-space stack can be built and tested in QEMU, which has no GPU. `KernelBackend::hw` says which.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -25,6 +26,7 @@ use nvgpu::devmodel::{Backend, Backing, Device, Error, Layout, SoftBackend};
 use nvgpu::uapi::{self, Push, SyncRef};
 
 use crate::fs::types::{Errno, Stat};
+use crate::gpu;
 use crate::memory::shm::ShmObject;
 use crate::process::file::{FileError, FileHandle, FileResult};
 use crate::process::syscall::{errno, validate_user_buffer};
@@ -33,6 +35,8 @@ use crate::process::syscall::{errno, validate_user_buffer};
 const ARENA_BYTES: u64 = 1 << 30;
 /// The software device's pretend VRAM.
 const SOFT_VRAM_BYTES: u64 = 6 << 30;
+/// What the hardware device offers: the user heap of `nvgpu::hwq` (VRAM the kernel does not use).
+const HW_VRAM_BYTES: u64 = nvgpu::hwq::USER_VRAM_BYTES;
 /// GPU virtual addresses user space may allocate: [64 GiB, 256 GiB). Below 2^40 because some methods take 40-bit addresses
 /// (`SET_VERTEX_STREAM_SUBSTITUTE_A` keeps the upper part in 8 bits; nouveau's own heap ends at 2^38), and above the fixed
 /// mappings the boot-time GPU code makes (4 GiB, 8 GiB..).
@@ -41,10 +45,12 @@ const VA_END: u64 = 1 << 38;
 
 static HELD: AtomicBool = AtomicBool::new(false);
 
-/// `SoftBackend`'s bookkeeping plus the arena, whose pages a released system BO gives back.
+/// The arena, whose pages a released system BO gives back, plus either `SoftBackend`'s bookkeeping or the GPU (`gpu::uapi`).
 struct KernelBackend {
     soft: SoftBackend,
     arena: Arc<ShmObject>,
+    /// A GPU is behind this session: page tables, the channel and the fences are its.
+    hw: bool,
 }
 
 impl Backend for KernelBackend {
@@ -54,20 +60,32 @@ impl Backend for KernelBackend {
 
     fn bo_release(&mut self, backing: Backing, size: u64) {
         if let Backing::System { arena_off } = backing {
-            self.arena.discard(arena_off, size);
+            // a wedged GPU may still write to these pages: they stay allocated
+            if !(self.hw && gpu::uapi::leaking()) {
+                self.arena.discard(arena_off, size);
+            }
         }
         self.soft.bo_release(backing, size);
     }
 
     fn bind(&mut self, va: u64, size: u64, backing: Backing, bo_off: u64, pte_kind: u32) -> Result<(), Error> {
+        if self.hw {
+            gpu::uapi::bind(&self.arena, va, size, backing, bo_off, pte_kind)?;
+        }
         self.soft.bind(va, size, backing, bo_off, pte_kind)
     }
 
     fn unbind(&mut self, va: u64, size: u64) {
+        if self.hw {
+            gpu::uapi::unbind(va, size);
+        }
         self.soft.unbind(va, size);
     }
 
     fn ctx_create(&mut self, ctx: u32, engines: u32) -> Result<(), Error> {
+        if self.hw {
+            gpu::uapi::ctx_create(engines)?;
+        }
         self.soft.ctx_create(ctx, engines)
     }
 
@@ -76,22 +94,38 @@ impl Backend for KernelBackend {
     }
 
     fn submit(&mut self, ctx: u32, pushes: &[Push]) -> Result<u64, Error> {
+        if self.hw {
+            // the model's fence numbers are the GPU's; the soft log is not kept
+            return gpu::uapi::submit(pushes);
+        }
         self.soft.submit(ctx, pushes)
     }
 
     fn fence_done(&mut self, ctx: u32, seq: u64) -> bool {
+        if self.hw {
+            return gpu::uapi::fence_done(seq);
+        }
         self.soft.fence_done(ctx, seq)
+    }
+
+    fn quiesce(&mut self) -> bool {
+        !self.hw || gpu::uapi::quiesce()
     }
 }
 
 struct Session {
     dev: crate::sync::Mutex<Device<KernelBackend>>,
     arena: Arc<ShmObject>,
+    hw: bool,
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        self.dev.lock().teardown();
+        let quiet = self.dev.lock().teardown();
+        if !quiet {
+            // the GPU did not go idle: it may still be writing into the arena's pages, so they are never freed
+            core::mem::forget(self.arena.clone());
+        }
         HELD.store(false, Ordering::SeqCst);
     }
 }
@@ -104,15 +138,21 @@ pub fn open() -> Result<Box<dyn FileHandle>, Errno> {
     if HELD.swap(true, Ordering::SeqCst) {
         return Err(Errno::EBUSY);
     }
+    // a GPU that came up and then died is not replaced by a software device behind the caller's back
+    let hw = gpu::uapi::installed();
+    if hw && gpu::uapi::dead() {
+        HELD.store(false, Ordering::SeqCst);
+        return Err(Errno::EIO);
+    }
     let arena = Arc::new(ShmObject::with_limit(ARENA_BYTES));
     if arena.set_size(ARENA_BYTES).is_err() {
         HELD.store(false, Ordering::SeqCst);
         return Err(Errno::ENOMEM);
     }
-    let layout = Layout { arena_bytes: ARENA_BYTES, vram_bytes: SOFT_VRAM_BYTES, va_start: VA_START, va_end: VA_END };
-    let backend = KernelBackend { soft: SoftBackend::default(), arena: arena.clone() };
+    let layout = Layout { arena_bytes: ARENA_BYTES, vram_bytes: if hw { HW_VRAM_BYTES } else { SOFT_VRAM_BYTES }, va_start: VA_START, va_end: VA_END };
+    let backend = KernelBackend { soft: SoftBackend::default(), arena: arena.clone(), hw };
     let dev = Device::new(backend, layout);
-    Ok(Box::new(NvgpuHandle { session: Arc::new(Session { dev: crate::sync::Mutex::new(dev), arena }) }))
+    Ok(Box::new(NvgpuHandle { session: Arc::new(Session { dev: crate::sync::Mutex::new(dev), arena, hw }) }))
 }
 
 // ---- user memory ----------------------------------------------------------------------------------------------------------
@@ -158,18 +198,20 @@ fn errno_of(e: Error) -> i64 {
         Error::Busy => errno::EBUSY,
         Error::Exist => errno::EEXIST,
         Error::Fault => errno::EFAULT,
+        Error::Again => errno::EAGAIN,
+        Error::Io => errno::EIO,
     }
 }
 
-fn info(vram_used: u64) -> uapi::Info {
+fn info(vram_used: u64, hw: bool) -> uapi::Info {
     let mut name = [0u8; 64];
-    let n = b"constanos software GPU (GA106 model)";
+    let n: &[u8] = if hw { b"NVIDIA GeForce RTX 3050 (constanos)" } else { b"constanos software GPU (GA106 model)" };
     name[..n.len()].copy_from_slice(n);
     let mut chip = [0u8; 16];
     chip[..5].copy_from_slice(b"GA106");
     uapi::Info {
         abi_version: uapi::ABI_VERSION,
-        flags: uapi::INFO_SOFTWARE,
+        flags: if hw { 0 } else { uapi::INFO_SOFTWARE },
         device_id: 0x2504,
         chipset: 0x196,
         sm: 86,
@@ -189,7 +231,7 @@ fn info(vram_used: u64) -> uapi::Info {
         cls_gpfifo: 0xc56f,
         cls_vdec: 0,
         max_smem_per_wg_kb: 99,
-        vram_size_b: SOFT_VRAM_BYTES,
+        vram_size_b: if hw { HW_VRAM_BYTES } else { SOFT_VRAM_BYTES },
         vram_used_b: vram_used,
         bar_size_b: 0,
         va_start: VA_START,
@@ -206,7 +248,7 @@ impl NvgpuHandle {
         let mut dev = self.session.dev.lock();
         match request {
             uapi::IOC_INFO => {
-                write_user(arg, info(dev.vram_used()))?;
+                write_user(arg, info(dev.vram_used(), self.session.hw))?;
             }
             uapi::IOC_BO_CREATE => {
                 let mut r: uapi::BoCreate = read_user(arg)?;
@@ -307,6 +349,11 @@ impl NvgpuHandle {
                 write_user(arg, r)?;
             }
             uapi::IOC_TIMESTAMP => {
+                if self.session.hw {
+                    let ns = gpu::uapi::timestamp_ns().ok_or(errno::EIO)?;
+                    write_user(arg, uapi::Timestamp { ns })?;
+                    return Ok(0);
+                }
                 let hz = crate::cpu::tsc::freq_hz().max(1);
                 let ticks = crate::cpu::tsc::read() as u128;
                 write_user(arg, uapi::Timestamp { ns: (ticks * 1_000_000_000 / hz as u128) as u64 })?;

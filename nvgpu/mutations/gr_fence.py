@@ -1,0 +1,9 @@
+# Mutations of the kernel's fence push (G4c): it must wait for idle, then release, on the compute subchannel.
+#   scripts/gpu-mutate.py nvgpu/src/gr.rs gr:: nvgpu/mutations/gr_fence.py
+M = [
+    ("pub fn fence_push(sem_va: u64, payload: u32) -> Vec<u32> {\n    let mut w = Vec::new();\n    w.extend(set_object());\n    w.push(incr_header(SUBCH_COMPUTE, C_WAIT_FOR_IDLE, 1));\n    w.push(0);\n    report_semaphore(&mut w, sem_va, payload);", "pub fn fence_push(sem_va: u64, payload: u32) -> Vec<u32> {\n    let mut w = Vec::new();\n    w.extend(set_object());\n    report_semaphore(&mut w, sem_va, payload);\n    w.push(incr_header(SUBCH_COMPUTE, C_WAIT_FOR_IDLE, 1));\n    w.push(0);"),
+    ("pub fn fence_push(sem_va: u64, payload: u32) -> Vec<u32> {\n    let mut w = Vec::new();\n    w.extend(set_object());\n    w.push(incr_header(SUBCH_COMPUTE, C_WAIT_FOR_IDLE, 1));", "pub fn fence_push(sem_va: u64, payload: u32) -> Vec<u32> {\n    let mut w = Vec::new();\n    w.push(incr_header(SUBCH_COMPUTE, C_WAIT_FOR_IDLE, 1));"),
+    ("    w.push(incr_header(SUBCH_COMPUTE, C_WAIT_FOR_IDLE, 1));\n    w.push(0);\n    report_semaphore(&mut w, sem_va, payload);\n    w\n}\n\n/// The size of [`fence_push`]", "    w.push(incr_header(SUBCH_COMPUTE, C_WAIT_FOR_IDLE, 1));\n    w.push(1);\n    report_semaphore(&mut w, sem_va, payload);\n    w\n}\n\n/// The size of [`fence_push`]"),
+    ("    w.push(incr_header(SUBCH_COMPUTE, C_WAIT_FOR_IDLE, 1));\n    w.push(0);\n    report_semaphore(&mut w, sem_va, payload);\n    w\n}\n\n/// The size of [`fence_push`]", "    w.push(incr_header(SUBCH_COMPUTE, C_WAIT_FOR_IDLE, 1));\n    w.push(0);\n    report_semaphore(&mut w, sem_va, payload.wrapping_add(1));\n    w\n}\n\n/// The size of [`fence_push`]"),
+    ("pub const FENCE_PUSH_BYTES: u32 = 36;", "pub const FENCE_PUSH_BYTES: u32 = 40;"),
+]

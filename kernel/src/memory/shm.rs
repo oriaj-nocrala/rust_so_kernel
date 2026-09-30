@@ -92,6 +92,12 @@ fn release_frame(frame: PhysFrame) {
     }
 }
 
+/// Give back a reference `frame_for_mapping` took for something that is not a process's PTE (the GPU's page tables, `gpu/uapi.rs`),
+/// identified by the frame's physical address.
+pub fn unpin_frame(pa: u64) {
+    release_frame(PhysFrame::containing_address(x86_64::PhysAddr::new(pa)));
+}
+
 impl ShmObject {
     pub const fn new() -> Self {
         Self {

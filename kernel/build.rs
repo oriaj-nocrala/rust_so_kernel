@@ -118,6 +118,7 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "link_test",
     "poll_file_test",
     "nvgpu_sw_test",
+    "nvgpu_hw_test",
     "vmshare_test",
     "seqpacket_test",
     "ext2_robust_test",

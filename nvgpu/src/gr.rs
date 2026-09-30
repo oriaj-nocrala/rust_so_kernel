@@ -541,6 +541,20 @@ pub fn dispatch_push(qmd_va: u64, sem_va: u64, payload: u32) -> Vec<u32> {
     w
 }
 
+/// The fence the kernel appends to every `EXEC` (G4c, `hwq::Queue`): bind the compute object, wait for the GR engine to go idle
+/// (what a user push's stores must have finished before the release) and release `payload` at `sem_va` (host memory).
+pub fn fence_push(sem_va: u64, payload: u32) -> Vec<u32> {
+    let mut w = Vec::new();
+    w.extend(set_object());
+    w.push(incr_header(SUBCH_COMPUTE, C_WAIT_FOR_IDLE, 1));
+    w.push(0);
+    report_semaphore(&mut w, sem_va, payload);
+    w
+}
+
+/// The size of [`fence_push`] in bytes.
+pub const FENCE_PUSH_BYTES: u32 = 36;
+
 // `clc56f.h`: the channel's memory operations, host methods (below 0x100, executed by the PBDMA, whatever the subchannel).
 const H_MEM_OP_A: u32 = 0x28;
 const MEM_OP_D_OPERATION_SHIFT: u32 = 27;
@@ -982,6 +996,17 @@ mod tests {
         assert_eq!(incr_header(0, 0x28, 4), 0x2004_000a);
         assert_eq!(w[7..], [incr_header(1, 0x1b00, 4), 3, 0x8004_2000, 0x77, 1 << 28]);
         assert!(w.len() * 4 <= PUSH_BYTES);
+    }
+
+    #[test]
+    fn the_kernels_fence_waits_for_idle_then_releases() {
+        let w = fence_push(0x3_8000_1000, 0xabcd);
+        assert_eq!(w.len() as u32 * 4, FENCE_PUSH_BYTES);
+        assert_eq!(w[..2], [incr_header(1, 0, 1), 0xc7c0]);
+        // WAIT_FOR_IDLE (0x110), then the release: the order is the whole point, a release first would overtake the shader's stores
+        assert_eq!(w[2..4], [incr_header(1, 0x110, 1), 0]);
+        assert_eq!(w[4..], [incr_header(1, 0x1b00, 4), 3, 0x8000_1000, 0xabcd, 1 << 28]);
+        assert!(FENCE_PUSH_BYTES as usize <= 64, "a fence slot is 64 bytes");
     }
 
     #[test]

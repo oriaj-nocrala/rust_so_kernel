@@ -131,6 +131,8 @@ pub struct PageTables {
     capacity: usize,
     target: Target,
     tables: Vec<[u8; TABLE_SIZE]>,
+    /// Tables written since the adapter last copied them out ([`PageTables::take_dirty`]): a run-time bind touches a few.
+    dirty: Vec<bool>,
 }
 
 /// The address a PDE points to: bits 55:4 hold `addr >> 4` (bits 3:0 are the aperture and VOL; a big-page table is
@@ -158,7 +160,7 @@ impl PageTables {
     pub fn new(base: u64, capacity: usize, target: Target) -> Self {
         // a PDE of 0 means "absent", so no table can be at physical address 0
         assert!(base != 0 && base % TABLE_SIZE as u64 == 0 && capacity >= 1);
-        PageTables { base, capacity, target, tables: vec![[0u8; TABLE_SIZE]] }
+        PageTables { base, capacity, target, tables: vec![[0u8; TABLE_SIZE]], dirty: vec![true] }
     }
 
     /// The physical address of the root (`SET_PAGE_DIRECTORY.physAddress`).
@@ -176,6 +178,25 @@ impl PageTables {
     pub fn images(&self) -> impl Iterator<Item = (u64, &[u8; TABLE_SIZE])> {
         let base = self.base;
         self.tables.iter().enumerate().map(move |(i, t)| (base + (i * TABLE_SIZE) as u64, t))
+    }
+
+    /// Write one entry and remember that its table changed.
+    fn put(&mut self, table: usize, at: usize, v: u64) {
+        wr64(&mut self.tables[table], at, v);
+        self.dirty[table] = true;
+    }
+
+    /// The tables written since the last call (a fresh tree reports all of them), in pool order, each with its physical
+    /// address and image: what the adapter copies into VRAM after a bind or an unbind. The root is table 0.
+    pub fn take_dirty(&mut self) -> Vec<(u64, [u8; TABLE_SIZE])> {
+        let base = self.base;
+        let mut out = Vec::new();
+        for (i, d) in self.dirty.iter_mut().enumerate() {
+            if core::mem::take(d) {
+                out.push((base + (i * TABLE_SIZE) as u64, self.tables[i]));
+            }
+        }
+        out
     }
 
     fn table_at(&self, pa: u64) -> Option<usize> {
@@ -197,8 +218,9 @@ impl PageTables {
         }
         let i = self.tables.len();
         self.tables.push([0u8; TABLE_SIZE]);
+        self.dirty.push(true);
         let pa = self.base + (i * TABLE_SIZE) as u64;
-        wr64(&mut self.tables[parent], at, pde(pa, self.target));
+        self.put(parent, at, pde(pa, self.target));
         Ok(i)
     }
 
@@ -225,7 +247,7 @@ impl PageTables {
         if rd64(&self.tables[t], at) != 0 {
             return Err(MapError::AlreadyMapped);
         }
-        wr64(&mut self.tables[t], at, pte(pa, target, f));
+        self.put(t, at, pte(pa, target, f));
         Ok(())
     }
 
@@ -266,7 +288,7 @@ impl PageTables {
         if rd64(&self.tables[t], at) != 0 {
             return Err(MapError::AlreadyMapped);
         }
-        wr64(&mut self.tables[t], at, pte(pa, target, f));
+        self.put(t, at, pte(pa, target, f));
         Ok(())
     }
 
@@ -305,7 +327,7 @@ impl PageTables {
         if rd64(&self.tables[t], at + PD0_SMALL) != 0 {
             return Err(MapError::Overlap);
         }
-        wr64(&mut self.tables[t], at, pte(pa, target, f));
+        self.put(t, at, pte(pa, target, f));
         Ok(())
     }
 
@@ -326,13 +348,13 @@ impl PageTables {
     pub fn unmap(&mut self, va: u64) -> bool {
         if let Some((t, at)) = self.locate_huge(va) {
             if rd64(&self.tables[t], at) != 0 {
-                wr64(&mut self.tables[t], at, 0);
+                self.put(t, at, 0);
                 return true;
             }
         }
         match self.locate(va) {
             Some((t, at)) if rd64(&self.tables[t], at) != 0 => {
-                wr64(&mut self.tables[t], at, 0);
+                self.put(t, at, 0);
                 true
             }
             _ => false,
@@ -405,6 +427,14 @@ impl PageTables {
         let (t, at) = self.locate(va)?;
         let e = rd64(&self.tables[t], at);
         (e & PTE_VALID != 0).then(|| (pte_addr(e) | (va & 0xfff), e))
+    }
+}
+
+#[cfg(test)]
+impl PageTables {
+    /// A tree rebuilt from table images (in pool order): what the GPU would walk after they were written to VRAM.
+    pub(crate) fn from_images(base: u64, capacity: usize, images: &[[u8; TABLE_SIZE]]) -> Self {
+        PageTables { base, capacity, target: Target::Vram, tables: images.to_vec(), dirty: vec![false; images.len()] }
     }
 }
 

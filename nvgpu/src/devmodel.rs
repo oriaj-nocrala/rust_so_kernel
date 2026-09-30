@@ -36,6 +36,10 @@ pub enum Error {
     Exist,
     /// `EFAULT`: a push that is not entirely inside bound memory.
     Fault,
+    /// `EAGAIN`: the device has no room for this right now (a full ring); nothing changed, try again after a fence completes.
+    Again,
+    /// `EIO`: the GPU stopped answering (a channel that faulted or hung); the session cannot run more work.
+    Io,
 }
 
 // ---- range allocator ------------------------------------------------------------------------------------------------------
@@ -143,6 +147,11 @@ pub trait Backend {
     fn submit(&mut self, ctx: u32, pushes: &[Push]) -> Result<u64, Error>;
     /// Whether fence `seq` of `ctx` has completed.
     fn fence_done(&mut self, ctx: u32, seq: u64) -> bool;
+    /// The device is closing: wait for the work in flight to finish. `false` when it did not (a hung GPU), which means the memory
+    /// it may still touch must not be reused. The software device has nothing in flight.
+    fn quiesce(&mut self) -> bool {
+        true
+    }
 }
 
 /// A backend with no hardware behind it: it accepts everything the model validated and completes work when told to.
@@ -679,8 +688,11 @@ impl<B: Backend> Device<B> {
         Ok(())
     }
 
-    /// Drop everything (the device was closed): unbind, complete, release. Leaves the model empty and reusable.
-    pub fn teardown(&mut self) {
+    /// Drop everything (the device was closed): let the GPU finish, then unbind, complete, release. Leaves the model empty and
+    /// reusable. Returns `false` when the GPU did not finish ([`Backend::quiesce`]): the caller must then keep the memory the
+    /// buffers were made of out of circulation.
+    pub fn teardown(&mut self) -> bool {
+        let quiet = self.backend.quiesce();
         let starts: Vec<(u64, u64)> = self.bound.iter().map(|(&s, b)| (s, b.len)).collect();
         for (s, l) in starts {
             let _ = self.va_unbind(s, l);
@@ -705,6 +717,7 @@ impl<B: Backend> Device<B> {
             self.va_allocs.remove(&s);
             self.va.free(s, l);
         }
+        quiet
     }
 
     pub fn layout(&self) -> Layout {

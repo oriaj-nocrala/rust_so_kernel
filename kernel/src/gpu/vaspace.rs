@@ -56,7 +56,7 @@ fn stop(r: &mut String, why: core::fmt::Arguments) {
     let _ = writeln!(r, "vaspace: STOP: {}", why);
 }
 
-pub(super) fn setup(r: &mut String, regs: &Bar0, rm: &mut Rm, copy: bool, compute: bool) {
+pub(super) fn setup(r: &mut String, regs: &Bar0, rm: &mut Rm, copy: bool, compute: bool, uapi: bool) {
     let t0 = crate::cpu::tsc::read();
 
     // 1. The space itself.
@@ -75,7 +75,8 @@ pub(super) fn setup(r: &mut String, regs: &Bar0, rm: &mut Rm, copy: bool, comput
     }
 
     // 2. Tables with one test mapping (and, for gpu=copy, the channel's), into VRAM.
-    let mut pt = PageTables::new(TABLE_VRAM, POOL_TABLES, Target::Vram);
+    // `gpu=uapi`: the pool user space binds its buffers into (`uapi.rs`)
+    let mut pt = PageTables::new(TABLE_VRAM, if uapi { super::uapi::POOL_TABLES } else { POOL_TABLES }, Target::Vram);
     if let Err(e) = pt.map_range(TEST_VA, TEST_PA, TEST_PAGES * 0x1000, Target::Vram, Flags::default()) {
         return stop(r, format_args!("building the tables: {:?}", e));
     }
@@ -146,7 +147,14 @@ pub(super) fn setup(r: &mut String, regs: &Bar0, rm: &mut Rm, copy: bool, comput
 
     // 5. Phase 7a: a GR channel over the same tables.
     if let Some(c) = comp {
-        super::compute::run(r, regs, rm, c);
+        let ch = super::compute::run(r, regs, rm, c);
+        // 6. G4c: keep the tables and the channel for `/dev/nvgpu`.
+        if uapi {
+            match ch {
+                Some(ch) => super::uapi::install(r, regs, pt, ch),
+                None => super::uapi::install_failed(r, format_args!("the compute channel is not up (see compute:)")),
+            }
+        }
     }
 }
 

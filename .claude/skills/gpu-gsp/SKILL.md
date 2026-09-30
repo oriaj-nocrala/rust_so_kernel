@@ -119,3 +119,12 @@ Rules learned:
 - **Verify output with a scribbled destination and read it by another path.** For host memory the CPU is that path. For VRAM, PRAMIN does **not** show the SM's stores (open finding: not after waits, MMIO or `MEM_OP` L2 flushes, or `STG.E.STRONG.SYS`), so read VRAM with a `copy` shader into a host page.
 - BAR1 reads of VRAM fail after GSP-RM (write-only view): not an alternative CPU read path.
 - Metal budget: three boots (#137-#139) were spent on a 5-line question (the PRAMIN view); when a check fails, add every independent diagnostic to the same boot before relaunching.
+
+## G4c: `/dev/nvgpu` on the hardware (`gpu=uapi`), code done 2026-09-30, not yet measured on the Ryzen
+
+Design and rules: `docs/reference/gpu.md` "`gpu=uapi`", plan `docs/gpu/g4-nvkmd-plan.md` "G4c". Code: `nvgpu::hwq` (pure: `bind_range`/`unbind_range`, `tlb_flush_regs`, `Queue` = ring + fences), `PageTables::take_dirty`, `gr::fence_push`, `kernel/src/gpu/uapi.rs` (state, BAR1 spans + PRAMIN fallback, `bind`/`unbind`/`submit`/`fence_done`/`quiesce`), `drivers/dev_nvgpu.rs` (`KernelBackend::hw`). Test: `userspace/c/nvgpu_hw_test.c` (runs in QEMU against the software device too), job `scripts/metal-jobs/gpu-uapi.sh`:
+
+    touch build.rs; echo 5 > target/metal/budget
+    scripts/metal-run.sh --kconf 'gpu=uapi' scripts/metal-jobs/gpu-uapi.sh
+
+When it runs: read `uapi:` first (BAR1 spans that do not land -> PRAMIN), `gpu_uapi:` (`tlb_us_max`, `again`, `dead`), then the test's FAIL lines. Rules: the CPU never reads VRAM at run time (fences live in host memory); every table a bind allocates is written out even if empty; a wedged GPU is never poked again and what user space bound stays leaked; one shared GR channel, `ctx_create` = compute only until G4d/G4e. Mutation lists: `nvgpu/mutations/{hwq,mmu_dirty,gr_fence}.py`; the C headers `userspace/c/nvgpu_{qmd,shaders}.h` are checked by host tests against the Rust QMD/shaders (regenerate the shader header with `scripts/gen-nvgpu-shader-header.py`).

@@ -70,6 +70,10 @@
 //          buffers promoted to RM) and the Ampere compute class: a
 //          semaphore release and inline writes through it (`compute.rs`,
 //          `nvgpu::gr`). `compute:` lines, `gpu_compute:`.
+//   uapi   (G4c) — also keep the GPU page tables and that GR channel for
+//          `/dev/nvgpu`: user space binds its own buffers at run time and
+//          submits pushes (`uapi.rs`, `nvgpu::hwq`). `uapi:` lines,
+//          `gpu_uapi:`.
 //
 // Runs once at boot, after `fs::init` (firmware is on `/mnt`) and before the
 // APs are released (BAR sizing turns decoding off for a few microseconds,
@@ -90,6 +94,7 @@ pub mod gsp;
 pub mod vaspace;
 pub mod copy;
 pub mod compute;
+pub mod uapi;
 pub mod bench;
 pub mod intr;
 pub mod hdmi;
@@ -451,6 +456,7 @@ fn probe_device(r: &mut String, level: GpuLevel) {
                     level >= GpuLevel::Vaspace,
                     level >= GpuLevel::Copy,
                     level >= GpuLevel::Compute,
+                    level >= GpuLevel::Uapi,
                     gsp::PciInfo {
                         bar0: bar0.addr,
                         bar1: bars[1].map_or(0, |b| b.addr),

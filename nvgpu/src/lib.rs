@@ -29,6 +29,7 @@ pub mod gr;
 pub mod gspmem;
 pub mod fwsec;
 pub mod hdmi;
+pub mod hwq;
 pub mod i2c;
 pub mod id;
 pub mod init;
