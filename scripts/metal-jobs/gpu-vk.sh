@@ -87,6 +87,15 @@ sum "gpu-vk: after the probe: $u2"
 [ "$(field "$u2" dead)" = 0 ] || { sum "gpu-vk: the GPU was declared dead during the probe"; fail=1; }
 [ "$(field "$u2" ce_execs)" -gt 0 ] 2>/dev/null || { sum "gpu-vk: ce_execs=$(field "$u2" ce_execs): the copy channel was never used"; fail=1; }
 
+# G4e experiment, last because a copy push the GR channel cannot take faults it for good (dead=1 afterwards): does a copy work on the GR
+# channel with nothing binding the copy class, as NVK's graphics queue pushes it? (`grcopy-bind` = with a SET_OBJECT first.)
+grep '^compute: copy object\|^compute: the copy object' /proc/gpu | while read -r l; do sum "gpu-vk: $l"; done
+/mnt/bin/nvgpu_hw_test ${GRCOPY_VARIANT:-grcopy} > /tmp/grcopy.out 2>&1
+grc=$?
+grep -E 'FAIL|copy ran|failure' /tmp/grcopy.out | while read -r l; do sum "gpu-vk: grcopy: $l"; done
+[ $grc = 0 ] || { sum "gpu-vk: the copy on the GR channel did not work (exit=$grc)"; fail=1; }
+sum "gpu-vk: after grcopy: $(grep '^gpu_uapi:' /proc/kdebug)"
+
 # RM still answers after all this, and the display is unharmed.
 echo 'gsp name' > /dev/dispctl && sum "gpu-vk: RM still answers" || { sum "gpu-vk: RM does not answer"; fail=1; }
 sum "gpu-vk: $(grep '^gpu_gsprt:' /proc/kdebug)"

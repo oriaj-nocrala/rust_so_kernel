@@ -172,6 +172,9 @@ struct Hw {
     chans: [Option<Chan>; 2],
     /// The GR channel has the 3D object (contexts may ask for the 3D engine).
     threed: bool,
+    /// The GR channel has a copy object (COPY0): whether copy pushes on it can work is what the `grcopy` test measures.
+    #[allow(dead_code)]
+    grcopy: bool,
     /// The host page holding the GR fence semaphore (at `SEM_OFF`); the copy channel's lives in `copy`'s.
     #[allow(dead_code)]
     host: DmaBuf,
@@ -312,7 +315,7 @@ pub(super) fn install(r: &mut String, regs: &Bar0, mut pt: PageTables, ch: Chann
             None => String::from("not available (contexts of the copy engine alone are refused)"),
         }
     );
-    *HW.lock() = Some(Hw { regs: Bar0 { base: regs.base, len: regs.len }, pt, spans, chans: [Some(gr_chan), ce_chan], threed: ch.threed, host: ch.host, dead: false, leak: false });
+    *HW.lock() = Some(Hw { regs: Bar0 { base: regs.base, len: regs.len }, pt, spans, chans: [Some(gr_chan), ce_chan], threed: ch.threed, grcopy: ch.copy, host: ch.host, dead: false, leak: false });
     STATE.store(1, Ordering::Relaxed);
 }
 

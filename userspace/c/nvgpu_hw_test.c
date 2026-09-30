@@ -225,7 +225,43 @@ static int out_is(struct region *r, unsigned slot, uint32_t (*want)(uint32_t), i
    return 1;
 }
 
-int main(void) {
+/// `nvgpu_hw_test grcopy[-bind]` (an experiment, run last in the metal job: a copy push the GR channel cannot take faults it for good): NVK's
+/// graphics queue pushes image copies on subchannel 4 of the GR channel. Does a copy host -> VRAM -> host through a compute + copy context
+/// (the GR channel), with nothing binding the copy class (`grcopy`) or with a SET_OBJECT of it in the push first (`grcopy-bind`).
+static int grcopy(int with_bind) {
+   printf("nvgpu_hw_test %s:\n", with_bind ? "grcopy-bind" : "grcopy");
+   fd = open("/dev/nvgpu", O_RDWR);
+   CHECK(fd >= 0, "open");
+   if (fd < 0) return 1;
+   struct nvg_info info;
+   call(NVG_IOC_INFO, &info);
+   hw = !(info.flags & NVG_INFO_SOFTWARE);
+   uint32_t ctx = ctx_create(NVG_ENGINE_COMPUTE | NVG_ENGINE_COPY), tl = sync_create(0);
+   struct region r;
+   CHECK(ctx && tl && region_make(&r, 4 * SLOT_BYTES) == 0, "a compute + copy context and a region");
+   uint32_t vb = bo_create(4096, NVG_BO_VRAM, NULL);
+   uint64_t vva = va_alloc(4096, 4096);
+   CHECK(vb && vva && bind(vva, 4096, vb, 0) == 0, "a VRAM page");
+   uint32_t *src = (uint32_t *)(r.cpu + OFF_OUT), *dst = (uint32_t *)(r.cpu + SLOT_BYTES + OFF_OUT);
+   for (uint32_t i = 0; i < 1024; i++) { src[i] = fill_word(i) ^ 0x0c0c0c0cu; dst[i] = scribble(i); }
+   uint32_t w[40], n = 0;
+   if (with_bind) { w[n++] = hdr(4, 0, 1); w[n++] = 0xc7b5; }
+   n += copy_push(w + n, r.va + OFF_OUT, vva, 4096);
+   n += copy_push(w + n, vva, r.va + SLOT_BYTES + OFF_OUT, 4096);
+   memcpy(r.cpu + OFF_PUSH, w, n * 4);
+   struct nvg_push p = { .va = r.va + OFF_PUSH, .bytes = n * 4, .flags = 0 };
+   CHECK(exec_signal(ctx, &p, 1, tl, 1) == 0, "EXEC of a copy on the GR channel");
+   int ok = wait_timeline(tl, 1, 15000) == 0;
+   int same = 1;
+   for (uint32_t i = 0; i < 1024; i++) same &= dst[i] == src[i];
+   HWCHECK(ok && same, "the copy ran on the GR channel (fence %s, data %s)", ok ? "came" : "never came", same ? "intact" : "not copied");
+   printf("nvgpu_hw_test grcopy: %d failure(s)\n", failures);
+   return failures ? 1 : 0;
+}
+
+int main(int argc, char **argv) {
+   if (argc > 1 && !strcmp(argv[1], "grcopy")) return grcopy(0);
+   if (argc > 1 && !strcmp(argv[1], "grcopy-bind")) return grcopy(1);
    printf("nvgpu_hw_test:\n");
    int bad = 0;
 

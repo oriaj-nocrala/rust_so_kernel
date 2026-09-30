@@ -31,6 +31,10 @@ pub fn h_chan(chid: u32) -> u32 {
 }
 /// The copy object's handle in the trace (`fixtures/rm-ph6-ce-alloc-c7b5-req.bin`).
 pub const H_COPY: u32 = 0x0004_c7b5;
+/// G4e: a copy object on the GR channel too (NVK pushes image copies to the copy subchannel of its graphics queue). Handle and engine
+/// `NV2080_ENGINE_TYPE_COPY0` (`r535/ce.c:38`, `COPY0 + inst`); CE0 shares runlist 0 with GR.
+pub const H_COPY_GR: u32 = 0x0005_c7b5;
+pub const ENGINE_COPY0: u32 = 9;
 
 /// `NV2080_ENGINE_TYPE_COPY2` = `RM_ENGINE_TYPE_COPY2` (`rm/r535/nvrm/engine.h:136,192`:
 /// COPY0 is 9). The trace's CE channel has `engineType = 0xb` and the device

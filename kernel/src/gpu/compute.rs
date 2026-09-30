@@ -337,6 +337,8 @@ pub(super) struct Channel {
     pub host: DmaBuf,
     /// The 3D object (`0xc797`) is allocated on the channel too: NVK's compute queue binds it (MME indirect dispatch).
     pub threed: bool,
+    /// A copy object (`0xc7b5` on COPY0) is allocated on the channel too (G4e): image copies of NVK's graphics queue.
+    pub copy: bool,
 }
 
 fn fail(r: &mut String, why: core::fmt::Arguments) -> Option<Channel> {
@@ -637,7 +639,18 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, c: Compute) -> Optio
             false
         }
     };
-    Some(Channel { token, slot, host, threed })
+    // G4e: a copy object on the GR channel, after the 3D one for the same reason (and last: nothing above depends on it).
+    let copy = match rm.alloc(chan::h_chan(CHID), chan::H_COPY_GR, chan::CLASS_COPY, &chan::copy_params(chan::ENGINE_COPY0)) {
+        Ok(_) => {
+            let _ = writeln!(r, "compute: copy object {:#x} (COPY0) allocated on the GR channel too", chan::CLASS_COPY);
+            true
+        }
+        Err(e) => {
+            let _ = writeln!(r, "compute: the copy object on the GR channel: {}", e);
+            false
+        }
+    };
+    Some(Channel { token, slot, host, threed, copy })
 }
 
 /// One way of asking for the golden context. Boot #126 (`gpu=compute`, the first run) got `NV_ERR_INVALID_ARGUMENT` from
