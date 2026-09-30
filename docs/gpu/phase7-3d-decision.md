@@ -104,3 +104,16 @@ Lo único de los riesgos de arriba que se puede probar ya, con la escalera de 6c
 - Cuánto de `std` usa realmente NAK ni si compila `no_std`.
 - Nada de esto se ha ejecutado en la Ryzen.
 - Los costes S/M/L/XL son estimaciones mías, no mediciones.
+
+
+## Resultados de G3 (2026-09-30): NAK sobre musl estático corre en constanos
+
+Sonda: `probes/nak/` (receta en su `README.md`). Mesa `main` 20f48abe compilado **cruzado a `x86_64-linux-musl`, estático**.
+
+- **Se compila entero:** NIR, util, el runtime de Vulkan, NVK y NAK (Rust con el `std` de musl), 320 pasos de Meson en 27 s. Los fallos fueron solo cabeceras de terceros que faltaban (libudev, libelf, spirv-tools, libdisplay-info, `xf86drm.h`) y dos funciones de pthread de glibc 2.30 que las cabeceras de libstdc++ declaran y musl no. Ninguno era del ABI ni de constanos.
+- **Se ejecuta en constanos:** un binario estático musl de 13,7 MB (sin símbolos) construye un shader con `nir_builder`, lo pasa por `nak_preprocess_nir`, `nak_postprocess_nir` y `nak_compile_shader` para SM86 y obtiene 7 instrucciones SASS, 112 bytes, huella FNV-1a `428b75c4542e3770`. **Idéntico al del host** (glibc nativo y musl en el host). Ninguna syscall sin implementar (`ENOSYS`); el `std` de Rust (panics con mensaje, asignador, `OnceLock`, `HashMap`) funciona.
+- **El riesgo de las dos libcs desaparece:** no hay que enlazar NAK con mlibc. Toda la pila 3D (Mesa en C y NAK en Rust) va contra **musl**, una sola libc, y G1 ya hace que el kernel la hable. mlibc sigue siendo la libc de BusyBox, DOOM y Quake.
+- **`std` de NAK:** solo lo puro (`mem`, `slice`, `ptr`, `cmp`, `fmt`, `BinaryHeap`, `HashMap`, `OnceLock`, atómicos, `RefCell`, `io::stderr`); no usa hilos, ficheros, red ni procesos. `no_std + alloc` sería posible pero ya no hace falta.
+- **Lo que el enlace final de `libvulkan_nouveau` todavía pide compilado contra musl:** `libdrm` (lo sustituye el backend `nvkmd` de G4), `libelf` (cubin), `libudev` y `libdisplay-info` (WSI de pantalla; se puede evitar), `SPIRV-Tools` (C++) y un runtime de C++. Para la sonda bastó `libstdc++.a` de gcc (compilada para glibc) con musl, porque solo se usan las pocas piezas de C++ de `util` (ASTC, `qsort`); **excepciones e hilos de C++ no están probados**. Para Zink haría falta libc++ o libstdc++ construidos contra musl.
+- **Sin medir todavía:** `dlopen` (Zink); si todo va enlazado estático en un solo proceso no hace falta, pero no está probado. El cargador Vulkan de Khronos. El tiempo de compilación de shaders reales (el de la sonda es un shader de 7 instrucciones).
+- **Decisión de G3:** enlazado **estático, todo contra musl**. Siguiente puerta: **G4**, el backend `nvkmd` de constanos (~1,5 k líneas estimadas), que reemplaza a libdrm.
