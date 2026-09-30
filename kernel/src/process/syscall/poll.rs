@@ -30,6 +30,9 @@ enum PollSource {
     Event { id: u64 },
     /// A pidfd (`process::pidfd`): readable once the process has exited.
     PidFd { pid: u64 },
+    /// fd 0 while it is still the console: readable when the keyboard buffer has a key. Once fd 0 is redirected to a file
+    /// it is `Other` like any file (always ready), the same gate `sys_read` uses (`stdin_is_console`).
+    Console,
 }
 
 /// A process's fd → `PollSource` mapping, snapshotted at the moment it blocks.
@@ -89,6 +92,8 @@ fn snapshot_sockets() -> SocketMap {
                 PollSource::Event { id }
             } else if let Some(pid) = h.pidfd_pid() {
                 PollSource::PidFd { pid: pid as u64 }
+            } else if fd == 0 && h.name() == "serial" {
+                PollSource::Console
             } else {
                 PollSource::Other
             };
@@ -326,7 +331,7 @@ static POLL_WAITERS: crate::sync::IrqLock<BTreeMap<usize, PollWaiter>> = crate::
 ///     `evdev_poll` answers).
 ///   - pipe end: read end POLLIN with data queued, POLLHUP once no writer is left; write end POLLOUT with room and a reader,
 ///     POLLERR once no reader is left.
-///   - stdin (fd=0): POLLIN if keyboard buffer has data.
+///   - stdin (fd=0) still bound to the console: POLLIN if keyboard buffer has data. A file redirected onto fd 0 is ready.
 ///   - All other device fds: always ready for the requested events.
 fn fd_check_ready(socks: &SocketMap, fd: i32, events: i16) -> i16 {
     // poll(2): a negative fd is skipped (revents 0), which is how a caller leaves holes in its array.
@@ -386,8 +391,8 @@ fn fd_check_ready(socks: &SocketMap, fd: i32, events: i16) -> i16 {
         return rev;
     }
 
-    // stdin
-    if fd_usize == 0 {
+    // stdin, while it is still the console (not a file or pipe dup2'd onto fd 0: those are handled above or are `Other`)
+    if let PollSource::Console = source {
         let mut rev: i16 = 0;
         if events & POLLIN != 0 && crate::keyboard::read_key_peek() {
             rev |= POLLIN;

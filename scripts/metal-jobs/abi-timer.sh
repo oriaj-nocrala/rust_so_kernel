@@ -21,7 +21,7 @@ for t in $tests; do
   if [ $rc != 0 ] || grep -q FAIL /tmp/t.out; then
     bad=$((bad + 1))
     sum "abi: $t exit=$rc"
-    # No `read` loops here: this ash's `read` builtin hangs (from a file) or prints nothing (in a pipeline).
+    # This BusyBox has no `head -4` / `tail -2` (only `-n N`): a pipeline fed by them is silently empty.
     grep -E 'FAIL|fail|error' /tmp/t.out | head -n 4 >> /tmp/abi-timer.sum
     grep -E 'FAIL|fail|error' /tmp/t.out | head -n 4
     tail -n 2 /tmp/t.out >> /tmp/abi-timer.sum
