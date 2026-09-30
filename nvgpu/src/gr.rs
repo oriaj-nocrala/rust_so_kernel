@@ -28,6 +28,43 @@ pub const ENGINE_GR0: u32 = 1;
 /// `obj=0x97000000`), and ours for the compute object.
 pub const H_THREED: u32 = 0x9700_0000;
 pub const H_COMPUTE: u32 = 0xc7c0_0000;
+/// `NV2080_CTRL_CMD_GR_GET_GPC_MASK` / `_GET_TPC_MASK` (`ctrl2080gr.h:1459,1487`): which GPCs, and which TPCs of a GPC, are enabled (what
+/// floorsweeping left). Parameters: `NV2080_CTRL_GR_ROUTE_INFO` (`flags` u32 + 8-aligned `route` u64 = 16 bytes, zero = GR0), then
+/// `gpcMask` (24 bytes with the tail padding), or `gpcId` and `tpcMask` (24 bytes).
+pub const CTRL_GET_GPC_MASK: u32 = 0x2080_122a;
+pub const CTRL_GET_TPC_MASK: u32 = 0x2080_122b;
+pub const GR_MASK_PARAMS_SIZE: usize = 24;
+
+pub fn gpc_mask_request() -> Vec<u8> {
+    alloc::vec![0u8; GR_MASK_PARAMS_SIZE]
+}
+
+pub fn gpc_mask_from(params: &[u8]) -> Option<u32> {
+    (params.len() >= 20).then(|| u32::from_le_bytes(params[16..20].try_into().unwrap()))
+}
+
+pub fn tpc_mask_request(gpc: u32) -> Vec<u8> {
+    let mut p = alloc::vec![0u8; GR_MASK_PARAMS_SIZE];
+    p[16..20].copy_from_slice(&gpc.to_le_bytes());
+    p
+}
+
+pub fn tpc_mask_from(params: &[u8]) -> Option<u32> {
+    (params.len() >= 24).then(|| u32::from_le_bytes(params[20..24].try_into().unwrap()))
+}
+
+/// The enabled units of a GPU: GPC count and the TPC count in all (Ampere has two SMs per TPC).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Topology {
+    pub gpcs: u32,
+    pub tpcs: u32,
+}
+
+/// From the GPC mask and the TPC mask of each enabled GPC, in GPC order.
+pub fn topology(gpc_mask: u32, tpc_masks: &[u32]) -> Topology {
+    Topology { gpcs: gpc_mask.count_ones(), tpcs: tpc_masks.iter().map(|m| m.count_ones()).sum() }
+}
+
 /// The 3D object of the real channel (G4d: NVK's compute queue also uses the 3D engine, for MME indirect dispatch); the golden channel's is
 /// `H_THREED`, freed long before.
 pub const H_THREED_CHAN: u32 = 0x9700_0001;
@@ -1022,5 +1059,27 @@ mod tests {
     #[should_panic(expected = "QMD address")]
     fn a_qmd_must_be_within_40_bits() {
         dispatch_push(1 << 40, 0, 0);
+    }
+
+    #[test]
+    fn the_floorsweeping_controls() {
+        assert_eq!((CTRL_GET_GPC_MASK, CTRL_GET_TPC_MASK), (0x2080122a, 0x2080122b));
+        // ROUTE_INFO is 16 bytes (u32 flags, 8-aligned u64 route); the mask follows
+        assert_eq!(gpc_mask_request(), [0u8; 24]);
+        let mut rep = [0u8; 24];
+        rep[16..20].copy_from_slice(&0b111u32.to_le_bytes());
+        assert_eq!(gpc_mask_from(&rep), Some(7));
+        assert_eq!(gpc_mask_from(&rep[..19]), None);
+        let req = tpc_mask_request(2);
+        assert_eq!(&req[16..20], &[2, 0, 0, 0]);
+        assert_eq!(&req[..16], &[0u8; 16]);
+        let mut rep = req.clone();
+        rep[20..24].copy_from_slice(&0b1_1011u32.to_le_bytes());
+        assert_eq!(tpc_mask_from(&rep), Some(0x1b));
+        assert_eq!(tpc_mask_from(&rep[..23]), None);
+        // 3 GPCs with 4, 3 and 3 TPCs
+        assert_eq!(topology(0b111, &[0b1111, 0b111, 0b1011]), Topology { gpcs: 3, tpcs: 10 });
+        // a GPC missing from the mask does not count (the caller only asks for the enabled ones)
+        assert_eq!(topology(0b101, &[0b11, 0b1]), Topology { gpcs: 2, tpcs: 3 });
     }
 }

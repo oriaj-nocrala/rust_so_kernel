@@ -52,7 +52,7 @@ sum "gpu-vk: the grid's own release semaphore: grid_release=$(field "$cc" grid_r
 [ "$(field "$cc" golden_ms)" -gt 0 ] 2>/dev/null || { sum "gpu-vk: golden_ms=$(field "$cc" golden_ms)"; fail=1; }
 
 # G4c: /dev/nvgpu on the hardware.
-grep '^uapi:' /proc/gpu >> /tmp/gpu-vk.sum
+grep '^uapi:\|^compute: floorsweeping\|^compute: .* GPCs' /proc/gpu >> /tmp/gpu-vk.sum
 grep -q '^uapi: installed' /proc/gpu || { sum "gpu-vk: the GPU state was not kept for /dev/nvgpu"; fail=1; }
 grep '^uapi: STOP' /proc/gpu && fail=1
 grep 'DOES NOT REACH VRAM' /proc/gpu && sum "gpu-vk: a BAR1 span does not reach VRAM (PRAMIN serves it: slower, not wrong)"
@@ -107,14 +107,24 @@ grep -q 'DRAW DONE' /tmp/vk_draw.out || { sum "gpu-vk: the draw program did not 
 grep -q 'draw result: EXECUTED' /tmp/vk_draw.out || { sum "gpu-vk: the draw did not execute correctly"; fail=1; }
 sum "gpu-vk: after the draw: $(grep '^gpu_uapi:' /proc/kdebug)"
 
-# G4e presentation: the same program, then 12 s of a spinning triangle rendered by the GPU (640x400, B8G8R8A8), copied to a host buffer and
+# G4e presentation: the same program, then 20 s of a spinning triangle rendered by the GPU (640x400, B8G8R8A8), copied to a host buffer and
 # from there into /dev/fb0 frame by frame: what the monitor shows is the GPU's picture (the CPU carries it to the screen for now).
-VK_DRAW_PRESENT=12 VK_PROBE_REQUIRE_EXEC=1 NVK_CONSTANOS_DEBUG=1 /mnt/bin/vk_draw > /tmp/vk_present.out 2>&1
+VK_DRAW_PRESENT=20 VK_PROBE_REQUIRE_EXEC=1 NVK_CONSTANOS_DEBUG=1 /mnt/bin/vk_draw > /tmp/vk_present.out 2>&1
 prc=$?
 grep -E 'VK present|FAIL|ASSERT|DRAW DONE' /tmp/vk_present.out | while read -r l; do sum "gpu-vk: present: $l"; done
 [ $prc = 0 ] || { sum "gpu-vk: the presentation run exit=$prc"; fail=1; tail -n 20 /tmp/vk_present.out >> /tmp/gpu-vk.sum; }
 grep -q 'VK present: [0-9]* frames' /tmp/vk_present.out || { sum "gpu-vk: no frames were presented"; fail=1; }
 sum "gpu-vk: after the presentation: $(grep '^gpu_uapi:' /proc/kdebug)"
+
+# G4e robustness, the very last thing (it kills the GPU channel on purpose): a launch whose program is an unbound VA. RM must tell us (RC_TRIGGERED)
+# and the kernel must declare the device dead within tens of ms, wake the waiter and answer the next EXEC with EIO; RM itself must live on.
+/mnt/bin/nvgpu_hw_test rc > /tmp/rc.out 2>&1
+rrc=$?
+grep -E 'FAIL|woke|failure' /tmp/rc.out | while read -r l; do sum "gpu-vk: rc: $l"; done
+[ $rrc = 0 ] || { sum "gpu-vk: the RC test exit=$rrc"; fail=1; tail -n 12 /tmp/rc.out >> /tmp/gpu-vk.sum; }
+sum "gpu-vk: after the fault: $(grep '^gpu_uapi:' /proc/kdebug)"
+[ "$(field "$(grep '^gpu_uapi:' /proc/kdebug)" dead)" = 1 ] || { sum "gpu-vk: the device was not declared dead after the fault"; fail=1; }
+sum "gpu-vk: $(grep '^gpu_gsprt:' /proc/kdebug)"
 
 # RM still answers after all this, and the display is unharmed.
 echo 'gsp name' > /dev/dispctl && sum "gpu-vk: RM still answers" || { sum "gpu-vk: RM does not answer"; fail=1; }

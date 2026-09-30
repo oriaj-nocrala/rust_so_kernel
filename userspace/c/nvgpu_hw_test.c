@@ -259,7 +259,43 @@ static int grcopy(int with_bind) {
    return failures ? 1 : 0;
 }
 
+/// `nvgpu_hw_test rc` (an experiment for the end of the metal job: it kills the GPU channel on purpose): a launch whose program address
+/// is a VA nothing is bound at. The GPU takes an MMU fault, RM resets the channel (RC_TRIGGERED) and it never releases the fence. The kernel
+/// must notice through RM's event within tens of milliseconds (not the 10 s hang limit), report every fence as done so the waiter wakes,
+/// and answer the next EXEC with EIO.
+static int rc_test(void) {
+   printf("nvgpu_hw_test rc:\n");
+   fd = open("/dev/nvgpu", O_RDWR);
+   CHECK(fd >= 0, "open");
+   if (fd < 0) return 1;
+   struct nvg_info info;
+   call(NVG_IOC_INFO, &info);
+   hw = !(info.flags & NVG_INFO_SOFTWARE);
+   uint32_t ctx = ctx_create(NVG_ENGINE_COMPUTE), tl = sync_create(0);
+   struct region r;
+   CHECK(ctx && tl && region_make(&r, 2 * SLOT_BYTES) == 0, "a compute context and a region");
+   uint64_t bad = va_alloc(0x10000, 0x10000);   // allocated, never bound
+   CHECK(bad != 0, "a VA range nothing is bound at");
+   struct nvg_push p = launch_prepare(&r, 0, nvg_shader_fill, r.va + OFF_OUT, 0, 1);
+   struct nvg_qmd_launch l = { .program = bad, .registers = 8, .grid = { 8, 1, 1 }, .block = { 32, 1, 1 }, .cbuf0 = r.va + OFF_CB0, .cbuf0_size = CBUF0_BYTES };
+   uint32_t q[64];
+   nvg_qmd_build(q, &l);
+   memcpy(r.cpu + OFF_QMD, q, 256);
+   int64_t t0 = now_ms();
+   CHECK(exec_signal(ctx, &p, 1, tl, 1) == 0, "EXEC of the faulting launch is accepted");
+   int woke = wait_timeline(tl, 1, 20000) == 0;
+   int64_t ms = now_ms() - t0;
+   printf("  the waiter woke after %lld ms\n", (long long)ms);
+   HWCHECK(woke && ms < 3000, "the fault was noticed and the fence released in %lld ms (the hang limit is 10000)", (long long)ms);
+   struct nvg_push q2 = launch_prepare(&r, 1, nvg_shader_fill, r.va + SLOT_BYTES + OFF_OUT, 0, 2);
+   int rr = exec_signal(ctx, &q2, 1, tl, 2);
+   HWCHECK(rr < 0 && errno == EIO, "the next EXEC says EIO (%d, errno %d)", rr, errno);
+   printf("nvgpu_hw_test rc: %d failure(s)\n", failures);
+   return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+   if (argc > 1 && !strcmp(argv[1], "rc")) return rc_test();
    if (argc > 1 && !strcmp(argv[1], "grcopy")) return grcopy(0);
    if (argc > 1 && !strcmp(argv[1], "grcopy-bind")) return grcopy(1);
    printf("nvgpu_hw_test:\n");
@@ -273,8 +309,8 @@ int main(int argc, char **argv) {
    memset(&info, 0, sizeof info);
    CHECK(call(NVG_IOC_INFO, &info) == 0, "INFO");
    hw = !(info.flags & NVG_INFO_SOFTWARE);
-   printf("  device: %s, %s, sm %u, %llu MiB of VRAM for buffers\n", info.device_name, hw ? "hardware" : "SOFTWARE (no GPU: execution checks are skipped)", info.sm,
-          (unsigned long long)(info.vram_size_B >> 20));
+   printf("  device: %s, %s, sm %u, %u GPCs, %u TPCs, %llu MiB of VRAM for buffers\n", info.device_name, hw ? "hardware" : "SOFTWARE (no GPU: execution checks are skipped)", info.sm,
+          info.gpc_count, info.tpc_count, (unsigned long long)(info.vram_size_B >> 20));
    CHECK(info.abi_version == NVG_ABI_VERSION && info.sm == 86 && info.cls_compute == 0xc7c0, "abi %u sm %u compute %#x", info.abi_version, info.sm, info.cls_compute);
    CHECK(info.va_start < info.va_end && info.vram_size_B > 0 && info.bar_size_B == 0, "ranges");
 

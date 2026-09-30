@@ -56,6 +56,8 @@ const HANG_MS: u64 = 10_000;
 /// The GPU's TLB flush and the quiesce at close each get this long.
 const FLUSH_MS: u64 = 2_000;
 const QUIESCE_MS: u64 = 3_000;
+/// Work in flight and no fence for this long: look at RM's status queue for an RC (a fault), before the hang limit.
+const RC_CHECK_MS: u64 = 20;
 /// `NV04_PTIMER_TIME_0/1` (`nvkm/subdev/timer/regsnv04.h:6-7`).
 const PTIMER_TIME_0: u32 = 0x9400;
 const PTIMER_TIME_1: u32 = 0x9410;
@@ -175,10 +177,13 @@ struct Hw {
     /// The GR channel has a copy object (COPY0): whether copy pushes on it can work is what the `grcopy` test measures.
     #[allow(dead_code)]
     grcopy: bool,
+    topo: Option<nvgpu::gr::Topology>,
     /// The host page holding the GR fence semaphore (at `SEM_OFF`); the copy channel's lives in `copy`'s.
     #[allow(dead_code)]
     host: DmaBuf,
     dead: bool,
+    /// `gsp::rc_events()` when the device came up: more of them later means RM reset a channel after a fault.
+    rc_base: u64,
     /// The GPU may still touch bound memory (it hung, or did not go idle at close): never give it back.
     leak: bool,
 }
@@ -315,13 +320,18 @@ pub(super) fn install(r: &mut String, regs: &Bar0, mut pt: PageTables, ch: Chann
             None => String::from("not available (contexts of the copy engine alone are refused)"),
         }
     );
-    *HW.lock() = Some(Hw { regs: Bar0 { base: regs.base, len: regs.len }, pt, spans, chans: [Some(gr_chan), ce_chan], threed: ch.threed, grcopy: ch.copy, host: ch.host, dead: false, leak: false });
+    *HW.lock() = Some(Hw { regs: Bar0 { base: regs.base, len: regs.len }, pt, spans, chans: [Some(gr_chan), ce_chan], threed: ch.threed, grcopy: ch.copy, topo: ch.topo, host: ch.host, dead: false, rc_base: super::gsp::rc_events(), leak: false });
     STATE.store(1, Ordering::Relaxed);
 }
 
 pub(super) fn install_failed(r: &mut String, why: core::fmt::Arguments) {
     STATE.store(2, Ordering::Relaxed);
     let _ = writeln!(r, "uapi: STOP: {}", why);
+}
+
+/// What floorsweeping left of the GR engine (GPCs, TPCs), if RM said.
+pub fn topology() -> Option<(u32, u32)> {
+    HW.lock().as_ref().and_then(|h| h.topo).map(|t| (t.gpcs, t.tpcs))
 }
 
 /// A GPU is up behind `/dev/nvgpu` (installed, whether or not it has since died).
@@ -355,15 +365,23 @@ impl Hw {
             FENCES.fetch_add(c.queue.done_seq() - before, Ordering::Relaxed);
             c.progress = crate::cpu::tsc::read();
         }
-        if !self.dead && c.queue.in_flight() > 0 && crate::cpu::tsc::read().wrapping_sub(c.progress) > super::copy::ms_ticks(HANG_MS) {
-            let why = alloc::format!(
-                "{:?} channel: no fence for {} ms with {} submission(s) in flight, semaphore {:#x}, last submitted {}",
-                kind,
-                HANG_MS,
-                c.queue.in_flight(),
-                sem,
-                c.queue.last_seq()
-            );
+        if self.dead || c.queue.in_flight() == 0 {
+            return;
+        }
+        let quiet = crate::cpu::tsc::read().wrapping_sub(c.progress);
+        let (in_flight, last) = (c.queue.in_flight(), c.queue.last_seq());
+        // A faulted channel is reset by RM and never releases again: its RC_TRIGGERED event says so within a few tens of ms, long before
+        // the hang limit. The status queue has no interrupt; look at it when work has been quiet for a moment.
+        if quiet > super::copy::ms_ticks(RC_CHECK_MS) {
+            super::gsp::poll_events_try();
+            if super::gsp::rc_events() > self.rc_base {
+                let why = alloc::format!("{:?} channel: RM reset a channel (RC_TRIGGERED) with {} submission(s) in flight, semaphore {:#x}, last submitted {}", kind, in_flight, sem, last);
+                self.mark_dead(&why);
+                return;
+            }
+        }
+        if quiet > super::copy::ms_ticks(HANG_MS) {
+            let why = alloc::format!("{:?} channel: no fence for {} ms with {} submission(s) in flight, semaphore {:#x}, last submitted {}", kind, HANG_MS, in_flight, sem, last);
             self.mark_dead(&why);
         }
     }

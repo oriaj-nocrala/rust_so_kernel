@@ -339,6 +339,8 @@ pub(super) struct Channel {
     pub threed: bool,
     /// A copy object (`0xc7b5` on COPY0) is allocated on the channel too (G4e): image copies of NVK's graphics queue.
     pub copy: bool,
+    /// What floorsweeping left (RM's GPC/TPC masks), when RM answered.
+    pub topo: Option<gr::Topology>,
 }
 
 fn fail(r: &mut String, why: core::fmt::Arguments) -> Option<Channel> {
@@ -650,7 +652,29 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, c: Compute) -> Optio
             false
         }
     };
-    Some(Channel { token, slot, host, threed, copy })
+    // G4e: the real GPC/TPC counts for INFO (NVK sizes local memory from them). Read-only controls on our subdevice.
+    let topo = (|| -> Result<gr::Topology, String> {
+        let m = rm.control(rm::H_SUBDEVICE, gr::CTRL_GET_GPC_MASK, &gr::gpc_mask_request()).map_err(|e| alloc::format!("GET_GPC_MASK: {}", e))?;
+        let gpc_mask = gr::gpc_mask_from(&m).ok_or_else(|| String::from("GET_GPC_MASK: short reply"))?;
+        let mut tpcs = Vec::new();
+        for g in (0..32).filter(|g| gpc_mask >> g & 1 != 0) {
+            let t = rm.control(rm::H_SUBDEVICE, gr::CTRL_GET_TPC_MASK, &gr::tpc_mask_request(g)).map_err(|e| alloc::format!("GET_TPC_MASK({}): {}", g, e))?;
+            tpcs.push(gr::tpc_mask_from(&t).ok_or_else(|| String::from("GET_TPC_MASK: short reply"))?);
+        }
+        let _ = writeln!(r, "compute: floorsweeping: GPC mask {:#x}, TPC masks {:x?}", gpc_mask, tpcs);
+        Ok(gr::topology(gpc_mask, &tpcs))
+    })();
+    let topo = match topo {
+        Ok(t) => {
+            let _ = writeln!(r, "compute: {} GPCs, {} TPCs ({} SMs)", t.gpcs, t.tpcs, t.tpcs * 2);
+            Some(t)
+        }
+        Err(e) => {
+            let _ = writeln!(r, "compute: topology: {} (INFO keeps the software numbers)", e);
+            None
+        }
+    };
+    Some(Channel { token, slot, host, threed, copy, topo })
 }
 
 /// One way of asking for the golden context. Boot #126 (`gpu=compute`, the first run) got `NV_ERR_INVALID_ARGUMENT` from

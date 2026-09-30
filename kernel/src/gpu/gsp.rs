@@ -751,6 +751,9 @@ fn drain(rt: &mut Runtime) -> usize {
             rt.stats.log.pop_front();
         }
         rt.stats.log.push_back((m.function, m.payload.len()));
+        if m.function == rpc::EVENT_RC_TRIGGERED {
+            RC_EVENTS.fetch_add(1, Ordering::Release);
+        }
         if m.function == rpc::EVENT_GSP_RUN_CPU_SEQUENCER {
             if let Ok((ops, mut save)) = rpc::decode_sequencer(&m.payload) {
                 let _ = rpc::run_sequencer(&rt.regs, &rt.env, &ops, &mut save);
@@ -768,6 +771,22 @@ static EVENTS_SEEN: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn events_seen() -> u64 {
     EVENTS_SEEN.load(Ordering::Acquire)
+}
+
+/// `RC_TRIGGERED` events read so far: RM reset a channel after a fault (`gpu/uapi.rs` watches it to declare the device dead at once).
+static RC_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn rc_events() -> u64 {
+    RC_EVENTS.load(Ordering::Acquire)
+}
+
+/// Serve the status queue now unless someone holds the runtime (never waits: callable with other locks held).
+pub(super) fn poll_events_try() {
+    if let Some(mut g) = RUNTIME.try_lock() {
+        if let Some(rt) = g.as_mut() {
+            drain(rt);
+        }
+    }
 }
 
 /// `/dev/dispctl` `gsp poll`: serve the status queue now (process context).

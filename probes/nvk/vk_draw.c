@@ -60,7 +60,7 @@ static int find_type(const VkPhysicalDeviceMemoryProperties *mp, uint32_t allowe
 #define W 64
 #define H 64
 
-/* /dev/fb0 (docs/reference/graphics.md) */
+/* /dev/fb0 (docs/reference/graphics.md): stride is in PIXELS (1920 wide -> 2048), as fb0_test.c uses it */
 #define FBIO_GET_INFO 0x46420010
 #define FBIO_FLUSH 0x46420011
 struct fb0_info { uint32_t width, height, stride, bytes_per_pixel; uint64_t offset, map_len; };
@@ -351,10 +351,18 @@ int main(void) {
             printf("VK present: frame 0 corner %#x centre %#x\n", corner, centre);
             CHECK(corner != 0xdeadbeefu && centre != 0xdeadbeefu && corner != centre, "frame 0: the GPU wrote the image and the triangle is not the background");
          }
-         for (uint32_t y = 0; y < PH; y++) memcpy(fbmap + fi.offset + (size_t)(y0 + y) * fi.stride + (size_t)x0 * 4, px2 + (size_t)y * PW, PW * 4);
+         for (uint32_t y = 0; y < PH; y++) memcpy(fbmap + fi.offset + ((size_t)(y0 + y) * fi.stride + x0) * 4, px2 + (size_t)y * PW, PW * 4);
+         if (frames == 0) {
+            // what reached the framebuffer's memory is the image, row by row (this is the check a wrong stride fails)
+            int rows_ok = 1;
+            for (uint32_t y = 0; y < PH; y++) rows_ok &= memcmp(fbmap + fi.offset + ((size_t)(y0 + y) * fi.stride + x0) * 4, px2 + (size_t)y * PW, PW * 4) == 0;
+            CHECK(rows_ok, "frame 0 is in the framebuffer, every row where it belongs");
+            CHECK(*(uint32_t *)(fbmap + fi.offset + ((size_t)(y0 + 1) * fi.stride + x0) * 4) == px2[PW], "the second row starts a stride below the first");
+         }
          struct fb0_flush fl = { .count = 1, .rects = { { x0, y0, PW, PH } } };
          if (ioctl(fb, FBIO_FLUSH, &fl) != 0) flush_busy++;
          frames++;
+         usleep(16000);   // about one frame per vblank: a flip is pending until the next one, and flooding FBIO_FLUSH starves the vblank handler
       }
       CHECK(frame_ok, "every frame rendered and fenced");
       printf("VK present: %u frames in %.1f s (%.1f fps), %u flushes refused (a flip pending)\n", frames, seconds, frames / (seconds > 0 ? seconds : 1), flush_busy);

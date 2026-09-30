@@ -212,6 +212,8 @@ fn info(vram_used: u64, hw: bool) -> uapi::Info {
     let mut name = [0u8; 64];
     let n: &[u8] = if hw { b"NVIDIA GeForce RTX 3050 (constanos)" } else { b"constanos software GPU (GA106 model)" };
     name[..n.len()].copy_from_slice(n);
+    // the real floorsweeping when the GPU told (RM's GPC/TPC masks), else the model's 3 GPCs and 10 TPCs
+    let topo = if hw { gpu::uapi::topology().unwrap_or((3, 10)) } else { (3, 10) };
     let mut chip = [0u8; 16];
     chip[..5].copy_from_slice(b"GA106");
     uapi::Info {
@@ -220,8 +222,8 @@ fn info(vram_used: u64, hw: bool) -> uapi::Info {
         device_id: 0x2504,
         chipset: 0x196,
         sm: 86,
-        gpc_count: 3,
-        tpc_count: 10,
+        gpc_count: topo.0 as u8,
+        tpc_count: topo.1 as u16,
         mp_per_tpc: 2,
         max_warps_per_mp: 48,
         max_blocks_per_mp: 16,
