@@ -17,6 +17,7 @@ pub mod aux;
 pub mod booter;
 pub mod chan;
 pub mod dcb;
+pub mod devmodel;
 pub mod display;
 pub mod dp;
 pub mod dispstate;
@@ -42,6 +43,7 @@ pub mod qmd;
 pub mod rm;
 pub mod rpc;
 pub mod supervisor;
+pub mod uapi;
 pub mod vbios;
 pub mod vblank;
 
