@@ -16,6 +16,7 @@ pub(crate) mod irq_guard;
 pub mod file;
 pub mod dead_files;
 pub mod fpu;
+pub mod creds;
 pub mod eventfd;
 pub mod pidfd;
 pub mod pipe;
@@ -188,8 +189,13 @@ pub struct Process {
     /// been reported to a `waitpid(WUNTRACED)` caller. Reset to `false`
     /// every time this process is freshly stopped, so a stop is reported
     /// exactly once — matching real POSIX "each stop/continue transition
-    /// is reported once" semantics (this kernel doesn't track WCONTINUED).
+    /// is reported once" semantics (the resume side is `continued_pending`).
     pub stop_reported: bool,
+    /// Set when a `SIGCONT` resumed this process out of a stop and no `waitpid(WCONTINUED)` has reported it yet (status `0xffff`,
+    /// `WIFCONTINUED`). Cleared by that report and by the next stop.
+    pub continued_pending: bool,
+    /// uids, gids and supplementary groups (`creds.rs`): bookkeeping only, inherited by `fork`/`clone`, kept by `exec`.
+    pub creds: creds::Creds,
 
     /// FS segment base (used for TLS via arch_prctl ARCH_SET_FS).
     /// Saved/restored on every context switch so mlibc's TLS works correctly.
@@ -428,6 +434,8 @@ impl Process {
             ctty: None,
             stopped_by_signal: None,
             stop_reported: false,
+            continued_pending: false,
+            creds: creds::Creds::default(),
             fs_base: 0,
             fpu_state: Box::new(fpu::default_state()),
             is_thread: false,
@@ -526,6 +534,8 @@ impl Process {
             ctty: None,
             stopped_by_signal: None,
             stop_reported: false,
+            continued_pending: false,
+            creds: creds::Creds::default(),
             fs_base: 0,
             fpu_state: Box::new(fpu::default_state()),
             is_thread: false,
@@ -615,6 +625,8 @@ impl Process {
             ctty: None,
             stopped_by_signal: None,
             stop_reported: false,
+            continued_pending: false,
+            creds: creds::Creds::default(),
             fs_base: 0,
             fpu_state,
             is_thread: false,
@@ -732,6 +744,8 @@ impl Process {
             ctty: None,
             stopped_by_signal: None,
             stop_reported: false,
+            continued_pending: false,
+            creds: creds::Creds::default(),
             fs_base: 0,
             fpu_state: Box::new(fpu::default_state()),
             is_thread: true,

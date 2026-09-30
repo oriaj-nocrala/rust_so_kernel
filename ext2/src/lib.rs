@@ -135,4 +135,4 @@ pub use error::Ext2Error;
 pub use inode::RawInode;
 pub use repair::ReconcileReport;
 pub use superblock::{Superblock, EXT2_MAGIC, FEATURE_INCOMPAT_FILETYPE, ROOT_INO};
-pub use volume::Ext2Core;
+pub use volume::{Ext2Core, Usage};

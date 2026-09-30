@@ -106,6 +106,14 @@ pub trait Inode: Send + Sync {
         Err(Errno::EROFS)
     }
 
+    /// Create a hard link: a second name `name` in this (directory) inode for the existing non-directory inode `node`, which
+    /// the call resolved from another path. `EPERM` if `node` is a directory or this filesystem has no hard links (the
+    /// default), `EXDEV` if `node` belongs to another filesystem, `EEXIST` if `name` is taken. Unlike `insert_child` (one name
+    /// moving), this leaves the old name in place and counts one more name on the inode (`st_nlink`).
+    fn link_child(&self, _name: &str, _node: &Arc<dyn Inode>) -> Result<(), Errno> {
+        Err(Errno::EPERM)
+    }
+
     /// Read this inode's symlink target — a path string, either absolute
     /// or relative to the symlink's own containing directory. Only
     /// meaningful on `Symlink`-type inodes (see `file_type`); the default

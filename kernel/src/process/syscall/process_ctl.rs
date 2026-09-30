@@ -519,7 +519,7 @@ fn fork_impl(child_stack: u64, tls: Option<u64>, vfork: bool) -> SyscallResult {
     unsafe { crate::process::fpu::save(&mut parent_fpu_state); }
 
     // Collect what we need from the running process
-    let (child_as, parent_pid, parent_fs_base, files_arc, child_tf, parent_cwd, (parent_pgid, parent_sid, parent_ctty), parent_exe_name, parent_signals, (parent_comm, parent_cmdline)) = {
+    let (child_as, parent_pid, parent_fs_base, files_arc, child_tf, parent_cwd, (parent_pgid, parent_sid, parent_ctty), parent_exe_name, parent_signals, (parent_comm, parent_cmdline, parent_creds)) = {
         let scheduler = crate::process::scheduler::local_scheduler();
         match scheduler.running_ref() {
             Some(proc) => {
@@ -536,7 +536,7 @@ fn fork_impl(child_stack: u64, tls: Option<u64>, vfork: bool) -> SyscallResult {
                     // stale if `arch_prctl` ran since — same reasoning as the
                     // live `fpu::save` above.
                     Ok(child_as) => (child_as, crate::process::Pid(proc.tgid), crate::process::scheduler::read_fs_base(), proc.files.clone(), tf_copy, proc.cwd.clone(), (proc.pgid, proc.sid, proc.ctty), proc.exe_name.clone(),
-                        (proc.signal_handlers, proc.sig_restart, proc.blocked_signals, proc.sig_extra, proc.altstack), (proc.name, proc.cmdline.clone())),
+                        (proc.signal_handlers, proc.sig_restart, proc.blocked_signals, proc.sig_extra, proc.altstack), (proc.name, proc.cmdline.clone(), proc.creds.clone())),
                     Err(e) => {
                         serial_println!("fork: address_space.fork() failed: {}", e);
                         return errno::ENOMEM;
@@ -580,6 +580,7 @@ fn fork_impl(child_stack: u64, tls: Option<u64>, vfork: bool) -> SyscallResult {
         // as `[child]`.
         child.name = parent_comm;
         child.cmdline = parent_cmdline;
+        child.creds = parent_creds;
         if vfork {
             child.vfork_parent = caller_tid;
         }
@@ -651,11 +652,11 @@ pub(super) fn sys_clone(flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) 
     unsafe { crate::process::fpu::save(&mut fpu_state); }
     let parent_fs_base = crate::process::scheduler::read_fs_base();
 
-    let ((tgid, group_parent), address_space, files, parent_cwd, (parent_pgid, parent_sid, parent_ctty), parent_exe_name, parent_signals, (parent_comm, parent_cmdline)) = {
+    let ((tgid, group_parent), address_space, files, parent_cwd, (parent_pgid, parent_sid, parent_ctty), parent_exe_name, parent_signals, (parent_comm, parent_cmdline, parent_creds)) = {
         let sched = crate::process::scheduler::local_scheduler();
         match sched.running_ref() {
             Some(proc) => ((proc.tgid, proc.parent_pid), proc.address_space.clone(), proc.files.clone(), proc.cwd.clone(), (proc.pgid, proc.sid, proc.ctty), proc.exe_name.clone(),
-                (proc.signal_handlers, proc.sig_restart, proc.blocked_signals, proc.sig_extra), (proc.name, proc.cmdline.clone())),
+                (proc.signal_handlers, proc.sig_restart, proc.blocked_signals, proc.sig_extra), (proc.name, proc.cmdline.clone(), proc.creds.clone())),
             None => return errno::ESRCH,
         }
     };
@@ -701,6 +702,7 @@ pub(super) fn sys_clone(flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) 
     // A thread starts with its creator's name and command line, as on Linux.
     thread.name = parent_comm;
     thread.cmdline = parent_cmdline;
+    thread.creds = parent_creds;
     scheduler.add_process(thread);
     pid.0 as SyscallResult
 }
@@ -1089,11 +1091,12 @@ fn resolve_exec_path(name: &str) -> Result<alloc::string::String, i64> {
 /// nothing is reapable yet. `WUNTRACED` (2) also matches a `Stopped` child
 /// (job control), reporting it once (see `Process::stop_reported`) without
 /// removing it from the wait queue — a later real exit, or another
-/// stop/continue cycle, can still be observed. No `WCONTINUED` support
-/// (this kernel doesn't track SIGCONT-resume events for reporting).
+/// stop/continue cycle, can still be observed. `WCONTINUED` (8) reports a child resumed by `SIGCONT` once, with status
+/// `0xffff` (`Process::continued_pending`).
 pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> SyscallResult {
     const WNOHANG: i32 = 1;
     const WUNTRACED: i32 = 2;
+    const WCONTINUED: i32 = 8;
 
     if status_ptr != 0 {
         if let Err(e) = validate_user_buffer(status_ptr as u64, 4) { return e; }
@@ -1144,6 +1147,15 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
             None
         };
 
+        // A child resumed by SIGCONT lives in a run queue (or on a CPU), not in `wait_queue`.
+        let continued_pid = if zombie_pos.is_none() && stopped_pos.is_none() && options & WCONTINUED != 0 {
+            scheduler.iter_all()
+                .find(|p| p.continued_pending && !p.is_thread && p.parent_pid == caller_pid && target.matches(p.pid.0, p.pgid))
+                .map(|p| p.pid.0)
+        } else {
+            None
+        };
+
         if let Some(pos) = zombie_pos {
             // Safe to write the status straight into `status_ptr` right
             // here: we're running on the *parent's* stack in the parent's
@@ -1178,6 +1190,14 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
             if status_ptr != 0 {
                 // write_unaligned: see the zombie_pos branch above for why.
                 unsafe { core::ptr::write_unaligned(status_ptr as *mut i32, status); }
+            }
+            Outcome::Return(pid as SyscallResult)
+        } else if let Some(pid) = continued_pid {
+            if let Some(c) = scheduler.find_process_mut(pid) {
+                c.continued_pending = false;
+            }
+            if status_ptr != 0 {
+                unsafe { core::ptr::write_unaligned(status_ptr as *mut i32, 0xffff); }
             }
             Outcome::Return(pid as SyscallResult)
         } else {

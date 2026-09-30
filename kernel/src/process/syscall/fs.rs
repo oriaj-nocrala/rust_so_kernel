@@ -415,6 +415,62 @@ fn stat_impl(dirfd: i64, path_ptr: usize, stat_ptr: usize, follow: bool) -> Sysc
     }
 }
 
+/// statx(332): `(dirfd, path, flags, mask, statxbuf)`. The same lookups as `newfstatat`, in the 256-byte `struct statx`. It
+/// reports the basic fields (`STATX_BASIC_STATS`) whatever `mask` asks: this kernel keeps no birth time, so `STATX_BTIME` is
+/// never in the returned mask, which is how a caller learns it is missing (Rust's `Metadata::created` then says unsupported).
+pub(super) fn sys_statx(dirfd: i64, path_ptr: usize, flags: u64, mask: u32, buf: usize) -> SyscallResult {
+    use crate::fs::types::Stat;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const AT_NO_AUTOMOUNT: u64 = 0x800;
+    const AT_STATX_SYNC_TYPE: u64 = 0x6000;
+    const STATX__RESERVED: u32 = 0x8000_0000;
+    const STATX_BASIC_STATS: u32 = 0x7ff;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE) != 0 || mask & STATX__RESERVED != 0 {
+        return errno::EINVAL;
+    }
+    if let Err(e) = validate_user_buffer(buf as u64, 256) { return e; }
+
+    let empty = flags & AT_EMPTY_PATH != 0 && validate_user_buffer(path_ptr as u64, 1).is_ok() && read_user_str(path_ptr).is_empty();
+    let result: Result<Stat, i64> = if empty {
+        with_fd_table(|t| t.get(dirfd as usize).ok().and_then(|f| f.stat())).flatten().ok_or(errno::EBADF)
+    } else {
+        match user_path_at(dirfd, path_ptr, errno::ENOENT) {
+            Err(e) => Err(e),
+            Ok(path) => {
+                let r = if flags & AT_SYMLINK_NOFOLLOW == 0 { crate::fs::stat(&path) } else { crate::fs::lstat(&path) };
+                r.map_err(|e| e.as_i64())
+            }
+        }
+    };
+    let mut st = match result { Ok(st) => st, Err(e) => return e };
+    fill_missing_times(&mut st);
+
+    // Linux's `major(dev)`/`minor(dev)` for a 64-bit dev_t.
+    let major = |d: u64| (((d >> 8) & 0xfff) | ((d >> 32) & !0xfff)) as u32;
+    let minor = |d: u64| ((d & 0xff) | ((d >> 12) & !0xff)) as u32;
+    let mut out = [0u8; 256];
+    let mut put = |off: usize, bytes: &[u8]| out[off..off + bytes.len()].copy_from_slice(bytes);
+    put(0, &STATX_BASIC_STATS.to_ne_bytes());
+    put(4, &(st.st_blksize as u32).to_ne_bytes());
+    put(16, &(st.st_nlink as u32).to_ne_bytes());
+    put(20, &st.st_uid.to_ne_bytes());
+    put(24, &st.st_gid.to_ne_bytes());
+    put(28, &(st.st_mode as u16).to_ne_bytes());
+    put(32, &st.st_ino.to_ne_bytes());
+    put(40, &(st.st_size as u64).to_ne_bytes());
+    put(48, &(st.st_blocks as u64).to_ne_bytes());
+    for (off, sec, nsec) in [(64, st.st_atime, st.st_atime_nsec), (96, st.st_ctime, st.st_ctime_nsec), (112, st.st_mtime, st.st_mtime_nsec)] {
+        put(off, &(sec as i64).to_ne_bytes());
+        put(off + 8, &(nsec as u32).to_ne_bytes());
+    }
+    put(128, &major(st.st_rdev).to_ne_bytes());
+    put(132, &minor(st.st_rdev).to_ne_bytes());
+    put(136, &major(st.st_dev).to_ne_bytes());
+    put(140, &minor(st.st_dev).to_ne_bytes());
+    unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), buf as *mut u8, 256); }
+    0
+}
+
 pub(super) fn sys_fstat(fd: i32, stat_ptr: usize) -> SyscallResult {
     use crate::fs::types::Stat;
     if let Err(e) = validate_user_buffer(stat_ptr as u64, core::mem::size_of::<Stat>()) { return e; }
@@ -541,6 +597,29 @@ fn symlink_at(target_ptr: usize, dirfd: i64, linkpath_ptr: usize) -> SyscallResu
     if target.is_empty() { return errno::EINVAL; }
     let linkpath = match user_path_at(dirfd, linkpath_ptr, errno::EINVAL) { Ok(p) => p, Err(e) => return e };
     match crate::fs::vfs::symlink(&target, &linkpath) {
+        Ok(()) => 0,
+        Err(e) => e.as_i64(),
+    }
+}
+
+/// link(86): `(oldpath, newpath)`; a symlink at the end of `oldpath` is linked itself, not what it points to.
+pub(super) fn sys_link(old_ptr: usize, new_ptr: usize) -> SyscallResult {
+    link_at(AT_FDCWD, old_ptr, AT_FDCWD, new_ptr, 0)
+}
+
+/// linkat(265): `(olddirfd, oldpath, newdirfd, newpath, flags)`; `AT_SYMLINK_FOLLOW` follows a final symlink of `oldpath`.
+pub(super) fn sys_linkat(olddirfd: i64, old_ptr: usize, newdirfd: i64, new_ptr: usize, flags: u64) -> SyscallResult {
+    link_at(olddirfd, old_ptr, newdirfd, new_ptr, flags)
+}
+
+fn link_at(olddirfd: i64, old_ptr: usize, newdirfd: i64, new_ptr: usize, flags: u64) -> SyscallResult {
+    const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    if flags & !AT_SYMLINK_FOLLOW != 0 {
+        return errno::EINVAL;
+    }
+    let old_path = match user_path_at(olddirfd, old_ptr, errno::ENOENT) { Ok(p) => p, Err(e) => return e };
+    let new_path = match user_path_at(newdirfd, new_ptr, errno::ENOENT) { Ok(p) => p, Err(e) => return e };
+    match crate::fs::vfs::link(&old_path, &new_path, flags & AT_SYMLINK_FOLLOW != 0) {
         Ok(()) => 0,
         Err(e) => e.as_i64(),
     }
@@ -1546,14 +1625,10 @@ struct Statvfs {
 
 /// sys_statvfs (custom #404): long statvfs(const char *path, struct statvfs *out)
 ///
-/// Backs BusyBox `df` (`statvfs()`, POSIX — mlibc's `sys_fstatvfs` also
-/// routes here with a fixed `"/"`, see the sysdep). This kernel has one
-/// physical-memory pool (the Buddy allocator) behind every mount rather
-/// than real per-filesystem block accounting, so every path reports the
-/// same numbers — enough for `df` to run and print plausible, live
-/// (not fabricated-constant) total/free figures, not a real per-mount
-/// breakdown. `path` only needs to resolve; the numbers don't depend on
-/// what it resolves to.
+/// Backs BusyBox `df` (`statvfs()`, POSIX — mlibc's `sys_fstatvfs` also routes here with a fixed `"/"`, see the sysdep). A path on
+/// the ext2 mount (`/mnt`) reports that volume's own block and inode counts from its superblock. Every other mount is in memory
+/// (ramfs, procfs, devfs, initramfs) and shares the one physical-memory pool (the buddy allocator), so those report the RAM
+/// totals: live, not fabricated, but not a per-mount breakdown. `path` must resolve.
 pub(super) fn sys_statvfs(path_ptr: usize, out_ptr: usize) -> SyscallResult {
     if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
     if let Err(e) = validate_user_buffer(out_ptr as u64, core::mem::size_of::<Statvfs>()) { return e; }
@@ -1564,23 +1639,38 @@ pub(super) fn sys_statvfs(path_ptr: usize, out_ptr: usize) -> SyscallResult {
         return e.as_i64();
     }
 
-    const BLOCK: u64 = 4096;
-    let (total, free) = crate::allocator::mem_stats();
-    let total_blocks = total / BLOCK;
-    let free_blocks = free / BLOCK;
-
-    let out = Statvfs {
-        f_bsize: BLOCK,
-        f_frsize: BLOCK,
-        f_blocks: total_blocks,
-        f_bfree: free_blocks,
-        f_bavail: free_blocks,
-        f_files: 0,
-        f_ffree: 0,
-        f_favail: 0,
-        f_fsid: 0,
-        f_flag: 0,
-        f_namemax: 255,
+    let on_ext2 = path == "/mnt" || path.starts_with("/mnt/");
+    let out = match on_ext2.then(crate::fs::ext2::usage).flatten() {
+        Some(u) => Statvfs {
+            f_bsize: u.block_size as u64,
+            f_frsize: u.block_size as u64,
+            f_blocks: u.blocks as u64,
+            f_bfree: u.free_blocks as u64,
+            f_bavail: u.free_blocks as u64,
+            f_files: u.inodes as u64,
+            f_ffree: u.free_inodes as u64,
+            f_favail: u.free_inodes as u64,
+            f_fsid: 0,
+            f_flag: if crate::fs::ext2::is_read_only() { 1 } else { 0 }, // ST_RDONLY
+            f_namemax: 255,
+        },
+        None => {
+            const BLOCK: u64 = 4096;
+            let (total, free) = crate::allocator::mem_stats();
+            Statvfs {
+                f_bsize: BLOCK,
+                f_frsize: BLOCK,
+                f_blocks: total / BLOCK,
+                f_bfree: free / BLOCK,
+                f_bavail: free / BLOCK,
+                f_files: 0,
+                f_ffree: 0,
+                f_favail: 0,
+                f_fsid: 0,
+                f_flag: 0,
+                f_namemax: 255,
+            }
+        }
     };
     unsafe { core::ptr::write(out_ptr as *mut Statvfs, out); }
     0

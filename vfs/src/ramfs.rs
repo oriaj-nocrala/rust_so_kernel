@@ -305,6 +305,7 @@ impl Inode for RamDirNode {
             data: Arc::new(Mutex::new(Vec::new())),
             mode: Arc::new(AtomicU32::new(0o644)),
             times: Arc::new(Times::now()),
+            nlink: Arc::new(AtomicU32::new(1)),
         });
         entries.insert(name.to_string(), node.clone() as Arc<dyn Inode>);
         self.times.modified();
@@ -328,11 +329,32 @@ impl Inode for RamDirNode {
             None => Err(Errno::ENOENT),
             Some(node) if node.file_type() == FileType::Directory => Err(Errno::EISDIR),
             Some(_) => {
-                entries.remove(name);
+                if let Some(node) = entries.remove(name) {
+                    if let Some((nlink, _)) = link_state(&node) {
+                        nlink.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
                 self.times.modified();
                 Ok(())
             }
         }
+    }
+
+    fn link_child(&self, name: &str, node: &Arc<dyn Inode>) -> Result<(), Errno> {
+        // Regular files and symlinks of this filesystem. A directory (or a socket node, which has no name count) is `EPERM`, as
+        // on Linux for a filesystem that cannot link it.
+        let Some((nlink, times)) = link_state(node) else {
+            return Err(Errno::EPERM);
+        };
+        let mut entries = self.lock_entries("link_child");
+        if entries.contains_key(name) {
+            return Err(Errno::EEXIST);
+        }
+        nlink.fetch_add(1, Ordering::Relaxed);
+        times.changed();
+        entries.insert(name.to_string(), node.clone());
+        self.times.modified();
+        Ok(())
     }
 
     fn rmdir(&self, name: &str) -> Result<(), Errno> {
@@ -375,7 +397,7 @@ impl Inode for RamDirNode {
         if entries.contains_key(name) {
             return Err(Errno::EEXIST);
         }
-        let node = Arc::new(RamSymlinkNode { ino: alloc_ino(), target: target.to_string(), times: Times::now() });
+        let node = Arc::new(RamSymlinkNode { ino: alloc_ino(), target: target.to_string(), times: Times::now(), nlink: AtomicU32::new(1) });
         entries.insert(name.to_string(), node.clone() as Arc<dyn Inode>);
         self.times.modified();
         Ok(node as Arc<dyn Inode>)
@@ -432,6 +454,14 @@ impl FileHandle for RamDirHandle {
 
 // ── File inode ───────────────────────────────────────────────────────────────
 
+/// The name count and times of a node that can have several names (a regular file or a symlink), or `None`.
+fn link_state(node: &Arc<dyn Inode>) -> Option<(&AtomicU32, &Times)> {
+    if let Some(f) = node.as_any().downcast_ref::<RamFileNode>() {
+        return Some((&f.nlink, &f.times));
+    }
+    node.as_any().downcast_ref::<RamSymlinkNode>().map(|l| (&l.nlink, &l.times))
+}
+
 struct RamFileNode {
     ino:  u64,
     data: Arc<Mutex<Vec<u8>>>,
@@ -443,6 +473,9 @@ struct RamFileNode {
     // being `Arc`-shared below.
     mode: Arc<AtomicU32>,
     times: Arc<Times>,
+    /// Names this file has (`link` adds one, `unlink` takes one). Shared with the handles for the same reason as `mode`: `fstat`
+    /// sees only a handle.
+    nlink: Arc<AtomicU32>,
 }
 
 impl Inode for RamFileNode {
@@ -450,7 +483,8 @@ impl Inode for RamFileNode {
 
     fn stat(&self) -> Stat {
         self.times.apply(Stat::regular_writable(self.ino, self.data.lock().len() as i64)
-            .with_perm_bits(self.mode.load(Ordering::Relaxed)))
+            .with_perm_bits(self.mode.load(Ordering::Relaxed))
+            .with_nlink(self.nlink.load(Ordering::Relaxed) as u64))
     }
 
     fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
@@ -469,6 +503,7 @@ impl Inode for RamFileNode {
             offset: Arc::new(Mutex::new(offset)),
             mode: self.mode.clone(),
             times: self.times.clone(),
+            nlink: self.nlink.clone(),
         }))
     }
 
@@ -493,6 +528,7 @@ impl Inode for RamFileNode {
 /// fly, this one just stores whatever string `symlink()` was called with —
 /// same as a real filesystem's symlink.
 struct RamSymlinkNode {
+    nlink: AtomicU32,
     ino:    u64,
     target: String,
     times:  Times,
@@ -502,7 +538,7 @@ impl Inode for RamSymlinkNode {
     fn as_any(&self) -> &dyn core::any::Any { self }
 
     fn stat(&self) -> Stat {
-        self.times.apply(Stat::symlink(self.ino, self.target.len() as i64))
+        self.times.apply(Stat::symlink(self.ino, self.target.len() as i64).with_nlink(self.nlink.load(Ordering::Relaxed) as u64))
     }
 
     fn open(&self, _flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
@@ -565,6 +601,7 @@ struct RamFileHandle {
     // it) — see that struct's doc comment on this same field.
     mode: Arc<AtomicU32>,
     times: Arc<Times>,
+    nlink: Arc<AtomicU32>,
 }
 
 impl FileHandle for RamFileHandle {
@@ -598,7 +635,8 @@ impl FileHandle for RamFileHandle {
 
     fn stat(&self) -> Option<Stat> {
         Some(self.times.apply(Stat::regular_writable(self.ino, self.data.lock().len() as i64)
-            .with_perm_bits(self.mode.load(Ordering::Relaxed))))
+            .with_perm_bits(self.mode.load(Ordering::Relaxed))
+            .with_nlink(self.nlink.load(Ordering::Relaxed) as u64)))
     }
 
     fn dup(&self) -> Option<Box<dyn FileHandle>> {
@@ -608,6 +646,7 @@ impl FileHandle for RamFileHandle {
             offset: self.offset.clone(),
             mode: self.mode.clone(),
             times: self.times.clone(),
+            nlink: self.nlink.clone(),
         }))
     }
 
@@ -857,6 +896,82 @@ mod tests {
         let fs = new_fs();
         let r = root(&fs);
         assert_eq!(r.lookup("nope").err(), Some(Errno::ENOENT));
+    }
+
+    // ── hard links ───────────────────────────────────────────────────────
+
+    #[test]
+    fn link_gives_a_second_name_to_the_same_file() {
+        let fs = new_fs();
+        let r = root(&fs);
+        let a = r.create("a").unwrap();
+        a.open(OpenFlags(OpenFlags::WRONLY.0)).unwrap().write(b"shared").unwrap();
+        assert_eq!(a.stat().st_nlink, 1);
+        r.link_child("b", &a).unwrap();
+        let b = r.lookup("b").unwrap();
+        assert_eq!(b.stat().st_ino, a.stat().st_ino, "same inode");
+        assert_eq!(b.stat().st_nlink, 2);
+        assert_eq!(r.lookup("a").unwrap().stat().st_nlink, 2);
+        assert_eq!(b.stat().st_size, 6);
+        // A write through one name is visible through the other.
+        b.open(OpenFlags(OpenFlags::WRONLY.0 | OpenFlags::APPEND.0)).unwrap().write(b"!").unwrap();
+        assert_eq!(a.stat().st_size, 7);
+    }
+
+    #[test]
+    fn unlinking_one_name_keeps_the_file_and_counts_down() {
+        let fs = new_fs();
+        let r = root(&fs);
+        let a = r.create("a").unwrap();
+        a.open(OpenFlags(OpenFlags::WRONLY.0)).unwrap().write(b"data").unwrap();
+        r.link_child("b", &a).unwrap();
+        r.unlink("a").unwrap();
+        assert!(r.lookup("a").is_err());
+        let b = r.lookup("b").unwrap();
+        assert_eq!(b.stat().st_nlink, 1);
+        assert_eq!(b.stat().st_size, 4);
+    }
+
+    #[test]
+    fn a_handle_sees_the_link_count_too() {
+        let fs = new_fs();
+        let r = root(&fs);
+        let a = r.create("a").unwrap();
+        let h = a.open(OpenFlags(OpenFlags::RDONLY.0)).unwrap();
+        r.link_child("b", &a).unwrap();
+        assert_eq!(h.stat().unwrap().st_nlink, 2, "fstat on a handle opened before the link");
+        r.unlink("b").unwrap();
+        assert_eq!(h.stat().unwrap().st_nlink, 1);
+    }
+
+    #[test]
+    fn link_onto_a_taken_name_is_eexist_and_changes_nothing() {
+        let fs = new_fs();
+        let r = root(&fs);
+        let a = r.create("a").unwrap();
+        r.create("b").unwrap();
+        assert_eq!(r.link_child("b", &a).err(), Some(Errno::EEXIST));
+        assert_eq!(a.stat().st_nlink, 1);
+    }
+
+    #[test]
+    fn a_directory_cannot_be_linked() {
+        let fs = new_fs();
+        let r = root(&fs);
+        let d = r.mkdir("d").unwrap();
+        assert_eq!(r.link_child("e", &d).err(), Some(Errno::EPERM));
+        assert!(r.lookup("e").is_err());
+    }
+
+    #[test]
+    fn rename_of_a_linked_file_keeps_the_count() {
+        let fs = new_fs();
+        let r = root(&fs);
+        let a = r.create("a").unwrap();
+        r.link_child("b", &a).unwrap();
+        let node = r.take_child("a").unwrap();
+        r.insert_child("c", node).unwrap();
+        assert_eq!(r.lookup("c").unwrap().stat().st_nlink, 2);
     }
 
     #[test]

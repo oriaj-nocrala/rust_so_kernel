@@ -24,11 +24,13 @@ impl Errno {
     pub const EFAULT:  Self = Self(14);
     pub const EBUSY:   Self = Self(16);
     pub const EEXIST:  Self = Self(17);
+    pub const EXDEV:   Self = Self(18);
     pub const ENODEV:  Self = Self(19);
     pub const ENOTDIR: Self = Self(20);
     pub const EISDIR:  Self = Self(21);
     pub const EINVAL:  Self = Self(22);
     pub const ENOSPC:  Self = Self(28);
+    pub const EMLINK:  Self = Self(31);
     pub const EFBIG:   Self = Self(27);
     pub const EROFS:   Self = Self(30);
     pub const EPIPE:   Self = Self(32);

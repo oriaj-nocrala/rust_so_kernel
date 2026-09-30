@@ -262,6 +262,23 @@ impl MountTable {
         Ok(())
     }
 
+    /// Create a hard link `new_path` to the existing `old_path` (`link(2)`): the last component of `old_path` is not followed if
+    /// it is a symlink (unless `follow_old`, `linkat`'s `AT_SYMLINK_FOLLOW`), and a directory cannot be linked (`EPERM`). Both
+    /// must be on the same mounted filesystem (`EXDEV`).
+    pub fn link(&self, old_path: &str, new_path: &str, follow_old: bool) -> Result<(), Errno> {
+        let (old_mount, _) = self.find(old_path).ok_or(Errno::ENOENT)?;
+        let node = if follow_old { self.resolve(old_path)? } else { self.resolve_no_follow(old_path)? };
+        if node.file_type() == FileType::Directory {
+            return Err(Errno::EPERM);
+        }
+        let (new_dir, new_leaf) = split_parent(new_path)?;
+        let (new_mount, _) = self.find(new_dir).ok_or(Errno::ENOENT)?;
+        if old_mount != new_mount {
+            return Err(Errno::EXDEV);
+        }
+        self.resolve(new_dir)?.link_child(new_leaf, &node)
+    }
+
     /// Create an AF_UNIX socket node at `path` — `bind()` with a pathname
     /// address. Fails with `EEXIST` if the name is taken, which is exactly
     /// what makes a second `bind()` to the same path report `EADDRINUSE`.

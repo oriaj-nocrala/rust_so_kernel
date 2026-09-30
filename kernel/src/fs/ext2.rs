@@ -229,6 +229,36 @@ pub fn cache_stats() -> Option<hal::blockcache::CacheStats> {
 /// don't take it.
 static EXT2_LOCK: Mutex<()> = Mutex::new(());
 
+/// The in-core inode records of the open file handles, by inode number. An open handle keeps its own copy of the inode
+/// (`Ext2FileHandle::raw`); a `link`/`unlink` through another name changes the on-disk link count behind its back, and the
+/// handle would report the old one to `fstat` and write it back on its next write (corrupting the count). So the two paths that
+/// change a link count also update every live handle's copy (`set_open_links`), and a handle needs no disk read to `fstat`.
+static OPEN_RAWS: Mutex<alloc::collections::BTreeMap<u32, Vec<alloc::sync::Weak<Mutex<RawInode>>>>> =
+    Mutex::new(alloc::collections::BTreeMap::new());
+
+fn register_open_raw(ino: u32, raw: &Arc<Mutex<RawInode>>) {
+    let mut open = OPEN_RAWS.lock();
+    let list = open.entry(ino).or_default();
+    list.retain(|w| w.strong_count() > 0);
+    list.push(Arc::downgrade(raw));
+}
+
+/// Tell every open handle on `ino` its new link count.
+fn set_open_links(ino: u32, links: u16) {
+    let mut open = OPEN_RAWS.lock();
+    if let Some(list) = open.get_mut(&ino) {
+        list.retain(|w| w.strong_count() > 0);
+        for w in list.iter() {
+            if let Some(raw) = w.upgrade() {
+                raw.lock().set_links_count(links);
+            }
+        }
+        if list.is_empty() {
+            open.remove(&ino);
+        }
+    }
+}
+
 /// Set when `/mnt` was mounted read-only (`init_read_only`). Every
 /// mutating path takes [`write_lock`] instead of `EXT2_LOCK` directly, so
 /// this one flag turns them all into `EROFS` — there is no mutation that
@@ -242,6 +272,11 @@ fn write_lock() -> Result<spin::MutexGuard<'static, ()>, Errno> {
         return Err(Errno::EROFS);
     }
     Ok(EXT2_LOCK.lock())
+}
+
+/// Block and inode totals of the mounted volume for `statvfs`; `None` when nothing is mounted or the disk cannot be read.
+pub fn usage() -> Option<ext2::Usage> {
+    EXT2.get()?.core.usage().ok()
 }
 
 /// Whether `/mnt` is mounted read-only.
@@ -727,9 +762,11 @@ impl Inode for Ext2Inode {
             } else {
                 0
             };
+            let raw = Arc::new(Mutex::new(raw));
+            register_open_raw(self.ino, &raw);
             Ok(Box::new(Ext2FileHandle {
                 ino: self.ino,
-                raw: Arc::new(Mutex::new(raw)),
+                raw,
                 offset: Arc::new(Mutex::new(start_offset)),
             }))
         }
@@ -853,6 +890,7 @@ impl Inode for Ext2Inode {
         let mut child_raw = f.read_inode(child_ino)?;
         let links = child_raw.links_count().saturating_sub(1);
         child_raw.set_links_count(links);
+        set_open_links(child_ino, links);
         if links == 0 {
             f.free_all_blocks(&mut child_raw)?;
             child_raw.set_dtime(crate::time::now_unix_secs() as u32);
@@ -956,6 +994,42 @@ impl Inode for Ext2Inode {
             parent_raw.set_links_count(parent_raw.links_count() + 1);
             f.write_inode(self.ino, &parent_raw)?;
         }
+        f.touch_dir(self.ino)?;
+        Ok(())
+    }
+
+    fn link_child(&self, name: &str, node: &Arc<dyn Inode>) -> Result<(), Errno> {
+        if !self.raw.is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        let kind = node.file_type();
+        if kind == FileType::Directory {
+            return Err(Errno::EPERM);
+        }
+        let Some(ext2_node) = node.as_any().downcast_ref::<Ext2Inode>() else {
+            return Err(Errno::EXDEV);
+        };
+        let _guard = write_lock()?;
+        if self.lookup(name).is_ok() {
+            return Err(Errno::EEXIST);
+        }
+
+        let f = fs();
+        // Read the inode fresh: `ext2_node.raw` is the copy from when the path was resolved.
+        let mut target_raw = f.read_inode(ext2_node.ino)?;
+        let links = target_raw.links_count();
+        if links == 0 {
+            return Err(Errno::ENOENT); // already unlinked: nothing to link to
+        }
+        if links >= 65000 {
+            return Err(Errno::EMLINK);
+        }
+        let mut dir_raw = self.raw.clone();
+        f.add_dir_entry(self.ino, &mut dir_raw, name, ext2_node.ino, kind)?;
+        target_raw.set_links_count(links + 1);
+        target_raw.stamp_changed(now());
+        f.write_inode(ext2_node.ino, &target_raw)?;
+        set_open_links(ext2_node.ino, links + 1);
         f.touch_dir(self.ino)?;
         Ok(())
     }

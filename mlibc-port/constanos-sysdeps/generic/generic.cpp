@@ -87,6 +87,8 @@ constexpr long SYS_lstat = 6;
 constexpr long SYS_readlink = 89;
 constexpr long SYS_access = 21;
 constexpr long SYS_symlink = 88;
+constexpr long SYS_link = 86;
+constexpr long SYS_linkat = 265;
 constexpr long SYS_chmod = 90;
 constexpr long SYS_fchmod = 91;
 constexpr long SYS_socket = 41;
@@ -999,6 +1001,17 @@ int sys_symlinkat(const char *target_path, int dirfd, const char *link_path) {
 	if (dirfd != AT_FDCWD)
 		return ENOSYS;
 	return sys_symlink(target_path, link_path);
+}
+
+// link()/linkat(): hard links, same filesystem only (EXDEV otherwise); the kernel's linkat takes real dirfds.
+int sys_link(const char *old_path, const char *new_path) {
+	long ret = raw_syscall(SYS_link, (long)old_path, (long)new_path);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+int sys_linkat(int olddirfd, const char *old_path, int newdirfd, const char *new_path, int flags) {
+	long ret = raw_syscall(SYS_linkat, olddirfd, (long)old_path, newdirfd, (long)new_path, flags);
+	return ret < 0 ? (int)-ret : 0;
 }
 
 // chmod()/fchmod(): this kernel has no per-inode permission-bits storage

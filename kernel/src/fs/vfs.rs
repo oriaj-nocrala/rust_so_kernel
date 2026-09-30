@@ -98,6 +98,11 @@ pub fn rmdir(path: &str) -> Result<(), Errno> {
     MOUNTS.rmdir(path)
 }
 
+/// Create a hard link `new_path` to `old_path`.
+pub fn link(old_path: &str, new_path: &str, follow_old: bool) -> Result<(), Errno> {
+    MOUNTS.link(old_path, new_path, follow_old)
+}
+
 /// Move/rename `old_path` to `new_path`.
 pub fn rename(old_path: &str, new_path: &str) -> Result<(), Errno> {
     MOUNTS.rename(old_path, new_path)

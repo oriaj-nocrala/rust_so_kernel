@@ -46,6 +46,16 @@ use crate::superblock::Superblock;
 /// The device-backed half of ext2: raw block I/O plus block/inode bitmap
 /// allocation and free-count bookkeeping. See the module doc comment for
 /// exactly what has (and hasn't) moved here.
+/// What `statvfs` reports for a volume (`Ext2Core::usage`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    pub block_size: u32,
+    pub blocks: u32,
+    pub free_blocks: u32,
+    pub inodes: u32,
+    pub free_inodes: u32,
+}
+
 pub struct Ext2Core {
     /// Every sector read/write funnels through here — `AtaBlockDevice` or
     /// the USB pendrive at real kernel boot, `hal::block::MemDisk` in this
@@ -174,6 +184,19 @@ impl Ext2Core {
             raw[16..20].copy_from_slice(&new.to_le_bytes());
         }
         self.device.write_sectors(2, 2, &raw).map_err(|_| Ext2Error::Io)
+    }
+
+    /// Totals and free counts for `statvfs`, read fresh from the superblock (where `adjust_sb_counts` keeps the free counters).
+    pub fn usage(&self) -> Result<Usage, Ext2Error> {
+        let mut raw = [0u8; 1024];
+        self.device.read_sectors(2, 2, &mut raw).map_err(|_| Ext2Error::Io)?;
+        Ok(Usage {
+            block_size: self.sb.block_size,
+            blocks: self.sb.blocks_count,
+            free_blocks: u32::from_le_bytes(raw[12..16].try_into().unwrap()),
+            inodes: self.sb.inodes_count,
+            free_inodes: u32::from_le_bytes(raw[16..20].try_into().unwrap()),
+        })
     }
 
     pub fn blocks_in_group(&self, group: u32) -> u32 {
@@ -1022,6 +1045,24 @@ mod tests {
         // Spot-check the reference itself against what was written.
         assert_eq!(reference(9 * BS, 4), (9 * BS..9 * BS + 4).map(pattern).collect::<alloc::vec::Vec<u8>>());
         assert_eq!(reference(100 * BS, 4), alloc::vec![0u8; 4]);
+    }
+
+    #[test]
+    fn usage_follows_allocation_and_release() {
+        let core = mount(minimal_image());
+        let before = core.usage().unwrap();
+        assert_eq!(before.block_size as usize, BS);
+        assert!(before.free_blocks > 2 && before.free_blocks < before.blocks);
+        let a = core.alloc_block().unwrap().unwrap();
+        let b = core.alloc_block().unwrap().unwrap();
+        assert_eq!(core.usage().unwrap().free_blocks, before.free_blocks - 2);
+        core.free_block(a).unwrap();
+        core.free_block(b).unwrap();
+        assert_eq!(core.usage().unwrap(), before);
+        let ino = core.alloc_inode(false).unwrap().unwrap();
+        assert_eq!(core.usage().unwrap().free_inodes, before.free_inodes - 1);
+        core.free_inode(ino, false).unwrap();
+        assert_eq!(core.usage().unwrap(), before);
     }
 
     #[test]

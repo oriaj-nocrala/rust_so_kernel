@@ -723,6 +723,7 @@ impl Scheduler {
                         Some(proc) => {
                             proc.stopped_by_signal = Some(sig);
                             proc.stop_reported = false;
+                            proc.continued_pending = false;
                             (proc.pid.0, proc.parent_pid)
                         }
                         None => (0, None),
@@ -1110,12 +1111,14 @@ impl Scheduler {
             |p| {
                 p.state = ProcessState::Ready;
                 p.stopped_by_signal = None;
+                p.continued_pending = sig == super::signal::SIGCONT;
             },
         );
         if woke {
             self.kick_idle(false);
             if sig == super::signal::SIGCONT {
                 if let Some(parent) = parent {
+                    self.notify_child_continued(pid, parent);
                     let origin = super::signal::SigOrigin::child(super::signal::CLD_CONTINUED, pid, super::signal::SIGCONT as i32);
                     if self.running_ref().map(|p| p.tgid) == Some(parent.0) {
                         if let Some(p) = self.running_mut() {
@@ -1473,6 +1476,34 @@ impl Scheduler {
         }
         // Last, for the reason `notify_child_death` gives.
         self.interrupt_blocked();
+    }
+
+    /// A stopped child was resumed by `SIGCONT`: wake the parent's thread blocked in `waitpid(WCONTINUED)` for it, handing it the
+    /// `0xffff` status (`WIFCONTINUED`) the way `notify_child_stopped` hands over a stop. The report is one-shot
+    /// (`Process::continued_pending`).
+    fn notify_child_continued(&mut self, child_pid: usize, parent_pid: Pid) {
+        const WCONTINUED: i32 = 8;
+        let Some(child_pgid) = self.find_process_mut(child_pid).map(|p| p.pgid) else { return; };
+        let mut waker_pid: Option<usize> = None;
+        for proc in self.core.wait_queue_mut().iter_mut() {
+            if Pid(proc.tgid) == parent_pid
+                && matches!(proc.state, ProcessState::Blocked)
+                && proc.waiting_options & WCONTINUED != 0
+                && proc.waiting_for.map(|t| t.matches(child_pid, child_pgid)).unwrap_or(false)
+            {
+                proc.trapframe.rax = child_pid as u64;
+                proc.waiting_for = None;
+                proc.pending_wait_status = Some(0xffff);
+                waker_pid = Some(proc.pid.0);
+                break;
+            }
+        }
+        if let Some(pid) = waker_pid {
+            if let Some(c) = self.find_process_mut(child_pid) {
+                c.continued_pending = false;
+            }
+            self.wake(pid);
+        }
     }
 
     /// If the process about to resume (`self.running`) has a pending
