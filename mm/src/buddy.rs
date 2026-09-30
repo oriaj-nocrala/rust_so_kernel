@@ -113,14 +113,12 @@ const _: () = assert!(BITMAP_BYTES < 64 * 1024, "Bitmap exceeds 64KiB — raise 
 /// `serial_println_raw!` text. `NotFound` preserves a pre-existing
 /// anomaly on purpose: the original format string's `free_list[{}]` slot
 /// there was fed `order`, not the list index (`idx = order - MIN_ORDER`,
-/// what `EmptyList`/`LoopLimit` both correctly use) — kept byte-for-byte
+/// what `EmptyList` correctly uses) — kept byte-for-byte
 /// identical, not fixed, since this is a mechanical move, not a bugfix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhantomEvent {
     /// `free_lists[idx]` was already fully empty.
     EmptyList { addr: PhysAddr, order: usize, idx: usize },
-    /// Scanned more than 4096 links without finding the block.
-    LoopLimit { addr: PhysAddr, idx: usize },
     /// Walked the whole list without finding `addr`. See this enum's doc
     /// comment: `order` here is what the original code printed in the
     /// `free_list[{}]` slot, not `idx` — preserved as-is.
@@ -161,6 +159,9 @@ impl FreeList {
 #[repr(C)]
 struct FreeBlock {
     next: Option<PhysAddr>,
+    /// Doubly linked so that removing a block from the middle (coalescing) is O(1): with only `next` it took a scan from
+    /// the head, and a list of more than a few thousand 4 KiB blocks is normal after heavy allocation.
+    prev: Option<PhysAddr>,
 }
 
 impl BuddyAllocator {
@@ -340,12 +341,14 @@ impl BuddyAllocator {
     unsafe fn add_block(&mut self, mem: &dyn PhysMap, order: usize, addr: PhysAddr) {
         let idx = self.order_to_index(order);
 
-        let new_block = FreeBlock {
-            next: self.free_lists[idx].head,
-        };
+        let old_head = self.free_lists[idx].head;
+        let new_block = FreeBlock { next: old_head, prev: None };
 
         let ptr = mem.virt_for(addr) as *mut FreeBlock;
         ptr.write(new_block);
+        if let Some(h) = old_head {
+            (*(mem.virt_for(h) as *mut FreeBlock)).prev = Some(addr);
+        }
 
         self.free_lists[idx].head = Some(addr);
         self.bitmap_set(order, addr);
@@ -367,7 +370,11 @@ impl BuddyAllocator {
         );
 
         let block = &*(mem.virt_for(addr) as *const FreeBlock);
-        self.free_lists[idx].head = block.next;
+        let next = block.next;
+        self.free_lists[idx].head = next;
+        if let Some(n) = next {
+            (*(mem.virt_for(n) as *mut FreeBlock)).prev = None;
+        }
         self.bitmap_clear(order, addr);
     }
 
@@ -379,7 +386,7 @@ impl BuddyAllocator {
     /// list). In the `Err` case the phantom bitmap bit is cleared so
     /// future coalescing won't loop.
     ///
-    /// Handles both the head case (O(1)) and the general case (O(n) scan).
+    /// O(1) for the head and for any other block (the list is doubly linked).
     /// Called during coalescing, where the buddy may be anywhere in the list.
     unsafe fn remove_arbitrary_block(
         &mut self,
@@ -395,45 +402,47 @@ impl BuddyAllocator {
             return Ok(());
         }
 
-        // Slow path: scan the list for the block and unlink it
-        let mut prev_addr = match self.free_lists[idx].head {
-            Some(a) => a,
+        // General case, O(1): the block names its neighbours. A block the bitmap wrongly calls free (a "phantom") has
+        // arbitrary contents in place of a `FreeBlock`, so the neighbours are checked to point back at it before they are
+        // touched; a 4 KiB-aligned address that is not really a list node is the one thing this cannot catch.
+        if self.free_lists[idx].head.is_none() {
+            // Phantom bitmap entry — free list is completely empty.
+            // Clear the phantom bit so future coalescing won't see it again.
+            self.bitmap_clear(order, addr);
+            return Err(PhantomEvent::EmptyList { addr, order, idx });
+        }
+        let block = &*(mem.virt_for(addr) as *const FreeBlock);
+        let (prev, next) = (block.prev, block.next);
+        let sane = |a: PhysAddr| a.as_u64() % (1u64 << MIN_ORDER) == 0;
+        if prev.map_or(false, |p| !sane(p)) || next.map_or(false, |n| !sane(n)) {
+            self.bitmap_clear(order, addr);
+            return Err(PhantomEvent::NotFound { addr, order });
+        }
+        match prev {
             None => {
-                // Phantom bitmap entry — free list is completely empty.
-                // Clear the phantom bit so future coalescing won't see it again.
+                // No predecessor means the head, which the fast path above already took: a phantom.
                 self.bitmap_clear(order, addr);
-                return Err(PhantomEvent::EmptyList { addr, order, idx });
+                return Err(PhantomEvent::NotFound { addr, order });
             }
-        };
-
-        let mut iters: usize = 0;
-        loop {
-            iters += 1;
-            if iters > 4096 {
-                // Pathological list — treat as phantom, clear bitmap, abort.
-                self.bitmap_clear(order, addr);
-                return Err(PhantomEvent::LoopLimit { addr, idx });
-            }
-
-            let prev_block = &mut *(mem.virt_for(prev_addr) as *mut FreeBlock);
-
-            match prev_block.next {
-                Some(next_addr) if next_addr == addr => {
-                    let target_block = &*(mem.virt_for(addr) as *const FreeBlock);
-                    prev_block.next = target_block.next;
-                    self.bitmap_clear(order, addr);
-                    return Ok(());
-                }
-                Some(next_addr) => {
-                    prev_addr = next_addr;
-                }
-                None => {
-                    // Block not found in list — phantom entry. Clear and abort.
+            Some(p) => {
+                let prev_block = &mut *(mem.virt_for(p) as *mut FreeBlock);
+                if prev_block.next != Some(addr) {
                     self.bitmap_clear(order, addr);
                     return Err(PhantomEvent::NotFound { addr, order });
                 }
+                if let Some(n) = next {
+                    let next_block = &mut *(mem.virt_for(n) as *mut FreeBlock);
+                    if next_block.prev != Some(addr) {
+                        self.bitmap_clear(order, addr);
+                        return Err(PhantomEvent::NotFound { addr, order });
+                    }
+                    next_block.prev = Some(p);
+                }
+                prev_block.next = next;
             }
         }
+        self.bitmap_clear(order, addr);
+        Ok(())
     }
 
     // ====================================================================
@@ -846,6 +855,32 @@ mod tests {
         // allocation should now succeed.
         let whole = unsafe { buddy.allocate(&mem, 13) };
         assert_eq!(whole, Some(PhysAddr::new(0)));
+    }
+
+    /// The buddy of a freed block sits deeper in its order's free list than any fixed scan limit: coalescing must still
+    /// find it. (On the Ryzen a long order-12 list made `deallocate` report "infinite loop free_list[0]", clear the
+    /// bitmap bit of a block that was still listed, and give up coalescing.)
+    #[test]
+    fn deallocate_coalesces_with_a_buddy_deep_in_a_long_free_list() {
+        const PAGES: u64 = 10_000;
+        let mem = VecMem::new(PAGES as usize * 4096);
+        let mut buddy = new_allocator_with_region(&mem, 0, PAGES * 4096);
+        let mut pages: std::vec::Vec<u64> = std::vec::Vec::new();
+        while let Some(p) = unsafe { buddy.allocate(&mem, 12) } {
+            pages.push(p.as_u64() >> 12);
+        }
+        assert_eq!(pages.len() as u64, PAGES);
+        pages.sort();
+        // Free the even pages in address order; each one's buddy (the next odd page) stays allocated, so nothing merges and
+        // the order-12 list grows to 5000 links, page 0 (freed first) at the tail.
+        for &n in pages.iter().filter(|n| *n % 2 == 0) {
+            assert_eq!(unsafe { buddy.deallocate(&mem, PhysAddr::new(n << 12), 12) }, None);
+        }
+        // Page 1's buddy is page 0: deeper in the list than the old 4096-link limit.
+        let ev = unsafe { buddy.deallocate(&mem, PhysAddr::new(1 << 12), 12) };
+        assert_eq!(ev, None, "the buddy is in the list, so there is no phantom event");
+        assert!(buddy.is_free(13, PhysAddr::new(0)), "pages 0 and 1 merged into an order-13 block");
+        assert!(!buddy.is_free(12, PhysAddr::new(0)), "and page 0 left the order-12 list");
     }
 
     #[test]

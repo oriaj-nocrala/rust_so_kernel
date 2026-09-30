@@ -18,7 +18,7 @@
 //   5. Bitmap ⟺ free-list coherence — the bitmap's "free" bit for a block
 //      is set if and only if the block is genuinely present in that
 //      order's free list. This is the primary target: production's own
-//      `PhantomEvent` (`EmptyList`/`NotFound`/`LoopLimit`) exists
+//      `PhantomEvent` (`EmptyList`/`NotFound`) exists
 //      specifically because this mismatch happens somewhere in practice,
 //      and gets silently patched over (clear the stray bit, stop
 //      coalescing) instead of investigated. Any `PhantomEvent` observed

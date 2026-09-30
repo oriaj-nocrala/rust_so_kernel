@@ -7,6 +7,7 @@ Code: `kernel/src/memory/`, `kernel/src/allocator/`, crate `mm/` (host tests: `c
 - **Buddy** (`mm::buddy`, physical frames, orders 12–28 = 4 KiB–256 MiB). Global `BUDDY` in `kernel/src/allocator/mod.rs` is the **only** frame allocator after `init_core`.
 - **Slab** (`mm::slab`, kernel heap) is the `#[global_allocator]` (`SlabGlobalAlloc`). Gets frames only through `mm::FrameSource` → `phys_alloc`/`phys_free`.
 - **`mm` has no `alloc` dependency, on purpose**: it *is* the allocator, so any allocation inside it would recurse. Fixed arrays and intrusive lists only.
+- The buddy free lists are **doubly linked** (`FreeBlock { next, prev }` in the free block itself), so coalescing removes the buddy from the middle of a list in O(1). With `next` only it scanned from the head and gave up after 4096 links (`PhantomEvent::LoopLimit`, seen once on the Ryzen with a long order-12 list); that variant is gone. A phantom bitmap bit is now caught by the neighbours not pointing back (`NotFound`).
 - `kernel/src/allocator/mod.rs` is the adapter: owns the globals and turns `mm`'s events (`PhantomEvent`, `AllocEvent`/`DeallocEvent`) into logs. Failures always print; routine events are `ktrace!(MM)`. A double free panics.
 - `BUDDY`/`SLAB_ALLOCATOR` are `diag::IrqMutex` (see Key Design Invariants in CLAUDE.md).
 - `mm` uses `x86_64::PhysAddr`/`VirtAddr`, pinned `=0.15.4` (0.15.5 does not build on this nightly).

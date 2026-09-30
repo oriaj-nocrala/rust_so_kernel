@@ -102,12 +102,6 @@ pub(crate) fn log_phantom_event(event: Option<mm::buddy::PhantomEvent>) {
                 addr.as_u64(), order, idx
             );
         }
-        Some(PhantomEvent::LoopLimit { addr, idx }) => {
-            crate::serial_println_raw!(
-                "[BUDDY] phantom: infinite loop free_list[{}] for {:#x} — clearing",
-                idx, addr.as_u64()
-            );
-        }
         Some(PhantomEvent::NotFound { addr, order }) => {
             crate::serial_println_raw!(
                 "[BUDDY] phantom: {:#x} NOT FOUND in free_list[{}] — clearing",
