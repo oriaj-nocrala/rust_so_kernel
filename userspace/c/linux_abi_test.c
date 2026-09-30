@@ -372,6 +372,29 @@ static void test_exit_group_and_fork_clone(void) {
     close(fds[0]);
     close(fds[1]);
 
+    // a fatal signal to one thread ends the whole group, and the parent sees that signal
+    pipe(fds);
+    pid = fork();
+    if (pid == 0) {
+        long tid = test_clone(THREAD_FLAGS, prepare(3, spin_fn, NULL), NULL, NULL, NULL);
+        write(fds[1], &tid, sizeof tid);
+        sc(234 /* tgkill */, getpid(), tid, SIGTERM, 0, 0, 0);      // default action: terminate, the whole process
+        for (;;) pause();
+    }
+    tid = 0;
+    read(fds[0], &tid, sizeof tid);
+    st = 0;
+    waitpid(pid, &st, 0);
+    CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGTERM, "SIGTERM to a thread killed the process: status %#x", st);
+    gone = 0;
+    for (int i = 0; i < 200 && !gone; i++) {
+        gone = sc(SYS_kill, tid, 0, 0, 0, 0, 0) == -ESRCH_;
+        if (!gone) usleep(10000);
+    }
+    CHECK(gone, "and the thread is gone (tid %ld)", tid);
+    close(fds[0]);
+    close(fds[1]);
+
     // no CLONE_THREAD: a copy-on-write fork with SIGCHLD as the exit signal, resuming on a stack of its own
     marker = 5;
     long r = test_clone(SIGCHLD, prepare(1, fork_child_fn, NULL), NULL, NULL, NULL);

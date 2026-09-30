@@ -695,9 +695,11 @@ impl Scheduler {
                     // killed it (read back by `Process::wait_status_word()`)
                     // and capture what its parent needs to be told, before
                     // `kill_and_switch_tf` below takes it out of `self.running`.
+                    self.kill_thread_group(sig);
                     let (dead_pid, parent_pid) = match self.running_mut() {
                         Some(proc) => {
-                            proc.killed_by_signal = Some(sig);
+                            // `get_or_insert`: a group-mate's fatal signal already named the real one.
+                            proc.killed_by_signal.get_or_insert(sig);
                             let parent = if proc.is_thread { None } else { proc.parent_pid };
                             (proc.pid.0, parent)
                         }
@@ -756,6 +758,36 @@ impl Scheduler {
     // Kill current process (user segfault, sys_exit)
     // ====================================================================
 
+    /// Zero `addr` in `space` and wake one futex waiter on it (`Process::clear_child_tid`).
+    fn clear_child_tid(&mut self, addr: u64, space: &alloc::sync::Arc<crate::memory::address_space::AddressSpace>) {
+        unsafe { space.copy_to_user(addr, &0u32.to_ne_bytes()); }
+        let as_id = space.root_frame().start_address().as_u64();
+        for pid in super::syscall::futex_take_waiters(as_id, addr, 1, u32::MAX) {
+            self.wake_with_retval(pid, 0);
+        }
+    }
+
+    /// A fatal signal ends the whole thread group (the processes sharing the running process's address space), as on Linux:
+    /// the others get SIGKILL, and the leader is tagged with `sig` first so its parent sees the signal that really ended the
+    /// process, not the SIGKILL that carries it out. Called before the running process is killed.
+    pub fn kill_thread_group(&mut self, sig: u32) {
+        let Some(me) = self.running_ref() else { return };
+        let (my_pid, space) = (me.pid.0, me.address_space.clone());
+        let others: alloc::vec::Vec<(usize, bool)> = self
+            .iter_all()
+            .filter(|p| p.pid.0 != my_pid && p.pid.0 != 0 && alloc::sync::Arc::ptr_eq(&p.address_space, &space))
+            .map(|p| (p.pid.0, p.is_thread))
+            .collect();
+        for (pid, is_thread) in others {
+            if !is_thread {
+                if let Some(p) = self.find_process_mut(pid) {
+                    p.killed_by_signal.get_or_insert(sig);
+                }
+            }
+            self.signal_pid(pid, super::signal::SIGKILL);
+        }
+    }
+
     /// Mark the running process as Zombie and move it to the wait queue —
     /// unless it's a thread (`is_thread`), in which case it's reaped
     /// immediately instead (dropped here and now).
@@ -776,6 +808,11 @@ impl Scheduler {
         if let Some(mut proc) = self.running[me].take() {
             assert!(proc.pid.0 != 0, "kill_current on an idle process");
             note_leaving(&mut proc);
+            // CLONE_CHILD_CLEARTID / set_tid_address, for every way a process can die (`sys_exit`, a fatal signal, a fault): tell
+            // whoever waits on it (musl's `pthread_join`) it is gone. Its address space is still intact here.
+            if proc.clear_child_tid != 0 {
+                self.clear_child_tid(proc.clear_child_tid, &proc.address_space);
+            }
             self.reparent_children(proc.pid);
             // Its files close now, as Linux's `do_exit` does — but not
             // here, under this lock: see `dead_files`. (`sys_exit` has

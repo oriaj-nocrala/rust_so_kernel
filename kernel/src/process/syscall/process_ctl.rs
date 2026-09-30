@@ -252,19 +252,6 @@ pub(super) fn sys_exit(status: i32) -> SyscallResult {
 
     let _irq = crate::process::irq_guard::InterruptGuard::new();
 
-    // CLONE_CHILD_CLEARTID: tell whoever waits on this thread (musl's
-    // `pthread_join`) it is gone. Before the process is taken off the CPU,
-    // while its address space is still the current one, and with IF=0 like
-    // everything after this point.
-    let clear = {
-        let sched = crate::process::scheduler::local_scheduler();
-        sched.running_ref().filter(|p| p.clear_child_tid != 0).map(|p| (p.clear_child_tid, p.address_space.clone()))
-    };
-    if let Some((addr, space)) = clear {
-        unsafe { space.copy_to_user(addr, &0u32.to_ne_bytes()); }
-        super::sync::futex_wake_irq_off(space.root_frame().start_address().as_u64(), addr, 1, u32::MAX);
-    }
-
     let (dead_pid, parent_to_notify, tf_ptr, old_files) = {
         let mut scheduler = crate::process::scheduler::local_scheduler();
         // Swap in a fresh, empty fd table *before* the process becomes a

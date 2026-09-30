@@ -574,9 +574,10 @@ fn kill_current_user_process(reason: &str, sig: u32) -> ! {
         // this kernel doesn't distinguish fault kinds at the signal level.
         // Captured before `kill_and_switch_tf` takes the process out of
         // `self.running`.
+        scheduler.kill_thread_group(sig);
         let (dead_pid, parent_pid) = match scheduler.running_mut() {
             Some(proc) => {
-                proc.killed_by_signal = Some(sig);
+                proc.killed_by_signal.get_or_insert(sig);
                 let parent = if proc.is_thread { None } else { proc.parent_pid };
 
                 // Say it on screen too, not just over serial. On hardware

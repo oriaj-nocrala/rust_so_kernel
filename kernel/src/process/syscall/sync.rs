@@ -169,26 +169,7 @@ fn futex_wake(uaddr: u64, val: i32, bitset: u32) -> SyscallResult {
 /// The wake itself, for a caller that already runs with IF=0 (`sys_exit`) and so must not go through an `InterruptGuard`, whose
 /// drop would turn interrupts back on. `as_id` is the address space's root frame, as `FutexWaiter::as_id` holds it.
 pub(super) fn futex_wake_irq_off(as_id: u64, uaddr: u64, max_wake: i32, bitset: u32) -> usize {
-    let mut woken_pids: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
-    {
-        let mut waiters = FUTEX_WAITERS.lock();
-        // A waiter a signal or a timeout ended is dropped without counting:
-        // the wakeup goes to one still asleep instead of being lost
-        // on one that has gone back to its loop.
-        waiters.retain(|&pid, w| {
-            if woken_pids.len() as i32 >= max_wake {
-                return true;
-            }
-            if w.uaddr != uaddr || w.as_id != as_id || w.bitset & bitset == 0 {
-                return true;
-            }
-            if w.cell.claim() {
-                woken_pids.push(pid);
-            }
-            false
-        });
-    }
-
+    let woken_pids = futex_take_waiters(as_id, uaddr, max_wake, bitset);
     if !woken_pids.is_empty() {
         let mut sched = crate::process::scheduler::local_scheduler();
         for &pid in &woken_pids {
@@ -196,6 +177,30 @@ pub(super) fn futex_wake_irq_off(as_id: u64, uaddr: u64, max_wake: i32, bitset: 
         }
     }
     woken_pids.len()
+}
+
+/// Claim up to `max_wake` waiters of (`uaddr`, address space `as_id`) whose mask shares a bit with `bitset`, and take them off
+/// the registry; the caller wakes them (`Scheduler::wake_with_retval`). Takes only `FUTEX_WAITERS`, so a caller that already
+/// holds the scheduler lock (the death path, `Scheduler::kill_current`) can use it: the lock order is scheduler → `FUTEX_WAITERS`.
+pub(crate) fn futex_take_waiters(as_id: u64, uaddr: u64, max_wake: i32, bitset: u32) -> alloc::vec::Vec<usize> {
+    let mut woken_pids: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    let mut waiters = FUTEX_WAITERS.lock();
+    // A waiter a signal or a timeout ended is dropped without counting:
+    // the wakeup goes to one still asleep instead of being lost
+    // on one that has gone back to its loop.
+    waiters.retain(|&pid, w| {
+        if woken_pids.len() as i32 >= max_wake {
+            return true;
+        }
+        if w.uaddr != uaddr || w.as_id != as_id || w.bitset & bitset == 0 {
+            return true;
+        }
+        if w.cell.claim() {
+            woken_pids.push(pid);
+        }
+        false
+    });
+    woken_pids
 }
 
 /// FUTEX_REQUEUE / FUTEX_CMP_REQUEUE: wake up to `nr_wake` waiters of `uaddr`, then move up to `nr_requeue` of the rest to

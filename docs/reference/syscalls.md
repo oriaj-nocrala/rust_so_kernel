@@ -64,8 +64,8 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 | 204 | sched_getaffinity | The scheduling CPUs; returns 8. No setaffinity |
 | 213/232/233 | epoll_create/wait/ctl | Shares poll's readiness |
 | 217 | getdents64 | `linux_dirent64` |
-| 218 | set_tid_address | Stores `Process::clear_child_tid`; `sys_exit` (only) zeroes it and futex-wakes it. `exec` clears it. A signal death does not honour it |
-| 231 | exit_group | SIGKILLs every process sharing the caller's address space, then `exit`. From a spawned thread the leader dies by SIGKILL and the status is lost |
+| 218 | set_tid_address | Stores `Process::clear_child_tid`; `Scheduler::kill_current` (every way of dying) zeroes it and futex-wakes it. `exec` clears it |
+| 231 | exit_group | SIGKILLs every process sharing the caller's address space, then `exit`. From a spawned thread the leader dies by SIGKILL and the status is lost. A fatal signal (or fault) in any thread ends the whole group the same way (`Scheduler::kill_thread_group`), and the leader's parent sees that signal |
 | 228/229 | clock_gettime/getres | `REALTIME` = RTC at boot + uptime. `MONOTONIC`/`BOOTTIME`/… = uptime. CPU-time clocks from `exec_ns`. Resolution 1 ns |
 | 280 | utimensat | `UTIME_NOW`/`OMIT`, `AT_SYMLINK_NOFOLLOW`, NULL path = futimens. A relative path with a real dirfd → `ENOSYS` |
 | 319 | memfd_create | |
