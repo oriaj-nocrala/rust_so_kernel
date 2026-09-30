@@ -107,6 +107,15 @@ grep -q 'DRAW DONE' /tmp/vk_draw.out || { sum "gpu-vk: the draw program did not 
 grep -q 'draw result: EXECUTED' /tmp/vk_draw.out || { sum "gpu-vk: the draw did not execute correctly"; fail=1; }
 sum "gpu-vk: after the draw: $(grep '^gpu_uapi:' /proc/kdebug)"
 
+# G4e presentation: the same program, then 12 s of a spinning triangle rendered by the GPU (640x400, B8G8R8A8), copied to a host buffer and
+# from there into /dev/fb0 frame by frame: what the monitor shows is the GPU's picture (the CPU carries it to the screen for now).
+VK_DRAW_PRESENT=12 VK_PROBE_REQUIRE_EXEC=1 NVK_CONSTANOS_DEBUG=1 /mnt/bin/vk_draw > /tmp/vk_present.out 2>&1
+prc=$?
+grep -E 'VK present|FAIL|ASSERT|DRAW DONE' /tmp/vk_present.out | while read -r l; do sum "gpu-vk: present: $l"; done
+[ $prc = 0 ] || { sum "gpu-vk: the presentation run exit=$prc"; fail=1; tail -n 20 /tmp/vk_present.out >> /tmp/gpu-vk.sum; }
+grep -q 'VK present: [0-9]* frames' /tmp/vk_present.out || { sum "gpu-vk: no frames were presented"; fail=1; }
+sum "gpu-vk: after the presentation: $(grep '^gpu_uapi:' /proc/kdebug)"
+
 # RM still answers after all this, and the display is unharmed.
 echo 'gsp name' > /dev/dispctl && sum "gpu-vk: RM still answers" || { sum "gpu-vk: RM does not answer"; fail=1; }
 sum "gpu-vk: $(grep '^gpu_gsprt:' /proc/kdebug)"

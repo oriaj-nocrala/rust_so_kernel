@@ -15,6 +15,13 @@
 #include <unwind.h>
 
 #include "draw_spv.h"
+#include "tri_spv.h"
+
+#include <fcntl.h>
+#include <math.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <time.h>
 
 static _Unwind_Reason_Code trace_cb(struct _Unwind_Context *c, void *arg) {
    (void)arg;
@@ -53,6 +60,13 @@ static int find_type(const VkPhysicalDeviceMemoryProperties *mp, uint32_t allowe
 #define W 64
 #define H 64
 
+/* /dev/fb0 (docs/reference/graphics.md) */
+#define FBIO_GET_INFO 0x46420010
+#define FBIO_FLUSH 0x46420011
+struct fb0_info { uint32_t width, height, stride, bytes_per_pixel; uint64_t offset, map_len; };
+struct fb0_rect { uint32_t x, y, w, h; };
+struct fb0_flush { uint32_t count, pad; struct fb0_rect rects[16]; };
+
 int main(void) {
    setvbuf(stdout, NULL, _IONBF, 0);
    VkInstance instance = VK_NULL_HANDLE;
@@ -67,6 +81,13 @@ int main(void) {
    VkPipeline pipe = VK_NULL_HANDLE;
    VkCommandPool cpool = VK_NULL_HANDLE;
    VkFence fence = VK_NULL_HANDLE;
+   VkImage image2 = VK_NULL_HANDLE;
+   VkDeviceMemory imem2 = VK_NULL_HANDLE, bmem2 = VK_NULL_HANDLE;
+   VkImageView view2 = VK_NULL_HANDLE;
+   VkBuffer buf2 = VK_NULL_HANDLE;
+   VkShaderModule vmod2 = VK_NULL_HANDLE, fmod2 = VK_NULL_HANDLE;
+   VkPipelineLayout pl2 = VK_NULL_HANDLE;
+   VkPipeline pipe2 = VK_NULL_HANDLE;
 
    GLOBAL(vkCreateInstance);
    if (!vkCreateInstance) return 1;
@@ -118,7 +139,7 @@ int main(void) {
    vkGetDeviceQueue(device, family, 0, &queue);
 
    // ---- the image (device-local: VRAM) and the buffer it is copied to (host-visible)
-   VkImageCreateInfo imci = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+   VkImageCreateInfo imci = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_B8G8R8A8_UNORM,
       .extent = { W, H, 1 }, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
       .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
       .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
@@ -132,7 +153,7 @@ int main(void) {
    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = it };
    VKOK(vkAllocateMemory(device, &mai, NULL, &imem));
    VKOK(vkBindImageMemory(device, image, imem, 0));
-   VkImageViewCreateInfo ivci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = image, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+   VkImageViewCreateInfo ivci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = image, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_B8G8R8A8_UNORM,
       .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
    VKOK(vkCreateImageView(device, &ivci, NULL, &view));
 
@@ -170,7 +191,7 @@ int main(void) {
    VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &cba };
    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
    VkPipelineDynamicStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn };
-   VkFormat cf = VK_FORMAT_R8G8B8A8_UNORM;
+   VkFormat cf = VK_FORMAT_B8G8R8A8_UNORM;
    VkPipelineRenderingCreateInfo pri = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1, .pColorAttachmentFormats = &cf };
    VkGraphicsPipelineCreateInfo gpci = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &pri, .stageCount = 2, .pStages = stages,
       .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms,
@@ -221,7 +242,8 @@ int main(void) {
    unsigned good = 0, untouched = 0, first_bad = ~0u;
    for (uint32_t i = 0; i < W * H; i++) {
       uint32_t p = px[i];
-      int rr = p & 0xff, gg = (p >> 8) & 0xff, bb = (p >> 16) & 0xff, aa = p >> 24;
+      // B8G8R8A8: byte 0 is blue, byte 2 red (a 0x00RRGGBB pixel, what /dev/fb0 takes)
+      int bb = p & 0xff, gg = (p >> 8) & 0xff, rr = (p >> 16) & 0xff, aa = p >> 24;
       if (rr == 255 && (gg == 127 || gg == 128) && (bb == 63 || bb == 64) && aa == 255) good++;
       else { if (first_bad == ~0u) first_bad = i; if (p == 0xdeadbeefu) untouched++; }
    }
@@ -232,11 +254,127 @@ int main(void) {
    if (getenv("VK_PROBE_REQUIRE_EXEC")) CHECK(executed, "the draw really ran on the GPU");
    VKOK(vkDeviceWaitIdle(device));
 
+   // ---- G4e presentation: VK_DRAW_PRESENT=<seconds> keeps drawing a spinning triangle into a 640x400 image, copies each frame to a host buffer
+   // and from there into /dev/fb0, so the GPU's pictures reach the screen (by the CPU for now; zero-copy scanout is for later)
+   if (getenv("VK_DRAW_PRESENT") && executed) {
+      const uint32_t PW = 640, PH = 400;
+      double seconds = atof(getenv("VK_DRAW_PRESENT"));
+      int fb = open("/dev/fb0", O_RDWR);
+      struct fb0_info fi;
+      uint8_t *fbmap = MAP_FAILED;
+      if (fb >= 0 && ioctl(fb, FBIO_GET_INFO, &fi) == 0) fbmap = mmap(NULL, fi.map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fb, 0);
+      CHECK(fbmap != MAP_FAILED, "/dev/fb0 mapped");
+      if (fbmap == MAP_FAILED) goto done;
+      printf("VK present: screen %ux%u stride %u, image %ux%u\n", fi.width, fi.height, fi.stride, PW, PH);
+      imci.extent = (VkExtent3D){ PW, PH, 1 };
+      VKOK(vkCreateImage(device, &imci, NULL, &image2));
+      vkGetImageMemoryRequirements(device, image2, &req);
+      mai.allocationSize = req.size;
+      mai.memoryTypeIndex = it;
+      VKOK(vkAllocateMemory(device, &mai, NULL, &imem2));
+      VKOK(vkBindImageMemory(device, image2, imem2, 0));
+      ivci.image = image2;
+      VKOK(vkCreateImageView(device, &ivci, NULL, &view2));
+      bci.size = PW * PH * 4;
+      VKOK(vkCreateBuffer(device, &bci, NULL, &buf2));
+      vkGetBufferMemoryRequirements(device, buf2, &req);
+      mai.allocationSize = req.size;
+      mai.memoryTypeIndex = bt;
+      VKOK(vkAllocateMemory(device, &mai, NULL, &bmem2));
+      VKOK(vkBindBufferMemory(device, buf2, bmem2, 0));
+      uint32_t *px2 = NULL;
+      VKOK(vkMapMemory(device, bmem2, 0, VK_WHOLE_SIZE, 0, (void **)&px2));
+
+      VkShaderModuleCreateInfo tvs = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = tri_vert_spv_len, .pCode = (const uint32_t *)tri_vert_spv };
+      VkShaderModuleCreateInfo tfs = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = tri_frag_spv_len, .pCode = (const uint32_t *)tri_frag_spv };
+      VKOK(vkCreateShaderModule(device, &tvs, NULL, &vmod2));
+      VKOK(vkCreateShaderModule(device, &tfs, NULL, &fmod2));
+      VkPushConstantRange pcr = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32 };
+      VkPipelineLayoutCreateInfo plci2 = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
+      VKOK(vkCreatePipelineLayout(device, &plci2, NULL, &pl2));
+      stages[0].module = vmod2;
+      stages[1].module = fmod2;
+      gpci.layout = pl2;
+      VKOK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gpci, NULL, &pipe2));
+      VkCommandBuffer cmd2;
+      VKOK(vkAllocateCommandBuffers(device, &cbai, &cmd2));
+      VkFence fence2;
+      VKOK(vkCreateFence(device, &fci, NULL, &fence2));
+      PFN_vkResetFences vkResetFences = (PFN_vkResetFences)vkGetDeviceProcAddr(device, "vkResetFences");
+      PFN_vkResetCommandBuffer vkResetCommandBuffer = (PFN_vkResetCommandBuffer)vkGetDeviceProcAddr(device, "vkResetCommandBuffer");
+      PFN_vkCmdPushConstants vkCmdPushConstants = (PFN_vkCmdPushConstants)vkGetDeviceProcAddr(device, "vkCmdPushConstants");
+      VkImageMemoryBarrier b1 = to_color, b2 = to_src;
+      b1.image = b2.image = image2;
+      b1.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      VkRenderingAttachmentInfo ca2 = ca;
+      ca2.imageView = view2;
+      ca2.clearValue.color.float32[0] = 0.02f; ca2.clearValue.color.float32[1] = 0.05f; ca2.clearValue.color.float32[2] = 0.12f; ca2.clearValue.color.float32[3] = 1.0f;
+      VkRenderingInfo ri2 = ri;
+      ri2.renderArea.extent = (VkExtent2D){ PW, PH };
+      ri2.pColorAttachments = &ca2;
+      VkViewport vp2 = { 0, 0, PW, PH, 0.0f, 1.0f };
+      VkRect2D sc2 = { { 0, 0 }, { PW, PH } };
+      VkBufferImageCopy reg2 = region;
+      reg2.imageExtent = (VkExtent3D){ PW, PH, 1 };
+      const uint32_t x0 = (fi.width - PW) / 2, y0 = (fi.height - PH) / 2;
+      struct timespec t0, t1;
+      clock_gettime(CLOCK_MONOTONIC, &t0);
+      unsigned frames = 0, flush_busy = 0;
+      int frame_ok = 1;
+      for (;;) {
+         clock_gettime(CLOCK_MONOTONIC, &t1);
+         double el = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+         if (el >= seconds && frames > 0) break;
+         float angle = (float)el * 1.5f;
+         float pc[8] = { angle, (float)PW / (float)PH, 0, 0, 0.5f + 0.5f * sinf(angle), 0.5f + 0.5f * sinf(angle + 2.1f), 0.5f + 0.5f * sinf(angle + 4.2f), 1.0f };
+         for (uint32_t i = 0; i < PW * PH; i++) px2[i] = 0xdeadbeefu;
+         vkResetCommandBuffer(cmd2, 0);
+         vkBeginCommandBuffer(cmd2, &bbi);
+         vkCmdPipelineBarrier(cmd2, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &b1);
+         vkCmdBeginRendering(cmd2, &ri2);
+         vkCmdSetViewport(cmd2, 0, 1, &vp2);
+         vkCmdSetScissor(cmd2, 0, 1, &sc2);
+         vkCmdBindPipeline(cmd2, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe2);
+         vkCmdPushConstants(cmd2, pl2, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, pc);
+         vkCmdDraw(cmd2, 3, 1, 0, 0);
+         vkCmdEndRendering(cmd2);
+         vkCmdPipelineBarrier(cmd2, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b2);
+         vkCmdCopyImageToBuffer(cmd2, image2, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf2, 1, &reg2);
+         vkCmdPipelineBarrier(cmd2, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &to_host, 0, NULL, 0, NULL);
+         vkEndCommandBuffer(cmd2);
+         vkResetFences(device, 1, &fence2);
+         VkSubmitInfo si3 = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd2 };
+         if (vkQueueSubmit(queue, 1, &si3, fence2) != VK_SUCCESS || vkWaitForFences(device, 1, &fence2, VK_TRUE, 10000000000ull) != VK_SUCCESS) { frame_ok = 0; break; }
+         if (frames == 0) {
+            // the clear colour in the corner, and something that is neither it nor the garbage at the centre of the triangle
+            uint32_t corner = px2[0], centre = px2[(PH / 2) * PW + PW / 2];
+            printf("VK present: frame 0 corner %#x centre %#x\n", corner, centre);
+            CHECK(corner != 0xdeadbeefu && centre != 0xdeadbeefu && corner != centre, "frame 0: the GPU wrote the image and the triangle is not the background");
+         }
+         for (uint32_t y = 0; y < PH; y++) memcpy(fbmap + fi.offset + (size_t)(y0 + y) * fi.stride + (size_t)x0 * 4, px2 + (size_t)y * PW, PW * 4);
+         struct fb0_flush fl = { .count = 1, .rects = { { x0, y0, PW, PH } } };
+         if (ioctl(fb, FBIO_FLUSH, &fl) != 0) flush_busy++;
+         frames++;
+      }
+      CHECK(frame_ok, "every frame rendered and fenced");
+      printf("VK present: %u frames in %.1f s (%.1f fps), %u flushes refused (a flip pending)\n", frames, seconds, frames / (seconds > 0 ? seconds : 1), flush_busy);
+      VKOK(vkDeviceWaitIdle(device));
+   }
+
 done:
    if (device) {
       PFN_vkDeviceWaitIdle wi = (PFN_vkDeviceWaitIdle)vkGetDeviceProcAddr(device, "vkDeviceWaitIdle");
       if (wi) wi(device);
 #define GONE(handle, fn) do { PFN_##fn f_ = (PFN_##fn)vkGetDeviceProcAddr(device, #fn); if (handle && f_) f_(device, handle, NULL); } while (0)
+      GONE(pipe2, vkDestroyPipeline);
+      GONE(pl2, vkDestroyPipelineLayout);
+      GONE(fmod2, vkDestroyShaderModule);
+      GONE(vmod2, vkDestroyShaderModule);
+      GONE(buf2, vkDestroyBuffer);
+      GONE(view2, vkDestroyImageView);
+      GONE(image2, vkDestroyImage);
+      GONE(bmem2, vkFreeMemory);
+      GONE(imem2, vkFreeMemory);
       GONE(fence, vkDestroyFence);
       GONE(cpool, vkDestroyCommandPool);
       GONE(pipe, vkDestroyPipeline);
