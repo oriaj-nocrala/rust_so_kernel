@@ -3,6 +3,7 @@
 // Process lifecycle + control syscalls: fork/clone/exec/exit/waitpid/kill/
 // getpid/setpgid/getpgid/setsid/yield/nanosleep/arch_prctl/set_tid_address.
 
+use crate::process::signal::SigOrigin;
 use crate::sync::Mutex;
 use crate::serial_println;
 use crate::process::TrapFrame;
@@ -1150,13 +1151,16 @@ fn kill_impl(target_pid: i64, sig: u32, exact: bool, in_group: Option<usize>) ->
     // whole function body instead of scoping it tightly and deadlocked the
     // first time a signal landed on a Ready (not self, not Blocked) target.
     with_scheduler(|sched| {
+        // `si_code`/`si_pid` a handler will see: `SI_USER` (`kill`) or `SI_TKILL` (`tkill`, `tgkill`, so `raise`) from this group.
+        let sender = sched.running_ref().map_or(0, |p| p.tgid);
+        let origin = if exact { SigOrigin::tkill(sender) } else { SigOrigin::user(sender) };
         if target_pid == 0 || target_pid < -1 {
             let pgid = if target_pid == 0 {
                 sched.running_ref().map(|p| p.pgid).unwrap_or(0)
             } else {
                 (-target_pid) as u32
             };
-            sched.signal_group(pgid, sig);
+            sched.signal_group_from(pgid, sig, origin);
             0
         } else {
             let Some(target_pid) = sched.resolve_signal_target(target_pid as usize, sig, exact, in_group) else {
@@ -1165,7 +1169,7 @@ fn kill_impl(target_pid: i64, sig: u32, exact: bool, in_group: Option<usize>) ->
             let is_self = sched.current_pid().map(|p| p.0) == Some(target_pid);
             if is_self {
                 if let Some(proc) = sched.running_mut() {
-                    crate::process::signal::queue_signal(proc, sig);
+                    crate::process::signal::queue_signal_from(proc, sig, origin);
                 }
                 0
             } else {
@@ -1181,7 +1185,7 @@ fn kill_impl(target_pid: i64, sig: u32, exact: bool, in_group: Option<usize>) ->
                     sched.wake_stopped(target_pid);
                 }
                 match sched.find_process_mut(target_pid) {
-                    Some(proc) => crate::process::signal::queue_signal(proc, sig),
+                    Some(proc) => crate::process::signal::queue_signal_from(proc, sig, origin),
                     None => return errno::ESRCH,
                 }
                 sched.interrupt_blocked();

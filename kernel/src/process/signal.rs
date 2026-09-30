@@ -164,14 +164,51 @@ pub fn resumes_stopped(sig: u32) -> bool {
     sig == SIGCONT || sig == SIGKILL
 }
 
-/// Set `sig`'s pending bit. Pending state is independent of whether the
+/// `si_code` values (`siginfo_t`, Linux's numbers).
+pub const SI_USER: i32 = 0;
+pub const SI_KERNEL: i32 = 0x80;
+pub const SI_TKILL: i32 = -6;
+pub const CLD_EXITED: i32 = 1;
+pub const CLD_KILLED: i32 = 2;
+pub const CLD_STOPPED: i32 = 5;
+
+/// Who sent a pending signal, as `siginfo_t` reports it: `si_code`, `si_pid` (a thread-group id) and, for `SIGCHLD`,
+/// `si_status`. There is no uid model, so `si_uid` is always 0. One per signal number, as standard signals do not queue: the
+/// first sender of a still-pending signal is the one a handler sees (`queue_signal_from`).
+#[derive(Clone, Copy)]
+pub struct SigOrigin {
+    pub code: i32,
+    pub pid: u32,
+    pub status: i32,
+}
+
+impl SigOrigin {
+    /// Raised by the kernel itself (a terminal's Ctrl-C, job control, a group kill on `exit_group`): `SI_KERNEL`, no sender.
+    pub const KERNEL: SigOrigin = SigOrigin { code: SI_KERNEL, pid: 0, status: 0 };
+    /// `kill(2)` from thread group `pid`.
+    pub const fn user(pid: usize) -> SigOrigin { SigOrigin { code: SI_USER, pid: pid as u32, status: 0 } }
+    /// `tkill(2)`/`tgkill(2)` (so `raise`) from thread group `pid`.
+    pub const fn tkill(pid: usize) -> SigOrigin { SigOrigin { code: SI_TKILL, pid: pid as u32, status: 0 } }
+    /// `SIGCHLD` for child `pid`: `code` is one of `CLD_*`, `status` its exit code or the signal.
+    pub const fn child(code: i32, pid: usize, status: i32) -> SigOrigin { SigOrigin { code, pid: pid as u32, status } }
+}
+
+/// Set `sig`'s pending bit, noting who sent it. Pending state is independent of whether the
 /// signal is currently blocked — blocking only defers delivery, matching
 /// POSIX `sigprocmask` semantics.
-pub fn queue_signal(proc: &mut Process, sig: u32) {
+pub fn queue_signal_from(proc: &mut Process, sig: u32, origin: SigOrigin) {
     if sig == 0 || sig as usize >= NUM_SIGNALS {
         return;
     }
+    if proc.pending_signals & (1u64 << sig) == 0 {
+        proc.sig_origin[sig as usize] = origin;
+    }
     proc.pending_signals |= 1u64 << sig;
+}
+
+/// `queue_signal_from` a kernel-raised signal (`SigOrigin::KERNEL`).
+pub fn queue_signal(proc: &mut Process, sig: u32) {
+    queue_signal_from(proc, sig, SigOrigin::KERNEL);
 }
 
 /// Check `proc`'s pending & unblocked signals against its handler table and
@@ -474,13 +511,20 @@ unsafe fn push_signal_frame(proc: &mut Process, tf: *mut TrapFrame, sig: u32, ha
     uc[UC_GREGS..UC_GREGS + 23].copy_from_slice(&gregs_from_tf(&old_tf));
     uc[UC_SIGMASK] = mask_to_user(saved_mask);
 
-    // siginfo: si_signo, si_errno 0, then `si_code` and, for a fault, `si_addr`; otherwise SI_USER and a zero
-    // sender (not tracked).
+    // siginfo: si_signo, si_errno 0, then `si_code` and, for a fault, `si_addr`; otherwise the sender recorded when the signal
+    // was queued: `si_pid`/`si_uid` at 16, and for SIGCHLD `si_status` at 24.
     let mut info = [0u64; 16];
     info[0] = sig as u64;
     if let Some((code, addr)) = fault {
         info[1] = code as u32 as u64;
         info[2] = addr;
+    } else {
+        let o = proc.sig_origin[sig as usize];
+        info[1] = o.code as u32 as u64;
+        info[2] = o.pid as u64;
+        if sig == SIGCHLD {
+            info[3] = o.status as u32 as u64;
+        }
     }
 
     let frame = RtFrame { uc, info, private: SignalFrame { fpu, saved_tf: old_tf } };

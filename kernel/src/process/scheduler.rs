@@ -924,9 +924,14 @@ impl Scheduler {
     /// not a fresh lock) — see `syscall::send_to_group` for the ISR-context
     /// wrapper that acquires one.
     pub fn queue_signal_to_group(&mut self, pgid: u32, sig: u32) {
+        self.queue_signal_to_group_from(pgid, sig, super::signal::SigOrigin::KERNEL);
+    }
+
+    /// `queue_signal_to_group`, naming the sender (`kill(-pgid)`).
+    pub fn queue_signal_to_group_from(&mut self, pgid: u32, sig: u32, origin: super::signal::SigOrigin) {
         for proc in self.iter_running_mut() {
             if proc.pgid == pgid {
-                super::signal::queue_signal(proc, sig);
+                super::signal::queue_signal_from(proc, sig, origin);
             }
         }
         // `iter_queued_mut` yields run queues then wait queue, i.e. the same
@@ -934,7 +939,7 @@ impl Scheduler {
         // replaces.
         for proc in self.core.iter_queued_mut() {
             if proc.pgid == pgid {
-                super::signal::queue_signal(proc, sig);
+                super::signal::queue_signal_from(proc, sig, origin);
             }
         }
         self.interrupt_blocked();
@@ -944,6 +949,11 @@ impl Scheduler {
     /// terminal's signals (`crate::ipc::pty`). A `SIGCONT` or `SIGKILL`
     /// resumes the stopped ones first (`signal::resumes_stopped`).
     pub fn signal_group(&mut self, pgid: u32, sig: u32) {
+        self.signal_group_from(pgid, sig, super::signal::SigOrigin::KERNEL);
+    }
+
+    /// `signal_group`, naming the sender.
+    pub fn signal_group_from(&mut self, pgid: u32, sig: u32, origin: super::signal::SigOrigin) {
         if super::signal::resumes_stopped(sig) {
             let stopped: Vec<usize> = self.core.wait_queue().iter()
                 .filter(|p| p.pgid == pgid && matches!(p.state, ProcessState::Stopped))
@@ -953,7 +963,7 @@ impl Scheduler {
                 self.wake_stopped(pid);
             }
         }
-        self.queue_signal_to_group(pgid, sig);
+        self.queue_signal_to_group_from(pgid, sig, origin);
     }
 
     /// The process (thread) a signal sent to `pid` lands on. `None` if there is no such thread (or, with `in_group`, it is not
@@ -1282,16 +1292,6 @@ impl Scheduler {
     /// share one correctly-locked implementation instead of each growing
     /// their own copy.
     pub fn notify_child_death(&mut self, dead_pid: usize, parent_pid: Option<Pid>) {
-        if let Some(parent_pid) = parent_pid {
-            if self.running_ref().map(|p| p.tgid) == Some(parent_pid.0) {
-                if let Some(parent) = self.running_mut() {
-                    super::signal::queue_signal(parent, super::signal::SIGCHLD);
-                }
-            } else if let Some(parent) = self.find_process_mut(parent_pid.0) {
-                super::signal::queue_signal(parent, super::signal::SIGCHLD);
-            }
-        }
-
         // Real exit status, if `dead_pid` is parked as a zombie. Threads
         // aren't (reaped immediately in `kill_current`), so this stays at
         // the "exited(0)" default for them — matches this kernel's existing
@@ -1300,6 +1300,22 @@ impl Scheduler {
             .find(|p| p.pid.0 == dead_pid && matches!(p.state, ProcessState::Zombie));
         let status_word = dead.map(|p| p.wait_status_word()).unwrap_or(0);
         let dead_pgid = dead.map(|p| p.pgid).unwrap_or(0);
+
+        if let Some(parent_pid) = parent_pid {
+            // `si_code`/`si_status` of the SIGCHLD: exited with a code, or killed by a signal.
+            let origin = if status_word & 0x7F != 0 {
+                super::signal::SigOrigin::child(super::signal::CLD_KILLED, dead_pid, status_word & 0x7F)
+            } else {
+                super::signal::SigOrigin::child(super::signal::CLD_EXITED, dead_pid, (status_word >> 8) & 0xFF)
+            };
+            if self.running_ref().map(|p| p.tgid) == Some(parent_pid.0) {
+                if let Some(parent) = self.running_mut() {
+                    super::signal::queue_signal_from(parent, super::signal::SIGCHLD, origin);
+                }
+            } else if let Some(parent) = self.find_process_mut(parent_pid.0) {
+                super::signal::queue_signal_from(parent, super::signal::SIGCHLD, origin);
+            }
+        }
 
         // Only the real parent can be woken — `WaitTarget::AnyChild`/`Pgid`
         // still must not wake an unrelated process just because its own
@@ -1389,20 +1405,22 @@ impl Scheduler {
     /// process is NOT removed from `wait_queue` — it stays there so a later
     /// real exit, or another stop/continue cycle, can still be observed.
     pub fn notify_child_stopped(&mut self, stopped_pid: usize, parent_pid: Option<Pid>) {
+        let found = self.core.wait_queue().iter()
+            .find(|p| p.pid.0 == stopped_pid && matches!(p.state, ProcessState::Stopped))
+            .map(|p| (p.pgid, p.stop_status_word()));
         if let Some(parent_pid) = parent_pid {
+            let stop_sig = found.map_or(0, |(_, word)| (word >> 8) & 0xFF);
+            let origin = super::signal::SigOrigin::child(super::signal::CLD_STOPPED, stopped_pid, stop_sig);
             if self.running_ref().map(|p| p.tgid) == Some(parent_pid.0) {
                 if let Some(parent) = self.running_mut() {
-                    super::signal::queue_signal(parent, super::signal::SIGCHLD);
+                    super::signal::queue_signal_from(parent, super::signal::SIGCHLD, origin);
                 }
             } else if let Some(parent) = self.find_process_mut(parent_pid.0) {
-                super::signal::queue_signal(parent, super::signal::SIGCHLD);
+                super::signal::queue_signal_from(parent, super::signal::SIGCHLD, origin);
             }
         }
 
-        let Some((stopped_pgid, status_word)) = self.core.wait_queue().iter()
-            .find(|p| p.pid.0 == stopped_pid && matches!(p.state, ProcessState::Stopped))
-            .map(|p| (p.pgid, p.stop_status_word()))
-        else {
+        let Some((stopped_pgid, status_word)) = found else {
             self.interrupt_blocked();
             return;
         };

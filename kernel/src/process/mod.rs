@@ -316,6 +316,8 @@ pub struct Process {
     /// `sa_flags`, `sa_restorer` and `sa_mask` per signal, from `sigaction`. Inherited by `fork`/`clone` and reset with the
     /// handlers on `exec`.
     pub sig_extra: [signal::SigExtra; signal::NUM_SIGNALS],
+    /// Who sent each signal that is pending (`siginfo_t`'s `si_code`/`si_pid`): valid while its bit is in `pending_signals`.
+    pub sig_origin: [signal::SigOrigin; signal::NUM_SIGNALS],
     /// The alternate signal stack (`sigaltstack`). Copied by `fork`; a thread starts without one; `exec` clears it.
     pub altstack: signal::AltStack,
 
@@ -435,6 +437,7 @@ impl Process {
             interrupted: None,
             sig_restart: 0,
             sig_extra: [signal::SigExtra::NONE; signal::NUM_SIGNALS],
+            sig_origin: [signal::SigOrigin::KERNEL; signal::NUM_SIGNALS],
             altstack: signal::AltStack::NONE,
             times: sched::cputime::ProcTimes::default(),
             dead_threads: sched::cputime::ProcTimes::default(),
@@ -530,6 +533,7 @@ impl Process {
             interrupted: None,
             sig_restart: 0,
             sig_extra: [signal::SigExtra::NONE; signal::NUM_SIGNALS],
+            sig_origin: [signal::SigOrigin::KERNEL; signal::NUM_SIGNALS],
             altstack: signal::AltStack::NONE,
             times: sched::cputime::ProcTimes::default(),
             dead_threads: sched::cputime::ProcTimes::default(),
@@ -616,6 +620,7 @@ impl Process {
             interrupted: None,
             sig_restart: 0,
             sig_extra: [signal::SigExtra::NONE; signal::NUM_SIGNALS],
+            sig_origin: [signal::SigOrigin::KERNEL; signal::NUM_SIGNALS],
             altstack: signal::AltStack::NONE,
             times: sched::cputime::ProcTimes::default(),
             dead_threads: sched::cputime::ProcTimes::default(),
@@ -730,6 +735,7 @@ impl Process {
             interrupted: None,
             sig_restart: 0,
             sig_extra: [signal::SigExtra::NONE; signal::NUM_SIGNALS],
+            sig_origin: [signal::SigOrigin::KERNEL; signal::NUM_SIGNALS],
             altstack: signal::AltStack::NONE,
             times: sched::cputime::ProcTimes::default(),
             dead_threads: sched::cputime::ProcTimes::default(),
