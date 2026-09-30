@@ -94,6 +94,7 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "cloexec_test",
     "sigabi_test",
     "sigsegv_test",
+    "pipe_poll_test",
     "argv_test",
     "jobctl_test",
     "ext2_robust_test",

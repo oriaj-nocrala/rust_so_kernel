@@ -66,6 +66,52 @@ use super::Process;
 
 const PIPE_CAPACITY: usize = 4096;
 
+/// Every live pipe by number, so `poll` can ask "is this pipe ready?" from a snapshot that holds only the number (a pipe's `Arc`
+/// cannot ride in a `Copy` `PollSource`, and a pointer could dangle). An entry goes when both ends are closed. `IrqMutex`:
+/// pipe ends are created and dropped in process context with interrupts on or off, and `poll` reads it from wakeups.
+static PIPES: diag::IrqMutex<alloc::collections::BTreeMap<u64, alloc::sync::Weak<Mutex<PipeBuffer>>>, crate::allocator::KernelIrq> =
+    diag::IrqMutex::new(alloc::collections::BTreeMap::new());
+static NEXT_PIPE_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// What `poll` reports for one end of a pipe.
+pub struct PipeMask {
+    pub readable: bool,
+    pub writable: bool,
+    /// Read end: no writer is left (EOF once drained).
+    pub hup: bool,
+    /// Write end: no reader is left (a write would `EPIPE`).
+    pub err: bool,
+}
+
+/// Readiness of one end of pipe `id`; `None` if there is no such pipe (closed). Never waits: this runs from wakeup paths, some
+/// with interrupts off, and a contended lock is answered "ready", which at worst wakes a poller for nothing (it looks again).
+pub fn poll_mask(id: u64, write: bool) -> Option<PipeMask> {
+    let weak = match PIPES.try_with(|m| m.get(&id).cloned()) {
+        Some(found) => found?,
+        None => return Some(PipeMask { readable: true, writable: true, hup: false, err: false }),
+    };
+    let buf = weak.upgrade()?;
+    let Some(pb) = buf.try_lock() else {
+        return Some(PipeMask { readable: true, writable: true, hup: false, err: false });
+    };
+    Some(if write {
+        PipeMask { readable: false, writable: pb.readers > 0 && pb.space() > 0, hup: false, err: pb.readers == 0 }
+    } else {
+        PipeMask { readable: pb.len > 0, writable: false, hup: pb.writers == 0, err: false }
+    })
+}
+
+/// Forget pipe `id` once both its ends are closed.
+fn forget_if_closed(id: u64, buf: &Arc<Mutex<PipeBuffer>>) {
+    let closed = {
+        let pb = buf.lock();
+        pb.readers == 0 && pb.writers == 0
+    };
+    if closed {
+        PIPES.with(|m| { m.remove(&id); });
+    }
+}
+
 struct PipeWaiter {
     pid: usize,
     user_buf: u64,
@@ -229,20 +275,24 @@ type NonBlock = Arc<core::sync::atomic::AtomicBool>;
 pub struct PipeReadEnd {
     buf: Arc<Mutex<PipeBuffer>>,
     nonblock: NonBlock,
+    id: u64,
 }
 
 pub struct PipeWriteEnd {
     buf: Arc<Mutex<PipeBuffer>>,
     nonblock: NonBlock,
+    id: u64,
 }
 
 /// Create a connected pipe (read end, write end) with one open reference
 /// on each side, matching what `pipe(2)` hands back.
 pub fn create() -> (PipeReadEnd, PipeWriteEnd) {
     let buf = Arc::new(Mutex::new(PipeBuffer::new()));
+    let id = NEXT_PIPE_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    PIPES.with(|m| { m.insert(id, Arc::downgrade(&buf)); });
     (
-        PipeReadEnd { buf: buf.clone(), nonblock: NonBlock::default() },
-        PipeWriteEnd { buf, nonblock: NonBlock::default() },
+        PipeReadEnd { buf: buf.clone(), nonblock: NonBlock::default(), id },
+        PipeWriteEnd { buf, nonblock: NonBlock::default(), id },
     )
 }
 
@@ -288,6 +338,9 @@ impl FileHandle for PipeReadEnd {
                     pb = self.buf.lock();
                 }
             }
+            drop(pb);
+            // The room this read freed: a `poll` for POLLOUT on the write end.
+            crate::process::syscall::poll_wakeup_for_pipe(self.id);
             return Ok(n);
         }
 
@@ -313,11 +366,15 @@ impl FileHandle for PipeReadEnd {
 
     fn dup(&self) -> Option<Box<dyn FileHandle>> {
         self.buf.lock().readers += 1;
-        Some(Box::new(PipeReadEnd { buf: self.buf.clone(), nonblock: self.nonblock.clone() }))
+        Some(Box::new(PipeReadEnd { buf: self.buf.clone(), nonblock: self.nonblock.clone(), id: self.id }))
     }
 
     fn nonblocking(&self) -> bool {
         self.nonblock.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn pipe_end(&self) -> Option<vfs::file::PipeEnd> {
+        Some(vfs::file::PipeEnd { id: self.id, write: false })
     }
 
     fn set_nonblocking(&self, on: bool) -> bool {
@@ -353,6 +410,7 @@ impl FileHandle for PipeWriteEnd {
             for (w, data) in deliveries {
                 wake_reader(w, &data);
             }
+            crate::process::syscall::poll_wakeup_for_pipe(self.id);
             return Ok(n);
         }
 
@@ -371,11 +429,15 @@ impl FileHandle for PipeWriteEnd {
 
     fn dup(&self) -> Option<Box<dyn FileHandle>> {
         self.buf.lock().writers += 1;
-        Some(Box::new(PipeWriteEnd { buf: self.buf.clone(), nonblock: self.nonblock.clone() }))
+        Some(Box::new(PipeWriteEnd { buf: self.buf.clone(), nonblock: self.nonblock.clone(), id: self.id }))
     }
 
     fn nonblocking(&self) -> bool {
         self.nonblock.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn pipe_end(&self) -> Option<vfs::file::PipeEnd> {
+        Some(vfs::file::PipeEnd { id: self.id, write: true })
     }
 
     fn set_nonblocking(&self, on: bool) -> bool {
@@ -394,6 +456,9 @@ impl Drop for PipeReadEnd {
             for w in waiters.into_iter().filter(|w| w.cell.claim()) {
                 wake_writer_error(w, super::syscall::errno::EPIPE);
             }
+            // POLLERR for a `poll` on the write end.
+            crate::process::syscall::poll_wakeup_for_pipe(self.id);
+            forget_if_closed(self.id, &self.buf);
         }
     }
 }
@@ -408,6 +473,9 @@ impl Drop for PipeWriteEnd {
             for w in waiters.into_iter().filter(|w| w.cell.claim()) {
                 wake_reader(w, &[]); // EOF
             }
+            // POLLHUP for a `poll` on the read end.
+            crate::process::syscall::poll_wakeup_for_pipe(self.id);
+            forget_if_closed(self.id, &self.buf);
         }
     }
 }

@@ -24,6 +24,8 @@ enum PollSource {
     Input { queue: u32, buffered: bool, seen: u64 },
     /// One end of a pseudo-terminal (`ipc::pty`).
     Pty { index: usize, master: bool },
+    /// One end of a pipe (`process::pipe`), by registry number.
+    Pipe { id: u64, write: bool },
 }
 
 /// A process's fd → `PollSource` mapping, snapshotted at the moment it blocks.
@@ -75,6 +77,8 @@ fn snapshot_sockets() -> SocketMap {
                 PollSource::Input { queue: src.queue as u32, buffered: src.buffered, seen: src.seen }
             } else if let Some(end) = h.pty_end() {
                 PollSource::Pty { index: end.index, master: end.master }
+            } else if let Some(end) = h.pipe_end() {
+                PollSource::Pipe { id: end.id, write: end.write }
             } else {
                 PollSource::Other
             };
@@ -301,6 +305,8 @@ static POLL_WAITERS: crate::sync::IrqLock<BTreeMap<usize, PollWaiter>> = crate::
 ///   - evdev device: POLLIN if its handle holds records or its queue is
 ///     non-empty; POLLOUT always (writes are accepted, as Linux's
 ///     `evdev_poll` answers).
+///   - pipe end: read end POLLIN with data queued, POLLHUP once no writer is left; write end POLLOUT with room and a reader,
+///     POLLERR once no reader is left.
 ///   - stdin (fd=0): POLLIN if keyboard buffer has data.
 ///   - All other device fds: always ready for the requested events.
 fn fd_check_ready(socks: &SocketMap, fd: i32, events: i16) -> i16 {
@@ -320,6 +326,16 @@ fn fd_check_ready(socks: &SocketMap, fd: i32, events: i16) -> i16 {
         if events & POLLIN != 0 && mask.readable { rev |= POLLIN; }
         if events & POLLOUT != 0 && mask.writable { rev |= POLLOUT; }
         if mask.hup { rev |= POLLHUP; }
+        return rev;
+    }
+
+    if let PollSource::Pipe { id, write } = source {
+        let Some(mask) = crate::process::pipe::poll_mask(id, write) else { return POLLNVAL };
+        let mut rev: i16 = 0;
+        if events & POLLIN != 0 && mask.readable { rev |= POLLIN; }
+        if events & POLLOUT != 0 && mask.writable { rev |= POLLOUT; }
+        if mask.hup { rev |= POLLHUP; }
+        if mask.err { rev |= POLLERR; }
         return rev;
     }
 
@@ -426,7 +442,8 @@ fn epoll_revents(rev: i16) -> u32 {
 
 // ── Waiter-scan helpers ────────────────────────────────────────────────────
 
-/// Whether `waiter` asked for POLLIN on some fd `wanted` accepts.
+/// Whether `waiter` asked for POLLIN or POLLOUT on some fd `wanted` accepts (a writer waiting for room is woken by the read
+/// that made it).
 /// Called while POLL_WAITERS is held (the waiter is borrowed from it);
 /// POLL_WAITERS → EPOLL_INSTANCES is the allowed nesting.
 fn poll_waiter_watches(
@@ -439,14 +456,14 @@ fn poll_waiter_watches(
             let base = (phys_offset + waiter.phys_buf) as *const PollFd;
             (0..nfds as usize).any(|i| {
                 let pfd = unsafe { *base.add(i) };
-                pfd.events & POLLIN != 0 && wanted(waiter, pfd.fd)
+                pfd.events & (POLLIN | POLLOUT) != 0 && wanted(waiter, pfd.fd)
             })
         }
         PollWaiterKind::EpollWait { epoll_id, .. } => {
             let instances = EPOLL_INSTANCES.lock();
             instances.get(epoll_id).is_some_and(|inst| {
                 inst.watches.iter().flatten()
-                    .any(|w| w.events & EPOLLIN != 0 && wanted(waiter, w.fd))
+                    .any(|w| w.events & (EPOLLIN | EPOLLOUT) != 0 && wanted(waiter, w.fd))
             })
         }
     }
@@ -559,6 +576,17 @@ pub(crate) fn poll_wakeup_for_socket(sock: SocketId) {
 /// `PTYS` released, IF=0): wakes poll/epoll sleepers watching it.
 pub(crate) fn poll_wakeup_for_pty(index: usize) {
     poll_wake_where(|w, fd| matches!(waiter_source(w, fd), PollSource::Pty { index: i, .. } if i == index));
+}
+
+/// Called by `process::pipe` after pipe `id` changed (data written or read, an end closed), with the pipe's lock released and
+/// IF=0: wakes poll/epoll sleepers watching either end.
+pub(crate) fn poll_wakeup_for_pipe(id: u64) {
+    // Interrupts off around the whole thing, saved and restored (not cli + sti): a pipe end can be dropped inside `sys_exit`,
+    // where turning them back on would let a tick free the kernel stack this runs on, and `POLL_WAITERS` is also taken by
+    // the keyboard ISR. The socket wakeup does the same (`poll_wakeup_for_socket`).
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        poll_wake_where(|w, fd| matches!(waiter_source(w, fd), PollSource::Pipe { id: i, .. } if i == id))
+    });
 }
 
 /// Cancel a pending poll/epoll waiter for a process (called on exit).

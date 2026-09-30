@@ -99,6 +99,15 @@ pub struct PtyEnd {
     pub master: bool,
 }
 
+/// What `FileHandle::pipe_end` reports — see there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PipeEnd {
+    /// The pipe's registry number (`process::pipe`), not a pointer: a `poll` snapshot may outlive the pipe.
+    pub id: u64,
+    /// The write end rather than the read end.
+    pub write: bool,
+}
+
 /// Trait representing any "file" in the system.
 ///
 /// Implementations include device drivers (/dev/null, /dev/console, etc.),
@@ -172,6 +181,12 @@ pub trait FileHandle: Send {
     /// reach another process's fd table (phase 3.3 of
     /// `docs/gui/gui-plan.md`).
     fn pty_end(&self) -> Option<PtyEnd> {
+        None
+    }
+
+    /// Which end of which pipe this handle is, if any — `pty_end()`'s technique again: `poll` snapshots an fd's source into its
+    /// waiter, and a wakeup cannot reach another process's fd table.
+    fn pipe_end(&self) -> Option<PipeEnd> {
         None
     }
 

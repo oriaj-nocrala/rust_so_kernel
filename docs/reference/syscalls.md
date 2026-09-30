@@ -22,7 +22,7 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 |----|------|-------|
 | 0/1/2/3 | read/write/open/close | |
 | 4/5/6 | stat/fstat/lstat | `lstat` does not follow a final symlink. `fstat` runs `FileHandle::stat` under the scheduler lock |
-| 7 | poll | ≤16 fds. Real readiness for sockets, stdin, ptys, `/dev/input/event*` (`FileHandle::event_source`); other devices are always ready. `POLLHUP`/`POLLERR` are reported even if not asked for (by epoll too) |
+| 7 | poll | ≤16 fds. Real readiness for sockets, stdin, ptys, pipes, `/dev/input/event*` (`FileHandle::event_source`); other devices are always ready. `POLLHUP`/`POLLERR` are reported even if not asked for (by epoll too) |
 | 8 | lseek | |
 | 9/11 | mmap/munmap | Private anonymous, `MAP_SHARED` of a memfd, or `MAP_SHARED\|MAP_ANONYMOUS`. A nonzero `addr` is treated as `MAP_FIXED` (and fails over an existing mapping). `prot` 0 is a real `PROT_NONE`. `munmap` takes any page-aligned range: cuts VMAs, spans several, holes are fine |
 | 10 | mprotect | Splits VMAs at the range's ends and rejoins equal neighbours; hole in the range → `ENOMEM`. A `Huge2M` VMA can only be cut on 2 MiB boundaries. `PROT_EXEC` is ignored (NX is off) |
@@ -31,7 +31,7 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 | 16 | ioctl | termios, `TIOCGWINSZ`, `TIOCG/SPGRP`. On any fd: `FIONBIO`, `FIOCLEX`/`FIONCLEX`. On a pty the handle answers every tty ioctl. `/dev/fb`: `FBIO_BLIT` 0x4642_0001. `/dev/fb0`: `FBIO_GET_INFO` 0x4642_0010, `FBIO_FLUSH` 0x4642_0011 |
 | 20 | writev | |
 | 21 | access | `F_OK`/`R_OK`/`X_OK` = "the path resolves". `W_OK` really probes: opens `O_WRONLY` and writes 0 bytes |
-| 22/293 | pipe/pipe2 | `pipe2`: `O_CLOEXEC`, `O_NONBLOCK`. A non-blocking end fails a would-block read/write with `EAGAIN`; `poll` still reports pipes always ready (a poll loop over one spins) |
+| 22/293 | pipe/pipe2 | `pipe2`: `O_CLOEXEC`, `O_NONBLOCK`. A non-blocking end fails a would-block read/write with `EAGAIN`. `poll`/`epoll` report real readiness (`process::pipe::poll_mask`, registry `PIPES` by number) and are woken by writes, reads, and closes of either end |
 | 24 | yield | |
 | 32/33/292 | dup/dup2/dup3 | Shared offset. `dup`/`dup2` clear `FD_CLOEXEC` on the new fd; `dup3` sets it with `O_CLOEXEC` (`oldfd == newfd` → `EINVAL`) |
 | 34 | pause | `rt_sigsuspend` with the current mask; always `EINTR` |
