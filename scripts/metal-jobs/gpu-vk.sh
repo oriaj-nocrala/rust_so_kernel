@@ -1,5 +1,5 @@
 # G4d of docs/gpu/g4-nvkmd-plan.md, on the Ryzen: a real Vulkan compute dispatch through NVK (Mesa, static musl) on /dev/nvgpu.
-#   strip -o disk-image-root/bin/vk_probe ~/src/gpu-ref/nvk-probe/vk-probe   # 15 MB; then a normal build
+#   strip -o disk-image-root/bin/vk_probe ~/src/gpu-ref/nvk-probe/vk-probe   # 15 MB each (and vk_draw); then a normal build
 #   touch build.rs; echo 5 > target/metal/budget
 #   scripts/metal-run.sh --kconf 'gpu=uapi' scripts/metal-jobs/gpu-vk.sh
 # Everything gpu-vk.sh does (G4c: nvgpu_hw_test, now with a copy-engine context as well), then probes/nvk/vk_probe.c with
@@ -95,6 +95,17 @@ grc=$?
 grep -E 'FAIL|copy ran|failure' /tmp/grcopy.out | while read -r l; do sum "gpu-vk: grcopy: $l"; done
 [ $grc = 0 ] || { sum "gpu-vk: the copy on the GR channel did not work (exit=$grc)"; fail=1; }
 sum "gpu-vk: after grcopy: $(grep '^gpu_uapi:' /proc/kdebug)"
+
+# G4e: the first draw. vk_draw renders one triangle over a 64x64 RGBA8 image in VRAM with NVK (dynamic rendering: the 3D engine) and copies
+# it to a host buffer with vkCmdCopyImageToBuffer (the copy object on the GR channel); the CPU checks every pixel. Last of all: if the 3D
+# path faults the GR channel, nothing after it is lost but the verdict.
+VK_PROBE_REQUIRE_EXEC=1 NVK_CONSTANOS_DEBUG=1 /mnt/bin/vk_draw > /tmp/vk_draw.out 2>&1
+drc=$?
+grep -E 'VK (using|image|draw)|DRAW DONE|FAIL|ASSERT' /tmp/vk_draw.out | while read -r l; do sum "gpu-vk: draw: $l"; done
+[ $drc = 0 ] || { sum "gpu-vk: vk_draw exit=$drc"; fail=1; tail -n 25 /tmp/vk_draw.out >> /tmp/gpu-vk.sum; tail -n 25 /tmp/vk_draw.out; }
+grep -q 'DRAW DONE' /tmp/vk_draw.out || { sum "gpu-vk: the draw program did not reach DRAW DONE"; fail=1; }
+grep -q 'draw result: EXECUTED' /tmp/vk_draw.out || { sum "gpu-vk: the draw did not execute correctly"; fail=1; }
+sum "gpu-vk: after the draw: $(grep '^gpu_uapi:' /proc/kdebug)"
 
 # RM still answers after all this, and the display is unharmed.
 echo 'gsp name' > /dev/dispctl && sum "gpu-vk: RM still answers" || { sum "gpu-vk: RM does not answer"; fail=1; }

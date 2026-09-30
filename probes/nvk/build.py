@@ -11,7 +11,7 @@ os.makedirs(out_dir, exist_ok=True)
 cc = ['clang', '--target=x86_64-linux-musl', '-nostdlibinc', '-isystem', '/usr/lib/musl/include', '-isystem', home + '/musl-inc',
       '-O2', '-g', '-D_GNU_SOURCE', '-fno-strict-aliasing', '-isystem', '/usr/lib/gcc/x86_64-pc-linux-gnu/16/include']
 objs = []
-for src in ['vk_probe.c', 'stubs.c']:
+for src in ['vk_probe.c', 'vk_draw.c', 'stubs.c']:
     p = os.path.join(here, src)
     if not os.path.exists(p):
         continue
@@ -32,9 +32,14 @@ libs = [os.path.join(bdir, l) for l in libs]
 m = '/usr/lib/musl/lib/'
 gcc = '/usr/lib/gcc/x86_64-pc-linux-gnu/16/'
 rustlib = os.path.expanduser('~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained/')
-out = os.path.join(out_dir, 'vk-probe')
-link = ['clang++', '--target=x86_64-linux-musl', '-static', '-nostdlib', '-fuse_ld=lld' if False else '-fuse-ld=lld', '-o', out,
+def link_cmd(out, objs):
+  return ['clang++', '--target=x86_64-linux-musl', '-static', '-nostdlib', '-fuse_ld=lld' if False else '-fuse-ld=lld', '-o', out,
         m + 'crt1.o', m + 'crti.o'] + objs + ['-Wl,--whole-archive', os.path.join(bdir, 'src/nouveau/vulkan/libnvk.a'), '-Wl,--no-whole-archive', '-Wl,--start-group'] + libs + ['-Wl,--end-group', '-Wl,--gc-sections', '-Wl,--build-id=sha1', '-Wl,--eh-frame-hdr',
         gcc + 'libstdc++.a', m + 'libm.a', m + 'libc.a', gcc + 'libgcc.a', rustlib + 'libunwind.a', m + 'libc.a', m + 'crtn.o']
-r = subprocess.run(link)
-sys.exit(r.returncode)
+rc = 0
+for prog, src in [('vk-probe', 'vk_probe.o'), ('vk-draw', 'vk_draw.o')]:
+    o = [x for x in objs if os.path.basename(x) in (src, 'stubs.o')]
+    if not any(os.path.basename(x) == src for x in o):
+        continue
+    rc |= subprocess.run(link_cmd(os.path.join(out_dir, prog), o)).returncode
+sys.exit(rc)

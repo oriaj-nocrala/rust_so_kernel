@@ -6,7 +6,7 @@ set -u
 cd "$(dirname "$0")/.."
 Q=scripts/qemu-debug.sh; log=/tmp/qemu-debug-rust_so_kernel/serial.log
 [ "${1:-}" = "--no-build" ] || { cargo build 2>&1 | grep -E "^error|panicked" -A8 | head -20; }
-probe=$HOME/src/gpu-ref/nvk-probe/vk-probe
+probe=$HOME/src/gpu-ref/nvk-probe/${PROBE:-vk-probe}
 [ -x "$probe" ] || { echo "no $probe: run mesa-port/build.sh first"; exit 1; }
 strip -o /tmp/vk_probe.stripped "$probe"
 $Q stop >/dev/null 2>&1
@@ -30,6 +30,6 @@ grep -E "ENOSYS" "$log" | sort -u
 [ "${KEEP_ALIVE:-0}" = 1 ] || $Q stop >/dev/null 2>&1
 debugfs -w -R "rm /vk_probe" disk.img >/dev/null 2>&1
 [ -z "$why" ] && ! echo "$out" | grep -q "VKEND=0" && why="the program failed"
-[ -z "$why" ] && echo "$out" | grep -q "VK PROBE DONE" || why="${why:-did not reach VK PROBE DONE}"
+[ -z "$why" ] && echo "$out" | grep -qE "VK (PROBE|DRAW) DONE" || why="${why:-did not reach VK PROBE DONE}"
 [ "$why" = "" ] && { echo "vk-probe: OK"; exit 0; }
 echo "vk-probe: FAILED — $why"; exit 1
