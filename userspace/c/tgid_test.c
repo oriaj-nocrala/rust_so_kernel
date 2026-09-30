@@ -76,6 +76,9 @@ int main(void) {
     snprintf(want, sizeof want, "/proc/%d", main_pid);
     CHECK(strcmp(w_self, want) == 0, "/proc/self in the thread is '%s', wanted '%s'", w_self, want);
 
+    printf("uids: a single-user system, everyone is root\n");
+    CHECK(sc(102, 0, 0, 0) == 0 && sc(104, 0, 0, 0) == 0 && sc(107, 0, 0, 0) == 0 && sc(108, 0, 0, 0) == 0, "getuid/getgid/geteuid/getegid");
+
     printf("kill(tid of a thread) is process-directed: the leader takes it\n");
     arm();
     CHECK(tkill_raw(w_tid, 0) == 0, "tkill sig 0 to the thread");

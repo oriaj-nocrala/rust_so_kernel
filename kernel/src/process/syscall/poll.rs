@@ -132,6 +132,7 @@ const EPOLLOUT:      u32 = 0x0000_0004;
 const EPOLLERR:      u32 = 0x0000_0008;
 const EPOLLHUP:      u32 = 0x0000_0010;
 const EPOLLET:       u32 = 0x8000_0000;
+const EPOLLONESHOT:  u32 = 0x4000_0000;
 
 const EPOLL_CTL_ADD: i32 = 1;
 const EPOLL_CTL_DEL: i32 = 2;
@@ -163,8 +164,8 @@ struct EpollWatch {
     events:         u32,   // EPOLLIN | EPOLLOUT | …
     data:           u64,   // opaque user data returned in events
     edge_triggered: bool,
-    #[allow(dead_code)]
-    et_delivered:   bool,
+    /// `EPOLLONESHOT` watch that has reported an event: silent until `EPOLL_CTL_MOD` re-arms it.
+    disarmed:       bool,
 }
 
 /// A single epoll instance (the object behind an epoll FD). The interest list is a `Vec` (at most `MAX_WATCHES`), kept in the
@@ -410,15 +411,15 @@ fn deliver_poll_result_phys(waiter: &PollWaiter, phys_offset: u64, write: bool) 
         PollWaiterKind::EpollWait { epoll_id, maxevents } => {
             // phys_buf → array of EpollEvent structs (12 bytes each, packed)
             let base = phys_offset + waiter.phys_buf;
-            let instances = EPOLL_INSTANCES.lock();
-            let inst = match instances.get(epoll_id) {
+            let mut instances = EPOLL_INSTANCES.lock();
+            let inst = match instances.get_mut(epoll_id) {
                 Some(i) => i,
                 None => return 0,
             };
             let mut written = 0usize;
-            for watch in inst.watches.iter() {
+            for watch in inst.watches.iter_mut() {
                 if written >= maxevents { break; }
-                {
+                if !watch.disarmed {
                     let mut poll_ev: i16 = 0;
                     if watch.events & EPOLLIN  != 0 { poll_ev |= POLLIN; }
                     if watch.events & EPOLLOUT != 0 { poll_ev |= POLLOUT; }
@@ -429,6 +430,7 @@ fn deliver_poll_result_phys(waiter: &PollWaiter, phys_offset: u64, write: bool) 
                         let dst = (base + written as u64 * 12) as *mut EpollEvent;
                         if write {
                             unsafe { core::ptr::write_unaligned(dst, ev); }
+                            watch.disarmed = watch.events & EPOLLONESHOT != 0;
                         }
                         written += 1;
                     }
@@ -476,7 +478,7 @@ fn poll_waiter_watches(
             let instances = EPOLL_INSTANCES.lock();
             instances.get(epoll_id).is_some_and(|inst| {
                 inst.watches.iter()
-                    .any(|w| w.events & (EPOLLIN | EPOLLOUT) != 0 && wanted(waiter, w.fd))
+                    .any(|w| !w.disarmed && w.events & (EPOLLIN | EPOLLOUT) != 0 && wanted(waiter, w.fd))
             })
         }
     }
@@ -681,15 +683,15 @@ fn epoll_ready(
     events_ptr: Option<u64>,
     maxevents: usize,
 ) -> usize {
-    let instances = EPOLL_INSTANCES.lock();
-    let inst = match instances.get(epoll_id) {
+    let mut instances = EPOLL_INSTANCES.lock();
+    let inst = match instances.get_mut(epoll_id) {
         Some(i) => i,
         None    => return 0,
     };
     let mut written = 0usize;
-    for watch in inst.watches.iter() {
+    for watch in inst.watches.iter_mut() {
         if written >= maxevents { break; }
-        {
+        if !watch.disarmed {
             let mut poll_ev: i16 = 0;
             if watch.events & EPOLLIN  != 0 { poll_ev |= POLLIN; }
             if watch.events & EPOLLOUT != 0 { poll_ev |= POLLOUT; }
@@ -704,6 +706,7 @@ fn epoll_ready(
                             ev,
                         );
                     }
+                    watch.disarmed = watch.events & EPOLLONESHOT != 0;
                 }
                 written += 1;
             }
@@ -962,7 +965,7 @@ pub(super) fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> Sysc
                 events: ev.events,
                 data:   ev.data,
                 edge_triggered: (ev.events & EPOLLET) != 0,
-                et_delivered:   false,
+                disarmed:       false,
             });
             0
         }
@@ -976,6 +979,7 @@ pub(super) fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> Sysc
                 w.events         = ev.events;
                 w.data           = ev.data;
                 w.edge_triggered = (ev.events & EPOLLET) != 0;
+                w.disarmed       = false;
                 0
             }
             None => errno::ENOENT,
@@ -985,6 +989,31 @@ pub(super) fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> Sysc
 }
 
 // ── sys_epoll_wait ─────────────────────────────────────────────────────────
+
+/// epoll_pwait(281): `epoll_wait` with a signal mask in force for the duration of the call (`sigmask` NULL: plain `epoll_wait`).
+/// The old mask travels in `Process::saved_sigmask`, as for `rt_sigsuspend`: the signal-return path puts it back (or a handler
+/// frame saves it), whichever way the call ends.
+pub(super) fn sys_epoll_pwait(epfd: i32, events_ptr: u64, maxevents: i32, timeout_ms: i32, sigmask: u64, sigsetsize: u64) -> SyscallResult {
+    if sigmask != 0 {
+        if sigsetsize != 8 {
+            return errno::EINVAL;
+        }
+        if let Err(e) = validate_user_buffer(sigmask, 8) {
+            return e;
+        }
+        let new = crate::process::signal::mask_from_user(unsafe { core::ptr::read_unaligned(sigmask as *const u64) })
+            & !(1u64 << crate::process::signal::SIGKILL)
+            & !(1u64 << crate::process::signal::SIGSTOP);
+        // Syscalls start with IF=0 and `sys_epoll_wait` relies on it, so no `SchedGuard` here (its `sti` would end that).
+        if let Some(p) = crate::process::scheduler::local_scheduler().running_mut() {
+            if p.saved_sigmask.is_none() {
+                p.saved_sigmask = Some(p.blocked_signals);
+            }
+            p.blocked_signals = new;
+        }
+    }
+    sys_epoll_wait(epfd, events_ptr, maxevents, timeout_ms)
+}
 
 /// epoll_wait(232) — wait for events on an epoll instance.
 ///

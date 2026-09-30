@@ -150,6 +150,14 @@ pub struct Process {
     /// its parent must see a normal `exit(status)`, not the SIGKILL that carries it out. Takes precedence over `killed_by_signal`.
     pub group_exited: bool,
 
+    /// Set on a child made by `clone(CLONE_VFORK)`: the tid of the parent suspended until this child execs or dies
+    /// (`Scheduler::kill_current`, `sys_exec` wake it).
+    pub vfork_parent: Option<usize>,
+
+    /// The `ktime` deadline of a relative sleep a stop/continue interrupted: the restarted `nanosleep`/`clock_nanosleep` sleeps
+    /// until it instead of for the whole time again (`signal::finish_interrupted_call` sets it, the sleep syscall consumes it).
+    pub sleep_resume: Option<u64>,
+
     /// Process group id (job control). Defaults to this process's own pid
     /// (group leader) at creation; `fork()`/`clone()` inherit the parent's
     /// pgid unless `setpgid()` later changes it — matches real POSIX
@@ -411,6 +419,8 @@ impl Process {
             pending_wait_status: None,
             killed_by_signal: None,
             group_exited: false,
+            vfork_parent: None,
+            sleep_resume: None,
             pgid: pid.0 as u32,
             sid: pid.0 as u32,
             ctty: None,
@@ -507,6 +517,8 @@ impl Process {
             pending_wait_status: None,
             killed_by_signal: None,
             group_exited: false,
+            vfork_parent: None,
+            sleep_resume: None,
             pgid: pid.0 as u32,
             sid: pid.0 as u32,
             ctty: None,
@@ -594,6 +606,8 @@ impl Process {
             pending_wait_status: None,
             killed_by_signal: None,
             group_exited: false,
+            vfork_parent: None,
+            sleep_resume: None,
             pgid: parent_pgid,
             sid: parent_sid,
             ctty: None,
@@ -709,6 +723,8 @@ impl Process {
             pending_wait_status: None,
             killed_by_signal: None,
             group_exited: false,
+            vfork_parent: None,
+            sleep_resume: None,
             pgid: parent_pgid,
             sid: parent_sid,
             ctty: None,

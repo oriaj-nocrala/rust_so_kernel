@@ -813,6 +813,10 @@ impl Scheduler {
             if proc.clear_child_tid != 0 {
                 self.clear_child_tid(proc.clear_child_tid, &proc.address_space);
             }
+            // A `vfork` parent waits for this process to exec or die.
+            if let Some(parent) = proc.vfork_parent.take() {
+                self.wake_with_retval(parent, proc.pid.0 as u64);
+            }
             self.reparent_children(proc.pid);
             // Its files close now, as Linux's `do_exit` does — but not
             // here, under this lock: see `dead_files`. (`sys_exit` has
@@ -960,7 +964,7 @@ impl Scheduler {
                 .map(|p| p.pid.0)
                 .collect();
             for pid in stopped {
-                self.wake_stopped(pid);
+                self.wake_stopped(pid, sig);
             }
         }
         self.queue_signal_to_group_from(pgid, sig, origin);
@@ -992,7 +996,7 @@ impl Scheduler {
     /// Send `sig` to one process, `kill(pid)`'s way (see `signal_group`).
     pub fn signal_pid(&mut self, pid: usize, sig: u32) {
         if super::signal::resumes_stopped(sig) {
-            self.wake_stopped(pid);
+            self.wake_stopped(pid, sig);
         }
         if self.current_pid().map(|p| p.0) == Some(pid) {
             if let Some(p) = self.running_mut() {
@@ -1093,7 +1097,11 @@ impl Scheduler {
     /// `wake()`, this is the *only* wakeup path a Stopped process ever has
     /// — it can't wake itself the way a Blocked process does when its I/O
     /// completes, since being stopped isn't waiting on anything.
-    pub fn wake_stopped(&mut self, pid: usize) -> bool {
+    pub fn wake_stopped(&mut self, pid: usize, sig: u32) -> bool {
+        // Who to tell if this is a SIGCONT: the parent of a stopped child (`SIGCHLD` with `CLD_CONTINUED`).
+        let parent = self.core.wait_queue().iter()
+            .find(|p| p.pid.0 == pid && matches!(p.state, ProcessState::Stopped))
+            .and_then(|p| p.parent_pid);
         let woke = self.core.wake_matching(
             |p| p.pid.0 == pid && matches!(p.state, ProcessState::Stopped),
             |p| {
@@ -1103,6 +1111,18 @@ impl Scheduler {
         );
         if woke {
             self.kick_idle(false);
+            if sig == super::signal::SIGCONT {
+                if let Some(parent) = parent {
+                    let origin = super::signal::SigOrigin::child(super::signal::CLD_CONTINUED, pid, super::signal::SIGCONT as i32);
+                    if self.running_ref().map(|p| p.tgid) == Some(parent.0) {
+                        if let Some(p) = self.running_mut() {
+                            super::signal::queue_signal_from(p, super::signal::SIGCHLD, origin);
+                        }
+                    } else if let Some(p) = self.find_process_mut(parent.0) {
+                        super::signal::queue_signal_from(p, super::signal::SIGCHLD, origin);
+                    }
+                }
+            }
         }
         woke
     }

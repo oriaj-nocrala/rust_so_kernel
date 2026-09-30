@@ -14,6 +14,7 @@ description: Playbook for verifying a change to rust_so_kernel: which test suite
 | kernel code on a hardware path | `scripts/run-kernel-tests.sh` |
 | syscalls, process or FS behaviour | the matching `userspace/c/*_test.c`, run in a booted kernel (`qemu-debug` skill). The tests live in `/mnt/bin` |
 | boot stability, races | `scripts/boot-matrix.sh N M` |
+| the C userspace tests (all of them, one boot) | `scripts/run-abi-suite.sh [--no-build] [--keep-going] [test ...]`: ~80 s for the standard 27; **fails fast** (first `FAIL`, kernel panic, a test over `TEST_TIMEOUT`=90 s, no output for `STALL`=60 s) and names the test; `KEEP_ALIVE=1` leaves a hung guest running; the list is `disk-image-root/abi-suite.sh` |
 | the compositor or GUI programs | `scripts/gui-e2e.sh [term\|wm\|text]` |
 | anything the Ryzen does differently | the `metal-run` skill |
 

@@ -171,6 +171,7 @@ pub const SI_TKILL: i32 = -6;
 pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
 pub const CLD_STOPPED: i32 = 5;
+pub const CLD_CONTINUED: i32 = 6;
 
 /// Who sent a pending signal, as `siginfo_t` reports it: `si_code`, `si_pid` (a thread-group id) and, for `SIGCHLD`,
 /// `si_status`. There is no uid model, so `si_uid` is always 0. One per signal number, as standard signals do not queue: the
@@ -298,7 +299,7 @@ fn next_effect(proc: &Process) -> sched::SignalEffect {
 /// was in return `EINTR`, or re-execute it, according to what the signal
 /// is about to do — before `deliver_one` saves the frame into a handler's
 /// signal frame, so the handler's `sigreturn` lands on the right one.
-fn finish_interrupted_call(proc: &Process, tf: *mut TrapFrame, i: super::wait::Interrupted) {
+fn finish_interrupted_call(proc: &mut Process, tf: *mut TrapFrame, i: super::wait::Interrupted) {
     const EINTR: i64 = -4;
     let restart = sched::wait::restarts(i.policy, next_effect(proc));
     crate::ktrace!(
@@ -306,8 +307,12 @@ fn finish_interrupted_call(proc: &Process, tf: *mut TrapFrame, i: super::wait::I
         "interrupted: PID {} syscall {} -> {}",
         proc.pid.0, i.nr, if restart { "restart" } else { "EINTR" }
     );
+    // A relative sleep that restarts (stopped, then continued) must sleep only what it had left, not the whole time again.
+    if let (true, Some(r)) = (restart, i.rem) {
+        proc.sleep_resume = Some(r.expiry);
+    }
     // A sleep ended by a handler reports the time it had left (`nanosleep`/`clock_nanosleep`'s `rem`).
-    if let (false, Some(r)) = (restart, i.rem) {
+    if let (false, Some(r), true) = (restart, i.rem, i.rem.is_some_and(|r| r.rem_ptr != 0)) {
         let left = r.expiry.saturating_sub(crate::time::ktime_get());
         let mut ts = [0u8; 16];
         ts[..8].copy_from_slice(&((left / 1_000_000_000) as i64).to_ne_bytes());

@@ -38,13 +38,14 @@ static void child_cld(pid_t *child, int how) {
     if (c == 0) {
         if (how == 0) _exit(7);
         if (how == 1) kill(getpid(), SIGTERM);            // default action: killed by SIGTERM
-        if (how == 2) { kill(getpid(), SIGSTOP); _exit(0); }
+        if (how == 2) { kill(getpid(), SIGSTOP); for (;;) ; }
         for (;;) ;
     }
     *child = c;
 }
 
 int main(void) {
+    setpgid(0, 0);   // kill(0) below signals the whole group: keep it to this test (a script's shell is in the caller's group)
     struct sigaction sa = {0};
     sa.sa_sigaction = handler;
     sa.sa_flags = SA_SIGINFO;
@@ -105,6 +106,12 @@ int main(void) {
     CHECK(wait_got() && got_sig == SIGCHLD, "no SIGCHLD");
     CHECK(got_code == CLD_STOPPED, "si_code %d, wanted CLD_STOPPED (5)", got_code);
     CHECK(got_pid == c && got_status == SIGSTOP, "si_pid %d si_status %d, wanted %d and %d", got_pid, got_status, c, SIGSTOP);
+    printf("SIGCHLD: the child continues\n");
+    arm();
+    kill(c, SIGCONT);
+    CHECK(wait_got() && got_sig == SIGCHLD, "no SIGCHLD");
+    CHECK(got_code == CLD_CONTINUED, "si_code %d, wanted CLD_CONTINUED (6)", got_code);
+    CHECK(got_pid == c && got_status == SIGCONT, "si_pid %d si_status %d, wanted %d and %d", got_pid, got_status, c, SIGCONT);
     kill(c, SIGKILL);
     waitpid(c, NULL, 0);
 

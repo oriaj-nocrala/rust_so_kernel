@@ -109,7 +109,7 @@ pub(super) fn sys_yield() -> SyscallResult {
 pub(super) fn sys_nanosleep(req: u64, rem: u64) -> SyscallResult {
     match read_sleep_args(req, rem) {
         Ok(ns) if ns == 0 => 0,
-        Ok(ns) => sleep_until(crate::time::ktime_get().saturating_add(ns), 35, rem),
+        Ok(ns) => sleep_until(relative_expiry(ns), 35, rem, true),
         Err(e) => e,
     }
 }
@@ -159,7 +159,15 @@ pub(super) fn sys_clock_nanosleep(clock: u64, flags: u32, req: u64, rem: u64) ->
     if expiry <= up {
         return 0;
     }
-    sleep_until(expiry, 230, if flags & TIMER_ABSTIME == 0 { rem } else { 0 })
+    let relative = flags & TIMER_ABSTIME == 0;
+    sleep_until(if relative { relative_expiry(ns) } else { expiry }, 230, rem, relative)
+}
+
+/// The deadline of a relative sleep of `ns` from now — or, if this call is the restart of a sleep a stop/continue interrupted,
+/// the deadline that sleep already had (`Process::sleep_resume`).
+fn relative_expiry(ns: u64) -> u64 {
+    let resume = crate::process::irq_guard::SchedGuard::lock().running_mut().and_then(|p| p.sleep_resume.take());
+    resume.unwrap_or_else(|| crate::time::ktime_get().saturating_add(ns))
 }
 
 /// A `timespec` as nanoseconds; `None` for a negative or out-of-range field (`EINVAL` in Linux).
@@ -175,7 +183,7 @@ fn timespec_ns(sec: i64, nsec: i64) -> Option<u64> {
 /// LOCKING (see hrtimer.rs for full analysis):
 ///   cli → scheduler lock → QUEUE lock (hrtimer::start) → QUEUE released →
 ///   block_current → never returns here.
-fn sleep_until(expiry: u64, syscall_nr: u64, rem: u64) -> SyscallResult {
+fn sleep_until(expiry: u64, syscall_nr: u64, rem: u64, relative: bool) -> SyscallResult {
     let tf_ptr = current_tf_ptr();
 
     // `_irq` is deliberately never dropped — see sys_yield above.
@@ -206,7 +214,8 @@ fn sleep_until(expiry: u64, syscall_nr: u64, rem: u64) -> SyscallResult {
             syscall_nr, ret_rip, crate::process::wait::RestartPolicy::NoHandlerOnly,
             crate::process::wait::Cleanup::Timer(timer),
         );
-        if rem != 0 {
+        // A relative sleep carries its deadline (the time left goes to `rem` if given; a restart resumes to it).
+        if relative {
             wait = wait.with_rem(crate::process::wait::SleepRem { expiry, rem_ptr: rem });
         }
         scheduler.block_current(tf_ptr, wait)
@@ -394,11 +403,11 @@ pub(crate) fn cancel_all_waiters(pid: usize) {
 }
 
 pub(super) fn sys_fork() -> SyscallResult {
-    fork_impl(0, None)
+    fork_impl(0, None, false)
 }
 
 /// `fork`, with `clone`'s two extras: the child resumes on `child_stack` if that is nonzero, and with `tls` as its FS base if given.
-fn fork_impl(child_stack: u64, tls: Option<u64>) -> SyscallResult {
+fn fork_impl(child_stack: u64, tls: Option<u64>, vfork: bool) -> SyscallResult {
     let tf_ptr = current_tf_ptr();
 
     let _irq = crate::process::irq_guard::InterruptGuard::new();
@@ -443,9 +452,10 @@ fn fork_impl(child_stack: u64, tls: Option<u64>) -> SyscallResult {
 
     let kernel_stack = crate::init::processes::allocate_kernel_stack();
 
-    let child_pid = {
+    let (child_pid, vfork_next) = {
         let mut scheduler = crate::process::scheduler::local_scheduler();
         let pid = scheduler.allocate_pid();
+        let caller_tid = scheduler.current_pid().map(|p| p.0);
 
         let mut child = alloc::boxed::Box::new(
             crate::process::Process::new_user_from_fork(
@@ -469,10 +479,25 @@ fn fork_impl(child_stack: u64, tls: Option<u64>) -> SyscallResult {
         // as `[child]`.
         child.name = parent_comm;
         child.cmdline = parent_cmdline;
+        if vfork {
+            child.vfork_parent = caller_tid;
+        }
         scheduler.add_process(child);
-        pid.0 as SyscallResult
+        // `CLONE_VFORK`: the parent sleeps until the child execs or dies. Added and blocked under one hold of the lock, so
+        // the child cannot finish first; whoever ends the child's hold on the parent wakes it with the child's pid.
+        let next = if vfork {
+            unsafe { (*(tf_ptr as *mut TrapFrame)).rax = pid.0 as u64; }
+            Some(scheduler.block_current(tf_ptr, crate::process::wait::Wait::uninterruptible()))
+        } else {
+            None
+        };
+        (pid.0 as SyscallResult, next)
     };
 
+    if let Some(next) = vfork_next {
+        // Diverges, like every blocking syscall: `_irq` stays held on purpose (see `sys_yield`).
+        unsafe { crate::process::trapframe::jump_to_user(next) }
+    }
     child_pid  // parent sees child PID
 }
 
@@ -495,6 +520,7 @@ fn fork_impl(child_stack: u64, tls: Option<u64>) -> SyscallResult {
 pub(super) fn sys_clone(flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) -> SyscallResult {
     const CLONE_VM: u64 = 0x100;
     const CLONE_SIGHAND: u64 = 0x800;
+    const CLONE_VFORK: u64 = 0x4000;
     const CLONE_THREAD: u64 = 0x1_0000;
     const CLONE_SETTLS: u64 = 0x8_0000;
     const CLONE_PARENT_SETTID: u64 = 0x10_0000;
@@ -502,7 +528,7 @@ pub(super) fn sys_clone(flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) 
     const CLONE_CHILD_SETTID: u64 = 0x100_0000;
 
     if flags & CLONE_THREAD == 0 {
-        return fork_impl(stack, (flags & CLONE_SETTLS != 0).then_some(tls));
+        return fork_impl(stack, (flags & CLONE_SETTLS != 0).then_some(tls), flags & CLONE_VFORK != 0);
     }
     if flags & CLONE_VM == 0 || flags & CLONE_SIGHAND == 0 {
         return errno::EINVAL;
@@ -770,6 +796,7 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
         crate::ktrace!(crate::debug::SCHED, "exec: scheduler locked, swapping address space");
         match scheduler.running_mut() {
             Some(proc) => {
+                let vfork_parent = proc.vfork_parent.take().map(|p| (p, proc.pid.0));
                 // Rename to the new image's basename, the way real
                 // `execve()` resets `comm`. Without it a process kept
                 // whatever it was called when it was created — and since
@@ -888,11 +915,16 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
                 // preemption already ran before this point and is unrelated.
                 crate::process::scheduler::tf_note_save(proc, "sys_exec");
                 crate::process::scheduler::tf_note_resume(proc, "sys_exec");
-                &*proc.trapframe as *const TrapFrame
+                (&*proc.trapframe as *const TrapFrame, vfork_parent)
             }
             None => return errno::ESRCH,
         }
     };
+    let (next_tf, vfork_parent) = next_tf;
+    // The image is replaced: a `vfork` parent waiting for that goes on (Linux releases it at exec as well as at exit).
+    if let Some((parent, child)) = vfork_parent {
+        crate::process::scheduler::local_scheduler().wake_with_retval(parent, child as u64);
+    }
 
     crate::ktrace!(crate::debug::SCHED, "exec: jump_to_trapframe");
     // Jump to the new program — never returns
@@ -1194,7 +1226,7 @@ fn kill_impl(target_pid: i64, sig: u32, exact: bool, in_group: Option<usize>) ->
                 // wait's one-shot cell now decides which of the signal and
                 // the waker ends it (`process::wait`).
                 if crate::process::signal::resumes_stopped(sig) {
-                    sched.wake_stopped(target_pid);
+                    sched.wake_stopped(target_pid, sig);
                 }
                 match sched.find_process_mut(target_pid) {
                     Some(proc) => crate::process::signal::queue_signal_from(proc, sig, origin),

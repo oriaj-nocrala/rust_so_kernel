@@ -22,7 +22,7 @@ State and the list of what is still missing: `docs/reference/syscalls.md` (rows,
   - `fork` masks PTE bugs: the child's PTEs are rebuilt from the VMA flags, so "the parent's PTE was updated" must be checked in a child that maps and lowers **after** the fork (`mprotect_test`).
   - A refault inside a handler died anyway (by stack exhaustion, later): make the second handler `_exit(77)` so only wrong delivery is visible.
   - `1 / z` with `z = 0` is undefined behaviour and clang folds it into a select; `base != 0` on the address of an object is folded to true. Use inline asm (`div`) or compare against a constant.
-- Scripted runner used in the sessions (recreate it in the scratchpad): build, `qemu-debug.sh stop/start --no-build`, wait for `# `, `sleep 5`, then for each test `send "/mnt/bin/T; echo END_T=\$?"`, `wait-for END_T=[0-9]`, and grep `\[fb\].*FAIL`. Never `pkill -f qemu-system` from a command whose own text contains it (it kills the shell); use `qemu-debug.sh stop`.
+- Runner: `scripts/run-abi-suite.sh` (`kernel-testing` skill): one boot, all the C tests, fails fast. Add a new test to its list in `disk-image-root/abi-suite.sh`. A test that signals its process group (`kill(0)`) must `setpgid(0,0)` first: inside the suite script it shares the shell's group. Never `pkill -f qemu-system` from a command whose own text contains it (it kills the shell); use `qemu-debug.sh stop`.
 - After any change to a path shared by all processes (fault entry, fd table, signals, exec, poll): `scripts/run-kernel-tests.sh`, ~15 userspace tests (`lifecycle`, `jobctl`, `pthread`, `sigsuspend`, `pipe_multi`, `fork_exec`, `socket`, `pty`), and `QEMU_DEBUG_SMP=4 scripts/boot-matrix.sh 4 5`.
 
 ## Traps that cost time
@@ -41,4 +41,4 @@ State and the list of what is still missing: `docs/reference/syscalls.md` (rows,
 
 ## Still missing (check `rust_std_gaps` first)
 
-a relative sleep restarted after SIGSTOP/SIGCONT sleeps the whole time again (Linux: the rest), `si_uid` (no uid model) and `CLD_CONTINUED`, `CLONE_VFORK` does not suspend the parent, `epoll_pwait` (281) is missing, epoll is level-triggered only (`EPOLLET`/`EPOLLONESHOT` stored, not honoured).
+`EPOLLET` is level-triggered on purpose (see `syscalls.md`), `waitpid(WCONTINUED)`, `CLONE_VM` without `CLONE_THREAD` shares nothing (COW copy; a `vfork` child's writes are invisible to the parent), `setuid` and friends (there are no uids).

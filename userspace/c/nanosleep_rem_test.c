@@ -102,6 +102,27 @@ int main(void) {
     CHECK(left == 2 || left == 3, "sleep(3) interrupted after 100 ms returned %u", left);
     waitpid(c, NULL, 0);
 
+    printf("a sleep stopped and continued sleeps only what it had left\n");
+    for (int variant = 0; variant < 2; variant++) {
+        pid_t stopper = fork();
+        if (stopper == 0) {
+            struct timespec a = {0, 100000000}, b = {0, 300000000};
+            pid_t parent = getppid();
+            nanosleep(&a, NULL); kill(parent, SIGSTOP);
+            nanosleep(&b, NULL); kill(parent, SIGCONT);
+            _exit(0);
+        }
+        struct timespec one = {1, 0}, s0, s1;
+        clock_gettime(CLOCK_MONOTONIC, &s0);
+        long sr = variant == 0 ? sc(NANOSLEEP, (long)&one, 0, 0, 0) : sc(CLOCK_NANOSLEEP, CLOCK_MONOTONIC, 0, (long)&one, 0);
+        clock_gettime(CLOCK_MONOTONIC, &s1);
+        long el = ns_of(s1) - ns_of(s0);
+        CHECK(sr == 0, "%s returned %ld", variant == 0 ? "nanosleep" : "clock_nanosleep", sr);
+        CHECK(el >= 990000000L && el < 1250000000L, "%s took %ld ms; a restart from scratch would take about 1400",
+              variant == 0 ? "nanosleep" : "clock_nanosleep", el / 1000000L);
+        waitpid(stopper, NULL, 0);
+    }
+
     printf(failures ? "nanosleep_rem_test: FAIL\n" : "nanosleep_rem_test: PASS\n");
     return failures != 0;
 }
