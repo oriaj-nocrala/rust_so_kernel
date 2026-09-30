@@ -1285,6 +1285,11 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
     match outcome {
         Outcome::Return(v) => {
             drop(irq);
+            // The `settle` at the top covers the deaths that had happened by then. A child that died on another CPU since (its table
+            // queued in `dead_files` before it became a zombie, see `kill_current`) is reaped here with its files possibly still being
+            // closed by whichever CPU took the queue: wait for that too, so a parent that reaps a dead holder of an exclusive or
+            // counted resource (a `/dev/nvgpu` session, `/dev/fb0`) finds it released, as after Linux's `do_exit`.
+            crate::process::dead_files::settle();
             v
         }
         // `irq` deliberately never dropped here — diverges via
