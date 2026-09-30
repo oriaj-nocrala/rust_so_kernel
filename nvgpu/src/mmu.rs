@@ -28,6 +28,10 @@ pub const PD0_SMALL: usize = 8;
 
 /// The size of the page a PD0 entry can map by itself (`NV_MMU_VER2_DUAL_PDE_IS_PTE`).
 pub const HUGE_PAGE: u64 = 2 << 20;
+/// 64 KiB pages (`"LPT"`, `docs/gpu/mmu-v3-notes.md`): the big-page half of a PD0 entry points to a table of 32 PTEs
+/// (5 index bits, 0x100 bytes), and nouveau maps context buffers of 64 KiB and up with them.
+pub const BIG_PAGE: u64 = 64 << 10;
+const BIG_ENTRIES: usize = 32;
 
 /// Where a page or table lives (`nvkm_memory_target`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,11 +133,16 @@ pub struct PageTables {
     tables: Vec<[u8; TABLE_SIZE]>,
 }
 
-/// The physical address in a PDE or PTE: bits 55:4 hold `addr >> 4` (bits 63:56
-/// of a PTE are the kind, bits 3:0 the flags; the low bits of a 4 KiB-aligned
-/// address are zero).
+/// The address a PDE points to: bits 55:4 hold `addr >> 4` (bits 3:0 are the aperture and VOL; a big-page table is
+/// only 256-byte aligned, so bits 7:4 are address).
 fn entry_addr(e: u64) -> u64 {
     (e & 0x00ff_ffff_ffff_fff0) << 4
+}
+
+/// The physical address a PTE maps: bits 55:8 (bits 7:0 are flags: valid, aperture, VOL, encrypted, PRIV at 5, RO at
+/// 6, ATOMIC_DISABLE at 7; bits 63:56 the kind). Pages are 4 KiB-aligned.
+fn pte_addr(e: u64) -> u64 {
+    (e & 0x00ff_ffff_ffff_ff00) << 4
 }
 
 fn rd64(t: &[u8; TABLE_SIZE], at: usize) -> u64 {
@@ -208,7 +217,7 @@ impl PageTables {
         t = self.child(t, ix[2] * 8)?;
         // PD0: 16-byte dual PDE, the small-page PDE is the second half; the first
         // half holding a PTE means a 2 MiB page covers this VA
-        if rd64(&self.tables[t], ix[3] * 16) != 0 {
+        if rd64(&self.tables[t], ix[3] * 16) & PTE_VALID != 0 {
             return Err(MapError::Overlap);
         }
         t = self.child(t, ix[3] * 16 + PD0_SMALL)?;
@@ -229,6 +238,47 @@ impl PageTables {
         while off < len {
             self.map(va + off, pa + off, target, f)?;
             off += 0x1000;
+        }
+        Ok(())
+    }
+
+    /// Map one 64 KiB page: the PTE is one of the 32 of the big-page table the PD0 entry's first half points to (a
+    /// 4 KiB table page of ours holds it, only its first 0x100 bytes are used). The small-page half of the same
+    /// entry may hold a table of 4 KiB pages elsewhere in the same 2 MiB: the hardware takes the big PTE when it
+    /// is valid.
+    pub fn map_big(&mut self, va: u64, pa: u64, target: Target, f: Flags) -> Result<(), MapError> {
+        if va & (BIG_PAGE - 1) != 0 || pa & (BIG_PAGE - 1) != 0 {
+            return Err(MapError::Unaligned);
+        }
+        if va >> VA_BITS != 0 {
+            return Err(MapError::OutOfRange);
+        }
+        let ix = indices(va);
+        let mut t = 0;
+        t = self.child(t, ix[0] * 8)?;
+        t = self.child(t, ix[1] * 8)?;
+        t = self.child(t, ix[2] * 8)?;
+        if rd64(&self.tables[t], ix[3] * 16) & PTE_VALID != 0 {
+            return Err(MapError::Overlap); // a 2 MiB page covers this VA
+        }
+        t = self.child(t, ix[3] * 16)?;
+        let at = ((va >> 16) as usize & (BIG_ENTRIES - 1)) * 8;
+        if rd64(&self.tables[t], at) != 0 {
+            return Err(MapError::AlreadyMapped);
+        }
+        wr64(&mut self.tables[t], at, pte(pa, target, f));
+        Ok(())
+    }
+
+    /// Map `len` bytes (a multiple of 64 KiB) of contiguous physical memory with 64 KiB pages.
+    pub fn map_big_range(&mut self, va: u64, pa: u64, len: u64, target: Target, f: Flags) -> Result<(), MapError> {
+        if len & (BIG_PAGE - 1) != 0 {
+            return Err(MapError::Unaligned);
+        }
+        let mut off = 0;
+        while off < len {
+            self.map_big(va + off, pa + off, target, f)?;
+            off += BIG_PAGE;
         }
         Ok(())
     }
@@ -318,17 +368,43 @@ impl PageTables {
         Some((t, ix[4] * 8))
     }
 
+    /// The physical addresses of the root and of the PD2 and PD1 tables on `va`'s path, if they exist: what
+    /// `NV90F1_CTRL_CMD_VASPACE_COPY_SERVER_RESERVED_PDES` names for a VA space RM manages over tables of ours
+    /// (`levels[i].physAddress`, root first; nouveau's `pd->pt[0]->addr`, then `pd->pde[0]`, `vmm.c:122-131`).
+    pub fn directories(&self, va: u64) -> Option<[u64; 3]> {
+        if va >> VA_BITS != 0 {
+            return None;
+        }
+        let ix = indices(va);
+        let pd2 = self.table_at(entry_addr(rd64(&self.tables[0], ix[0] * 8)))?;
+        let pd1 = self.table_at(entry_addr(rd64(&self.tables[pd2], ix[1] * 8)))?;
+        let at = |i: usize| self.base + (i * TABLE_SIZE) as u64;
+        Some([at(0), at(pd2), at(pd1)])
+    }
+
     /// Translate `va` through the images: the physical address and the PTE.
     pub fn translate(&self, va: u64) -> Option<(u64, u64)> {
         if let Some((t, at)) = self.locate_huge(va) {
             let e = rd64(&self.tables[t], at);
             if e & PTE_VALID != 0 {
-                return Some((entry_addr(e) | (va & (HUGE_PAGE - 1)), e));
+                return Some((pte_addr(e) | (va & (HUGE_PAGE - 1)), e));
+            }
+        }
+        // a valid 64 KiB PTE wins over the table of 4 KiB pages
+        if let Some((t, at)) = self.locate_huge(va) {
+            let pde = rd64(&self.tables[t], at);
+            if pde != 0 && pde & PTE_VALID == 0 {
+                if let Some(bt) = self.table_at(entry_addr(pde)) {
+                    let e = rd64(&self.tables[bt], ((va >> 16) as usize & (BIG_ENTRIES - 1)) * 8);
+                    if e & PTE_VALID != 0 {
+                        return Some((pte_addr(e) | (va & (BIG_PAGE - 1)), e));
+                    }
+                }
             }
         }
         let (t, at) = self.locate(va)?;
         let e = rd64(&self.tables[t], at);
-        (e & PTE_VALID != 0).then(|| (entry_addr(e) | (va & 0xfff), e))
+        (e & PTE_VALID != 0).then(|| (pte_addr(e) | (va & 0xfff), e))
     }
 }
 
@@ -354,6 +430,18 @@ mod tests {
                 let big = get(table, i * 16)?;
                 if big & 1 == 1 {
                     return Some(((((big >> 8) & 0x00ff_ffff_ffff) << 12) | (va & 0x1f_ffff), big));
+                }
+            }
+            if size == 16 {
+                // a big-page table (first half, bit 0 clear): a valid PTE in it wins over the small tables
+                let big = get(table, i * 16)?;
+                if big != 0 {
+                    let bt = ((big >> 8) & 0x00ff_ffff_ffff) << 12;
+                    if let Some(e) = get(bt, (((va >> 16) & 0x1f) as usize) * 8) {
+                        if e & 1 == 1 {
+                            return Some(((((e >> 8) & 0x00ff_ffff_ffff) << 12) | (va & 0xffff), e));
+                        }
+                    }
                 }
             }
             let e = get(table, i * size + if size == 16 { 8 } else { 0 })?;
@@ -425,6 +513,26 @@ mod tests {
     }
 
     #[test]
+    fn directories_name_the_root_pd2_and_pd1_on_a_path() {
+        let mut pt = PageTables::new(BASE, 16, Target::Vram);
+        assert_eq!(pt.directories(0x1000), None, "no PD2 yet");
+        // a first path under root[1] / PD2[3], then a second under root[0] / PD2[0]: the tables are not in
+        // order, so the addresses must come from the entries
+        pt.map((1 << 47) | (3 << 38), 0x5000, Target::Vram, Flags::default()).unwrap();
+        pt.map(0x1000, 0x6000, Target::Vram, Flags::default()).unwrap();
+        assert_eq!(pt.directories((1 << 47) | (3 << 38) | 0x1234_5000), Some([BASE, BASE + 0x1000, BASE + 0x2000]));
+        assert_eq!(pt.directories(0x1000), Some([BASE, BASE + 0x5000, BASE + 0x6000]));
+        // the server-reserved window (4 GiB) shares root[0] and PD2[0] with VA 0
+        assert_eq!(pt.directories(0x1_0000_0000), pt.directories(0x1000));
+        assert_eq!(pt.directories(1 << 49), None);
+        // cross-check against the independent walk: PD1 is the table whose slot 0 leads to the leaf
+        let pd1 = pt.directories(0x1000).unwrap()[2];
+        let img = pt.images().find(|(a, _)| *a == pd1).unwrap().1;
+        assert_ne!(rd64(img, 0), 0);
+        assert_eq!(walk(&pt, 0x1000).map(|(pa, _)| pa), Some(0x6000));
+    }
+
+    #[test]
     fn pd0_entries_are_sixteen_bytes_and_use_the_small_page_half() {
         let mut pt = PageTables::new(BASE, 16, Target::Vram);
         let va = 3u64 << 21; // PD0 index 3
@@ -463,6 +571,106 @@ mod tests {
         assert_eq!(walk(&pt, 0x3000), None);
         assert_eq!(pt.translate(0x3000), None);
         assert_eq!(pt.translate(1 << 49), None);
+    }
+
+    #[test]
+    fn big_pages_use_the_first_half_of_pd0_and_a_32_entry_table() {
+        let mut pt = PageTables::new(BASE, 32, Target::Vram);
+        // two 64 KiB pages in the same 2 MiB, one in the next
+        let (va, pa) = (0x3_0001_0000u64, 0x1_2345_0000u64);
+        pt.map_big(va, pa, Target::Vram, Flags { privileged: true, ..Flags::default() }).unwrap();
+        pt.map_big(va + 0x10000, pa + 0x10000, Target::Vram, Flags::default()).unwrap();
+        pt.map_big(va + 0x20_0000, 0x7_0000, Target::Vram, Flags::default()).unwrap();
+        // 5 directory/table pages for the first (PD3 PD2 PD1 PD0 + LPT), one more LPT for the next 2 MiB
+        assert_eq!(pt.len(), 6);
+        let ix = indices(va);
+        let (_, pd0) = pt.images().nth(3).unwrap();
+        // first qword of the PD0 entry: the big-page table, not a PTE (bit 0 clear); second qword empty
+        let lpt = BASE + 4 * 0x1000;
+        assert_eq!(rd64(pd0, ix[3] * 16), pde(lpt, Target::Vram));
+        assert_eq!(rd64(pd0, ix[3] * 16) & 1, 0);
+        assert_eq!(rd64(pd0, ix[3] * 16 + 8), 0);
+        // the table: entry (va >> 16) & 31 = 1 and 2
+        let (_, t) = pt.images().nth(4).unwrap();
+        assert_eq!(rd64(t, 8), pte(pa, Target::Vram, Flags { privileged: true, ..Flags::default() }));
+        assert_eq!(rd64(t, 16), pte(pa + 0x10000, Target::Vram, Flags::default()));
+        assert_eq!(rd64(t, 0), 0);
+        assert!(t[0x100..].iter().all(|&b| b == 0), "only 32 entries are used");
+        // translate and the independent walk agree, offsets inside the 64 KiB kept, neighbours unmapped
+        for (v, p) in [(va, pa), (va + 0x10000, pa + 0x10000), (va + 0x20_0000, 0x7_0000)] {
+            for off in [0u64, 0x123, 0xffff] {
+                assert_eq!(walk(&pt, v + off).map(|w| w.0), Some(p + off), "walk {v:#x}+{off:#x}");
+                assert_eq!(pt.translate(v + off).map(|w| w.0), Some(p + off), "translate {v:#x}+{off:#x}");
+            }
+        }
+        assert_eq!(walk(&pt, va + 0x20000), None);
+        assert_eq!(pt.translate(va + 0x20000), None);
+        assert_eq!(pt.translate(va - 0x10000), None);
+    }
+
+    #[test]
+    fn big_and_small_pages_can_share_a_pd0_slot_and_big_wins() {
+        let mut pt = PageTables::new(BASE, 32, Target::Vram);
+        let base = 0x3_0000_0000u64;
+        pt.map_big(base + 0x10000, 0x100_0000, Target::Vram, Flags::default()).unwrap();
+        pt.map(base + 0x2000, 0x5000, Target::Vram, Flags::default()).unwrap();
+        pt.map(base + 0x11000, 0x6000, Target::Vram, Flags::default()).unwrap(); // under the big page: shadowed
+        assert_eq!(pt.translate(base + 0x2000).map(|w| w.0), Some(0x5000));
+        assert_eq!(walk(&pt, base + 0x2000).map(|w| w.0), Some(0x5000));
+        assert_eq!(pt.translate(base + 0x11000).map(|w| w.0), Some(0x100_1000), "the big PTE is valid: it wins");
+        assert_eq!(walk(&pt, base + 0x11000).map(|w| w.0), Some(0x100_1000));
+        let (_, pd0) = pt.images().nth(3).unwrap();
+        let ix = indices(base);
+        assert_ne!(rd64(pd0, ix[3] * 16), 0);
+        assert_ne!(rd64(pd0, ix[3] * 16 + 8), 0);
+    }
+
+    #[test]
+    fn big_pages_refuse_what_they_cannot_hold() {
+        let mut pt = PageTables::new(BASE, 32, Target::Vram);
+        assert_eq!(pt.map_big(0x1_0000 + 0x1000, 0x10000, Target::Vram, Flags::default()), Err(MapError::Unaligned));
+        assert_eq!(pt.map_big(0x1_0000, 0x10800, Target::Vram, Flags::default()), Err(MapError::Unaligned));
+        assert_eq!(pt.map_big(1 << 49, 0x10000, Target::Vram, Flags::default()), Err(MapError::OutOfRange));
+        pt.map_big(0x1_0000, 0x10000, Target::Vram, Flags::default()).unwrap();
+        assert_eq!(pt.map_big(0x1_0000, 0x20000, Target::Vram, Flags::default()), Err(MapError::AlreadyMapped));
+        assert_eq!(pt.map_big_range(0x4_0000, 0x40000, 0x8001, Target::Vram, Flags::default()), Err(MapError::Unaligned));
+        // a 2 MiB page in the same slot
+        pt.map_huge(0x20_0000, 0x40_0000, Target::Vram, Flags::default()).unwrap();
+        assert_eq!(pt.map_big(0x20_0000, 0x10000, Target::Vram, Flags::default()), Err(MapError::Overlap));
+        // and a range crossing a 2 MiB boundary
+        let mut pt = PageTables::new(BASE, 32, Target::Vram);
+        pt.map_big_range(0x1f_0000, 0x1f0000, 0x3_0000, Target::Vram, Flags::default()).unwrap();
+        for k in 0..3u64 {
+            assert_eq!(pt.translate(0x1f_0000 + k * 0x10000 + 5).map(|w| w.0), Some(0x1f0000 + k * 0x10000 + 5));
+            assert_eq!(walk(&pt, 0x1f_0000 + k * 0x10000 + 5).map(|w| w.0), Some(0x1f0000 + k * 0x10000 + 5));
+        }
+        assert_eq!(BIG_PAGE, 0x10000);
+    }
+
+    #[test]
+    fn flags_in_a_pte_do_not_leak_into_its_address() {
+        let f = Flags { privileged: true, read_only: true, kind: 0 };
+        let mut pt = PageTables::new(BASE, 32, Target::Vram);
+        pt.map(0x1000, 0x7_0000, Target::Vram, f).unwrap();
+        pt.map_big(0x40_0000, 0x8_0000, Target::Vram, f).unwrap();
+        pt.map_huge(0x80_0000, 0x120_0000, Target::Vram, f).unwrap();
+        for (va, pa) in [(0x1000u64, 0x7_0000u64), (0x40_0000, 0x8_0000), (0x80_0000, 0x120_0000)] {
+            assert_eq!(pt.translate(va + 5).map(|w| w.0), Some(pa + 5), "translate {va:#x}");
+            assert_eq!(walk(&pt, va + 5).map(|w| w.0), Some(pa + 5), "walk {va:#x}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_big_pte_falls_through_to_the_small_table() {
+        let mut pt = PageTables::new(BASE, 32, Target::Vram);
+        let base = 0x3_0000_0000u64;
+        pt.map_big(base + 0x10000, 0x100_0000, Target::Vram, Flags::default()).unwrap();
+        pt.map(base + 0x21000, 0x9000, Target::Vram, Flags::default()).unwrap();
+        // the big table's entry for base + 0x20000 holds a sparse marker (VOL without VALID): not a mapping
+        let lpt = 4; // PD3 PD2 PD1 PD0 are tables 0..=3, the big table is 4
+        wr64(&mut pt.tables[lpt], 2 * 8, 1 << 3);
+        assert_eq!(pt.translate(base + 0x21000).map(|w| w.0), Some(0x9000), "the small mapping still answers");
+        assert_eq!(walk(&pt, base + 0x21000).map(|w| w.0), Some(0x9000));
     }
 
     #[test]

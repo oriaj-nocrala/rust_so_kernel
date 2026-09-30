@@ -118,6 +118,9 @@ pub enum GpuLevel {
     /// Phase 6c: also a GPFIFO channel on the Ampere copy engine and a
     /// measured system -> VRAM -> system copy through it. Implies `vaspace`.
     Copy,
+    /// Phase 7a: also a GR channel with a golden context and the Ampere compute
+    /// class, and a semaphore release and inline writes through it. Implies `copy`.
+    Compute,
 }
 
 impl GpuLevel {
@@ -142,6 +145,7 @@ impl GpuLevel {
             "gsp" => Some(GpuLevel::Gsp),
             "vaspace" => Some(GpuLevel::Vaspace),
             "copy" => Some(GpuLevel::Copy),
+            "compute" => Some(GpuLevel::Compute),
             _ => None,
         }
     }
@@ -197,6 +201,8 @@ mod tests {
         assert!(GpuLevel::Vaspace > GpuLevel::Gsp);
         assert_eq!(GpuLevel::parse("copy"), Some(GpuLevel::Copy));
         assert!(GpuLevel::Copy > GpuLevel::Vaspace);
+        assert_eq!(GpuLevel::parse("compute"), Some(GpuLevel::Compute));
+        assert!(GpuLevel::Compute > GpuLevel::Copy);
         assert!(GpuLevel::Vpll > GpuLevel::Super);
         assert!(GpuLevel::Super > GpuLevel::Scanout && GpuLevel::Scanout > GpuLevel::Chan);
         assert!(GpuLevel::Chan > GpuLevel::Dispstate && GpuLevel::Dispstate > GpuLevel::Vblank);

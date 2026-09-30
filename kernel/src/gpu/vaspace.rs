@@ -32,9 +32,10 @@ use super::Bar0;
 /// display instance memory is at `0x1ffc90000` and WPR2 at the top
 /// (`docs/gpu/mmu-v3-notes.md`).
 pub const TABLE_VRAM: u64 = 64 << 20;
-/// The pool: 64 tables (256 KiB, VRAM 64 MiB ..): the 6b test mapping needs 5;
-/// `gpu=copy` adds the channel's pages and two 4 MiB buffers (a PT per 2 MiB).
-const POOL_TABLES: usize = 64;
+/// The pool: 128 tables (512 KiB, VRAM 64 MiB ..): the 6b test mapping needs 5;
+/// `gpu=copy` adds the channel's pages and two 4 MiB buffers (a PT per 2 MiB);
+/// `gpu=compute` the context buffers (a few PT per buffer) and the GR channel's.
+const POOL_TABLES: usize = 128;
 
 /// The test mapping: `TEST_PAGES` pages of VRAM at 96 MiB, seen at VA 4 GiB
 /// (the start of the window nouveau reserves for RM: `SPLIT_VAS_SERVER_RM_MANAGED_VA_START`
@@ -55,7 +56,7 @@ fn stop(r: &mut String, why: core::fmt::Arguments) {
     let _ = writeln!(r, "vaspace: STOP: {}", why);
 }
 
-pub(super) fn setup(r: &mut String, regs: &Bar0, rm: &mut Rm, copy: bool) {
+pub(super) fn setup(r: &mut String, regs: &Bar0, rm: &mut Rm, copy: bool, compute: bool) {
     let t0 = crate::cpu::tsc::read();
 
     // 1. The space itself.
@@ -84,6 +85,16 @@ pub(super) fn setup(r: &mut String, regs: &Bar0, rm: &mut Rm, copy: bool) {
             return stop(r, format_args!("mapping the copy buffers: {:?}", e));
         }
         Some(b)
+    } else {
+        None
+    };
+    // 7a: the GR context buffers (RM's sizes come from a control, so this runs before the tables are written)
+    let comp = if compute {
+        let Some(c) = super::compute::prepare(r, regs, rm) else { return };
+        if let Err(e) = c.map(&mut pt) {
+            return stop(r, format_args!("mapping the compute buffers: {:?}", e));
+        }
+        Some(c)
     } else {
         None
     };
@@ -131,6 +142,11 @@ pub(super) fn setup(r: &mut String, regs: &Bar0, rm: &mut Rm, copy: bool) {
     // 4. Phase 6c: a channel over these tables.
     if let Some(b) = bufs {
         super::copy::run(r, regs, rm, b);
+    }
+
+    // 5. Phase 7a: a GR channel over the same tables.
+    if let Some(c) = comp {
+        super::compute::run(r, regs, rm, c);
     }
 }
 

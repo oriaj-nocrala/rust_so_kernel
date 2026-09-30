@@ -66,6 +66,10 @@
 //   copy   (phase 6c) — also a GPFIFO channel on the copy engine and a
 //          measured system -> VRAM -> system copy (`copy.rs`, `nvgpu::chan`).
 //          `copy:` lines, `gpu_copy:`.
+//   compute (phase 7a) — also a GR channel with a golden context (context
+//          buffers promoted to RM) and the Ampere compute class: a
+//          semaphore release and inline writes through it (`compute.rs`,
+//          `nvgpu::gr`). `compute:` lines, `gpu_compute:`.
 //
 // Runs once at boot, after `fs::init` (firmware is on `/mnt`) and before the
 // APs are released (BAR sizing turns decoding off for a few microseconds,
@@ -85,6 +89,7 @@ pub mod evo;
 pub mod gsp;
 pub mod vaspace;
 pub mod copy;
+pub mod compute;
 pub mod bench;
 pub mod intr;
 pub mod hdmi;
@@ -445,6 +450,7 @@ fn probe_device(r: &mut String, level: GpuLevel) {
                     level >= GpuLevel::Gsp,
                     level >= GpuLevel::Vaspace,
                     level >= GpuLevel::Copy,
+                    level >= GpuLevel::Compute,
                     gsp::PciInfo {
                         bar0: bar0.addr,
                         bar1: bars[1].map_or(0, |b| b.addr),

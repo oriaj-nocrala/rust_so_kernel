@@ -204,7 +204,7 @@ impl Firmware {
     }
 }
 
-pub fn setup(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8), full: bool, vaspace: bool, copy: bool, pci: PciInfo) {
+pub fn setup(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8), full: bool, vaspace: bool, copy: bool, compute: bool, pci: PciInfo) {
     let Some((bios, _)) = super::VBIOS.get() else {
         stop(r, format_args!("no VBIOS (gpu=disp did not read it)"));
         return;
@@ -391,7 +391,7 @@ pub fn setup(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8), full: bool, vaspace
     }
 
     if let (Some(mem), Some((fwset, _))) = (mem, prepared) {
-        boot_gsp(r, regs, &fwset, mem, vaspace, copy);
+        boot_gsp(r, regs, &fwset, mem, vaspace, copy, compute);
     }
 }
 
@@ -574,7 +574,7 @@ fn build_memory(r: &mut String, fw: &Firmware, layout: &gspmem::FbLayout, gsp: &
 
 /// Phase 4e, after FRTS: reset the GSP into RISC-V mode, give it the LibOS
 /// address, run the booter on SEC2, check the RISC-V core.
-fn boot_gsp(r: &mut String, regs: &Bar0, fw: &Firmware, mut mem: Memory, vaspace: bool, copy: bool) {
+fn boot_gsp(r: &mut String, regs: &Bar0, fw: &Firmware, mut mem: Memory, vaspace: bool, copy: bool, compute: bool) {
     use nvgpu::booter;
     let gsp = falcon::GSP;
     let b = match Booter::parse(&fw.booter) {
@@ -645,7 +645,7 @@ fn boot_gsp(r: &mut String, regs: &Bar0, fw: &Firmware, mut mem: Memory, vaspace
 
     // Phase 4f: GSP-RM boots on its own, asking the host for register work
     // (RUN_CPU_SEQUENCER) until it says INIT_DONE; then the static configuration.
-    rpc_phase(r, regs, &mut mem, vaspace, copy);
+    rpc_phase(r, regs, &mut mem, vaspace, copy, compute);
 
     // Then see whether it wrote its logs.
     for _ in 0..50 {
@@ -829,6 +829,22 @@ fn queue_diag(regs: &Bar0, shm: &ShmBuf) -> String {
 /// GSP-RM sends meanwhile (`r535_gsp_msg_recv`, `rm/r535/rpc.c:262-330`). Other
 /// events are counted and dropped, as nouveau does for the ones it has no
 /// handler for.
+/// The first bytes of the events RM sent that nobody waited for (an MMU fault's address, an RC's channel), kept for the
+/// adapters that want to say what happened (`take_events`). At most 24, 448 bytes each.
+static EVENT_TRACE: spin::Mutex<alloc::vec::Vec<(u32, alloc::vec::Vec<u8>)>> = spin::Mutex::new(alloc::vec::Vec::new());
+
+fn record_event(function: u32, payload: &[u8]) {
+    let mut g = EVENT_TRACE.lock();
+    if g.len() < 24 {
+        g.push((function, payload[..payload.len().min(448)].to_vec()));
+    }
+}
+
+/// The events kept since the last call, oldest first.
+pub(super) fn take_events() -> alloc::vec::Vec<(u32, alloc::vec::Vec<u8>)> {
+    core::mem::take(&mut *EVENT_TRACE.lock())
+}
+
 fn wait_for(regs: &Bar0, shm: &ShmBuf, q: &Queues, env: &rpc::SeqEnv, want: u32, budget_ms: u64, seen: &mut alloc::vec::Vec<u32>) -> Result<rpc::Message, String> {
     let t0 = crate::cpu::tsc::read();
     loop {
@@ -850,6 +866,7 @@ fn wait_for(regs: &Bar0, shm: &ShmBuf, q: &Queues, env: &rpc::SeqEnv, want: u32,
                     }
                 } else {
                     seen.push(m.function);
+                    record_event(m.function, &m.payload);
                 }
             }
             Ok(None) => {
@@ -874,7 +891,7 @@ fn seq_env(regs: &Bar0, mem: &Memory) -> rpc::SeqEnv {
 }
 
 /// Phase 4f: wait for INIT_DONE, then GET_GSP_STATIC_INFO for the GPU's name.
-fn rpc_phase(r: &mut String, regs: &Bar0, mem: &mut Memory, vaspace: bool, copy: bool) {
+fn rpc_phase(r: &mut String, regs: &Bar0, mem: &mut Memory, vaspace: bool, copy: bool, compute: bool) {
     let shm = ShmBuf(&mem.shm);
     let env = seq_env(regs, mem);
     let mut seen = alloc::vec::Vec::new();
@@ -938,7 +955,7 @@ fn rpc_phase(r: &mut String, regs: &Bar0, mem: &mut Memory, vaspace: bool, copy:
 
     // Phase 6b: a GPU virtual address space for that client.
     if vaspace {
-        super::vaspace::setup(r, regs, &mut rm, copy);
+        super::vaspace::setup(r, regs, &mut rm, copy, compute);
     }
 }
 
@@ -976,6 +993,20 @@ impl Rm<'_> {
         Ok(reply.payload)
     }
 
+    /// `FREE` of one of our objects (`r535_gsp_rpc_rm_free`): the reply is `rpc_free_v03_00` with
+    /// the status at offset 12.
+    pub(super) fn free(&mut self, object: u32) -> Result<(), String> {
+        let reply = self.call(rm::FN_FREE, &rm::free_request(rm::H_CLIENT, object))?;
+        if reply.result != 0 {
+            return Err(alloc::format!("free {:#x}: RPC result {:#x}", object, reply.result));
+        }
+        let status = reply.payload.get(12..16).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+        match rm::status_error(status) {
+            Some(e) => Err(alloc::format!("free {:#x}: {:?}", object, e)),
+            None => Ok(()),
+        }
+    }
+
     pub(super) fn control(&mut self, object: u32, cmd: u32, params: &[u8]) -> Result<alloc::vec::Vec<u8>, String> {
         let reply = self.call(rm::FN_GSP_RM_CONTROL, &rm::control_request(rm::H_CLIENT, object, cmd, params))?;
         rm::check_control_reply(&reply.payload, rm::H_CLIENT, object, cmd).map(|p| p.to_vec()).map_err(|e| alloc::format!("control {:#x}: {:?}", cmd, e))
@@ -995,7 +1026,7 @@ impl Rm<'_> {
 pub fn render_kdebug() -> String {
     let base = render_gsp_kdebug();
     let mut out = base;
-    for v in [super::vaspace::render_kdebug(), super::copy::render_kdebug(), super::bench::render_kdebug(), super::intr::render_kdebug(), super::copy::render_irq_kdebug(), super::copy::render_fault_kdebug(), render_runtime_kdebug()] {
+    for v in [super::vaspace::render_kdebug(), super::copy::render_kdebug(), super::compute::render_kdebug(), super::bench::render_kdebug(), super::intr::render_kdebug(), super::copy::render_irq_kdebug(), super::copy::render_fault_kdebug(), render_runtime_kdebug()] {
         if !v.is_empty() {
             out += "\n";
             out += &v;
