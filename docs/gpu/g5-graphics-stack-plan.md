@@ -28,17 +28,17 @@ Decisión (2026-09-30, usuario + análisis): **WSI estándar de Vulkan como cimi
 - Arreglos de paso: `wait4` espera a `dead_files::settle()` también al *devolver* un zombi (Linux cierra los ficheros en `do_exit`; había una ventana en que un padre veía libre un recurso aún en uso, hecha visible por 12 sesiones); `disk.img` ahora 288 MiB (los cuatro binarios Vulkan de 15 MB llenaban los 160).
 - Tirón del dueño del display al arrancar otros clientes: causa = crear (y destruir) un canal GR con el cerrojo global `HW` tomado (cortes de 178/94/83 ms); arreglado sacando de ese cerrojo la parte lenta de ambos. Medido #166: 0 intervalos >25 ms (máximo 20,1 ms), 60,1 fps, espera máxima por el cerrojo 2,8 ms (144 ms antes). Quedan retenciones de 3-8 ms (`unbind`, `prepare_rt`), registradas en `gpu_uapi_slow:`.
 
-## Capa 3 (WSI): camino directo HECHO, pendiente de medir en la Ryzen (2026-09-30)
+## Capa 3 (WSI): camino directo HECHO y medido en la Ryzen #168 (2026-09-30)
 
 - **Decisión de diseño**: no hay plataforma nueva; la superficie `VK_EXT_headless_surface` de Mesa *es la pantalla* cuando NVK tiene display (así no hace falta una extensión de instancia nueva ni generar entrypoints). Sin display (QEMU) sigue siendo headless de verdad. Cuando haya compositor (capa 4) la elección pasará a depender de quién sea el dueño.
 - **Cómo**: `wsi_common_headless.c` (parche) usa los swapchains de copia a buffer de `wsi_common` (parámetros `WSI_IMAGE_TYPE_CPU`, sin DRM) con el buffer de destino en VRAM y el pitch del scanout (`image_info.linear_stride/size`, tipo de memoria y `create_mem` propios); `queue_present` espera el fence de la copia, el flip anterior (`poll(/dev/vblank)`) y hace `PRESENT`; `acquire` no da la imagen en pantalla. Ganchos: `wsi_device.scanout` (`nvk_wsi.c`), implementados en `nvkmd_constanos.c` (`nvk_constanos_wait_flip`, `nvkmd_constanos_pdev_scanout`; el layout se lee al describir el pdev).
-- **snake3d portado** (`vk_snake.c`): `VK_KHR_swapchain`, ya no conoce `nvk_constanos_*`; la ruta `-DSNAKE_HOST` (imágenes PPM) intacta. Probado: host (imágenes), QEMU headless (4 imágenes, sin pantalla). **Falta la Ryzen**: `scripts/metal-run.sh --kconf 'gpu=uapi' scripts/metal-jobs/gpu-snake.sh` (el job ya exige pantalla detrás de la superficie, 50-61 fps, autopilot puntuó, 0 flips rechazados) y comprobar a ojo que no hay desgarros ni saltos.
+- **snake3d portado** (`vk_snake.c`): `VK_KHR_swapchain`, ya no conoce `nvk_constanos_*`; la ruta `-DSNAKE_HOST` (imágenes PPM) intacta. Probado: host (imágenes), QEMU headless (4 imágenes, sin pantalla). **Ryzen #168 (`gpu-snake.sh`, OK)**: superficie 1920x1080 con display, swapchain de 3 imágenes, 1202 frames en 20,0 s (60,1 fps), 1202 flips externos de 1206 enviados y 1205 latched, 0 rechazados, `gpu_uapi` state=ok dead=0. **Falta** que el usuario lo mire a ojo (desgarros, saltos): el job mide medias, no intervalos por frame.
 - **Deuda conocida**: destruir un swapchain deja el buffer en pantalla sin liberar hasta cerrar el dispositivo (el kernel no puede quitar un BO del display: la solución es que `PRESENT` tome un holder del almacenamiento); un segundo cliente no ve sus frames (`EBUSY`); solo FIFO.
-- **Siguiente**: medir en la Ryzen; luego `vk_draw` al WSI y el camino ventanado (imágenes exportadas con `BO_EXPORT`, timelines con `SYNC_EXPORT`) para la capa 4.
+- **Siguiente**: luego `vk_draw` al WSI y el camino ventanado (imágenes exportadas con `BO_EXPORT`, timelines con `SYNC_EXPORT`) para la capa 4.
 
 ## Siguiente paso
 
-Capa 3: medir el camino directo en la Ryzen y cerrarla; después el camino ventanado (las imágenes se comparten con el compositor de la capa 4, que ya tiene BOs y timelines compartibles).
+Capa 3: el camino directo está cerrado (a falta de la mirada del usuario); ahora el camino ventanado (las imágenes se comparten con el compositor de la capa 4, que ya tiene BOs y timelines compartibles).
 
 ## Notas para la capa 3 (WSI), para quien retome
 
