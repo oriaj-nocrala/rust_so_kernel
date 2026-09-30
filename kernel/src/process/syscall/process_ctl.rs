@@ -4,6 +4,7 @@
 // getpid/setpgid/getpgid/setsid/yield/nanosleep/arch_prctl/set_tid_address.
 
 use crate::process::signal::SigOrigin;
+use super::with_current_process;
 use crate::sync::Mutex;
 use crate::serial_println;
 use crate::process::TrapFrame;
@@ -223,6 +224,62 @@ fn sleep_until(expiry: u64, syscall_nr: u64, rem: u64, relative: bool) -> Syscal
     };
 
     unsafe { crate::process::trapframe::jump_to_user(next_tf) }
+}
+
+/// pidfd_open(434): a descriptor for process `pid` (a thread-group leader; `EINVAL` for a thread's tid, `ESRCH` if there is no such
+/// process), readable once it has exited. `PIDFD_NONBLOCK` (= `O_NONBLOCK`) is the only flag; the fd is always close-on-exec.
+pub(super) fn sys_pidfd_open(pid: i64, flags: u32) -> SyscallResult {
+    const PIDFD_NONBLOCK: u32 = 0x800;
+    if pid <= 0 || flags & !PIDFD_NONBLOCK != 0 {
+        return errno::EINVAL;
+    }
+    let pid = pid as usize;
+    // (leader, zombie) of the process, from the scheduler; syscalls start with IF=0.
+    let found = {
+        let sched = crate::process::scheduler::local_scheduler();
+        let r = sched.iter_all().find(|p| p.pid.0 == pid && pid != 0).map(|p| (!p.is_thread, matches!(p.state, crate::process::ProcessState::Zombie)));
+        r
+    };
+    let Some((leader, zombie)) = found else { return errno::ESRCH };
+    if !leader {
+        return errno::EINVAL;
+    }
+    let handle = crate::process::pidfd::create(pid, zombie, flags & PIDFD_NONBLOCK != 0);
+    super::with_files(|files| {
+        match files.allocate(alloc::boxed::Box::new(handle)) {
+            Ok(fd) => {
+                let _ = files.set_cloexec(fd, true);
+                fd as SyscallResult
+            }
+            Err(_) => errno::EMFILE,
+        }
+    })
+}
+
+/// pidfd_send_signal(424): `kill` through a pidfd (`info` must be NULL, `flags` 0). `ESRCH` once the process has been reaped.
+pub(super) fn sys_pidfd_send_signal(pidfd: i32, sig: u32, info: u64, flags: u32) -> SyscallResult {
+    if info != 0 || flags != 0 {
+        return errno::EINVAL;
+    }
+    let files = match crate::process::scheduler::local_scheduler().running_ref() {
+        Some(p) => p.files.clone(),
+        None => return errno::ESRCH,
+    };
+    let pid = {
+        let guard = files.lock();
+        if pidfd < 0 {
+            return errno::EBADF;
+        }
+        match guard.get(pidfd as usize) {
+            Ok(h) => match h.pidfd_pid() {
+                Some(pid) => pid,
+                None => return errno::EBADF,
+            },
+            Err(_) => return errno::EBADF,
+        }
+    };
+    // As `kill`: a zombie still takes (and ignores) the signal, a reaped process is `ESRCH`.
+    sys_kill(pid as i64, sig)
 }
 
 /// prctl(157): only `PR_SET_NAME` (15) and `PR_GET_NAME` (16), the thread's `comm` (Rust's `thread::Builder::name`, tokio's worker
@@ -462,7 +519,7 @@ fn fork_impl(child_stack: u64, tls: Option<u64>, vfork: bool) -> SyscallResult {
     unsafe { crate::process::fpu::save(&mut parent_fpu_state); }
 
     // Collect what we need from the running process
-    let (child_as, parent_pid, parent_fs_base, files, child_tf, parent_cwd, (parent_pgid, parent_sid, parent_ctty), parent_exe_name, parent_signals, (parent_comm, parent_cmdline)) = {
+    let (child_as, parent_pid, parent_fs_base, files_arc, child_tf, parent_cwd, (parent_pgid, parent_sid, parent_ctty), parent_exe_name, parent_signals, (parent_comm, parent_cmdline)) = {
         let scheduler = crate::process::scheduler::local_scheduler();
         match scheduler.running_ref() {
             Some(proc) => {
@@ -478,7 +535,7 @@ fn fork_impl(child_stack: u64, tls: Option<u64>, vfork: bool) -> SyscallResult {
                     // only refreshed when the parent is switched out, so it is
                     // stale if `arch_prctl` ran since — same reasoning as the
                     // live `fpu::save` above.
-                    Ok(child_as) => (child_as, crate::process::Pid(proc.tgid), crate::process::scheduler::read_fs_base(), proc.files.lock().clone(), tf_copy, proc.cwd.clone(), (proc.pgid, proc.sid, proc.ctty), proc.exe_name.clone(),
+                    Ok(child_as) => (child_as, crate::process::Pid(proc.tgid), crate::process::scheduler::read_fs_base(), proc.files.clone(), tf_copy, proc.cwd.clone(), (proc.pgid, proc.sid, proc.ctty), proc.exe_name.clone(),
                         (proc.signal_handlers, proc.sig_restart, proc.blocked_signals, proc.sig_extra, proc.altstack), (proc.name, proc.cmdline.clone())),
                     Err(e) => {
                         serial_println!("fork: address_space.fork() failed: {}", e);
@@ -489,6 +546,10 @@ fn fork_impl(child_stack: u64, tls: Option<u64>, vfork: bool) -> SyscallResult {
             None => return errno::ESRCH,
         }
     };
+
+    // The fd table is copied (each handle `dup`ed) with `SCHEDULER` released: see `with_fd_table` for the lock order.
+    let files = files_arc.lock().clone();
+    drop(files_arc);
 
     let kernel_stack = crate::init::processes::allocate_kernel_stack();
 

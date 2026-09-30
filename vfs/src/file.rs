@@ -203,6 +203,11 @@ pub trait FileHandle: Send {
         None
     }
 
+    /// The process a pidfd refers to (`process::pidfd`); its readiness is registry-based, like a pipe's, for the same reason.
+    fn pidfd_pid(&self) -> Option<usize> {
+        None
+    }
+
     /// A request `ioctl(2)` addressed to this device. `Some(result)` (a
     /// return value or a negative errno) if the handle implements
     /// `request`; `None` falls through to the generic ioctls (termios,

@@ -17,6 +17,7 @@ pub mod file;
 pub mod dead_files;
 pub mod fpu;
 pub mod eventfd;
+pub mod pidfd;
 pub mod pipe;
 pub mod signal;
 pub mod wait;

@@ -16,7 +16,7 @@ Code: `kernel/src/memory/`, `kernel/src/allocator/`, crate `mm/` (host tests: `c
 
 - `OwnedPageTable` (`page_table_manager.rs`) wraps `OffsetPageTable`. `new_user()` copies the kernel's (non-user) PML4 entries into a fresh PML4.
 - `AddressSpace` (`address_space.rs`) = page table + `VmaList`. Each process holds one through an `Arc` (threads share it).
-- **VMAs** (`vma.rs`): at most 256 per process, in a `Vec`. Kinds:
+- **VMAs** (`vma.rs`): at most 65530 per process (Linux's `vm.max_map_count`), in an unsorted `Vec` (lookups are linear: keep it small). `mmap` places anonymous mappings contiguously and `VmaList::add_merged` folds a new `Anonymous` VMA into an adjacent one with equal flags (there was a guard page between allocations and a cap of 256, which a tokio run with 4000 tasks hit through musl's allocator). `/proc/<pid>/maps` lists them. Kinds:
   - `Code`: loaded up front, not demand-paged.
   - `Anonymous`: zero-filled on demand.
   - `GrowableStack`: starts at 64 KiB and grows down on a fault in the guard gap, up to 8 MiB (`VmaList::grow_stack`, called from the fault path).

@@ -33,6 +33,8 @@ use crate::sync::Mutex;
 type Table = Arc<Mutex<FileDescriptorTable>>;
 
 static DEAD: IrqMutex<Vec<Table>, KernelIrq> = IrqMutex::new(Vec::new());
+/// Thread-group leaders that died, for `pidfd` readiness (`process::pidfd`); drained with the tables.
+static DEAD_PIDS: IrqMutex<Vec<usize>, KernelIrq> = IrqMutex::new(Vec::new());
 /// Something is queued: lets [`drain`] skip the lock on every syscall.
 static PENDING: AtomicBool = AtomicBool::new(false);
 
@@ -41,6 +43,12 @@ static PENDING: AtomicBool = AtomicBool::new(false);
 /// the lock order) and may allocate, as the scheduler already does there.
 pub fn defer(table: Table) {
     DEAD.with(|d| d.push(table));
+    PENDING.store(true, Ordering::Release);
+}
+
+/// Queues the death of thread-group leader `pid`: `drain` marks its pidfds ready and wakes whoever polls them.
+pub fn defer_exit(pid: usize) {
+    DEAD_PIDS.with(|d| d.push(pid));
     PENDING.store(true, Ordering::Release);
 }
 
@@ -56,5 +64,9 @@ pub fn drain() {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let tables = DEAD.with(core::mem::take);
         drop(tables);
+        for pid in DEAD_PIDS.with(core::mem::take) {
+            crate::process::pidfd::mark_exited(pid);
+            crate::process::syscall::poll_wakeup_for_pidfd(pid);
+        }
     });
 }

@@ -8,7 +8,7 @@
 use crate::sync::Mutex;
 use crate::process::TrapFrame;
 use super::{
-    errno, SyscallResult, with_current_process, validate_user_buffer,
+    errno, SyscallResult, with_current_process, with_files, with_fd_table, validate_user_buffer,
     resolve_path, current_cwd, read_user_str, current_tf_ptr,
 };
 
@@ -55,13 +55,7 @@ static STDIN_WAITER: crate::sync::IrqLock<Option<StdinWaiter>> = crate::sync::Ir
 /// anything else (a redirected file, a pipe) falls through to the generic
 /// file-table path below, same as any other fd.
 fn stdin_is_console() -> bool {
-    let guard = crate::process::irq_guard::SchedGuard::lock();
-    match guard.running_ref() {
-        Some(proc) => proc.files.lock().get(0)
-            .map(|h| h.name() == "serial")
-            .unwrap_or(false),
-        None => false,
-    }
+    with_fd_table(|t| t.get(0).map(|h| h.name() == "serial").unwrap_or(false)).unwrap_or(false)
 }
 
 pub(super) fn sys_read(fd: i32, buf: usize, count: usize) -> SyscallResult {
@@ -316,14 +310,17 @@ pub(super) fn sys_write(fd: i32, buf: usize, count: usize) -> SyscallResult {
 }
 
 pub(super) fn sys_open(path_ptr: usize, flags: i32) -> SyscallResult {
-    // Validation BEFORE cli — no lock needed
-    if let Err(e) = validate_user_buffer(path_ptr as u64, 256) {
-        return e;
-    }
+    open_at(AT_FDCWD, path_ptr, flags)
+}
 
-    let path = read_user_str(path_ptr);
-    if path.is_empty() { return errno::EINVAL; }
-    let path = resolve_path(path);
+/// openat(257): `(dirfd, path, flags, mode)`; `mode` is not kept (no permission model), as for `open`.
+pub(super) fn sys_openat(dirfd: i64, path_ptr: usize, flags: i32, _mode: u32) -> SyscallResult {
+    open_at(dirfd, path_ptr, flags)
+}
+
+fn open_at(dirfd: i64, path_ptr: usize, flags: i32) -> SyscallResult {
+    // Validation BEFORE cli — no lock needed
+    let path = match user_path_at(dirfd, path_ptr, errno::EINVAL) { Ok(p) => p, Err(e) => return e };
     crate::ktrace!(crate::debug::FS, "sys_open: path={} flags={:#x}", path, flags);
 
     // Resolve through VFS: /dev/* → drivers, /bin/* → initramfs, …
@@ -339,13 +336,14 @@ pub(super) fn sys_open(path_ptr: usize, flags: i32) -> SyscallResult {
     }
 
     // Only take scheduler lock for the FD table insertion
-    with_current_process(|proc| {
-        let mut files = proc.files.lock();
+    with_files(|files| {
         match files.allocate(handle) {
             Ok(fd) => {
                 if flags & O_CLOEXEC != 0 {
                     let _ = files.set_cloexec(fd, true);
                 }
+                // Kept so a later `openat(fd, "rel")` (this fd as a `dirfd`) can resolve.
+                files.set_path(fd, path.clone());
                 fd as i64
             }
             Err(_) => errno::EMFILE, // the table is full
@@ -355,14 +353,28 @@ pub(super) fn sys_open(path_ptr: usize, flags: i32) -> SyscallResult {
 
 /// Mark an fd of the calling process close-on-exec (`SOCK_CLOEXEC`, `MFD_CLOEXEC`, …).
 pub(super) fn set_cloexec_current(fd: usize) {
-    with_current_process(|proc| {
-        let _ = proc.files.lock().set_cloexec(fd, true);
+    with_files(|files| {
+        let _ = files.set_cloexec(fd, true);
         0
     });
 }
 
 pub(super) fn sys_stat(path_ptr: usize, stat_ptr: usize) -> SyscallResult {
-    stat_impl(path_ptr, stat_ptr, true)
+    stat_impl(AT_FDCWD, path_ptr, stat_ptr, true)
+}
+
+/// newfstatat(262): `(dirfd, path, statbuf, flags)`. `AT_SYMLINK_NOFOLLOW` is `lstat`; `AT_EMPTY_PATH` with an empty path is
+/// `fstat(dirfd)`.
+pub(super) fn sys_newfstatat(dirfd: i64, path_ptr: usize, stat_ptr: usize, flags: u64) -> SyscallResult {
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const AT_NO_AUTOMOUNT: u64 = 0x800;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT) != 0 {
+        return errno::EINVAL;
+    }
+    if flags & AT_EMPTY_PATH != 0 && validate_user_buffer(path_ptr as u64, 1).is_ok() && read_user_str(path_ptr).is_empty() {
+        return sys_fstat(dirfd as i32, stat_ptr);
+    }
+    stat_impl(dirfd, path_ptr, stat_ptr, flags & AT_SYMLINK_NOFOLLOW == 0)
 }
 
 /// lstat(6): like `stat`, but doesn't follow a symlink at the final path
@@ -371,7 +383,7 @@ pub(super) fn sys_stat(path_ptr: usize, stat_ptr: usize) -> SyscallResult {
 /// yet"); now that `fs::vfs` has real symlink support (see `fs::procfs`),
 /// this is the genuine no-follow lookup.
 pub(super) fn sys_lstat(path_ptr: usize, stat_ptr: usize) -> SyscallResult {
-    stat_impl(path_ptr, stat_ptr, false)
+    stat_impl(AT_FDCWD, path_ptr, stat_ptr, false)
 }
 
 /// A filesystem that keeps no times (initramfs, devfs, procfs) reports 0
@@ -387,13 +399,11 @@ fn fill_missing_times(stat: &mut crate::fs::types::Stat) {
     }
 }
 
-fn stat_impl(path_ptr: usize, stat_ptr: usize, follow: bool) -> SyscallResult {
+fn stat_impl(dirfd: i64, path_ptr: usize, stat_ptr: usize, follow: bool) -> SyscallResult {
     use crate::fs::types::Stat;
-    if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
     if let Err(e) = validate_user_buffer(stat_ptr as u64, core::mem::size_of::<Stat>()) { return e; }
 
-    let path = read_user_str(path_ptr);
-    let path = resolve_path(path);
+    let path = match user_path_at(dirfd, path_ptr, errno::ENOENT) { Ok(p) => p, Err(e) => return e };
     let result = if follow { crate::fs::stat(&path) } else { crate::fs::lstat(&path) };
     match result {
         Err(e)   => e.as_i64(),
@@ -411,12 +421,7 @@ pub(super) fn sys_fstat(fd: i32, stat_ptr: usize) -> SyscallResult {
 
     // Retrieve stat outside with_current_process to avoid holding the scheduler lock
     // while doing a potentially expensive write.
-    let stat_result: Option<Stat> = {
-        let mut sched = crate::process::scheduler::local_scheduler();
-        sched.running_mut().and_then(|proc| {
-            proc.files.lock().get(fd as usize).ok().and_then(|f| f.stat())
-        })
-    };
+    let stat_result: Option<Stat> = with_fd_table(|t| t.get(fd as usize).ok().and_then(|f| f.stat())).flatten();
 
     match stat_result {
         None       => errno::EBADF,
@@ -433,10 +438,16 @@ pub(super) fn sys_fstat(fd: i32, stat_ptr: usize) -> SyscallResult {
 /// nothing here enforces permission bits, so there's nothing to store it
 /// in.
 pub(super) fn sys_mkdir(path_ptr: usize) -> SyscallResult {
-    if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
-    let path = read_user_str(path_ptr);
-    if path.is_empty() { return errno::EINVAL; }
-    let path = resolve_path(path);
+    mkdir_at(AT_FDCWD, path_ptr)
+}
+
+/// mkdirat(258): `(dirfd, path, mode)`.
+pub(super) fn sys_mkdirat(dirfd: i64, path_ptr: usize, _mode: u32) -> SyscallResult {
+    mkdir_at(dirfd, path_ptr)
+}
+
+fn mkdir_at(dirfd: i64, path_ptr: usize) -> SyscallResult {
+    let path = match user_path_at(dirfd, path_ptr, errno::EINVAL) { Ok(p) => p, Err(e) => return e };
     match crate::fs::vfs::mkdir(&path) {
         Ok(())  => 0,
         Err(e)  => e.as_i64(),
@@ -445,10 +456,11 @@ pub(super) fn sys_mkdir(path_ptr: usize) -> SyscallResult {
 
 /// rmdir(84): long rmdir(const char *path)
 pub(super) fn sys_rmdir(path_ptr: usize) -> SyscallResult {
-    if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
-    let path = read_user_str(path_ptr);
-    if path.is_empty() { return errno::EINVAL; }
-    let path = resolve_path(path);
+    rmdir_at(AT_FDCWD, path_ptr)
+}
+
+fn rmdir_at(dirfd: i64, path_ptr: usize) -> SyscallResult {
+    let path = match user_path_at(dirfd, path_ptr, errno::EINVAL) { Ok(p) => p, Err(e) => return e };
     match crate::fs::vfs::rmdir(&path) {
         Ok(())  => 0,
         Err(e)  => e.as_i64(),
@@ -457,10 +469,20 @@ pub(super) fn sys_rmdir(path_ptr: usize) -> SyscallResult {
 
 /// unlink(87): long unlink(const char *path)
 pub(super) fn sys_unlink(path_ptr: usize) -> SyscallResult {
-    if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
-    let path = read_user_str(path_ptr);
-    if path.is_empty() { return errno::EINVAL; }
-    let path = resolve_path(path);
+    unlink_at(AT_FDCWD, path_ptr)
+}
+
+/// unlinkat(263): `(dirfd, path, flags)`; `AT_REMOVEDIR` makes it `rmdir`.
+pub(super) fn sys_unlinkat(dirfd: i64, path_ptr: usize, flags: u64) -> SyscallResult {
+    const AT_REMOVEDIR: u64 = 0x200;
+    if flags & !AT_REMOVEDIR != 0 {
+        return errno::EINVAL;
+    }
+    if flags & AT_REMOVEDIR != 0 { rmdir_at(dirfd, path_ptr) } else { unlink_at(dirfd, path_ptr) }
+}
+
+fn unlink_at(dirfd: i64, path_ptr: usize) -> SyscallResult {
+    let path = match user_path_at(dirfd, path_ptr, errno::EINVAL) { Ok(p) => p, Err(e) => return e };
     match crate::fs::vfs::unlink(&path) {
         Ok(())  => 0,
         Err(e)  => e.as_i64(),
@@ -473,11 +495,17 @@ pub(super) fn sys_unlink(path_ptr: usize) -> SyscallResult {
 /// matching real `readlink(2)`) — truncated silently to `bufsiz` if the
 /// target is longer, same as real POSIX.
 pub(super) fn sys_readlink(path_ptr: usize, buf_ptr: usize, bufsiz: usize) -> SyscallResult {
-    if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
+    readlink_at(AT_FDCWD, path_ptr, buf_ptr, bufsiz)
+}
+
+/// readlinkat(267): `(dirfd, path, buf, bufsiz)`.
+pub(super) fn sys_readlinkat(dirfd: i64, path_ptr: usize, buf_ptr: usize, bufsiz: usize) -> SyscallResult {
+    readlink_at(dirfd, path_ptr, buf_ptr, bufsiz)
+}
+
+fn readlink_at(dirfd: i64, path_ptr: usize, buf_ptr: usize, bufsiz: usize) -> SyscallResult {
     if let Err(e) = validate_user_buffer(buf_ptr as u64, bufsiz) { return e; }
-    let path = read_user_str(path_ptr);
-    if path.is_empty() { return errno::EINVAL; }
-    let path = resolve_path(path);
+    let path = match user_path_at(dirfd, path_ptr, errno::EINVAL) { Ok(p) => p, Err(e) => return e };
     match crate::fs::readlink(&path) {
         Ok(target) => {
             let bytes = target.as_bytes();
@@ -499,12 +527,19 @@ pub(super) fn sys_readlink(path_ptr: usize, buf_ptr: usize, bufsiz: usize) -> Sy
 /// goes) gets cwd-normalized; `target` is exactly what the caller passed,
 /// same as real symlinks store whatever string they were given.
 pub(super) fn sys_symlink(target_ptr: usize, linkpath_ptr: usize) -> SyscallResult {
+    symlink_at(target_ptr, AT_FDCWD, linkpath_ptr)
+}
+
+/// symlinkat(266): `(target, newdirfd, linkpath)`.
+pub(super) fn sys_symlinkat(target_ptr: usize, dirfd: i64, linkpath_ptr: usize) -> SyscallResult {
+    symlink_at(target_ptr, dirfd, linkpath_ptr)
+}
+
+fn symlink_at(target_ptr: usize, dirfd: i64, linkpath_ptr: usize) -> SyscallResult {
     if let Err(e) = validate_user_buffer(target_ptr as u64, 1) { return e; }
-    if let Err(e) = validate_user_buffer(linkpath_ptr as u64, 1) { return e; }
     let target = read_user_str(target_ptr);
-    let linkpath = read_user_str(linkpath_ptr);
-    if target.is_empty() || linkpath.is_empty() { return errno::EINVAL; }
-    let linkpath = resolve_path(linkpath);
+    if target.is_empty() { return errno::EINVAL; }
+    let linkpath = match user_path_at(dirfd, linkpath_ptr, errno::EINVAL) { Ok(p) => p, Err(e) => return e };
     match crate::fs::vfs::symlink(&target, &linkpath) {
         Ok(()) => 0,
         Err(e) => e.as_i64(),
@@ -531,10 +566,17 @@ pub(super) fn sys_symlink(target_ptr: usize, linkpath_ptr: usize) -> SyscallResu
 /// `RamFileHandle`'s and `Ext2FileHandle`'s `write()` with an empty
 /// buffer are true no-ops — real answer, no side effect either way.
 pub(super) fn sys_access(path_ptr: usize, mode: i32) -> SyscallResult {
-    if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
-    let path = read_user_str(path_ptr);
-    if path.is_empty() { return errno::EINVAL; }
-    let path = resolve_path(path);
+    access_at(AT_FDCWD, path_ptr, mode)
+}
+
+/// faccessat(269) / faccessat2(439): `(dirfd, path, mode[, flags])`; the flags (`AT_EACCESS`, `AT_SYMLINK_NOFOLLOW`) change nothing
+/// here, where there are no uids.
+pub(super) fn sys_faccessat(dirfd: i64, path_ptr: usize, mode: i32) -> SyscallResult {
+    access_at(dirfd, path_ptr, mode)
+}
+
+fn access_at(dirfd: i64, path_ptr: usize, mode: i32) -> SyscallResult {
+    let path = match user_path_at(dirfd, path_ptr, errno::EINVAL) { Ok(p) => p, Err(e) => return e };
 
     const W_OK: i32 = 2;
 
@@ -556,13 +598,20 @@ pub(super) fn sys_access(path_ptr: usize, mode: i32) -> SyscallResult {
 
 /// rename(82): long rename(const char *old_path, const char *new_path)
 pub(super) fn sys_rename(old_path_ptr: usize, new_path_ptr: usize) -> SyscallResult {
-    if let Err(e) = validate_user_buffer(old_path_ptr as u64, 1) { return e; }
-    if let Err(e) = validate_user_buffer(new_path_ptr as u64, 1) { return e; }
-    let old_path = read_user_str(old_path_ptr);
-    let new_path = read_user_str(new_path_ptr);
-    if old_path.is_empty() || new_path.is_empty() { return errno::EINVAL; }
-    let old_path = resolve_path(old_path);
-    let new_path = resolve_path(new_path);
+    rename_at(AT_FDCWD, old_path_ptr, AT_FDCWD, new_path_ptr)
+}
+
+/// renameat(264) / renameat2(316): `(olddirfd, old, newdirfd, new[, flags])`. Only `flags == 0` (no `RENAME_NOREPLACE` and friends).
+pub(super) fn sys_renameat(olddirfd: i64, old_ptr: usize, newdirfd: i64, new_ptr: usize, flags: u64) -> SyscallResult {
+    if flags != 0 {
+        return errno::EINVAL;
+    }
+    rename_at(olddirfd, old_ptr, newdirfd, new_ptr)
+}
+
+fn rename_at(olddirfd: i64, old_path_ptr: usize, newdirfd: i64, new_path_ptr: usize) -> SyscallResult {
+    let old_path = match user_path_at(olddirfd, old_path_ptr, errno::EINVAL) { Ok(p) => p, Err(e) => return e };
+    let new_path = match user_path_at(newdirfd, new_path_ptr, errno::EINVAL) { Ok(p) => p, Err(e) => return e };
     match crate::fs::vfs::rename(&old_path, &new_path) {
         Ok(())  => 0,
         Err(e)  => e.as_i64(),
@@ -619,6 +668,54 @@ pub(super) fn sys_chdir(path_ptr: usize) -> SyscallResult {
     })
 }
 
+/// fchdir(81): `chdir` to the directory an open fd names.
+pub(super) fn sys_fchdir(fd: i32) -> SyscallResult {
+    match dir_path_of(fd as i64) {
+        Ok(path) => with_current_process(|proc| {
+            proc.cwd = path;
+            0
+        }),
+        Err(e) => e,
+    }
+}
+
+/// The absolute path a `*at` call names: `ptr` is a user string, absolute or relative to `dirfd` (an open directory's fd, or
+/// `AT_FDCWD` for the cwd). `empty_err` is the errno for an empty string. `EBADF` for a `dirfd` that is not open, `ENOTDIR` if it is
+/// open but not a directory (or was not opened by path: pipes, sockets).
+fn user_path_at(dirfd: i64, ptr: usize, empty_err: i64) -> Result<alloc::string::String, i64> {
+    validate_user_buffer(ptr as u64, 1)?;
+    let raw = read_user_str(ptr);
+    if raw.is_empty() {
+        return Err(empty_err);
+    }
+    if raw.starts_with('/') || dirfd == AT_FDCWD {
+        return Ok(resolve_path(raw));
+    }
+    let base = dir_path_of(dirfd)?;
+    Ok(crate::fs::vfs::normalize_path(&base, raw))
+}
+
+/// The path directory descriptor `fd` was opened by (`FileDescriptorTable::path`).
+fn dir_path_of(fd: i64) -> Result<alloc::string::String, i64> {
+    if fd < 0 {
+        return Err(errno::EBADF);
+    }
+    let files = crate::process::irq_guard::SchedGuard::lock().running_ref().map(|p| p.files.clone()).ok_or(errno::ESRCH)?;
+    let (open, path) = {
+        let table = files.lock();
+        (table.get(fd as usize).is_ok(), table.path(fd as usize).map(alloc::string::String::from))
+    };
+    if !open {
+        return Err(errno::EBADF);
+    }
+    let path = path.ok_or(errno::ENOTDIR)?;
+    match crate::fs::vfs::resolve(&path) {
+        Ok(inode) if inode.file_type() == crate::fs::types::FileType::Directory => Ok(path),
+        Ok(_) => Err(errno::ENOTDIR),
+        Err(e) => Err(e.as_i64()),
+    }
+}
+
 /// getdents64(217): long getdents64(int fd, void *buf, size_t count)
 ///
 /// Deliberately does NOT use `with_current_process`: that helper holds the
@@ -644,8 +741,7 @@ const UTIME_OMIT: i64 = (1 << 30) - 2;
 /// `path` makes `dirfd` the file itself — that is how libc implements
 /// `futimens(fd)`. `AT_SYMLINK_NOFOLLOW` sets a symlink's own times
 /// (`lutimes`). Seconds only: no filesystem here keeps nanoseconds. A
-/// relative path against a real `dirfd` is `ENOSYS` — an fd does not know
-/// its path here, and nothing this system runs asks for it.
+/// relative path is resolved against `dirfd`'s recorded path (`user_path_at`).
 pub(super) fn sys_utimensat(dirfd: i64, path_ptr: u64, times_ptr: u64, flags: u64) -> SyscallResult {
     if flags & !AT_SYMLINK_NOFOLLOW != 0 {
         return errno::EINVAL;
@@ -696,13 +792,7 @@ pub(super) fn sys_utimensat(dirfd: i64, path_ptr: u64, times_ptr: u64, flags: u6
         };
     }
 
-    if let Err(e) = validate_user_buffer(path_ptr, 1) { return e; }
-    let path = read_user_str(path_ptr as usize);
-    if path.is_empty() { return errno::ENOENT; }
-    if !path.starts_with('/') && dirfd != AT_FDCWD {
-        return errno::ENOSYS;
-    }
-    let path = resolve_path(path);
+    let path = match user_path_at(dirfd, path_ptr as usize, errno::ENOENT) { Ok(p) => p, Err(e) => return e };
     let inode = if flags & AT_SYMLINK_NOFOLLOW != 0 {
         crate::fs::vfs::resolve_no_follow(&path)
     } else {
@@ -796,8 +886,8 @@ pub(super) fn sys_close(fd: i32) -> SyscallResult {
 /// `with_current_process` is fine.
 pub(super) fn sys_dup(fd: i32) -> SyscallResult {
     if fd < 0 { return errno::EBADF; }
-    with_current_process(|proc| {
-        match proc.files.lock().dup(fd as usize, 0) {
+    with_files(|files| {
+        match files.dup(fd as usize, 0) {
             Ok(newfd) => newfd as SyscallResult,
             Err(_) => errno::EBADF,
         }
@@ -877,8 +967,8 @@ pub(super) fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
     if fd < 0 { return errno::EBADF; }
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
-            with_current_process(|proc| {
-                match proc.files.lock().dup_with(fd as usize, arg as usize, cmd == F_DUPFD_CLOEXEC) {
+            with_files(|files| {
+                match files.dup_with(fd as usize, arg as usize, cmd == F_DUPFD_CLOEXEC) {
                     Ok(newfd) => newfd as SyscallResult,
                     Err(crate::process::file::FileError::InvalidArgument) => errno::EMFILE,
                     Err(_) => errno::EBADF,
@@ -888,16 +978,16 @@ pub(super) fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
         // O_NONBLOCK is real for handles that support it (sockets today);
         // the rest of the status flags are still validity-checked stubs.
         F_GETFL => {
-            with_current_process(|proc| {
-                match proc.files.lock().get(fd as usize) {
+            with_files(|files| {
+                match files.get(fd as usize) {
                     Ok(h) => if h.nonblocking() { O_NONBLOCK as i64 } else { 0 },
                     Err(_) => errno::EBADF,
                 }
             })
         }
         F_SETFL => {
-            with_current_process(|proc| {
-                match proc.files.lock().get(fd as usize) {
+            with_files(|files| {
+                match files.get(fd as usize) {
                     Ok(h) => {
                         let want = arg as i64 & O_NONBLOCK != 0;
                         // A handle with no notion of non-blocking silently
@@ -914,16 +1004,16 @@ pub(super) fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
         }
         // FD_CLOEXEC is the descriptor's only flag; `exec` closes the ones that have it.
         F_GETFD => {
-            with_current_process(|proc| {
-                match proc.files.lock().cloexec(fd as usize) {
+            with_files(|files| {
+                match files.cloexec(fd as usize) {
                     Ok(on) => on as SyscallResult,
                     Err(_) => errno::EBADF,
                 }
             })
         }
         F_SETFD => {
-            with_current_process(|proc| {
-                match proc.files.lock().set_cloexec(fd as usize, arg & FD_CLOEXEC != 0) {
+            with_files(|files| {
+                match files.set_cloexec(fd as usize, arg & FD_CLOEXEC != 0) {
                     Ok(()) => 0,
                     Err(_) => errno::EBADF,
                 }
@@ -951,8 +1041,7 @@ pub(super) fn sys_eventfd(initval: u32, flags: i32) -> SyscallResult {
         return errno::EINVAL;
     }
     let handle = crate::process::eventfd::create(initval, flags);
-    with_current_process(|proc| {
-        let mut files = proc.files.lock();
+    with_files(|files| {
         match files.allocate(alloc::boxed::Box::new(handle)) {
             Ok(fd) => {
                 if flags & EFD_CLOEXEC != 0 {
@@ -980,8 +1069,7 @@ pub(super) fn sys_pipe2(pipefd_ptr: u64, flags: i32) -> SyscallResult {
         write_end.set_nonblocking(true);
     }
 
-    with_current_process(|proc| {
-        let mut files = proc.files.lock();
+    with_files(|files| {
         let rfd = match files.allocate(alloc::boxed::Box::new(read_end)) {
             Ok(fd) => fd,
             Err(_) => return errno::EMFILE,
@@ -1052,21 +1140,28 @@ pub(super) fn sys_mmap(addr: u64, length: u64, prot: u32, flags: u32, fd: i32, o
     if flags & MAP_PRIVATE != 0 || offset & 0xFFF != 0 || length == 0 || addr & 0xFFF != 0 {
         return errno::EINVAL;
     }
-    with_current_process(|proc| {
-        let obj: Arc<ShmObject> = if anon {
-            let obj = Arc::new(ShmObject::new());
-            if obj.set_size(length).is_err() {
-                return errno::ENOMEM;
-            }
-            obj
-        } else {
-            let files = proc.files.lock();
-            let Ok(handle) = files.get(fd as usize) else { return errno::EBADF };
+    // The object first, from the fd table (never under `SCHEDULER`), then the mapping.
+    let obj: Arc<ShmObject> = if anon {
+        let obj = Arc::new(ShmObject::new());
+        if obj.set_size(length).is_err() {
+            return errno::ENOMEM;
+        }
+        obj
+    } else {
+        let found = with_fd_table(|files| {
+            let Ok(handle) = files.get(fd as usize) else { return Err(errno::EBADF) };
             match handle.shm_object().map(|o| o.downcast::<ShmObject>()) {
-                Some(Ok(obj)) => obj,
-                _ => return errno::ENODEV,
+                Some(Ok(obj)) => Ok(obj),
+                _ => Err(errno::ENODEV),
             }
-        };
+        });
+        match found {
+            Some(Ok(obj)) => obj,
+            Some(Err(e)) => return e,
+            None => return errno::ESRCH,
+        }
+    };
+    with_current_process(|proc| {
         let r = proc.address_space.mmap_shared(addr, length, prot, obj, (offset / 4096) as usize);
         crate::ktrace!(crate::debug::MM, "mmap shared pid={:?} addr={:#x} len={:#x} fd={} off={:#x} -> {:?}",
             proc.pid, addr, length, fd, offset, r);
@@ -1093,8 +1188,7 @@ pub(super) fn sys_memfd_create(name_ptr: u64, flags: u32) -> SyscallResult {
         return e;
     }
     let handle = alloc::boxed::Box::new(crate::ipc::memfd::MemfdHandle::new());
-    with_current_process(|proc| {
-        let mut files = proc.files.lock();
+    with_files(|files| {
         match files.allocate(handle) {
             Ok(fd) => {
                 if flags & MFD_CLOEXEC != 0 {
@@ -1120,8 +1214,7 @@ pub(super) fn sys_ftruncate(fd: i32, length: i64) -> SyscallResult {
     }
     // Under the scheduler lock, like `lseek`; the object's own lock and
     // `BUDDY` (a shrink frees frames) come after it in the lock order.
-    with_current_process(|proc| {
-        let files = proc.files.lock();
+    with_files(|files| {
         let Ok(handle) = files.get(fd as usize) else { return errno::EBADF };
         let obj = match handle.shm_object().map(|o| o.downcast::<ShmObject>()) {
             Some(Ok(obj)) => obj,
@@ -1186,8 +1279,8 @@ pub(super) fn sys_mprotect(addr: u64, length: u64, prot: u32) -> SyscallResult {
 /// around a WAD's lump directory instead of reading it start-to-end).
 pub(super) fn sys_lseek(fd: i32, offset: i64, whence: i32) -> SyscallResult {
     if fd < 0 || fd as usize >= crate::process::file::MAX_FILES { return errno::EBADF; }
-    with_current_process(|proc| {
-        match proc.files.lock().get_mut(fd as usize) {
+    with_files(|files| {
+        match files.get_mut(fd as usize) {
             Ok(file) => match file.seek(offset, whence) {
                 Ok(pos) => pos,
                 Err(crate::process::file::FileError::NotSupported) => errno::ESPIPE,
@@ -1298,16 +1391,14 @@ pub(super) fn sys_ioctl(fd: i32, request: u64, argp: u64) -> SyscallResult {
     // by fd number — see the `is_tty` doc below for why that breaks under
     // `dup`). An owned enum (not the handle's borrowed `&str` name) so the
     // result can outlive the lock guard it was computed under.
-    let fd_kind = {
-        let mut sched = crate::process::irq_guard::SchedGuard::lock();
-        sched.running_mut().and_then(|proc| {
-            proc.files.lock().get(fd as usize).ok().map(|f| match f.name() {
-                "serial" => FdKind::Serial,
-                "fb" => FdKind::Fb,
-                _ => FdKind::Other,
-            })
+    let fd_kind = with_fd_table(|t| {
+        t.get(fd as usize).ok().map(|f| match f.name() {
+            "serial" => FdKind::Serial,
+            "fb" => FdKind::Fb,
+            _ => FdKind::Other,
         })
-    };
+    })
+    .flatten();
 
     // A handle counts as a tty if it's actually backed by the console
     // driver (serial or framebuffer) — checked by the handle's identity,
@@ -1506,10 +1597,16 @@ pub(super) fn sys_statvfs(path_ptr: usize, out_ptr: usize) -> SyscallResult {
 /// on-disk `i_mode` field, and `Ext2Inode::chmod` actually persists the
 /// change there.
 pub(super) fn sys_chmod(path_ptr: usize, mode: u32) -> SyscallResult {
-    if let Err(e) = validate_user_buffer(path_ptr as u64, 1) { return e; }
-    let path = read_user_str(path_ptr);
-    if path.is_empty() { return errno::EINVAL; }
-    let path = resolve_path(path);
+    chmod_at(AT_FDCWD, path_ptr, mode)
+}
+
+/// fchmodat(268) / fchmodat2(452): `(dirfd, path, mode[, flags])`.
+pub(super) fn sys_fchmodat(dirfd: i64, path_ptr: usize, mode: u32) -> SyscallResult {
+    chmod_at(dirfd, path_ptr, mode)
+}
+
+fn chmod_at(dirfd: i64, path_ptr: usize, mode: u32) -> SyscallResult {
+    let path = match user_path_at(dirfd, path_ptr, errno::EINVAL) { Ok(p) => p, Err(e) => return e };
     match crate::fs::vfs::resolve(&path).and_then(|inode| inode.chmod(mode)) {
         Ok(()) => 0,
         Err(e) => e.as_i64(),
@@ -1520,8 +1617,8 @@ pub(super) fn sys_chmod(path_ptr: usize, mode: u32) -> SyscallResult {
 /// `FileHandle::chmod` instead of resolving a path to an `Inode`.
 pub(super) fn sys_fchmod(fd: i32, mode: u32) -> SyscallResult {
     if fd < 0 { return errno::EBADF; }
-    with_current_process(|proc| {
-        match proc.files.lock().get_mut(fd as usize) {
+    with_files(|files| {
+        match files.get_mut(fd as usize) {
             Ok(file) => match file.chmod(mode) {
                 Ok(()) => 0,
                 Err(_) => errno::EIO,

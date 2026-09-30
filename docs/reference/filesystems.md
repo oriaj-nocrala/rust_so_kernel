@@ -13,7 +13,7 @@ Code: `kernel/src/fs/`, crates `vfs/` and `ext2/` (host tests: `cd vfs && cargo 
 | `/proc` | procfs | Synthetic, regenerated on every open |
 
 - `ls /` lists the other mounts via `fs::vfs::direct_children`; the mount table redirects traversal into them.
-- **procfs contents**: `meminfo`, `stat`, `uptime`, `loadavg`, `cpuinfo`, `<pid>/{stat,statm,cmdline,exe}` (Linux formats, backing `ps`/`top`), `self`, `dmesg` (klog), `kdebug`, `fbinfo`, `pci`, `sensors`, `acpi`. Pid listing: `scheduler::all_pids()`, which takes `SCHEDULER` itself, so never call it while holding that lock.
+- **procfs contents**: `meminfo`, `stat`, `uptime`, `loadavg`, `cpuinfo`, `<pid>/{stat,statm,cmdline,exe,maps}` (Linux formats, backing `ps`/`top`; `maps` is one line per VMA, `start-end perms 00000000 00:00 0 [stack]`: no file mappings, and `x` shows because anonymous memory is mapped without NX), `self`, `dmesg` (klog), `kdebug`, `fbinfo`, `pci`, `sensors`, `acpi`. Pid listing: `scheduler::all_pids()`, which takes `SCHEDULER` itself, so never call it while holding that lock.
 
 ## VFS (`vfs` crate, adapter `kernel/src/fs/vfs.rs`)
 
@@ -22,7 +22,7 @@ Code: `kernel/src/fs/`, crates `vfs/` and `ext2/` (host tests: `cd vfs && cargo 
 - Mutations (`create`/`mkdir`/`symlink`/`mksocket`/…) default to `EROFS`; only ramfs and ext2 implement them.
 - vfs locks call a relax hook (`vfs::lock::set_relax_hook`) so a spinning CPU still answers TLB shootdowns. `vfs::clock::set_clock` gives ramfs wall time.
 - **Permissions**: there is no permission model and no uids. `Stat::regular()` reports 0o444; ramfs's `regular_writable()` reports 0o644; ext2 reports the real `i_mode`. The write bits matter because BusyBox `vi` checks `st_mode` as well as `access(W_OK)`.
-- **fd table**: 16 fds per process. For processes on the console: fd 0 = `/dev/console` (reads come from the keyboard ring), fds 1/2 = `/dev/fb`. Everything written to `/dev/fb` is also mirrored to serial (`[fb] ` prefix) and to klog.
+- **fd table**: 256 fds per process (`EMFILE` beyond). For processes on the console: fd 0 = `/dev/console` (reads come from the keyboard ring), fds 1/2 = `/dev/fb`. Everything written to `/dev/fb` is also mirrored to serial (`[fb] ` prefix) and to klog.
 
 ## Timestamps
 

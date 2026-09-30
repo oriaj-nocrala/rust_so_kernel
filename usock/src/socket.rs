@@ -52,10 +52,11 @@ impl Shutdown {
 
 /// Default receive-queue capacity, i.e. the effective `SO_RCVBUF`.
 ///
-/// 16 KiB rather than `pipe.rs`'s 4 KiB: a stream socket's queue is a `Vec`
-/// that grows only with real traffic, not a fixed array in a struct, so the
-/// cost of a larger ceiling is paid only by sockets that actually fill it.
-pub const DEFAULT_BUF: usize = 16 * 1024;
+/// 208 KiB, Linux's `net.core.rmem_default`/`wmem_default` (212992), rather than `pipe.rs`'s 4 KiB: a stream socket's queue is a
+/// `Vec` that grows only with real traffic, not a fixed array in a struct, so the cost of a larger ceiling is paid only by sockets
+/// that actually fill it. It used to be 16 KiB, which made a bulk transfer wake and switch every 16 KiB (a 32 MiB copy through a
+/// socket pair ran at 11 MiB/s).
+pub const DEFAULT_BUF: usize = 208 * 1024;
 
 /// `SOMAXCONN` — the ceiling `listen()` clamps its backlog to.
 pub const SOMAXCONN: usize = 128;

@@ -132,6 +132,13 @@ impl AddressSpace {
     /// walk and not a counter). `shared` is the resident part of `Shared`
     /// VMAs; `text` and `data` are virtual sizes, as in Linux's `statm`
     /// (`Code` VMAs, and the anonymous, huge and stack ones).
+    /// Every VMA as `(start, end, page-table flags, kind)`, ordered by address (`/proc/<pid>/maps`).
+    pub fn vma_snapshot(&self) -> alloc::vec::Vec<(u64, u64, u64, VmaKind)> {
+        let mut out: alloc::vec::Vec<_> = self.vmas.with(|v| v.iter().map(|x| (x.start, x.end(), x.flags, x.kind)).collect());
+        out.sort_by_key(|e| e.0);
+        out
+    }
+
     pub fn mem_stats(&self) -> MemStats {
         let pml4 = self.page_table.pml4_phys().as_u64();
         let zero = crate::memory::cow::zero_frame_phys();
@@ -650,9 +657,10 @@ impl AddressSpace {
         // second map_to call panics in create_or_next_table_mut.
         self.vmas.with(|vmas| {
             let vaddr = if addr == 0 {
+                // Contiguous, as Linux places them: adjacent anonymous mappings then merge (`VmaList::add_merged`). A gap
+                // between allocations (there was a guard page) kept every one of them a VMA of its own.
                 let base = self.mmap_base.load(Ordering::Relaxed);
-                // Advance bump pointer; add one guard page between allocations.
-                self.mmap_base.store(base + size_pages as u64 * 4096 + 4096, Ordering::Relaxed);
+                self.mmap_base.store(base + size_pages as u64 * 4096, Ordering::Relaxed);
                 base
             } else {
                 if vmas.overlaps(addr, size_pages) {
@@ -667,7 +675,7 @@ impl AddressSpace {
                 kind: VmaKind::Anonymous,
                 shm: None,
             };
-            vmas.add(vma).map_err(|_| "mmap: VMA list full")?;
+            vmas.add_merged(vma).map_err(|_| "mmap: VMA list full")?;
             Ok(vaddr)
         })
     }
@@ -702,7 +710,7 @@ impl AddressSpace {
         self.vmas.with(|vmas| {
             let vaddr = if addr == 0 {
                 let base = self.mmap_base.load(Ordering::Relaxed);
-                self.mmap_base.store(base + size_pages as u64 * 4096 + 4096, Ordering::Relaxed);
+                self.mmap_base.store(base + size_pages as u64 * 4096, Ordering::Relaxed);
                 base
             } else {
                 if vmas.overlaps(addr, size_pages) {

@@ -38,6 +38,7 @@ fn pid_exe_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 8 + 1 }
 fn pid_stat_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 8 + 2 }
 fn pid_cmdline_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 8 + 3 }
 fn pid_statm_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 8 + 4 }
+fn pid_maps_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 8 + 5 }
 
 // ── Filesystem ───────────────────────────────────────────────────────────────
 
@@ -764,6 +765,7 @@ impl Inode for ProcPidDirInode {
             "stat" => Ok(Arc::new(ProcStatInode { pid: self.pid })),
             "cmdline" => Ok(Arc::new(ProcCmdlineInode { pid: self.pid })),
             "statm" => Ok(Arc::new(ProcStatmInode { pid: self.pid })),
+            "maps" => Ok(Arc::new(ProcMapsInode { pid: self.pid })),
             _ => Err(Errno::ENOENT),
         }
     }
@@ -777,6 +779,7 @@ impl Inode for ProcPidDirInode {
             3 => Ok(Some(DirEntry::new(pid_stat_ino(self.pid), FileType::Regular, b"stat"))),
             4 => Ok(Some(DirEntry::new(pid_cmdline_ino(self.pid), FileType::Regular, b"cmdline"))),
             5 => Ok(Some(DirEntry::new(pid_statm_ino(self.pid), FileType::Regular, b"statm"))),
+            6 => Ok(Some(DirEntry::new(pid_maps_ino(self.pid), FileType::Regular, b"maps"))),
             _ => Ok(None),
         }
     }
@@ -808,6 +811,49 @@ impl Inode for ProcStatInode {
         let data = render_proc_stat(self.pid, &snap).into_bytes();
         Ok(Box::new(ProcFile { data, offset: 0 }))
     }
+}
+
+/// `/proc/<pid>/maps`, see `render_proc_maps`.
+struct ProcMapsInode {
+    pid: usize,
+}
+
+impl Inode for ProcMapsInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
+    fn stat(&self) -> Stat {
+        Stat::regular(pid_maps_ino(self.pid), 0)
+    }
+
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+        if flags.is_write() {
+            return Err(Errno::EROFS);
+        }
+        let space = crate::process::scheduler::address_space_of(self.pid).ok_or(Errno::ENOENT)?;
+        Ok(Box::new(ProcFile { data: render_proc_maps(&space.vma_snapshot()).into_bytes(), offset: 0 }))
+    }
+}
+
+/// One line per VMA, Linux's format: `start-end perms offset dev inode [name]`. `r` if user-accessible (a `PROT_NONE` region has no
+/// access), `w` if writable, `x` unless no-execute, `s` for a shared (memfd / `MAP_SHARED`) region and `p` otherwise. There is no
+/// file mapping (offset, dev and inode read 0); the user stack is named `[stack]`.
+fn render_proc_maps(vmas: &[(u64, u64, u64, crate::memory::vma::VmaKind)]) -> String {
+    use crate::memory::vma::VmaKind;
+    use x86_64::structures::paging::PageTableFlags as F;
+    let mut out = String::new();
+    for &(start, end, flags, kind) in vmas {
+        let f = F::from_bits_truncate(flags);
+        let user = f.contains(F::USER_ACCESSIBLE);
+        let perms = [
+            if user { 'r' } else { '-' },
+            if user && f.contains(F::WRITABLE) { 'w' } else { '-' },
+            if user && !f.contains(F::NO_EXECUTE) { 'x' } else { '-' },
+            if kind == VmaKind::Shared { 's' } else { 'p' },
+        ];
+        let name = if kind == VmaKind::GrowableStack { "[stack]" } else { "" };
+        out.push_str(&format!("{:08x}-{:08x} {} 00000000 00:00 0 {}\n", start, end, perms.iter().collect::<String>(), name));
+    }
+    out
 }
 
 /// `/proc/<pid>/statm`, see `render_proc_statm`.

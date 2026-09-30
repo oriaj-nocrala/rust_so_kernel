@@ -43,7 +43,7 @@ mod misc;
 pub(crate) use fs::{send_to_group, stdin_wakeup};
 pub(crate) use process_ctl::cancel_all_waiters;
 pub(crate) use sync::futex_take_waiters;
-pub(crate) use poll::{poll_wakeup_for_fd0, poll_wakeup_for_input, poll_clear_on_timeout, poll_wakeup_for_socket, poll_wakeup_for_pty, poll_wakeup_for_pipe, poll_wakeup_for_eventfd};
+pub(crate) use poll::{poll_wakeup_for_fd0, poll_wakeup_for_input, poll_clear_on_timeout, poll_wakeup_for_socket, poll_wakeup_for_pty, poll_wakeup_for_pipe, poll_wakeup_for_eventfd, poll_wakeup_for_pidfd};
 
 use core::arch::global_asm;
 use super::TrapFrame;
@@ -319,6 +319,21 @@ pub enum SyscallNumber {
     EpollCreate = 213,
     EpollCreate1 = 291,
     Prctl = 157,
+    Fchdir = 81,
+    Openat = 257,
+    Mkdirat = 258,
+    Newfstatat = 262,
+    Unlinkat = 263,
+    Renameat = 264,
+    Symlinkat = 266,
+    Readlinkat = 267,
+    Fchmodat = 268,
+    Faccessat = 269,
+    Renameat2 = 316,
+    Faccessat2 = 439,
+    Fchmodat2 = 452,
+    PidfdSendSignal = 424,
+    PidfdOpen = 434,
     Eventfd = 284,
     Eventfd2 = 290,
     EpollPwait = 281,
@@ -431,6 +446,21 @@ impl SyscallNumber {
             213 => Some(Self::EpollCreate),
             291 => Some(Self::EpollCreate1),
             157 => Some(Self::Prctl),
+            81 => Some(Self::Fchdir),
+            257 => Some(Self::Openat),
+            258 => Some(Self::Mkdirat),
+            262 => Some(Self::Newfstatat),
+            263 => Some(Self::Unlinkat),
+            264 => Some(Self::Renameat),
+            266 => Some(Self::Symlinkat),
+            267 => Some(Self::Readlinkat),
+            268 => Some(Self::Fchmodat),
+            269 => Some(Self::Faccessat),
+            316 => Some(Self::Renameat2),
+            439 => Some(Self::Faccessat2),
+            452 => Some(Self::Fchmodat2),
+            424 => Some(Self::PidfdSendSignal),
+            434 => Some(Self::PidfdOpen),
             284 => Some(Self::Eventfd),
             290 => Some(Self::Eventfd2),
             281 => Some(Self::EpollPwait),
@@ -503,6 +533,33 @@ pub mod errno {
 // ============================================================================
 // SAFE HELPERS
 // ============================================================================
+
+/// Run `f` on the running process's fd table with **`SCHEDULER` released**. Interrupts stay off for the duration, as a handle's
+/// `close`/`Drop` needs (a pipe or socket end takes the scheduler to wake its peer).
+///
+/// Never take a process's fd-table lock while holding `SCHEDULER`: `sys_read`/`sys_write` hold the table lock across
+/// `FileHandle::read/write`, and those take the scheduler (`current_pid()`, wakes) — the opposite order. A multi-threaded process
+/// shares one table, so a `fcntl` on one thread against a pipe `read` on another deadlocked every CPU (found by a tokio stress run).
+/// Take the `Arc` under a short scheduler section, drop that guard, then lock the table — which is all this does. `None` if no
+/// process is running.
+pub(crate) fn with_fd_table<R>(f: impl FnOnce(&mut super::file::FileDescriptorTable) -> R) -> Option<R> {
+    let _irq = super::irq_guard::InterruptGuard::new();
+    let files = {
+        let sched = super::scheduler::local_scheduler();
+        sched.running_ref().map(|p| p.files.clone())
+    };
+    let files = files?;
+    let mut table = files.lock();
+    Some(f(&mut table))
+}
+
+/// `with_fd_table` for the syscalls that return a `SyscallResult` (`ESRCH` if nothing runs).
+pub(super) fn with_files<F>(f: F) -> SyscallResult
+where
+    F: FnOnce(&mut super::file::FileDescriptorTable) -> SyscallResult,
+{
+    with_fd_table(f).unwrap_or(errno::ESRCH)
+}
 
 fn with_current_process<F>(f: F) -> SyscallResult
 where
@@ -713,6 +770,19 @@ pub fn syscall_handler(
         SyscallNumber::EpollCreate => poll::sys_epoll_create(arg1 as i32),
         SyscallNumber::EpollCreate1 => poll::sys_epoll_create1(arg1 as i32),
         SyscallNumber::Prctl => process_ctl::sys_prctl(arg1 as i32, arg2),
+        SyscallNumber::Fchdir => fs::sys_fchdir(arg1 as i32),
+        SyscallNumber::Openat => fs::sys_openat(arg1 as i64, arg2 as usize, arg3 as i32, arg4 as u32),
+        SyscallNumber::Mkdirat => fs::sys_mkdirat(arg1 as i64, arg2 as usize, arg3 as u32),
+        SyscallNumber::Newfstatat => fs::sys_newfstatat(arg1 as i64, arg2 as usize, arg3 as usize, arg4),
+        SyscallNumber::Unlinkat => fs::sys_unlinkat(arg1 as i64, arg2 as usize, arg3),
+        SyscallNumber::Renameat => fs::sys_renameat(arg1 as i64, arg2 as usize, arg3 as i64, arg4 as usize, 0),
+        SyscallNumber::Renameat2 => fs::sys_renameat(arg1 as i64, arg2 as usize, arg3 as i64, arg4 as usize, arg5),
+        SyscallNumber::Symlinkat => fs::sys_symlinkat(arg1 as usize, arg2 as i64, arg3 as usize),
+        SyscallNumber::Readlinkat => fs::sys_readlinkat(arg1 as i64, arg2 as usize, arg3 as usize, arg4 as usize),
+        SyscallNumber::Fchmodat | SyscallNumber::Fchmodat2 => fs::sys_fchmodat(arg1 as i64, arg2 as usize, arg3 as u32),
+        SyscallNumber::Faccessat | SyscallNumber::Faccessat2 => fs::sys_faccessat(arg1 as i64, arg2 as usize, arg3 as i32),
+        SyscallNumber::PidfdOpen => process_ctl::sys_pidfd_open(arg1 as i64, arg2 as u32),
+        SyscallNumber::PidfdSendSignal => process_ctl::sys_pidfd_send_signal(arg1 as i32, arg2 as u32, arg3, arg4 as u32),
         SyscallNumber::Eventfd => fs::sys_eventfd(arg1 as u32, 0),
         SyscallNumber::Eventfd2 => fs::sys_eventfd(arg1 as u32, arg2 as i32),
         SyscallNumber::EpollPwait => poll::sys_epoll_pwait(arg1 as i32, arg2, arg3 as i32, arg4 as i32, arg5, arg6),

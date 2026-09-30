@@ -828,6 +828,9 @@ impl Scheduler {
                 )),
             );
             super::dead_files::defer(files);
+            if !proc.is_thread {
+                super::dead_files::defer_exit(proc.pid.0);
+            }
             crate::serial_println!(
                 "💀 Killed PID {} ({}): {}",
                 proc.pid.0,
@@ -2065,6 +2068,11 @@ fn proc_stat_snapshot_locked(pid: usize) -> Option<(ProcStatSnapshot, Arc<Addres
         }, p.address_space.clone()));
     unsafe { core::arch::asm!("sti"); }
     snap
+}
+
+/// The address space of process `pid` (a thread's is its group's), for `/proc/<pid>/maps`.
+pub fn address_space_of(pid: usize) -> Option<Arc<AddressSpace>> {
+    proc_stat_snapshot_locked(pid).map(|(_, space)| space)
 }
 
 pub fn find_current_vma(addr: u64) -> Option<(usize, Vma)> {

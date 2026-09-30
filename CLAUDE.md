@@ -88,6 +88,7 @@ Breaking one of these has cost days of debugging each time. The *why* is kept sh
 - No new `static mut` or global `UnsafeCell` for shared state. Per-CPU state is indexed by `cpu::cpu_id()`.
 - Lock order: scheduler → address space → `BUDDY`/`SLAB_ALLOCATOR`.
 - Registry locks (pipes, `SOCKETS`, `PTYS`, poll waiters) come **before** `SCHEDULER`: never take one while holding the scheduler lock.
+- **A process's fd-table lock also comes before `SCHEDULER`**: `sys_read`/`sys_write` hold it across `FileHandle::read/write`, which take the scheduler, and threads share one table. Never `proc.files.lock()` inside `with_current_process`/under `local_scheduler()`: use `syscall::with_files`/`with_fd_table` (clone the `Arc`, release the scheduler, then lock; IF stays 0). Breaking it deadlocked all CPUs under a multi-threaded tokio run (`fdlock_test`).
 - Never drop a file handle under `SCHEDULER` (its `Drop` may take it).
 - Full per-lock audit: stage 6 of `docs/smp/smp-plan.md`.
 

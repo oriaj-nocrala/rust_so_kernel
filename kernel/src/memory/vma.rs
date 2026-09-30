@@ -21,8 +21,9 @@ use super::shm::ShmObject;
 // Constants
 // ============================================================================
 
-/// Maximum VMAs per process (code + stack + heap + extras).
-pub const MAX_VMAS_PER_PROCESS: usize = 256;
+/// Maximum VMAs per process (Linux's `vm.max_map_count`). Merging (`add_merged`) keeps typical programs far below it; it was 256,
+/// which a tokio program with 4000 tasks reached (musl's allocator maps many small groups).
+pub const MAX_VMAS_PER_PROCESS: usize = 65530;
 
 /// How far below a `GrowableStack` VMA's current low boundary a fault is
 /// still treated as legitimate stack growth rather than a wild pointer —
@@ -168,6 +169,37 @@ impl VmaList {
         self.entries.try_reserve(1).map_err(|_| "VMA list: out of memory")?;
         self.entries.push(vma);
         Ok(())
+    }
+
+    /// `add`, but a new `Anonymous` VMA that touches an `Anonymous` neighbour of equal flags extends it instead of being a new entry
+    /// (as Linux merges adjacent anonymous mappings): a program that maps thousands of small regions in a row (an allocator's
+    /// groups) then holds a few VMAs. Cost O(n), unlike `merge_adjacent`'s full pass.
+    pub fn add_merged(&mut self, vma: Vma) -> Result<(), &'static str> {
+        if vma.kind != VmaKind::Anonymous {
+            return self.add(vma);
+        }
+        let (start, end, flags) = (vma.start, vma.end(), vma.flags);
+        let mergeable = |b: &Vma| b.kind == VmaKind::Anonymous && b.flags == flags;
+        let prev = self.entries.iter().position(|b| mergeable(b) && b.end() == start);
+        let next = self.entries.iter().position(|b| mergeable(b) && b.start == end);
+        match (prev, next) {
+            (Some(p), Some(n)) => {
+                let absorbed = self.entries[n].size_pages;
+                self.entries[p].size_pages += vma.size_pages + absorbed;
+                self.entries.remove(n);
+                Ok(())
+            }
+            (Some(p), None) => {
+                self.entries[p].size_pages += vma.size_pages;
+                Ok(())
+            }
+            (None, Some(n)) => {
+                self.entries[n].start = start;
+                self.entries[n].size_pages += vma.size_pages;
+                Ok(())
+            }
+            (None, None) => self.add(vma),
+        }
     }
 
     /// Find the VMA containing `addr`, if any.

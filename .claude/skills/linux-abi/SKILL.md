@@ -42,7 +42,8 @@ State and the list of what is still missing: `docs/reference/syscalls.md` (rows,
 ## Real programs already run
 
 - **tokio** (`probes/tokio`, `scripts/run-tokio-probe.sh`): current_thread and multi_thread runtimes, timers, mpsc/oneshot, AF_UNIX echo, `tokio::fs`, `spawn_blocking`, `tokio::process`, signals. It found `eventfd2`, a non-dupable epoll fd (tokio `dup`s its epoll fd), `listen(fd, -1)` (Rust's std passes it: it means the maximum) and `prctl(PR_SET_NAME)`. Method that worked: write the program in stages that print a marker each, log each first-seen unknown syscall (`ENOSYS: unimplemented syscall N` on serial), and add a C test per gap.
-- Not implemented and tolerated by tokio: `pidfd_open` (434), tokio's process driver falls back to SIGCHLD.
+- **tkstress** (heavy tokio, same script): 10k tasks, 1000 timers, 64-producer fan-in, 100 AF_UNIX clients x 100 messages, 32 MiB through a socket, child processes (pipes, kill, 12 concurrent), locks/semaphore/broadcast/watch, `select!`, `JoinSet::abort_all`, `spawn_blocking` x64, 200 `tokio::fs` files. It found: the 256-VMA cap plus a guard page between `mmap`s (musl's allocator hit it at ~4000 tasks; now contiguous mappings that merge, cap 65530), the `*at` family (`std::fs::remove_dir_all`), `pidfd_open`, `/proc/<pid>/maps`, and an fd-table/`SCHEDULER` lock-order deadlock between `fcntl` and a pipe `read` on sibling threads (`with_files`, `fdlock_test`). Socket buffers were 16 KiB (11 MiB/s through a socket pair); 208 KiB gives ~190 MiB/s. Still latency-bound: ~235 us per wake/switch round trip (100 clients ping-ponging 10k messages take ~4.7 s).
+- Debugging a hang: `KEEP_ALIVE=1 scripts/run-tokio-probe.sh`, then `echo 'gdbserver tcp::1234' | socat - UNIX-CONNECT:/tmp/qemu-debug-rust_so_kernel/monitor.sock` and `scripts/qemu-debug.sh gdb 'info threads' 'thread N' 'bt 10'` per CPU: all CPUs spinning in a `lock()` shows the ABBA at once.
 
 ## Still missing (check `rust_std_gaps` first)
 

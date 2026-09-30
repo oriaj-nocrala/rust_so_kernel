@@ -36,12 +36,15 @@ pub struct FileDescriptorTable {
     /// `FD_CLOEXEC` per slot: `exec` closes the flagged ones (`take_cloexec`). A property of the descriptor, not of the handle,
     /// so `dup` gives the copy a clear flag and `fork` copies it as it is. Always as long as `files`.
     cloexec: alloc::vec::Vec<bool>,
+    /// The absolute path an fd was opened by (`open`/`openat`), which the `*at` calls resolve a relative path against when it is
+    /// their `dirfd`. `None` for fds that were not opened by path (pipes, sockets, stdio) and for a slot's fresh handle.
+    paths: alloc::vec::Vec<Option<alloc::string::String>>,
 }
 
 impl FileDescriptorTable {
     /// Create an empty table.
     pub const fn new() -> Self {
-        Self { files: alloc::vec::Vec::new(), cloexec: alloc::vec::Vec::new() }
+        Self { files: alloc::vec::Vec::new(), cloexec: alloc::vec::Vec::new(), paths: alloc::vec::Vec::new() }
     }
 
     /// Make `fd` a valid slot index (growing the table with free slots). `false` if it is past `MAX_FILES`.
@@ -52,6 +55,7 @@ impl FileDescriptorTable {
         if fd >= self.files.len() {
             self.files.resize_with(fd + 1, || None);
             self.cloexec.resize(fd + 1, false);
+            self.paths.resize(fd + 1, None);
         }
         true
     }
@@ -60,6 +64,19 @@ impl FileDescriptorTable {
     fn put(&mut self, fd: usize, handle: Box<dyn FileHandle>, cloexec: bool) {
         self.files[fd] = Some(handle);
         self.cloexec[fd] = cloexec;
+        self.paths[fd] = None;
+    }
+
+    /// Record the absolute path `fd` was opened by (see `paths`).
+    pub fn set_path(&mut self, fd: usize, path: alloc::string::String) {
+        if let Some(slot) = self.paths.get_mut(fd) {
+            *slot = Some(path);
+        }
+    }
+
+    /// The path `fd` was opened by, if it was opened by path.
+    pub fn path(&self, fd: usize) -> Option<&str> {
+        self.paths.get(fd).and_then(|p| p.as_deref())
     }
 
     /// Create a table with stdin/stdout/stderr pre-opened.
@@ -145,7 +162,9 @@ impl FileDescriptorTable {
         for i in min_fd..MAX_FILES {
             if self.files.get(i).map_or(true, |slot| slot.is_none()) {
                 self.ensure(i);
+                let path = self.paths.get(fd).cloned().flatten();
                 self.put(i, cloned, cloexec);
+                self.paths[i] = path;
                 return Ok(i);
             }
         }
@@ -178,7 +197,9 @@ impl FileDescriptorTable {
         if let Some(mut old) = self.files[newfd].take() {
             let _ = old.close();
         }
+        let path = self.paths.get(oldfd).cloned().flatten();
         self.put(newfd, cloned, cloexec);
+        self.paths[newfd] = path;
         Ok(newfd)
     }
 
@@ -202,6 +223,7 @@ impl FileDescriptorTable {
         for i in 0..self.files.len() {
             if self.cloexec[i] {
                 self.cloexec[i] = false;
+                self.paths[i] = None;
                 if let Some(h) = self.files[i].take() {
                     out.push(h);
                 }
@@ -220,6 +242,7 @@ impl FileDescriptorTable {
         }
 
         self.cloexec[fd] = false;
+        self.paths[fd] = None;
         if let Some(mut handle) = self.files[fd].take() {
             handle.close()?;
         }
@@ -275,6 +298,7 @@ impl Clone for FileDescriptorTable {
             };
         }
         new_table.cloexec = self.cloexec.clone();
+        new_table.paths = self.paths.clone();
 
         new_table
     }

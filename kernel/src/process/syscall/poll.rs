@@ -28,6 +28,8 @@ enum PollSource {
     Pipe { id: u64, write: bool },
     /// An eventfd (`process::eventfd`), by registry number.
     Event { id: u64 },
+    /// A pidfd (`process::pidfd`): readable once the process has exited.
+    PidFd { pid: u64 },
 }
 
 /// A process's fd → `PollSource` mapping, snapshotted at the moment it blocks.
@@ -85,6 +87,8 @@ fn snapshot_sockets() -> SocketMap {
                 PollSource::Pipe { id: end.id, write: end.write }
             } else if let Some(id) = h.eventfd_id() {
                 PollSource::Event { id }
+            } else if let Some(pid) = h.pidfd_pid() {
+                PollSource::PidFd { pid: pid as u64 }
             } else {
                 PollSource::Other
             };
@@ -364,6 +368,11 @@ fn fd_check_ready(socks: &SocketMap, fd: i32, events: i16) -> i16 {
         return rev;
     }
 
+    if let PollSource::PidFd { pid } = source {
+        let Some(gone) = crate::process::pidfd::exited(pid as usize) else { return POLLNVAL };
+        return if events & POLLIN != 0 && gone { POLLIN } else { 0 };
+    }
+
     // Socket?
     if let PollSource::Socket(sock) = source {
         let Some(mask) = unix::poll_mask(sock) else { return POLLNVAL };
@@ -619,6 +628,13 @@ pub(crate) fn poll_wakeup_for_pipe(id: u64) {
 pub(crate) fn poll_wakeup_for_eventfd(id: u64) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         poll_wake_where(|w, fd| matches!(waiter_source(w, fd), PollSource::Event { id: i } if i == id))
+    });
+}
+
+/// A process a pidfd names has exited: wake poll/epoll sleepers watching it.
+pub(crate) fn poll_wakeup_for_pidfd(pid: usize) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        poll_wake_where(|w, fd| matches!(waiter_source(w, fd), PollSource::PidFd { pid: p } if p == pid as u64))
     });
 }
 
@@ -913,34 +929,16 @@ fn epoll_create_impl(cloexec: bool) -> SyscallResult {
 
     let handle = alloc::boxed::Box::new(EpollHandle { epoll_id, refs: alloc::sync::Arc::new(()) });
 
-    let _irq = crate::process::irq_guard::InterruptGuard::new();
-    let mut sched = crate::process::scheduler::local_scheduler();
-    match sched.running_mut() {
-        Some(proc) => {
-            // See sys_socket's comment: the lock guard must not outlive
-            // this `let`, since the arms below drop `sched`.
-            let alloc_result = proc.files.lock().allocate(handle);
-            match alloc_result {
-                Ok(fd) => {
-                    if cloexec {
-                        let _ = proc.files.lock().set_cloexec(fd, true);
-                    }
-                    drop(sched);
-                    fd as i64
-                }
-                Err(_) => {
-                    drop(sched);
-                    EPOLL_INSTANCES.lock().free(epoll_id);
-                    errno::EINVAL
-                }
+    // The instance goes with its handle (`EpollHandle::drop`), so a failed allocation frees it by itself.
+    super::with_files(|files| match files.allocate(handle) {
+        Ok(fd) => {
+            if cloexec {
+                let _ = files.set_cloexec(fd, true);
             }
+            fd as i64
         }
-        None => {
-            drop(sched);
-            EPOLL_INSTANCES.lock().free(epoll_id);
-            errno::ESRCH
-        }
-    }
+        Err(_) => errno::EINVAL,
+    })
 }
 
 // ── sys_epoll_ctl ──────────────────────────────────────────────────────────

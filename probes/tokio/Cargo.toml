@@ -4,7 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io-util", "macros", "sync", "process", "signal", "fs"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io-util", "macros", "sync", "process", "signal", "fs", "full"] }
+
+[[bin]]
+name = "tkprobe"
+path = "src/bin/probe.rs"
+
+[[bin]]
+name = "tkstress"
+path = "src/bin/stress.rs"
 
 [profile.release]
 opt-level = 2
