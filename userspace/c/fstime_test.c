@@ -10,7 +10,7 @@
 //      NULL times[] is now; futimens through an fd; AT_SYMLINK_NOFOLLOW on
 //      a symlink leaves its target alone; EROFS where nothing keeps times;
 //      EINVAL for a bad tv_nsec;
-//   C. ext2 (/mnt), if it is writable: a new file is stamped now, and
+//   C. ext2 (/mnt), if it is writable: a new file is stamped now (its write, a second later, moves mtime only), and
 //      utimensat's times survive a fresh stat;
 //   D. /proc and /dev report the boot time, not the epoch;
 //   E. libc: ctime() is 25 characters, sscanf honours %4u%2u widths
@@ -128,10 +128,16 @@ static void case_ext2(void) {
         printf("  /mnt is not writable (errno %d): skipped\n", errno);
         return;
     }
+    // The write comes 1.1 s after the create, so it lands in another second: the real-hardware flake (a slow stick
+    // crossed a second boundary between the two) made deterministic.
+    struct timespec nap = { 1, 100000000 };
+    nanosleep(&nap, NULL);
     write(fd, "e", 1);
     close(fd);
     struct stat s = st_of("/mnt/fst_e");
-    check("new file stamped now", s.st_mtime >= time(NULL) - 2 && s.st_atime == s.st_mtime);
+    // As on ramfs (section A): the create stamps all three, the later write moves mtime and ctime, not atime.
+    check("new file stamped now", s.st_atime >= time(NULL) - 4 && s.st_mtime >= time(NULL) - 2);
+    check("the write moved mtime and ctime, not atime", s.st_mtime > s.st_atime && s.st_ctime == s.st_mtime);
     struct timespec t[2] = { { 1111111111, 0 }, { 1222222222, 0 } };
     check("utimensat", utimensat(AT_FDCWD, "/mnt/fst_e", t, 0) == 0);
     s = st_of("/mnt/fst_e");
