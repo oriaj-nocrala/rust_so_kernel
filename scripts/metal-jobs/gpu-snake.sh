@@ -29,6 +29,9 @@ sum "gpu-snake: flips after: $f1"
 u=$(grep '^gpu_uapi:' /proc/kdebug)
 sum "gpu-snake: $u"
 [ "$(field "$u" dead)" = 0 ] || { sum "gpu-snake: the GPU was declared dead"; fail=1; }
+# the swapchain was destroyed with its last buffer on screen, and the device closed: nothing may stay held (PRESENT's holder is released at close)
+sum "gpu-snake: share counters: $(grep '^gpu_share:' /proc/kdebug)"
+grep '^gpu_share:' /proc/kdebug | grep -q 'sessions=0 storage_allocs=0 syncs=0' || { sum "gpu-snake: something is still held after snake3d ended"; fail=1; }
 echo "---- summary ----"
 cat /tmp/gpu-snake.sum
 sum "gpu-snake: verdict exit=$fail"

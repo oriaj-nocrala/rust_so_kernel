@@ -385,7 +385,7 @@ index cfb921d..589d5bf 100644
  
     bool disable_unordered_submits;
 diff --git a/src/vulkan/wsi/wsi_common_headless.c b/src/vulkan/wsi/wsi_common_headless.c
-index 05906d4..5203426 100644
+index 05906d4..0408678 100644
 --- a/src/vulkan/wsi/wsi_common_headless.c
 +++ b/src/vulkan/wsi/wsi_common_headless.c
 @@ -21,10 +21,17 @@
@@ -593,25 +593,20 @@ index 05906d4..5203426 100644
     return VK_SUCCESS;
  }
  
-@@ -461,7 +574,17 @@ wsi_headless_swapchain_destroy(struct wsi_swapchain *wsi_chain,
+@@ -461,6 +574,12 @@ wsi_headless_swapchain_destroy(struct wsi_swapchain *wsi_chain,
     struct wsi_headless_swapchain *chain =
        (struct wsi_headless_swapchain *)wsi_chain;
  
 +   if (chain->scanout) {
-+      /* The buffer that was on screen before the last present is free once that flip has taken effect. */
++      /* The buffer that was on screen before the last present is free once that flip has taken effect. The one on screen now may be freed
++       * too: the kernel holds the storage of what the display scans out until it shows something else or the device is closed. */
 +      chain->base.wsi->scanout.wait_flip(chain->base.device, 1000);
 +   }
 +
     for (uint32_t i = 0; i < chain->base.image_count; i++) {
-+      if (chain->scanout && (int)i == chain->last) {
-+         /* The display is still scanning this buffer out, and the kernel offers no way to take it off the screen but closing the device
-+          * (which puts the console back): freeing it would leave the display reading freed VRAM. It is given up with the device. */
-+         chain->images[i].base.blit.memory = VK_NULL_HANDLE;
-+      }
        if (chain->images[i].base.image != VK_NULL_HANDLE)
           wsi_destroy_image(&chain->base, &chain->images[i].base);
-    }
-@@ -473,6 +596,22 @@ wsi_headless_swapchain_destroy(struct wsi_swapchain *wsi_chain,
+@@ -473,6 +592,22 @@ wsi_headless_swapchain_destroy(struct wsi_swapchain *wsi_chain,
     return VK_SUCCESS;
  }
  
@@ -634,7 +629,7 @@ index 05906d4..5203426 100644
  static VkResult
  wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
                                        VkDevice device,
-@@ -486,6 +625,18 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+@@ -486,6 +621,18 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
  
     assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
  
@@ -653,7 +648,7 @@ index 05906d4..5203426 100644
     int num_images = pCreateInfo->minImageCount;
  
     size_t size = sizeof(*chain) + num_images * sizeof(chain->images[0]);
-@@ -500,7 +651,7 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+@@ -500,7 +647,7 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
        .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
        .pNext = &mod_list,
     };
@@ -662,7 +657,7 @@ index 05906d4..5203426 100644
        wsi_device->GetPhysicalDeviceFormatProperties2(
           wsi_device->pdevice, pCreateInfo->imageFormat, &props);
        assert(mod_list.drmFormatModifierCount > 0);
-@@ -522,7 +673,8 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+@@ -522,7 +669,8 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
     struct wsi_base_image_params *image_params = NULL;
     struct wsi_cpu_image_params cpu_params;
     struct wsi_drm_image_params drm_params;
@@ -672,7 +667,7 @@ index 05906d4..5203426 100644
        cpu_params = (struct wsi_cpu_image_params) {
           .base.image_type = WSI_IMAGE_TYPE_CPU,
        };
-@@ -547,6 +699,21 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+@@ -547,6 +695,21 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
     if (result != VK_SUCCESS)
        goto fail_free_chain;
  

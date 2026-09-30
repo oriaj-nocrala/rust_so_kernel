@@ -661,6 +661,66 @@ int main(int argc, char **argv) {
             err_small, err_sys, err_align, err_flags, err_none, want);
    }
 
+   // ---- 4e. PRESENT holds what it shows: freeing a buffer's handle while the display scans it out must not give its VRAM back (a WSI destroying a
+   // swapchain does exactly that). The display reads the latest buffer and the one it replaced; the older one is let go at the next present. Section 5
+   // then checks that closing the device releases the rest (a fresh session finds the VRAM heap empty).
+   if (hw) {
+      struct nvg_scanout_info si;
+      struct nvg_info base_info;
+      call(NVG_IOC_INFO, &base_info);
+      if (call(NVG_IOC_SCANOUT_INFO, &si) == 0) {
+         const uint64_t S = (si.size_B + 4095) & ~4095ull;
+         uint32_t b[3];
+         for (int i = 0; i < 3; i++) b[i] = bo_create(si.size_B, NVG_BO_VRAM, NULL);
+         struct nvg_info all_info;
+         call(NVG_IOC_INFO, &all_info);
+         CHECK(b[0] && b[1] && b[2] && all_info.vram_used_B == base_info.vram_used_B + 3 * S,
+               "three screen-sized buffers take %llu bytes of VRAM (%llu)", (unsigned long long)(3 * S), (unsigned long long)(all_info.vram_used_B - base_info.vram_used_B));
+         int shown_ok = 1;
+         uint64_t used_after_free_a = 0, used_b = 0, used_c = 0, used_freed = 0;
+         for (int i = 0; i < 3; i++) {
+            // the previous flip must have taken effect before the next present
+            struct nvg_flip_state fs = { 0 };
+            for (int t = 0; t < 500; t++) {
+               if (call(NVG_IOC_FLIP_STATE, &fs) != 0 || !fs.pending) break;
+               nap_us(2000);
+            }
+            struct nvg_present pr = { .handle = b[i], .offset = 0 };
+            int pr_rc = -1;
+            for (int t = 0; t < 200 && pr_rc != 0; t++) {
+               pr_rc = call(NVG_IOC_PRESENT, &pr);
+               if (pr_rc != 0) nap_us(1000);
+            }
+            if (pr_rc != 0) { shown_ok = 0; break; }
+            struct nvg_info cur;
+            if (i == 0) {
+               struct nvg_bo_free f = { .handle = b[0] };
+               call(NVG_IOC_BO_FREE, &f);
+               call(NVG_IOC_INFO, &cur);
+               used_after_free_a = cur.vram_used_B;
+            } else {
+               call(NVG_IOC_INFO, &cur);
+               if (i == 1) used_b = cur.vram_used_B; else used_c = cur.vram_used_B;
+            }
+         }
+         CHECK(shown_ok, "three buffers were put on the screen one after the other");
+         CHECK(used_after_free_a == all_info.vram_used_B, "the freed buffer's VRAM is still held while the display may read it (%llu, was %llu)",
+               (unsigned long long)used_after_free_a, (unsigned long long)all_info.vram_used_B);
+         CHECK(used_b == all_info.vram_used_B, "still held after the second present (the display may still show it: %llu)", (unsigned long long)used_b);
+         CHECK(used_c == all_info.vram_used_B - S, "the third present lets the first go: %llu, want %llu", (unsigned long long)used_c,
+               (unsigned long long)(all_info.vram_used_B - S));
+         for (int i = 1; i < 3; i++) { struct nvg_bo_free f = { .handle = b[i] }; call(NVG_IOC_BO_FREE, &f); }
+         struct nvg_info fin;
+         call(NVG_IOC_INFO, &fin);
+         used_freed = fin.vram_used_B;
+         printf("  present holds: buffer %llu bytes; VRAM in use base %llu, three buffers %llu, a freed while shown %llu, third shown %llu, last two freed %llu\n",
+                (unsigned long long)S, (unsigned long long)base_info.vram_used_B, (unsigned long long)all_info.vram_used_B,
+                (unsigned long long)used_after_free_a, (unsigned long long)used_c, (unsigned long long)used_freed);
+         CHECK(used_freed == used_c, "freeing the last two handles returns nothing while they are on screen (%llu, was %llu)", (unsigned long long)used_freed,
+               (unsigned long long)used_c);
+      }
+   }
+
    // ---- 5. the device is handed back: close, reopen, and a holder that dies with work in flight
    uint64_t before_vram = 0;
    {

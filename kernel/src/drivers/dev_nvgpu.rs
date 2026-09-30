@@ -417,6 +417,10 @@ struct Session {
     hw: bool,
     /// A buffer of this session is (or was) on the screen: closing the device flips the console's picture back.
     presented: AtomicBool,
+    /// VRAM storage (heap offset, size) the display may be reading because of this session's `PRESENT`s, each held (`hold_storage`): the
+    /// latest buffer shown (or about to be) and the one it replaced, which stays on screen until the latest one's flip takes effect. Freeing
+    /// a BO handle, or the BO's last descriptor, cannot hand that VRAM to someone else while the display scans it out.
+    shown: crate::sync::Mutex<[Option<(u64, u64)>; 2]>,
 }
 
 /// What the display scans out, if a driver flips buffers (`gpu=scanout`).
@@ -443,6 +447,11 @@ impl Drop for Session {
                     _ => break,
                 }
             }
+        }
+        // the display is on the console's picture again: what it was scanning out can go (before `teardown`, which frees the BOs' own holds)
+        let held = core::mem::take(&mut *self.shown.lock());
+        for (off, size) in held.into_iter().flatten() {
+            release_storage(Heap::Vram, off, size);
         }
         // a GPU that did not go idle may still be writing into the BOs' pages: `release_storage` keeps them (`gpu::uapi::leaking`)
         let _quiet = self.dev.lock().teardown();
@@ -504,7 +513,7 @@ pub fn open() -> Result<Box<dyn FileHandle>, Errno> {
     let layout = Layout { arena_bytes: 0, vram_bytes: 0, va_start, va_end };
     let backend = KernelBackend { soft: SoftBackend::default(), arena: arena.clone(), hw, kinds: Default::default() };
     let dev = Device::new(backend, layout);
-    Ok(Box::new(NvgpuHandle { session: Arc::new(Session { slot, dev: crate::sync::Mutex::new(dev), arena, hw, presented: AtomicBool::new(false) }) }))
+    Ok(Box::new(NvgpuHandle { session: Arc::new(Session { slot, dev: crate::sync::Mutex::new(dev), arena, hw, presented: AtomicBool::new(false), shown: crate::sync::Mutex::new([None; 2]) }) }))
 }
 
 // ---- user memory ----------------------------------------------------------------------------------------------------------
@@ -804,7 +813,22 @@ impl NvgpuHandle {
                 let pa = nvgpu::hwq::user_vram_pa(vram_off) + r.offset;
                 let res = crate::framebuffer::FRAMEBUFFER.lock().as_mut().map(|fb| fb.present_external(pa));
                 match res {
-                    Some(Ok(())) => self.session.presented.store(true, Ordering::SeqCst),
+                    Some(Ok(())) => {
+                        self.session.presented.store(true, Ordering::SeqCst);
+                        // The display reads this buffer from the next vblank on, and the one before it until then (this present was accepted, so
+                        // the flip before it had taken effect: the one before *that* is off the screen). Hold both; let the older go.
+                        hold_storage(Heap::Vram, vram_off);
+                        let old = {
+                            let mut shown = self.session.shown.lock();
+                            let old = shown[1];
+                            shown[1] = shown[0];
+                            shown[0] = Some((vram_off, size));
+                            old
+                        };
+                        if let Some((off, sz)) = old {
+                            release_storage(Heap::Vram, off, sz);
+                        }
+                    }
                     Some(Err(crate::framebuffer::PresentError::Busy)) => {
                         self.release_display_claim();
                         return Err(errno::EBUSY);

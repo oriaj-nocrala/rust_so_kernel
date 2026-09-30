@@ -28,12 +28,14 @@ sum "gpu-multi: before: $(grep '^gpu_uapi:' /proc/kdebug)"
 # ---- 1. the test program, sessions in parallel
 /mnt/bin/nvgpu_hw_test > /tmp/nvgpu_hw_test.out 2>&1
 rc=$?
-grep -E 'FAIL|child|clients|four|own client|failure' /tmp/nvgpu_hw_test.out | while read -r l; do sum "gpu-multi: test: $l"; done
+grep -E 'FAIL|child|clients|four|own client|failure|present holds' /tmp/nvgpu_hw_test.out | while read -r l; do sum "gpu-multi: test: $l"; done
 [ $rc = 0 ] || { sum "gpu-multi: nvgpu_hw_test exit=$rc"; fail=1; tail -n 12 /tmp/nvgpu_hw_test.out >> /tmp/gpu-multi.sum; tail -n 12 /tmp/nvgpu_hw_test.out; }
 grep -q 'hardware' /tmp/nvgpu_hw_test.out || { sum "gpu-multi: the test ran against the software device"; fail=1; }
 grep -q 'skip ' /tmp/nvgpu_hw_test.out && { sum "gpu-multi: execution checks were skipped"; fail=1; }
 grep -q 'ok   distinct' /tmp/nvgpu_hw_test.out || { sum "gpu-multi: the four sessions were not shown to have four VA ranges"; fail=1; }
 grep -q 'ok   all_ok' /tmp/nvgpu_hw_test.out || { sum "gpu-multi: not every client ran its launches right"; fail=1; }
+# PRESENT holds the storage it shows (section 4e): all four checks must have run and passed, not been skipped with the display absent
+grep -q 'ok   used_after_free_a == ' /tmp/nvgpu_hw_test.out && grep -q 'ok   used_c == ' /tmp/nvgpu_hw_test.out && grep -q 'ok   used_freed == ' /tmp/nvgpu_hw_test.out || { sum "gpu-multi: section 4e (PRESENT holds what it shows) did not run and pass"; fail=1; }
 grep -q 'ok   code8 == 0' /tmp/nvgpu_hw_test.out && grep -q 'ok   wait_timeline(t8, 2' /tmp/nvgpu_hw_test.out || { sum "gpu-multi: the shared-timeline section (8) did not pass"; fail=1; }
 grep -q 'ok   out_is(&sh8, 1, fillwt_word' /tmp/nvgpu_hw_test.out || { sum "gpu-multi: the child's GPU output was not in the parent's pages after the shared timeline said so"; fail=1; }
 grep -q 'ok   code7 == 0' /tmp/nvgpu_hw_test.out || { sum "gpu-multi: the shared-buffer section (7) did not pass"; fail=1; }
