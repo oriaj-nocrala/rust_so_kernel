@@ -19,7 +19,8 @@ Code: `kernel/src/fs/`, crates `vfs/` and `ext2/` (host tests: `cd vfs && cargo 
 
 - Traits `Inode`/`Filesystem`/`FileHandle`, `MountTable`, `normalize_path`.
 - `resolve()` follows symlinks at every component (open/stat). `resolve_no_follow()` leaves the last one (lstat/readlink). Both stop after 8 hops with `ELOOP`.
-- Mutations (`create`/`mkdir`/`symlink`/`mksocket`/…) default to `EROFS`; only ramfs and ext2 implement them.
+- Mutations (`create`/`mkdir`/`symlink`/`mksocket`/…) default to `EROFS`; only ramfs and ext2 implement them. `Inode::link_child` (hard links) defaults to `EPERM`; `MountTable::link` checks the mount (`EXDEV`) and that the source is not a directory.
+- Open ext2 handles keep their own copy of the inode; the two paths that change a link count (`link_child`, `unlink`) update every live copy (`OPEN_RAWS`), because a handle would otherwise report the old count to `fstat` and write it back on its next write.
 - vfs locks call a relax hook (`vfs::lock::set_relax_hook`) so a spinning CPU still answers TLB shootdowns. `vfs::clock::set_clock` gives ramfs wall time.
 - **Permissions**: there is no permission model and no uids. `Stat::regular()` reports 0o444; ramfs's `regular_writable()` reports 0o644; ext2 reports the real `i_mode`. The write bits matter because BusyBox `vi` checks `st_mode` as well as `access(W_OK)`.
 - **fd table**: 256 fds per process (`EMFILE` beyond). For processes on the console: fd 0 = `/dev/console` (reads come from the keyboard ring), fds 1/2 = `/dev/fb`. Everything written to `/dev/fb` is also mirrored to serial (`[fb] ` prefix) and to klog.

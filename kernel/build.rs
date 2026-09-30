@@ -116,6 +116,8 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "creds_test",
     "statx_test",
     "link_test",
+    "vmshare_test",
+    "seqpacket_test",
     "ext2_robust_test",
     "fpu_test",
     "socket_test",

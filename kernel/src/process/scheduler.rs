@@ -614,12 +614,12 @@ impl Scheduler {
         let mut times = thread.times;
         times.absorb_thread(&thread.dead_threads);
         let ns = thread.exec_ns + thread.dead_threads_ns;
-        let space = &thread.address_space;
+        let tgid = thread.tgid;
         let leader = self.running.iter_mut()
             .filter_map(|r| r.as_deref_mut())
             .filter(|p| p.pid.0 != 0)
             .chain(self.core.iter_queued_mut())
-            .find(|p| !p.is_thread && Arc::ptr_eq(&p.address_space, space));
+            .find(|p| !p.is_thread && p.tgid == tgid);
         if let Some(leader) = leader {
             leader.dead_threads.absorb_thread(&times);
             leader.dead_threads_ns += ns;
@@ -627,8 +627,7 @@ impl Scheduler {
     }
 
     /// The running process's CPU time, its own and its thread group's
-    /// (every process sharing its address space — this kernel has no
-    /// thread-group id; threads are processes that share one). IF=0.
+    /// (every process with its tgid). IF=0.
     pub fn current_cpu_times(&self) -> Option<CpuTimesOf> {
         let me = self.running_ref()?;
         let now = crate::time::ktime_get();
@@ -642,7 +641,7 @@ impl Scheduler {
             group: sched::cputime::ProcTimes::default(),
             group_exec_ns: 0,
         };
-        for p in self.iter_all().filter(|p| Arc::ptr_eq(&p.address_space, &me.address_space)) {
+        for p in self.iter_all().filter(|p| p.tgid == me.tgid) {
             out.group.absorb_thread(&p.times);
             out.group.absorb_thread(&p.dead_threads);
             out.group_exec_ns += exec_now(p) + p.dead_threads_ns;
@@ -768,15 +767,15 @@ impl Scheduler {
         }
     }
 
-    /// A fatal signal ends the whole thread group (the processes sharing the running process's address space), as on Linux:
+    /// A fatal signal ends the whole thread group (the processes with the running process's tgid), as on Linux:
     /// the others get SIGKILL, and the leader is tagged with `sig` first so its parent sees the signal that really ended the
     /// process, not the SIGKILL that carries it out. Called before the running process is killed.
     pub fn kill_thread_group(&mut self, sig: u32) {
         let Some(me) = self.running_ref() else { return };
-        let (my_pid, space) = (me.pid.0, me.address_space.clone());
+        let (my_pid, my_tgid) = (me.pid.0, me.tgid);
         let others: alloc::vec::Vec<(usize, bool)> = self
             .iter_all()
-            .filter(|p| p.pid.0 != my_pid && p.pid.0 != 0 && alloc::sync::Arc::ptr_eq(&p.address_space, &space))
+            .filter(|p| p.pid.0 != my_pid && p.pid.0 != 0 && p.tgid == my_tgid)
             .map(|p| (p.pid.0, p.is_thread))
             .collect();
         for (pid, is_thread) in others {

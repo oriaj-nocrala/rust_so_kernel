@@ -316,7 +316,7 @@ impl<F> SocketTable<F> {
 
     pub fn listen(&mut self, id: SocketId, backlog: i32) -> Result<(), SockError> {
         let s = self.sock_mut(id)?;
-        if s.ty != SockType::Stream {
+        if !s.ty.is_connection_oriented() {
             return Err(SockError::OpNotSupp);
         }
         if s.peer.is_some() {
@@ -363,7 +363,7 @@ impl<F> SocketTable<F> {
                 s.peer_gone = false;
                 Ok(ConnectOutcome { peer: target, wakes: Wakes::default() })
             }
-            SockType::Stream => {
+            SockType::Stream | SockType::SeqPacket => {
                 if already.is_some() {
                     return Err(SockError::IsConn);
                 }
@@ -385,7 +385,7 @@ impl<F> SocketTable<F> {
                 let server_addr = self.sock(target)?.sockname();
                 let client_addr = self.sock(id)?.sockname();
 
-                let child = self.create(SockType::Stream)?;
+                let child = self.create(ty)?;
                 {
                     let c = self.sock_mut(child)?;
                     c.peer = Some(id);
@@ -510,6 +510,33 @@ impl<F> SocketTable<F> {
                 }
                 Ok(SendOutcome { written, wakes })
             }
+            SockType::SeqPacket => {
+                if dest.is_some() {
+                    return Err(SockError::IsConn);
+                }
+                let peer = match peer {
+                    Some(p) => p,
+                    None => {
+                        return Err(if peer_gone { SockError::Pipe } else { SockError::NotConn })
+                    }
+                };
+                if self.sock(peer)?.rd_shut {
+                    return Err(SockError::Pipe);
+                }
+                // A message is never split: too big for the receiver's buffer at all is EMSGSIZE, too big for the room left
+                // right now is "try again".
+                if data.len() > self.sock(peer)?.rx.capacity() {
+                    return Err(SockError::MsgSize);
+                }
+                let batch = core::mem::take(fds);
+                match self.sock_mut(peer)?.rx.push_dgram(data, batch, UnixAddr::Unnamed) {
+                    Ok(()) => Ok(SendOutcome { written: data.len(), wakes: Wakes::readable(peer) }),
+                    Err(returned) => {
+                        *fds = returned;
+                        Err(SockError::Again)
+                    }
+                }
+            }
             SockType::Dgram => {
                 let target = match dest {
                     Some(a) => self.binds.get(a).copied().ok_or(SockError::ConnRefused)?,
@@ -619,6 +646,34 @@ impl<F> SocketTable<F> {
                 }
                 Ok(RecvOutcome { n, full_len: n, fds, from: None, wakes })
             }
+            SockType::SeqPacket => {
+                let read = self.sock_mut(id)?.rx.read_dgram(buf, peek);
+                match read {
+                    Some(d) => {
+                        let mut wakes = Wakes::default();
+                        if !peek {
+                            if let Some(p) = peer {
+                                wakes.push_writable(p);
+                            }
+                        }
+                        Ok(RecvOutcome { n: d.n, full_len: d.full_len, fds: d.fds, from: None, wakes })
+                    }
+                    None => {
+                        // Like a stream: end of file once the peer is gone or has shut its write side.
+                        let peer_done = match peer {
+                            Some(p) => self.sock(p)?.wr_shut,
+                            None => true,
+                        };
+                        if peer.is_none() && !peer_gone {
+                            return Err(SockError::NotConn);
+                        }
+                        if peer_done {
+                            return Ok(RecvOutcome { n: 0, full_len: 0, fds: Vec::new(), from: None, wakes: Wakes::default() });
+                        }
+                        Err(SockError::Again)
+                    }
+                }
+            }
             SockType::Dgram => {
                 let read = self.sock_mut(id)?.rx.read_dgram(buf, peek);
                 match read {
@@ -661,7 +716,7 @@ impl<F> SocketTable<F> {
             let s = self.sock(id)?;
             (s.ty, s.peer)
         };
-        if ty == SockType::Stream && peer.is_none() {
+        if ty.is_connection_oriented() && peer.is_none() {
             return Err(SockError::NotConn);
         }
         {
@@ -699,7 +754,7 @@ impl<F> SocketTable<F> {
         let peer = s.peer.and_then(|p| self.get(p));
 
         match s.ty {
-            SockType::Stream => {
+            SockType::Stream | SockType::SeqPacket => {
                 let eof = s.rd_shut
                     || s.peer_gone
                     || peer.map(|p| p.wr_shut).unwrap_or(false);
@@ -758,7 +813,7 @@ impl<F> SocketTable<F> {
         let s = self.sock(id)?;
         Ok(match s.ty {
             SockType::Stream => s.rx.bytes(),
-            SockType::Dgram => s.rx.peek_dgram_len().unwrap_or(0),
+            SockType::Dgram | SockType::SeqPacket => s.rx.peek_dgram_len().unwrap_or(0),
         })
     }
 }
@@ -800,6 +855,126 @@ mod tests {
         let o = t.recv(id, &mut buf, false)?;
         buf.truncate(o.n);
         Ok((o.n, buf))
+    }
+
+    // ── SOCK_SEQPACKET ──────────────────────────────────────────────────
+
+    #[test]
+    fn seqpacket_keeps_message_boundaries() {
+        let mut t = T::new();
+        let (a, b) = t.socketpair(SockType::SeqPacket).unwrap();
+        send(&mut t, a, b"abc").unwrap();
+        send(&mut t, a, b"de").unwrap();
+        // One recv is one message, however big the buffer.
+        assert_eq!(recv(&mut t, b, 100).unwrap(), (3, b"abc".to_vec()));
+        assert_eq!(recv(&mut t, b, 100).unwrap(), (2, b"de".to_vec()));
+        assert_eq!(recv(&mut t, b, 100), Err(SockError::Again));
+    }
+
+    #[test]
+    fn seqpacket_truncates_a_message_that_does_not_fit_and_drops_the_rest() {
+        let mut t = T::new();
+        let (a, b) = t.socketpair(SockType::SeqPacket).unwrap();
+        send(&mut t, a, b"hello").unwrap();
+        send(&mut t, a, b"next").unwrap();
+        let mut buf = [0u8; 3];
+        let o = t.recv(b, &mut buf, false).unwrap();
+        assert_eq!((o.n, o.full_len), (3, 5));
+        assert_eq!(&buf, b"hel");
+        assert_eq!(recv(&mut t, b, 10).unwrap(), (4, b"next".to_vec()), "the tail of the first message is gone, not glued to the next");
+    }
+
+    #[test]
+    fn seqpacket_peek_leaves_the_message_in_place() {
+        let mut t = T::new();
+        let (a, b) = t.socketpair(SockType::SeqPacket).unwrap();
+        send(&mut t, a, b"peek").unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(t.recv(b, &mut buf, true).unwrap().n, 4);
+        assert_eq!(recv(&mut t, b, 8).unwrap(), (4, b"peek".to_vec()));
+    }
+
+    #[test]
+    fn seqpacket_sees_end_of_file_when_the_peer_closes_and_epipe_on_send() {
+        let mut t = T::new();
+        let (a, b) = t.socketpair(SockType::SeqPacket).unwrap();
+        send(&mut t, a, b"last").unwrap();
+        t.close(a);
+        // What was queued is still delivered, then EOF (n == 0), unlike a datagram socket, which would just say "again".
+        assert_eq!(recv(&mut t, b, 10).unwrap(), (4, b"last".to_vec()));
+        assert_eq!(recv(&mut t, b, 10).unwrap(), (0, vec![]));
+        assert_eq!(send(&mut t, b, b"x"), Err(SockError::Pipe));
+        let m = t.poll(b).unwrap();
+        assert!(m.readable && m.hup);
+    }
+
+    #[test]
+    fn seqpacket_shutdown_write_is_eof_for_the_peer_after_the_queue_drains() {
+        let mut t = T::new();
+        let (a, b) = t.socketpair(SockType::SeqPacket).unwrap();
+        send(&mut t, a, b"one").unwrap();
+        t.shutdown(a, Shutdown::Write).unwrap();
+        assert_eq!(recv(&mut t, b, 10).unwrap(), (3, b"one".to_vec()));
+        assert_eq!(recv(&mut t, b, 10).unwrap(), (0, vec![]));
+        assert_eq!(send(&mut t, a, b"x"), Err(SockError::Pipe));
+    }
+
+    #[test]
+    fn seqpacket_listens_accepts_and_the_accepted_socket_is_a_seqpacket_too() {
+        let mut t = T::new();
+        let l = t.create(SockType::SeqPacket).unwrap();
+        t.bind(l, addr("/tmp/sp")).unwrap();
+        t.listen(l, 4).unwrap();
+        let c = t.create(SockType::SeqPacket).unwrap();
+        t.connect(c, &addr("/tmp/sp")).unwrap();
+        let s = t.accept(l).unwrap().id;
+        assert_eq!(t.sock_type(s).unwrap(), SockType::SeqPacket);
+        send(&mut t, c, b"ping").unwrap();
+        send(&mut t, c, b"pong").unwrap();
+        assert_eq!(recv(&mut t, s, 100).unwrap(), (4, b"ping".to_vec()));
+        assert_eq!(recv(&mut t, s, 100).unwrap(), (4, b"pong".to_vec()));
+        send(&mut t, s, b"back").unwrap();
+        assert_eq!(recv(&mut t, c, 100).unwrap(), (4, b"back".to_vec()));
+    }
+
+    #[test]
+    fn seqpacket_and_stream_do_not_connect_to_each_other() {
+        let mut t = T::new();
+        let l = server(&mut t, "/tmp/st");
+        let c = t.create(SockType::SeqPacket).unwrap();
+        assert_eq!(t.connect(c, &addr("/tmp/st")).err(), Some(SockError::ProtoType));
+        let _ = l;
+    }
+
+    #[test]
+    fn seqpacket_unconnected_send_is_enotconn_and_a_destination_is_eisconn() {
+        let mut t = T::new();
+        let a = t.create(SockType::SeqPacket).unwrap();
+        assert_eq!(send(&mut t, a, b"x"), Err(SockError::NotConn));
+        let (c, _s) = t.socketpair(SockType::SeqPacket).unwrap();
+        let mut fds = vec![];
+        assert_eq!(t.send(c, b"x", &mut fds, Some(&addr("/tmp/nowhere"))).err(), Some(SockError::IsConn));
+    }
+
+    #[test]
+    fn seqpacket_message_larger_than_the_receive_buffer_is_emsgsize() {
+        let mut t = T::new();
+        let (a, b) = t.socketpair(SockType::SeqPacket).unwrap();
+        t.set_rcvbuf(b, 8).unwrap();
+        assert_eq!(send(&mut t, a, &[0u8; 9]), Err(SockError::MsgSize));
+        assert_eq!(send(&mut t, a, &[0u8; 8]), Ok(8));
+    }
+
+    #[test]
+    fn seqpacket_carries_descriptors_with_its_message() {
+        let mut t = T::new();
+        let (a, b) = t.socketpair(SockType::SeqPacket).unwrap();
+        let mut fds = vec![7u32];
+        t.send(a, b"fd", &mut fds, None).unwrap();
+        assert!(fds.is_empty(), "handed over");
+        let mut buf = [0u8; 4];
+        let o = t.recv(b, &mut buf, false).unwrap();
+        assert_eq!((o.n, o.fds), (2, vec![7u32]));
     }
 
     // ── naming ──────────────────────────────────────────────────────────

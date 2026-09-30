@@ -12,8 +12,8 @@
 //! `kernel/src/ipc/channel.rs`: a bespoke IPC of 64-byte fixed messages whose
 //! `socket()` took no arguments at all — no domain, no type, no `sockaddr`,
 //! no `listen()`. Nothing about it was AF_UNIX except the syscall numbers it
-//! borrowed. What lives here is the real thing: `SOCK_STREAM` byte streams
-//! and `SOCK_DGRAM` datagrams, `bind`/`listen`/`accept` with a backlog,
+//! borrowed. What lives here is the real thing: `SOCK_STREAM` byte streams,
+//! `SOCK_DGRAM` datagrams and `SOCK_SEQPACKET` (a connection that keeps message boundaries), `bind`/`listen`/`accept` with a backlog,
 //! `socketpair`, half-close, the abstract namespace, and `SCM_RIGHTS`
 //! descriptor passing.
 //!
@@ -45,7 +45,7 @@
 //!
 //! ## Out of scope, on purpose
 //!
-//! `SOCK_SEQPACKET`, `SO_PEERCRED`/`SCM_CREDENTIALS` (this kernel has no uid
+//! `SO_PEERCRED`/`SCM_CREDENTIALS` (this kernel has no uid
 //! model — every process is root), `MSG_OOB` (AF_UNIX has no out-of-band
 //! data in Linux either), and non-blocking `connect()` handshakes
 //! (`EINPROGRESS`): an AF_UNIX stream connect completes or fails

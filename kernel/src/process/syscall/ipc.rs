@@ -170,6 +170,7 @@ fn parse_type(ty: i32) -> Result<(SockType, bool), i64> {
     let kind = match base {
         1 => SockType::Stream,
         2 => SockType::Dgram,
+        5 => SockType::SeqPacket,
         _ => return Err(ESOCKTNOSUPPORT),
     };
     Ok((kind, ty & SOCK_NONBLOCK != 0))
@@ -707,6 +708,7 @@ pub(super) fn sys_getsockopt(
         SO_TYPE => match SOCKETS.with(|t| t.sock_type(id)) {
             Ok(SockType::Stream) => 1,
             Ok(SockType::Dgram) => 2,
+            Ok(SockType::SeqPacket) => 5,
             Err(e) => return unix::errno_of(e),
         },
         SO_ERROR => match SOCKETS.with(|t| t.take_error(id)) {

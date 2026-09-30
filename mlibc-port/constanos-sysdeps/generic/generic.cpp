@@ -88,6 +88,20 @@ constexpr long SYS_readlink = 89;
 constexpr long SYS_access = 21;
 constexpr long SYS_symlink = 88;
 constexpr long SYS_link = 86;
+constexpr long SYS_getuid = 102;
+constexpr long SYS_getgid = 104;
+constexpr long SYS_setuid = 105;
+constexpr long SYS_setgid = 106;
+constexpr long SYS_geteuid = 107;
+constexpr long SYS_getegid = 108;
+constexpr long SYS_setreuid = 113;
+constexpr long SYS_setregid = 114;
+constexpr long SYS_getgroups = 115;
+constexpr long SYS_setgroups = 116;
+constexpr long SYS_setresuid = 117;
+constexpr long SYS_getresuid = 118;
+constexpr long SYS_setresgid = 119;
+constexpr long SYS_getresgid = 120;
 constexpr long SYS_linkat = 265;
 constexpr long SYS_chmod = 90;
 constexpr long SYS_fchmod = 91;
@@ -968,23 +982,36 @@ pid_t sys_getppid() {
 	return (pid_t)raw_syscall(SYS_getppid);
 }
 
-// No real user/group model exists — this kernel is single-user, everything
-// runs as an implicit root (uid==euid==gid==egid==0). ash's startup (and
-// anything else calling getuid()/geteuid()) needs these to not be missing
-// sysdeps, not for the value to mean anything beyond "not a setuid binary".
-uid_t sys_getuid() { return 0; }
-uid_t sys_geteuid() { return 0; }
-gid_t sys_getgid() { return 0; }
-gid_t sys_getegid() { return 0; }
+// Credentials live in the kernel (`process::creds`): Linux's rules for who may change which id, inherited by fork and kept by
+// exec, but nothing else checks them (files have no owners). Everything boots as root (all ids 0).
+uid_t sys_getuid() { return (uid_t)raw_syscall(SYS_getuid); }
+uid_t sys_geteuid() { return (uid_t)raw_syscall(SYS_geteuid); }
+gid_t sys_getgid() { return (gid_t)raw_syscall(SYS_getgid); }
+gid_t sys_getegid() { return (gid_t)raw_syscall(SYS_getegid); }
 
-// Single-user kernel, single implicit group (root's, gid 0) — `size == 0`
-// is the POSIX "just tell me how many groups there are" probe (must NOT
-// touch `list`, since it may be null/undersized on that call).
+static int ret_errno(long r) { return r < 0 ? (int)-r : 0; }
+int sys_setuid(uid_t uid) { return ret_errno(raw_syscall(SYS_setuid, uid)); }
+int sys_setgid(gid_t gid) { return ret_errno(raw_syscall(SYS_setgid, gid)); }
+int sys_seteuid(uid_t euid) { return ret_errno(raw_syscall(SYS_setresuid, -1L, euid, -1L)); }
+int sys_setegid(gid_t egid) { return ret_errno(raw_syscall(SYS_setresgid, -1L, egid, -1L)); }
+int sys_setreuid(uid_t r, uid_t e) { return ret_errno(raw_syscall(SYS_setreuid, r, e)); }
+int sys_setregid(gid_t r, gid_t e) { return ret_errno(raw_syscall(SYS_setregid, r, e)); }
+int sys_setresuid(uid_t r, uid_t e, uid_t s) { return ret_errno(raw_syscall(SYS_setresuid, r, e, s)); }
+int sys_setresgid(gid_t r, gid_t e, gid_t s) { return ret_errno(raw_syscall(SYS_setresgid, r, e, s)); }
+int sys_getresuid(uid_t *r, uid_t *e, uid_t *s) { return ret_errno(raw_syscall(SYS_getresuid, (long)r, (long)e, (long)s)); }
+int sys_getresgid(gid_t *r, gid_t *e, gid_t *s) { return ret_errno(raw_syscall(SYS_getresgid, (long)r, (long)e, (long)s)); }
+
+// `size == 0` is the POSIX "just tell me how many groups there are" probe (the kernel does not touch `list` then).
 int sys_getgroups(size_t size, gid_t *list, int *ret) {
-	if (size > 0)
-		list[0] = 0;
-	*ret = 1;
+	long r = raw_syscall(SYS_getgroups, (long)size, (long)list);
+	if (r < 0)
+		return (int)-r;
+	*ret = (int)r;
 	return 0;
+}
+
+int sys_setgroups(size_t size, const gid_t *list) {
+	return ret_errno(raw_syscall(SYS_setgroups, (long)size, (long)list));
 }
 
 // symlink()/symlinkat(): real symlink creation — this kernel's SYS_symlink

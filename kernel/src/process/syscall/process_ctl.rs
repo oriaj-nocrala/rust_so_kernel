@@ -446,7 +446,7 @@ pub(super) fn sys_exit(status: i32) -> SyscallResult {
 
 /// exit_group(231): end every thread of the calling process, then exit.
 ///
-/// A thread group is the set of processes sharing one address space (there is no tgid here). The others get SIGKILL; the caller
+/// A thread group is the set of processes with one tgid (`CLONE_THREAD`; a `CLONE_VM` child is not in its parent's). The others get SIGKILL; the caller
 /// exits with `status`. Called from a spawned thread, the *leader* is what the parent waits for: it is told to report
 /// `exit(status)` (`group_exited`) although SIGKILL is what ends it.
 pub(super) fn sys_exit_group(status: i32) -> SyscallResult {
@@ -455,10 +455,10 @@ pub(super) fn sys_exit_group(status: i32) -> SyscallResult {
         // The caller ends the process with `status`: the SIGKILLs below make its threads die "of a signal", and each such death
         // tags the still-unreaped leader (the caller, if it is one) with SIGKILL through `kill_thread_group`.
         me.group_exited = true;
-        let (my_pid, space) = (me.pid.0, me.address_space.clone());
+        let (my_pid, my_tgid) = (me.pid.0, me.tgid);
         let others: alloc::vec::Vec<(usize, bool)> = sched
             .iter_all()
-            .filter(|p| p.pid.0 != my_pid && p.pid.0 != 0 && alloc::sync::Arc::ptr_eq(&p.address_space, &space))
+            .filter(|p| p.pid.0 != my_pid && p.pid.0 != 0 && p.tgid == my_tgid)
             .map(|p| (p.pid.0, p.is_thread))
             .collect();
         for (pid, is_thread) in others {
@@ -500,11 +500,31 @@ pub(crate) fn cancel_all_waiters(pid: usize) {
 }
 
 pub(super) fn sys_fork() -> SyscallResult {
-    fork_impl(0, None, false)
+    fork_impl(0, None, false, Share::NOTHING)
 }
 
-/// `fork`, with `clone`'s two extras: the child resumes on `child_stack` if that is nonzero, and with `tls` as its FS base if given.
-fn fork_impl(child_stack: u64, tls: Option<u64>, vfork: bool) -> SyscallResult {
+/// vfork(58): `clone(CLONE_VM | CLONE_VFORK | SIGCHLD)` on the parent's own stack. The child runs in the parent's memory, and the
+/// parent sleeps until the child execs or dies (a libc's `vfork` wrapper takes care of the shared return address).
+pub(super) fn sys_vfork() -> SyscallResult {
+    fork_impl(0, None, true, Share { vm: true, files: false })
+}
+
+/// What a `clone` without `CLONE_THREAD` shares with its parent instead of copying (`fork` shares nothing).
+#[derive(Clone, Copy)]
+struct Share {
+    /// `CLONE_VM`: one address space, no copy-on-write. The child is still its own process (own tgid, parent, wait status).
+    vm: bool,
+    /// `CLONE_FILES`: one fd table.
+    files: bool,
+}
+
+impl Share {
+    const NOTHING: Share = Share { vm: false, files: false };
+}
+
+/// `fork`, with `clone`'s extras: the child resumes on `child_stack` if that is nonzero, and with `tls` as its FS base if given;
+/// with `vfork` the parent sleeps until the child execs or dies; `share` says what is shared rather than copied.
+fn fork_impl(child_stack: u64, tls: Option<u64>, vfork: bool, share: Share) -> SyscallResult {
     let tf_ptr = current_tf_ptr();
 
     let _irq = crate::process::irq_guard::InterruptGuard::new();
@@ -530,7 +550,12 @@ fn fork_impl(child_stack: u64, tls: Option<u64>, vfork: bool) -> SyscallResult {
                     tf_copy.rsp = child_stack;
                 }
 
-                match unsafe { proc.address_space.fork() } {
+                let child_space = if share.vm {
+                    Ok(proc.address_space.clone())
+                } else {
+                    unsafe { proc.address_space.fork() }.map(alloc::sync::Arc::new)
+                };
+                match child_space {
                     // FS base from the MSR, not `proc.fs_base`: that field is
                     // only refreshed when the parent is switched out, so it is
                     // stale if `arch_prctl` ran since — same reasoning as the
@@ -547,9 +572,13 @@ fn fork_impl(child_stack: u64, tls: Option<u64>, vfork: bool) -> SyscallResult {
         }
     };
 
-    // The fd table is copied (each handle `dup`ed) with `SCHEDULER` released: see `with_fd_table` for the lock order.
-    let files = files_arc.lock().clone();
-    drop(files_arc);
+    // The fd table is copied (each handle `dup`ed) with `SCHEDULER` released: see `with_fd_table` for the lock order. With
+    // `CLONE_FILES` the child holds the parent's table itself.
+    let files = if share.files {
+        files_arc
+    } else {
+        alloc::sync::Arc::new(crate::sync::Mutex::new(files_arc.lock().clone()))
+    };
 
     let kernel_stack = crate::init::processes::allocate_kernel_stack();
 
@@ -612,15 +641,18 @@ fn fork_impl(child_stack: u64, tls: Option<u64>, vfork: bool) -> SyscallResult {
 ///   caller's registers and FPU state, `rsp = stack` (if nonzero) and FS base = `tls` under `CLONE_SETTLS`. The caller gets the
 ///   new thread's pid, its tid. `CLONE_PARENT_SETTID`/`CLONE_CHILD_SETTID` store it at `ptid`/`ctid` before the thread can run;
 ///   `CLONE_CHILD_CLEARTID` registers `ctid` for `Process::clear_child_tid`.
-/// - Without `CLONE_THREAD`: a COW fork (`fork_impl`) on `stack`, whatever `CLONE_VM`/`CLONE_VFORK` say. That is what musl's
-///   `posix_spawn` asks for; the parent is not suspended until the child execs, which is safe because musl reports an exec
-///   failure through a close-on-exec pipe, not shared memory. (close-on-exec is not honoured yet, so a spawn would block.)
+/// - Without `CLONE_THREAD`: a new process (`fork_impl`) that resumes on `stack`. `CLONE_VM` makes it share the parent's address
+///   space instead of a copy-on-write copy (a `vfork` child's writes are the parent's), `CLONE_FILES` the fd table, and
+///   `CLONE_VFORK` suspends the parent until the child execs or dies. It has its own tgid and is the parent's child for
+///   `wait`; only `CLONE_THREAD` puts two processes in one thread group. `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and
+///   `CLONE_CHILD_CLEARTID` are not honoured here (threads only).
 ///
-/// A thread is a process with its own pid: there is no tgid, so `getpid()` in a thread returns the tid. It never zombie-parks on
+/// A thread is a process with its own pid and the group's tgid: `getpid()` in a thread returns the tgid, `gettid()` the tid. It never zombie-parks on
 /// exit (see `Process::is_thread`, `Scheduler::kill_current`). A `Huge2M` VMA under `stack` is recorded as the thread's own and
 /// freed when it dies (mlibc never unmaps its thread stacks).
 pub(super) fn sys_clone(flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) -> SyscallResult {
     const CLONE_VM: u64 = 0x100;
+    const CLONE_FILES: u64 = 0x400;
     const CLONE_SIGHAND: u64 = 0x800;
     const CLONE_VFORK: u64 = 0x4000;
     const CLONE_THREAD: u64 = 0x1_0000;
@@ -630,7 +662,8 @@ pub(super) fn sys_clone(flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) 
     const CLONE_CHILD_SETTID: u64 = 0x100_0000;
 
     if flags & CLONE_THREAD == 0 {
-        return fork_impl(stack, (flags & CLONE_SETTLS != 0).then_some(tls), flags & CLONE_VFORK != 0);
+        let share = Share { vm: flags & CLONE_VM != 0, files: flags & CLONE_FILES != 0 };
+        return fork_impl(stack, (flags & CLONE_SETTLS != 0).then_some(tls), flags & CLONE_VFORK != 0, share);
     }
     if flags & CLONE_VM == 0 || flags & CLONE_SIGHAND == 0 {
         return errno::EINVAL;

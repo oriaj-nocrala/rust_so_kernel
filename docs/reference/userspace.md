@@ -48,7 +48,8 @@ How to add a program or change mlibc/BusyBox: the `userspace-programs` skill. Th
   - `pause()`: a missing sysdep.
 - Sysdeps we added (in `generic/generic.cpp`):
   - memfd, ftruncate, a `vm_map` that passes flags/fd/offset through;
-  - access, symlink, chmod, statvfs, getgroups;
+  - access, symlink, link/linkat, chmod, statvfs;
+  - the id family (`getuid`, `setuid`, `setresuid`, `getgroups`, `setgroups`, …): they call the kernel (`process::creds`);
   - times, getrusage, clock_getres, `sched_getaffinity`, `sysinfo`;
   - `sysconf`: `_SC_CLK_TCK` 100, CPUs from the affinity mask, `_SC_OPEN_MAX` 16, physical pages.
 - Userspace-only stubs: uid/gid are always 0; `uname`/`gethostname` are per-process statics; `getmntent` reads a compiled-in mount table.

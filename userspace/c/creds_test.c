@@ -7,6 +7,8 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <sys/wait.h>
+#include <grp.h>
+#include <errno.h>
 
 static long sc(long nr, long a, long b, long c) {
     long r;
@@ -139,6 +141,24 @@ static int s_groups(void) {
     return local_fail;
 }
 
+// The libc wrappers (mlibc's sysdeps) reach the kernel's ids instead of answering 0.
+static int s_libc(void) {
+    LCHECK(getuid() == 0 && geteuid() == 0 && getgid() == 0 && getegid() == 0, "root at start");
+    gid_t g[3] = {11, 22, 33};
+    LCHECK(setgroups(3, g) == 0, "setgroups");
+    gid_t out[8];
+    LCHECK(getgroups(0, NULL) == 3 && getgroups(8, out) == 3 && out[0] == 11 && out[2] == 33, "getgroups returns them");
+    LCHECK(setgid(200) == 0 && getgid() == 200 && getegid() == 200, "setgid");
+    LCHECK(setuid(300) == 0 && getuid() == 300 && geteuid() == 300, "setuid");
+    uid_t r, e, s;
+    LCHECK(getresuid(&r, &e, &s) == 0 && r == 300 && e == 300 && s == 300, "getresuid %u %u %u", r, e, s);
+    LCHECK(setuid(0) == -1 && errno == EPERM, "no way back to root");
+    LCHECK(seteuid(300) == 0 && setegid(200) == 0, "seteuid/setegid to the current ids");
+    LCHECK(setreuid(-1, 5) == -1 && errno == EPERM, "setreuid to a foreign euid");
+    LCHECK(setgroups(1, g) == -1 && errno == EPERM, "setgroups is root-only");
+    return local_fail;
+}
+
 // Ids survive fork (inherited) and exec (kept). The exec'd copy checks, via argv[1].
 static int s_inherit(void) {
     uint32_t g[2] = {7, 8};
@@ -191,6 +211,7 @@ int main(int argc, char **argv) {
     in_child("gids", s_gids);
     in_child("groups", s_groups);
     in_child("inherit across fork and exec", s_inherit);
+    in_child("libc wrappers", s_libc);
     CHECK(sc(GETUID, 0, 0, 0) == 0, "the parent was never touched");
     printf(failures ? "creds_test: %d FAILURES\n" : "creds_test: OK\n", failures);
     return failures ? 1 : 0;

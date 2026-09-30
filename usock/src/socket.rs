@@ -15,12 +15,20 @@ use crate::queue::RecvQueue;
 use crate::SocketId;
 
 /// `SOCK_STREAM` / `SOCK_DGRAM`, the only two types AF_UNIX needs here.
-/// (`SOCK_SEQPACKET` is a real third one; it is not implemented — see the
-/// crate doc's scope note.)
+/// `SeqPacket` is connection-oriented like `Stream` (listen/accept/connect, half-close, EOF) but keeps message boundaries
+/// like `Dgram` (one `send` is one `recv`; a short buffer truncates the message).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SockType {
     Stream,
     Dgram,
+    SeqPacket,
+}
+
+impl SockType {
+    /// Sockets that connect through `listen`/`accept` and see EOF when the peer goes.
+    pub fn is_connection_oriented(self) -> bool {
+        !matches!(self, SockType::Dgram)
+    }
 }
 
 /// `shutdown(2)`'s `how`, with Linux's real values.

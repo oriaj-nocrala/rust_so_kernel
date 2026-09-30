@@ -5,7 +5,7 @@ Code: `kernel/src/process/` (`scheduler.rs`, `timer_preempt.rs`, `trapframe.rs`,
 ## Process
 
 - `Process` holds: pid, state, base and effective priority (0–10), name, `Box<TrapFrame>`, kernel stack, `Arc<AddressSpace>`, fd table, sid/pgid, ctty, signal state, times.
-- **A thread is a process that shares its `AddressSpace`.** `Process::pid` is the tid, `Process::tgid` the thread-group id (the leader's pid, what `getpid`, `kill`, `waitpid`, a child's `parent_pid` and `/proc/self` use). Kernel code that finds a group still uses `Arc::ptr_eq` on the `AddressSpace` (`exit_group`, `kill_thread_group`); a thread's `parent_pid` is its group's parent.
+- **A thread is a process that shares its `AddressSpace`.** `Process::pid` is the tid, `Process::tgid` the thread-group id (the leader's pid, what `getpid`, `kill`, `waitpid`, a child's `parent_pid` and `/proc/self` use). Kernel code that finds a group compares `tgid` (`exit_group`, `kill_thread_group`, CPU-time sums, `fold_into_leader`), not the `AddressSpace`: a `clone(CLONE_VM)` without `CLONE_THREAD` shares the `Arc<AddressSpace>` but is its own process and group. A thread's `parent_pid` is its group's parent.
 - Names:
   - `name` (Linux `comm`, 15 bytes) = basename of the path *as passed* to exec, before symlinks are followed.
   - `exe_name` = the canonical resolved path (`/proc/<pid>/exe`).
