@@ -736,7 +736,7 @@ impl Inode for SelfInode {
     }
 
     fn readlink(&self) -> Result<String, Errno> {
-        let pid = crate::process::scheduler::current_pid_safe().ok_or(Errno::ENOENT)?;
+        let pid = crate::process::scheduler::current_tgid_safe().ok_or(Errno::ENOENT)?;
         Ok(format!("/proc/{}", pid))
     }
 }

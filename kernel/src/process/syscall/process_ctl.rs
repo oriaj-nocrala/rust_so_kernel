@@ -204,31 +204,35 @@ fn sleep_until(expiry: u64, syscall_nr: u64) -> SyscallResult {
     unsafe { crate::process::trapframe::jump_to_user(next_tf) }
 }
 
+/// getpid(39): the thread-group id (`Process::tgid`): the same in every thread of a process, and the pid `kill`/`waitpid` and a child's
+/// `getppid` use. The per-thread id is `gettid`.
 pub(super) fn sys_getpid() -> SyscallResult {
     with_scheduler(|scheduler| {
-        scheduler.current_pid().map(|pid| pid.0 as SyscallResult).unwrap_or(0)
+        scheduler.running_ref().map(|p| p.tgid as SyscallResult).unwrap_or(0)
     })
 }
 
 /// gettid(186). A thread is a process here (`sys_clone` gives it its own pid), so its tid is that pid.
 pub(super) fn sys_gettid() -> SyscallResult {
-    sys_getpid()
+    with_scheduler(|scheduler| {
+        scheduler.current_pid().map(|pid| pid.0 as SyscallResult).unwrap_or(0)
+    })
 }
 
-/// tkill(200) / tgkill(234): a signal to one thread. Threads are processes with their own pid, so this is `kill` on that pid
-/// (`tgkill` also names the thread group, which is not checked).
+/// tkill(200) / tgkill(234): a signal to one thread, not to whichever thread of the group takes it (`kill_impl` with `exact`).
 pub(super) fn sys_tkill(tid: i64, sig: u32) -> SyscallResult {
     if tid <= 0 {
         return errno::EINVAL;
     }
-    sys_kill(tid, sig)
+    kill_impl(tid, sig, true, None)
 }
 
+/// `tgkill` also names the thread group, and ESRCH if `tid` is not in it (a tid reused by another process cannot be hit).
 pub(super) fn sys_tgkill(tgid: i64, tid: i64, sig: u32) -> SyscallResult {
     if tgid <= 0 || tid <= 0 {
         return errno::EINVAL;
     }
-    sys_kill(tid, sig)
+    kill_impl(tid, sig, true, Some(tgid as usize))
 }
 
 /// getppid(110): the parent's pid — `Process::parent_pid`, which
@@ -413,7 +417,7 @@ fn fork_impl(child_stack: u64, tls: Option<u64>) -> SyscallResult {
                     // only refreshed when the parent is switched out, so it is
                     // stale if `arch_prctl` ran since — same reasoning as the
                     // live `fpu::save` above.
-                    Ok(child_as) => (child_as, proc.pid, crate::process::scheduler::read_fs_base(), proc.files.lock().clone(), tf_copy, proc.cwd.clone(), (proc.pgid, proc.sid, proc.ctty), proc.exe_name.clone(),
+                    Ok(child_as) => (child_as, crate::process::Pid(proc.tgid), crate::process::scheduler::read_fs_base(), proc.files.lock().clone(), tf_copy, proc.cwd.clone(), (proc.pgid, proc.sid, proc.ctty), proc.exe_name.clone(),
                         (proc.signal_handlers, proc.sig_restart, proc.blocked_signals, proc.sig_extra, proc.altstack), (proc.name, proc.cmdline.clone())),
                     Err(e) => {
                         serial_println!("fork: address_space.fork() failed: {}", e);
@@ -508,10 +512,10 @@ pub(super) fn sys_clone(flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) 
     unsafe { crate::process::fpu::save(&mut fpu_state); }
     let parent_fs_base = crate::process::scheduler::read_fs_base();
 
-    let (parent_pid, address_space, files, parent_cwd, (parent_pgid, parent_sid, parent_ctty), parent_exe_name, parent_signals, (parent_comm, parent_cmdline)) = {
+    let ((tgid, group_parent), address_space, files, parent_cwd, (parent_pgid, parent_sid, parent_ctty), parent_exe_name, parent_signals, (parent_comm, parent_cmdline)) = {
         let sched = crate::process::scheduler::local_scheduler();
         match sched.running_ref() {
-            Some(proc) => (proc.pid, proc.address_space.clone(), proc.files.clone(), proc.cwd.clone(), (proc.pgid, proc.sid, proc.ctty), proc.exe_name.clone(),
+            Some(proc) => ((proc.tgid, proc.parent_pid), proc.address_space.clone(), proc.files.clone(), proc.cwd.clone(), (proc.pgid, proc.sid, proc.ctty), proc.exe_name.clone(),
                 (proc.signal_handlers, proc.sig_restart, proc.blocked_signals, proc.sig_extra), (proc.name, proc.cmdline.clone())),
             None => return errno::ESRCH,
         }
@@ -539,7 +543,7 @@ pub(super) fn sys_clone(flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) 
 
     let mut thread = alloc::boxed::Box::new(
         crate::process::Process::new_thread(
-            pid, parent_pid,
+            pid, tgid, group_parent,
             x86_64::VirtAddr::new(child_tf.rip), x86_64::VirtAddr::new(child_tf.rsp),
             kernel_stack, address_space, files, owned_stack_vma, parent_cwd, parent_pgid, parent_sid, parent_exe_name,
         )
@@ -969,7 +973,7 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
     let outcome = {
         let mut scheduler = crate::process::scheduler::local_scheduler();
 
-        let caller_pid = scheduler.current_pid();
+        let caller_pid = scheduler.running_ref().map(|p| crate::process::Pid(p.tgid));
         let caller_pgid = scheduler.running_ref().map(|p| p.pgid).unwrap_or(0);
 
         let target = match pid_arg {
@@ -1037,7 +1041,7 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
             // reaping with WNOHANG until it sees ECHILD — a 0 here sent it
             // back to sigsuspend with nothing left to wake it.
             let has_any = scheduler.iter_all()
-                .any(|p| p.parent_pid == caller_pid && target.matches(p.pid.0, p.pgid));
+                .any(|p| !p.is_thread && p.parent_pid == caller_pid && target.matches(p.pid.0, p.pgid));
             if !has_any {
                 Outcome::Return(errno::ECHILD)
             } else if options & WNOHANG != 0 {
@@ -1113,6 +1117,13 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
 /// addition to (not instead of) the normal `queue_signal`, so a handler
 /// installed for SIGCONT still runs once the process resumes.
 pub(super) fn sys_kill(target_pid: i64, sig: u32) -> SyscallResult {
+    kill_impl(target_pid, sig, false, None)
+}
+
+/// `kill`, `tkill` and `tgkill`. `pid > 0` names a thread group for `kill` (any of its threads' ids will do): the signal goes
+/// to the thread that can take it (`Scheduler::resolve_signal_target`). With `exact` (`tkill`/`tgkill`) it names one thread;
+/// `in_group` makes `tgkill` fail with ESRCH when that thread belongs to another group.
+fn kill_impl(target_pid: i64, sig: u32, exact: bool, in_group: Option<usize>) -> SyscallResult {
     if sig as usize >= crate::process::signal::NUM_SIGNALS {
         return errno::EINVAL;
     }
@@ -1120,8 +1131,7 @@ pub(super) fn sys_kill(target_pid: i64, sig: u32) -> SyscallResult {
         // POSIX: no signal is sent, only the checks are made — does the target exist? (BusyBox's `timeout` probes with it.)
         if target_pid > 0 {
             return with_scheduler(|sched| {
-                let pid = target_pid as usize;
-                if sched.current_pid().map(|p| p.0) == Some(pid) || sched.find_process_mut(pid).is_some() { 0 } else { errno::ESRCH }
+                if sched.resolve_signal_target(target_pid as usize, sig, exact, in_group).is_some() { 0 } else { errno::ESRCH }
             });
         }
         return 0;
@@ -1149,7 +1159,9 @@ pub(super) fn sys_kill(target_pid: i64, sig: u32) -> SyscallResult {
             sched.signal_group(pgid, sig);
             0
         } else {
-            let target_pid = target_pid as usize;
+            let Some(target_pid) = sched.resolve_signal_target(target_pid as usize, sig, exact, in_group) else {
+                return errno::ESRCH;
+            };
             let is_self = sched.current_pid().map(|p| p.0) == Some(target_pid);
             if is_self {
                 if let Some(proc) = sched.running_mut() {
@@ -1203,7 +1215,7 @@ pub(super) fn sys_setpgid(pid: i64, pgid: i64) -> SyscallResult {
 
     with_scheduler(|sched| {
         let (caller_pid, caller_sid) = match sched.running_ref() {
-            Some(p) => (p.pid.0, p.sid),
+            Some(p) => (p.tgid, p.sid),
             None => return errno::ESRCH,
         };
         let target_pid = if pid == 0 { caller_pid } else { pid as usize };
@@ -1258,7 +1270,7 @@ fn lookup_id(pid: i64, field: fn(&crate::process::Process) -> u32) -> SyscallRes
     }
 
     with_scheduler(|sched| {
-        let caller_pid = sched.current_pid().map(|p| p.0).unwrap_or(0);
+        let caller_pid = sched.running_ref().map(|p| p.tgid).unwrap_or(0);
         let target_pid = if pid == 0 { caller_pid } else { pid as usize };
 
         if target_pid == caller_pid {

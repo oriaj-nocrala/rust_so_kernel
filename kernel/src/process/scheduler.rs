@@ -956,6 +956,29 @@ impl Scheduler {
         self.queue_signal_to_group(pgid, sig);
     }
 
+    /// The process (thread) a signal sent to `pid` lands on. `None` if there is no such thread (or, with `in_group`, it is not
+    /// in that thread group). `exact` (`tkill`/`tgkill`): `pid` itself. Otherwise `pid` names its whole thread group and the
+    /// signal is process-directed: the leader takes it unless it blocks `sig`, then the first live thread that does not; if
+    /// every thread blocks it, the leader keeps it pending. A leader that is a zombie with live threads is skipped.
+    pub fn resolve_signal_target(&self, pid: usize, sig: u32, exact: bool, in_group: Option<usize>) -> Option<usize> {
+        let target = self.iter_all().find(|p| p.pid.0 == pid && pid != 0)?;
+        if in_group.is_some_and(|g| g != target.tgid) {
+            return None;
+        }
+        if exact {
+            return Some(pid);
+        }
+        let tgid = target.tgid;
+        let takes = |p: &&Process| !matches!(p.state, ProcessState::Zombie) && p.blocked_signals & (1u64 << sig) == 0;
+        let live: alloc::vec::Vec<&Process> = self.iter_all().filter(|p| p.tgid == tgid && p.pid.0 != 0).collect();
+        let leader = live.iter().copied().find(|p| p.pid.0 == tgid);
+        let pick = leader.filter(|p| takes(&p))
+            .or_else(|| live.iter().copied().find(takes))
+            .or(leader)
+            .or_else(|| live.first().copied());
+        pick.map(|p| p.pid.0)
+    }
+
     /// Send `sig` to one process, `kill(pid)`'s way (see `signal_group`).
     pub fn signal_pid(&mut self, pid: usize, sig: u32) {
         if super::signal::resumes_stopped(sig) {
@@ -1260,7 +1283,7 @@ impl Scheduler {
     /// their own copy.
     pub fn notify_child_death(&mut self, dead_pid: usize, parent_pid: Option<Pid>) {
         if let Some(parent_pid) = parent_pid {
-            if self.current_pid() == Some(parent_pid) {
+            if self.running_ref().map(|p| p.tgid) == Some(parent_pid.0) {
                 if let Some(parent) = self.running_mut() {
                     super::signal::queue_signal(parent, super::signal::SIGCHLD);
                 }
@@ -1283,7 +1306,7 @@ impl Scheduler {
         // `waitpid()` target happens to match by pid/pgid coincidence.
         let mut waker_pid: Option<usize> = None;
         for proc in self.core.wait_queue_mut().iter_mut() {
-            if Some(proc.pid) == parent_pid
+            if Some(Pid(proc.tgid)) == parent_pid
                 && matches!(proc.state, ProcessState::Blocked)
                 && proc.waiting_for.map(|t| t.matches(dead_pid, dead_pgid)).unwrap_or(false)
             {
@@ -1340,7 +1363,7 @@ impl Scheduler {
         }
         let mut zombies: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
         let mut adopt = |p: &mut Process| {
-            if p.parent_pid == Some(dead) && !p.is_thread {
+            if p.parent_pid == Some(dead) {
                 p.parent_pid = Some(Pid(INIT_PID));
                 if matches!(p.state, ProcessState::Zombie) {
                     zombies.push(p.pid.0);
@@ -1367,7 +1390,7 @@ impl Scheduler {
     /// real exit, or another stop/continue cycle, can still be observed.
     pub fn notify_child_stopped(&mut self, stopped_pid: usize, parent_pid: Option<Pid>) {
         if let Some(parent_pid) = parent_pid {
-            if self.current_pid() == Some(parent_pid) {
+            if self.running_ref().map(|p| p.tgid) == Some(parent_pid.0) {
                 if let Some(parent) = self.running_mut() {
                     super::signal::queue_signal(parent, super::signal::SIGCHLD);
                 }
@@ -1387,7 +1410,7 @@ impl Scheduler {
         const WUNTRACED: i32 = 2;
         let mut waker_pid: Option<usize> = None;
         for proc in self.core.wait_queue_mut().iter_mut() {
-            if Some(proc.pid) == parent_pid
+            if Some(Pid(proc.tgid)) == parent_pid
                 && matches!(proc.state, ProcessState::Blocked)
                 && proc.waiting_options & WUNTRACED != 0
                 && proc.waiting_for.map(|t| t.matches(stopped_pid, stopped_pgid)).unwrap_or(false)
@@ -1901,6 +1924,14 @@ pub fn current_pid_safe() -> Option<usize> {
     let pid = local_scheduler().current_pid().map(|p| p.0);
     unsafe { core::arch::asm!("sti"); }
     pid
+}
+
+/// `current_pid_safe`, but the thread-group id (`getpid`'s): what `/proc/self` names.
+pub fn current_tgid_safe() -> Option<usize> {
+    unsafe { core::arch::asm!("cli"); }
+    let tgid = local_scheduler().running_ref().map(|p| p.tgid);
+    unsafe { core::arch::asm!("sti"); }
+    tgid
 }
 
 /// Look up an arbitrary process's `exe_name` by pid — checked against

@@ -80,7 +80,13 @@ pub enum PrivilegeLevel {
 }
 
 pub struct Process {
+    /// The thread id (`gettid`). Every thread is a process here, with its own pid.
     pub pid: Pid,
+    /// The thread-group id (`getpid`): the pid of the group leader, i.e. the process `fork`/`exec` made. Equal to `pid` for
+    /// everything but a thread made by `clone(CLONE_THREAD)`, which takes its creator's.
+    pub tgid: usize,
+    /// The *process's* parent (`getppid`, whom `waitpid`/SIGCHLD concern): a forked child's is its forker's `tgid`, a thread's is
+    /// its group's parent, so `reparent_children` moves both together.
     pub parent_pid: Option<Pid>,
     pub exit_status: i32,
     pub state: ProcessState,
@@ -385,6 +391,7 @@ impl Process {
         
         Process {
             pid,
+            tgid: pid.0,
             parent_pid: None,
             exit_status: 0,
             state: ProcessState::Ready,
@@ -479,6 +486,7 @@ impl Process {
         
         Process {
             pid,
+            tgid: pid.0,
             parent_pid: None,
             exit_status: 0,
             state: ProcessState::Ready,
@@ -564,6 +572,7 @@ impl Process {
         crate::debug::inc_forks();
         Process {
             pid,
+            tgid: pid.0,
             parent_pid: Some(parent_pid),
             exit_status: 0,
             state: ProcessState::Ready,
@@ -633,7 +642,8 @@ impl Process {
     /// siblings — POSIX threads see each other's open files.
     pub fn new_thread(
         pid: Pid,
-        parent_pid: Pid,
+        tgid: usize,
+        parent_pid: Option<Pid>,
         entry: VirtAddr,
         stack: VirtAddr,
         kernel_stack: VirtAddr,
@@ -670,13 +680,14 @@ impl Process {
         trapframe.r15 = 0;
 
         crate::serial_println!(
-            "Creating THREAD PID {} (parent PID {}): entry={:#x} stack={:#x}, sharing address space",
-            pid.0, parent_pid.0, entry.as_u64(), stack.as_u64(),
+            "Creating THREAD PID {} (tgid {}): entry={:#x} stack={:#x}, sharing address space",
+            pid.0, tgid, entry.as_u64(), stack.as_u64(),
         );
 
         Process {
             pid,
-            parent_pid: Some(parent_pid),
+            tgid,
+            parent_pid,
             exit_status: 0,
             state: ProcessState::Ready,
             privilege: PrivilegeLevel::User,
