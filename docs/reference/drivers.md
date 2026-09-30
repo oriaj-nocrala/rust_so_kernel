@@ -9,6 +9,7 @@ A device is a `FileHandle` (`read`/`write`/`ioctl`/`stat`/`dup`/…). Device sta
 | Device | What |
 |--------|------|
 | `/dev/null`, `/dev/zero` | |
+| `/dev/urandom`, `/dev/random` | the same non-blocking generator (`kernel/src/random.rs`, `hal::random`); a write mixes in without crediting entropy |
 | `/dev/console` | serial; stdin reads come from the keyboard ring |
 | `/dev/fb` | text console (`graphics.md`) |
 | `/dev/fb0` | exclusive graphics mode (`graphics.md`) |

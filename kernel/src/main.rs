@@ -44,6 +44,7 @@ mod pci;
 mod process;
 mod reboot;
 mod pit;
+mod random;
 mod rtc;
 mod serial;
 mod smp;

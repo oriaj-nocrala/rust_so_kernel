@@ -218,3 +218,38 @@ fn suspend(new_mask: Option<u64>) -> SyscallResult {
         Some(next) => unsafe { crate::process::trapframe::jump_to_user(next) },
     }
 }
+
+// ── sigaltstack(131) ───────────────────────────────────────────────────────
+
+/// sigaltstack(131): int sigaltstack(const stack_t *ss, stack_t *old_ss)
+///
+/// Accepts the call and reports "no alternate stack" (`SS_DISABLE`): handlers still run on the interrupted stack, `SA_ONSTACK`
+/// is not honoured. That is enough for what runtimes do at startup (Rust's `std` installs one for its stack-overflow handler
+/// and tolerates a handler that never gets to use it); a real alternate stack would need signal delivery to switch to it.
+pub(super) fn sys_sigaltstack(ss: u64, old_ss: u64) -> SyscallResult {
+    const SS_DISABLE: i32 = 2;
+    const SS_ONSTACK: i32 = 1;
+    // stack_t { void *ss_sp; int ss_flags; size_t ss_size; } = 24 bytes
+    if old_ss != 0 {
+        if validate_user_buffer(old_ss, 24).is_err() {
+            return errno::EFAULT;
+        }
+        // SAFETY: validated as a user-space range.
+        unsafe {
+            *(old_ss as *mut u64) = 0;
+            *((old_ss + 8) as *mut i32) = SS_DISABLE;
+            *((old_ss + 16) as *mut u64) = 0;
+        }
+    }
+    if ss != 0 {
+        if validate_user_buffer(ss, 24).is_err() {
+            return errno::EFAULT;
+        }
+        // SAFETY: as above.
+        let flags = unsafe { *((ss + 8) as *const i32) };
+        if flags & !(SS_DISABLE | SS_ONSTACK) != 0 {
+            return errno::EINVAL;
+        }
+    }
+    0
+}

@@ -18,6 +18,7 @@ pub mod dev_mouse_event;
 pub mod dev_null;
 pub mod dev_vblank;
 pub mod dev_zero;
+pub mod dev_random;
 pub mod serial_console;
 pub mod framebuffer_console;
 
@@ -39,6 +40,9 @@ static DEVICES: &[DeviceEntry] = &[
     DeviceEntry { path: "/dev/kbd",     open: || Ok(dev_kbd::open()) },
     DeviceEntry { path: "/dev/null",    open: || Ok(dev_null::open()) },
     DeviceEntry { path: "/dev/zero",    open: || Ok(dev_zero::open()) },
+    // Both are the same non-blocking generator (`random.rs`), as on Linux since 5.6.
+    DeviceEntry { path: "/dev/urandom", open: || Ok(dev_random::open("/dev/urandom")) },
+    DeviceEntry { path: "/dev/random",  open: || Ok(dev_random::open("/dev/random")) },
     DeviceEntry { path: "/dev/console", open: || Ok(serial_console::open()) },
     DeviceEntry { path: "/dev/fb",      open: || Ok(framebuffer_console::open()) },
     // The compositor's screen: exclusive, and open = graphics mode.

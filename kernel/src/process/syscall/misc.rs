@@ -373,3 +373,36 @@ pub(super) fn sys_sched_getaffinity(pid: i64, len: usize, mask_ptr: u64) -> Sysc
     MASK_BYTES as SyscallResult
 }
 
+
+// ── getrandom(318) ─────────────────────────────────────────────────────────
+
+/// getrandom(318): ssize_t getrandom(void *buf, size_t buflen, unsigned int flags)
+///
+/// Served by `crate::random` (ChaCha20, seeded on first use). It never blocks: the generator is seeded synchronously, so
+/// `GRND_NONBLOCK` has nothing to do, and `GRND_RANDOM`/`GRND_INSECURE` read the same stream (Linux since 5.6 does the same
+/// for `GRND_RANDOM`). At most 32 MiB - 1 are returned per call, as on Linux.
+pub(super) fn sys_getrandom(buf: u64, len: usize, flags: u32) -> SyscallResult {
+    const GRND_NONBLOCK: u32 = 1;
+    const GRND_RANDOM: u32 = 2;
+    const GRND_INSECURE: u32 = 4;
+    if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0 || (flags & GRND_RANDOM != 0 && flags & GRND_INSECURE != 0) {
+        return errno::EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let len = len.min(0x1ff_ffff);
+    if let Err(e) = validate_user_buffer(buf, len) {
+        return e;
+    }
+    let mut tmp = [0u8; 256];
+    let mut done = 0usize;
+    while done < len {
+        let n = (len - done).min(tmp.len());
+        crate::random::fill(&mut tmp[..n]);
+        // SAFETY: the range was validated as user space; a fault demand-pages or kills the caller, as for any user store.
+        unsafe { core::ptr::copy_nonoverlapping(tmp.as_ptr(), (buf + done as u64) as *mut u8, n) };
+        done += n;
+    }
+    len as SyscallResult
+}

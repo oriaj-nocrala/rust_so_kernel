@@ -43,7 +43,7 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 | 59 | exec | `(path, argv, envp)`. Resolved through the VFS with symlinks followed. Caught signals go back to `SIG_DFL`; ignored stay ignored; mask and pending carry over |
 | 60 | exit | See Process death in `processes-and-scheduling.md` |
 | 61 | waitpid | POSIX pid forms, `WNOHANG`/`WUNTRACED`, `WIFSIGNALED`. No matching child → `ECHILD`, even with `WNOHANG` |
-| 62 | kill | pid >0, 0, <-1. Interrupts an interruptible wait. `SIGCONT` and `SIGKILL` resume a stopped target |
+| 62 | kill | pid >0, 0, <-1. Interrupts an interruptible wait. `SIGCONT` and `SIGKILL` resume a stopped target. Signal 0 only probes that the pid exists (`ESRCH` otherwise) |
 | 72 | fcntl | Only `F_DUPFD`/`F_DUPFD_CLOEXEC` do something |
 | 77 | ftruncate | memfds only (`EINVAL` otherwise); shrinking a mapped one → `EBUSY` |
 | 82/83/84/87 | rename/mkdir/rmdir/unlink | ramfs and ext2; `EROFS` elsewhere |
@@ -57,7 +57,11 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 | 158 | arch_prctl | `ARCH_SET_FS` |
 | 162 | sync | Flushes the kernel log to the USB log partition (ext2 writes are synchronous). Errors: `ENODEV`/`EBUSY`/`EIO` |
 | 169 | reboot | Flushes the log, then resets: FADT `RESET_REG` → port 0xCF9 → 8042 0xFE → triple fault (`reboot.rs`). `HALT`/`POWER_OFF` just stop |
-| 202 | futex | wait/wake |
+| 131 | sigaltstack | Accepts and reports `SS_DISABLE`; handlers still run on the interrupted stack (`SA_ONSTACK` is not honoured) |
+| 186/200/234 | gettid/tkill/tgkill | A thread is a process with its own pid, so tid = pid and `tkill` = `kill` on it; `tgkill` does not check the group |
+| 202 | futex | `WAIT` (relative timeout, `ETIMEDOUT`), `WAIT_BITSET` (absolute `CLOCK_MONOTONIC`, or `CLOCK_REALTIME` with the flag; Rust `std` waits with it), `WAKE`, `WAKE_BITSET`, `REQUEUE`/`CMP_REQUEUE`. Not `WAKE_OP`/PI. A timeout already past returns `ETIMEDOUT` without arming a timer |
+| 230 | clock_nanosleep | Linux ABI (`timespec`), unlike 35. `TIMER_ABSTIME` on realtime/monotonic/boottime; `rem` is never written, so an interrupted sleep restarts with the whole time when retried |
+| 318 | getrandom | `crate::random` (ChaCha20, seeded on first use from RDSEED/RDRAND, TSC, clock, jitter). Never blocks; flags validated. Also `/dev/urandom`, `/dev/random` |
 | 204 | sched_getaffinity | The scheduling CPUs; returns 8. No setaffinity |
 | 213/232/233 | epoll_create/wait/ctl | Shares poll's readiness |
 | 217 | getdents64 | `linux_dirent64` |

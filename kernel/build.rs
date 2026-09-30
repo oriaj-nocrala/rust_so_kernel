@@ -89,6 +89,7 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "producer_consumer",
     "mlibc_signal_test",
     "stat_test",
+    "linux_abi_test",
     "argv_test",
     "jobctl_test",
     "ext2_robust_test",

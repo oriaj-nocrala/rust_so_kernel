@@ -44,6 +44,7 @@ pub mod msc;
 pub mod pci;
 pub mod pcicfg;
 pub mod pit;
+pub mod random;
 pub mod ring;
 pub mod rtc;
 pub mod smp;

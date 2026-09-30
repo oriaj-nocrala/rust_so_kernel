@@ -99,18 +99,68 @@ pub(super) fn sys_yield() -> SyscallResult {
 /// sys_nanosleep — block the calling process for at least `ns` nanoseconds.
 ///
 /// Returns 0 when the sleep completes. Returns immediately (0) if ns == 0.
-///
-/// LOCKING (see hrtimer.rs for full analysis):
-///   cli → scheduler lock → QUEUE lock (hrtimer::start) → QUEUE released →
-///   block_current → never returns here.
 pub(super) fn sys_nanosleep(ns: u64) -> SyscallResult {
     if ns == 0 {
         return 0;
     }
+    sleep_until(crate::time::ktime_get().saturating_add(ns), 35)
+}
 
-    let now = crate::time::ktime_get();
-    let expiry = now.saturating_add(ns);
+/// clock_nanosleep(230): int clock_nanosleep(clockid_t, int flags, const struct timespec *req, struct timespec *rem)
+///
+/// The Linux ABI (`req` is a `timespec`), unlike `nanosleep(35)` above, which keeps this port's plain-nanoseconds form for
+/// mlibc. `TIMER_ABSTIME` sleeps until an absolute time on the clock named: the monotonic ones are `ktime`, `CLOCK_REALTIME`
+/// is `ktime` shifted by the wall clock (the same reading `clock_gettime` gives). A time already past returns 0 at once.
+/// `rem` is never written: an interrupted sleep reports `EINTR` without the time left (a loop that retries with the same
+/// `req`, as Rust's `thread::sleep` does, then sleeps the whole time again).
+pub(super) fn sys_clock_nanosleep(clock: u64, flags: u32, req: u64, _rem: u64) -> SyscallResult {
+    const TIMER_ABSTIME: u32 = 1;
+    const CLOCK_REALTIME: u64 = 0;
+    const CLOCK_MONOTONIC: u64 = 1;
+    const CLOCK_MONOTONIC_RAW: u64 = 4;
+    const CLOCK_BOOTTIME: u64 = 7;
+    if flags & !TIMER_ABSTIME != 0 {
+        return errno::EINVAL;
+    }
+    if !matches!(clock, CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME) {
+        return errno::EINVAL;
+    }
+    if validate_user_buffer(req, 16).is_err() {
+        return errno::EFAULT;
+    }
+    // SAFETY: validated as a user-space range; a fault demand-pages or kills the caller, as for any user store.
+    let (sec, nsec) = unsafe { (*(req as *const i64), *((req + 8) as *const i64)) };
+    let Some(ns) = timespec_ns(sec, nsec) else { return errno::EINVAL };
+    let up = crate::time::ktime_get();
+    let expiry = if flags & TIMER_ABSTIME == 0 {
+        up.saturating_add(ns)
+    } else if clock == CLOCK_REALTIME {
+        // `ktime` at which the wall clock reads `ns`: the wall clock is `BOOT_UNIX_SECS * 1e9 + up`
+        let wall_now = crate::time::now_unix_secs().saturating_mul(1_000_000_000).saturating_add(up % 1_000_000_000);
+        up.saturating_add(ns.saturating_sub(wall_now))
+    } else {
+        ns
+    };
+    if expiry <= up {
+        return 0;
+    }
+    sleep_until(expiry, 230)
+}
 
+/// A `timespec` as nanoseconds; `None` for a negative or out-of-range field (`EINVAL` in Linux).
+fn timespec_ns(sec: i64, nsec: i64) -> Option<u64> {
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return None;
+    }
+    Some((sec as u64).saturating_mul(1_000_000_000).saturating_add(nsec as u64))
+}
+
+/// Block the caller until `ktime` reaches `expiry` (an hrtimer wake), or a signal ends the wait.
+///
+/// LOCKING (see hrtimer.rs for full analysis):
+///   cli → scheduler lock → QUEUE lock (hrtimer::start) → QUEUE released →
+///   block_current → never returns here.
+fn sleep_until(expiry: u64, syscall_nr: u64) -> SyscallResult {
     let tf_ptr = current_tf_ptr();
 
     // `_irq` is deliberately never dropped — see sys_yield above.
@@ -126,7 +176,7 @@ pub(super) fn sys_nanosleep(ns: u64) -> SyscallResult {
         }
 
         let pid = scheduler.current_pid().map(|p| p.0).unwrap_or(0);
-        crate::ktrace!(crate::debug::SCHED, "nanosleep PID {} for {} ns (expiry={})", pid, ns, expiry);
+        crate::ktrace!(crate::debug::SCHED, "sleep PID {} until {} (syscall {})", pid, expiry, syscall_nr);
 
         // Register the hrtimer.  QUEUE lock is acquired and released inside
         // start(); we still hold the scheduler lock, which is safe because
@@ -136,10 +186,10 @@ pub(super) fn sys_nanosleep(ns: u64) -> SyscallResult {
         let timer = crate::time::hrtimer::start(expiry, crate::time::hrtimer::HrTimerAction::Wake { pid, cell });
 
         // A signal ends the sleep with EINTR once a handler runs (no
-        // remaining time is reported: mlibc passes no `rem`).
+        // remaining time is reported).
         let ret_rip = unsafe { (*tf_ptr).rip };
         scheduler.block_current(tf_ptr, crate::process::wait::Wait::cell(
-            35, ret_rip, crate::process::wait::RestartPolicy::NoHandlerOnly,
+            syscall_nr, ret_rip, crate::process::wait::RestartPolicy::NoHandlerOnly,
             crate::process::wait::Cleanup::Timer(timer),
         ))
         // scheduler lock dropped here
@@ -152,6 +202,27 @@ pub(super) fn sys_getpid() -> SyscallResult {
     with_scheduler(|scheduler| {
         scheduler.current_pid().map(|pid| pid.0 as SyscallResult).unwrap_or(0)
     })
+}
+
+/// gettid(186). A thread is a process here (`sys_clone` gives it its own pid), so its tid is that pid.
+pub(super) fn sys_gettid() -> SyscallResult {
+    sys_getpid()
+}
+
+/// tkill(200) / tgkill(234): a signal to one thread. Threads are processes with their own pid, so this is `kill` on that pid
+/// (`tgkill` also names the thread group, which is not checked).
+pub(super) fn sys_tkill(tid: i64, sig: u32) -> SyscallResult {
+    if tid <= 0 {
+        return errno::EINVAL;
+    }
+    sys_kill(tid, sig)
+}
+
+pub(super) fn sys_tgkill(tgid: i64, tid: i64, sig: u32) -> SyscallResult {
+    if tgid <= 0 || tid <= 0 {
+        return errno::EINVAL;
+    }
+    sys_kill(tid, sig)
 }
 
 /// getppid(110): the parent's pid — `Process::parent_pid`, which
@@ -952,8 +1023,18 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
 /// addition to (not instead of) the normal `queue_signal`, so a handler
 /// installed for SIGCONT still runs once the process resumes.
 pub(super) fn sys_kill(target_pid: i64, sig: u32) -> SyscallResult {
-    if sig == 0 || sig as usize >= crate::process::signal::NUM_SIGNALS {
+    if sig as usize >= crate::process::signal::NUM_SIGNALS {
         return errno::EINVAL;
+    }
+    if sig == 0 {
+        // POSIX: no signal is sent, only the checks are made — does the target exist? (BusyBox's `timeout` probes with it.)
+        if target_pid > 0 {
+            return with_scheduler(|sched| {
+                let pid = target_pid as usize;
+                if sched.current_pid().map(|p| p.0) == Some(pid) || sched.find_process_mut(pid).is_some() { 0 } else { errno::ESRCH }
+            });
+        }
+        return 0;
     }
     if target_pid == -1 {
         return errno::EINVAL;
