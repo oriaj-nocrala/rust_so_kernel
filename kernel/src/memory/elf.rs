@@ -26,6 +26,7 @@ const ELFDATA2LSB: u8 = 1; // Little-endian
 
 // e_type values
 const ET_EXEC: u16 = 2; // Executable file
+const ET_DYN: u16 = 3; // Position-independent executable (static-pie), or a shared object
 
 // e_machine values
 const EM_X86_64: u16 = 62;
@@ -33,6 +34,8 @@ const EM_X86_64: u16 = 62;
 // Program header types
 /// Loadable segment — must be mapped into memory.
 pub const PT_LOAD: u32 = 1;
+/// Names a dynamic linker: an executable that needs one cannot be loaded.
+pub const PT_INTERP: u32 = 3;
 
 // Program header flags (p_flags)
 /// Segment is executable.
@@ -151,9 +154,9 @@ impl<'a> Elf64<'a> {
             return Err("ELF: not little-endian");
         }
 
-        // ── Type: executable ──────────────────────────────────────────
-        if header.e_type != ET_EXEC {
-            return Err("ELF: not an executable (ET_EXEC)");
+        // ── Type: executable (a static-pie is ET_DYN; `is_dyn` tells the loader to bias it) ──────────────────────────────────────────
+        if header.e_type != ET_EXEC && header.e_type != ET_DYN {
+            return Err("ELF: not an executable (ET_EXEC or ET_DYN)");
         }
 
         // ── Machine: x86_64 ──────────────────────────────────────────
@@ -186,6 +189,13 @@ impl<'a> Elf64<'a> {
     #[inline]
     pub fn entry_point(&self) -> u64 {
         self.header.e_entry
+    }
+
+    /// True for `ET_DYN` (a static-pie): every address in the file is
+    /// relative to a base the loader picks.
+    #[inline]
+    pub fn is_dyn(&self) -> bool {
+        self.header.e_type == ET_DYN
     }
 
     /// Number of program headers.

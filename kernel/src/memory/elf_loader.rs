@@ -15,8 +15,9 @@
 //   5. Return LoadedElf { entry_point, address_space, user_stack_top }
 //
 // LIMITATIONS:
-//   - Static executables only (no dynamic linker / PT_INTERP).
-//   - No relocations.
+//   - Static executables only (no dynamic linker / PT_INTERP). A static-pie
+//     (ET_DYN without PT_INTERP) is loaded at `PIE_BASE`; it relocates
+//     itself (musl's rcrt1), so the kernel applies no relocations.
 //   - Segments must not overlap (undefined behavior if they do).
 //   - User code must live in the lower half of the address space.
 
@@ -33,6 +34,11 @@ use super::vma::{Vma, VmaKind};
 // ============================================================================
 // Configuration
 // ============================================================================
+
+/// Where a static-pie (ET_DYN) is loaded: 4 GiB, 2 MiB-aligned, in PML4[0]
+/// like a static executable, far from the mmap area, the stack and the
+/// trampoline. Fixed, not randomised: there is no ASLR here.
+const PIE_BASE: u64 = 0x1_0000_0000;
 
 /// Default user stack base address.
 /// Each process gets its stack at a unique offset (base + pid * gap).
@@ -105,6 +111,12 @@ pub unsafe fn load_elf(
         elf.ph_count(),
     );
 
+    if elf.program_headers().any(|ph| ph.p_type == super::elf::PT_INTERP) {
+        return Err("ELF loader: dynamically linked executables are not supported");
+    }
+    let bias = if elf.is_dyn() { PIE_BASE } else { 0 };
+    let entry = elf.entry_point().checked_add(bias).ok_or("ELF loader: entry point overflows")?;
+
     // ── 2. Create address space ───────────────────────────────────────
 
     let mut address_space = AddressSpace::new_user()
@@ -118,7 +130,7 @@ pub unsafe fn load_elf(
     // ── 3. Map each PT_LOAD segment ───────────────────────────────────
 
     for ph in elf.load_segments() {
-        load_segment(&elf, ph, &mut address_space)?;
+        load_segment(&elf, ph, bias, &mut address_space)?;
     }
 
     // ── 4. Set up demand-paged stack VMA ──────────────────────────────
@@ -167,7 +179,7 @@ pub unsafe fn load_elf(
             && e_phoff >= ph.p_offset
             && e_phoff < ph.p_offset + ph.p_filesz
         {
-            phdr_vaddr = ph.p_vaddr + (e_phoff - ph.p_offset);
+            phdr_vaddr = bias + ph.p_vaddr + (e_phoff - ph.p_offset);
             break;
         }
     }
@@ -190,7 +202,7 @@ pub unsafe fn load_elf(
     // the exact layout) into this page and get back the resulting RSP.
     let rsp_va = build_initial_stack(
         page_ptr, top_page_vaddr, argv, envp,
-        phdr_vaddr, elf.ph_count(), elf.entry_point(),
+        phdr_vaddr, elf.ph_count(), entry,
     )?;
 
     crate::serial_println!(
@@ -232,7 +244,7 @@ pub unsafe fn load_elf(
 
     Ok(LoadedElf {
         address_space,
-        entry_point: VirtAddr::new(elf.entry_point()),
+        entry_point: VirtAddr::new(entry),
         user_stack_top: VirtAddr::new(rsp_va),
     })
 }
@@ -251,9 +263,9 @@ pub unsafe fn load_elf(
 ///                                   string blocks is arbitrary, only the
 ///                                   pointer tables built from them matter)
 ///   `[rsp, frame_top)`              argc, argv ptrs + NULL, envp ptrs +
-///                                   NULL, then 5 auxv (type, value) pairs
+///                                   NULL, then 7 auxv (type, value) pairs
 ///                                   (AT_PHDR/AT_PHENT/AT_PHNUM/AT_ENTRY/
-///                                   AT_NULL)
+///                                   AT_PAGESZ/AT_RANDOM/AT_NULL)
 ///
 /// `rsp` always comes out 16-byte aligned, as the ABI requires at process
 /// entry: `frame_top` is rounded down to 16 first, and if the slot count
@@ -272,7 +284,8 @@ unsafe fn build_initial_stack(
     ph_count: usize,
     entry_point: u64,
 ) -> Result<u64, &'static str> {
-    const AUXV_PAIRS: usize = 5; // AT_PHDR, AT_PHENT, AT_PHNUM, AT_ENTRY, AT_NULL
+    const AUXV_PAIRS: usize = 7; // AT_PHDR, AT_PHENT, AT_PHNUM, AT_ENTRY, AT_PAGESZ, AT_RANDOM, AT_NULL
+    const RANDOM_BYTES: usize = 16; // what AT_RANDOM points at (musl seeds its stack canary from it)
 
     let strings_bytes: usize = argv.iter().chain(envp.iter()).map(|s| s.len() + 1).sum();
 
@@ -285,13 +298,15 @@ unsafe fn build_initial_stack(
     let frame_bytes = slot_count * 8;
 
     // 16 bytes of slack for frame_top's alignment rounding below.
-    if strings_bytes + frame_bytes + 16 > 4096 {
+    if strings_bytes + RANDOM_BYTES + frame_bytes + 16 > 4096 {
         return Err("ELF loader: argv/envp too large for the initial stack page");
     }
 
     // ── Place strings ───────────────────────────────────────────────────
-    let content_top = 4096 - strings_bytes;
-    let mut cursor = content_top;
+    let content_top = 4096 - strings_bytes - RANDOM_BYTES;
+    let random_addr = top_page_vaddr + content_top as u64;
+    crate::random::fill(core::slice::from_raw_parts_mut(page_ptr.add(content_top), RANDOM_BYTES));
+    let mut cursor = content_top + RANDOM_BYTES;
 
     let mut envp_addrs: Vec<u64> = Vec::with_capacity(envp.len());
     for s in envp {
@@ -331,6 +346,8 @@ unsafe fn build_initial_stack(
     put!(4); put!(56);              // AT_PHENT (sizeof Elf64_Phdr)
     put!(5); put!(ph_count as u64); // AT_PHNUM
     put!(9); put!(entry_point);     // AT_ENTRY
+    put!(6); put!(4096);            // AT_PAGESZ
+    put!(25); put!(random_addr);    // AT_RANDOM
     put!(0); put!(0);               // AT_NULL
     if pad { put!(0); }
 
@@ -351,6 +368,7 @@ unsafe fn build_initial_stack(
 unsafe fn load_segment(
     elf: &Elf64,
     ph: &super::elf::Elf64ProgramHeader,
+    bias: u64,
     address_space: &mut AddressSpace,
 ) -> Result<(), &'static str> {
     if ph.p_memsz == 0 {
@@ -364,8 +382,11 @@ unsafe fn load_segment(
     //   - Account for the offset within the first page
     //   - Round up the total size to full pages
 
-    let seg_vaddr = ph.p_vaddr;
+    let seg_vaddr = ph.p_vaddr.checked_add(bias).ok_or("ELF loader: segment address overflows")?;
     let seg_memsz = ph.p_memsz;
+    if seg_vaddr.checked_add(seg_memsz).map_or(true, |end| end > super::page_table_manager::USER_MMAP_BASE) {
+        return Err("ELF loader: segment outside the user address range");
+    }
     let seg_filesz = ph.p_filesz;
 
     let page_offset = seg_vaddr & 0xFFF; // offset within first page

@@ -114,6 +114,10 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "rss_test",
 ];
 
+/// Freestanding static-pie test programs (userspace/c/): no libc, no crt, linked `-static-pie` so they are `ET_DYN`
+/// and relocate themselves. They exist to exercise the kernel's PIE loading; built to `disk-image-root/bin/`.
+const DISK_PIE_PROGRAMS: &[&str] = &["pie_test"];
+
 /// Not built here at all — see the busybox.elf handling below, which
 /// shells out to scripts/build-busybox.sh (a `make`-based external build,
 /// nothing like the Rust/C recipes above) only when the output is missing.
@@ -372,6 +376,25 @@ fn main() {
         build_c_program(stem, &dst);
         strip_elf(strip, &dst);
         println!("cargo:warning=userspace(c, disk): {}.c -> disk-image-root/bin/{}", stem, stem);
+    }
+
+    for stem in DISK_PIE_PROGRAMS {
+        let src = c_dir.join(format!("{}.c", stem));
+        let dst = disk_bin_dir.join(stem);
+        let status = Command::new("clang")
+            .args([
+                "--target=x86_64-unknown-none-elf",
+                "-ffreestanding", "-fPIE", "-fno-stack-protector", "-mno-red-zone", "-O2",
+                "-nostdlib", "-static-pie", "-fuse-ld=lld",
+                "-Wl,--no-dynamic-linker", "-Wl,-e,_start",
+                src.to_str().unwrap(),
+                "-o", dst.to_str().unwrap(),
+            ])
+            .status()
+            .expect("Failed to spawn clang for a static-pie test program");
+        assert!(status.success(), "static-pie build failed for {}", stem);
+        strip_elf(strip, &dst);
+        println!("cargo:warning=userspace(c, static-pie, disk): {}.c -> disk-image-root/bin/{}", stem, stem);
     }
 
     // ── Build BusyBox if missing ────────────────────────────────────────────

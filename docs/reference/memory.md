@@ -53,7 +53,9 @@ Code: `kernel/src/memory/`, `kernel/src/allocator/`, crate `mm/` (host tests: `c
 
 ## ELF loader (`memory/elf_loader.rs`)
 
-- Static ELF64 only; reads only the ELF header and the PT_LOAD program headers, so stripped binaries load the same.
+- Static ELF64 only; reads only the ELF header and the PT_LOAD program headers (and looks for PT_INTERP, which is refused), so stripped binaries load the same.
+- `ET_DYN` (static-pie, Rust's default for musl) loads at the fixed base `PIE_BASE` (4 GiB): segments, entry and `AT_PHDR` get the bias, and **the kernel applies no relocations** (musl's rcrt1 does). No ASLR. Test: `pie_test` (freestanding, `DISK_PIE_PROGRAMS` in `kernel/build.rs`); a real `x86_64-unknown-linux-musl` std binary runs too (`rustc` inside the repo dir picks the pinned nightly).
+- auxv: `AT_PHDR/PHENT/PHNUM/ENTRY/PAGESZ/RANDOM`. `AT_RANDOM` points at 16 fresh bytes in the stack page.
 - `build_initial_stack` writes the SysV argc/argv/envp/auxv frame into the top stack page. If it does not fit in one page, exec fails with `E2BIG`.
 
 ## RSS (`hal::paging::count_resident`, `AddressSpace::mem_stats`)
