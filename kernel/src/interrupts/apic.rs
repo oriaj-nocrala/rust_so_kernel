@@ -41,6 +41,92 @@ const ISA_VECTOR_BASE: u8 = super::pic::PIC1_OFFSET;
 
 const TIMER_HZ: u32 = 100; // same rate the PIT ran at; cursor blink, USB poll and quanta assume it
 const TIMER_DIVISOR: u32 = 16;
+/// One tick, in ns.
+const TICK_NS: u64 = 1_000_000_000 / TIMER_HZ as u64;
+/// An interrupt this close before a tick's deadline counts as the tick (the next one would follow at once).
+const TICK_SLACK_NS: u64 = 100_000;
+/// Shortest timeout worth programming: a deadline nearer than this is armed as this far away.
+const MIN_ARM_NS: u64 = 2_000;
+
+/// The LAPIC timer as a one-shot clock event, per CPU. A CPU used to take a periodic 100 Hz interrupt and nothing else, so a timeout
+/// (`nanosleep`, a `poll` timeout, tokio's timers) fired at the next tick: `nanosleep(200 us)` took 10 ms. Now each interrupt
+/// re-arms the timer for the earlier of this CPU's next 100 Hz tick and the earliest `hrtimer`, and `hrtimer::start` arms it early
+/// when its expiry comes before what is programmed. Only an interrupt at a tick boundary is a *tick* (time slices, CPU-time
+/// accounting, the BSP's polling); an earlier one just drains the hrtimers (`tick_due`).
+static ONESHOT: AtomicBool = AtomicBool::new(false);
+static STARTED: [AtomicBool; crate::cpu::MAX_CPUS] = [const { AtomicBool::new(false) }; crate::cpu::MAX_CPUS];
+/// ktime of this CPU's next 100 Hz tick.
+static NEXT_TICK_NS: [AtomicU64; crate::cpu::MAX_CPUS] = [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
+/// ktime this CPU's timer is programmed to fire at.
+static ARMED_NS: [AtomicU64; crate::cpu::MAX_CPUS] = [const { AtomicU64::new(u64::MAX) }; crate::cpu::MAX_CPUS];
+
+/// Is the LAPIC timer driving this kernel as a one-shot event (false: the PIT fallback, a plain 100 Hz tick)?
+pub fn oneshot() -> bool {
+    ONESHOT.load(Ordering::Relaxed)
+}
+
+/// Program this CPU's timer to fire at ktime `deadline_ns` (at least `MIN_ARM_NS` from now).
+fn arm_at(deadline_ns: u64) {
+    let Some(status) = STATUS.get() else { return };
+    let cpu = crate::cpu::cpu_id();
+    let now = crate::time::ktime_get();
+    let delta = deadline_ns.saturating_sub(now).max(MIN_ARM_NS);
+    let count = (delta as u128 * status.timer_count as u128 / TICK_NS as u128).clamp(1, u32::MAX as u128) as u32;
+    lapic_write(lapic::TIMER_INITIAL, count);
+    ARMED_NS[cpu].store(now + delta, Ordering::Relaxed);
+}
+
+/// Start this CPU's one-shot tick sequence: LVT one-shot on the timer vector, first tick one period from now.
+fn start_oneshot_tick() {
+    let cpu = crate::cpu::cpu_id();
+    lapic_write(lapic::LVT_TIMER, apic::lvt_timer(TIMER_VECTOR, TimerMode::OneShot, false));
+    let first = crate::time::ktime_get() + TICK_NS;
+    NEXT_TICK_NS[cpu].store(first, Ordering::Relaxed);
+    STARTED[cpu].store(true, Ordering::Relaxed);
+    ONESHOT.store(true, Ordering::Relaxed);
+    arm_at(first);
+}
+
+/// For the timer ISR: is this interrupt a tick? (Always, in the PIT fallback.) When it is, the next one is scheduled a period after
+/// this one's deadline, keeping the 100 Hz grid, or from now if some were missed.
+pub fn tick_due(now: u64) -> bool {
+    if !oneshot() {
+        return true;
+    }
+    let cpu = crate::cpu::cpu_id();
+    let next = NEXT_TICK_NS[cpu].load(Ordering::Relaxed);
+    if now + TICK_SLACK_NS < next {
+        return false;
+    }
+    let following = next + TICK_NS;
+    NEXT_TICK_NS[cpu].store(if following <= now { now + TICK_NS } else { following }, Ordering::Relaxed);
+    true
+}
+
+/// For the timer ISR, once the hrtimers are drained: program the next interrupt — the earlier of this CPU's next tick and
+/// `next_hrtimer` (the queue's earliest expiry).
+pub fn rearm(next_hrtimer: Option<u64>) {
+    if !oneshot() {
+        return;
+    }
+    let tick = NEXT_TICK_NS[crate::cpu::cpu_id()].load(Ordering::Relaxed);
+    arm_at(match next_hrtimer {
+        Some(h) if h < tick => h,
+        _ => tick,
+    });
+}
+
+/// `hrtimer::start` calls this: a timer expiring before this CPU's timer fires must bring the interrupt forward.
+pub fn hrtimer_started(expiry_ns: u64) {
+    if !oneshot() {
+        return;
+    }
+    let cpu = crate::cpu::cpu_id();
+    if STARTED[cpu].load(Ordering::Relaxed) && expiry_ns + MIN_ARM_NS < ARMED_NS[cpu].load(Ordering::Relaxed) {
+        arm_at(expiry_ns);
+    }
+}
+
 /// Calibration window, in TSC time.
 const CALIBRATION_NS: u64 = 10_000_000;
 
@@ -401,8 +487,7 @@ pub fn init_this_cpu() {
 
     lapic_write(lapic::TIMER_DIVIDE, apic::divide_config(TIMER_DIVISOR).unwrap());
     if runs_timer() {
-        lapic_write(lapic::LVT_TIMER, apic::lvt_timer(TIMER_VECTOR, TimerMode::Periodic, false));
-        lapic_write(lapic::TIMER_INITIAL, status.timer_count);
+        start_oneshot_tick();
     } else {
         lapic_write(lapic::LVT_TIMER, apic::lvt_timer(TIMER_VECTOR, TimerMode::Periodic, true));
         lapic_write(lapic::TIMER_INITIAL, 0);
@@ -426,8 +511,8 @@ pub fn start_timer_on_ap() {
         return;
     }
     let Some(status) = STATUS.get() else { return };
-    lapic_write(lapic::LVT_TIMER, apic::lvt_timer(TIMER_VECTOR, TimerMode::Periodic, false));
-    lapic_write(lapic::TIMER_INITIAL, status.timer_count);
+    let _ = status;
+    start_oneshot_tick();
 }
 
 /// Reads back what `init_this_cpu` set.
@@ -466,12 +551,11 @@ pub fn verify_this_cpu() -> Result<(), &'static str> {
         }
         return Ok(());
     }
-    if lvt != apic::lvt_timer(TIMER_VECTOR, TimerMode::Periodic, false) {
-        return Err("LAPIC timer LVT is not periodic on the timer vector");
+    // One-shot since the timer became a clock event: the count runs down and is re-armed by every interrupt, so it is not compared.
+    if lvt != apic::lvt_timer(TIMER_VECTOR, TimerMode::OneShot, false) {
+        return Err("LAPIC timer LVT is not one-shot on the timer vector");
     }
-    if lapic_read(lapic::TIMER_INITIAL) != status.timer_count {
-        return Err("LAPIC timer count differs from the calibration");
-    }
+    let _ = status;
     Ok(())
 }
 

@@ -191,23 +191,30 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> Resume 
     // declined (`interrupts::apic::init`) — both on vector 32.
     crate::interrupts::eoi(crate::interrupts::apic::TIMER_VECTOR);
 
-    // Per-CPU GS invariant (`cpu/percpu.rs`): two rdmsrs, 100 Hz.
-    crate::cpu::percpu::check_gs_invariant();
+    // The LAPIC timer is a one-shot clock event (`interrupts::apic`): an interrupt is a *tick* only at a 100 Hz boundary; one
+    // taken earlier, for an hrtimer, just drains the timers.
+    let now_ns = crate::time::ktime_get();
+    let tick = crate::interrupts::apic::tick_due(now_ns);
 
-    // Per-CPU work: this CPU's APERF/MPERF (`cpu/freq.rs`), two rdmsrs.
-    crate::cpu::freq::tick();
-    // Per-CPU C0 residency; package energy on CPU 0 (`cpu/idle.rs`).
-    crate::cpu::idle::tick();
+    if tick {
+        // Per-CPU GS invariant (`cpu/percpu.rs`): two rdmsrs, 100 Hz.
+        crate::cpu::percpu::check_gs_invariant();
+
+        // Per-CPU work: this CPU's APERF/MPERF (`cpu/freq.rs`), two rdmsrs.
+        crate::cpu::freq::tick();
+        // Per-CPU C0 residency; package energy on CPU 0 (`cpu/idle.rs`).
+        crate::cpu::idle::tick();
+    }
 
     // ── 2. Global work: CPU 0 only ────────────────────────────────────
     // Every CPU that schedules gets this tick (stage 7 of
     // docs/smp/smp-plan.md); what is not per-CPU runs once per period, on
-    // the BSP (decision 3): the cursor, the USB poll, `TICK_COUNT` (the
-    // 100 Hz check of `/proc/kdebug`) and the hrtimers.
+    // the BSP (decision 3): the cursor, the USB poll and `TICK_COUNT` (the
+    // 100 Hz check of `/proc/kdebug`).
     let bsp = crate::cpu::cpu_id() == 0;
     let mut wake_pids = [(0usize, 0u32); 8];
     let mut wake_count = 0;
-    if bsp {
+    if bsp && tick {
         crate::drivers::framebuffer_console::tick_cursor_blink();
 
         // The xHCI driver has no interrupt of its own (see `usb/mod.rs`), so
@@ -219,11 +226,13 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> Resume 
         crate::usb::poll();
 
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
 
-        // tick() acquires QUEUE, drains expired timers, releases QUEUE, then
-        // returns a list of PIDs to wake. QUEUE is always released before we
-        // acquire the scheduler lock below (ABBA-deadlock prevention).
-        let now_ns = crate::time::ktime_get();
+    // The hrtimers: with the one-shot timer any CPU drains them (whichever interrupt comes first, tick or not); with the PIT
+    // fallback only the BSP takes interrupts that schedule. tick() acquires QUEUE, drains expired timers, releases QUEUE, then
+    // returns a list of PIDs to wake. QUEUE is always released before we acquire the scheduler lock below (ABBA-deadlock
+    // prevention).
+    if bsp || crate::interrupts::apic::oneshot() {
         wake_count = crate::time::hrtimer::tick(now_ns, &mut wake_pids);
 
         // A timed-out poll/epoll waiter is removed *before* its process is
@@ -235,6 +244,9 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> Resume 
             crate::process::syscall::poll_clear_on_timeout(pid, timer);
         }
     }
+
+    // Program the next interrupt: the earlier of this CPU's next tick and the earliest hrtimer left.
+    crate::interrupts::apic::rearm(crate::time::hrtimer::next_expiry());
 
     // ── 3. Scheduler: wake hrtimer PIDs + tick time slice ────────────
     let mut scheduler = super::scheduler::local_scheduler();
@@ -252,6 +264,19 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> Resume 
     // integration tests): there is nothing to preempt.
     if scheduler.running_ref().is_none() {
         return Resume::to(current_tf);
+    }
+
+    // Between ticks (an hrtimer's interrupt): nothing is owed to the time slice or the accounting. If the wake-up made work Ready on
+    // an idle CPU, run it now — as the reschedule IPI does.
+    if !tick {
+        if !scheduler.resched_due() {
+            return Resume::to(current_tf);
+        }
+        let tf = switch_and_resolve(&mut scheduler, current_tf);
+        let kstack_top = scheduler.running_ref().map(|p| p.kernel_stack.as_u64()).unwrap_or(0);
+        drop(scheduler);
+        validate_resume_frame(tf, kstack_top, "timer-early");
+        return Resume::to(tf);
     }
 
     // RPL 3 in the saved CS: the tick interrupted user mode.

@@ -802,9 +802,14 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u32, timeout_ms: i32) -> SyscallResul
     let tf_ptr = current_tf_ptr();
 
     // Pre-translate user buffer to physical address
-    let phys_buf = match translate_user_buf_phys(fds_ptr, buf_size) {
-        Some(pa) => pa,
-        None => return errno::EFAULT,
+    // `poll(NULL, 0, ms)` is a plain sleep: with no descriptors there is no buffer to translate (and a NULL pointer is fine).
+    let phys_buf = if buf_size == 0 {
+        0
+    } else {
+        match translate_user_buf_phys(fds_ptr, buf_size) {
+            Some(pa) => pa,
+            None => return errno::EFAULT,
+        }
     };
 
     let ready_now = |socks: &SocketMap| {

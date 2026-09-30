@@ -31,7 +31,7 @@ Code: `kernel/src/cpu/`, `kernel/src/smp.rs`, `kernel/src/interrupts/`, `kernel/
 
 ## Interrupt controllers (`interrupts/`, `hal::apic`)
 
-- The tick is the **LAPIC timer** (100 Hz, calibrated against the TSC, which was calibrated against the PIT). ISA IRQs (keyboard 1, COM1 4, mouse 12) go through the **I/O APIC**, with the MADT overrides applied. The 8259 stays masked.
+- The tick is the **LAPIC timer** (100 Hz, calibrated against the TSC, which was calibrated against the PIT), used as a **one-shot clock event per CPU** (`interrupts::apic`): every timer interrupt re-arms for the earlier of this CPU's next 100 Hz tick (`NEXT_TICK_NS`) and the earliest `hrtimer` (`hrtimer::next_expiry`), and `hrtimer::start` brings the interrupt forward when its expiry comes first (`hrtimer_started`). Only an interrupt at a tick boundary is a *tick* (`apic::tick_due`: time slices, CPU-time accounting, `TICK_COUNT`, the BSP's polling); an earlier one just drains the hrtimers (any CPU drains them). So a timeout fires at its own time: `nanosleep(200 us)` takes ~220 us on KVM (it took a whole tick, 10 ms, when the timer was periodic). The PIT fallback (APIC declined) keeps the plain 100 Hz tick. `timer_test` pins both the resolution and the 100 Hz rate. ISA IRQs (keyboard 1, COM1 4, mouse 12) go through the **I/O APIC**, with the MADT overrides applied. The 8259 stays masked.
 - `apic::init` is best-effort: if anything fails, the 8259 + PIT keep working (`-cpu max,-apic` tests this). Uses x2APIC only if the firmware already enabled it.
 - Vectors: timer 32, ISA line n → 32+n, TLB shootdown 0xF0, wake 0xF1, reschedule 0xF2, LAPIC spurious 0xFF (never EOI'd).
 - **Drivers call `interrupts::enable_isa_irq(line)` and `interrupts::eoi(vector)`, never `pic::*`.**

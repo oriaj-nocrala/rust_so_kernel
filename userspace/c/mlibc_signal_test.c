@@ -10,6 +10,7 @@
 // (raise()-testable independently) to confirm, and reaps the child.
 
 #include <stdio.h>
+#include <errno.h>
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
@@ -69,21 +70,26 @@ int main(void) {
     // Parent: read end only.
     close(fds[1]);
 
+    // Wait for the handler by time, not by a spin count: on a fast machine a fixed count is over before the child has run.
     int spins = 0;
-    while (!usr1_received && spins < 100000) {
-        spins++;
+    for (int i = 0; i < 2000 && !usr1_received; i++) {
+        usleep(1000);
     }
 
+    // The read may be interrupted by SIGUSR1 (the handler has no SA_RESTART): retry, as any caller must.
     char buf[64] = {0};
-    ssize_t n = read(fds[0], buf, sizeof(buf) - 1);
+    ssize_t n;
+    do {
+        n = read(fds[0], buf, sizeof(buf) - 1);
+    } while (n < 0 && errno == EINTR);
     close(fds[0]);
 
     waitpid(pid, NULL, 0);
 
-    spins = 0;
-    while (!chld_received && spins < 100000) {
-        spins++;
+    for (int i = 0; i < 2000 && !chld_received; i++) {
+        usleep(1000);
     }
+    (void)spins;
 
     int pipe_ok = (n > 0 && strcmp(buf, "hello from child") == 0);
 

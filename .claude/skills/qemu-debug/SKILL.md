@@ -51,6 +51,10 @@ Iterating on metal costs a physical reboot per try. Make QEMU look like the Ryze
 
 `scripts/boot-matrix.sh N M` runs N QEMUs in parallel, M boots each (one qcow2 overlay per instance), and classifies every boot as `OK`/`HANG`/`PANIC`/`DOUBLE_FAULT` with `cpus_online=M/N`. Serial logs of non-OK boots are kept; read them.
 
+## KVM and timing
+
+- `qemu-debug.sh` runs QEMU in software emulation (TCG) unless told otherwise: syscalls cost ~10 us and a pipe round trip ~900 us, ~30x KVM's (`QEMU_DEBUG_EXTRA_ARGS="-enable-kvm"`: 0.56 us and ~30 us). Measure latency and throughput with KVM, and run the suite both ways: KVM's speed exposes tests that assume a slow guest (spin counts). `scripts/run-abi-suite.sh latency_bench` prints wake-up latencies.
+
 ## gdb
 
 - `start --gdb` adds a gdbstub without stopping the CPU; attach whenever needed (e.g. once it hangs). `--gdb-freeze` stops at the reset vector.

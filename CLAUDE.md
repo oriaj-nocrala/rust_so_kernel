@@ -101,7 +101,7 @@ Breaking one of these has cost days of debugging each time. The *why* is kept sh
 - **Nothing per-process lives in a per-CPU global across a preemption point.** The syscall frame is `syscall::current_tf_ptr()`, derived from the kernel stack.
 - **A process can migrate at any preemption point**: with IF=1, don't keep a `cpu_id()` (or anything indexed by it) across one.
 - New per-CPU hardware state goes into `cpu::init_this_cpu`, with a `verify_*`.
-- Anything new on the timer tick must state whether it is global work (CPU 0) or per-CPU work.
+- Anything new on the timer tick must state whether it is global work (CPU 0) or per-CPU work. The timer is one-shot: an interrupt is a tick only where `apic::tick_due` says so; put per-tick work in that branch of `timer_preempt_handler`, not before it.
 
 **TLB and address spaces**
 - Every PTE change invalidates through `memory::tlb` (`invalidate_page(pml4, addr)` / `invalidate_kernel_page`). Never `x86_64::instructions::tlb::*` or `MapperFlush::flush()`: call `.ignore()` and pass the page.

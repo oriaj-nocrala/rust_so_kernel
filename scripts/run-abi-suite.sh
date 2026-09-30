@@ -54,6 +54,8 @@ if [ -n "$verdict" ]; then
 fi
 [ "${KEEP_ALIVE:-0}" = 1 ] || $Q stop >/dev/null 2>&1   # KEEP_ALIVE=1: leave the guest running to inspect a hang
 bad=$(grep -vc "=0$" /tmp/abi-suite.results)
+# A test that prints FAIL but exits 0 is still a failure.
+bad=$((bad + $(grep -cE "^\[fb\].*FAIL" "$log")))
 total=$(wc -l < /tmp/abi-suite.results)
 [ -n "$verdict" ] && { echo "abi-suite: ABORTED — $verdict ($total tests finished)"; exit 1; }
 echo "abi-suite: $total tests, $bad not clean"

@@ -65,7 +65,16 @@ pub fn start(expiry_ns: u64, action: HrTimerAction) -> u32 {
     // Insertion sort by expiry_ns (list is usually very short).
     let pos = q.timers.partition_point(|t| t.expiry_ns <= expiry_ns);
     q.timers.insert(pos, HrTimer { id, expiry_ns, action });
+    drop(q);
+    // The LAPIC timer is a one-shot clock event: bring this CPU's interrupt forward if the timer expires before it (the queue's
+    // lock is released first: the ISR takes it after the timer fires).
+    crate::interrupts::apic::hrtimer_started(expiry_ns);
     id
+}
+
+/// The earliest expiry in the queue, if any (the timer ISR re-arms for it).
+pub fn next_expiry() -> Option<u64> {
+    QUEUE.lock().timers.first().map(|t| t.expiry_ns)
 }
 
 /// Cancel a pending timer by ID.
