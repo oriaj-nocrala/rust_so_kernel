@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <time.h>
 #include <pthread.h>
+#include <sys/wait.h>
 
 static long sc(long nr, long a, long b, long c, long d, long e, long f) {
     long ret;
@@ -20,7 +21,10 @@ static long sc(long nr, long a, long b, long c, long d, long e, long f) {
 }
 
 enum { SYS_sigaltstack = 131, SYS_gettid = 186, SYS_tkill = 200, SYS_futex = 202, SYS_clock_nanosleep = 230, SYS_tgkill = 234,
-       SYS_getrandom = 318, SYS_kill = 62, SYS_getpid = 39 };
+       SYS_getrandom = 318, SYS_kill = 62, SYS_getpid = 39, SYS_clone = 56, SYS_exit_group = 231, SYS_set_tid_address = 218,
+       SYS_exit = 60, SYS_arch_prctl = 158 };
+enum { CLONE_VM = 0x100, CLONE_FS = 0x200, CLONE_FILES = 0x400, CLONE_SIGHAND = 0x800, CLONE_THREAD = 0x10000, CLONE_SYSVSEM = 0x40000,
+       CLONE_SETTLS = 0x80000, CLONE_PARENT_SETTID = 0x100000, CLONE_CHILD_CLEARTID = 0x200000, CLONE_CHILD_SETTID = 0x1000000 };
 enum { EPERM_ = 1, ESRCH_ = 3, EAGAIN_ = 11, EINVAL_ = 22, ETIMEDOUT_ = 110, ENOSYS_ = 38 };
 enum { FUTEX_WAIT = 0, FUTEX_WAKE = 1, FUTEX_REQUEUE = 3, FUTEX_CMP_REQUEUE = 4, FUTEX_WAIT_BITSET = 9, FUTEX_WAKE_BITSET = 10,
        FUTEX_PRIVATE = 128 };
@@ -239,6 +243,145 @@ static void test_futex_threads(void) {
     CHECK(sc(SYS_futex, (long)&word, FUTEX_REQUEUE | FUTEX_PRIVATE, 1, 1, (long)&word2, 0) == 0, "REQUEUE with nobody waiting");
 }
 
+// long test_clone(flags, stack, ptid, ctid, tls): Linux's clone(2) with the child's first steps done here, as libc does. The child
+// starts with rsp = stack, where the caller left [fn][arg]; it calls fn(arg), then exit(0).
+__asm__(".text\n.globl test_clone\ntest_clone:\n"
+        "  mov %rcx, %r10\n  mov $56, %eax\n  syscall\n  test %rax, %rax\n  jnz 1f\n"
+        "  pop %rax\n  pop %rdi\n  call *%rax\n  mov $60, %eax\n  xor %edi, %edi\n  syscall\n1: ret\n");
+extern long test_clone(unsigned long flags, void *stack, int *ptid, int *ctid, void *tls);
+
+#define THREAD_FLAGS (CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM)
+static char stacks[4][16384] __attribute__((aligned(16)));
+
+static void *prepare(int n, void (*fn)(void *), void *arg) {
+    void **sp = (void **)(stacks[n] + sizeof stacks[n] - 32);
+    sp[0] = (void *)fn;
+    sp[1] = arg;
+    return sp;
+}
+
+static volatile long seen_rsp_room, seen_tid, seen_fs0;
+static volatile int child_go;
+static void child_fn(void *arg) {
+    long *slot = arg;
+    char here;
+    seen_rsp_room = (long)&here;                     // an address on the child's own stack
+    seen_tid = sc(186, 0, 0, 0, 0, 0, 0);
+    long fs0;
+    __asm__ volatile("mov %%fs:0, %0" : "=r"(fs0));
+    seen_fs0 = fs0;
+    while (!child_go) sc(SYS_futex, (long)&child_go, FUTEX_WAIT | FUTEX_PRIVATE, 0, 0, 0, 0);
+    *slot = 1;
+}
+
+static int ptid_word, ctid_word;
+static void test_clone_thread(void) {
+    printf("clone (Linux ABI)\n");
+    long done = 0;
+    static void *tls_block[2];
+    tls_block[0] = tls_block;                        // %fs:0 must read back its own address
+    ptid_word = 0;
+    ctid_word = -1;
+    long tid = test_clone(THREAD_FLAGS | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID,
+                          prepare(0, child_fn, &done), &ptid_word, &ctid_word, tls_block);
+    CHECK(tid > 0, "clone returned %ld", tid);
+    CHECK(ptid_word == tid, "PARENT_SETTID stored %d, tid is %ld", ptid_word, tid);
+    CHECK(ctid_word == tid || ctid_word == 0, "CHILD_SETTID stored %d", ctid_word);
+    for (int i = 0; i < 200 && !seen_tid; i++) usleep(10000);
+    CHECK(seen_tid == tid, "the thread's gettid is %ld, wanted %ld", (long)seen_tid, tid);
+    CHECK((long)seen_rsp_room >= (long)stacks[0] && (long)seen_rsp_room < (long)(stacks[0] + sizeof stacks[0]), "child runs on the given stack");
+    CHECK(seen_fs0 == (long)tls_block, "CLONE_SETTLS: fs:0 is %#lx, wanted %p", (long)seen_fs0, (void *)tls_block);
+    CHECK(sc(SYS_kill, tid, 0, 0, 0, 0, 0) == 0, "the thread exists while it waits");
+    CHECK(ctid_word == tid, "CLEARTID has not fired while the thread lives (%d)", ctid_word);
+    int64_t t0 = mono_ns();
+    child_go = 1;
+    sc(SYS_futex, (long)&child_go, FUTEX_WAKE | FUTEX_PRIVATE, 1, 0, 0, 0);
+    // wait on the tid word the way pthread_join does; the kernel must zero it and wake us
+    struct timespec to = ts_ns(3000000000LL);
+    int spins = 0;
+    while (ctid_word != 0 && spins++ < 10) {
+        long r = sc(SYS_futex, (long)&ctid_word, FUTEX_WAIT | FUTEX_PRIVATE, ctid_word, (long)&to, 0, 0);
+        if (r == -ETIMEDOUT_) break;
+    }
+    int64_t waited = mono_ns() - t0;
+    CHECK(ctid_word == 0, "CHILD_CLEARTID zeroed the word");
+    CHECK(waited < 1500000000LL, "and woke the waiter (waited %ld ms)", (long)(waited / 1000000));
+    CHECK(done == 1, "the thread ran to its end");
+    usleep(50000);
+    CHECK(sc(SYS_kill, tid, 0, 0, 0, 0, 0) == -ESRCH_, "the thread is gone");
+
+    // flags CLONE_THREAD needs
+    CHECK(sc(SYS_clone, CLONE_THREAD | CLONE_VM, 0, 0, 0, 0, 0) == -EINVAL_, "CLONE_THREAD without CLONE_SIGHAND");
+    CHECK(sc(SYS_clone, CLONE_THREAD | CLONE_SIGHAND, 0, 0, 0, 0, 0) == -EINVAL_, "CLONE_THREAD without CLONE_VM");
+    CHECK(sc(SYS_clone, THREAD_FLAGS | CLONE_PARENT_SETTID, (long)prepare(1, child_fn, &done), 8, 0, 0, 0) < 0, "ptid outside user memory");
+}
+
+static void settid_fn(void *arg) {
+    long r = sc(SYS_set_tid_address, (long)arg, 0, 0, 0, 0, 0);
+    *(volatile long *)((char *)arg + 8) = r;         // what it returned, next to the word
+}
+
+static void test_set_tid_address(void) {
+    printf("set_tid_address\n");
+    static volatile int words[4] = { 77, 0, 0, 0 };  // words[0]: cleared at exit; words[2..3]: the returned tid
+    long tid = test_clone(THREAD_FLAGS, prepare(2, settid_fn, (void *)words), NULL, NULL, NULL);
+    struct timespec to = ts_ns(3000000000LL);
+    int spins = 0;
+    while (words[0] != 0 && spins++ < 10) {
+        long r = sc(SYS_futex, (long)&words[0], FUTEX_WAIT | FUTEX_PRIVATE, 77, (long)&to, 0, 0);
+        if (r == -ETIMEDOUT_) break;
+    }
+    CHECK(words[0] == 0, "the word set with set_tid_address is zeroed at thread exit");
+    CHECK(*(volatile long *)&words[2] == tid, "it returns the tid (%ld, wanted %ld)", *(volatile long *)&words[2], tid);
+}
+
+static void spin_fn(void *arg) {
+    (void)arg;
+    for (;;) __asm__ volatile("pause");
+}
+
+static volatile int marker;
+static void fork_child_fn(void *arg) {
+    (void)arg;
+    marker = 6;
+    sc(SYS_exit, marker == 6 ? 3 : 4, 0, 0, 0, 0, 0);
+}
+
+static void test_exit_group_and_fork_clone(void) {
+    printf("exit_group, clone without CLONE_THREAD\n");
+    int fds[2];
+    pipe(fds);
+    pid_t pid = fork();
+    if (pid == 0) {
+        long tid = test_clone(THREAD_FLAGS, prepare(3, spin_fn, NULL), NULL, NULL, NULL);
+        write(fds[1], &tid, sizeof tid);
+        sc(SYS_exit_group, 7, 0, 0, 0, 0, 0);
+        _exit(99);
+    }
+    long tid = 0;
+    read(fds[0], &tid, sizeof tid);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 7, "exit_group status: %#x", st);
+    int gone = 0;
+    for (int i = 0; i < 200 && !gone; i++) {
+        gone = sc(SYS_kill, tid, 0, 0, 0, 0, 0) == -ESRCH_;
+        if (!gone) usleep(10000);
+    }
+    CHECK(gone, "exit_group ended the spinning thread (tid %ld)", tid);
+    close(fds[0]);
+    close(fds[1]);
+
+    // no CLONE_THREAD: a copy-on-write fork with SIGCHLD as the exit signal, resuming on a stack of its own
+    marker = 5;
+    long r = test_clone(SIGCHLD, prepare(1, fork_child_fn, NULL), NULL, NULL, NULL);
+    CHECK(r > 0, "clone(SIGCHLD) returned %ld", r);
+    st = 0;
+    waitpid((pid_t)r, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 3, "the child ran on its stack with a private copy: status %#x", st);
+    CHECK(marker == 5, "its write did not reach the parent (%d)", marker);
+}
+
 int main(void) {
     test_getrandom();
     test_tid_and_signals();
@@ -246,6 +389,9 @@ int main(void) {
     test_clock_nanosleep();
     test_futex_timeouts();
     test_futex_threads();
+    test_clone_thread();
+    test_set_tid_address();
+    test_exit_group_and_fork_clone();
     if (failures) {
         printf("linux_abi_test: %d FAILED\n", failures);
         return 1;

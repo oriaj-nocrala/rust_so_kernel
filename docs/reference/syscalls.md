@@ -40,7 +40,7 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 | 35 | nanosleep | hrtimer; `EINTR` on a signal |
 | 39/110 | getpid/getppid | ppid is 1 after reparenting, 0 for PID 1 |
 | 41–55, 288 | socket … accept4 | AF_UNIX only (`AF_INET` → `EAFNOSUPPORT`). See `ipc.md` |
-| 56/57 | clone/fork | Thread (shares address space and fds) / COW fork |
+| 56/57 | clone/fork | **clone is Linux's** `(flags, stack, ptid, ctid, tls)`. `CLONE_THREAD` (needs `VM`+`SIGHAND`): a thread that shares the address space and fds, resumes after the `syscall` with the caller's registers and `rax=0`, honours `SETTLS`, `PARENT_SETTID`, `CHILD_SETTID`, `CHILD_CLEARTID`. Without `CLONE_THREAD`: a COW fork on `stack` (musl's `posix_spawn`; the parent is not suspended). A thread is a process with its own pid: no tgid, `getpid()` returns the tid. mlibc's `sys_clone` calls it through `__constanos_clone` (`thread_entry.S`) |
 | 59 | exec | `(path, argv, envp)`. Resolved through the VFS with symlinks followed. Caught signals go back to `SIG_DFL`; ignored stay ignored; mask and pending carry over |
 | 60 | exit | See Process death in `processes-and-scheduling.md` |
 | 61 | waitpid | POSIX pid forms, `WNOHANG`/`WUNTRACED`, `WIFSIGNALED`. No matching child → `ECHILD`, even with `WNOHANG` |
@@ -66,7 +66,8 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 | 204 | sched_getaffinity | The scheduling CPUs; returns 8. No setaffinity |
 | 213/232/233 | epoll_create/wait/ctl | Shares poll's readiness |
 | 217 | getdents64 | `linux_dirent64` |
-| 218 | set_tid_address | stub |
+| 218 | set_tid_address | Stores `Process::clear_child_tid`; `sys_exit` (only) zeroes it and futex-wakes it. `exec` clears it. A signal death does not honour it |
+| 231 | exit_group | SIGKILLs every process sharing the caller's address space, then `exit`. From a spawned thread the leader dies by SIGKILL and the status is lost |
 | 228/229 | clock_gettime/getres | `REALTIME` = RTC at boot + uptime. `MONOTONIC`/`BOOTTIME`/… = uptime. CPU-time clocks from `exec_ns`. Resolution 1 ns |
 | 280 | utimensat | `UTIME_NOW`/`OMIT`, `AT_SYMLINK_NOFOLLOW`, NULL path = futimens. A relative path with a real dirfd → `ENOSYS` |
 | 319 | memfd_create | |

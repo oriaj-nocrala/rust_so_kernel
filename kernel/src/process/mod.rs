@@ -195,6 +195,11 @@ pub struct Process {
     /// forever — see `Scheduler::kill_current`.
     pub is_thread: bool,
 
+    /// `CLONE_CHILD_CLEARTID` / `set_tid_address`: a user address that gets a 0 written to it (and a futex wake) when this thread
+    /// exits through `sys_exit`; how musl's `pthread_join` learns the thread is gone. 0 = none. Cleared by `exec` (the address
+    /// belongs to the old image). Not honoured on a signal death.
+    pub clear_child_tid: u64,
+
     /// For a thread (`is_thread == true`) whose stack `sys_clone` found to
     /// be a private `mmap()`-backed VMA (as opposed to a caller-supplied
     /// one via `pthread_attr_setstack`): `(vma_start, size_pages)`, freed
@@ -396,6 +401,7 @@ impl Process {
             fpu_state: Box::new(fpu::default_state()),
             is_thread: false,
             owned_stack_vma: None,
+            clear_child_tid: 0,
             cwd: alloc::string::String::from("/"),
             exe_name: alloc::string::String::new(),
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
@@ -486,6 +492,7 @@ impl Process {
             fpu_state: Box::new(fpu::default_state()),
             is_thread: false,
             owned_stack_vma: None,
+            clear_child_tid: 0,
             cwd: alloc::string::String::from("/"),
             exe_name: alloc::string::String::new(),
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
@@ -567,6 +574,7 @@ impl Process {
             fpu_state,
             is_thread: false,
             owned_stack_vma: None,
+            clear_child_tid: 0,
             cwd,
             exe_name,
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],
@@ -675,6 +683,7 @@ impl Process {
             fpu_state: Box::new(fpu::default_state()),
             is_thread: true,
             owned_stack_vma,
+            clear_child_tid: 0,
             cwd,
             exe_name,
             signal_handlers: [SignalAction::Default; signal::NUM_SIGNALS],

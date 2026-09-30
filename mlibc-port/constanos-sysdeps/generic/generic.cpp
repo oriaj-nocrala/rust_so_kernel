@@ -119,7 +119,6 @@ constexpr long SYS_ioctl = 16;
 constexpr long SYS_nanosleep = 35;
 constexpr long SYS_getpid = 39;
 constexpr long SYS_getppid = 110;
-constexpr long SYS_clone = 56;
 constexpr long SYS_fork = 57;
 constexpr long SYS_execve = 59;
 constexpr long SYS_exit = 60;
@@ -870,17 +869,18 @@ int sys_futex_wake(int *pointer) {
 // All remaining functions are disabled in ldso.
 #ifndef MLIBC_BUILDING_RTLD
 
-// This kernel's clone(56) is a custom ABI, not Linux's real clone(2):
-// long clone(void *entry, void *stack, void *tcb). It creates a new
-// schedulable thread sharing the caller's AddressSpace, starting execution
-// at `entry` with RSP=`stack`; `tcb` is passed through unused by the kernel
-// (see kernel/src/process/syscall.rs::sys_clone) — __mlibc_enter_thread
-// below sets FS itself via sys_tcb_set() once the new thread actually runs.
-// `stack` here is the value thread.cpp's sys_prepare_stack() already built
-// (entry/user_arg/tcb pushed on it for __mlibc_start_thread to pop).
+// clone(56) is Linux's: clone(flags, stack, ptid, ctid, tls). __constanos_clone (thread_entry.S) makes the call and, in the new
+// thread, jumps to __mlibc_start_thread on `stack`: the value thread.cpp's sys_prepare_stack() already built (entry, user_arg and
+// tcb pushed on it). __mlibc_enter_thread sets FS itself via sys_tcb_set() once the thread runs, so no CLONE_SETTLS; the tid
+// comes back as the return value and the parent stores it in the TCB (the child waits for that).
+extern "C" long __constanos_clone(unsigned long flags, void *stack, int *ptid, int *ctid, void *tls);
+
 int sys_clone(void *tcb, pid_t *tid_out, void *stack) {
-	long ret = raw_syscall(SYS_clone, (long)__mlibc_start_thread,
-			(long)stack, (long)tcb);
+	(void)tcb;
+	constexpr unsigned long CLONE_VM = 0x100, CLONE_FS = 0x200, CLONE_FILES = 0x400, CLONE_SIGHAND = 0x800,
+		CLONE_THREAD = 0x10000, CLONE_SYSVSEM = 0x40000;
+	long ret = __constanos_clone(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM,
+			stack, nullptr, nullptr, nullptr);
 	if (ret < 0)
 		return (int)-ret;
 	*tid_out = (pid_t)ret;

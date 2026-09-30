@@ -64,10 +64,16 @@ pub(super) fn sys_arch_prctl(code: i32, addr: u64) -> SyscallResult {
 
 /// set_tid_address(218): pid_t set_tid_address(int *tidptr)
 ///
-/// Used by mlibc during thread startup to register a clear-child-tid pointer.
-/// In our single-threaded model we just return the current PID.
-pub(super) fn sys_set_tid_address(_tidptr: u64) -> SyscallResult {
-    sys_getpid()
+/// Registers the address that gets a 0 and a futex wake when this thread
+/// exits (`Process::clear_child_tid`); returns the tid.
+pub(super) fn sys_set_tid_address(tidptr: u64) -> SyscallResult {
+    with_scheduler(|scheduler| match scheduler.running_mut() {
+        Some(proc) => {
+            proc.clear_child_tid = tidptr;
+            proc.pid.0 as SyscallResult
+        }
+        None => 0,
+    })
 }
 
 /// sys_yield — voluntary context switch.
@@ -246,6 +252,19 @@ pub(super) fn sys_exit(status: i32) -> SyscallResult {
 
     let _irq = crate::process::irq_guard::InterruptGuard::new();
 
+    // CLONE_CHILD_CLEARTID: tell whoever waits on this thread (musl's
+    // `pthread_join`) it is gone. Before the process is taken off the CPU,
+    // while its address space is still the current one, and with IF=0 like
+    // everything after this point.
+    let clear = {
+        let sched = crate::process::scheduler::local_scheduler();
+        sched.running_ref().filter(|p| p.clear_child_tid != 0).map(|p| (p.clear_child_tid, p.address_space.clone()))
+    };
+    if let Some((addr, space)) = clear {
+        unsafe { space.copy_to_user(addr, &0u32.to_ne_bytes()); }
+        super::sync::futex_wake_irq_off(space.root_frame().start_address().as_u64(), addr, 1, u32::MAX);
+    }
+
     let (dead_pid, parent_to_notify, tf_ptr, old_files) = {
         let mut scheduler = crate::process::scheduler::local_scheduler();
         // Swap in a fresh, empty fd table *before* the process becomes a
@@ -315,6 +334,28 @@ pub(super) fn sys_exit(status: i32) -> SyscallResult {
     }
 }
 
+/// exit_group(231): end every thread of the calling process, then exit.
+///
+/// A thread group is the set of processes sharing one address space (there is no tgid here). The others get SIGKILL; the caller
+/// exits with `status`. Called from a spawned thread, that ends the process with the *leader* killed by SIGKILL instead of
+/// exiting with `status`: `status` is lost then, and only the main thread's exit code is exact.
+pub(super) fn sys_exit_group(status: i32) -> SyscallResult {
+    with_scheduler(|sched| {
+        let Some(me) = sched.running_ref() else { return 0 };
+        let (my_pid, space) = (me.pid.0, me.address_space.clone());
+        let others: alloc::vec::Vec<usize> = sched
+            .iter_all()
+            .filter(|p| p.pid.0 != my_pid && p.pid.0 != 0 && alloc::sync::Arc::ptr_eq(&p.address_space, &space))
+            .map(|p| p.pid.0)
+            .collect();
+        for pid in others {
+            sched.signal_pid(pid, crate::process::signal::SIGKILL);
+        }
+        0
+    });
+    sys_exit(status)
+}
+
 /// Cancel every side-table registration a dying process might be holding
 /// (pending poll/epoll waits, futex waiters). Must run for *every* death
 /// path, not just `sys_exit`'s: `resolve_signals`'s uncaught-signal
@@ -341,6 +382,11 @@ pub(crate) fn cancel_all_waiters(pid: usize) {
 }
 
 pub(super) fn sys_fork() -> SyscallResult {
+    fork_impl(0, None)
+}
+
+/// `fork`, with `clone`'s two extras: the child resumes on `child_stack` if that is nonzero, and with `tls` as its FS base if given.
+fn fork_impl(child_stack: u64, tls: Option<u64>) -> SyscallResult {
     let tf_ptr = current_tf_ptr();
 
     let _irq = crate::process::irq_guard::InterruptGuard::new();
@@ -362,6 +408,9 @@ pub(super) fn sys_fork() -> SyscallResult {
                 // Build child TrapFrame: same as parent but rax=0 (fork returns 0 in child)
                 let mut tf_copy = unsafe { *tf_ptr };
                 tf_copy.rax = 0;
+                if child_stack != 0 {
+                    tf_copy.rsp = child_stack;
+                }
 
                 match unsafe { proc.address_space.fork() } {
                     // FS base from the MSR, not `proc.fs_base`: that field is
@@ -393,7 +442,7 @@ pub(super) fn sys_fork() -> SyscallResult {
                 alloc::boxed::Box::new(parent_fpu_state),
             )
         );
-        child.fs_base = parent_fs_base; // inherit TLS base from parent
+        child.fs_base = tls.unwrap_or(parent_fs_base); // inherit TLS base from parent unless clone gave one
         child.ctty = parent_ctty;
         // POSIX fork(): dispositions (with their SA_RESTART) and the signal
         // mask are inherited; pending signals are not. Every child used to
@@ -417,31 +466,52 @@ pub(super) fn sys_fork() -> SyscallResult {
 
 // ── clone(56) ──────────────────────────────────────────────────────────────
 
-/// clone(56): long clone(void *entry, void *stack, void *tcb)
+/// clone(56): long clone(unsigned long flags, void *stack, int *ptid, int *ctid, void *tls) — Linux's x86-64 argument order.
 ///
-/// Real threading: creates a new schedulable Process that SHARES the
-/// caller's AddressSpace (same `Arc`, no COW page-table clone at all —
-/// unlike fork()) instead of getting its own. The new thread starts
-/// executing at `entry` with RSP=`stack`.
+/// - `CLONE_THREAD` (with `CLONE_VM|CLONE_SIGHAND`): a new schedulable Process that SHARES the caller's `AddressSpace` (the same
+///   `Arc`, no page-table copy) and file table. It resumes where the caller does, after the `syscall`, with `rax = 0`, the
+///   caller's registers and FPU state, `rsp = stack` (if nonzero) and FS base = `tls` under `CLONE_SETTLS`. The caller gets the
+///   new thread's pid, its tid. `CLONE_PARENT_SETTID`/`CLONE_CHILD_SETTID` store it at `ptid`/`ctid` before the thread can run;
+///   `CLONE_CHILD_CLEARTID` registers `ctid` for `Process::clear_child_tid`.
+/// - Without `CLONE_THREAD`: a COW fork (`fork_impl`) on `stack`, whatever `CLONE_VM`/`CLONE_VFORK` say. That is what musl's
+///   `posix_spawn` asks for; the parent is not suspended until the child execs, which is safe because musl reports an exec
+///   failure through a close-on-exec pipe, not shared memory. (close-on-exec is not honoured yet, so a spawn would block.)
 ///
-/// This is a custom ABI (not Linux's real `clone(2)` flags/signature) —
-/// it matches exactly what this kernel's mlibc port's `sys_clone` calls
-/// with: `entry` = `__mlibc_start_thread`, `stack` = the already-prepared
-/// stack `sys_prepare_stack` built in userspace (carrying the real
-/// entry/arg/tcb the assembly trampoline pops off it), `tcb` unused here —
-/// mlibc's own `__mlibc_enter_thread` calls `sys_tcb_set(tcb)` itself once
-/// the new thread actually starts running.
-///
-/// Returns the new thread's pid (used as its tid) to the caller.
-///
-/// The new thread shares the caller's `FileDescriptorTable` (`Arc<Mutex<..>>`,
-/// see `Process::files`) — files one thread opens are visible to its
-/// siblings, matching POSIX semantics. It also never zombie-parks on exit:
-/// see `Process::is_thread` / `Scheduler::kill_current` for why (mlibc's
-/// `pthread_join()` never calls `waitpid()` on a tid, so the kernel reaps a
-/// thread's `Process` immediately instead of waiting for a collector that
-/// will never come).
-pub(super) fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
+/// A thread is a process with its own pid: there is no tgid, so `getpid()` in a thread returns the tid. It never zombie-parks on
+/// exit (see `Process::is_thread`, `Scheduler::kill_current`). A `Huge2M` VMA under `stack` is recorded as the thread's own and
+/// freed when it dies (mlibc never unmaps its thread stacks).
+pub(super) fn sys_clone(flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) -> SyscallResult {
+    const CLONE_VM: u64 = 0x100;
+    const CLONE_SIGHAND: u64 = 0x800;
+    const CLONE_THREAD: u64 = 0x1_0000;
+    const CLONE_SETTLS: u64 = 0x8_0000;
+    const CLONE_PARENT_SETTID: u64 = 0x10_0000;
+    const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
+    const CLONE_CHILD_SETTID: u64 = 0x100_0000;
+
+    if flags & CLONE_THREAD == 0 {
+        return fork_impl(stack, (flags & CLONE_SETTLS != 0).then_some(tls));
+    }
+    if flags & CLONE_VM == 0 || flags & CLONE_SIGHAND == 0 {
+        return errno::EINVAL;
+    }
+    for (flag, addr) in [(CLONE_PARENT_SETTID, ptid), (CLONE_CHILD_SETTID, ctid), (CLONE_CHILD_CLEARTID, ctid)] {
+        if flags & flag != 0 && validate_user_buffer(addr, 4).is_err() {
+            return errno::EFAULT;
+        }
+    }
+
+    let tf_ptr = current_tf_ptr();
+    let mut child_tf = unsafe { *tf_ptr };
+    child_tf.rax = 0;
+    if stack != 0 {
+        child_tf.rsp = stack;
+    }
+    // Like `fork`: the live registers, not what the last preemption stashed.
+    let mut fpu_state = crate::process::fpu::default_state();
+    unsafe { crate::process::fpu::save(&mut fpu_state); }
+    let parent_fs_base = crate::process::scheduler::read_fs_base();
+
     let (parent_pid, address_space, files, parent_cwd, (parent_pgid, parent_sid, parent_ctty), parent_exe_name, parent_signals, (parent_comm, parent_cmdline)) = {
         let sched = crate::process::scheduler::local_scheduler();
         match sched.running_ref() {
@@ -451,33 +521,39 @@ pub(super) fn sys_clone(entry: u64, stack: u64, _tcb: u64) -> SyscallResult {
         }
     };
 
-    // If `stack` falls inside a VMA that mlibc's sys_prepare_stack mmap'd
-    // just for this thread (the common case — Huge2M, since mlibc's
-    // default_stacksize is exactly 2 MiB, which sys_mmap_anon always backs
-    // with a huge page), record it so the kernel can free it when this
-    // thread dies. mlibc itself never does (see Process::owned_stack_vma's
-    // doc comment) — a caller-supplied stack (pthread_attr_setstack) has no
-    // matching VMA here and is correctly left alone.
-    let owned_stack_vma = address_space.find_vma(stack).and_then(|vma| {
-        if vma.kind == crate::memory::vma::VmaKind::Huge2M {
-            Some((vma.start, vma.size_pages))
-        } else {
-            None
-        }
-    });
+    let owned_stack_vma = if stack == 0 {
+        None
+    } else {
+        address_space.find_vma(stack).and_then(|vma| {
+            (vma.kind == crate::memory::vma::VmaKind::Huge2M).then_some((vma.start, vma.size_pages))
+        })
+    };
 
     let kernel_stack = crate::init::processes::allocate_kernel_stack();
 
     let mut scheduler = crate::process::irq_guard::SchedGuard::lock();
     let pid = scheduler.allocate_pid();
+    let tid_bytes = (pid.0 as u32).to_ne_bytes();
+    // Before the thread exists for the scheduler: it must find its tid in place. (Lock order: scheduler → address space.)
+    for (flag, addr) in [(CLONE_PARENT_SETTID, ptid), (CLONE_CHILD_SETTID, ctid)] {
+        if flags & flag != 0 && unsafe { address_space.copy_to_user(addr, &tid_bytes) } != 4 {
+            return errno::EFAULT;
+        }
+    }
 
     let mut thread = alloc::boxed::Box::new(
         crate::process::Process::new_thread(
             pid, parent_pid,
-            x86_64::VirtAddr::new(entry), x86_64::VirtAddr::new(stack),
+            x86_64::VirtAddr::new(child_tf.rip), x86_64::VirtAddr::new(child_tf.rsp),
             kernel_stack, address_space, files, owned_stack_vma, parent_cwd, parent_pgid, parent_sid, parent_exe_name,
         )
     );
+    *thread.trapframe = child_tf;
+    thread.fpu_state = alloc::boxed::Box::new(fpu_state);
+    thread.fs_base = if flags & CLONE_SETTLS != 0 { tls } else { parent_fs_base };
+    if flags & CLONE_CHILD_CLEARTID != 0 {
+        thread.clear_child_tid = ctid;
+    }
     // A copy, not Linux's shared table (CLONE_SIGHAND): enough that a
     // signal landing on a new thread runs the handler its process
     // installed, rather than the default action.
@@ -698,6 +774,8 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
                     }
                 }
                 proc.sig_restart = 0;
+                // `set_tid_address`'s pointer belongs to the old image.
+                proc.clear_child_tid = 0;
                 crate::ktrace!(crate::debug::SCHED, "exec: dropping old AS");
                 // Replace address space with freshly loaded one. This drops
                 // this Process's Arc reference to whatever it had before —

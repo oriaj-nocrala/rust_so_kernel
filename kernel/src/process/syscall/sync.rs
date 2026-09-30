@@ -163,7 +163,12 @@ fn futex_wake(uaddr: u64, val: i32, bitset: u32) -> SyscallResult {
         }
     };
 
-    let max_wake = if val <= 0 { i32::MAX } else { val };
+    futex_wake_irq_off(as_id, uaddr, if val <= 0 { i32::MAX } else { val }, bitset) as i64
+}
+
+/// The wake itself, for a caller that already runs with IF=0 (`sys_exit`) and so must not go through an `InterruptGuard`, whose
+/// drop would turn interrupts back on. `as_id` is the address space's root frame, as `FutexWaiter::as_id` holds it.
+pub(super) fn futex_wake_irq_off(as_id: u64, uaddr: u64, max_wake: i32, bitset: u32) -> usize {
     let mut woken_pids: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
     {
         let mut waiters = FUTEX_WAITERS.lock();
@@ -190,7 +195,7 @@ fn futex_wake(uaddr: u64, val: i32, bitset: u32) -> SyscallResult {
             sched.wake_with_retval(pid, 0);
         }
     }
-    woken_pids.len() as i64
+    woken_pids.len()
 }
 
 /// FUTEX_REQUEUE / FUTEX_CMP_REQUEUE: wake up to `nr_wake` waiters of `uaddr`, then move up to `nr_requeue` of the rest to
