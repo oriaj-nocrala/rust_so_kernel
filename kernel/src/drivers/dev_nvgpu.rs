@@ -33,9 +33,11 @@ use crate::process::syscall::{errno, validate_user_buffer};
 const ARENA_BYTES: u64 = 1 << 30;
 /// The software device's pretend VRAM.
 const SOFT_VRAM_BYTES: u64 = 6 << 30;
-/// GPU virtual addresses user space may allocate: [1 TiB, 128 TiB).
-const VA_START: u64 = 1 << 40;
-const VA_END: u64 = 1 << 47;
+/// GPU virtual addresses user space may allocate: [64 GiB, 256 GiB). Below 2^40 because some methods take 40-bit addresses
+/// (`SET_VERTEX_STREAM_SUBSTITUTE_A` keeps the upper part in 8 bits; nouveau's own heap ends at 2^38), and above the fixed
+/// mappings the boot-time GPU code makes (4 GiB, 8 GiB..).
+const VA_START: u64 = 1 << 36;
+const VA_END: u64 = 1 << 38;
 
 static HELD: AtomicBool = AtomicBool::new(false);
 
@@ -180,7 +182,9 @@ fn info(vram_used: u64) -> uapi::Info {
         cls_copy: 0xc7b5,
         cls_eng2d: 0x902d,
         cls_eng3d: 0xc797,
-        cls_m2mf: 0x9039,
+        // What nouveau's winsys reports on Turing and later: KEPLER_INLINE_TO_MEMORY_B. A class at or below FERMI_MEMORY_TO_MEMORY_FORMAT_A
+        // (0x9039, and 0 is below it) makes NVK push Fermi M2MF methods at a subchannel the queue does not have.
+        cls_m2mf: 0xa140,
         cls_compute: 0xc7c0,
         cls_gpfifo: 0xc56f,
         cls_vdec: 0,
@@ -260,7 +264,7 @@ impl NvgpuHandle {
                 let waits = read_user_array::<SyncRef>(r.waits, r.wait_count, nvgpu::devmodel::MAX_SYNC_REFS)?;
                 let signals = read_user_array::<SyncRef>(r.signals, r.sig_count, nvgpu::devmodel::MAX_SYNC_REFS)?;
                 // All waits satisfied, or nothing happens and the caller retries.
-                if dev.waits_ready(&waits, false).map_err(errno_of)?.is_none() {
+                if dev.waits_ready(&waits, false, false).map_err(errno_of)?.is_none() {
                     return Err(errno::EAGAIN);
                 }
                 dev.exec(r.ctx, &pushes, &waits, &signals).map_err(errno_of)?;
@@ -283,12 +287,13 @@ impl NvgpuHandle {
             }
             uapi::IOC_SYNC_WAIT => {
                 let mut r: uapi::SyncWait = read_user(arg)?;
-                if r.flags & !uapi::WAIT_ANY != 0 || r.count == 0 {
+                if r.flags & !(uapi::WAIT_ANY | uapi::WAIT_PENDING) != 0 || r.count == 0 {
                     return Err(errno::EINVAL);
                 }
                 let refs = read_user_array::<SyncRef>(r.refs, r.count, nvgpu::devmodel::MAX_SYNC_REFS)?;
                 let any = r.flags & uapi::WAIT_ANY != 0;
-                match dev.waits_ready(&refs, any).map_err(errno_of)? {
+                let pending = r.flags & uapi::WAIT_PENDING != 0;
+                match dev.waits_ready(&refs, any, pending).map_err(errno_of)? {
                     Some(i) => {
                         r.first_ready = i as u32;
                         write_user(arg, r)?;
@@ -298,7 +303,7 @@ impl NvgpuHandle {
             }
             uapi::IOC_SYNC_QUERY => {
                 let mut r: uapi::SyncQuery = read_user(arg)?;
-                r.value = dev.sync_query(r.handle).map_err(errno_of)?;
+                (r.value, r.pending) = dev.sync_query(r.handle).map_err(errno_of)?;
                 write_user(arg, r)?;
             }
             uapi::IOC_TIMESTAMP => {
@@ -334,8 +339,9 @@ impl FileHandle for NvgpuHandle {
     }
 
     fn ioctl(&mut self, request: u64, arg: u64) -> Option<i64> {
-        // Our requests are 32-bit numbers; anything else belongs to the generic ioctls.
-        let request = u32::try_from(request).ok()?;
+        // The command is 32 bits, as in Linux (`unsigned int cmd`): musl declares `ioctl(int, int, ...)`, so a request with the top
+        // bit set arrives sign-extended (0xffffffffc0a04e01). Anything that is not ours belongs to the generic ioctls.
+        let request = request as u32;
         if (request >> 8) & 0xff != u32::from(b'N') {
             return None;
         }

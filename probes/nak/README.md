@@ -13,7 +13,7 @@ Receta (todo fuera del repo, en `~/src/gpu-ref/`):
    `pthread_mutex_clocklock` y `pthread_cond_clockwait`, que las cabeceras de libstdc++ de glibc usan y musl no declara).
 4. Herramientas nativas de build: en `build-nak` (Meson nativo, `-Dllvm=enabled -Dshared-llvm=enabled`) construir
    `src/compiler/clc/mesa_clc` y `src/compiler/spirv/vtn_bindgen2`, y copiarlas a `~/src/gpu-ref/native-tools/`.
-5. Meson cruzado: `PATH=~/src/gpu-ref/native-tools:$PATH meson setup build-musl --cross-file probes/nak/musl-cross.ini
+5. Meson cruzado: `PATH=~/src/gpu-ref/native-tools:$PATH meson setup build-musl --cross-file mesa-port/musl-cross.ini
    --default-library=static -Dvulkan-drivers=nouveau -Dgallium-drivers= -Dplatforms= -Dllvm=disabled -Dopengl=false -Dgles1=disabled
    -Dgles2=disabled -Degl=disabled -Dgbm=disabled -Dglx=disabled -Dvideo-codecs= -Dvulkan-layers= -Dbuild-tests=false -Dtools=
    -Dlibunwind=disabled -Dlmsensors=disabled -Dxlib-lease=disabled -Dzlib=disabled -Dzstd=disabled -Dexpat=disabled

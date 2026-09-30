@@ -27,6 +27,7 @@ pub const PUSH_NO_PREFETCH: u32 = 1 << 0;
 pub const PUSH_MAX_BYTES: u32 = 0x7f_fffc;
 
 pub const WAIT_ANY: u32 = 1 << 0;
+pub const WAIT_PENDING: u32 = 1 << 1;
 
 /// Linux's `_IOWR('N', nr, size)`.
 pub const fn ioc(nr: u32, size: usize) -> u32 {
@@ -229,6 +230,7 @@ pub struct SyncQuery {
     pub handle: u32,
     pub _pad: u32,
     pub value: u64,
+    pub pending: u64,
 }
 
 /// `struct nvg_timestamp`.
@@ -261,7 +263,7 @@ mod tests {
         assert_eq!(size_of::<SyncDestroy>(), 8, "nvg_sync_destroy");
         assert_eq!(size_of::<SyncSignal>(), 16, "nvg_sync_signal");
         assert_eq!(size_of::<SyncWait>(), 24, "nvg_sync_wait");
-        assert_eq!(size_of::<SyncQuery>(), 16, "nvg_sync_query");
+        assert_eq!(size_of::<SyncQuery>(), 24, "nvg_sync_query");
         assert_eq!(size_of::<Timestamp>(), 8, "nvg_timestamp");
         assert_eq!(offset_of!(Info, abi_version), 0, "nvg_info.abi_version");
         assert_eq!(offset_of!(Info, flags), 4, "nvg_info.flags");
@@ -306,6 +308,7 @@ mod tests {
         assert_eq!(offset_of!(SyncWait, flags), 12, "nvg_sync_wait.flags");
         assert_eq!(offset_of!(SyncWait, first_ready), 16, "nvg_sync_wait.first_ready");
         assert_eq!(offset_of!(SyncQuery, value), 8, "nvg_sync_query.value");
+        assert_eq!(offset_of!(SyncQuery, pending), 16, "nvg_sync_query.pending");
     }
 
     #[test]
@@ -324,7 +327,7 @@ mod tests {
         assert_eq!(IOC_SYNC_DESTROY, 0xc0084e0c, "NVG_IOC_SYNC_DESTROY");
         assert_eq!(IOC_SYNC_SIGNAL, 0xc0104e0d, "NVG_IOC_SYNC_SIGNAL");
         assert_eq!(IOC_SYNC_WAIT, 0xc0184e0e, "NVG_IOC_SYNC_WAIT");
-        assert_eq!(IOC_SYNC_QUERY, 0xc0104e0f, "NVG_IOC_SYNC_QUERY");
+        assert_eq!(IOC_SYNC_QUERY, 0xc0184e0f, "NVG_IOC_SYNC_QUERY");
         assert_eq!(IOC_TIMESTAMP, 0xc0084e10, "NVG_IOC_TIMESTAMP");
     }
 

@@ -243,6 +243,13 @@ struct Binding {
     pte_kind: u32,
 }
 
+/// A timeline: `value` has completed, `pending` is the highest value work already queued will signal (`pending >= value`).
+#[derive(Debug, Clone, Copy)]
+struct Timeline {
+    value: u64,
+    pending: u64,
+}
+
 #[derive(Debug)]
 struct Pending {
     ctx: u32,
@@ -275,7 +282,7 @@ pub struct Device<B: Backend> {
     bound: BTreeMap<u64, Binding>,
     ctxs: BTreeMap<u32, u32>,
     next_ctx: u32,
-    syncs: BTreeMap<u32, u64>,
+    syncs: BTreeMap<u32, Timeline>,
     next_sync: u32,
     pending: Vec<Pending>,
 }
@@ -553,7 +560,7 @@ impl<B: Backend> Device<B> {
         while self.syncs.contains_key(&h) || h == 0 {
             h = h.wrapping_add(1);
         }
-        self.syncs.insert(h, initial);
+        self.syncs.insert(h, Timeline { value: initial, pending: initial });
         self.next_sync = h.wrapping_add(1);
         Ok(h)
     }
@@ -564,26 +571,30 @@ impl<B: Backend> Device<B> {
 
     /// CPU signal: the value must not go backwards (Vulkan timeline semantics).
     pub fn sync_signal(&mut self, handle: u32, value: u64) -> Result<(), Error> {
-        let v = self.syncs.get_mut(&handle).ok_or(Error::NoEnt)?;
-        if value < *v {
+        let t = self.syncs.get_mut(&handle).ok_or(Error::NoEnt)?;
+        if value < t.value {
             return Err(Error::Inval);
         }
-        *v = value;
+        t.value = value;
+        t.pending = t.pending.max(value);
         Ok(())
     }
 
-    pub fn sync_query(&mut self, handle: u32) -> Result<u64, Error> {
+    /// `(value, pending)`.
+    pub fn sync_query(&mut self, handle: u32) -> Result<(u64, u64), Error> {
         self.poll();
-        self.syncs.get(&handle).copied().ok_or(Error::NoEnt)
+        self.syncs.get(&handle).map(|t| (t.value, t.pending)).ok_or(Error::NoEnt)
     }
 
-    /// The index of a ready reference (`any`), or of the last one when all are (`!any`, `Some(0)` for none); `None` while not ready.
-    /// A reference to a destroyed timeline is an error.
-    pub fn waits_ready(&mut self, refs: &[SyncRef], any: bool) -> Result<Option<usize>, Error> {
+    /// The index of a ready reference (`any`), or of the first one when all are (`!any`, `Some(0)` for none); `None` while not ready.
+    /// `pending` compares with each timeline's pending value instead of its completed one. A reference to a destroyed timeline is
+    /// an error.
+    pub fn waits_ready(&mut self, refs: &[SyncRef], any: bool, pending: bool) -> Result<Option<usize>, Error> {
         self.poll();
         let mut first = None;
         for (i, r) in refs.iter().enumerate() {
-            let v = *self.syncs.get(&r.handle).ok_or(Error::NoEnt)?;
+            let t = *self.syncs.get(&r.handle).ok_or(Error::NoEnt)?;
+            let v = if pending { t.pending } else { t.value };
             let ready = v >= r.value;
             if any && ready {
                 return Ok(Some(i));
@@ -600,8 +611,9 @@ impl<B: Backend> Device<B> {
 
     fn advance(&mut self, s: SyncRef) {
         // a timeline destroyed while work was in flight simply loses the signal
-        if let Some(v) = self.syncs.get_mut(&s.handle) {
-            *v = (*v).max(s.value);
+        if let Some(t) = self.syncs.get_mut(&s.handle) {
+            // `exec` raised `pending` to this value when the work was queued, so `pending >= value` still holds.
+            t.value = t.value.max(s.value);
         }
     }
 
@@ -656,6 +668,11 @@ impl<B: Backend> Device<B> {
         // An EXEC with nothing to run still orders after earlier work on the context: signals wait for its fence too.
         let seq = self.backend.submit(ctx, pushes)?;
         if !signals.is_empty() {
+            for s in signals {
+                if let Some(t) = self.syncs.get_mut(&s.handle) {
+                    t.pending = t.pending.max(s.value);
+                }
+            }
             self.pending.push(Pending { ctx, seq, signals: signals.to_vec() });
         }
         self.poll();
@@ -978,11 +995,11 @@ mod tests {
     fn sync_timelines_only_move_forward() {
         let mut d = dev();
         let s = d.sync_create(5).unwrap();
-        assert_eq!(d.sync_query(s), Ok(5));
+        assert_eq!(d.sync_query(s).map(|t| t.0), Ok(5));
         d.sync_signal(s, 5).unwrap();
         d.sync_signal(s, 9).unwrap();
         assert_eq!(d.sync_signal(s, 8), Err(Error::Inval));
-        assert_eq!(d.sync_query(s), Ok(9));
+        assert_eq!(d.sync_query(s).map(|t| t.0), Ok(9));
         d.sync_destroy(s).unwrap();
         assert_eq!(d.sync_query(s), Err(Error::NoEnt));
         assert_eq!(d.sync_signal(s, 10), Err(Error::NoEnt));
@@ -994,15 +1011,15 @@ mod tests {
         let a = d.sync_create(3).unwrap();
         let b = d.sync_create(0).unwrap();
         let refs = [sr(a, 3), sr(b, 1)];
-        assert_eq!(d.waits_ready(&refs, false), Ok(None), "b has not reached 1");
-        assert_eq!(d.waits_ready(&refs, true), Ok(Some(0)), "a is ready");
-        assert_eq!(d.waits_ready(&[sr(b, 1), sr(a, 4)], true), Ok(None));
+        assert_eq!(d.waits_ready(&refs, false, false), Ok(None), "b has not reached 1");
+        assert_eq!(d.waits_ready(&refs, true, false), Ok(Some(0)), "a is ready");
+        assert_eq!(d.waits_ready(&[sr(b, 1), sr(a, 4)], true, false), Ok(None));
         d.sync_signal(b, 1).unwrap();
-        assert_eq!(d.waits_ready(&refs, false), Ok(Some(0)));
-        assert_eq!(d.waits_ready(&[], false), Ok(Some(0)), "waiting for nothing is ready");
-        assert_eq!(d.waits_ready(&[], true), Ok(None), "any of nothing is not");
-        assert_eq!(d.waits_ready(&[sr(77, 0)], false), Err(Error::NoEnt));
-        assert_eq!(d.waits_ready(&[sr(a, 0), sr(77, 0)], true), Ok(Some(0)), "any stops at the first ready one");
+        assert_eq!(d.waits_ready(&refs, false, false), Ok(Some(0)));
+        assert_eq!(d.waits_ready(&[], false, false), Ok(Some(0)), "waiting for nothing is ready");
+        assert_eq!(d.waits_ready(&[], true, false), Ok(None), "any of nothing is not");
+        assert_eq!(d.waits_ready(&[sr(77, 0)], false, false), Err(Error::NoEnt));
+        assert_eq!(d.waits_ready(&[sr(a, 0), sr(77, 0)], true, false), Ok(Some(0)), "any stops at the first ready one");
     }
 
     // ---- exec -------------------------------------------------------------------------------------------------------------
@@ -1059,10 +1076,10 @@ mod tests {
         let (ctx, va) = ready_ctx(&mut d);
         let s = d.sync_create(0).unwrap();
         d.exec(ctx, &[push(va, 8)], &[], &[sr(s, 7)]).unwrap();
-        assert_eq!(d.sync_query(s), Ok(0), "still running");
+        assert_eq!(d.sync_query(s).map(|t| t.0), Ok(0), "still running");
         assert!(d.busy());
         d.backend.complete_all();
-        assert_eq!(d.sync_query(s), Ok(7));
+        assert_eq!(d.sync_query(s).map(|t| t.0), Ok(7));
         assert!(!d.busy());
     }
 
@@ -1072,7 +1089,7 @@ mod tests {
         let (ctx, va) = ready_ctx(&mut d);
         let s = d.sync_create(0).unwrap();
         d.exec(ctx, &[push(va, 8)], &[], &[sr(s, 3)]).unwrap();
-        assert_eq!(d.sync_query(s), Ok(3));
+        assert_eq!(d.sync_query(s).map(|t| t.0), Ok(3));
     }
 
     #[test]
@@ -1081,7 +1098,7 @@ mod tests {
         let (ctx, va) = ready_ctx(&mut d);
         let s = d.sync_create(10).unwrap();
         d.exec(ctx, &[push(va, 8)], &[], &[sr(s, 4)]).unwrap();
-        assert_eq!(d.sync_query(s), Ok(10));
+        assert_eq!(d.sync_query(s).map(|t| t.0), Ok(10));
     }
 
     #[test]
@@ -1092,9 +1109,9 @@ mod tests {
         let s = d.sync_create(0).unwrap();
         d.exec(ctx, &[push(va, 8)], &[], &[]).unwrap();
         d.exec(ctx, &[], &[], &[sr(s, 1)]).unwrap();
-        assert_eq!(d.sync_query(s), Ok(0), "the earlier push has not finished");
+        assert_eq!(d.sync_query(s).map(|t| t.0), Ok(0), "the earlier push has not finished");
         d.backend.complete_all();
-        assert_eq!(d.sync_query(s), Ok(1));
+        assert_eq!(d.sync_query(s).map(|t| t.0), Ok(1));
     }
 
     #[test]
@@ -1105,7 +1122,7 @@ mod tests {
         let s = d.sync_create(0).unwrap();
         d.exec(ctx, &[push(va, 8)], &[], &[sr(s, 5)]).unwrap();
         d.ctx_destroy(ctx).unwrap();
-        assert_eq!(d.sync_query(s), Ok(5));
+        assert_eq!(d.sync_query(s).map(|t| t.0), Ok(5));
         assert!(!d.busy());
     }
 
@@ -1203,6 +1220,66 @@ mod tests {
         assert_eq!(r, Err(Error::NoEnt), "refused by the model");
         // prove the guard above is what stops it: call the backend directly
         d.backend.submit(ctx, &[]).unwrap();
+    }
+
+
+    #[test]
+    fn pending_runs_ahead_of_the_completed_value_until_the_work_finishes() {
+        let mut d = dev();
+        d.backend.hold = true;
+        let (ctx, va) = ready_ctx(&mut d);
+        let s = d.sync_create(2).unwrap();
+        assert_eq!(d.sync_query(s), Ok((2, 2)), "a fresh timeline: nothing pending beyond its value");
+        d.exec(ctx, &[push(va, 8)], &[], &[sr(s, 7)]).unwrap();
+        assert_eq!(d.sync_query(s), Ok((2, 7)), "queued work will take it to 7");
+        assert_eq!(d.waits_ready(&[sr(s, 7)], false, false), Ok(None), "not completed");
+        assert_eq!(d.waits_ready(&[sr(s, 7)], false, true), Ok(Some(0)), "but pending");
+        assert_eq!(d.waits_ready(&[sr(s, 8)], false, true), Ok(None), "beyond what anyone will signal");
+        d.exec(ctx, &[push(va, 8)], &[], &[sr(s, 4)]).unwrap();
+        assert_eq!(d.sync_query(s), Ok((2, 7)), "a lower signal never lowers pending");
+        d.backend.complete_all();
+        assert_eq!(d.sync_query(s), Ok((7, 7)));
+    }
+
+    #[test]
+    fn a_cpu_signal_raises_both_values() {
+        let mut d = dev();
+        let s = d.sync_create(0).unwrap();
+        d.sync_signal(s, 3).unwrap();
+        assert_eq!(d.sync_query(s), Ok((3, 3)));
+    }
+
+    #[test]
+    fn a_cpu_signal_below_the_completed_value_is_refused_but_below_pending_is_not() {
+        let mut d = dev();
+        d.backend.hold = true;
+        let (ctx, va) = ready_ctx(&mut d);
+        let s = d.sync_create(0).unwrap();
+        d.exec(ctx, &[push(va, 8)], &[], &[sr(s, 9)]).unwrap();
+        d.sync_signal(s, 4).unwrap();
+        assert_eq!(d.sync_query(s), Ok((4, 9)), "the CPU moved the completed value, pending stays ahead");
+        assert_eq!(d.sync_signal(s, 3), Err(Error::Inval));
+    }
+
+    #[test]
+    fn a_refused_exec_leaves_pending_alone() {
+        let mut d = dev();
+        let (ctx, va) = ready_ctx(&mut d);
+        let s = d.sync_create(0).unwrap();
+        assert_eq!(d.exec(ctx, &[push(va + 0x100000, 8)], &[], &[sr(s, 5)]), Err(Error::Fault));
+        assert_eq!(d.sync_query(s), Ok((0, 0)));
+    }
+
+    #[test]
+    fn pending_wait_any_and_all() {
+        let mut d = dev();
+        d.backend.hold = true;
+        let (ctx, va) = ready_ctx(&mut d);
+        let a = d.sync_create(0).unwrap();
+        let b = d.sync_create(0).unwrap();
+        d.exec(ctx, &[push(va, 8)], &[], &[sr(a, 1)]).unwrap();
+        assert_eq!(d.waits_ready(&[sr(a, 1), sr(b, 1)], true, true), Ok(Some(0)));
+        assert_eq!(d.waits_ready(&[sr(a, 1), sr(b, 1)], false, true), Ok(None));
     }
 
     // ---- teardown and a randomised cross-check ----------------------------------------------------------------------------

@@ -16,6 +16,13 @@
 
 extern int ioctl(int fd, unsigned long request, ...);
 
+// A raw syscall: mlibc has no syscall(), and the point is to control the register the request travels in.
+static long sc3(long nr, long a, long b, long c) {
+   long ret;
+   __asm__ volatile("syscall" : "=a"(ret) : "a"(nr), "D"(a), "S"(b), "d"(c) : "rcx", "r11", "memory");
+   return ret;
+}
+
 static int failures;
 #define CHECK(cond, ...) do { if (cond) printf("  ok   %s\n", #cond); else { failures++; printf("  FAIL %s (line %d): ", #cond, __LINE__); printf(__VA_ARGS__); printf(" [errno %d]\n", errno); } } while (0)
 
@@ -52,12 +59,15 @@ static uint32_t sync_create(uint64_t initial) {
    return call(NVG_IOC_SYNC_CREATE, &s) == 0 ? s.handle : 0;
 }
 
-static int sync_query(uint32_t h, uint64_t *v) {
+static int sync_query2(uint32_t h, uint64_t *v, uint64_t *pending) {
    struct nvg_sync_query q = { .handle = h };
    int r = call(NVG_IOC_SYNC_QUERY, &q);
    *v = q.value;
+   if (pending) *pending = q.pending;
    return r;
 }
+
+static int sync_query(uint32_t h, uint64_t *v) { return sync_query2(h, v, NULL); }
 
 static int sync_wait(const struct nvg_sync_ref *refs, uint32_t n, uint32_t flags, uint32_t *first) {
    struct nvg_sync_wait w = { .refs = (uintptr_t)refs, .count = n, .flags = flags };
@@ -90,6 +100,11 @@ int main(void) {
          (unsigned long long)info.bar_size_B);
    CHECK(info.va_start < info.va_end && info.vram_size_B > 0 && strlen(info.device_name) > 0, "ranges and name");
    CHECK(call(0xc0004e77, &info) < 0 && errno == ENOTTY, "an unknown request is ENOTTY");
+   // musl's ioctl() takes an int, so the request reaches the kernel sign-extended to 64 bits: only the low 32 bits count (as in Linux)
+   struct nvg_info wide;
+   memset(&wide, 0, sizeof wide);
+   long wr = sc3(16 /* ioctl */, fd, (long)(int)NVG_IOC_INFO, (long)&wide);
+   CHECK(wr == 0 && wide.abi_version == NVG_ABI_VERSION, "a sign-extended request works (%ld, abi %u)", wr, wide.abi_version);
 
    // ---- BOs and the arena
    uint64_t off1 = 0, off2 = 0;
@@ -196,8 +211,14 @@ int main(void) {
    ss.value = 0;
    CHECK(call(NVG_IOC_SYNC_SIGNAL, &ss) < 0 && errno == EINVAL, "a timeline cannot go backwards");
 
-   struct nvg_sync_ref both[2] = { { .handle = s, .value = 5 }, { .handle = gate, .value = 2 } };
    uint32_t first = 77;
+   uint64_t pend = 0;
+   CHECK(sync_query2(s, &v, &pend) == 0 && v == 5 && pend == 5, "a settled timeline has pending == value (%llu, %llu)", (unsigned long long)v, (unsigned long long)pend);
+   struct nvg_sync_ref past_pending = { .handle = s, .value = 6 };
+   CHECK(sync_wait(&past_pending, 1, NVG_WAIT_PENDING, &first) < 0 && errno == EAGAIN, "a value nobody will signal is not pending either");
+   CHECK(sync_wait(&sig, 1, NVG_WAIT_PENDING, &first) == 0, "a pending wait for a completed value is ready");
+
+   struct nvg_sync_ref both[2] = { { .handle = s, .value = 5 }, { .handle = gate, .value = 2 } };
    CHECK(sync_wait(both, 2, 0, &first) < 0 && errno == EAGAIN, "waiting for all: EAGAIN while one is short");
    CHECK(sync_wait(both, 2, NVG_WAIT_ANY, &first) == 0 && first == 0, "waiting for any: ready at index %u", first);
    both[1].value = 1;

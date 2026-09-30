@@ -37,7 +37,7 @@ Cabecera única `nvgpu/uapi/nvgpu.h` (la usan el kernel, en espejo Rust con test
 | Rodaja | Contenido | Verificación |
 |---|---|---|
 | **G4a** | Cabecera UAPI + espejo Rust + `/dev/nvgpu` con **dispositivo software** (BOs en páginas de sistema, tabla de VA validada, `EXEC` registra los pushes y completa al instante, timelines reales). Lógica pura en un crate con tests de host. | tests de host; programa C musl en QEMU que recorre toda la interfaz; sabotaje |
-| **G4b** | Backend `nvkmd_constanos` en C (parche de Mesa en el repo) + `vk_sync_type` de constanos; NVK estático musl contra el dispositivo software. | en QEMU: enumerar el dispositivo, crear dispositivo lógico, buffers, un pipeline de cómputo compilado por NAK |
+| **G4b** (hecha 2026-09-30) | Backend `nvkmd_constanos` en C (`mesa-port/`) + `vk_sync_type` de constanos; NVK estático musl contra el dispositivo software. | `scripts/run-vk-probe.sh`: en QEMU enumera el dispositivo, crea dispositivo lógico, memoria (sistema y VRAM), un pipeline de cómputo compilado por NAK, envío, fence, semáforos binarios y de línea de tiempo |
 | **G4c** | Estado de GPU persistente (tablas, VRAM, canal GR, cerrojo) y el dispositivo *hardware* detrás de la misma interfaz: `VA_BIND` en caliente, `EXEC` real, fence de contexto. Nivel `gpu=uapi`. | Ryzen: mismo programa C de G4a con un shader real; lectura por otro camino |
 | **G4d** | Un dispatch de cómputo Vulkan de verdad en la Ryzen (SPIR-V -> NAK -> GPU) y verificación de resultados. | Ryzen |
 | **G4e** | Varios contextos (canales en caliente), cola de copia, robustez (RC tras fallo), y luego gráficos (clase 3D `0xc797`) y presentación. | según el caso |
@@ -52,3 +52,9 @@ Hoy el kernel **nunca bloquea** en `SYNC_WAIT`/`EXEC`: devuelven `-EAGAIN` y el 
 - **VRAM sin lectura desde CPU**: las lecturas de resultados pasan por un shader de copia a sistema (ya usado en 7b).
 - **C++ y `SPIRV-Tools` contra musl** para enlazar NVK completo (G3 lo dejó anotado).
 - Cada vuelta en la Ryzen consume budget de reanudación: juntar todos los diagnósticos en el mismo arranque.
+
+## Resultados de G4b (2026-09-30)
+
+- NVK completo (Vulkan 1.4, NAK, el runtime de Mesa) corre en constanos como un ejecutable estático musl de 15 MB contra `/dev/nvgpu` (dispositivo software): `vkCreateInstance`, un dispositivo físico (`NVK GA106`, NVIDIA `0x10de`, discreta), dos familias de colas (gráficos+cómputo+copia y cómputo), tres tipos de memoria (VRAM, VRAM "visible" que el backend sirve con memoria de sistema, sistema), `vkCreateDevice`, buffers con memoria mapeada y de VRAM, un pipeline de cómputo (NAK, ~190 ms bajo TCG), buffer de comandos, `vkQueueSubmit`, fence, semáforo de línea de tiempo y binario, `vkQueueWaitIdle`. El dispatch no se ejecuta (`not executed (software device)`).
+- Lo que salió al ejecutar el driver real, y no antes: (1) `ioctl` de musl toma un `int`: la petición llega extendida en signo (el kernel toma solo los 32 bits bajos, como Linux); (2) `cls_m2mf` debe ser `0xa140` (no 0 ni la clase Fermi) o NVK empuja métodos M2MF por un subcanal que la cola no tiene; (3) el rango de VA debe quedar bajo 2^40 (`SET_VERTEX_STREAM_SUBSTITUTE_A` guarda la dirección en 8+32 bits): `[64 GiB, 256 GiB)`; (4) los tipos `vk_sync` con `GPU_WAIT` exigen `WAIT_PENDING`, de ahí el valor `pending` de las timelines en la interfaz; (5) las entradas de Vulkan de NVK son símbolos débiles: `libnvk.a` va con `--whole-archive`; (6) un ejecutable estático no tiene `dladdr`, y NVK busca su `build-id` con él (parche en `util/build_id.c`).
+- Sigue pendiente: `dlopen` no se necesita (todo va enlazado), el dispositivo es software, `bar_size_B = 0`, sin sparse ni dma-buf ni WSI. Siguiente: **G4c**, el backend hardware detrás de la misma interfaz.

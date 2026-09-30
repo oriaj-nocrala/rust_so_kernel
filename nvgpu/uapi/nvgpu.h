@@ -177,7 +177,8 @@ struct nvg_sync_signal {   /* signal from the CPU; the value must not go backwar
 };
 #define NVG_IOC_SYNC_SIGNAL NVG_IOC(13, sizeof(struct nvg_sync_signal))
 
-#define NVG_WAIT_ANY (1u << 0) /* succeed when any reference reached its value (default: all of them) */
+#define NVG_WAIT_ANY (1u << 0)     /* succeed when any reference reached its value (default: all of them) */
+#define NVG_WAIT_PENDING (1u << 1) /* compare with the timeline's pending value (see NVG_IOC_SYNC_QUERY) instead of its completed one */
 /* Never blocks: 0 with `first_ready` set if the condition holds, -EAGAIN if not yet (the caller sleeps and asks again). */
 struct nvg_sync_wait {
    uint64_t refs;             /* user pointer to count x struct nvg_sync_ref */
@@ -188,10 +189,15 @@ struct nvg_sync_wait {
 };
 #define NVG_IOC_SYNC_WAIT NVG_IOC(14, sizeof(struct nvg_sync_wait))
 
+/* Every timeline has two values. `value` is what has completed (CPU signals and finished work). `pending` is the highest value any
+ * EXEC already queued will signal, so pending >= value; a CPU signal raises both. Vulkan's threaded submit orders submissions with
+ * it: it waits for `pending` before queuing work that waits for a value, so the wait can be satisfied without the CPU thread
+ * blocking in the kernel. */
 struct nvg_sync_query {
    uint32_t handle;
    uint32_t _pad;
-   uint64_t value;            /* out: the timeline's current value */
+   uint64_t value;            /* out: the timeline's completed value */
+   uint64_t pending;          /* out: the timeline's pending value */
 };
 #define NVG_IOC_SYNC_QUERY NVG_IOC(15, sizeof(struct nvg_sync_query))
 

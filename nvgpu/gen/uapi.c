@@ -29,7 +29,7 @@ int main(void) {
    O(nvg_exec, signals);
    S(nvg_sync_create); S(nvg_sync_destroy); S(nvg_sync_signal); O(nvg_sync_signal, value);
    S(nvg_sync_wait); O(nvg_sync_wait, count); O(nvg_sync_wait, flags); O(nvg_sync_wait, first_ready);
-   S(nvg_sync_query); O(nvg_sync_query, value);
+   S(nvg_sync_query); O(nvg_sync_query, value); O(nvg_sync_query, pending);
    S(nvg_timestamp);
    I(NVG_IOC_INFO); I(NVG_IOC_BO_CREATE); I(NVG_IOC_BO_FREE); I(NVG_IOC_VA_ALLOC); I(NVG_IOC_VA_FREE); I(NVG_IOC_VA_BIND);
    I(NVG_IOC_VA_UNBIND); I(NVG_IOC_CTX_CREATE); I(NVG_IOC_CTX_DESTROY); I(NVG_IOC_EXEC); I(NVG_IOC_SYNC_CREATE);

@@ -41,12 +41,10 @@ M = [
     ("if self.ctxs.len() >= MAX_CTX {", "if self.ctxs.len() > MAX_CTX {"),
     ("if self.pending[i].ctx == ctx {", "if self.pending[i].ctx != ctx {"),
     # timelines
-    ("if value < *v {\n            return Err(Error::Inval);", "if value <= *v {\n            return Err(Error::Inval);"),
     ("let ready = v >= r.value;", "let ready = v > r.value;"),
     ("if any && ready {\n                return Ok(Some(i));", "if any && !ready {\n                return Ok(Some(i));"),
     ("if !any && !ready {\n                return Ok(None);", "if !any && ready {\n                return Ok(None);"),
     ("Ok(if any { None } else { Some(first.unwrap_or(0)) })", "Ok(if any { Some(0) } else { Some(first.unwrap_or(0)) })"),
-    ("*v = (*v).max(s.value);", "*v = s.value;"),
     ("if self.backend.fence_done(ctx, seq) {\n                let p = self.pending.remove(i);", "if !self.backend.fence_done(ctx, seq) {\n                let p = self.pending.remove(i);"),
     # exec
     ("if p.bytes == 0 || p.bytes % 4 != 0 || p.bytes > uapi::PUSH_MAX_BYTES || p.va % 4 != 0 {", "if p.bytes % 4 != 0 || p.bytes > uapi::PUSH_MAX_BYTES || p.va % 4 != 0 {"),
@@ -60,5 +58,14 @@ M = [
     ("if !self.ctxs.contains_key(&ctx) {\n            return Err(Error::NoEnt);\n        }\n        if pushes.len()", "if false {\n            return Err(Error::NoEnt);\n        }\n        if pushes.len()"),
     ("for r in waits.iter().chain(signals) {", "for r in signals.iter() {"),
     ("for r in waits.iter().chain(signals) {", "for r in waits.iter() {"),
-    ("if !signals.is_empty() {\n            self.pending.push", "if false {\n            self.pending.push"),
+    ("if !signals.is_empty() {\n            for s in signals {", "if false {\n            for s in signals {"),
+    # pending values
+    ("t.value = value;\n        t.pending = t.pending.max(value);", "t.value = value;\n        t.pending = value;"),
+    ("t.value = value;\n        t.pending = t.pending.max(value);", "t.value = value;"),
+    ("if value < t.value {", "if value < t.pending {"),
+    ("t.pending = t.pending.max(s.value);\n                }\n            }\n            self.pending.push", "t.pending = s.value;\n                }\n            }\n            self.pending.push"),
+    ("let v = if pending { t.pending } else { t.value };", "let v = if pending { t.value } else { t.pending };"),
+    ("Timeline { value: initial, pending: initial }", "Timeline { value: initial, pending: 0 }"),
+    ("Timeline { value: initial, pending: initial }", "Timeline { value: 0, pending: initial }"),
+    ("t.value = t.value.max(s.value);", "t.value = s.value;"),
 ]
