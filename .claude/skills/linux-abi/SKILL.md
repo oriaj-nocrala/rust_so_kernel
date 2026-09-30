@@ -41,4 +41,4 @@ State and the list of what is still missing: `docs/reference/syscalls.md` (rows,
 
 ## Still missing (check `rust_std_gaps` first)
 
-`rem` of `nanosleep`/`clock_nanosleep` on EINTR (needs a hook in `process::wait`), a real tgid, `si_pid`/`si_code` for `kill`, `exit_group` from a spawned thread loses the status, `CLONE_VFORK` does not suspend the parent, epoll instances hold 16 watches.
+`rem` of `nanosleep`/`clock_nanosleep` on EINTR (needs a hook in `process::wait`), a real tgid, `si_pid`/`si_code` for `kill`, `CLONE_VFORK` does not suspend the parent, epoll instances hold 16 watches.

@@ -324,18 +324,27 @@ pub(super) fn sys_exit(status: i32) -> SyscallResult {
 /// exit_group(231): end every thread of the calling process, then exit.
 ///
 /// A thread group is the set of processes sharing one address space (there is no tgid here). The others get SIGKILL; the caller
-/// exits with `status`. Called from a spawned thread, that ends the process with the *leader* killed by SIGKILL instead of
-/// exiting with `status`: `status` is lost then, and only the main thread's exit code is exact.
+/// exits with `status`. Called from a spawned thread, the *leader* is what the parent waits for: it is told to report
+/// `exit(status)` (`group_exited`) although SIGKILL is what ends it.
 pub(super) fn sys_exit_group(status: i32) -> SyscallResult {
     with_scheduler(|sched| {
-        let Some(me) = sched.running_ref() else { return 0 };
+        let Some(me) = sched.running_mut() else { return 0 };
+        // The caller ends the process with `status`: the SIGKILLs below make its threads die "of a signal", and each such death
+        // tags the still-unreaped leader (the caller, if it is one) with SIGKILL through `kill_thread_group`.
+        me.group_exited = true;
         let (my_pid, space) = (me.pid.0, me.address_space.clone());
-        let others: alloc::vec::Vec<usize> = sched
+        let others: alloc::vec::Vec<(usize, bool)> = sched
             .iter_all()
             .filter(|p| p.pid.0 != my_pid && p.pid.0 != 0 && alloc::sync::Arc::ptr_eq(&p.address_space, &space))
-            .map(|p| p.pid.0)
+            .map(|p| (p.pid.0, p.is_thread))
             .collect();
-        for pid in others {
+        for (pid, is_thread) in others {
+            if !is_thread {
+                if let Some(leader) = sched.find_process_mut(pid) {
+                    leader.exit_status = status;
+                    leader.group_exited = true;
+                }
+            }
             sched.signal_pid(pid, crate::process::signal::SIGKILL);
         }
         0

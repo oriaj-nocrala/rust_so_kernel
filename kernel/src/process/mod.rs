@@ -140,6 +140,10 @@ pub struct Process {
     /// at the signal level). Read by `wait_status_word()`.
     pub killed_by_signal: Option<u32>,
 
+    /// Set on a thread-group leader when a *spawned thread* called `exit_group(status)`: the leader is then ended by SIGKILL, but
+    /// its parent must see a normal `exit(status)`, not the SIGKILL that carries it out. Takes precedence over `killed_by_signal`.
+    pub group_exited: bool,
+
     /// Process group id (job control). Defaults to this process's own pid
     /// (group leader) at creation; `fork()`/`clone()` inherit the parent's
     /// pgid unless `setpgid()` later changes it — matches real POSIX
@@ -397,6 +401,7 @@ impl Process {
             waiting_status_ptr: 0,
             pending_wait_status: None,
             killed_by_signal: None,
+            group_exited: false,
             pgid: pid.0 as u32,
             sid: pid.0 as u32,
             ctty: None,
@@ -490,6 +495,7 @@ impl Process {
             waiting_status_ptr: 0,
             pending_wait_status: None,
             killed_by_signal: None,
+            group_exited: false,
             pgid: pid.0 as u32,
             sid: pid.0 as u32,
             ctty: None,
@@ -574,6 +580,7 @@ impl Process {
             waiting_status_ptr: 0,
             pending_wait_status: None,
             killed_by_signal: None,
+            group_exited: false,
             pgid: parent_pgid,
             sid: parent_sid,
             ctty: None,
@@ -685,6 +692,7 @@ impl Process {
             waiting_status_ptr: 0,
             pending_wait_status: None,
             killed_by_signal: None,
+            group_exited: false,
             pgid: parent_pgid,
             sid: parent_sid,
             ctty: None,
@@ -752,7 +760,7 @@ impl Process {
     /// 7 bits for a kill (no core-dump bit). Matches `abi-bits/wait.h`,
     /// which is Linux's, and what musl and Rust's `std` decode.
     pub fn wait_status_word(&self) -> i32 {
-        match self.killed_by_signal {
+        match self.killed_by_signal.filter(|_| !self.group_exited) {
             Some(sig) => (sig as i32) & 0x7F,
             None => (self.exit_status & 0xFF) << 8,
         }

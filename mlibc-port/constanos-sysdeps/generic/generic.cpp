@@ -119,6 +119,7 @@ constexpr long SYS_getppid = 110;
 constexpr long SYS_fork = 57;
 constexpr long SYS_execve = 59;
 constexpr long SYS_exit = 60;
+constexpr long SYS_exit_group = 231;
 constexpr long SYS_waitpid = 61;
 constexpr long SYS_kill = 62;
 constexpr long SYS_setpgid = 109;
@@ -179,7 +180,7 @@ void sys_libc_log(const char *message) {
 
 void sys_libc_panic() {
 	mlibc::infoLogger() << "\e[31mmlibc: panic!" << frg::endlog;
-	raw_syscall(SYS_exit, 1);
+	raw_syscall(SYS_exit_group, 1);
 	__builtin_trap();
 }
 
@@ -203,8 +204,10 @@ int sys_anon_free(void *pointer, size_t size) {
 }
 
 #ifndef MLIBC_BUILDING_RTLD
+// exit() ends the whole process, from any thread (musl and Linux: exit_group); only pthread_exit / a returning thread
+// uses plain exit (`sys_thread_exit`).
 void sys_exit(int status) {
-	raw_syscall(SYS_exit, status);
+	raw_syscall(SYS_exit_group, status);
 	__builtin_trap();
 }
 #endif
