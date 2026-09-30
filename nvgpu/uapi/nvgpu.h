@@ -236,4 +236,14 @@ struct nvg_present {
 };
 #define NVG_IOC_PRESENT NVG_IOC(18, sizeof(struct nvg_present))
 
+/* Whether the last NVG_IOC_PRESENT has taken effect (the display latched the new buffer at a vblank): until then the buffer that was on screen
+ * still is, and must not be drawn into. Never blocks: ask again (a millisecond apart) until `pending` is 0. `vblank_seq` counts the primary head's
+ * vblanks, so a client can also pace itself by it. */
+struct nvg_flip_state {
+   uint32_t pending;          /* 1: a flip was submitted and has not been seen done */
+   uint32_t flags;            /* 0 */
+   uint64_t vblank_seq;
+};
+#define NVG_IOC_FLIP_STATE NVG_IOC(19, sizeof(struct nvg_flip_state))
+
 #endif /* NVGPU_UAPI_H */

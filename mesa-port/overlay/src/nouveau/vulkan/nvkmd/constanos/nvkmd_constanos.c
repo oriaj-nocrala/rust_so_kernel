@@ -1094,3 +1094,14 @@ nvk_constanos_present(VkDevice _device, VkDeviceMemory _memory, uint64_t offset)
    struct nvg_present p = { .handle = mem->handle, .offset = offset };
    return constanos_ioctl(cdev->fd, NVG_IOC_PRESENT, &p);
 }
+
+/* 1 while the last present has not taken effect (the buffer that was on screen still is: do not draw into it), 0 once it has, or a negative errno. */
+int
+nvk_constanos_flip_pending(VkDevice _device)
+{
+   VK_FROM_HANDLE(nvk_device, dev, _device);
+   struct nvkmd_constanos_dev *cdev = nvkmd_constanos_dev(dev->nvkmd);
+   struct nvg_flip_state f = { 0 };
+   const int r = constanos_ioctl(cdev->fd, NVG_IOC_FLIP_STATE, &f);
+   return r < 0 ? r : (int)f.pending;
+}

@@ -29,12 +29,13 @@ int main(void) {
    O(nvg_exec, signals);
    S(nvg_scanout_info); O(nvg_scanout_info, pitch_B); O(nvg_scanout_info, format); O(nvg_scanout_info, size_B); O(nvg_scanout_info, flags);
    S(nvg_present); O(nvg_present, offset);
+   S(nvg_flip_state); O(nvg_flip_state, vblank_seq);
    S(nvg_sync_create); S(nvg_sync_destroy); S(nvg_sync_signal); O(nvg_sync_signal, value);
    S(nvg_sync_wait); O(nvg_sync_wait, count); O(nvg_sync_wait, flags); O(nvg_sync_wait, first_ready);
    S(nvg_sync_query); O(nvg_sync_query, value); O(nvg_sync_query, pending);
    S(nvg_timestamp);
    I(NVG_IOC_INFO); I(NVG_IOC_BO_CREATE); I(NVG_IOC_BO_FREE); I(NVG_IOC_VA_ALLOC); I(NVG_IOC_VA_FREE); I(NVG_IOC_VA_BIND);
    I(NVG_IOC_VA_UNBIND); I(NVG_IOC_CTX_CREATE); I(NVG_IOC_CTX_DESTROY); I(NVG_IOC_EXEC); I(NVG_IOC_SYNC_CREATE);
-   I(NVG_IOC_SYNC_DESTROY); I(NVG_IOC_SYNC_SIGNAL); I(NVG_IOC_SYNC_WAIT); I(NVG_IOC_SYNC_QUERY); I(NVG_IOC_TIMESTAMP); I(NVG_IOC_SCANOUT_INFO); I(NVG_IOC_PRESENT);
+   I(NVG_IOC_SYNC_DESTROY); I(NVG_IOC_SYNC_SIGNAL); I(NVG_IOC_SYNC_WAIT); I(NVG_IOC_SYNC_QUERY); I(NVG_IOC_TIMESTAMP); I(NVG_IOC_SCANOUT_INFO); I(NVG_IOC_PRESENT); I(NVG_IOC_FLIP_STATE);
    return 0;
 }

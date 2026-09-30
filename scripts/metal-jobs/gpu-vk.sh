@@ -117,7 +117,7 @@ grep -q 'VK present: [0-9]* frames' /tmp/vk_present.out || { sum "gpu-vk: no fra
 sum "gpu-vk: after the presentation: $(grep '^gpu_uapi:' /proc/kdebug)"
 
 # G4e zero-copy scanout: the same triangle rendered at the screen's size into a VRAM buffer laid out as the display scans out, and the display engine
-# pointed at that buffer (NVG_IOC_PRESENT, no copy by the CPU or the kernel), 20 s. Two buffers, one drawn while the other is on screen. The kernel puts the
+# pointed at that buffer (NVG_IOC_PRESENT, no copy by the CPU or the kernel), 20 s. Three buffers, the previous flip awaited through NVG_IOC_FLIP_STATE (no sleeping a frame): it must reach the display's 60 Hz. The kernel puts the
 # console's picture back when the program ends.
 f0=$(grep '^gpu_flip:' /proc/kdebug)
 VK_DRAW_SCANOUT=20 VK_PROBE_REQUIRE_EXEC=1 NVK_CONSTANOS_DEBUG=1 /mnt/bin/vk_draw > /tmp/vk_scanout.out 2>&1
@@ -129,6 +129,7 @@ f1=$(grep '^gpu_flip:' /proc/kdebug)
 sum "gpu-vk: flips before: $f0"
 sum "gpu-vk: flips after: $f1"
 [ "$(field "$f1" external)" -gt 0 ] 2>/dev/null || { sum "gpu-vk: no flip to an external buffer was submitted"; fail=1; }
+awk -v a="$(grep -o 'frames shown in [0-9.]* s ([0-9.]*' /tmp/vk_scanout.out | sed 's/.*(//')" 'BEGIN { exit !(a >= 50 && a <= 61) }' || { sum "gpu-vk: the scanout ran at $(grep -o '([0-9.]* per second' /tmp/vk_scanout.out) frames, not at the display's 60"; fail=1; }
 [ "$(field "$f1" refused)" = 0 ] || { sum "gpu-vk: the display refused flips (refused=$(field "$f1" refused))"; fail=1; }
 
 # G4e robustness, the very last thing (it kills one GPU channel on purpose): a launch whose program is an unbound VA, on one of two contexts.

@@ -115,5 +115,6 @@ VkResult nvkmd_constanos_copy_sync_payloads(struct vk_device *device,
 /* constanos extension for programs that link NVK statically (not Vulkan): the screen. See nvkmd_constanos.c. */
 int nvk_constanos_scanout_info(VkDevice device, struct nvg_scanout_info *out);
 int nvk_constanos_present(VkDevice device, VkDeviceMemory memory, uint64_t offset);
+int nvk_constanos_flip_pending(VkDevice device);
 
 #endif /* NVKMD_CONSTANOS_H */

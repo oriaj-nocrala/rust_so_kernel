@@ -410,6 +410,16 @@ impl NvgpuHandle {
                     None => return Err(errno::ENODEV),
                 }
             }
+            uapi::IOC_FLIP_STATE => {
+                if !self.session.hw {
+                    return Err(errno::ENODEV);
+                }
+                let mut r: uapi::FlipState = read_user(arg)?;
+                let settled = crate::framebuffer::FRAMEBUFFER.lock().as_mut().map(|fb| fb.flip_settled()).ok_or(errno::ENODEV)?;
+                r.pending = !settled as u32;
+                r.vblank_seq = crate::gpu::vblank::seq();
+                write_user(arg, r)?;
+            }
             uapi::IOC_TIMESTAMP => {
                 if self.session.hw {
                     let ns = gpu::uapi::timestamp_ns().ok_or(errno::EIO)?;

@@ -46,6 +46,7 @@ extern PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance instance, const c
 struct nvg_scanout_info { uint32_t width, height, pitch_B, format; uint64_t size_B, flags; };
 extern int nvk_constanos_scanout_info(VkDevice device, struct nvg_scanout_info *out);
 extern int nvk_constanos_present(VkDevice device, VkDeviceMemory memory, uint64_t offset);
+extern int nvk_constanos_flip_pending(VkDevice device);
 
 static int failures;
 #define CHECK(cond, ...) do { if (cond) printf("VK ok   %s\n", #cond); else { failures++; printf("VK FAIL %s (line %d): ", #cond, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -94,9 +95,9 @@ int main(void) {
    VkPipelineLayout pl2 = VK_NULL_HANDLE;
    VkPipeline pipe2 = VK_NULL_HANDLE;
    VkImage image3 = VK_NULL_HANDLE;
-   VkDeviceMemory imem3 = VK_NULL_HANDLE, smem[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+   VkDeviceMemory imem3 = VK_NULL_HANDLE, smem[3] = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
    VkImageView view3 = VK_NULL_HANDLE;
-   VkBuffer sbuf[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+   VkBuffer sbuf[3] = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
    VkShaderModule vmod3 = VK_NULL_HANDLE, fmod3 = VK_NULL_HANDLE;
    VkPipelineLayout pl3 = VK_NULL_HANDLE;
    VkPipeline pipe3 = VK_NULL_HANDLE;
@@ -401,9 +402,9 @@ int main(void) {
       VKOK(vkBindImageMemory(device, image3, imem3, 0));
       ivci.image = image3;
       VKOK(vkCreateImageView(device, &ivci, NULL, &view3));
-      // the two display buffers: device-local, not host-visible (VRAM), the size the display scans out
+      // the three display buffers: device-local, not host-visible (VRAM), the size the display scans out
       VkBufferCreateInfo sbci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = si.size_B, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
-      for (int k = 0; k < 2; k++) {
+      for (int k = 0; k < 3; k++) {
          VKOK(vkCreateBuffer(device, &sbci, NULL, &sbuf[k]));
          vkGetBufferMemoryRequirements(device, sbuf[k], &req);
          mai.allocationSize = req.size;
@@ -449,7 +450,7 @@ int main(void) {
          clock_gettime(CLOCK_MONOTONIC, &t1);
          double el = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
          if (el >= seconds && frames > 0) break;
-         int k = frames & 1;
+         int k = frames % 3;   // triple buffering: the buffer drawn into was on screen two presents ago and has been replaced since
          float angle = (float)el * 1.5f;
          float pc[8] = { angle, (float)SW / (float)SH, 0, 0, 0.5f + 0.5f * sinf(angle), 0.5f + 0.5f * sinf(angle + 2.1f), 0.5f + 0.5f * sinf(angle + 4.2f), 1.0f };
          vkResetCommandBuffer(cmd3, 0);
@@ -468,18 +469,19 @@ int main(void) {
          vkResetFences(device, 1, &fence3);
          VkSubmitInfo si3 = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd3 };
          if (vkQueueSubmit(queue, 1, &si3, fence3) != VK_SUCCESS || vkWaitForFences(device, 1, &fence3, VK_TRUE, 10000000000ull) != VK_SUCCESS) { frame_ok = 0; break; }
-         // the picture is in VRAM: point the display at it (a flip is pending until the next vblank: retry while the kernel says EBUSY)
-         int pr;
-         int tries = 0;
-         while ((pr = nvk_constanos_present(device, smem[k], 0)) == -16 /* EBUSY */ && tries++ < 100) { busy++; usleep(1000); }
+         // the picture is in VRAM. The previous present must have taken effect before the next one (the display latches at a vblank): ask the kernel
+         // rather than sleep a frame, then point the display at this buffer. Meanwhile the next frame could already be drawn into the third buffer.
+         int pr, tries = 0;
+         while (nvk_constanos_flip_pending(device) > 0 && tries++ < 200) { busy++; usleep(200); }
+         tries = 0;
+         while ((pr = nvk_constanos_present(device, smem[k], 0)) == -16 /* EBUSY */ && tries++ < 100) { busy++; usleep(200); }
          if (pr != 0) { present_ok = 0; printf("VK scanout: PRESENT failed (%d) at frame %u\n", pr, frames); break; }
          shown++;
          frames++;
-         usleep(17000);   // the flip lands at the next vblank; the other buffer is free to draw into once it has
       }
       CHECK(frame_ok, "every frame rendered and fenced");
       CHECK(present_ok && shown == frames, "every frame was put on the screen (%u of %u)", shown, frames);
-      printf("VK scanout: %u frames shown in %.1f s, %u EBUSY retries\n", frames, seconds, busy);
+      printf("VK scanout: %u frames shown in %.1f s (%.1f per second), %u waits for the previous flip\n", frames, seconds, frames / (seconds > 0 ? seconds : 1), busy);
       VKOK(vkDeviceWaitIdle(device));
    }
 
@@ -494,10 +496,12 @@ done:
       GONE(vmod3, vkDestroyShaderModule);
       GONE(sbuf[0], vkDestroyBuffer);
       GONE(sbuf[1], vkDestroyBuffer);
+      GONE(sbuf[2], vkDestroyBuffer);
       GONE(view3, vkDestroyImageView);
       GONE(image3, vkDestroyImage);
       GONE(smem[0], vkFreeMemory);
       GONE(smem[1], vkFreeMemory);
+      GONE(smem[2], vkFreeMemory);
       GONE(imem3, vkFreeMemory);
       GONE(pipe2, vkDestroyPipeline);
       GONE(pl2, vkDestroyPipelineLayout);
