@@ -4,10 +4,11 @@
 //
 // "Safe" here means two things. First, nothing that should survive the
 // reset is still only in RAM: ext2 writes are synchronous (ATA issues a
-// CACHE FLUSH after every write, the block cache is write-through) and the
-// USB data partition is mounted read-only, so the one buffered thing left
-// is the kernel log ring, which is flushed to the stick's `constanos-log`
-// partition before anything else happens. Second, the reset itself does not
+// CACHE FLUSH after every write, the block cache is write-through); a USB
+// stick has its own volatile cache, so `prepare` asks it to write it out
+// (SYNCHRONIZE CACHE). The one buffered thing left is the kernel log ring,
+// which is flushed to the stick's `constanos-log` partition before anything
+// else happens. Second, the reset itself does not
 // depend on a single mechanism that some machine lacks: the methods are
 // tried in turn, each given time to take effect, ending in a triple fault
 // that no x86 CPU survives.
@@ -50,10 +51,16 @@ const METHOD_WAIT_US: u32 = 500_000;
 /// announce, then flush the log to the stick.
 fn prepare(what: &str) {
     serial_println!("reboot: {} requested — flushing the log", what);
+    // Data written to /mnt first: the log flush below is one more write, and the sync after it covers both.
     match crate::block::logpart::flush(hal::logpart::Reason::Reboot) {
         Ok(pos) => serial_println!("reboot: log flushed to the USB stick (pos {})", pos),
         Err(crate::block::logpart::FlushError::NoPartition) => {}
         Err(e) => serial_println!("reboot: log flush failed: {}", e),
+    }
+    match crate::block::usb::sync_stick() {
+        Ok(true) => serial_println!("reboot: the stick's write cache is flushed"),
+        Ok(false) => {}
+        Err(e) => serial_println!("reboot: {}", e),
     }
 }
 

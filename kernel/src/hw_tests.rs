@@ -111,7 +111,11 @@ fn ext2_memdisk_roundtrip() {
     // unlink + rmdir cleanup, verifying each removal actually took
     crate::fs::vfs::unlink("/memtest/subdir/renamed.txt").expect("unlink renamed.txt");
     crate::fs::vfs::unlink("/memtest/hello_link").expect("unlink hello_link");
+    let subdir_ino = crate::fs::vfs::stat("/memtest/subdir").expect("stat subdir").st_ino as u32;
+    assert_eq!(crate::fs::ext2::raw_links_count(subdir_ino), Some(2), "a live directory has two links");
     crate::fs::vfs::rmdir("/memtest/subdir").expect("rmdir now-empty subdir");
+    // e2fsck reads a removed directory that still says 2 links as an inode in use (a phantom directory per rmdir).
+    assert_eq!(crate::fs::ext2::raw_links_count(subdir_ino), Some(0), "a removed directory ends with no links");
     crate::fs::vfs::unlink("/memtest/hello.txt").expect("unlink hello.txt");
 
     assert!(crate::fs::vfs::resolve("/memtest/hello.txt").is_err());

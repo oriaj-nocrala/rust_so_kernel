@@ -338,6 +338,18 @@ pub fn storage_write(dev: &Storage, lba: u32, count: usize, buf: &[u8]) -> Resul
     Ok(())
 }
 
+/// Asks the stick to put its own cache on the medium (SCSI SYNCHRONIZE CACHE). After every `storage_write` that must
+/// survive a reset: reboot, `sync(2)`.
+pub fn storage_sync(dev: &Storage) -> Result<(), xhci::MscError> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut slots = CONTROLLERS.lock();
+        match slots[dev.ctrl].as_mut() {
+            Some(ctrl) => ctrl.storage_sync(dev.slot),
+            None => Err(xhci::MscError::NotStorage),
+        }
+    })
+}
+
 /// One write of at most [`xhci::MAX_SECTORS`] sectors that gives up
 /// instead of waiting for the controller lock — `None` if it is held.
 ///

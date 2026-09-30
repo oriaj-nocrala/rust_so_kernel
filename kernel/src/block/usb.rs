@@ -72,7 +72,14 @@ impl BlockDevice for UsbBlockDevice {
     }
 }
 
-/// The data partition of the boot pendrive, read-only, ready to mount — or
+/// Flushes the stick's own write cache. `Ok(false)`: no stick. An error means the stick did not confirm (some do not
+/// implement the command), which the callers log and go on from.
+pub fn sync_stick() -> Result<bool, &'static str> {
+    let Some(dev) = crate::usb::storage() else { return Ok(false) };
+    crate::usb::storage_sync(&dev).map(|_| true).map_err(|_| "usb-storage: SYNCHRONIZE CACHE failed")
+}
+
+/// The data partition of the boot pendrive, ready to mount — or
 /// why not. Logs which GPT copy was used and where the partition sits, so a
 /// boot on the target machine says on screen what it found.
 pub fn data_partition() -> Result<Partition, &'static str> {
@@ -94,7 +101,7 @@ pub fn data_partition() -> Result<Partition, &'static str> {
         table.copy, part.index, part.name_ascii(&mut name), part.first_lba, part.sectors()
     );
     // `select` already refused anything past 32-bit LBAs.
-    Partition::new(Box::new(disk), part.first_lba as u32, part.sectors() as u32, true)
+    Partition::new(Box::new(disk), part.first_lba as u32, part.sectors() as u32, false)
         .ok_or("data partition does not fit 32-bit LBAs")
 }
 

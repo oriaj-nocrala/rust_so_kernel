@@ -301,6 +301,12 @@ impl Xhci {
         Ok(())
     }
 
+    /// SYNCHRONIZE CACHE(10): everything written so far is on the medium when this returns. A stick that does not
+    /// implement it answers ILLEGAL REQUEST; the caller treats an error as "could not confirm", not as data loss.
+    pub fn storage_sync(&mut self, slot: u8) -> MResult<()> {
+        self.scsi_retrying(slot, &m::synchronize_cache_10(), false, 0).map(|_| ())
+    }
+
     fn check_range(&mut self, slot: u8, lba: u32, count: usize, buf_len: usize) -> MResult<usize> {
         let blocks = self.storage(slot)?.blocks;
         let bytes = count * BLOCK_SIZE;

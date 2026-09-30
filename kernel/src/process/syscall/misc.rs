@@ -106,7 +106,11 @@ pub(super) fn sys_kdebug_ctl(cmd: u64, name_ptr: u64, enable: u64) -> SyscallRes
 /// use, `EBUSY` if a flush is already running, `EIO` if the write failed.
 pub(super) fn sys_sync() -> SyscallResult {
     use crate::block::logpart::{flush, FlushError};
-    match flush(hal::logpart::Reason::Sync) {
+    // Whatever went to /mnt or the log is only safe once the stick's own cache is written out; a stick that does not
+    // implement the command is not an error for sync.
+    let flushed = flush(hal::logpart::Reason::Sync);
+    let _ = crate::block::usb::sync_stick();
+    match flushed {
         Ok(_) => 0,
         Err(FlushError::NoPartition) => errno::ENODEV,
         Err(FlushError::Busy) => errno::EBUSY,

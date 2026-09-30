@@ -32,7 +32,7 @@ The target is an AM4/Ryzen machine with **no serial capture**. Every observation
 
 - If `/mnt/autorun/job` exists, PID 1 prints `METAL-BEGIN <nonce>`, `sync`s, runs the job with `ash`, prints `METAL-DONE <nonce> exit=N|signal=N`, and `reboot(2)`s.
 - In autorun mode a panic resets after the log flush instead of halting (`reboot::restart_from_panic`, lock-free).
-- The kernel never deletes the job (`/mnt` is read-only from the stick); the host removes it.
+- The kernel never deletes the job; the host removes it (`/mnt` is writable now, but a job that the kernel removed itself could be lost on a hang before the verdict).
 - On the Ryzen, reset goes through the FADT reset register.
 
 ## Watchdog (`kernel/src/watchdog.rs`, `hal::sp5100_tco`)

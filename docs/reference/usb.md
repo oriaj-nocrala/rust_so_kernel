@@ -29,7 +29,7 @@ Why it exists: the Ryzen target has no PS/2 and no IDE. Keyboard, mouse and `/mn
 - The stick has GPT partitions `boot` (FAT), `constanos-data` (ext2) and `constanos-log` (raw, see `metal.md`).
 - `hal::gpt` checks both CRCs and falls back to the backup. It looks partitions up by name, else takes the *only* Linux-filesystem partition. `hal::block::Partition` refuses out-of-range requests.
 - `fs::ext2::init` tries USB first, then ATA.
-- **The USB mount is read-only** (no journal, and the stick is also the boot key). `Partition` refuses writes as a second guard.
+- **The USB mount is read-write** since 2026-09-30, with the same mount-time repair passes as ATA (no journal: a hang mid-write can leave the data partition inconsistent; `scripts/sync-usb-data.sh` rebuilds it, and the boot partition is separate). `sync(2)` and the reboot path send SCSI SYNCHRONIZE CACHE (`block::usb::sync_stick`) so the stick's own cache reaches the medium; a stick that rejects it is only logged. `sync-usb-data.sh` recreates the filesystem, so files a metal run leaves on `/mnt` are gone at the next sync.
 - **Every transfer runs with IF=0 and `CONTROLLERS` held** (`usb::storage_read`/`storage_write`, ≤64 KiB each, lock released between transfers), so the transfer is the ring's only reader and can't be preempted. Cost: ~1 ms of interrupt latency per 64 KiB.
 - BOT recovery:
   - STALL → clear halt on both sides;

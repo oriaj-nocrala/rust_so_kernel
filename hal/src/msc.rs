@@ -147,6 +147,7 @@ pub const OP_INQUIRY: u8 = 0x12;
 pub const OP_READ_CAPACITY_10: u8 = 0x25;
 pub const OP_READ_10: u8 = 0x28;
 pub const OP_WRITE_10: u8 = 0x2A;
+pub const OP_SYNCHRONIZE_CACHE_10: u8 = 0x35;
 
 /// Standard INQUIRY data is 36 bytes; asking for exactly that is what
 /// Linux does, and some devices misbehave when asked for more.
@@ -179,6 +180,12 @@ pub fn read_10(lba: u32, blocks: u16) -> [u8; 10] {
 /// WRITE(10): same layout as READ(10).
 pub fn write_10(lba: u32, blocks: u16) -> [u8; 10] {
     rw_10(OP_WRITE_10, lba, blocks)
+}
+
+/// SYNCHRONIZE CACHE(10) for the whole medium (LBA 0, 0 blocks = to the end): the stick writes what its own volatile cache
+/// still holds. Without it a reset right after a `WRITE(10)` can lose the write.
+pub fn synchronize_cache_10() -> [u8; 10] {
+    [OP_SYNCHRONIZE_CACHE_10, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 }
 
 fn rw_10(op: u8, lba: u32, blocks: u16) -> [u8; 10] {
@@ -422,6 +429,16 @@ mod tests {
     fn rw10_is_big_endian() {
         assert_eq!(read_10(0x0102_0304, 0x0506), [0x28, 0, 1, 2, 3, 4, 0, 5, 6, 0]);
         assert_eq!(write_10(0x0102_0304, 0x0506), [0x2A, 0, 1, 2, 3, 4, 0, 5, 6, 0]);
+    }
+
+    #[test]
+    fn synchronize_cache_covers_the_whole_medium() {
+        // opcode 0x35; IMMED (byte 1 bit 1) clear so the command completes only when the data is on the medium;
+        // LBA 0 and 0 blocks mean "to the end of the medium".
+        assert_eq!(synchronize_cache_10(), [0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let w = build_cbw(9, 0, false, 0, &synchronize_cache_10()).unwrap();
+        assert_eq!(w[14], 10, "CDB length");
+        assert_eq!(w[15], 0x35);
     }
 
     #[test]

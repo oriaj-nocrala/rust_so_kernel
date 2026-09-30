@@ -259,7 +259,7 @@ fn set_open_links(ino: u32, links: u16) {
     }
 }
 
-/// Set when `/mnt` was mounted read-only (`init_read_only`). Every
+/// Nothing sets this today (the USB mount is read-write since 2026-09-30). Every
 /// mutating path takes [`write_lock`] instead of `EXT2_LOCK` directly, so
 /// this one flag turns them all into `EROFS` — there is no mutation that
 /// can forget to check it.
@@ -285,7 +285,7 @@ pub fn is_read_only() -> bool {
 }
 
 /// Mount the ext2 filesystem: the USB boot pendrive's data partition if
-/// there is one (read-only, see `init_read_only`), else the real ATA disk
+/// there is one (read-write, with the same repair passes as ATA), else the real ATA disk
 /// (`crate::block::AtaBlockDevice`). Call once, before the VFS mounts
 /// `/mnt`. Returns `Err`
 /// (not panics) on any problem — a missing or unreadable disk shouldn't
@@ -297,9 +297,9 @@ pub fn init() -> Result<(), &'static str> {
     // ordinary QEMU boot unchanged.
     if crate::usb::storage().is_some() {
         match crate::block::usb::data_partition() {
-            Ok(part) => match init_read_only(Box::new(part)) {
+            Ok(part) => match mount_and_repair(Box::new(part)) {
                 Ok(()) => {
-                    crate::kalert!("ext2: /mnt montado desde el pendrive USB (solo lectura)");
+                    crate::kalert!("ext2: /mnt montado desde el pendrive USB (lectura y escritura)");
                     return Ok(());
                 }
                 Err(e) => crate::kalert!("ext2: pendrive USB sin montar: {}", e),
@@ -320,23 +320,6 @@ pub fn init() -> Result<(), &'static str> {
     crate::pci::claim_matching("ata", |f| {
         (f.class, f.subclass) == (0x01, 0x01) && f.progif & 0x04 == 0
     });
-    Ok(())
-}
-
-/// Mounts ext2 **read-only** from an arbitrary device — the USB pendrive's
-/// data partition. Skips the mount-time repair passes, which write, and
-/// marks the mount read-only so every mutation fails with `EROFS` instead
-/// of reaching the disk.
-///
-/// Read-only first because there is no journal and the stick is also the
-/// boot key: a hang in the middle of `reclaim_orphans` on a new, barely
-/// exercised transport would leave the only copy of the filesystem
-/// inconsistent. Writing comes once reading is boring — see
-/// `docs/storage/usb-msc-plan.md`, step 6.
-pub fn init_read_only(device: Box<dyn BlockDevice>) -> Result<(), &'static str> {
-    let fs = Ext2Fs::mount(device)?;
-    READ_ONLY.store(true, Ordering::Relaxed);
-    EXT2.call_once(|| fs);
     Ok(())
 }
 
@@ -378,6 +361,12 @@ fn mount_and_repair(device: Box<dyn BlockDevice>) -> Result<(), &'static str> {
         .map_err(|_| "ext2: mount-time orphan reclaim failed (I/O error or directory tree too deep)")?;
     EXT2.call_once(|| fs);
     Ok(())
+}
+
+/// `i_links_count` of the on-disk record of `ino`, for `hw_tests` (a removed inode must end at 0).
+#[cfg(test)]
+pub(crate) fn raw_links_count(ino: u32) -> Option<u16> {
+    Some(fs().read_inode(ino).ok()?.links_count())
 }
 
 fn fs() -> &'static Ext2Fs {
@@ -935,6 +924,9 @@ impl Inode for Ext2Inode {
 
         let mut child_raw = f.read_inode(child_ino)?;
         f.free_all_blocks(&mut child_raw)?;
+        // A removed directory has no names left, "." and its parent's entry included. Leaving 2 here made e2fsck read
+        // the record as an inode still in use (with a dtime and a freed bitmap bit): a phantom directory per rmdir.
+        child_raw.set_links_count(0);
         child_raw.set_dtime(crate::time::now_unix_secs() as u32);
         // Same "persist the zeroed record before freeing the bitmap bit"
         // fix as `unlink` above.

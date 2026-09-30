@@ -9,7 +9,7 @@ Code: `kernel/src/fs/`, crates `vfs/` and `ext2/` (host tests: `cd vfs && cargo 
 | `/` | initramfs | The embedded programs in `/bin`, plus `/etc` (`ETC_FILES`: `localtime` (UTC TZif), `passwd`, `group`). mlibc's `localtime()` **panics** without `/etc/localtime` |
 | `/dev` | devfs | Flat, except the hardcoded `/dev/input/` and `/dev/pts/` |
 | `/tmp` | ramfs (`vfs::ramfs::RamFs`) | Writable. The only FS with symlink creation *and* socket nodes. `busybox --install -s /tmp/bin` puts the applet symlinks here at boot |
-| `/mnt` | ext2 | From the USB stick (read-only), else ATA `disk.img` (read-write). Best effort: may be absent |
+| `/mnt` | ext2 | From the USB stick (read-write, `sync(2)` flushes the stick's cache), else ATA `disk.img` (read-write). Best effort: may be absent |
 | `/proc` | procfs | Synthetic, regenerated on every open |
 
 - `ls /` lists the other mounts via `fs::vfs::direct_children`; the mount table redirects traversal into them.
@@ -49,7 +49,8 @@ Code: `kernel/src/fs/`, crates `vfs/` and `ext2/` (host tests: `cd vfs && cargo 
 - `ext2::Ext2Core` does every on-disk detail: layout, allocation, direct through triple-indirect blocks, directories, fast (<60 B) and slow symlinks, repair passes. It speaks inode numbers and `Ext2Error`, never VFS types.
 - The adapter provides the VFS impls, `Ext2Error → Errno`, the `EXT2` global plus `EXT2_LOCK`, and wall-clock time.
 - **`EXT2_LOCK` serializes every mutation.** Read paths (`lookup`/`readdir`) don't take it, because mutations call them while holding it and the lock isn't reentrant.
-- **Read-only mount** (from USB, `init_read_only`): no repair passes, and every mutation / write-open returns `EROFS`.
+- **Read-only switch**: `READ_ONLY` / `write_lock()` turn every mutation and write-open into `EROFS`, but nothing sets it today (the USB mount used to).
+- `rmdir` ends the removed directory's inode with `links_count = 0`, like `unlink`; with 2 left, e2fsck reports a phantom directory (`hw_tests` checks it).
 - Test images: `ext2::testimg::{build_minimal_image, build_image_with_orphans}`, shared with `hw_tests`.
 
 ### Crash safety (there is no journal)
