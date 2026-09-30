@@ -22,7 +22,7 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 |----|------|-------|
 | 0/1/2/3 | read/write/open/close | |
 | 4/5/6 | stat/fstat/lstat | `lstat` does not follow a final symlink. `fstat` runs `FileHandle::stat` under the scheduler lock |
-| 7 | poll | ≤16 fds. Real readiness for sockets, stdin, ptys, pipes, `/dev/input/event*` (`FileHandle::event_source`); other devices are always ready. `POLLHUP`/`POLLERR` are reported even if not asked for (by epoll too) |
+| 7 | poll | ≤64 entries in an array that does not straddle a page; a negative fd is skipped, an fd past the highest open one is `POLLNVAL`. Real readiness for sockets, stdin, ptys, pipes, `/dev/input/event*` (`FileHandle::event_source`); other devices are always ready. `POLLHUP`/`POLLERR` are reported even if not asked for (by epoll too) |
 | 8 | lseek | |
 | 9/11 | mmap/munmap | Private anonymous, `MAP_SHARED` of a memfd, or `MAP_SHARED\|MAP_ANONYMOUS`. A nonzero `addr` is treated as `MAP_FIXED` (and fails over an existing mapping). `prot` 0 is a real `PROT_NONE`. `munmap` takes any page-aligned range: cuts VMAs, spans several, holes are fine |
 | 10 | mprotect | Splits VMAs at the range's ends and rejoins equal neighbours; hole in the range → `ENOMEM`. A `Huge2M` VMA can only be cut on 2 MiB boundaries. `PROT_EXEC` is ignored (NX is off) |

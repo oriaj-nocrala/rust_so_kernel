@@ -9,7 +9,7 @@ use crate::ipc::unix;
 
 /// Upper bound on pids tracked by the per-pid side tables below.
 /// Must match `FileDescriptorTable`'s own `MAX_FILES`.
-pub(super) const MAX_FILES_PER_PROC: usize = 16;
+pub(super) const MAX_FILES_PER_PROC: usize = crate::process::file::MAX_FILES;
 
 /// What `poll` needs to know about one fd without its handle: what can make
 /// it ready. Anything else is always ready (`/dev/null`, regular files).
@@ -47,7 +47,7 @@ enum PollSource {
 /// A handle's `buffered` records cannot change while its process sleeps in
 /// `poll` (only a read takes them), so a snapshot saying "buffered" makes
 /// the fast path return and the process never blocks on a stale answer.
-type SocketMap = [PollSource; MAX_FILES_PER_PROC];
+type SocketMap = alloc::boxed::Box<[PollSource]>;
 
 // Every `PollWaiter` carries a `SocketMap`, and `poll_wake_where` holds up
 // to `MAX_WAKE_PER_EVENT` waiters on the stack of the ISR that calls it
@@ -56,19 +56,21 @@ type SocketMap = [PollSource; MAX_FILES_PER_PROC];
 // GUI e2e test), so its size is pinned.
 const _: () = assert!(core::mem::size_of::<PollSource>() <= 16);
 
-const NO_SOCKETS: SocketMap = [PollSource::Other; MAX_FILES_PER_PROC];
 
 /// Resolve every fd of the *running* process to what can make it ready.
 fn snapshot_sockets() -> SocketMap {
-    let mut map = NO_SOCKETS;
     let files = {
         let sched = crate::process::scheduler::local_scheduler();
         match sched.running_ref() {
             Some(proc) => proc.files.clone(),
-            None => return map,
+            None => return alloc::boxed::Box::new([]),
         }
     };
     let guard = files.lock();
+    // As long as the highest open fd needs, no longer: the waiter carries it on the heap (a `Box`, so the array of
+    // waiters a wakeup keeps on the ISR's stack stays small) and an fd past its end reads as `Other`.
+    let len = guard.open_extent();
+    let mut map = alloc::vec![PollSource::Other; len];
     for (fd, slot) in map.iter_mut().enumerate() {
         if let Ok(h) = guard.get(fd) {
             *slot = if let Some(id) = h.socket_id() {
@@ -84,7 +86,7 @@ fn snapshot_sockets() -> SocketMap {
             };
         }
     }
-    map
+    map.into_boxed_slice()
 }
 
 // ============================================================================
@@ -207,7 +209,10 @@ impl EpollInstanceTable {
 static EPOLL_INSTANCES: crate::sync::IrqLock<EpollInstanceTable> = crate::sync::IrqLock::new(EpollInstanceTable::new());
 
 /// pid×fd → EpollInstanceId side table (0 = not an epoll fd).
-static EPOLL_FD_MAP: Mutex<BTreeMap<usize, [EpollInstanceId; MAX_FILES_PER_PROC]>> =
+///
+/// Sparse, keyed by (pid, fd): a per-pid `[EpollInstanceId; 256]` made each B-tree node 22 KiB, which insertion moves by value
+/// (at opt-level 0, several copies deep) and overflowed the kernel stack.
+static EPOLL_FD_MAP: Mutex<BTreeMap<(usize, usize), EpollInstanceId>> =
     Mutex::new(BTreeMap::new());
 
 /// FileHandle marker stored in the FD table for epoll FDs.
@@ -232,26 +237,20 @@ impl crate::process::file::FileHandle for EpollHandle {
 // ── EPOLL_FD_MAP helpers ───────────────────────────────────────────────────
 
 fn get_epoll_fd(pid: usize, fd: usize) -> EpollInstanceId {
-    if fd < MAX_FILES_PER_PROC {
-        EPOLL_FD_MAP.lock().get(&pid).map_or(0, |fds| fds[fd])
-    } else {
-        0
-    }
+    EPOLL_FD_MAP.lock().get(&(pid, fd)).copied().unwrap_or(0)
 }
 
 fn set_epoll_fd(pid: usize, fd: usize, epoll_id: EpollInstanceId) {
-    if fd < MAX_FILES_PER_PROC {
-        let mut map = EPOLL_FD_MAP.lock();
-        if epoll_id != 0 {
-            map.entry(pid).or_insert([0; MAX_FILES_PER_PROC])[fd] = epoll_id;
-        } else if let Some(fds) = map.get_mut(&pid) {
-            fds[fd] = 0;
-        }
+    let mut map = EPOLL_FD_MAP.lock();
+    if epoll_id != 0 {
+        map.insert((pid, fd), epoll_id);
+    } else {
+        map.remove(&(pid, fd));
     }
 }
 
 pub(super) fn clear_epoll_fd_all(pid: usize) {
-    EPOLL_FD_MAP.lock().remove(&pid);
+    EPOLL_FD_MAP.lock().retain(|&(p, _), _| p != pid);
 }
 
 // ── Poll waiter ────────────────────────────────────────────────────────────
@@ -310,9 +309,11 @@ static POLL_WAITERS: crate::sync::IrqLock<BTreeMap<usize, PollWaiter>> = crate::
 ///   - stdin (fd=0): POLLIN if keyboard buffer has data.
 ///   - All other device fds: always ready for the requested events.
 fn fd_check_ready(socks: &SocketMap, fd: i32, events: i16) -> i16 {
-    if fd < 0 { return POLLNVAL; }
+    // poll(2): a negative fd is skipped (revents 0), which is how a caller leaves holes in its array.
+    if fd < 0 { return 0; }
     let fd_usize = fd as usize;
-    let source = socks.get(fd_usize).copied().unwrap_or(PollSource::Other);
+    // The snapshot runs to the highest open fd: past it, nothing is open.
+    let Some(&source) = socks.get(fd_usize) else { return POLLNVAL };
 
     if let PollSource::Input { queue, buffered, seen } = source {
         let ready = buffered || crate::drivers::evdev::queue_ready(queue as usize, seen);
@@ -704,17 +705,21 @@ fn epoll_ready(
 /// poll(7) — wait for events on a set of file descriptors.
 ///
 /// `fds_ptr`   — user pointer to array of `struct pollfd`.
-/// `nfds`      — number of entries (max 16).
+/// `nfds`      — number of entries (max `MAX_POLL_FDS`).
 /// `timeout_ms`— milliseconds to wait (-1 = forever, 0 = non-blocking).
+/// Most entries one `poll` takes: its array is pre-translated as one page for the waker (`translate_user_buf_phys`), so it
+/// cannot grow past a page (512 entries) and an array that straddles one is `EFAULT`.
+const MAX_POLL_FDS: u32 = 64;
+
 pub(super) fn sys_poll(fds_ptr: u64, nfds: u32, timeout_ms: i32) -> SyscallResult {
-    if nfds > 16 { return errno::EINVAL; }
+    if nfds > MAX_POLL_FDS { return errno::EINVAL; }
     let buf_size = nfds as usize * 8; // sizeof(PollFd)
     if buf_size > 0 {
         if let Err(e) = validate_user_buffer(fds_ptr, buf_size) { return e; }
     }
 
     // Read PollFd array from user memory (user page table active)
-    let mut fds = [PollFd { fd: -1, events: 0, revents: 0 }; 16];
+    let mut fds = [PollFd { fd: -1, events: 0, revents: 0 }; MAX_POLL_FDS as usize];
     for i in 0..nfds as usize {
         fds[i] = unsafe { *((fds_ptr + i as u64 * 8) as *const PollFd) };
     }
@@ -792,7 +797,7 @@ fn block_poll_waiter(
     ready_now: impl FnOnce(&SocketMap) -> bool,
 ) -> SyscallResult {
     let pid = waiter.pid;
-    let socks = waiter.socks;
+    let socks = waiter.socks.clone(); // the waiter keeps its own; this copy is for the re-check below
     let next_tf = {
         let mut sched = crate::process::scheduler::local_scheduler();
         let cell = sched.begin_wait();

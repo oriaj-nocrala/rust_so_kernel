@@ -346,7 +346,7 @@ pub(super) fn sys_open(path_ptr: usize, flags: i32) -> SyscallResult {
                 }
                 fd as i64
             }
-            Err(_) => errno::EINVAL,
+            Err(_) => errno::EMFILE, // the table is full
         }
     })
 }
@@ -878,6 +878,7 @@ pub(super) fn sys_fcntl(fd: i32, cmd: i32, arg: u64) -> SyscallResult {
             with_current_process(|proc| {
                 match proc.files.lock().dup_with(fd as usize, arg as usize, cmd == F_DUPFD_CLOEXEC) {
                     Ok(newfd) => newfd as SyscallResult,
+                    Err(crate::process::file::FileError::InvalidArgument) => errno::EMFILE,
                     Err(_) => errno::EBADF,
                 }
             })
@@ -960,7 +961,7 @@ pub(super) fn sys_pipe2(pipefd_ptr: u64, flags: i32) -> SyscallResult {
         let mut files = proc.files.lock();
         let rfd = match files.allocate(alloc::boxed::Box::new(read_end)) {
             Ok(fd) => fd,
-            Err(_) => return errno::EINVAL,
+            Err(_) => return errno::EMFILE,
         };
         let wfd = match files.allocate(alloc::boxed::Box::new(write_end)) {
             Ok(fd) => fd,
@@ -973,7 +974,7 @@ pub(super) fn sys_pipe2(pipefd_ptr: u64, flags: i32) -> SyscallResult {
                 // that would need to re-lock SCHEDULER. Don't reuse this
                 // pattern for closing an fd a process has actually had open.
                 let _ = files.close(rfd);
-                return errno::EINVAL;
+                return errno::EMFILE;
             }
         };
         if flags & O_CLOEXEC != 0 {
@@ -1161,7 +1162,7 @@ pub(super) fn sys_mprotect(addr: u64, length: u64, prot: u32) -> SyscallResult {
 /// on a real file (confirmed live: `doom`'s WAD loader, which seeks
 /// around a WAD's lump directory instead of reading it start-to-end).
 pub(super) fn sys_lseek(fd: i32, offset: i64, whence: i32) -> SyscallResult {
-    if fd < 0 || fd >= 16 { return errno::EBADF; }
+    if fd < 0 || fd as usize >= crate::process::file::MAX_FILES { return errno::EBADF; }
     with_current_process(|proc| {
         match proc.files.lock().get_mut(fd as usize) {
             Ok(file) => match file.seek(offset, whence) {

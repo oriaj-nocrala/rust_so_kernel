@@ -21,24 +21,45 @@ pub use vfs::file::{compute_seek, FileError, FileHandle, FileResult};
 // FILE DESCRIPTOR TABLE
 // ============================================================================
 
-const MAX_FILES: usize = 16;
+/// Slots a process's descriptor table can grow to (Linux's default soft limit is 1024). `poll`'s and `epoll`'s per-process tables
+/// are sized from it.
+pub const MAX_FILES: usize = 256;
 
 /// Per-process table of open file descriptors.
+///
+/// A `Vec` that grows on demand up to `MAX_FILES`, not an array: an inline `[Option<Box<..>>; 256]` is 4 KiB moved by value
+/// through `Mutex::new`, `Arc::new` and `clone`, and at opt-level 0 that overflowed the boot stack (a double fault creating
+/// PID 1), the way `VmaList` once did. A slot past the end is a free one; `new()` allocates nothing, which the scheduler
+/// relies on when it swaps in an empty table under its lock.
 pub struct FileDescriptorTable {
-    files: [Option<Box<dyn FileHandle>>; MAX_FILES],
+    files: alloc::vec::Vec<Option<Box<dyn FileHandle>>>,
     /// `FD_CLOEXEC` per slot: `exec` closes the flagged ones (`take_cloexec`). A property of the descriptor, not of the handle,
-    /// so `dup` gives the copy a clear flag and `fork` copies it as it is.
-    cloexec: [bool; MAX_FILES],
+    /// so `dup` gives the copy a clear flag and `fork` copies it as it is. Always as long as `files`.
+    cloexec: alloc::vec::Vec<bool>,
 }
 
 impl FileDescriptorTable {
     /// Create an empty table.
     pub const fn new() -> Self {
-        const NONE: Option<Box<dyn FileHandle>> = None;
-        Self {
-            files: [NONE; MAX_FILES],
-            cloexec: [false; MAX_FILES],
+        Self { files: alloc::vec::Vec::new(), cloexec: alloc::vec::Vec::new() }
+    }
+
+    /// Make `fd` a valid slot index (growing the table with free slots). `false` if it is past `MAX_FILES`.
+    fn ensure(&mut self, fd: usize) -> bool {
+        if fd >= MAX_FILES {
+            return false;
         }
+        if fd >= self.files.len() {
+            self.files.resize_with(fd + 1, || None);
+            self.cloexec.resize(fd + 1, false);
+        }
+        true
+    }
+
+    /// Put `handle` at `fd` (free or not; the caller has dealt with whatever was there), with a clear close-on-exec flag.
+    fn put(&mut self, fd: usize, handle: Box<dyn FileHandle>, cloexec: bool) {
+        self.files[fd] = Some(handle);
+        self.cloexec[fd] = cloexec;
     }
 
     /// Create a table with stdin/stdout/stderr pre-opened.
@@ -47,6 +68,7 @@ impl FileDescriptorTable {
         use crate::drivers;
 
         let mut table = Self::new();
+        table.ensure(2);
 
         // FD 0: stdin — bound to the console (serial), same device as
         // stderr. `sys_read`'s fd==0 branch hardcodes reading straight from
@@ -80,40 +102,31 @@ impl FileDescriptorTable {
 
     /// Get a mutable file handle.
     pub fn get_mut(&mut self, fd: usize) -> FileResult<&mut (dyn FileHandle + '_)> {
-        if fd >= MAX_FILES {
-            return Err(FileError::BadFileDescriptor);
-        }
-
-        if let Some(ref mut boxed) = self.files[fd] {
-            Ok(&mut **boxed)
-        } else {
-            Err(FileError::BadFileDescriptor)
+        match self.files.get_mut(fd) {
+            Some(Some(boxed)) => Ok(&mut **boxed),
+            _ => Err(FileError::BadFileDescriptor),
         }
     }
 
     /// Get an immutable file handle.
     pub fn get(&self, fd: usize) -> FileResult<&(dyn FileHandle + '_)> {
-        if fd >= MAX_FILES {
-            return Err(FileError::BadFileDescriptor);
+        match self.files.get(fd) {
+            Some(Some(boxed)) => Ok(&**boxed),
+            _ => Err(FileError::BadFileDescriptor),
         }
-
-        self.files[fd]
-            .as_ref()
-            .map(|boxed| &**boxed)
-            .ok_or(FileError::BadFileDescriptor)
     }
 
     /// Allocate the first free FD for a handle.  Returns the FD number.
     pub fn allocate(&mut self, handle: Box<dyn FileHandle>) -> FileResult<usize> {
-        for (i, slot) in self.files.iter_mut().enumerate() {
-            if slot.is_none() {
-                *slot = Some(handle);
-                self.cloexec[i] = false;
-                return Ok(i);
-            }
+        let fd = match self.files.iter().position(|slot| slot.is_none()) {
+            Some(i) => i,
+            None => self.files.len(),
+        };
+        if !self.ensure(fd) {
+            return Err(FileError::InvalidArgument); // Too many files open
         }
-
-        Err(FileError::InvalidArgument) // Too many files open
+        self.put(fd, handle, false);
+        Ok(fd)
     }
 
     /// dup(2): install a clone of `fd`'s handle at the first free slot
@@ -130,9 +143,9 @@ impl FileDescriptorTable {
         let cloned = self.get(fd)?.dup().ok_or(FileError::NotSupported)?;
 
         for i in min_fd..MAX_FILES {
-            if self.files[i].is_none() {
-                self.files[i] = Some(cloned);
-                self.cloexec[i] = cloexec;
+            if self.files.get(i).map_or(true, |slot| slot.is_none()) {
+                self.ensure(i);
+                self.put(i, cloned, cloexec);
                 return Ok(i);
             }
         }
@@ -161,11 +174,11 @@ impl FileDescriptorTable {
 
         let cloned = self.get(oldfd)?.dup().ok_or(FileError::NotSupported)?;
 
+        self.ensure(newfd);
         if let Some(mut old) = self.files[newfd].take() {
             let _ = old.close();
         }
-        self.files[newfd] = Some(cloned);
-        self.cloexec[newfd] = cloexec;
+        self.put(newfd, cloned, cloexec);
         Ok(newfd)
     }
 
@@ -186,7 +199,7 @@ impl FileDescriptorTable {
     /// handle's `Drop` may take it).
     pub fn take_cloexec(&mut self) -> alloc::vec::Vec<Box<dyn FileHandle>> {
         let mut out = alloc::vec::Vec::new();
-        for i in 0..MAX_FILES {
+        for i in 0..self.files.len() {
             if self.cloexec[i] {
                 self.cloexec[i] = false;
                 if let Some(h) = self.files[i].take() {
@@ -202,6 +215,9 @@ impl FileDescriptorTable {
         if fd >= MAX_FILES {
             return Err(FileError::BadFileDescriptor);
         }
+        if fd >= self.files.len() {
+            return Ok(());
+        }
 
         self.cloexec[fd] = false;
         if let Some(mut handle) = self.files[fd].take() {
@@ -209,6 +225,11 @@ impl FileDescriptorTable {
         }
 
         Ok(())
+    }
+
+    /// The number of slots that can hold an open fd: one past the highest open one, or 0.
+    pub fn open_extent(&self) -> usize {
+        self.files.iter().rposition(|slot| slot.is_some()).map_or(0, |i| i + 1)
     }
 
     /// Debug: list all open FDs to serial.
@@ -240,26 +261,20 @@ impl FileHandle for NullFallback {
 impl Clone for FileDescriptorTable {
     fn clone(&self) -> Self {
         let mut new_table = Self::new();
+        if self.files.is_empty() {
+            return new_table;
+        }
+        new_table.ensure(self.files.len() - 1);
 
-        if self.files[0].is_some() {
-            new_table.files[0] = self.files[0].as_ref().unwrap().dup()
-                .or_else(|| crate::drivers::open_device("/dev/console").ok());
+        for i in 0..self.files.len() {
+            let Some(ref handle) = self.files[i] else { continue };
+            new_table.files[i] = match i {
+                0 => handle.dup().or_else(|| crate::drivers::open_device("/dev/console").ok()),
+                1 | 2 => handle.dup().or_else(|| crate::drivers::open_device("/dev/fb").ok()),
+                _ => handle.dup(),
+            };
         }
-        if self.files[1].is_some() {
-            new_table.files[1] = self.files[1].as_ref().unwrap().dup()
-                .or_else(|| crate::drivers::open_device("/dev/fb").ok());
-        }
-        if self.files[2].is_some() {
-            new_table.files[2] = self.files[2].as_ref().unwrap().dup()
-                .or_else(|| crate::drivers::open_device("/dev/fb").ok());
-        }
-
-        for i in 3..MAX_FILES {
-            if let Some(ref handle) = self.files[i] {
-                new_table.files[i] = handle.dup();
-            }
-        }
-        new_table.cloexec = self.cloexec;
+        new_table.cloexec = self.cloexec.clone();
 
         new_table
     }
