@@ -552,6 +552,25 @@ struct Runtime {
 
 static RUNTIME: crate::sync::Mutex<Option<Runtime>> = crate::sync::Mutex::new(None);
 
+/// What `/dev/nvgpu` (`uapi.rs`) needs of the run-time channel.
+pub(super) struct Handover {
+    pub token: u32,
+    /// `GP_PUT`: every push so far was waited for.
+    pub slot: u32,
+    /// The host fence page (`chan::HFENCE_VA`), as a kernel virtual address.
+    pub hfence: usize,
+}
+
+/// G4d: give the copy channel to `/dev/nvgpu` for good. The `/dev/dispctl` copy self-tests (`copy irq`, `copy fault`) then report that
+/// there is no run-time channel: two owners would fight over the ring.
+pub(super) fn take_for_uapi() -> Option<Handover> {
+    let rt = RUNTIME.lock().take()?;
+    if rt.dead {
+        return None;
+    }
+    Some(Handover { token: rt.tokens[0], slot: rt.slot, hfence: rt.hfence })
+}
+
 fn install(r: &mut String, regs: &Bar0, sub: &Submitter, bufs: &Buffers) {
     let Some(pci) = super::gsp::pci_info().filter(|p| p.bar1 != 0) else {
         let _ = writeln!(r, "copy: run-time channel not installed: no BAR1");

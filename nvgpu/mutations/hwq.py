@@ -83,6 +83,11 @@ M = [
     ("seq <= self.done\n    }", "seq < self.done\n    }"),
     ("(self.put % self.entries as u64) as u32\n    }", "self.put as u32\n    }"),
     ("self.next_seq - 1\n    }", "self.next_seq\n    }"),
+    ("let need = pushes.len() as u64 + 1 + (self.prelude_bytes > 0) as u64;", "let need = pushes.len() as u64 + 1;"),
+    ("if self.prelude_bytes > 0 {\n            // behind", "if self.prelude_bytes == 0 {\n            // behind"),
+    ("slot as u64 * self.slot_bytes as u64 + self.fence_bytes as u64, self.prelude_bytes));", "slot as u64 * self.slot_bytes as u64, self.prelude_bytes));"),
+    ("slot as u64 * self.slot_bytes as u64 + self.fence_bytes as u64, self.prelude_bytes));", "slot as u64 * self.slot_bytes as u64 + self.fence_bytes as u64, self.fence_bytes));"),
+    ("fence_bytes + prelude_bytes <= slot_bytes", "fence_bytes <= slot_bytes"),
 ]
 # Equivalent by construction (not listed): dropping the `va` alignment check of bind_range (PageTables::map refuses an unaligned VA
 # itself, with the same error) and short-circuiting free_entries when nothing is in flight (consumed == put then, always).

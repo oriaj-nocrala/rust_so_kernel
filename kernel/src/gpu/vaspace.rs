@@ -151,7 +151,7 @@ pub(super) fn setup(r: &mut String, regs: &Bar0, rm: &mut Rm, copy: bool, comput
         // 6. G4c: keep the tables and the channel for `/dev/nvgpu`.
         if uapi {
             match ch {
-                Some(ch) => super::uapi::install(r, regs, pt, ch),
+                Some(ch) => super::uapi::install(r, regs, pt, ch, super::copy::take_for_uapi()),
                 None => super::uapi::install_failed(r, format_args!("the compute channel is not up (see compute:)")),
             }
         }

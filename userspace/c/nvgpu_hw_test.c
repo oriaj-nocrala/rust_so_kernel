@@ -174,6 +174,15 @@ static uint32_t launch_push(uint32_t *w, uint64_t qmd_va) {
    return n;
 }
 
+/// Methods of a linear copy on the copy subchannel (4), as NVK's upload queue pushes them: no SET_OBJECT, the kernel binds the class.
+static uint32_t copy_push(uint32_t *w, uint64_t src, uint64_t dst, uint32_t bytes) {
+   uint32_t n = 0;
+   w[n++] = hdr(4, 0x400, 4); w[n++] = src >> 32; w[n++] = (uint32_t)src; w[n++] = dst >> 32; w[n++] = (uint32_t)dst;  // OFFSET_IN/OUT
+   w[n++] = hdr(4, 0x410, 4); w[n++] = bytes; w[n++] = bytes; w[n++] = bytes; w[n++] = 1;      // PITCH_IN/OUT, LINE_LENGTH_IN, LINE_COUNT
+   w[n++] = hdr(4, 0x300, 1); w[n++] = 2 | (1 << 2) | (1 << 7) | (1 << 8);                     // LAUNCH_DMA: non-pipelined, flush, pitch layouts
+   return n;
+}
+
 /// Set up slot `slot` of `r` to run `shader` (384 bytes, 8 registers) as 8 CTAs of 32 threads with kernel parameters `p0` and `p1`, and
 /// scribble its output page. Returns the push segment to EXEC.
 static struct nvg_push launch_prepare(struct region *r, unsigned slot, const uint8_t *shader, uint64_t p0, uint64_t p1, uint32_t release_payload) {
@@ -240,7 +249,7 @@ int main(void) {
    CHECK(t2 > t1 && t2 - t1 < 5000000000ull, "the GPU timer moves: %llu -> %llu ns", (unsigned long long)t1, (unsigned long long)t2);
    if (hw) {
       CHECK(ctx_create(NVG_ENGINE_COPY | NVG_ENGINE_2D | NVG_ENGINE_3D | NVG_ENGINE_M2MF | NVG_ENGINE_COMPUTE) == 0 && errno == EINVAL,
-            "a context asking for engines the channel has no object for is EINVAL (G4e)");
+            "a context asking for 2D or M2MF is EINVAL (no such objects)");
    }
    uint32_t ctx = ctx_create(NVG_ENGINE_COMPUTE);
    CHECK(ctx != 0, "a compute context");
@@ -272,6 +281,31 @@ int main(void) {
    CHECK(wait_timeline(tl, seq, 5000) == 0, "its fence comes");
    HWCHECK(out_is(&host, 2, fill_word, &first), "the GPU read back what the GPU wrote to VRAM (first bad word %d)", first);
    HWCHECK(slot_grid_sem(&host, 1) == 0x4243 && slot_grid_sem(&host, 2) == 0x4244, "both grids released their semaphores");
+
+   // ---- 2b. the copy engine alone (NVK's upload queue): host -> VRAM -> host, the pushes carry no SET_OBJECT
+   {
+      uint32_t cctx = ctx_create(NVG_ENGINE_COPY);
+      CHECK(cctx != 0, "a copy-only context");
+      CHECK(ctx_create(NVG_ENGINE_COMPUTE | NVG_ENGINE_COPY) != 0, "a compute + copy context");
+      CHECK(ctx_create(NVG_ENGINE_3D | NVG_ENGINE_COMPUTE | NVG_ENGINE_COPY) != 0, "a 3D + compute + copy context (what NVK's queue families ask for)");
+      uint32_t cb = bo_create(4096, NVG_BO_VRAM, NULL);
+      uint64_t cva = va_alloc(4096, 4096);
+      CHECK(cb && cva && bind(cva, 4096, cb, 0) == 0, "a VRAM page for the copy");
+      uint32_t *csrc = (uint32_t *)(host.cpu + 37ull * SLOT_BYTES + OFF_OUT), *cdst = (uint32_t *)(host.cpu + 38ull * SLOT_BYTES + OFF_OUT);
+      for (uint32_t i = 0; i < 1024; i++) { csrc[i] = fill_word(i) ^ 0x0badf00du; cdst[i] = scribble(i); }
+      uint32_t w[32];
+      uint32_t n = copy_push(w, host.va + 37ull * SLOT_BYTES + OFF_OUT, cva, 4096);
+      n += copy_push(w + n, cva, host.va + 38ull * SLOT_BYTES + OFF_OUT, 4096);
+      memcpy(host.cpu + 37ull * SLOT_BYTES + OFF_PUSH, w, n * 4);
+      struct nvg_push cp = { .va = host.va + 37ull * SLOT_BYTES + OFF_PUSH, .bytes = n * 4, .flags = 0 };
+      uint32_t ctl = sync_create(0);
+      int64_t c0 = now_us();
+      CHECK(ctl && exec_signal(cctx, &cp, 1, ctl, 1) == 0 && wait_timeline(ctl, 1, 5000) == 0, "EXEC of host -> VRAM -> host on the copy context");
+      int same = 1;
+      for (uint32_t i = 0; i < 1024; i++) same &= cdst[i] == csrc[i];
+      HWCHECK(same, "the 4 KiB came back from VRAM intact");
+      printf("  copy context: host -> VRAM -> host in %lld us\n", (long long)(now_us() - c0));
+   }
 
    // ---- 3. rebinding: the VA must follow the new buffer (the GPU's TLB is flushed by bind and unbind)
    {
@@ -361,7 +395,7 @@ int main(void) {
       call(NVG_IOC_INFO, &i2);
       before_vram = i2.vram_used_B;
    }
-   CHECK(before_vram == 3 * 4096, "VRAM in use before closing: %llu (three pages: the read-back page and X, Y)", (unsigned long long)before_vram);
+   CHECK(before_vram == 4 * 4096, "VRAM in use before closing: %llu (four pages: the read-back page, the copy page, X and Y)", (unsigned long long)before_vram);
    close(fd);
    fd = open("/dev/nvgpu", O_RDWR);
    CHECK(fd >= 0, "the device opens again after a close");

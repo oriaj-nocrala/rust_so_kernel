@@ -127,8 +127,12 @@ int main(void) {
    int family = -1;
    for (uint32_t i = 0; i < nq; i++) {
       printf("VK queue family %u: flags %#x count %u\n", i, qf[i].queueFlags, qf[i].queueCount);
-      if (family < 0 && (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT)) family = (int)i;
+      // a compute-only family first: its contexts ask for compute (+ transfer) engines, which the hardware device serves (graphics engines
+      // are not wired up yet); fall back to the first family with compute
+      if ((qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && (family < 0 || (qf[family].queueFlags & VK_QUEUE_GRAPHICS_BIT))) family = (int)i;
+      else if (family < 0 && (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT)) family = (int)i;
    }
+   printf("VK using queue family %d\n", family);
    CHECK(family >= 0, "a compute queue family");
 
    VkPhysicalDeviceMemoryProperties mp;
@@ -240,6 +244,8 @@ int main(void) {
    for (uint32_t i = 0; i < N; i++) if (data[i] != 0xdeadbeefu) untouched = 0;
    printf("VK dispatch result: %s\n", executed ? "EXECUTED" : untouched ? "not executed (software device)" : "WRONG DATA");
    CHECK(executed || untouched, "the buffer holds either the results or what we put there");
+   // On the hardware the dispatch must have run: VK_PROBE_REQUIRE_EXEC=1 (the metal job) makes "not executed" a failure.
+   if (getenv("VK_PROBE_REQUIRE_EXEC")) CHECK(executed, "the dispatch really ran on the GPU");
 
    // ---- a timeline semaphore
    VkSemaphoreTypeCreateInfo stci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE, .initialValue = 0 };

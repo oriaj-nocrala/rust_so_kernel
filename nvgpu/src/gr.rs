@@ -28,6 +28,9 @@ pub const ENGINE_GR0: u32 = 1;
 /// `obj=0x97000000`), and ours for the compute object.
 pub const H_THREED: u32 = 0x9700_0000;
 pub const H_COMPUTE: u32 = 0xc7c0_0000;
+/// The 3D object of the real channel (G4d: NVK's compute queue also uses the 3D engine, for MME indirect dispatch); the golden channel's is
+/// `H_THREED`, freed long before.
+pub const H_THREED_CHAN: u32 = 0x9700_0001;
 
 /// `NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO` (`rm/r570/nvrm/gr.h:11`): 8
 /// engines x 26 buffers (r570's `ENGINE_ID_COUNT` is 0x1a; r535's was 0x19) x (size, alignment)

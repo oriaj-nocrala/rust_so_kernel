@@ -49,8 +49,10 @@ static HELD: AtomicBool = AtomicBool::new(false);
 struct KernelBackend {
     soft: SoftBackend,
     arena: Arc<ShmObject>,
-    /// A GPU is behind this session: page tables, the channel and the fences are its.
+    /// A GPU is behind this session: page tables, the channels and the fences are its.
     hw: bool,
+    /// Which channel each context runs on (hardware only).
+    kinds: alloc::collections::BTreeMap<u32, gpu::uapi::ChanKind>,
 }
 
 impl Backend for KernelBackend {
@@ -84,26 +86,29 @@ impl Backend for KernelBackend {
 
     fn ctx_create(&mut self, ctx: u32, engines: u32) -> Result<(), Error> {
         if self.hw {
-            gpu::uapi::ctx_create(engines)?;
+            let kind = gpu::uapi::ctx_create(engines)?;
+            self.kinds.insert(ctx, kind);
         }
         self.soft.ctx_create(ctx, engines)
     }
 
     fn ctx_destroy(&mut self, ctx: u32) {
+        self.kinds.remove(&ctx);
         self.soft.ctx_destroy(ctx);
     }
 
     fn submit(&mut self, ctx: u32, pushes: &[Push]) -> Result<u64, Error> {
         if self.hw {
             // the model's fence numbers are the GPU's; the soft log is not kept
-            return gpu::uapi::submit(pushes);
+            let kind = *self.kinds.get(&ctx).ok_or(Error::NoEnt)?;
+            return gpu::uapi::submit(kind, pushes);
         }
         self.soft.submit(ctx, pushes)
     }
 
     fn fence_done(&mut self, ctx: u32, seq: u64) -> bool {
         if self.hw {
-            return gpu::uapi::fence_done(seq);
+            return self.kinds.get(&ctx).is_none_or(|&kind| gpu::uapi::fence_done(kind, seq));
         }
         self.soft.fence_done(ctx, seq)
     }
@@ -150,7 +155,7 @@ pub fn open() -> Result<Box<dyn FileHandle>, Errno> {
         return Err(Errno::ENOMEM);
     }
     let layout = Layout { arena_bytes: ARENA_BYTES, vram_bytes: if hw { HW_VRAM_BYTES } else { SOFT_VRAM_BYTES }, va_start: VA_START, va_end: VA_END };
-    let backend = KernelBackend { soft: SoftBackend::default(), arena: arena.clone(), hw };
+    let backend = KernelBackend { soft: SoftBackend::default(), arena: arena.clone(), hw, kinds: Default::default() };
     let dev = Device::new(backend, layout);
     Ok(Box::new(NvgpuHandle { session: Arc::new(Session { dev: crate::sync::Mutex::new(dev), arena, hw }) }))
 }

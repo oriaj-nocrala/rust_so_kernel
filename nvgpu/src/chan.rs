@@ -301,6 +301,18 @@ pub fn release_push(sem_va: u64, payload: u32) -> Vec<u32> {
     w
 }
 
+/// The size of [`release_push`] in bytes: the kernel's fence on a copy-engine channel (`/dev/nvgpu`, `hwq::Queue`).
+pub const RELEASE_PUSH_BYTES: u32 = 32;
+
+/// Only the object bind of [`release_push`]: `SET_OBJECT` of the copy class on its subchannel. NVK's copy contexts push copy
+/// methods at that subchannel without ever binding it, so the kernel runs this before each of their submissions (idempotent).
+pub fn bind_push() -> Vec<u32> {
+    alloc::vec![incr_header(SUBCH_COPY, 0, 1), CLASS_COPY]
+}
+
+/// The size of [`bind_push`] in bytes.
+pub const BIND_PUSH_BYTES: u32 = 8;
+
 // ---- the layout the adapter uses -------------------------------------------------------
 
 /// One buffer: where the GPU sees it (VA) and where it is (VRAM address or bus
@@ -747,5 +759,17 @@ mod tests {
         assert!(HUGE_BACK_VA + (256 << 20) <= FRAME_SRC_VA && FRAME_SRC_VA + (256 << 20) <= FRAME_DST_VA);
         // the frame's VRAM: after the 4 MiB destination, 2 MiB aligned, below the GSP heap
         assert!(VRAM_DST + (4 << 20) <= FRAME_VRAM && FRAME_VRAM % (2 << 20) == 0 && FRAME_VRAM + FRAME_BYTES < (1 << 32));
+    }
+
+    #[test]
+    fn the_copy_channels_kernel_pushes() {
+        let r = release_push(0x2_0003_0000, 0x55);
+        assert_eq!(r.len() as u32 * 4, RELEASE_PUSH_BYTES);
+        assert_eq!(bind_push().len() as u32 * 4, BIND_PUSH_BYTES);
+        // the bind is the release's own first two words: SET_OBJECT (method 0) on the copy subchannel with the copy class
+        assert_eq!(bind_push(), r[..2]);
+        assert_eq!(bind_push(), [incr_header(4, 0, 1), 0xc7b5]);
+        // the release: SET_SEMAPHORE_A/B/C, then LAUNCH_DMA with NONE + FLUSH + RELEASE_ONE_WORD
+        assert_eq!(r[2..], [incr_header(4, 0x240, 3), 2, 0x0003_0000, 0x55, incr_header(4, 0x300, 1), 0xc]);
     }
 }

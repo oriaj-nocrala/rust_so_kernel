@@ -335,6 +335,8 @@ pub(super) struct Channel {
     pub token: u32,
     pub slot: u32,
     pub host: DmaBuf,
+    /// The 3D object (`0xc797`) is allocated on the channel too: NVK's compute queue binds it (MME indirect dispatch).
+    pub threed: bool,
 }
 
 fn fail(r: &mut String, why: core::fmt::Arguments) -> Option<Channel> {
@@ -623,7 +625,19 @@ pub(super) fn run(r: &mut String, regs: &Bar0, rm: &mut Rm, c: Compute) -> Optio
     let slot = sub.slot;
     let Compute { host, kern, mthd_golden, mthd_chan, .. } = c;
     core::mem::forget((kern, mthd_golden, mthd_chan));
-    Some(Channel { token, slot, host })
+    // G4d: last of all, so that if RM refuses (and goes quiet, as a refused call can) everything above has already been measured. The
+    // golden channel did the same allocation, with no parameters.
+    let threed = match rm.alloc(chan::h_chan(CHID), gr::H_THREED_CHAN, gr::CLASS_THREED, &[]) {
+        Ok(_) => {
+            let _ = writeln!(r, "compute: 3D object {:#x} allocated on the channel too (for NVK's MME indirect dispatch)", gr::CLASS_THREED);
+            true
+        }
+        Err(e) => {
+            let _ = writeln!(r, "compute: the 3D object on the channel: {} (contexts asking for the 3D engine are refused)", e);
+            false
+        }
+    };
+    Some(Channel { token, slot, host, threed })
 }
 
 /// One way of asking for the golden context. Boot #126 (`gpu=compute`, the first run) got `NV_ERR_INVALID_ARGUMENT` from

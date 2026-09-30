@@ -6,9 +6,11 @@
 //
 //   - the GPU page tables (`PageTables`, pool of `POOL_TABLES` tables at VRAM 64 MiB): `bind` maps user buffers into them, `unbind`
 //     removes them, each followed by writing the tables it touched into VRAM and flushing the GPU's TLB (`hwq::tlb_flush_regs`);
-//   - the GR channel `compute::run` built (chid 1, runlist 0, the compute object): its GPFIFO ring, USERD and doorbell token. Every
-//     context of every session shares this one channel (G4e gives each its own); `hwq::Queue` decides where an `EXEC`'s pushes go and
-//     appends the kernel's fence (`gr::fence_push`) that releases a sequence number into a semaphore in host memory;
+//   - the GR channel `compute::run` built (chid 1, runlist 0, the compute object) and the copy channel `copy::run` left (chid 2, CE2):
+//     their GPFIFO rings, USERD and doorbell tokens. A compute context runs on the first, a copy-only context (NVK's upload queue) on
+//     the second; every context of a kind shares its channel (one channel per context is G4e). `hwq::Queue` decides where an `EXEC`'s
+//     pushes go and appends the kernel's fence (`gr::fence_push`, `chan::release_push`) that releases a sequence number into a
+//     semaphore in host memory; a copy context also gets `chan::bind_push` first, because NVK never binds the copy class itself;
 //   - where to write: the ring, the fence pushes and the tables live in VRAM, and the CPU reaches VRAM at run time through BAR1
 //     write-combined (write-only after GSP-RM boots; PRAMIN is the fallback for any span BAR1 does not reach, checked at install).
 //
@@ -31,6 +33,7 @@ use nvgpu::uapi::Push;
 use nvgpu::Mmio;
 
 use super::compute::Channel;
+use super::copy::Handover;
 use super::vaspace::TABLE_VRAM;
 use super::Bar0;
 use crate::memory::dma::DmaBuf;
@@ -42,11 +45,11 @@ pub const POOL_TABLES: usize = 8192;
 
 /// `NVC361_NOTIFY_CHANNEL_PENDING` (see `compute.rs`).
 const DOORBELL: u32 = 0xb8_0000 + 0x3_0000 + 0x90;
-/// The kernel's fence pushes: 64 slots of 64 bytes in the channel's push page (`gr::PUSH_VA`, VRAM `gr::CHAN_PUSH`), which the boot's
-/// rungs are done with.
+/// The kernel's fence pushes: 64 slots of 64 bytes in each channel's push page (`gr::PUSH_VA` / VRAM `gr::CHAN_PUSH`; `chan::PUSH_VA` /
+/// `chan::PUSH_VRAM`), which the boot's rungs are done with.
 const FENCE_SLOTS: u32 = 64;
 const FENCE_SLOT_BYTES: u32 = 64;
-/// The fence semaphore: the host page the rungs used (`gr::HOST_VA + HOST_SEM_OFF`).
+/// The GR channel's fence semaphore: the host page the rungs used (`gr::HOST_VA + HOST_SEM_OFF`).
 const SEM_OFF: u64 = gr::HOST_SEM_OFF;
 /// No fence in this long and work in flight: the channel is wedged (a faulted channel is reset by RM and never releases again).
 const HANG_MS: u64 = 10_000;
@@ -127,22 +130,57 @@ impl<'a> Io<'a> {
 
 // ---- the state --------------------------------------------------------------------------------------------------------------
 
+/// Which channel a context runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChanKind {
+    /// The GR channel: compute (and, later, 3D).
+    Gr = 0,
+    /// The copy channel.
+    Ce = 1,
+}
+
+/// One channel's ring, doorbell and fence.
+struct Chan {
+    kind: ChanKind,
+    token: u32,
+    queue: Queue,
+    /// The fence semaphore's word (host memory) and the GPU VA it is mapped at.
+    sem: *const u32,
+    sem_va: u64,
+    /// VRAM addresses the CPU writes: `GP_PUT`'s USERD, the GPFIFO ring, the fence-push slots.
+    userd: u64,
+    gpfifo: u64,
+    slots: u64,
+    /// The TSC when the oldest work in flight started, or the last time a fence was seen while work was in flight.
+    progress: u64,
+}
+
+impl Chan {
+    /// The kernel's fence push for `payload`, and the prelude the channel's queue puts before every submission (empty for GR).
+    fn pushes(&self, payload: u32) -> (Vec<u32>, Vec<u32>) {
+        match self.kind {
+            ChanKind::Gr => (gr::fence_push(self.sem_va, payload), Vec::new()),
+            ChanKind::Ce => (chan::release_push(self.sem_va, payload), chan::bind_push()),
+        }
+    }
+}
+
 struct Hw {
     regs: Bar0,
     pt: PageTables,
     spans: Vec<Span>,
-    queue: Queue,
-    token: u32,
-    /// The host page holding the fence semaphore (at `SEM_OFF`).
+    chans: [Option<Chan>; 2],
+    /// The GR channel has the 3D object (contexts may ask for the 3D engine).
+    threed: bool,
+    /// The host page holding the GR fence semaphore (at `SEM_OFF`); the copy channel's lives in `copy`'s.
+    #[allow(dead_code)]
     host: DmaBuf,
-    /// The TSC when the oldest work in flight started, or the last time a fence was seen while work was in flight.
-    progress: u64,
     dead: bool,
     /// The GPU may still touch bound memory (it hung, or did not go idle at close): never give it back.
     leak: bool,
 }
 
-// SAFETY: the mappings and the register window are device memory used under `HW`'s lock.
+// SAFETY: the mappings, the semaphore pointers and the register window are device/DMA memory used under `HW`'s lock.
 unsafe impl Send for Hw {}
 
 static HW: crate::sync::Mutex<Option<Hw>> = crate::sync::Mutex::new(None);
@@ -153,6 +191,7 @@ static BINDS: AtomicU64 = AtomicU64::new(0);
 static UNBINDS: AtomicU64 = AtomicU64::new(0);
 static PAGES_BOUND: AtomicU64 = AtomicU64::new(0);
 static EXECS: AtomicU64 = AtomicU64::new(0);
+static CE_EXECS: AtomicU64 = AtomicU64::new(0);
 static AGAIN: AtomicU64 = AtomicU64::new(0);
 static FENCES: AtomicU64 = AtomicU64::new(0);
 static TLB_FLUSHES: AtomicU64 = AtomicU64::new(0);
@@ -199,7 +238,7 @@ fn map_span(r: &mut String, regs: &Bar0, bar1: u64, vram: u64, len: u64, probe: 
 
 /// Keep the boot's GPU state for `/dev/nvgpu`. Called by `vaspace::setup` after `compute::run` succeeded: `pt` is the tree the boot
 /// built and RM was handed, `ch` the GR channel's position.
-pub(super) fn install(r: &mut String, regs: &Bar0, mut pt: PageTables, ch: Channel) {
+pub(super) fn install(r: &mut String, regs: &Bar0, mut pt: PageTables, ch: Channel, ce: Option<Handover>) {
     let Some(pci) = super::gsp::pci_info().filter(|p| p.bar1 != 0) else {
         STATE.store(2, Ordering::Relaxed);
         let _ = writeln!(r, "uapi: STOP: no BAR1");
@@ -209,7 +248,9 @@ pub(super) fn install(r: &mut String, regs: &Bar0, mut pt: PageTables, ch: Chann
     let boot_tables = pt.take_dirty().len();
 
     let mut spans = Vec::new();
-    // the pool's last table (unused: a bind allocates from the front) and the channel's DST page (its last rung is done)
+    let mut wanted = 2;
+    // the pool's last table (unused: a bind allocates from the front), the GR channel's DST page (its last rung is done), the copy
+    // channel's VRAM fence page (only the ladder used it)
     let pool_bytes = POOL_TABLES as u64 * 0x1000;
     if let Some(s) = map_span(r, regs, pci.bar1, TABLE_VRAM, pool_bytes, TABLE_VRAM + pool_bytes - 0x1000, "tables") {
         spans.push(s);
@@ -217,35 +258,61 @@ pub(super) fn install(r: &mut String, regs: &Bar0, mut pt: PageTables, ch: Chann
     if let Some(s) = map_span(r, regs, pci.bar1, gr::VRAM_CHAN, 0x1_0000, gr::CHAN_DST, "channel") {
         spans.push(s);
     }
+    if ce.is_some() {
+        wanted += 1;
+        if let Some(s) = map_span(r, regs, pci.bar1, chan::VRAM_CHAN, 0x1_0000, chan::FENCE_VRAM, "copy channel") {
+            spans.push(s);
+        }
+    }
     SPANS_BAR1.store(spans.len() as u32, Ordering::Relaxed);
-    SPANS_PRAMIN.store(2 - spans.len() as u32, Ordering::Relaxed);
+    SPANS_PRAMIN.store((wanted - spans.len()) as u32, Ordering::Relaxed);
 
-    // The fence semaphore starts at 0 and the ring where the boot's pushes left it (all of them were waited for).
+    // Each fence semaphore starts at 0 and each ring where the boot's pushes left it (all of them were waited for).
     ch.host.copy_in(SEM_OFF as usize, &0u32.to_le_bytes());
-    let queue = Queue::new(gr::GPFIFO_ENTRIES, ch.slot, FENCE_SLOTS, gr::PUSH_VA, FENCE_SLOT_BYTES, gr::FENCE_PUSH_BYTES);
+    let gr_chan = Chan {
+        kind: ChanKind::Gr,
+        token: ch.token,
+        queue: Queue::new(gr::GPFIFO_ENTRIES, ch.slot, FENCE_SLOTS, gr::PUSH_VA, FENCE_SLOT_BYTES, gr::FENCE_PUSH_BYTES, 0),
+        // SAFETY: the host page is a live DMA allocation of ours, at least `SEM_OFF + 4` bytes long (kept in `Hw::host`).
+        sem: unsafe { ch.host.virt().add(SEM_OFF as usize) } as *const u32,
+        sem_va: gr::HOST_VA + SEM_OFF,
+        userd: gr::CHAN_USERD,
+        gpfifo: gr::CHAN_GPFIFO,
+        slots: gr::CHAN_PUSH,
+        progress: crate::cpu::tsc::read(),
+    };
+    let ce_chan = ce.map(|h| {
+        // SAFETY: the copy channel's host fence page (`chan::HFENCE_VA`), a leaked 4 KiB DMA allocation; the channel is ours now.
+        unsafe { core::ptr::write_volatile(h.hfence as *mut u32, 0) };
+        Chan {
+            kind: ChanKind::Ce,
+            token: h.token,
+            queue: Queue::new(chan::GPFIFO_ENTRIES, h.slot, FENCE_SLOTS, chan::PUSH_VA, FENCE_SLOT_BYTES, chan::RELEASE_PUSH_BYTES, chan::BIND_PUSH_BYTES),
+            sem: h.hfence as *const u32,
+            sem_va: chan::HFENCE_VA,
+            userd: chan::USERD_VRAM,
+            gpfifo: chan::GPFIFO_VRAM,
+            slots: chan::PUSH_VRAM,
+            progress: crate::cpu::tsc::read(),
+        }
+    });
     let _ = writeln!(
         r,
-        "uapi: installed: {} tables ({} written at boot, pool {}), {} BAR1 span(s) + {} through PRAMIN, GR channel token {:#x}, ring at entry {} of {}",
+        "uapi: installed: {} tables ({} written at boot, pool {}), {} BAR1 span(s) + {} through PRAMIN, GR channel token {:#x} at ring entry {} of {}, copy channel {}",
         pt.len(),
         boot_tables,
         POOL_TABLES,
         spans.len(),
-        2 - spans.len(),
+        wanted - spans.len(),
         ch.token,
         ch.slot,
-        gr::GPFIFO_ENTRIES
+        gr::GPFIFO_ENTRIES,
+        match &ce_chan {
+            Some(c) => alloc::format!("token {:#x}", c.token),
+            None => String::from("not available (contexts of the copy engine alone are refused)"),
+        }
     );
-    *HW.lock() = Some(Hw {
-        regs: Bar0 { base: regs.base, len: regs.len },
-        pt,
-        spans,
-        queue,
-        token: ch.token,
-        host: ch.host,
-        progress: crate::cpu::tsc::read(),
-        dead: false,
-        leak: false,
-    });
+    *HW.lock() = Some(Hw { regs: Bar0 { base: regs.base, len: regs.len }, pt, spans, chans: [Some(gr_chan), ce_chan], threed: ch.threed, host: ch.host, dead: false, leak: false });
     STATE.store(1, Ordering::Relaxed);
 }
 
@@ -275,17 +342,25 @@ impl Hw {
         }
     }
 
-    /// Read the fence semaphore, retire what it completes, and declare the channel dead when work has been in flight too long.
-    fn poll(&mut self) {
-        // SAFETY: the host page is a live DMA allocation of ours, at least `SEM_OFF + 4` bytes long.
-        let sem = unsafe { core::ptr::read_volatile(self.host.virt().add(SEM_OFF as usize) as *const u32) };
-        let before = self.queue.done_seq();
-        if self.queue.observe(sem) {
-            FENCES.fetch_add(self.queue.done_seq() - before, Ordering::Relaxed);
-            self.progress = crate::cpu::tsc::read();
+    /// Read a channel's fence semaphore, retire what it completes, and declare the GPU dead when work has been in flight too long.
+    fn poll(&mut self, kind: ChanKind) {
+        let Some(c) = self.chans[kind as usize].as_mut() else { return };
+        // SAFETY: the semaphore word is host memory of ours that outlives the device state.
+        let sem = unsafe { core::ptr::read_volatile(c.sem) };
+        let before = c.queue.done_seq();
+        if c.queue.observe(sem) {
+            FENCES.fetch_add(c.queue.done_seq() - before, Ordering::Relaxed);
+            c.progress = crate::cpu::tsc::read();
         }
-        if !self.dead && self.queue.in_flight() > 0 && crate::cpu::tsc::read().wrapping_sub(self.progress) > super::copy::ms_ticks(HANG_MS) {
-            let why = alloc::format!("no fence for {} ms with {} submission(s) in flight, semaphore {:#x}, last submitted {}", HANG_MS, self.queue.in_flight(), sem, self.queue.last_seq());
+        if !self.dead && c.queue.in_flight() > 0 && crate::cpu::tsc::read().wrapping_sub(c.progress) > super::copy::ms_ticks(HANG_MS) {
+            let why = alloc::format!(
+                "{:?} channel: no fence for {} ms with {} submission(s) in flight, semaphore {:#x}, last submitted {}",
+                kind,
+                HANG_MS,
+                c.queue.in_flight(),
+                sem,
+                c.queue.last_seq()
+            );
             self.mark_dead(&why);
         }
     }
@@ -404,19 +479,37 @@ pub fn leaking() -> bool {
     HW.lock().as_ref().is_some_and(|h| h.leak)
 }
 
-/// The engines a context may ask for. The channel has the compute object only; the others are allocated per channel in G4e.
-pub fn ctx_create(engines: u32) -> Result<(), Error> {
-    with(|_| if engines == nvgpu::uapi::ENGINE_COMPUTE { Ok(()) } else { Err(Error::Inval) })
+/// The channel a context with `engines` runs on. NVK's queue families ask for 3D + compute (+ copy, Vulkan's transfer bit; even a
+/// compute-only one gets the 3D engine, for MME indirect dispatch): they run on the GR channel, which has compute and (if RM allowed
+/// it) 3D objects but no copy object, so copy commands pushed to it would fault the channel; NVK's own transfers go through the upload
+/// queue (copy alone, on the copy channel). 2D and M2MF are not offered.
+pub fn ctx_create(engines: u32) -> Result<ChanKind, Error> {
+    use nvgpu::uapi::{ENGINE_3D, ENGINE_COMPUTE, ENGINE_COPY};
+    with(|hw| {
+        let kind = match engines {
+            e if e & ENGINE_COMPUTE != 0 && e & !(ENGINE_COMPUTE | ENGINE_COPY | ENGINE_3D) == 0 => {
+                if e & ENGINE_3D != 0 && !hw.threed {
+                    return Err(Error::Inval);
+                }
+                ChanKind::Gr
+            }
+            ENGINE_COPY => ChanKind::Ce,
+            _ => return Err(Error::Inval),
+        };
+        hw.chans[kind as usize].as_ref().map(|_| kind).ok_or(Error::Inval)
+    })
 }
 
-/// Queue `pushes` (already validated) and the fence after them; returns the sequence number the fence completes as.
-pub fn submit(pushes: &[Push]) -> Result<u64, Error> {
+/// Queue `pushes` (already validated) on the channel of `kind` with the fence after them; returns the sequence number the fence
+/// completes as.
+pub fn submit(kind: ChanKind, pushes: &[Push]) -> Result<u64, Error> {
     with(|hw| {
-        hw.poll();
+        hw.poll(kind);
         if hw.dead {
             return Err(Error::Io);
         }
-        let plan = match hw.queue.plan(pushes) {
+        let c = hw.chans[kind as usize].as_mut().ok_or(Error::Io)?;
+        let plan = match c.queue.plan(pushes) {
             Ok(p) => p,
             Err(Error::Again) => {
                 AGAIN.fetch_add(1, Ordering::Relaxed);
@@ -424,45 +517,54 @@ pub fn submit(pushes: &[Push]) -> Result<u64, Error> {
             }
             Err(e) => return Err(e),
         };
-        if hw.queue.in_flight() == 1 {
-            hw.progress = crate::cpu::tsc::read();
+        if c.queue.in_flight() == 1 {
+            c.progress = crate::cpu::tsc::read();
         }
-        let sem_va = gr::HOST_VA + SEM_OFF;
-        let fence = gr::fence_push(sem_va, plan.payload);
+        let (fence, prelude) = c.pushes(plan.payload);
+        let (slots, gpfifo, userd, token) = (c.slots, c.gpfifo, c.userd, c.token);
         let mut io = Io::new(&hw.regs, &hw.spans);
-        let slot_at = gr::CHAN_PUSH + plan.fence_slot as u64 * FENCE_SLOT_BYTES as u64;
+        let slot_at = slots + plan.fence_slot as u64 * FENCE_SLOT_BYTES as u64;
         for (i, w) in fence.iter().enumerate() {
             io.wr32(slot_at + 4 * i as u64, *w);
         }
-        for (idx, e) in &plan.entries {
-            io.wr64(gr::CHAN_GPFIFO + 8 * *idx as u64, *e);
+        for (i, w) in prelude.iter().enumerate() {
+            io.wr32(slot_at + 4 * fence.len() as u64 + 4 * i as u64, *w);
         }
-        io.wr32(gr::CHAN_USERD + chan::USERD_GP_PUT, plan.gp_put);
+        for (idx, e) in &plan.entries {
+            io.wr64(gpfifo + 8 * *idx as u64, *e);
+        }
+        io.wr32(userd + chan::USERD_GP_PUT, plan.gp_put);
         io.finish();
         core::sync::atomic::fence(Ordering::SeqCst);
-        hw.regs.wr32(DOORBELL, hw.token);
+        hw.regs.wr32(DOORBELL, token);
         EXECS.fetch_add(1, Ordering::Relaxed);
+        if kind == ChanKind::Ce {
+            CE_EXECS.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(plan.seq)
     })
 }
 
-/// Whether the fence of `seq` has completed. A dead device reports everything done, so waiters drain and the next `EXEC` says EIO.
-pub fn fence_done(seq: u64) -> bool {
+/// Whether the fence of `seq` on the channel of `kind` has completed. A dead device reports everything done, so waiters drain and the
+/// next `EXEC` says EIO.
+pub fn fence_done(kind: ChanKind, seq: u64) -> bool {
     let mut g = HW.lock();
     let Some(hw) = g.as_mut() else { return true };
-    hw.poll();
-    hw.dead || hw.queue.is_done(seq)
+    hw.poll(kind);
+    hw.dead || hw.chans[kind as usize].as_ref().is_none_or(|c| c.queue.is_done(seq))
 }
 
-/// Wait for the work in flight to finish (the device is closing). `false`: it did not, and what user space had bound stays leaked.
+/// Wait for the work in flight on every channel to finish (the device is closing). `false`: it did not, and what user space had bound
+/// stays leaked.
 pub fn quiesce() -> bool {
     let t0 = crate::cpu::tsc::read();
     loop {
         {
             let mut g = HW.lock();
             let Some(hw) = g.as_mut() else { return true };
-            hw.poll();
-            if hw.queue.in_flight() == 0 {
+            hw.poll(ChanKind::Gr);
+            hw.poll(ChanKind::Ce);
+            if hw.chans.iter().flatten().all(|c| c.queue.in_flight() == 0) {
                 return !hw.dead;
             }
             if crate::cpu::tsc::read().wrapping_sub(t0) > super::copy::ms_ticks(QUIESCE_MS) {
@@ -495,7 +597,7 @@ pub fn render_kdebug() -> String {
     match STATE.load(Ordering::Relaxed) {
         0 => String::new(),
         s => alloc::format!(
-            "gpu_uapi: state={} spans_bar1={} spans_pramin={} binds={} unbinds={} pages_bound={} tables_written={} tlb_flushes={} tlb_us_max={} execs={} again={} fences={} dead={}",
+            "gpu_uapi: state={} spans_bar1={} spans_pramin={} binds={} unbinds={} pages_bound={} tables_written={} tlb_flushes={} tlb_us_max={} execs={} ce_execs={} again={} fences={} dead={}",
             if s == 1 { "ok" } else { "failed" },
             SPANS_BAR1.load(Ordering::Relaxed),
             SPANS_PRAMIN.load(Ordering::Relaxed),
@@ -506,6 +608,7 @@ pub fn render_kdebug() -> String {
             TLB_FLUSHES.load(Ordering::Relaxed),
             TLB_US_MAX.load(Ordering::Relaxed),
             EXECS.load(Ordering::Relaxed),
+            CE_EXECS.load(Ordering::Relaxed),
             AGAIN.load(Ordering::Relaxed),
             FENCES.load(Ordering::Relaxed),
             DEAD.load(Ordering::Relaxed)

@@ -145,7 +145,8 @@ pub struct Plan {
     pub seq: u64,
     /// What the fence push writes into the semaphore: `seq` truncated to 32 bits.
     pub payload: u32,
-    /// The GPFIFO entries to write: (ring index, entry), the push segments in order and the fence entry last.
+    /// The GPFIFO entries to write: (ring index, entry), the prelude (if the queue has one), the push segments in order and the fence
+    /// entry last.
     pub entries: Vec<(u32, u64)>,
     /// Which of the kernel's fence-push slots holds this submission's fence push (`slot * slot_bytes` from the slot area).
     pub fence_slot: u32,
@@ -169,6 +170,9 @@ pub struct Queue {
     fence_bytes: u32,
     slot_bytes: u32,
     slot_va: u64,
+    /// A kernel push run before the caller's pushes (0 = none), in the same slot after the fence push: it binds the engine's class
+    /// to its subchannel, which the copy-engine contexts of NVK never do themselves.
+    prelude_bytes: u32,
     /// GPFIFO entries written so far (free running; the ring index is `put % entries`).
     put: u64,
     /// Entries the GPU is known to have consumed: those before the last completed submission.
@@ -183,10 +187,11 @@ pub struct Queue {
 impl Queue {
     /// A ring of `entries` GPFIFO entries (a power of two) whose write position is already `put` (`GP_PUT`: the boot's own
     /// pushes were all waited for, so the GPU has consumed them), with `fence_slots` slots of `slot_bytes` at VA `slot_va` for
-    /// the fence pushes, each `fence_bytes` long.
-    pub fn new(entries: u32, put: u32, fence_slots: u32, slot_va: u64, slot_bytes: u32, fence_bytes: u32) -> Self {
-        assert!(entries.is_power_of_two() && put < entries && fence_slots >= 1 && fence_bytes <= slot_bytes && slot_bytes % 4 == 0);
-        Queue { entries, fence_slots, fence_bytes, slot_bytes, slot_va, put: put as u64, consumed: put as u64, next_seq: 1, done: 0, inflight: VecDeque::new() }
+    /// the fence pushes, each `fence_bytes` long, and (when `prelude_bytes` > 0) a prelude push behind each, also in the slot.
+    pub fn new(entries: u32, put: u32, fence_slots: u32, slot_va: u64, slot_bytes: u32, fence_bytes: u32, prelude_bytes: u32) -> Self {
+        assert!(entries.is_power_of_two() && put < entries && fence_slots >= 1 && fence_bytes + prelude_bytes <= slot_bytes && slot_bytes % 4 == 0);
+        assert!(fence_bytes % 4 == 0 && prelude_bytes % 4 == 0);
+        Queue { entries, fence_slots, fence_bytes, slot_bytes, slot_va, prelude_bytes, put: put as u64, consumed: put as u64, next_seq: 1, done: 0, inflight: VecDeque::new() }
     }
 
     /// Submissions queued and not yet seen complete.
@@ -218,7 +223,7 @@ impl Queue {
     /// the fence slots are all in use (nothing changes: the caller retries after a fence completes); the pushes are the model's
     /// validated ones. The caller writes the fence push into its slot, the entries, `GP_PUT`, and rings the doorbell.
     pub fn plan(&mut self, pushes: &[Push]) -> Result<Plan, Error> {
-        let need = pushes.len() as u64 + 1;
+        let need = pushes.len() as u64 + 1 + (self.prelude_bytes > 0) as u64;
         if need > self.entries as u64 - 1 {
             return Err(Error::Inval);
         }
@@ -228,6 +233,11 @@ impl Queue {
         let seq = self.next_seq;
         let slot = (seq % self.fence_slots as u64) as u32;
         let mut entries = Vec::with_capacity(need as usize);
+        if self.prelude_bytes > 0 {
+            // behind the fence push in the same slot; it must run before anything of the caller's, and the previous submission's fence
+            // entry (SYNC_WAIT) already made everything before it finish
+            entries.push(gp_entry(self.slot_va + slot as u64 * self.slot_bytes as u64 + self.fence_bytes as u64, self.prelude_bytes));
+        }
         for p in pushes {
             let mut e = gp_entry(p.va, p.bytes);
             if p.flags & PUSH_NO_PREFETCH != 0 {
@@ -278,7 +288,7 @@ mod tests {
     const SLOT_VA: u64 = 0x3_8001_0000;
 
     fn queue(entries: u32, slots: u32) -> Queue {
-        Queue::new(entries, 0, slots, SLOT_VA, 64, crate::gr::FENCE_PUSH_BYTES)
+        Queue::new(entries, 0, slots, SLOT_VA, 64, crate::gr::FENCE_PUSH_BYTES, 0)
     }
 
     fn push(va: u64, bytes: u32) -> Push {
@@ -304,6 +314,33 @@ mod tests {
     }
 
     #[test]
+    fn a_prelude_runs_first_from_the_slot_behind_the_fence_push() {
+        let mut q = Queue::new(16, 0, 4, SLOT_VA, 64, 36, 8);
+        let p = q.plan(&[push(0x1000_0000, 64)]).unwrap();
+        // prelude, the push, the fence
+        assert_eq!(p.entries.len(), 3);
+        assert_eq!(p.entries[0], (0, gp_entry(SLOT_VA + 64 + 36, 8)));
+        assert_eq!(p.entries[1], (1, gp_entry(0x1000_0000, 64)));
+        assert_eq!(p.entries[2], (2, gp_entry(SLOT_VA + 64, 36) | GP_ENTRY_SYNC_WAIT));
+        assert_eq!(p.gp_put, 3);
+        // one more entry per submission: a 6-segment EXEC (6 + prelude + fence = 8) does not fit a ring of 8 (7 usable)
+        let mut q = Queue::new(8, 0, 4, SLOT_VA, 64, 36, 8);
+        let six: Vec<Push> = (0..6).map(|i| push(0x1000 * (i + 1), 16)).collect();
+        assert_eq!(q.plan(&six), Err(Error::Inval));
+        q.plan(&six[..5]).unwrap();
+        // and the space it took comes back with the fence
+        assert_eq!(q.free_entries(), 0);
+        assert!(q.observe(1));
+        assert_eq!(q.free_entries(), 7);
+    }
+
+    #[test]
+    #[should_panic]
+    fn a_prelude_that_does_not_fit_its_slot_is_a_bug() {
+        Queue::new(16, 0, 4, SLOT_VA, 64, 36, 32);
+    }
+
+    #[test]
     fn no_prefetch_sets_the_sync_wait_bit_of_that_entry_only() {
         let mut q = queue(16, 4);
         let p = q.plan(&[Push { va: 0x1000, bytes: 16, flags: PUSH_NO_PREFETCH }, push(0x2000, 16)]).unwrap();
@@ -323,7 +360,7 @@ mod tests {
 
     #[test]
     fn the_ring_wraps_and_indexes_follow_put() {
-        let mut q = Queue::new(8, 6, 4, SLOT_VA, 64, crate::gr::FENCE_PUSH_BYTES);
+        let mut q = Queue::new(8, 6, 4, SLOT_VA, 64, crate::gr::FENCE_PUSH_BYTES, 0);
         let p = q.plan(&[push(0x1000, 16), push(0x2000, 16)]).unwrap();
         // 6, 7, then back to 0
         assert_eq!(p.entries.iter().map(|e| e.0).collect::<Vec<_>>(), vec![6, 7, 0]);
