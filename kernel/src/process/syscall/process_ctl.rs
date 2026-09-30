@@ -225,6 +225,47 @@ fn sleep_until(expiry: u64, syscall_nr: u64, rem: u64, relative: bool) -> Syscal
     unsafe { crate::process::trapframe::jump_to_user(next_tf) }
 }
 
+/// prctl(157): only `PR_SET_NAME` (15) and `PR_GET_NAME` (16), the thread's `comm` (Rust's `thread::Builder::name`, tokio's worker
+/// threads). Any other option is `EINVAL`.
+pub(super) fn sys_prctl(option: i32, arg2: u64) -> SyscallResult {
+    const PR_SET_NAME: i32 = 15;
+    const PR_GET_NAME: i32 = 16;
+    match option {
+        PR_SET_NAME => {
+            if validate_user_buffer(arg2, 1).is_err() {
+                return errno::EFAULT;
+            }
+            // Up to 15 bytes, stopping at NUL, read one at a time (the name may end right at an unmapped page).
+            let mut name = [0u8; 16];
+            let mut n = 0;
+            while n < 15 {
+                if validate_user_buffer(arg2 + n as u64, 1).is_err() {
+                    return errno::EFAULT;
+                }
+                let b = unsafe { *((arg2 + n as u64) as *const u8) };
+                if b == 0 { break; }
+                name[n] = b;
+                n += 1;
+            }
+            with_scheduler(|s| {
+                if let Some(p) = s.running_mut() {
+                    p.name = name;
+                }
+                0
+            })
+        }
+        PR_GET_NAME => {
+            if validate_user_buffer(arg2, 16).is_err() {
+                return errno::EFAULT;
+            }
+            let name = crate::process::irq_guard::SchedGuard::lock().running_ref().map(|p| p.name).unwrap_or([0; 16]);
+            unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), arg2 as *mut u8, 16); }
+            0
+        }
+        _ => errno::EINVAL,
+    }
+}
+
 /// getpid(39): the thread-group id (`Process::tgid`): the same in every thread of a process, and the pid `kill`/`waitpid` and a child's
 /// `getppid` use. The per-thread id is `gettid`.
 pub(super) fn sys_getpid() -> SyscallResult {
@@ -394,7 +435,6 @@ pub(super) fn sys_exit_group(status: i32) -> SyscallResult {
 /// intermittently died after 1-2 characters, traced back to exactly this.
 pub(crate) fn cancel_all_waiters(pid: usize) {
     super::poll::poll_cancel_waiter(pid);
-    super::poll::clear_epoll_fd_all(pid);
     super::sync::futex_cancel_waiter(pid);
     // A socket waiter left behind would later wake whatever process
     // inherits this pid number.

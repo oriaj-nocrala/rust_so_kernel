@@ -327,7 +327,9 @@ impl<F> SocketTable<F> {
             // would be no address for anyone to connect to.
             return Err(SockError::Inval);
         }
-        let backlog = (backlog.max(0) as usize).clamp(1, SOMAXCONN);
+        // A negative backlog means "the maximum" (Linux reads it as unsigned and clamps to somaxconn; Rust's std passes -1),
+        // not 0: the old `max(0)` gave such a listener room for a single pending connection.
+        let backlog = if backlog < 0 { SOMAXCONN } else { (backlog as usize).clamp(1, SOMAXCONN) };
         match &mut s.listener {
             Some(l) => l.backlog = backlog,
             None => s.listener = Some(Listener { backlog, pending: Vec::new() }),
@@ -922,6 +924,21 @@ mod tests {
         // Accepting drains one slot and lets the next connect through.
         t.accept(s).unwrap();
         assert!(t.connect(c2, &addr("/tmp/s")).is_ok());
+    }
+
+    #[test]
+    fn a_negative_backlog_is_the_maximum() {
+        // Rust's std calls listen(fd, -1); tokio's UnixListener then refused every connect after the first.
+        let mut t = T::new();
+        let s = t.create(SockType::Stream).unwrap();
+        t.bind(s, addr("/tmp/s")).unwrap();
+        t.listen(s, -1).unwrap();
+        for _ in 0..crate::socket::SOMAXCONN {
+            let c = t.create(SockType::Stream).unwrap();
+            assert!(t.connect(c, &addr("/tmp/s")).is_ok());
+        }
+        let c = t.create(SockType::Stream).unwrap();
+        assert_eq!(t.connect(c, &addr("/tmp/s")).err(), Some(SockError::Again));
     }
 
     #[test]

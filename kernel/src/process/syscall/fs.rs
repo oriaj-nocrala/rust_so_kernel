@@ -150,6 +150,7 @@ pub(super) fn sys_read(fd: i32, buf: usize, count: usize) -> SyscallResult {
                 };
                 unsafe { crate::process::trapframe::jump_to_user(next_tf) }
             }
+            Err(crate::process::file::FileError::InvalidInput) => errno::EINVAL,
             Err(_) => errno::EIO,
         }
     }
@@ -297,6 +298,7 @@ pub(super) fn sys_write(fd: i32, buf: usize, count: usize) -> SyscallResult {
         Err(crate::process::file::FileError::Again) => errno::EAGAIN,
         Err(crate::process::file::FileError::BrokenPipe) => errno::EPIPE,
         Err(crate::process::file::FileError::NoSpace) => errno::ENOSPC,
+        Err(crate::process::file::FileError::InvalidInput) => errno::EINVAL,
         Err(crate::process::file::FileError::WouldBlock) => {
             // Same as `sys_read`'s WouldBlock arm: `jump_to_user` never
             // returns, so drop the fd-table `Arc` before it or the table
@@ -942,6 +944,27 @@ pub(super) fn sys_pipe(pipefd_ptr: u64) -> SyscallResult {
 }
 
 /// pipe2(293): `pipe` with `O_CLOEXEC` and `O_NONBLOCK` for both ends.
+/// eventfd2(290) / eventfd(284, no flags): a counter fd, `EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC` (`process::eventfd`).
+pub(super) fn sys_eventfd(initval: u32, flags: i32) -> SyscallResult {
+    use crate::process::eventfd::{EFD_CLOEXEC, EFD_NONBLOCK, EFD_SEMAPHORE};
+    if flags & !(EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC) != 0 {
+        return errno::EINVAL;
+    }
+    let handle = crate::process::eventfd::create(initval, flags);
+    with_current_process(|proc| {
+        let mut files = proc.files.lock();
+        match files.allocate(alloc::boxed::Box::new(handle)) {
+            Ok(fd) => {
+                if flags & EFD_CLOEXEC != 0 {
+                    let _ = files.set_cloexec(fd, true);
+                }
+                fd as SyscallResult
+            }
+            Err(_) => errno::EMFILE,
+        }
+    })
+}
+
 pub(super) fn sys_pipe2(pipefd_ptr: u64, flags: i32) -> SyscallResult {
     if flags & !(O_CLOEXEC | O_NONBLOCK as i32) != 0 {
         return errno::EINVAL;

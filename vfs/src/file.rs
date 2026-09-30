@@ -32,6 +32,9 @@ pub enum FileError {
     /// distinct from `IOError` so `sys_write` can report the real reason a
     /// write to a disk-backed filesystem failed.
     NoSpace,
+    /// The request itself is malformed (a wrong buffer size, a value out of range): `EINVAL`. Unlike `InvalidArgument`, which
+    /// the read/write paths report as `EIO` (a ptmx's locked slave relies on that), this one is `EINVAL`.
+    InvalidInput,
     /// The operation would block (empty pipe on read, full pipe on write).
     /// `sys_read`/`sys_write` catch this, drop the fd-table lock, and
     /// perform the actual block_current/jump_to_trapframe themselves — see
@@ -187,6 +190,16 @@ pub trait FileHandle: Send {
     /// Which end of which pipe this handle is, if any — `pty_end()`'s technique again: `poll` snapshots an fd's source into its
     /// waiter, and a wakeup cannot reach another process's fd table.
     fn pipe_end(&self) -> Option<PipeEnd> {
+        None
+    }
+
+    /// An eventfd's registry number (`process::eventfd`), for the same reason as `pipe_end`: `poll` snapshots hold only numbers.
+    fn eventfd_id(&self) -> Option<u64> {
+        None
+    }
+
+    /// The epoll instance behind this descriptor (`process::syscall::poll`); every `dup` of an epoll fd names the same one.
+    fn epoll_instance(&self) -> Option<usize> {
         None
     }
 

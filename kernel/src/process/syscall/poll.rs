@@ -2,7 +2,6 @@
 //
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
-use crate::sync::Mutex;
 use crate::process::TrapFrame;
 use super::{errno, SyscallResult, validate_user_buffer, current_tf_ptr};
 use usock::SocketId;
@@ -27,6 +26,8 @@ enum PollSource {
     Pty { index: usize, master: bool },
     /// One end of a pipe (`process::pipe`), by registry number.
     Pipe { id: u64, write: bool },
+    /// An eventfd (`process::eventfd`), by registry number.
+    Event { id: u64 },
 }
 
 /// A process's fd → `PollSource` mapping, snapshotted at the moment it blocks.
@@ -82,6 +83,8 @@ fn snapshot_sockets() -> SocketMap {
                 PollSource::Pty { index: end.index, master: end.master }
             } else if let Some(end) = h.pipe_end() {
                 PollSource::Pipe { id: end.id, write: end.write }
+            } else if let Some(id) = h.eventfd_id() {
+                PollSource::Event { id }
             } else {
                 PollSource::Other
             };
@@ -100,7 +103,7 @@ fn snapshot_sockets() -> SocketMap {
 //   - `fd_check_ready(socks, fd, events)` checks FD readiness without consuming data.
 //   - `POLL_WAITERS` (pid → waiter) stores a blocked process's buffer info for wakeup delivery.
 //   - `EPOLL_INSTANCES` holds per-epoll-fd watch lists.
-//   - `EPOLL_FD_MAP` (pid → [fd]) maps epoll FDs to EpollInstanceIds.
+//   - an epoll fd's `EpollHandle` names its EpollInstanceId (`FileHandle::epoll_instance`).
 //   Both are keyed by pid with no bound. They were `[_; 32]` arrays that
 //   silently skipped pid >= 32: a `poll()` with no timeout from such a pid
 //   blocked without registering and was never woken, and `epoll_*` said
@@ -221,16 +224,12 @@ impl EpollInstanceTable {
 
 static EPOLL_INSTANCES: crate::sync::IrqLock<EpollInstanceTable> = crate::sync::IrqLock::new(EpollInstanceTable::new());
 
-/// pid×fd → EpollInstanceId side table (0 = not an epoll fd).
-///
-/// Sparse, keyed by (pid, fd): a per-pid `[EpollInstanceId; 256]` made each B-tree node 22 KiB, which insertion moves by value
-/// (at opt-level 0, several copies deep) and overflowed the kernel stack.
-static EPOLL_FD_MAP: Mutex<BTreeMap<(usize, usize), EpollInstanceId>> =
-    Mutex::new(BTreeMap::new());
-
-/// FileHandle marker stored in the FD table for epoll FDs.
+/// FileHandle stored in the FD table for epoll FDs. Every `dup` (tokio's `Registry::try_clone`, `fcntl(F_DUPFD_CLOEXEC)`) is
+/// another handle on the same instance; the instance goes when the last one is dropped (`refs` counts them). The instance
+/// is found through the handle (`FileHandle::epoll_instance`), so any fd number that refers to it works.
 struct EpollHandle {
     epoll_id: EpollInstanceId,
+    refs: alloc::sync::Arc<()>,
 }
 
 impl crate::process::file::FileHandle for EpollHandle {
@@ -240,30 +239,34 @@ impl crate::process::file::FileHandle for EpollHandle {
     fn write(&mut self, _buf: &[u8]) -> crate::process::file::FileResult<usize> {
         Err(crate::process::file::FileError::NotSupported)
     }
-    fn close(&mut self) -> crate::process::file::FileResult<()> {
-        EPOLL_INSTANCES.lock().free(self.epoll_id);
-        Ok(())
-    }
     fn name(&self) -> &str { "epoll" }
-}
-
-// ── EPOLL_FD_MAP helpers ───────────────────────────────────────────────────
-
-fn get_epoll_fd(pid: usize, fd: usize) -> EpollInstanceId {
-    EPOLL_FD_MAP.lock().get(&(pid, fd)).copied().unwrap_or(0)
-}
-
-fn set_epoll_fd(pid: usize, fd: usize, epoll_id: EpollInstanceId) {
-    let mut map = EPOLL_FD_MAP.lock();
-    if epoll_id != 0 {
-        map.insert((pid, fd), epoll_id);
-    } else {
-        map.remove(&(pid, fd));
+    fn dup(&self) -> Option<alloc::boxed::Box<dyn crate::process::file::FileHandle>> {
+        Some(alloc::boxed::Box::new(EpollHandle { epoll_id: self.epoll_id, refs: self.refs.clone() }))
+    }
+    fn epoll_instance(&self) -> Option<usize> {
+        Some(self.epoll_id)
     }
 }
 
-pub(super) fn clear_epoll_fd_all(pid: usize) {
-    EPOLL_FD_MAP.lock().retain(|&(p, _), _| p != pid);
+impl Drop for EpollHandle {
+    fn drop(&mut self) {
+        if alloc::sync::Arc::strong_count(&self.refs) == 1 {
+            EPOLL_INSTANCES.lock().free(self.epoll_id);
+        }
+    }
+}
+
+/// The epoll instance descriptor `fd` of the running process refers to; 0 if it is not an epoll fd. Interrupts off.
+fn epoll_of_fd(fd: usize) -> EpollInstanceId {
+    let files = {
+        let sched = crate::process::scheduler::local_scheduler();
+        match sched.running_ref() {
+            Some(proc) => proc.files.clone(),
+            None => return 0,
+        }
+    };
+    let guard = files.lock();
+    guard.get(fd).ok().and_then(|h| h.epoll_instance()).unwrap_or(0)
 }
 
 // ── Poll waiter ────────────────────────────────────────────────────────────
@@ -350,6 +353,14 @@ fn fd_check_ready(socks: &SocketMap, fd: i32, events: i16) -> i16 {
         if events & POLLOUT != 0 && mask.writable { rev |= POLLOUT; }
         if mask.hup { rev |= POLLHUP; }
         if mask.err { rev |= POLLERR; }
+        return rev;
+    }
+
+    if let PollSource::Event { id } = source {
+        let Some((readable, writable)) = crate::process::eventfd::poll_mask(id) else { return POLLNVAL };
+        let mut rev: i16 = 0;
+        if events & POLLIN != 0 && readable { rev |= POLLIN; }
+        if events & POLLOUT != 0 && writable { rev |= POLLOUT; }
         return rev;
     }
 
@@ -601,6 +612,13 @@ pub(crate) fn poll_wakeup_for_pipe(id: u64) {
     // the keyboard ISR. The socket wakeup does the same (`poll_wakeup_for_socket`).
     x86_64::instructions::interrupts::without_interrupts(|| {
         poll_wake_where(|w, fd| matches!(waiter_source(w, fd), PollSource::Pipe { id: i, .. } if i == id))
+    });
+}
+
+/// `poll_wakeup_for_pipe` for an eventfd whose counter changed (a write raised it, a read lowered it).
+pub(crate) fn poll_wakeup_for_eventfd(id: u64) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        poll_wake_where(|w, fd| matches!(waiter_source(w, fd), PollSource::Event { id: i } if i == id))
     });
 }
 
@@ -893,13 +911,12 @@ fn epoll_create_impl(cloexec: bool) -> SyscallResult {
         }
     };
 
-    let handle = alloc::boxed::Box::new(EpollHandle { epoll_id });
+    let handle = alloc::boxed::Box::new(EpollHandle { epoll_id, refs: alloc::sync::Arc::new(()) });
 
     let _irq = crate::process::irq_guard::InterruptGuard::new();
     let mut sched = crate::process::scheduler::local_scheduler();
     match sched.running_mut() {
         Some(proc) => {
-            let pid = proc.pid.0;
             // See sys_socket's comment: the lock guard must not outlive
             // this `let`, since the arms below drop `sched`.
             let alloc_result = proc.files.lock().allocate(handle);
@@ -909,7 +926,6 @@ fn epoll_create_impl(cloexec: bool) -> SyscallResult {
                         let _ = proc.files.lock().set_cloexec(fd, true);
                     }
                     drop(sched);
-                    set_epoll_fd(pid, fd, epoll_id);
                     fd as i64
                 }
                 Err(_) => {
@@ -931,10 +947,9 @@ fn epoll_create_impl(cloexec: bool) -> SyscallResult {
 
 /// epoll_ctl(233) — modify an epoll instance's interest list.
 pub(super) fn sys_epoll_ctl(epfd: i32, op: i32, fd: i32, event_ptr: u64) -> SyscallResult {
-    let pid = crate::process::scheduler::current_pid().unwrap_or(0);
     if epfd < 0 || (epfd as usize) >= MAX_FILES_PER_PROC { return errno::EBADF; }
 
-    let epoll_id = get_epoll_fd(pid, epfd as usize);
+    let epoll_id = epoll_of_fd(epfd as usize);
     if epoll_id == 0 { return errno::EBADF; }
 
     // Read EpollEvent from user memory (not needed for EPOLL_CTL_DEL)
@@ -1029,7 +1044,7 @@ pub(super) fn sys_epoll_wait(epfd: i32, events_ptr: u64, maxevents: i32, timeout
     let pid = crate::process::scheduler::current_pid().unwrap_or(0);
     if epfd < 0 || (epfd as usize) >= MAX_FILES_PER_PROC { return errno::EBADF; }
 
-    let epoll_id = get_epoll_fd(pid, epfd as usize);
+    let epoll_id = epoll_of_fd(epfd as usize);
     if epoll_id == 0 { return errno::EBADF; }
 
     // `irq` is deliberately never dropped on the slow (blocking) path below

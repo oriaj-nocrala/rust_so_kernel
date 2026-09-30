@@ -100,6 +100,8 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "nanosleep_rem_test",
     "epoll_scale_test",
     "vfork_test",
+    "eventfd_test",
+    "unix_nb_test",
     "pipe_poll_test",
     "fdlimit_test",
     "argv_test",

@@ -76,6 +76,14 @@ int main(void) {
     snprintf(want, sizeof want, "/proc/%d", main_pid);
     CHECK(strcmp(w_self, want) == 0, "/proc/self in the thread is '%s', wanted '%s'", w_self, want);
 
+    printf("prctl(PR_SET_NAME / PR_GET_NAME) names the thread\n");
+    char nm[16] = {0};
+    CHECK(sc(157, 15, (long)"tgid-main", 0) == 0 && sc(157, 16, (long)nm, 0) == 0 && strcmp(nm, "tgid-main") == 0, "name read back '%s'", nm);
+    sc(157, 15, (long)"a-name-longer-than-fifteen", 0);
+    sc(157, 16, (long)nm, 0);
+    CHECK(strcmp(nm, "a-name-longer-t") == 0, "a long name is cut to 15 bytes: '%s'", nm);
+    CHECK(sc(157, 9999, 0, 0) == -22, "an unknown option is EINVAL");
+
     printf("uids: a single-user system, everyone is root\n");
     CHECK(sc(102, 0, 0, 0) == 0 && sc(104, 0, 0, 0) == 0 && sc(107, 0, 0, 0) == 0 && sc(108, 0, 0, 0) == 0, "getuid/getgid/geteuid/getegid");
 

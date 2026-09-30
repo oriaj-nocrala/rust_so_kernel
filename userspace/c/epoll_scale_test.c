@@ -133,6 +133,25 @@ int main(void) {
     CHECK(epoll_create1(0x1) == -1 && errno == EINVAL, "an unknown flag gave errno %d", errno);
     CHECK(wrap(sc(213, 0, 0, 0, 0)) == -1 && errno == EINVAL, "epoll_create(0) gave errno %d", errno);
 
+    printf("an epoll fd can be duplicated (tokio's Registry::try_clone)\n");
+    int dp = epoll_create1(0);
+    int d1 = dup(dp);
+    int d2 = (int)sc(292, dp, 100, 0x80000, 0);                 // dup3(dp, 100, O_CLOEXEC)
+    int d3 = fcntl(dp, 1030, 50);                               // F_DUPFD_CLOEXEC, at least fd 50
+    CHECK(d1 >= 0 && d2 == 100 && d3 >= 50, "dup gave %d, dup3 %d, F_DUPFD_CLOEXEC %d (errno %d)", d1, d2, d3, errno);
+    ev.events = EPOLLIN; ev.data_u64 = 55;
+    CHECK(epoll_ctl(d1, EPOLL_CTL_ADD, rd[40], &ev) == 0, "ctl through the dup");
+    write(wr[40], "d", 1);
+    CHECK(epoll_wait(dp, evs, 4, 0) == 1 && evs[0].data_u64 == 55, "wait on the original sees a watch added through the dup");
+    CHECK(epoll_wait(d3, evs, 4, 0) == 1, "wait on another dup sees it too");
+    close(dp); close(d1);
+    CHECK(epoll_wait(d2, evs, 4, 0) == 1 && evs[0].data_u64 == 55, "the instance outlives the closed fds while one dup is left");
+    close(d2); close(d3);
+    int reuse = open("/dev/null", O_RDONLY);                    // takes the lowest free fd, a number an epoll fd just had
+    CHECK(epoll_wait(reuse, evs, 4, 0) == -1 && errno == EBADF, "a reused fd number is not an epoll fd (errno %d)", errno);
+    close(reuse);
+    read(rd[40], &c, 1);
+
     printf("EPOLLONESHOT: one report, then silent until MOD\n");
     int os = epoll_create1(0);
     ev.events = EPOLLIN | EPOLLONESHOT; ev.data_u64 = 7;

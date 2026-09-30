@@ -1,0 +1,14 @@
+[package]
+name = "tkprobe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io-util", "macros", "sync", "process", "signal", "fs"] }
+
+[profile.release]
+opt-level = 2
+strip = true
+panic = "unwind"
+
+[workspace]

@@ -43,7 +43,7 @@ mod misc;
 pub(crate) use fs::{send_to_group, stdin_wakeup};
 pub(crate) use process_ctl::cancel_all_waiters;
 pub(crate) use sync::futex_take_waiters;
-pub(crate) use poll::{poll_wakeup_for_fd0, poll_wakeup_for_input, poll_clear_on_timeout, poll_wakeup_for_socket, poll_wakeup_for_pty, poll_wakeup_for_pipe};
+pub(crate) use poll::{poll_wakeup_for_fd0, poll_wakeup_for_input, poll_clear_on_timeout, poll_wakeup_for_socket, poll_wakeup_for_pty, poll_wakeup_for_pipe, poll_wakeup_for_eventfd};
 
 use core::arch::global_asm;
 use super::TrapFrame;
@@ -318,6 +318,9 @@ pub enum SyscallNumber {
     Getrandom = 318,
     EpollCreate = 213,
     EpollCreate1 = 291,
+    Prctl = 157,
+    Eventfd = 284,
+    Eventfd2 = 290,
     EpollPwait = 281,
     GetUid = 102,
     GetGid = 104,
@@ -427,6 +430,9 @@ impl SyscallNumber {
             318 => Some(Self::Getrandom),
             213 => Some(Self::EpollCreate),
             291 => Some(Self::EpollCreate1),
+            157 => Some(Self::Prctl),
+            284 => Some(Self::Eventfd),
+            290 => Some(Self::Eventfd2),
             281 => Some(Self::EpollPwait),
             102 => Some(Self::GetUid),
             104 => Some(Self::GetGid),
@@ -582,6 +588,19 @@ pub(crate) fn validate_user_buffer(addr: u64, size: usize) -> Result<(), i64> {
 // SYSCALL DISPATCH
 // ============================================================================
 
+/// One serial line the first time each unknown syscall number is called (`ENOSYS: syscall N`): the quickest way to learn what a
+/// new Linux program needs. A bitmap over the numbers below 512; larger ones are not tracked.
+fn note_unknown_syscall(nr: u64) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static SEEN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    if nr < 512 {
+        let (word, bit) = ((nr / 64) as usize, nr % 64);
+        if SEEN[word].fetch_or(1 << bit, Ordering::Relaxed) & (1 << bit) == 0 {
+            crate::serial_println!("ENOSYS: unimplemented syscall {} (pid {})", nr, crate::process::scheduler::current_pid().unwrap_or(0));
+        }
+    }
+}
+
 pub fn syscall_handler(
     syscall_num: u64,
     arg1: u64,
@@ -605,7 +624,10 @@ pub fn syscall_handler(
 
     let syscall = match SyscallNumber::from_u64(syscall_num) {
         Some(s) => s,
-        None => return errno::ENOSYS,
+        None => {
+            note_unknown_syscall(syscall_num);
+            return errno::ENOSYS;
+        }
     };
 
     match syscall {
@@ -690,6 +712,9 @@ pub fn syscall_handler(
         SyscallNumber::SetTidAddress => process_ctl::sys_set_tid_address(arg1),
         SyscallNumber::EpollCreate => poll::sys_epoll_create(arg1 as i32),
         SyscallNumber::EpollCreate1 => poll::sys_epoll_create1(arg1 as i32),
+        SyscallNumber::Prctl => process_ctl::sys_prctl(arg1 as i32, arg2),
+        SyscallNumber::Eventfd => fs::sys_eventfd(arg1 as u32, 0),
+        SyscallNumber::Eventfd2 => fs::sys_eventfd(arg1 as u32, arg2 as i32),
         SyscallNumber::EpollPwait => poll::sys_epoll_pwait(arg1 as i32, arg2, arg3 as i32, arg4 as i32, arg5, arg6),
         // A single-user system: everyone is root (uid = gid = 0, which is also what `si_uid` reports).
         SyscallNumber::GetUid | SyscallNumber::GetGid | SyscallNumber::GetEuid | SyscallNumber::GetEgid => 0,

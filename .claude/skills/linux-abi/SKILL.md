@@ -39,6 +39,11 @@ State and the list of what is still missing: `docs/reference/syscalls.md` (rows,
 
 `process/syscall/{process_ctl,signal,sync,fs,poll}.rs` (clone/exit_group/exec, rt_sigaction/sigaltstack, futex, open/fcntl/pipe2/dup3/mprotect, poll/epoll), `process/signal.rs` (frame, `deliver_fault`), `process/scheduler.rs` (`kill_current`, `kill_thread_group`), `process/file.rs` (fd table), `process/pipe.rs` (`PIPES` registry, `poll_mask`), `memory/{vma,address_space,elf_loader}.rs` (split/merge, mprotect, static-pie), `init/devices.rs` (fault entries), `mlibc-port/constanos-sysdeps/generic/{generic.cpp,thread_entry.S}` (`__constanos_clone`, restorers, sigaction sysdep).
 
+## Real programs already run
+
+- **tokio** (`probes/tokio`, `scripts/run-tokio-probe.sh`): current_thread and multi_thread runtimes, timers, mpsc/oneshot, AF_UNIX echo, `tokio::fs`, `spawn_blocking`, `tokio::process`, signals. It found `eventfd2`, a non-dupable epoll fd (tokio `dup`s its epoll fd), `listen(fd, -1)` (Rust's std passes it: it means the maximum) and `prctl(PR_SET_NAME)`. Method that worked: write the program in stages that print a marker each, log each first-seen unknown syscall (`ENOSYS: unimplemented syscall N` on serial), and add a C test per gap.
+- Not implemented and tolerated by tokio: `pidfd_open` (434), tokio's process driver falls back to SIGCHLD.
+
 ## Still missing (check `rust_std_gaps` first)
 
 `EPOLLET` is level-triggered on purpose (see `syscalls.md`), `waitpid(WCONTINUED)`, `CLONE_VM` without `CLONE_THREAD` shares nothing (COW copy; a `vfork` child's writes are invisible to the parent), `setuid` and friends (there are no uids).
