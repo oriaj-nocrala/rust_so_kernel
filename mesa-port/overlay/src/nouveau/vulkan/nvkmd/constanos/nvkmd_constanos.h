@@ -18,6 +18,10 @@
 struct nvkmd_constanos_pdev {
    struct nvkmd_pdev base;
 
+   /* What the display scans out (read once, when the device was described); valid == false without a display driver. */
+   bool scanout_valid;
+   struct nvg_scanout_info scanout;
+
    struct vk_sync_type sync_type;
    const struct vk_sync_type *sync_types[2];
 };
@@ -34,6 +38,9 @@ struct nvkmd_constanos_dev {
 
    /* The session: closing it releases everything the process holds on the GPU. */
    int fd;
+
+   /* /dev/vblank, opened by the first wait for a flip (-1 until then). */
+   int vblank_fd;
 
    simple_mtx_t heap_mutex;
    struct util_vma_heap heap;
@@ -116,5 +123,9 @@ VkResult nvkmd_constanos_copy_sync_payloads(struct vk_device *device,
 int nvk_constanos_scanout_info(VkDevice device, struct nvg_scanout_info *out);
 int nvk_constanos_present(VkDevice device, VkDeviceMemory memory, uint64_t offset);
 int nvk_constanos_flip_pending(VkDevice device);
+/* Sleeps (poll on /dev/vblank) until the last present has taken effect: 0, or -ETIMEDOUT after timeout_ms. */
+int nvk_constanos_wait_flip(VkDevice device, int timeout_ms);
+/* The layout the display scans out, if there is a display driver and it scans out XRGB8888 (what the WSI can present to). */
+bool nvkmd_constanos_pdev_scanout(struct nvkmd_pdev *pdev, struct nvg_scanout_info *out);
 
 #endif /* NVKMD_CONSTANOS_H */

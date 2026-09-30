@@ -28,6 +28,38 @@ Decisión (2026-09-30, usuario + análisis): **WSI estándar de Vulkan como cimi
 - Arreglos de paso: `wait4` espera a `dead_files::settle()` también al *devolver* un zombi (Linux cierra los ficheros en `do_exit`; había una ventana en que un padre veía libre un recurso aún en uso, hecha visible por 12 sesiones); `disk.img` ahora 288 MiB (los cuatro binarios Vulkan de 15 MB llenaban los 160).
 - Tirón del dueño del display al arrancar otros clientes: causa = crear (y destruir) un canal GR con el cerrojo global `HW` tomado (cortes de 178/94/83 ms); arreglado sacando de ese cerrojo la parte lenta de ambos. Medido #166: 0 intervalos >25 ms (máximo 20,1 ms), 60,1 fps, espera máxima por el cerrojo 2,8 ms (144 ms antes). Quedan retenciones de 3-8 ms (`unbind`, `prepare_rt`), registradas en `gpu_uapi_slow:`.
 
+## Capa 3 (WSI): camino directo HECHO, pendiente de medir en la Ryzen (2026-09-30)
+
+- **Decisión de diseño**: no hay plataforma nueva; la superficie `VK_EXT_headless_surface` de Mesa *es la pantalla* cuando NVK tiene display (así no hace falta una extensión de instancia nueva ni generar entrypoints). Sin display (QEMU) sigue siendo headless de verdad. Cuando haya compositor (capa 4) la elección pasará a depender de quién sea el dueño.
+- **Cómo**: `wsi_common_headless.c` (parche) usa los swapchains de copia a buffer de `wsi_common` (parámetros `WSI_IMAGE_TYPE_CPU`, sin DRM) con el buffer de destino en VRAM y el pitch del scanout (`image_info.linear_stride/size`, tipo de memoria y `create_mem` propios); `queue_present` espera el fence de la copia, el flip anterior (`poll(/dev/vblank)`) y hace `PRESENT`; `acquire` no da la imagen en pantalla. Ganchos: `wsi_device.scanout` (`nvk_wsi.c`), implementados en `nvkmd_constanos.c` (`nvk_constanos_wait_flip`, `nvkmd_constanos_pdev_scanout`; el layout se lee al describir el pdev).
+- **snake3d portado** (`vk_snake.c`): `VK_KHR_swapchain`, ya no conoce `nvk_constanos_*`; la ruta `-DSNAKE_HOST` (imágenes PPM) intacta. Probado: host (imágenes), QEMU headless (4 imágenes, sin pantalla). **Falta la Ryzen**: `scripts/metal-run.sh --kconf 'gpu=uapi' scripts/metal-jobs/gpu-snake.sh` (el job ya exige pantalla detrás de la superficie, 50-61 fps, autopilot puntuó, 0 flips rechazados) y comprobar a ojo que no hay desgarros ni saltos.
+- **Deuda conocida**: destruir un swapchain deja el buffer en pantalla sin liberar hasta cerrar el dispositivo (el kernel no puede quitar un BO del display: la solución es que `PRESENT` tome un holder del almacenamiento); un segundo cliente no ve sus frames (`EBUSY`); solo FIFO.
+- **Siguiente**: medir en la Ryzen; luego `vk_draw` al WSI y el camino ventanado (imágenes exportadas con `BO_EXPORT`, timelines con `SYNC_EXPORT`) para la capa 4.
+
 ## Siguiente paso
 
-Capa 3 (WSI de constanos en `wsi_common`, camino directo primero; el camino ventanado y el compositor de la capa 4 ya tienen BOs y timelines compartibles).
+Capa 3: medir el camino directo en la Ryzen y cerrarla; después el camino ventanado (las imágenes se comparten con el compositor de la capa 4, que ya tiene BOs y timelines compartibles).
+
+## Notas para la capa 3 (WSI), para quien retome
+
+- **Modelo a seguir:** `~/src/gpu-ref/mesa/src/vulkan/wsi/wsi_common_headless.c` (plataforma sin sistema de ventanas: imágenes como buffers, presentar = un callback); el gancho de NVK es `src/nouveau/vulkan/nvk_wsi.c` (`nvk_init_wsi`). Hay también `wsi_common_display.c` (pantalla directa, pero sobre DRM/KMS, que aquí no existe). La plataforma nueva sería `wsi_common_constanos.c`, enganchada como hace `nvk-constanos` con los demás ficheros (`mesa-port/patches/0001-nvk-constanos.patch` + `overlay/`).
+- **Lo que hay hoy y el WSI sustituye:** la extensión propia `nvk_constanos_present(device, memory, offset)` / `nvk_constanos_flip_pending` (en `nvkmd_constanos.c`), usada por `vk_draw` (`VK_DRAW_SCANOUT`: triple buffer, `vkCmdCopyImageToBuffer` a un BO VRAM con el layout del scanout, `NVG_IOC_PRESENT`, espera del flip con `poll(/dev/vblank)` + `FLIP_STATE`, 60 fps) y por `snake3d` (ver `probes/nvk/vk_snake.c`).
+- **Hechos del display:** escanea XRGB8888 **lineal** (`NVG_IOC_SCANOUT_INFO`: 1920x1080, pitch 8192); NVK renderiza en bloques, de ahí la copia/desembaldosado; `PRESENT` pide un BO VRAM con `offset % 256 == 0` y tamaño suficiente; el **primer** `PRESENT` de una sesión la hace dueña del scanout (otra recibe EBUSY hasta que la dueña cierra, que restaura la consola).
+- **Camino directo primero** (swapchain = BOs de VRAM con el layout del scanout, presentar = `PRESENT` + esperar el flip); **camino ventanado después** (las imágenes se exportan con `BO_EXPORT`, el compositor las importa, y la sincronización va por timelines exportadas: `SYNC_EXPORT`; todo ya existe y está medido). `VK_KHR_external_memory_fd`/`VK_KHR_external_semaphore_fd` ya funcionan (ver `vk_share`).
+- **Antes de tocar nada:** `snake3d` debería portarse al WSI como primera prueba (decisión del usuario, memoria `snake3d_port_to_wsi`); `probes/nvk/host-snake.sh` lo dibuja fuera de pantalla en el host para comprobar imágenes.
+- **Trampas conocidas de esta pila:** ver el skill `gpu-g5` (cerrojo único de la GPU, holders del almacenamiento, timelines en el registro) y `kernel-testing` (el dispositivo software no ve carreras de trabajo en vuelo).
+
+## Pendiente fuera de las capas: relojes y estado de rendimiento de la GPU (anotado 2026-09-30, sin medir)
+
+**Pregunta abierta:** ¿en qué estado de rendimiento (pstate, relojes de núcleo y de memoria) queda la GA106 después de nuestro arranque de GSP-RM? Nadie lo ha medido. Las cifras de pantalla (60 fps de un triángulo, el ritmo de `snake3d`) no lo detectan porque no exigen nada a la GPU, y los benchmarks que hay (`kernel/src/gpu/bench.rs`, copias) están limitados por el enlace PCIe (~6,2 GB/s), no por los relojes. Si la GPU se queda en el estado más bajo, el techo real de cómputo y de 3D sería mucho menor del que el hardware da, y el compositor de la capa 4 lo sentiría.
+
+**Contexto (de memoria, sin verificar contra fuentes):** en Linux, nouveau no podía cambiar relojes en Maxwell y posteriores sin firmware firmado, y la tarjeta se quedaba en los relojes de arranque (de ahí el "1 fps" de nouveau + Wayland/KMS, sobre todo con llvmpipe de respaldo). Desde Turing el firmware GSP-RM hace ese trabajo y nouveau lo usa (experimental desde el kernel 6.7, por defecto en 6.8 para Turing/Ampere/Ada, a comprobar). El conflicto GBM/EGLStreams de 2016 afectó al driver privativo en Wayland, no a nouveau, y no tiene relación con esto.
+
+**Cómo medirlo, en orden:**
+1. Referencia: en el Linux de esa misma máquina con el driver privativo (queda sano tras cada ronda de metal), `nvidia-smi -q -d CLOCK,PERFORMANCE` en reposo y bajo carga.
+2. Nuestro lado: pedirle a GSP-RM el estado actual por RM, con el cliente que ya existe (`Rm::control` sobre nuestro subdevice, `nvgpu::rm`). Los controles están en OpenRM (`~/src/gpu-ref/open-gpu-kernel-modules`, `ctrl2080*.h`): `NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE`, `NV2080_CTRL_CMD_PERF_GET_LEVEL_INFO`, `NV2080_CTRL_CMD_GPU_GET_INFO`; leer los campos exactos de esos ficheros antes de escribir los parámetros (y su fixture, como en `rm-*`). Añadirlo a `/proc/gpu` o a `gpu_gsprt:`.
+3. Un benchmark limitado por ALU, no por el enlace (un shader de cómputo con un bucle largo, vía `nvgpu::qmd`/`nvgpu/gen/shader`), comparado con el mismo cálculo bajo Linux/CUDA: la diferencia de tiempo da la diferencia de relojes.
+4. Si hay diferencia: buscar qué control de RM sube el nivel (`PERF_*`/`CLK_*`; mirar cómo lo hace el driver privativo y qué pide nova-core/nouveau-GSP), probar en QEMU lo que se pueda con un fixture y el resto en metal.
+
+No bloquea la capa 3; conviene hacerlo antes de juzgar el rendimiento de la capa 4.
+

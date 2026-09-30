@@ -246,6 +246,47 @@ index 69cbe03..f2b3ae7 100644
  void nvk_physical_device_destroy(struct vk_physical_device *vk_device);
  
  VkExtent2D nvk_max_shading_rate(const struct nvk_physical_device *pdev,
+diff --git a/src/nouveau/vulkan/nvk_wsi.c b/src/nouveau/vulkan/nvk_wsi.c
+index ae36a88..9550bbc 100644
+--- a/src/nouveau/vulkan/nvk_wsi.c
++++ b/src/nouveau/vulkan/nvk_wsi.c
+@@ -7,6 +7,10 @@
+ #include "nvkmd/nvkmd.h"
+ #include "wsi_common.h"
+ 
++#ifdef NVK_CONSTANOS
++#include "nvkmd/constanos/nvkmd_constanos.h"
++#endif
++
+ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+ nvk_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
+ {
+@@ -34,6 +38,25 @@ nvk_init_wsi(struct nvk_physical_device *pdev)
+    if (result != VK_SUCCESS)
+       return result;
+ 
++#ifdef NVK_CONSTANOS
++   {
++      /* The hooks are always set: they say this driver has no DRM/dma-buf, so a headless swapchain takes the CPU platform's buffers. `valid`
++       * says there is a display to present to. */
++      struct nvg_scanout_info si;
++      const bool display = nvkmd_constanos_pdev_scanout(pdev->nvkmd, &si);
++      pdev->wsi_device.scanout = (struct wsi_scanout) {
++         .valid = display,
++         .width = display ? si.width : 0,
++         .height = display ? si.height : 0,
++         .pitch_B = display ? si.pitch_B : 0,
++         .size_B = display ? si.size_B : 0,
++         .present = nvk_constanos_present,
++         .flip_pending = nvk_constanos_flip_pending,
++         .wait_flip = nvk_constanos_wait_flip,
++      };
++   }
++#endif
++
+    pdev->wsi_device.supports_scanout = false;
+    pdev->wsi_device.supports_modifiers =
+       pdev->vk.supported_extensions.table.EXT_image_drm_format_modifier;
 diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.c b/src/nouveau/vulkan/nvkmd/nvkmd.c
 index c6ffb94..17f19e8 100644
 --- a/src/nouveau/vulkan/nvkmd/nvkmd.c
@@ -315,3 +356,341 @@ index 78d6398..ac7f24c 100644
  #if DETECT_OS_APPLE
     if (!build_id_find_uuid_command(&data))
        return NULL;
+diff --git a/src/vulkan/wsi/wsi_common.h b/src/vulkan/wsi/wsi_common.h
+index cfb921d..589d5bf 100644
+--- a/src/vulkan/wsi/wsi_common.h
++++ b/src/vulkan/wsi/wsi_common.h
+@@ -111,6 +111,23 @@ struct wsi_device {
+    /* Create headless swapchains. */
+    bool force_headless_swapchain;
+ 
++   /* constanos: the screen the headless platform presents to, when the driver has one (valid == false: headless proper). The display
++    * scans out a linear surface; a swapchain image is copied into a device-local buffer of that layout, and presenting points the
++    * display at the buffer, with no copy by the CPU.
++    */
++   struct wsi_scanout {
++      bool valid;
++      uint32_t width, height;
++      uint32_t pitch_B;
++      uint64_t size_B;             /* pitch_B * height */
++      /* 0, -EBUSY (the previous flip has not taken effect, or another client owns the screen) or another negative errno. */
++      int (*present)(VkDevice device, VkDeviceMemory memory, uint64_t offset);
++      /* 1 while the last present has not taken effect (the buffer that was on screen still is), 0 once it has, or a negative errno. */
++      int (*flip_pending)(VkDevice device);
++      /* Sleeps until flip_pending() is 0 (through a vblank, not a spin): 0, or -ETIMEDOUT after timeout_ms. */
++      int (*wait_flip)(VkDevice device, int timeout_ms);
++   } scanout;
++
+    bool force_swapchain_to_currentExtent;
+ 
+    bool disable_unordered_submits;
+diff --git a/src/vulkan/wsi/wsi_common_headless.c b/src/vulkan/wsi/wsi_common_headless.c
+index 05906d4..5203426 100644
+--- a/src/vulkan/wsi/wsi_common_headless.c
++++ b/src/vulkan/wsi/wsi_common_headless.c
+@@ -21,10 +21,17 @@
+  * DEALINGS IN THE SOFTWARE.
+  */
+ 
+-/** VK_EXT_headless_surface */
++/** VK_EXT_headless_surface
++ *
++ * constanos: when the driver has a display (wsi_device->scanout.valid) this surface is the screen. The swapchain is three or more images of
++ * the display's size; presenting copies the image on the GPU into a device-local buffer laid out as the display scans out (the buffer-blit
++ * path every other platform uses for linear targets) and points the display at that buffer (no copy by the CPU). FIFO only: present waits
++ * for the previous flip. Without a display it is the headless platform it always was.
++ */
+ 
+ #include "util/macros.h"
+ #include "util/timespec.h"
++#include "util/u_math.h"
+ #include "vk_util.h"
+ #include "vk_instance.h"
+ #include "vk_physical_device.h"
+@@ -33,6 +40,9 @@
+ 
+ #include "drm-uapi/drm_fourcc.h"
+ 
++#include <errno.h>
++#include <unistd.h>
++
+ struct wsi_headless {
+    struct wsi_interface base;
+ };
+@@ -53,6 +63,10 @@ static const VkPresentModeKHR present_modes[] = {
+    VK_PRESENT_MODE_FIFO_KHR,
+ };
+ 
++static const VkPresentModeKHR scanout_present_modes[] = {
++   VK_PRESENT_MODE_FIFO_KHR,
++};
++
+ static VkResult
+ wsi_headless_surface_get_capabilities(VkIcdSurfaceBase *surface,
+                                       struct wsi_device *wsi_device,
+@@ -83,6 +97,18 @@ wsi_headless_surface_get_capabilities(VkIcdSurfaceBase *surface,
+       VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR |
+       VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+ 
++   if (wsi_device->scanout.valid) {
++      /* The screen has one size: three images (one on screen, one waiting for the flip, one to draw) of exactly that. */
++      caps->surfaceCapabilities.minImageCount = 3;
++      caps->surfaceCapabilities.currentExtent = (VkExtent2D) {
++         wsi_device->scanout.width, wsi_device->scanout.height,
++      };
++      caps->surfaceCapabilities.minImageExtent = caps->surfaceCapabilities.currentExtent;
++      caps->surfaceCapabilities.maxImageExtent = caps->surfaceCapabilities.currentExtent;
++      /* The X of XRGB8888 is ignored by the display. */
++      caps->surfaceCapabilities.supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
++   }
++
+    VkImageUsageFlags image_usage = wsi_caps_get_image_usage();
+ 
+    VK_FROM_HANDLE(vk_physical_device, pdevice, wsi_device->pdevice);
+@@ -213,7 +239,17 @@ wsi_headless_surface_get_formats(VkIcdSurfaceBase *icd_surface,
+ {
+    VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormatKHR, out, pSurfaceFormats, pSurfaceFormatCount);
+ 
+-   if (wsi_device->force_bgra8_unorm_first) {
++   if (wsi_device->scanout.valid) {
++      /* The display scans out bytes B, G, R, X. */
++      vk_outarray_append_typed(VkSurfaceFormatKHR, &out, out_fmt) {
++         out_fmt->format = VK_FORMAT_B8G8R8A8_UNORM;
++         out_fmt->colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++      }
++      vk_outarray_append_typed(VkSurfaceFormatKHR, &out, out_fmt) {
++         out_fmt->format = VK_FORMAT_B8G8R8A8_SRGB;
++         out_fmt->colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++      }
++   } else if (wsi_device->force_bgra8_unorm_first) {
+       vk_outarray_append_typed(VkSurfaceFormatKHR, &out, out_fmt) {
+          out_fmt->format = VK_FORMAT_B8G8R8A8_UNORM;
+          out_fmt->colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+@@ -261,7 +297,16 @@ wsi_headless_surface_get_formats2(VkIcdSurfaceBase *icd_surface,
+ {
+    VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormat2KHR, out, pSurfaceFormats, pSurfaceFormatCount);
+ 
+-   if (wsi_device->force_bgra8_unorm_first) {
++   if (wsi_device->scanout.valid) {
++      vk_outarray_append_typed(VkSurfaceFormat2KHR, &out, out_fmt) {
++         out_fmt->surfaceFormat.format = VK_FORMAT_B8G8R8A8_UNORM;
++         out_fmt->surfaceFormat.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++      }
++      vk_outarray_append_typed(VkSurfaceFormat2KHR, &out, out_fmt) {
++         out_fmt->surfaceFormat.format = VK_FORMAT_B8G8R8A8_SRGB;
++         out_fmt->surfaceFormat.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++      }
++   } else if (wsi_device->force_bgra8_unorm_first) {
+       vk_outarray_append_typed(VkSurfaceFormat2KHR, &out, out_fmt) {
+          out_fmt->surfaceFormat.format = VK_FORMAT_B8G8R8A8_UNORM;
+          out_fmt->surfaceFormat.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+@@ -306,15 +351,20 @@ wsi_headless_surface_get_present_modes(VkIcdSurfaceBase *surface,
+                                        uint32_t* pPresentModeCount,
+                                        VkPresentModeKHR* pPresentModes)
+ {
++   const VkPresentModeKHR *modes = wsi_device->scanout.valid ?
++      scanout_present_modes : present_modes;
++   const uint32_t mode_count = wsi_device->scanout.valid ?
++      ARRAY_SIZE(scanout_present_modes) : ARRAY_SIZE(present_modes);
++
+    if (pPresentModes == NULL) {
+-      *pPresentModeCount = ARRAY_SIZE(present_modes);
++      *pPresentModeCount = mode_count;
+       return VK_SUCCESS;
+    }
+ 
+-   *pPresentModeCount = MIN2(*pPresentModeCount, ARRAY_SIZE(present_modes));
+-   typed_memcpy(pPresentModes, present_modes, *pPresentModeCount);
++   *pPresentModeCount = MIN2(*pPresentModeCount, mode_count);
++   typed_memcpy(pPresentModes, modes, *pPresentModeCount);
+ 
+-   if (*pPresentModeCount < ARRAY_SIZE(present_modes))
++   if (*pPresentModeCount < mode_count)
+       return VK_INCOMPLETE;
+    else
+       return VK_SUCCESS;
+@@ -357,6 +407,14 @@ struct wsi_headless_image {
+ 
+ struct wsi_headless_swapchain {
+    struct wsi_swapchain base;
++
++   /* The swapchain presents to the screen (wsi_device->scanout). `last` is the image most recently presented (on screen, or about to be),
++    * `prev` the one before it (still on screen while the flip of `last` is pending); -1 before the first present. Their buffers must not
++    * be written by a copy in flight.
++    */
++   bool scanout;
++   int last, prev;
++
+    struct wsi_headless_image images[0];
+ };
+ VK_DEFINE_NONDISP_HANDLE_CASTS(wsi_headless_swapchain, base.base, VkSwapchainKHR,
+@@ -403,6 +461,32 @@ wsi_headless_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    timespec_add(&end_time, &rel_timeout, &start_time);
+ 
++   if (chain->scanout) {
++      const struct wsi_device *wsi = chain->base.wsi;
++      while (1) {
++         const bool pending = wsi->scanout.flip_pending(chain->base.device) > 0;
++         for (uint32_t n = 0; n < chain->base.image_count; n++) {
++            const uint32_t i = (chain->last + 1 + n) % chain->base.image_count;
++            if (chain->images[i].busy_on_host || (int)i == chain->last || (pending && (int)i == chain->prev))
++               continue;
++            *image_index = i;
++            chain->images[i].busy_on_host = true;
++            return VK_SUCCESS;
++         }
++
++         struct timespec current_time;
++         clock_gettime(CLOCK_MONOTONIC, &current_time);
++         if (timespec_after(&current_time, &end_time))
++            return info->timeout == 0 ? VK_NOT_READY : VK_TIMEOUT;
++
++         /* Every image is held by the app, or is the one on screen: the flip frees one. Sleep through a vblank rather than spin. */
++         if (pending)
++            wsi->scanout.wait_flip(chain->base.device, 10);
++         else
++            usleep(200);
++      }
++   }
++
+    while (1) {
+       /* Try to find a free image. */
+       for (uint32_t i = 0; i < chain->base.image_count; i++) {
+@@ -442,6 +526,35 @@ wsi_headless_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
+ 
+    chain->images[image_index].busy_on_host = false;
+ 
++   if (!chain->scanout)
++      return VK_SUCCESS;
++
++   const struct wsi_device *wsi = chain->base.wsi;
++   VkDevice device = chain->base.device;
++
++   /* wsi_common signalled this fence at the end of the copy into the scanout buffer: the picture is in VRAM when it is. */
++   VkResult result = wsi->WaitForFences(device, 1, &chain->base.fences[image_index], true, UINT64_MAX);
++   if (result != VK_SUCCESS)
++      return result;
++
++   /* The display latches a new buffer at a vblank: the previous present must have taken effect, which also frees the buffer that was on
++    * screen before it. */
++   wsi->scanout.wait_flip(device, 1000);
++
++   int r, tries = 0;
++   while ((r = wsi->scanout.present(device, chain->images[image_index].base.blit.memory, 0)) == -EBUSY && tries++ < 5)
++      usleep(1000);
++
++   if (r == -EBUSY) {
++      /* Another client owns the screen (only one at a time until there is a compositor): this frame is not shown. */
++      return VK_SUCCESS;
++   }
++   if (r != 0)
++      return VK_ERROR_SURFACE_LOST_KHR;
++
++   chain->prev = chain->last;
++   chain->last = image_index;
++
+    return VK_SUCCESS;
+ }
+ 
+@@ -461,7 +574,17 @@ wsi_headless_swapchain_destroy(struct wsi_swapchain *wsi_chain,
+    struct wsi_headless_swapchain *chain =
+       (struct wsi_headless_swapchain *)wsi_chain;
+ 
++   if (chain->scanout) {
++      /* The buffer that was on screen before the last present is free once that flip has taken effect. */
++      chain->base.wsi->scanout.wait_flip(chain->base.device, 1000);
++   }
++
+    for (uint32_t i = 0; i < chain->base.image_count; i++) {
++      if (chain->scanout && (int)i == chain->last) {
++         /* The display is still scanning this buffer out, and the kernel offers no way to take it off the screen but closing the device
++          * (which puts the console back): freeing it would leave the display reading freed VRAM. It is given up with the device. */
++         chain->images[i].base.blit.memory = VK_NULL_HANDLE;
++      }
+       if (chain->images[i].base.image != VK_NULL_HANDLE)
+          wsi_destroy_image(&chain->base, &chain->images[i].base);
+    }
+@@ -473,6 +596,22 @@ wsi_headless_swapchain_destroy(struct wsi_swapchain *wsi_chain,
+    return VK_SUCCESS;
+ }
+ 
++static uint32_t
++wsi_headless_select_scanout_memory_type(const struct wsi_device *wsi, uint32_t type_bits)
++{
++   /* VRAM: the display engine reads it, the CPU never does. */
++   return wsi_select_memory_type(wsi, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
++                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, type_bits);
++}
++
++static VkResult
++wsi_headless_create_scanout_mem(const struct wsi_swapchain *chain,
++                                const struct wsi_image_info *info,
++                                struct wsi_image *image)
++{
++   return wsi_create_buffer_blit_context(chain, info, image, 0);
++}
++
+ static VkResult
+ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+                                       VkDevice device,
+@@ -486,6 +625,18 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+ 
+    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
+ 
++   const bool scanout = wsi_device->scanout.valid;
++   if (scanout) {
++      /* What get_capabilities said: the screen's size, bytes B, G, R, X. */
++      if (pCreateInfo->imageExtent.width != wsi_device->scanout.width ||
++          pCreateInfo->imageExtent.height != wsi_device->scanout.height ||
++          (pCreateInfo->imageFormat != VK_FORMAT_B8G8R8A8_UNORM &&
++           pCreateInfo->imageFormat != VK_FORMAT_B8G8R8A8_SRGB))
++         return VK_ERROR_INITIALIZATION_FAILED;
++      if (pCreateInfo->presentMode != VK_PRESENT_MODE_FIFO_KHR)
++         return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
+    int num_images = pCreateInfo->minImageCount;
+ 
+    size_t size = sizeof(*chain) + num_images * sizeof(chain->images[0]);
+@@ -500,7 +651,7 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+       .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+       .pNext = &mod_list,
+    };
+-   if (!wsi_device->sw && wsi_device->supports_modifiers) {
++   if (!wsi_device->scanout.present && !wsi_device->sw && wsi_device->supports_modifiers) {
+       wsi_device->GetPhysicalDeviceFormatProperties2(
+          wsi_device->pdevice, pCreateInfo->imageFormat, &props);
+       assert(mod_list.drmFormatModifierCount > 0);
+@@ -522,7 +673,8 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+    struct wsi_base_image_params *image_params = NULL;
+    struct wsi_cpu_image_params cpu_params;
+    struct wsi_drm_image_params drm_params;
+-   if (wsi_device->sw) {
++   /* A driver with no DRM (constanos) has no dma-buf images: its headless swapchains are CPU ones too. */
++   if (wsi_device->sw || wsi_device->scanout.present) {
+       cpu_params = (struct wsi_cpu_image_params) {
+          .base.image_type = WSI_IMAGE_TYPE_CPU,
+       };
+@@ -547,6 +699,21 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+    if (result != VK_SUCCESS)
+       goto fail_free_chain;
+ 
++   if (scanout) {
++      /* The CPU platform's buffer blit, with the buffer laid out as the display scans out and in VRAM (never mapped). */
++      if (chain->base.blit.type != WSI_SWAPCHAIN_BUFFER_BLIT) {
++         wsi_swapchain_finish(&chain->base);
++         result = VK_ERROR_INITIALIZATION_FAILED;
++         goto fail_free_chain;
++      }
++      chain->base.image_info.linear_stride = wsi_device->scanout.pitch_B;
++      chain->base.image_info.linear_size = wsi_device->scanout.size_B;
++      chain->base.image_info.select_blit_dst_memory_type = wsi_headless_select_scanout_memory_type;
++      chain->base.image_info.create_mem = wsi_headless_create_scanout_mem;
++      chain->scanout = true;
++      chain->last = chain->prev = -1;
++   }
++
+    chain->base.destroy = wsi_headless_swapchain_destroy;
+    chain->base.get_wsi_image = wsi_headless_swapchain_get_wsi_image;
+    chain->base.acquire_next_image = wsi_headless_swapchain_acquire_next_image;

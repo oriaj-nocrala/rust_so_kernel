@@ -6,14 +6,15 @@
  * constants). Every object is one draw: there are no vertex buffers, no descriptors, no textures; snake3d.vert builds the geometry from
  * gl_VertexIndex and the push constants, snake3d.frag lights it.
  *
- * Each frame is rendered at the display's size into a device-local image, copied by the GPU into one of three scanout-layout buffers and put
- * on the screen with no CPU copy (nvk_constanos_present), waiting for the previous flip by poll() on /dev/vblank: the loop of vk_draw's
- * VK_DRAW_SCANOUT. The 2D snake (userspace/src/bin/snake.rs) stays the version that needs no GPU.
+ * On constanos it presents through VK_KHR_swapchain on a VK_EXT_headless_surface, which on this platform is the screen (G5 layer 3: the
+ * WSI in Mesa's wsi_common_headless.c): it renders into the swapchain's images at the display's size, and the WSI copies each one on the GPU
+ * into a scanout-layout buffer and points the display at it with no CPU copy, FIFO-paced by the flip. It knows nothing of /dev/nvgpu. The 2D
+ * snake (userspace/src/bin/snake.rs) stays the version that needs no GPU.
  *
  * Arrows/WASD steer, P pauses, C switches the camera (overview / chase), Space or Enter starts, Esc or Q quits. The title screen plays itself.
  *   SNAKE3D_AUTOPLAY=1   an autopilot plays (and restarts) for unattended runs
  *   SNAKE3D_SECONDS=<n>  quit after n seconds
- *   SNAKE3D_HEADLESS=1   with no display (QEMU's software device): render 640x360 and present nothing
+ *   SNAKE3D_HEADLESS=1   with no display (QEMU's software device): the surface has no fixed size, render 640x360 and present nothing
  * The same source builds for the host (-DSNAKE_HOST, host-snake.sh) against the system's Vulkan: it renders offscreen at a fixed 60 Hz step
  * and dumps PPM frames (SNAKE3D_DUMP=<dir> SNAKE3D_DUMP_AT=<frame,frame,...>), which is how the pictures were checked.
  */
@@ -37,18 +38,11 @@ extern VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance
 struct nvg_scanout_info { uint32_t width, height, pitch_B, format; uint64_t size_B, flags; };
 #else
 #include <fcntl.h>
-#include <poll.h>
 #include <sys/ioctl.h>
 #include <unwind.h>
 
 extern PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance instance, const char *name);
 #define GET_INSTANCE_PROC vk_icdGetInstanceProcAddr
-
-/* constanos extension of the statically linked NVK (mesa-port: nvkmd_constanos.c): the screen. */
-struct nvg_scanout_info { uint32_t width, height, pitch_B, format; uint64_t size_B, flags; };
-extern int nvk_constanos_scanout_info(VkDevice device, struct nvg_scanout_info *out);
-extern int nvk_constanos_present(VkDevice device, VkDeviceMemory memory, uint64_t offset);
-extern int nvk_constanos_flip_pending(VkDevice device);
 
 static _Unwind_Reason_Code trace_cb(struct _Unwind_Context *c, void *arg) {
    (void)arg;
@@ -721,22 +715,40 @@ int main(void) {
    VkDevice device = VK_NULL_HANDLE;
    PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr = NULL;
    VkImage image = VK_NULL_HANDLE, dimage = VK_NULL_HANDLE;
-   VkDeviceMemory imem = VK_NULL_HANDLE, dmem = VK_NULL_HANDLE, smem[3] = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
+   VkDeviceMemory imem = VK_NULL_HANDLE, dmem = VK_NULL_HANDLE;
    VkImageView view = VK_NULL_HANDLE, dview = VK_NULL_HANDLE;
+#ifdef SNAKE_HOST
+   VkDeviceMemory smem[3] = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
    VkBuffer sbuf[3] = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
+#else
+   enum { MAX_SC_IMAGES = 8 };
+   VkSurfaceKHR surface = VK_NULL_HANDLE;
+   VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+   VkImage sc_images[MAX_SC_IMAGES];
+   VkImageView sc_views[MAX_SC_IMAGES] = { VK_NULL_HANDLE };
+   VkSemaphore render_sem[MAX_SC_IMAGES] = { VK_NULL_HANDLE };   /* one per image: a present may still be waiting on the last one signalled */
+   VkSemaphore acquire_sem = VK_NULL_HANDLE;
+   uint32_t sc_count = 0;
+#endif
    VkShaderModule vmod = VK_NULL_HANDLE, fmod = VK_NULL_HANDLE;
    VkPipelineLayout pl = VK_NULL_HANDLE;
    VkCommandPool cpool = VK_NULL_HANDLE;
    VkFence fence = VK_NULL_HANDLE;
    struct input in = { -1 };
    int have_input = 0;
-   int vfd = -1;
+#ifdef SNAKE_HOST
    uint8_t *smap[3] = { NULL, NULL, NULL };
+#endif
 
    GLOBAL(vkCreateInstance);
    if (!vkCreateInstance) return 1;
    VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "snake3d", .apiVersion = VK_API_VERSION_1_3 };
    VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
+#ifndef SNAKE_HOST
+   static const char *const instance_exts[] = { "VK_KHR_surface", "VK_EXT_headless_surface" };
+   ici.enabledExtensionCount = 2;
+   ici.ppEnabledExtensionNames = instance_exts;
+#endif
    VKOK(vkCreateInstance(&ici, NULL, &instance));
    INST(vkEnumeratePhysicalDevices);
    INST(vkGetPhysicalDeviceQueueFamilyProperties);
@@ -773,6 +785,11 @@ int main(void) {
    VkPhysicalDeviceVulkan13Features f13 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .dynamicRendering = VK_TRUE };
    VkPhysicalDeviceVulkan12Features f12 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13, .timelineSemaphore = VK_TRUE };
    VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f12, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci };
+#ifndef SNAKE_HOST
+   static const char *const device_exts[] = { "VK_KHR_swapchain" };
+   dci.enabledExtensionCount = 1;
+   dci.ppEnabledExtensionNames = device_exts;
+#endif
    VKOK(vkCreateDevice(pdev, &dci, NULL, &device));
 
    DEV(vkDestroyDevice); DEV(vkGetDeviceQueue); DEV(vkCreateBuffer); DEV(vkGetBufferMemoryRequirements); DEV(vkAllocateMemory);
@@ -782,43 +799,54 @@ int main(void) {
    DEV(vkCmdBeginRendering); DEV(vkCmdEndRendering); DEV(vkCmdBindPipeline); DEV(vkCmdSetViewport); DEV(vkCmdSetScissor); DEV(vkCmdDraw);
    DEV(vkCmdPipelineBarrier); DEV(vkCmdCopyImageToBuffer); DEV(vkCreateFence); DEV(vkQueueSubmit); DEV(vkWaitForFences);
    DEV(vkDeviceWaitIdle); DEV(vkResetFences); DEV(vkResetCommandBuffer); DEV(vkCmdPushConstants);
+#ifndef SNAKE_HOST
+   DEV(vkCreateSwapchainKHR); DEV(vkGetSwapchainImagesKHR); DEV(vkAcquireNextImageKHR); DEV(vkQueuePresentKHR); DEV(vkCreateSemaphore);
+#endif
    VkQueue queue;
    vkGetDeviceQueue(device, (uint32_t)family, 0, &queue);
 
-   /* the screen's layout: the display's size and the pitch its scanout buffers have */
-   struct nvg_scanout_info si;
-#ifdef SNAKE_HOST
-   si = (struct nvg_scanout_info){ .width = 1280, .height = 720, .pitch_B = 1280 * 4, .size_B = 1280 * 720 * 4 };
-   if (getenv("SNAKE3D_SIZE")) sscanf(getenv("SNAKE3D_SIZE"), "%ux%u", &si.width, &si.height), si.pitch_B = si.width * 4, si.size_B = (uint64_t)si.pitch_B * si.height;
-#else
-   int sr = nvk_constanos_scanout_info(device, &si);
-   int headless = getenv("SNAKE3D_HEADLESS") != NULL;   /* no display to show it on (QEMU's software device): render and copy, present nothing */
-   if (sr != 0 && headless) {
-      si = (struct nvg_scanout_info){ .width = 640, .height = 360, .pitch_B = 640 * 4, .size_B = 640 * 360 * 4 };
-      sr = 0;
-      printf("SNAKE3D headless: no display layout, rendering 640x360 without presenting\n");
-   }
-   if (sr != 0) { printf("SNAKE3D FAIL the display's layout (%d): is gpu=uapi on, and nothing else holding the screen?\n", sr); failures++; goto done; }
-#endif
-   printf("SNAKE3D screen %ux%u, pitch %u bytes, format %u\n", si.width, si.height, si.pitch_B, si.format);
-   const uint32_t SW = si.width, SH = si.height;
-
-   /* colour image (device-local), depth image, and three scanout-layout buffers */
+   /* the screen: its size (the surface says it when there is a display; the swapchain must have exactly that size) */
+   uint32_t SW, SH;
    VkMemoryRequirements req;
+#ifdef SNAKE_HOST
+   struct nvg_scanout_info si = { .width = 1280, .height = 720, .pitch_B = 1280 * 4, .size_B = 1280 * 720 * 4 };
+   if (getenv("SNAKE3D_SIZE")) sscanf(getenv("SNAKE3D_SIZE"), "%ux%u", &si.width, &si.height), si.pitch_B = si.width * 4, si.size_B = (uint64_t)si.pitch_B * si.height;
+   SW = si.width;
+   SH = si.height;
+   printf("SNAKE3D screen %ux%u (offscreen)\n", SW, SH);
+#else
+   INST(vkCreateHeadlessSurfaceEXT);
+   INST(vkGetPhysicalDeviceSurfaceSupportKHR);
+   INST(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
+   VkHeadlessSurfaceCreateInfoEXT hsci = { .sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT };
+   VKOK(vkCreateHeadlessSurfaceEXT(instance, &hsci, NULL, &surface));
+   VkBool32 supported = VK_FALSE;
+   VKOK(vkGetPhysicalDeviceSurfaceSupportKHR(pdev, (uint32_t)family, surface, &supported));
+   if (!supported) { printf("SNAKE3D FAIL the queue family cannot present\n"); failures++; goto done; }
+   VkSurfaceCapabilitiesKHR caps;
+   VKOK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pdev, surface, &caps));
+   /* currentExtent is -1 when the surface has no size of its own: no display behind it (QEMU's software device) */
+   const int has_display = caps.currentExtent.width != 0xFFFFFFFFu;
+   int headless = getenv("SNAKE3D_HEADLESS") != NULL;   /* nothing to show it on: render and present into the void */
+   if (!has_display && !headless) { printf("SNAKE3D FAIL no display behind the surface: is gpu=uapi on, and nothing else holding the screen? (SNAKE3D_HEADLESS=1 to render anyway)\n"); failures++; goto done; }
+   if (has_display) {
+      SW = caps.currentExtent.width;
+      SH = caps.currentExtent.height;
+   } else {
+      SW = 640;
+      SH = 360;
+      printf("SNAKE3D headless: the surface has no display, rendering %ux%u without showing it\n", SW, SH);
+   }
+   printf("SNAKE3D screen %ux%u (%s)\n", SW, SH, has_display ? "the display" : "headless");
+#endif
+
+   /* depth image, and the colour target: one image drawn offscreen and copied to a buffer (host), or the swapchain's images (the WSI copies them) */
    VkImageCreateInfo imci = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_B8G8R8A8_UNORM,
       .extent = { SW, SH, 1 }, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
       .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
       .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
-   VKOK(vkCreateImage(device, &imci, NULL, &image));
-   vkGetImageMemoryRequirements(device, image, &req);
-   int it = find_type(&mp, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-   if (it < 0) { printf("SNAKE3D FAIL no device-local memory type\n"); failures++; goto done; }
-   VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = (uint32_t)it };
-   VKOK(vkAllocateMemory(device, &mai, NULL, &imem));
-   VKOK(vkBindImageMemory(device, image, imem, 0));
-   VkImageViewCreateInfo ivci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = image, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_B8G8R8A8_UNORM,
+   VkImageViewCreateInfo ivci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_B8G8R8A8_UNORM,
       .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
-   VKOK(vkCreateImageView(device, &ivci, NULL, &view));
 
    const VkFormat DEPTH_FORMAT = VK_FORMAT_D32_SFLOAT;
    VkImageCreateInfo dici = imci;
@@ -826,8 +854,9 @@ int main(void) {
    dici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
    VKOK(vkCreateImage(device, &dici, NULL, &dimage));
    vkGetImageMemoryRequirements(device, dimage, &req);
-   mai.allocationSize = req.size;
-   mai.memoryTypeIndex = (uint32_t)it;
+   int it = find_type(&mp, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+   if (it < 0) { printf("SNAKE3D FAIL no device-local memory type\n"); failures++; goto done; }
+   VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = (uint32_t)it };
    VKOK(vkAllocateMemory(device, &mai, NULL, &dmem));
    VKOK(vkBindImageMemory(device, dimage, dmem, 0));
    VkImageViewCreateInfo divci = ivci;
@@ -836,24 +865,47 @@ int main(void) {
    divci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
    VKOK(vkCreateImageView(device, &divci, NULL, &dview));
 
+#ifdef SNAKE_HOST
+   VKOK(vkCreateImage(device, &imci, NULL, &image));
+   vkGetImageMemoryRequirements(device, image, &req);
+   mai.allocationSize = req.size;
+   VKOK(vkAllocateMemory(device, &mai, NULL, &imem));
+   VKOK(vkBindImageMemory(device, image, imem, 0));
+   ivci.image = image;
+   VKOK(vkCreateImageView(device, &ivci, NULL, &view));
+
    VkBufferCreateInfo sbci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = si.size_B, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
    for (int k = 0; k < 3; k++) {
       VKOK(vkCreateBuffer(device, &sbci, NULL, &sbuf[k]));
       vkGetBufferMemoryRequirements(device, sbuf[k], &req);
-#ifdef SNAKE_HOST
       int st = find_type(&mp, req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
-#else
-      int st = it;   /* VRAM, not host-visible: the display reads it */
-#endif
-      if (st < 0) { printf("SNAKE3D FAIL no memory type for the scanout buffers\n"); failures++; goto done; }
+      if (st < 0) { printf("SNAKE3D FAIL no memory type for the readback buffers\n"); failures++; goto done; }
       mai.allocationSize = req.size;
       mai.memoryTypeIndex = (uint32_t)st;
       VKOK(vkAllocateMemory(device, &mai, NULL, &smem[k]));
       VKOK(vkBindBufferMemory(device, sbuf[k], smem[k], 0));
-#ifdef SNAKE_HOST
       VKOK(vkMapMemory(device, smem[k], 0, VK_WHOLE_SIZE, 0, (void **)&smap[k]));
-#endif
    }
+#else
+   VkSwapchainCreateInfoKHR sci = { .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = surface,
+      .minImageCount = caps.minImageCount < 3 ? 3 : caps.minImageCount, .imageFormat = VK_FORMAT_B8G8R8A8_UNORM,
+      .imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR, .imageExtent = { SW, SH }, .imageArrayLayers = 1,
+      .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      .preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR, .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+      .presentMode = VK_PRESENT_MODE_FIFO_KHR, .clipped = VK_TRUE };
+   VKOK(vkCreateSwapchainKHR(device, &sci, NULL, &swapchain));
+   sc_count = MAX_SC_IMAGES;
+   VkResult sr = vkGetSwapchainImagesKHR(device, swapchain, &sc_count, sc_images);
+   if ((sr != VK_SUCCESS && sr != VK_INCOMPLETE) || sc_count == 0) { printf("SNAKE3D FAIL swapchain images (%d)\n", (int)sr); failures++; goto done; }
+   printf("SNAKE3D swapchain of %u images\n", sc_count);
+   VkSemaphoreCreateInfo semi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+   VKOK(vkCreateSemaphore(device, &semi, NULL, &acquire_sem));
+   for (uint32_t i = 0; i < sc_count; i++) {
+      ivci.image = sc_images[i];
+      VKOK(vkCreateImageView(device, &ivci, NULL, &sc_views[i]));
+      VKOK(vkCreateSemaphore(device, &semi, NULL, &render_sem[i]));
+   }
+#endif
 
    /* pipelines: one shader pair, three blend/depth states */
    VkShaderModuleCreateInfo vs = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = snake3d_vert_spv_len, .pCode = (const uint32_t *)snake3d_vert_spv };
@@ -908,9 +960,16 @@ int main(void) {
    VkImageMemoryBarrier b_depth = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
       .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = dimage, .subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 } };
+#ifdef SNAKE_HOST
    VkImageMemoryBarrier b_src = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
       .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = image, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+#else
+   /* what the WSI expects of an image it is given to present: PRESENT_SRC (it moves it to transfer-source itself) */
+   VkImageMemoryBarrier b_src = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+#endif
    VkRenderingAttachmentInfo ca = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view, .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
       .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue = { .color = { .float32 = { 0, 0, 0, 1.0f } } } };
    /* the clear colour is the fog's (snake3d.frag's FOG), which the fragment shader writes through sqrt: the image is UNORM, not sRGB */
@@ -921,12 +980,10 @@ int main(void) {
       .pColorAttachments = &ca, .pDepthAttachment = &da };
    VkViewport viewport = { 0, 0, (float)SW, (float)SH, 0.0f, 1.0f };
    VkRect2D scissor = { { 0, 0 }, { SW, SH } };
+#ifdef SNAKE_HOST
    /* the buffers' rows are `pitch` bytes apart: bufferRowLength is in texels */
    VkBufferImageCopy region = { .bufferRowLength = si.pitch_B / 4, .bufferImageHeight = SH, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { SW, SH, 1 } };
-
-#ifndef SNAKE_HOST
-   vfd = open("/dev/vblank", O_RDONLY | O_NONBLOCK);
-   printf("SNAKE3D waiting for the flip %s\n", vfd >= 0 ? "by poll() on /dev/vblank" : "by polling every 200 us (no /dev/vblank)");
+#else
    input_open(&in);
    have_input = 1;
 #endif
@@ -941,7 +998,7 @@ int main(void) {
    spawn_food(0);
 
    double t0 = clock_s(), last = t0;
-   unsigned frames = 0, busy = 0, slept = 0, shown = 0, draws_max = 0;
+   unsigned frames = 0, shown = 0, draws_max = 0;
    int quit = 0, frame_ok = 1, present_ok = 1;
    while (!quit) {
 #ifdef SNAKE_HOST
@@ -994,6 +1051,17 @@ int main(void) {
       parts_update((float)dt);
       if (G.shake > 0) { G.shake -= (float)dt * 8.0f; if (G.shake < 0) G.shake = 0; }
 
+#ifndef SNAKE_HOST
+      /* the image to draw into: the WSI never hands out the one on screen */
+      uint32_t idx = 0;
+      {
+         const VkResult ar = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, acquire_sem, VK_NULL_HANDLE, &idx);
+         if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) { frame_ok = 0; printf("SNAKE3D acquire failed (%d) at frame %u\n", (int)ar, frames); break; }
+      }
+      b_color.image = b_src.image = sc_images[idx];
+      ca.imageView = sc_views[idx];
+#endif
+
       /* record and submit the frame */
       vkResetCommandBuffer(R.cmd, 0);
       vkBeginCommandBuffer(R.cmd, &bbi);
@@ -1008,11 +1076,21 @@ int main(void) {
       if ((unsigned)R.draws > draws_max) draws_max = (unsigned)R.draws;
       vkCmdEndRendering(R.cmd);
       vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b_src);
-      int k = frames % 3;   /* triple buffering: the buffer drawn into was on screen two presents ago and has been replaced since */
+#ifdef SNAKE_HOST
+      int k = frames % 3;
       vkCmdCopyImageToBuffer(R.cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sbuf[k], 1, &region);
+#endif
       vkEndCommandBuffer(R.cmd);
       vkResetFences(device, 1, &fence);
       VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &R.cmd };
+#ifndef SNAKE_HOST
+      const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+      submit.waitSemaphoreCount = 1;
+      submit.pWaitSemaphores = &acquire_sem;
+      submit.pWaitDstStageMask = &wait_stage;
+      submit.signalSemaphoreCount = 1;
+      submit.pSignalSemaphores = &render_sem[idx];
+#endif
       if (vkQueueSubmit(queue, 1, &submit, fence) != VK_SUCCESS || vkWaitForFences(device, 1, &fence, VK_TRUE, 10000000000ull) != VK_SUCCESS) { frame_ok = 0; break; }
 
 #ifdef SNAKE_HOST
@@ -1040,22 +1118,11 @@ int main(void) {
       }
       shown++;
 #else
-      /* the picture is in VRAM. The previous present must have taken effect before the next one (the display latches at a vblank): ask the kernel
-       * rather than sleep a frame, then point the display at this buffer. */
-      int pr, tries = 0;
-      while (!headless && nvk_constanos_flip_pending(device) > 0 && tries++ < 200) {
-         busy++;
-         if (vfd >= 0) {
-            struct pollfd pf = { .fd = vfd, .events = POLLIN };
-            if (poll(&pf, 1, 100) > 0) { uint64_t ev[2]; if (read(vfd, ev, sizeof ev) == (ssize_t)sizeof ev) slept++; }
-         } else {
-            usleep(200);
-         }
-      }
-      tries = 0;
-      pr = 0;
-      while (!headless && (pr = nvk_constanos_present(device, smem[k], 0)) == -16 /* EBUSY */ && tries++ < 100) { busy++; usleep(200); }
-      if (pr != 0) { present_ok = 0; printf("SNAKE3D PRESENT failed (%d) at frame %u\n", pr, frames); break; }
+      /* the WSI copies the image into a scanout buffer on the GPU, waits for the previous flip and points the display at the buffer */
+      VkPresentInfoKHR pinfo = { .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &render_sem[idx],
+         .swapchainCount = 1, .pSwapchains = &swapchain, .pImageIndices = &idx };
+      const VkResult pr = vkQueuePresentKHR(queue, &pinfo);
+      if (pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR) { present_ok = 0; printf("SNAKE3D present failed (%d) at frame %u\n", (int)pr, frames); break; }
       shown++;
 #endif
       frames++;
@@ -1067,14 +1134,13 @@ int main(void) {
 #endif
       if (!frame_ok) { failures++; printf("SNAKE3D FAIL a frame was not rendered and fenced\n"); }
       if (!present_ok || shown != frames) { failures++; printf("SNAKE3D FAIL %u of %u frames were put on the screen\n", shown, frames); }
-      printf("SNAKE3D %u frames in %.1f s (%.1f per second), score %u best %u, up to %u draws per frame, %u waits for the previous flip (%u slept through a vblank)\n",
-             frames, el, frames / (el > 0 ? el : 1), G.score, G.best, draws_max, busy, slept);
+      printf("SNAKE3D %u frames in %.1f s (%.1f per second), score %u best %u, up to %u draws per frame\n",
+             frames, el, frames / (el > 0 ? el : 1), G.score, G.best, draws_max);
    }
    VKOK(vkDeviceWaitIdle(device));
 
 done:
    if (have_input) input_close(&in);
-   if (vfd >= 0) close(vfd);
    if (device) {
       PFN_vkDeviceWaitIdle wi = (PFN_vkDeviceWaitIdle)vkGetDeviceProcAddr(device, "vkDeviceWaitIdle");
       if (wi) wi(device);
@@ -1083,7 +1149,13 @@ done:
       GONE(pl, vkDestroyPipelineLayout);
       GONE(fmod, vkDestroyShaderModule);
       GONE(vmod, vkDestroyShaderModule);
+#ifdef SNAKE_HOST
       for (int k = 0; k < 3; k++) { GONE(sbuf[k], vkDestroyBuffer); GONE(smem[k], vkFreeMemory); }
+#else
+      for (uint32_t i = 0; i < MAX_SC_IMAGES; i++) { GONE(render_sem[i], vkDestroySemaphore); GONE(sc_views[i], vkDestroyImageView); }
+      GONE(acquire_sem, vkDestroySemaphore);
+      GONE(swapchain, vkDestroySwapchainKHR);
+#endif
       GONE(dview, vkDestroyImageView);
       GONE(dimage, vkDestroyImage);
       GONE(dmem, vkFreeMemory);
@@ -1095,6 +1167,12 @@ done:
       PFN_vkDestroyDevice dd = (PFN_vkDestroyDevice)vkGetDeviceProcAddr(device, "vkDestroyDevice");
       if (dd) dd(device, NULL);
    }
+#ifndef SNAKE_HOST
+   if (instance && surface) {
+      PFN_vkDestroySurfaceKHR ds = (PFN_vkDestroySurfaceKHR)GET_INSTANCE_PROC(instance, "vkDestroySurfaceKHR");
+      if (ds) ds(instance, surface, NULL);
+   }
+#endif
    if (instance) {
       PFN_vkDestroyInstance di = (PFN_vkDestroyInstance)GET_INSTANCE_PROC(instance, "vkDestroyInstance");
       if (di) di(instance, NULL);

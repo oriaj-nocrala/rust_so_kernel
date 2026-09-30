@@ -1,4 +1,5 @@
-# snake3d on the Ryzen: the snake in 3D on the GPU (probes/nvk/vk_snake.c), 20 s of the autopilot playing, presented with no CPU copy.
+# snake3d on the Ryzen: the snake in 3D on the GPU (probes/nvk/vk_snake.c), 20 s of the autopilot playing, presented through VK_KHR_swapchain
+# (G5 layer 3: Mesa's headless platform is the screen on constanos; the WSI copies each image on the GPU and points the display at it, no CPU copy).
 #   probes/nvk/build.py && strip -o disk-image-root/bin/snake3d ~/src/gpu-ref/nvk-probe/vk-snake   # 16 MB: check `dumpe2fs -h disk.img | grep Free`
 #   touch build.rs; echo 5 > target/metal/budget
 #   scripts/metal-run.sh --kconf 'gpu=uapi' scripts/metal-jobs/gpu-snake.sh
@@ -15,7 +16,8 @@ rc=$?
 grep -E 'SNAKE3D|FAIL|ASSERT' /tmp/snake3d.out | while read -r l; do sum "gpu-snake: $l"; done
 [ $rc = 0 ] || { sum "gpu-snake: snake3d exit=$rc"; fail=1; tail -n 25 /tmp/snake3d.out >> /tmp/gpu-snake.sum; }
 grep -q 'SNAKE3D DONE' /tmp/snake3d.out || { sum "gpu-snake: did not reach SNAKE3D DONE"; fail=1; }
-grep -q 'by poll() on /dev/vblank' /tmp/snake3d.out || { sum "gpu-snake: did not wait by poll() on /dev/vblank"; fail=1; }
+grep -q 'SNAKE3D screen [0-9]*x[0-9]* (the display)' /tmp/snake3d.out || { sum "gpu-snake: the surface had no display behind it"; fail=1; }
+grep -q 'SNAKE3D swapchain of [0-9]* images' /tmp/snake3d.out || { sum "gpu-snake: no swapchain was created"; fail=1; }
 fps=$(grep -o '([0-9.]* per second' /tmp/snake3d.out | tr -d '(' | cut -d' ' -f1)
 awk -v a="$fps" 'BEGIN { exit !(a >= 50 && a <= 61) }' || { sum "gpu-snake: ran at '$fps' frames per second, not at the display's 60"; fail=1; }
 score=$(grep -o 'score [0-9]* best' /tmp/snake3d.out | cut -d' ' -f2)

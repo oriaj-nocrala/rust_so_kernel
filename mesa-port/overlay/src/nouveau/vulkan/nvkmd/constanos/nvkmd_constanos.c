@@ -30,6 +30,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -365,6 +366,9 @@ nvkmd_constanos_try_create_pdev(struct vk_object_base *log_obj, enum nvk_debug d
 
    struct nvg_info info;
    const int r = constanos_ioctl(fd, NVG_IOC_INFO, &info);
+   /* The display's layout does not change while the process runs: ask now, while a session is open (the WSI needs it before any device). */
+   struct nvg_scanout_info scanout;
+   const bool scanout_valid = r == 0 && constanos_ioctl(fd, NVG_IOC_SCANOUT_INFO, &scanout) == 0;
    close(fd);
    if (r != 0 || info.abi_version != NVG_ABI_VERSION)
       return vk_errorf(log_obj, VK_ERROR_INCOMPATIBLE_DRIVER, "%s speaks ABI %u, not %u", NVKMD_CONSTANOS_DEVICE_PATH,
@@ -376,6 +380,9 @@ nvkmd_constanos_try_create_pdev(struct vk_object_base *log_obj, enum nvk_debug d
 
    pdev->base.ops = &nvkmd_constanos_pdev_ops;
    pdev->base.debug_flags = debug_flags;
+   pdev->scanout_valid = scanout_valid;
+   if (scanout_valid)
+      pdev->scanout = scanout;
    fill_dev_info(&pdev->base.dev_info, &info);
    pdev->base.kmd_info = (struct nvkmd_info){
       .has_dma_buf = true,
@@ -452,6 +459,7 @@ nvkmd_constanos_create_dev(struct nvkmd_pdev *pdev, struct vk_object_base *log_o
       return vk_error(log_obj, VK_ERROR_INITIALIZATION_FAILED);
    }
 
+   dev->vblank_fd = -1;
    dev->base.ops = &nvkmd_constanos_dev_ops;
    dev->base.pdev = pdev;
    dev->base.va_start = info.va_start;
@@ -478,6 +486,8 @@ constanos_dev_destroy(struct nvkmd_dev *_dev)
    simple_mtx_destroy(&dev->heap_mutex);
    /* Closing the session unbinds and releases whatever is left. */
    close(dev->fd);
+   if (dev->vblank_fd >= 0)
+      close(dev->vblank_fd);
    FREE(dev);
 }
 
@@ -1202,4 +1212,43 @@ nvk_constanos_flip_pending(VkDevice _device)
    struct nvg_flip_state f = { 0 };
    const int r = constanos_ioctl(cdev->fd, NVG_IOC_FLIP_STATE, &f);
    return r < 0 ? r : (int)f.pending;
+}
+
+bool
+nvkmd_constanos_pdev_scanout(struct nvkmd_pdev *_pdev, struct nvg_scanout_info *out)
+{
+   struct nvkmd_constanos_pdev *pdev = nvkmd_constanos_pdev(_pdev);
+   if (!pdev->scanout_valid || pdev->scanout.format != NVG_SCANOUT_XRGB8888)
+      return false;
+   *out = pdev->scanout;
+   return true;
+}
+
+/* Waits for the last present to take effect without spinning: the kernel answers flip_pending at once, and /dev/vblank wakes us at the next
+ * vblank (one read per wakeup marks the live vblank as seen: looping on poll alone would never end). Without /dev/vblank, sleep a little. */
+int
+nvk_constanos_wait_flip(VkDevice _device, int timeout_ms)
+{
+   VK_FROM_HANDLE(nvk_device, dev, _device);
+   struct nvkmd_constanos_dev *cdev = nvkmd_constanos_dev(dev->nvkmd);
+   if (cdev->vblank_fd < 0)
+      cdev->vblank_fd = open("/dev/vblank", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+   const uint64_t end = os_time_get_nano() + (uint64_t)timeout_ms * 1000000ull;
+   for (;;) {
+      const int p = nvk_constanos_flip_pending(_device);
+      if (p <= 0)
+         return p;
+      if (os_time_get_nano() >= end)
+         return -ETIMEDOUT;
+      if (cdev->vblank_fd >= 0) {
+         struct pollfd pf = { .fd = cdev->vblank_fd, .events = POLLIN };
+         if (poll(&pf, 1, 100) > 0) {
+            uint64_t ev[2];
+            if (read(cdev->vblank_fd, ev, sizeof ev) < 0)
+               usleep(200);
+         }
+      } else {
+         usleep(200);
+      }
+   }
 }
