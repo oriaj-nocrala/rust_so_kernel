@@ -17,3 +17,20 @@ for n in ("vert", "frag"):
     print("static const unsigned int snake3d_%s_spv_len = %d;" % (n, len(d)))
 PY
 rm -rf "$t"
+
+# the compositor's shaders (comp.vert / comp.frag -> comp_spv.h)
+t=$(mktemp -d)
+glslangValidator -V comp.vert -o "$t/vert.spv" >/dev/null
+glslangValidator -V comp.frag -o "$t/frag.spv" >/dev/null
+python3 - "$t" <<'PY' > comp_spv.h
+import sys
+print("/* Generated from comp.vert and comp.frag with glslangValidator -V (gen-spv.sh): do not edit. */")
+for n in ("vert", "frag"):
+    d = open(sys.argv[1] + "/%s.spv" % n, "rb").read()
+    print("static const unsigned char comp_%s_spv[] = {" % n)
+    for i in range(0, len(d), 12):
+        print("  " + ", ".join("0x%02x" % b for b in d[i:i + 12]) + ",")
+    print("};")
+    print("static const unsigned int comp_%s_spv_len = %d;" % (n, len(d)))
+PY
+rm -rf "$t"
