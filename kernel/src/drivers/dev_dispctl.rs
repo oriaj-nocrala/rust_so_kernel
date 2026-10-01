@@ -24,6 +24,7 @@
 //   EINVAL if already so, EAGAIN if busy, EIO if it failed.
 //   `peek <offset>` reads one display register from an allow-list (EINVAL
 //   otherwise); the value comes back on the next `read` as a `peek:` line.
+//   `gsp pstate`: only the current P-state (`gpu_perf: pstate=Pn`), one RM control.
 // - `read`: one status line (the SOR's ARMED control, the core channel's
 //   PUT/GET), with `gpu=modes` a second (`mode: ...`), then EOF.
 
@@ -81,6 +82,7 @@ impl FileHandle for DispctlDevice {
             return match what.trim() {
                 "name" => crate::gpu::gsp::runtime_name().map(|_| buf.len()).map_err(|_| FileError::IOError),
                 "perf" => crate::gpu::gsp::runtime_perf().map(|_| buf.len()).map_err(|_| FileError::IOError),
+                "pstate" => crate::gpu::gsp::runtime_pstate().map(|_| buf.len()).map_err(|_| FileError::IOError),
                 "poll" => crate::gpu::gsp::poll_events().map(|_| buf.len()).ok_or(FileError::IOError),
                 _ => Err(FileError::InvalidArgument),
             };

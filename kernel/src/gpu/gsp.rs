@@ -778,6 +778,21 @@ pub fn runtime_perf() -> Result<String, String> {
     Ok(report)
 }
 
+/// Only the current P-state (one RM control, not nine): what a sampler that must not disturb the load asks for. The result replaces the
+/// `gpu_perf:` line (`pstate=Pn`, no levels).
+pub fn runtime_pstate() -> Result<String, String> {
+    let report = with_rm(|rm| match rm.control(rm::H_SUBDEVICE, rm::CTRL_PERF_GET_CURRENT_PSTATE, &[0u8; rm::PSTATE_PARAMS_SIZE]) {
+        Ok(p) => match rm::pstate_from_params(&p) {
+            Some(n) => alloc::format!("pstate=P{}", n),
+            None => alloc::format!("pstate=raw:{:02x?}", p),
+        },
+        Err(e) => alloc::format!("pstate=err({})", e),
+    })
+    .ok_or_else(|| String::from("GSP-RM is not running"))?;
+    *PERF_REPORT.lock() = report.clone();
+    Ok(report)
+}
+
 pub fn render_perf_kdebug() -> String {
     let r = PERF_REPORT.lock();
     if r.is_empty() { String::new() } else { alloc::format!("gpu_perf: {} (domain:current/default/min-max kHz)", *r) }
