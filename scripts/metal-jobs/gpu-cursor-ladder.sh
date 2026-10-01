@@ -62,27 +62,24 @@ attempt() { # attempt <label>
     if echo "cursor raw 0x209c 0xcf" > /dev/dispctl; then sum "gpu-cursor-ladder: assembly cursor control back to disabled"; else sum "gpu-cursor-ladder: could not disable it again: $(rawlog | cut -c1-300)"; fi
   fi
 }
-# E (first): HEAD_SET_DISPLAY_ID(0): the GOP leaves 0, nouveau's round 2 has 0x10 (DCB output 4, the ASUS on DP) for head 0 and 0x80 for head 1 (where the cursor
-# enables). The bit mask of the output the head drives; the head 1 sequence has it (`hdmi::head_methods`), head 0 never got it from this driver.
-echo "cursor raw 0x2020 0x10" > /dev/dispctl && sum "gpu-cursor-ladder: head 0 display id 0x10 pushed: $(grep -a 'cursor: raw' /proc/gpu | tail -n 1 | cut -c1-260)" || sum "gpu-cursor-ladder: display id push FAILED: $(rawlog | cut -c1-300)"
-attempt "E display id"
+# Ryzen #218 compared head 0 with head 1 (where the cursor enables) after `hdmi on`: the ONLY ARMED differences in the head methods are the dither (0x2018 = 0x10), the display
+# id (0x2020), the usage bounds (0x2030, pushed already), the output LUT (0x2280-0x228c) and HEAD_SET_DSC_CONTROL (0x22d4 = 8), and in window 0 against window 2 the owner
+# and the usage bounds (0x1004 = 0xf, 0x1010 = 0x117fff). Each alone failed (#214, #217, #216 for the LUT). Now ALL of them in ONE push (without the LUT, then with it).
+enabled=0
+attempt() { # attempt <label>
+  if echo "cursor raw 0x209c 0x800000cf" > /dev/dispctl; then enabled=1; sum "gpu-cursor-ladder: $1: enable ENABLED"
+  else
+    sum "gpu-cursor-ladder: $1: enable failed: $(rawlog | cut -c1-300)"; sum "gpu-cursor-ladder: $1: $(st2)"
+    echo "cursor recover" > /dev/dispctl; sum "gpu-cursor-ladder: recovered: $(grep -a 'cursor: recover' /proc/gpu | tail -n 1 | cut -c1-200)"
+    if echo "cursor raw 0x209c 0xcf" > /dev/dispctl; then sum "gpu-cursor-ladder: assembly cursor control back to disabled"; else sum "gpu-cursor-ladder: could not disable it again: $(rawlog | cut -c1-300)"; fi
+  fi
+}
+echo "cursor raw 0x2020 0x10 0x2018 0x10 0x2000 0 0x22d4 8 0x1004 0xf 0x1008 0 0x1010 0x117fff" > /dev/dispctl && sum "gpu-cursor-ladder: head 0 gets head 1's state in one push: $(rawlog | cut -c1-300)" || sum "gpu-cursor-ladder: combined push FAILED: $(rawlog | cut -c1-300)"
+sum "gpu-cursor-ladder: $(st2)"
+attempt "F all differences but the LUT"
 if [ $enabled = 0 ]; then
-  # D: head 1 has an output LUT (identity, `hdmi::olut_methods`, in VRAM at 0x3e04000 since `gpu=hdmi` boot) and head 0, the GOP's, none while its usage bounds say
-  # OLUT_ALLOWED: HEAD_SET_OLUT_CONTROL 0x40509, FP_NORM_SCALE 0xffffffff, CONTEXT_DMA_OLUT = the LUT handle, OFFSET_OLUT 0x3e040
-  # all four in ONE push (Ryzen #215: one at a time the ctxdma alone raised INVALID_STATE 0x41, the group is only valid whole)
-  echo "cursor raw 0x2280 0x40509 0x2284 0xffffffff 0x2288 0xf0000001 0x228c 0x3e040" > /dev/dispctl && sum "gpu-cursor-ladder: head 0 output LUT (4 methods, one push) ok" || sum "gpu-cursor-ladder: head 0 output LUT FAILED: $(rawlog | cut -c1-400)"
-  sum "gpu-cursor-ladder: output LUT pushed: $(st2)"
-  attempt "D + output LUT"
-fi
-if [ $enabled = 0 ]; then
-  for pair in "0x1004 0xf" "0x1008 0" "0x1010 0x117fff"; do echo "cursor raw $pair" > /dev/dispctl && sum "gpu-cursor-ladder: window 0 usage $pair ok" || sum "gpu-cursor-ladder: window 0 usage $pair FAILED: $(rawlog | cut -c1-300)"; done
-  sum "gpu-cursor-ladder: window 0 usage bounds pushed: $(st2)"
-  attempt "B + window 0 usage bounds"
-fi
-if [ $enabled = 0 ]; then
-  for pair in "0x2000 0" "0x2018 0x10"; do echo "cursor raw $pair" > /dev/dispctl && sum "gpu-cursor-ladder: head $pair ok" || sum "gpu-cursor-ladder: head $pair FAILED: $(rawlog | cut -c1-300)"; done
-  sum "gpu-cursor-ladder: procamp and dither pushed: $(st2)"
-  attempt "C + procamp + dither"
+  echo "cursor raw 0x2280 0x40509 0x2284 0xffffffff 0x2288 0xf0000001 0x228c 0x3e040" > /dev/dispctl && sum "gpu-cursor-ladder: output LUT (one push) ok" || sum "gpu-cursor-ladder: output LUT FAILED: $(rawlog | cut -c1-400)"
+  attempt "G + the output LUT"
 fi
 [ $enabled = 1 ] || { fail=1; stopped=1; }
 sum "gpu-cursor-ladder: after the enable attempts: $(st)"
