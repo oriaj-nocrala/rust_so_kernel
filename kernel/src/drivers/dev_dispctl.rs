@@ -107,7 +107,7 @@ impl FileHandle for DispctlDevice {
                         .map_err(|_| FileError::InvalidArgument)
                     };
                     let (m, v) = (num(it.next())?, num(it.next())?);
-                    cur::raw(m, v)
+                    cur::raw(m, v, it.next() == Some("il"))
                 }
                 _ => return Err(FileError::InvalidArgument),
             };

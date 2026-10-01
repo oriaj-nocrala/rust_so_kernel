@@ -152,7 +152,7 @@ pub fn write_image(size: u32) -> Result<(), CursorError> {
 
 /// `cursor raw <method> <value>`: ONE core method plus UPDATE (a debugging ladder: Ryzen #196/#197 left the core not idle after the whole enable
 /// push, its exception slot naming method 0x2088 with type 0). Waits for the core to go idle, with IF=1, and logs where it stands.
-pub fn raw(method: u32, value: u32) -> Result<(), CursorError> {
+pub fn raw(method: u32, value: u32, interlock: bool) -> Result<(), CursorError> {
     let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
     if !nc::core_method_allowed(head, method) {
         return Err(CursorError::Invalid);
@@ -162,7 +162,15 @@ pub fn raw(method: u32, value: u32) -> Result<(), CursorError> {
         x86_64::instructions::interrupts::enable();
     }
     let faults0 = evo::Faults::read(regs);
-    let pushed = supervisor::push_core("cursor raw", &[(method, value)], false);
+    let mut methods = alloc::vec![(method, value)];
+    if interlock {
+        // the core's UPDATE waits for this head's cursor channel: send the flag first, the channel's own UPDATE right after the push
+        methods.insert(0, (evo::CORE_SET_INTERLOCK_FLAGS, nc::core_interlock_with_cursor(head)));
+    }
+    let pushed = supervisor::push_core("cursor raw", &methods, false);
+    if interlock && pushed.is_ok() {
+        let _ = nc::update(regs, head);
+    }
     let idle = pushed.is_ok() && {
         let t0 = crate::cpu::tsc::read();
         loop {
@@ -181,9 +189,10 @@ pub fn raw(method: u32, value: u32) -> Result<(), CursorError> {
     }
     let f = evo::Faults::read(regs).new_since(&faults0);
     log(alloc::format!(
-        "cursor: raw {:#x} = {:#x}: push {:?}, core idle {} status {:#x} put {:#x} get {:#x}, slot {:#x},{:#x},{:#x}, new faults ctrl_disp {:#x} exc_other {:#x}",
+        "cursor: raw {:#x} = {:#x}{}: push {:?}, core idle {} status {:#x} put {:#x} get {:#x}, slot {:#x},{:#x},{:#x}, new faults ctrl_disp {:#x} exc_other {:#x}",
         method,
         value,
+        if interlock { " (interlocked with the cursor channel)" } else { "" },
         pushed,
         idle as u8,
         regs.rd32(0x61_0630),

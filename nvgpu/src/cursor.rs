@@ -121,6 +121,23 @@ pub const fn core_olut_context_dma(h: u32) -> u32 {
     0x2288 + h * 0x400
 }
 
+/// The core's `SET_INTERLOCK_FLAGS` bit that makes its next UPDATE wait for head `h`'s cursor channel (`clc67d.h:153-160`: `INTERLOCK_WITH_CURSOR(i)` = bit i).
+/// nouveau's core UPDATE carries it whenever a cursor changes (`corec37d_update`), and the cursor channel then gets its own UPDATE (`cursc37a_update`). A window
+/// state change without its interlock raised INVALID_STATE too (Ryzen #89), so the cursor's enable (INVALID_STATE code 0x43, #204-#206) may be the same.
+pub const fn core_interlock_with_cursor(h: u32) -> u32 {
+    1 << h
+}
+
+/// Only the cursor channel's UPDATE (`cursc37a_update`), after a core push that interlocked with it.
+pub fn update(m: &dyn Mmio, head: u32) -> Result<(), CursorError> {
+    let base = chan(head).user_base();
+    if !evo::wait(m, || m.rd32(base + USER_FREE) & 0x3f >= 1) {
+        return Err(CursorError::NoRoom(m.rd32(base + USER_FREE)));
+    }
+    m.wr32(base + USER_UPDATE, UPDATE_RELEASE_ELV);
+    Ok(())
+}
+
 /// The only core methods `/dev/dispctl cursor raw` may push for `head`: the five the cursor uses and the OLUT context DMA control (a debugging ladder, one
 /// method per push).
 pub fn core_method_allowed(head: u32, method: u32) -> bool {
@@ -134,6 +151,7 @@ pub fn core_method_allowed(head: u32, method: u32) -> bool {
         core_control(head),
         core_composition(head),
         core_olut_context_dma(head),
+        evo::CORE_SET_INTERLOCK_FLAGS,
     ]
     .contains(&method)
 }
@@ -309,7 +327,7 @@ mod tests {
             assert!(core_method_allowed(1, m), "{m:#x}");
             assert!(!core_method_allowed(0, m), "{m:#x}");
         }
-        for m in [0x200, 0x218, 0x2034, 0x2084, 0x2084, 0x20a4, 0x300, 0x2284, 0x228c, 0x2080, 0x209d] {
+        for m in [0x200, 0x21c, 0x2034, 0x2084, 0x2084, 0x20a4, 0x300, 0x2284, 0x228c, 0x2080, 0x209d] {
             assert!(!core_method_allowed(0, m), "{m:#x}");
         }
     }
@@ -373,6 +391,19 @@ mod tests {
         assert_eq!(m.regs.borrow()[&0x611dac], 0x30001);
         intr(&m, 0, false);
         assert_eq!(m.regs.borrow()[&0x611dac], 0x20001); // only head 0's bit, the core's stays
+    }
+
+    #[test]
+    fn the_interlock_with_the_cursor_is_bit_head() {
+        assert_eq!(core_interlock_with_cursor(0), 1);
+        assert_eq!(core_interlock_with_cursor(1), 2);
+        assert!(core_method_allowed(0, 0x218) && core_method_allowed(1, 0x218));
+        let m = Sim::new(true);
+        update(&m, 0).unwrap();
+        assert_eq!(*m.writes.borrow(), alloc::vec![(0x6d8200, 1)]);
+        let full = Sim { free: 0, ..Sim::new(true) };
+        assert_eq!(update(&full, 0), Err(CursorError::NoRoom(0)));
+        assert!(full.writes.borrow().is_empty());
     }
 
     #[test]

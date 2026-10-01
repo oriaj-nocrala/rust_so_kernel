@@ -44,31 +44,27 @@ echo 'cursor probe' > /dev/dispctl && sum "gpu-cursor-ladder: channel allocated:
 # Ryzen #204/#205: with the context DMA resolved (step 5), enabling the cursor raised INVALID_STATE (slot 0x5080 data 1 code 0x43; UPDATE), also with the
 # cursor channel positioned first and with nouveau's whole curs_set in one push. NVIDIA's own driver (nvkms-evo3.c EvoSetCursorImageC3) also pushes
 # PRESENT_CONTROL_CURSOR (0x2098 = MONO) and the context DMA and offset of the second slot (0x208c, 0x2094) ("HW ignores it unless stereo", but validation may not).
-# Variants, each recovered from (`cursor recover` clears the exception slot as nouveau does) so the next one runs in the same boot:
-#   6a  the second slot + present control one method at a time, the cursor channel's UPDATE, then the enable alone
-#   6b  NVIDIA's whole set in one push (`cursor on 32 nb`: present control, both slots, control, composition) + UPDATE
 variants() {
 step 53 context-dma-slot1 0x208c 0xf0000001
 step 54 offset-slot1 0x2094 0x50000
 step 55 present-control-mono 0x2098 0
 [ $stopped = 1 ] && return
-echo "cursor move 100 100" > /dev/dispctl && sum "gpu-cursor-ladder: channel positioned (its own UPDATE)" || { sum "gpu-cursor-ladder: move FAILED"; fail=1; }
+# Ryzen #206: still INVALID_STATE code 0x43 with both slots and the present control. nouveau's core UPDATE carries SET_INTERLOCK_FLAGS (0x218) = the head's
+# cursor bit whenever a cursor changes and the cursor channel then gets its own UPDATE; a window's first update without its interlock raised the same
+# exception (#89). `il` pushes the flag with the method and sends the cursor channel's UPDATE right after the push.
 enabled=0
-if echo "cursor raw 0x209c 0x800000cf" > /dev/dispctl; then enabled=1; sum "gpu-cursor-ladder: 6a enable after the channel's UPDATE: idle again, ENABLED"
+if echo "cursor raw 0x209c 0x800000cf il" > /dev/dispctl; then enabled=1; sum "gpu-cursor-ladder: 6c enable interlocked with the cursor channel: idle again, ENABLED"
 else
-  sum "gpu-cursor-ladder: 6a enable after the channel's UPDATE: failed"; sum "gpu-cursor-ladder: 6a: $(rawlog)"; sum "gpu-cursor-ladder: 6a: $(st2)"
-  if echo "cursor recover" > /dev/dispctl; then sum "gpu-cursor-ladder: recovered: $(grep -a 'cursor: recover' /proc/gpu | tail -n 1 | cut -c1-300)"
-  else sum "gpu-cursor-ladder: recover FAILED: $(grep -a 'cursor: recover' /proc/gpu | tail -n 1 | cut -c1-300)"; stopped=1; fi
-  if [ $stopped = 0 ]; then
-    if echo "cursor on 32 nb" > /dev/dispctl; then enabled=1; sum "gpu-cursor-ladder: 6b whole curs_set in one push: ENABLED"
-    else
-      sum "gpu-cursor-ladder: 6b whole curs_set in one push: failed"; sum "gpu-cursor-ladder: 6b: $(grep -a 'cursor: the core did not latch' /proc/gpu | tail -n 1 | cut -c1-400)"; sum "gpu-cursor-ladder: 6b: $(st2)"
-      echo "cursor recover" > /dev/dispctl; sum "gpu-cursor-ladder: recovered: $(grep -a 'cursor: recover' /proc/gpu | tail -n 1 | cut -c1-300)"
-      stopped=1; fail=1
-    fi
-  else fail=1; fi
+  sum "gpu-cursor-ladder: 6c enable interlocked with the cursor channel: failed"; sum "gpu-cursor-ladder: 6c: $(rawlog)"; sum "gpu-cursor-ladder: 6c: $(st2)"
+  echo "cursor recover" > /dev/dispctl; sum "gpu-cursor-ladder: recovered: $(grep -a 'cursor: recover' /proc/gpu | tail -n 1 | cut -c1-300)"
+  fail=1
 fi
-[ $enabled = 1 ] || stopped=1
+if [ $enabled = 1 ]; then
+  # the flag persists in the core's ASSEMBLY state: reset it
+  echo "cursor raw 0x218 0" > /dev/dispctl && sum "gpu-cursor-ladder: interlock flags reset" || { sum "gpu-cursor-ladder: interlock reset FAILED"; fail=1; }
+else
+  stopped=1
+fi
 sum "gpu-cursor-ladder: after the enable attempts: $(st)"
 }
 [ $stopped = 0 ] && variants
