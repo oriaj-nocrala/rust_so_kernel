@@ -44,6 +44,19 @@ pub const fn core_context_dma(h: u32) -> u32 {
 pub const fn core_offset(h: u32) -> u32 {
     0x2090 + h * 0x400
 }
+/// The second ("right eye", stereo) slot of the context DMA and the offset (`clc67d.h:855-858`: the `(a, b)` index adds `b * 4`), and
+/// `HEAD_SET_PRESENT_CONTROL_CURSOR` (`clc67d.h:859`, MONO = 0). nouveau pushes only slot 0; NVIDIA's own driver pushes the present control and BOTH slots
+/// ("HW will just ignore this if it is not in stereo cursor mode", `nvkms-evo3.c:6520-6544`). Ryzen #204/#205: enabling with slot 1 left at 0 raised
+/// INVALID_STATE (code 0x43).
+pub const fn core_context_dma_right(h: u32) -> u32 {
+    0x208c + h * 0x400
+}
+pub const fn core_offset_right(h: u32) -> u32 {
+    0x2094 + h * 0x400
+}
+pub const fn core_present_control(h: u32) -> u32 {
+    0x2098 + h * 0x400
+}
 pub const fn core_control(h: u32) -> u32 {
     0x209c + h * 0x400
 }
@@ -84,18 +97,21 @@ pub fn control(size: u32, hot_x: u32, hot_y: u32) -> Option<u32> {
 pub const COMPOSITION: u32 = 0xff | 2 << 8 | 7 << 12;
 
 /// The core methods that turn the cursor of `head` on with the image at `vram` (256-byte aligned) through the context DMA `handle`: usage bounds first, then
-/// what `headc37d_curs_set` pushes, in its order (control, composition, context DMA, offset >> 8). `None` if the image's size or hot spot is not valid
-/// or the address is not aligned.
+/// what NVIDIA's `EvoSetCursorImageC3` pushes (`nvkms-evo3.c:6546-6625`): present control MONO, the context DMA and the offset in BOTH slots, control,
+/// composition. `None` if the image's size or hot spot is not valid or the address is not aligned.
 pub fn core_methods_set(head: u32, handle: u32, vram: u64, size: u32, hot_x: u32, hot_y: u32) -> Option<Vec<(u32, u32)>> {
     if vram & 0xff != 0 || (vram >> 8) > u32::MAX as u64 {
         return None;
     }
     Some(alloc::vec![
         (core_usage_bounds(head), USAGE_BOUNDS),
+        (core_present_control(head), 0),
+        (core_context_dma(head), handle),
+        (core_context_dma_right(head), handle),
+        (core_offset(head), (vram >> 8) as u32),
+        (core_offset_right(head), (vram >> 8) as u32),
         (core_control(head), control(size, hot_x, hot_y)?),
         (core_composition(head), COMPOSITION),
-        (core_context_dma(head), handle),
-        (core_offset(head), (vram >> 8) as u32),
     ])
 }
 
@@ -108,7 +124,18 @@ pub const fn core_olut_context_dma(h: u32) -> u32 {
 /// The only core methods `/dev/dispctl cursor raw` may push for `head`: the five the cursor uses and the OLUT context DMA control (a debugging ladder, one
 /// method per push).
 pub fn core_method_allowed(head: u32, method: u32) -> bool {
-    [core_usage_bounds(head), core_context_dma(head), core_offset(head), core_control(head), core_composition(head), core_olut_context_dma(head)].contains(&method)
+    [
+        core_usage_bounds(head),
+        core_context_dma(head),
+        core_context_dma_right(head),
+        core_offset(head),
+        core_offset_right(head),
+        core_present_control(head),
+        core_control(head),
+        core_composition(head),
+        core_olut_context_dma(head),
+    ]
+    .contains(&method)
 }
 
 /// What `headc37d_curs_clr` pushes: disabled (format kept), context DMA 0 (`headc37d.c:104-119`).
@@ -233,19 +260,32 @@ mod tests {
 
     #[test]
     fn core_methods_match_what_nouveau_pushes() {
-        // headc37d_curs_set for head 0, ARGB8888, 64x64 (layout 1), hot spot 0: control 0x800000cf | 1 << 8, composition 0x72ff, ctxdma, offset >> 8.
+        // NVIDIA's EvoSetCursorImageC3 for head 0, ARGB8888, 64x64 (layout 1), hot spot 0: present control MONO, ctxdma and offset >> 8 in both slots, control
+        // 0x800000cf | 1 << 8, composition 0x72ff.
         let m = core_methods_set(0, 0xfb00_0001, 0x38_0000, 64, 0, 0).unwrap();
         assert_eq!(
             m,
-            alloc::vec![(0x2030, 0x1114), (0x209c, 0x8000_01cf), (0x20a0, 0x72ff), (0x2088, 0xfb00_0001), (0x2090, 0x3800)]
+            alloc::vec![
+                (0x2030, 0x1114),
+                (0x2098, 0),
+                (0x2088, 0xfb00_0001),
+                (0x208c, 0xfb00_0001),
+                (0x2090, 0x3800),
+                (0x2094, 0x3800),
+                (0x209c, 0x8000_01cf),
+                (0x20a0, 0x72ff)
+            ]
         );
         // head 1 adds 0x400 to every method; 256x256 with a hot spot
         let m = core_methods_set(1, 7, 0x100, 256, 3, 5).unwrap();
         assert_eq!(m[0], (0x2430, 0x1114));
-        assert_eq!(m[1], (0x249c, 0x8000_0000 | 0xcf | 3 << 8 | 3 << 12 | 5 << 20));
-        assert_eq!(m[2].0, 0x24a0);
-        assert_eq!(m[3], (0x2488, 7));
+        assert_eq!(m[1], (0x2498, 0));
+        assert_eq!(m[2], (0x2488, 7));
+        assert_eq!(m[3], (0x248c, 7));
         assert_eq!(m[4], (0x2490, 1));
+        assert_eq!(m[5], (0x2494, 1));
+        assert_eq!(m[6], (0x249c, 0x8000_0000 | 0xcf | 3 << 8 | 3 << 12 | 5 << 20));
+        assert_eq!(m[7].0, 0x24a0);
     }
 
     #[test]
@@ -262,14 +302,14 @@ mod tests {
 
     #[test]
     fn raw_pushes_are_limited_to_the_cursors_methods_of_that_head() {
-        for m in [0x2030, 0x2088, 0x2090, 0x209c, 0x20a0, 0x2288] {
+        for m in [0x2030, 0x2088, 0x208c, 0x2090, 0x2094, 0x2098, 0x209c, 0x20a0, 0x2288] {
             assert!(core_method_allowed(0, m), "{m:#x}");
         }
-        for m in [0x2430, 0x2488, 0x2490, 0x249c, 0x24a0, 0x2688] {
+        for m in [0x2430, 0x2488, 0x248c, 0x2490, 0x2494, 0x2498, 0x249c, 0x24a0, 0x2688] {
             assert!(core_method_allowed(1, m), "{m:#x}");
             assert!(!core_method_allowed(0, m), "{m:#x}");
         }
-        for m in [0x200, 0x218, 0x2034, 0x2084, 0x2094, 0x2098, 0x20a4, 0x300, 0x2284, 0x228c] {
+        for m in [0x200, 0x218, 0x2034, 0x2084, 0x2084, 0x20a4, 0x300, 0x2284, 0x228c, 0x2080, 0x209d] {
             assert!(!core_method_allowed(0, m), "{m:#x}");
         }
     }

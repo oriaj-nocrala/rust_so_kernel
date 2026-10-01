@@ -41,11 +41,17 @@ step 4 usage-bounds 0x2030 0x1114
 # DMA lookup hung because the instance memory was in GSP's reserved top of VRAM; it now lives at 256 MiB (`evo::INST_VRAM`).
 step 5 cursor-context-dma 0x2088 0xf0000001
 echo 'cursor probe' > /dev/dispctl && sum "gpu-cursor-ladder: channel allocated: $(st)" || { sum "gpu-cursor-ladder: probe FAILED"; fail=1; }
-# Ryzen #204: with the context DMA resolved (step 5), enabling the cursor raised INVALID_STATE (slot 0x5080 data 1 code 0x43; UPDATE). Variants, each recovered
-# from (`cursor recover` clears the exception slot as nouveau does) so the next one runs in the same boot:
-#   6a  the cursor channel gets a position + UPDATE first (its own state may have to be valid before the core enables it), then the enable alone
-#   6b  nouveau's whole `curs_set` in one push (control enable, composition, context DMA, offset) + UPDATE, usage bounds left as they are
+# Ryzen #204/#205: with the context DMA resolved (step 5), enabling the cursor raised INVALID_STATE (slot 0x5080 data 1 code 0x43; UPDATE), also with the
+# cursor channel positioned first and with nouveau's whole curs_set in one push. NVIDIA's own driver (nvkms-evo3.c EvoSetCursorImageC3) also pushes
+# PRESENT_CONTROL_CURSOR (0x2098 = MONO) and the context DMA and offset of the second slot (0x208c, 0x2094) ("HW ignores it unless stereo", but validation may not).
+# Variants, each recovered from (`cursor recover` clears the exception slot as nouveau does) so the next one runs in the same boot:
+#   6a  the second slot + present control one method at a time, the cursor channel's UPDATE, then the enable alone
+#   6b  NVIDIA's whole set in one push (`cursor on 32 nb`: present control, both slots, control, composition) + UPDATE
 variants() {
+step 53 context-dma-slot1 0x208c 0xf0000001
+step 54 offset-slot1 0x2094 0x50000
+step 55 present-control-mono 0x2098 0
+[ $stopped = 1 ] && return
 echo "cursor move 100 100" > /dev/dispctl && sum "gpu-cursor-ladder: channel positioned (its own UPDATE)" || { sum "gpu-cursor-ladder: move FAILED"; fail=1; }
 enabled=0
 if echo "cursor raw 0x209c 0x800000cf" > /dev/dispctl; then enabled=1; sum "gpu-cursor-ladder: 6a enable after the channel's UPDATE: idle again, ENABLED"
