@@ -62,6 +62,50 @@ pub fn session_va(slot: usize) -> (u64, u64) {
     (start, start + SESSION_VA_BYTES)
 }
 
+// ---- explaining a fault -----------------------------------------------------------------------------------------------------
+
+/// One bind or unbind of GPU virtual addresses, kept by the kernel in a ring (the latest few hundred) so a fault RM reports can be placed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VaEvent {
+    pub bind: bool,
+    pub va: u64,
+    pub size: u64,
+    pub at_ms: u64,
+}
+
+/// Where a faulting address `addr` sits, from `log` (oldest first): its session slice, and the latest event that covered it (bound and still
+/// bound, or bound and then unbound), else the nearest mapped ranges around it. Text for a log line.
+pub fn describe_va(log: &[VaEvent], addr: u64) -> alloc::string::String {
+    use alloc::format;
+    let slice = if (USER_VA_START..USER_VA_END).contains(&addr) {
+        let slot = (addr - USER_VA_START) / SESSION_VA_BYTES;
+        format!("session slice {} (+{:#x})", slot, (addr - USER_VA_START) % SESSION_VA_BYTES)
+    } else {
+        alloc::string::String::from("outside the user range")
+    };
+    // the latest event that covers the address
+    if let Some(e) = log.iter().rev().find(|e| e.va <= addr && addr < e.va + e.size) {
+        return if e.bind {
+            format!("{}: inside {:#x}+{:#x} bound at {} ms and not unbound since (a page the bind did not map?)", slice, e.va, e.size, e.at_ms)
+        } else {
+            format!("{}: inside {:#x}+{:#x} UNBOUND at {} ms (used after the unbind)", slice, e.va, e.size, e.at_ms)
+        };
+    }
+    // never covered: the closest bound extents on each side (a bind whose own unbind came later is not mapped any more, so replay the log)
+    let mut live: alloc::vec::Vec<(u64, u64, u64)> = alloc::vec::Vec::new();
+    for e in log {
+        if e.bind {
+            live.push((e.va, e.size, e.at_ms));
+        } else {
+            live.retain(|&(v, s, _)| !(v >= e.va && v + s <= e.va + e.size));
+        }
+    }
+    let below = live.iter().filter(|l| l.0 + l.1 <= addr).max_by_key(|l| l.0 + l.1);
+    let above = live.iter().filter(|l| l.0 > addr).min_by_key(|l| l.0);
+    let fmt = |l: Option<&(u64, u64, u64)>| l.map_or(alloc::string::String::from("none"), |l| format!("{:#x}+{:#x} (bound at {} ms)", l.0, l.1, l.2));
+    format!("{}: never mapped in the last {} events; live below: {}; above: {}", slice, log.len(), fmt(below), fmt(above))
+}
+
 // ---- page tables at run time ------------------------------------------------------------------------------------------------
 
 /// Where the pages of a bind come from.
@@ -848,5 +892,24 @@ mod tests {
     #[should_panic(expected = "slot out of range")]
     fn session_va_refuses_a_slot_past_the_end() {
         session_va(SESSIONS);
+    }
+
+    #[test]
+    fn describe_va_places_a_fault_among_the_latest_binds() {
+        let s1 = USER_VA_START + SESSION_VA_BYTES; // session slice 1
+        let log = [
+            VaEvent { bind: true, va: s1, size: 0x10000, at_ms: 10 },
+            VaEvent { bind: true, va: s1 + 0x100000, size: 0x2000, at_ms: 11 },
+            VaEvent { bind: false, va: s1 + 0x100000, size: 0x2000, at_ms: 20 },
+            VaEvent { bind: true, va: s1 + 0x400000, size: 0x1000, at_ms: 21 },
+        ];
+        let d = describe_va(&log, s1 + 0x8000);
+        assert!(d.contains("session slice 1") && d.contains("not unbound since"), "{d}");
+        let d = describe_va(&log, s1 + 0x100800);
+        assert!(d.contains("UNBOUND at 20 ms"), "{d}");
+        let d = describe_va(&log, s1 + 0x200000);
+        assert!(d.contains("never mapped") && d.contains("below: ") && d.contains("above: ") && d.contains("bound at 21 ms"), "{d}");
+        assert!(!d.contains("bound at 11 ms"), "an unbound range is not live: {d}");
+        assert!(describe_va(&[], 0x1000).contains("outside the user range"));
     }
 }

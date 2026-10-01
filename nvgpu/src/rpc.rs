@@ -40,6 +40,51 @@ pub fn rc_chid(payload: &[u8]) -> Option<u32> {
     (payload.len() >= 8).then(|| u32::from_le_bytes(payload[4..8].try_into().unwrap()))
 }
 
+/// A payload for a log line: its length, the first `max_words` little-endian u32 words in hex, and every run of at least 4 printable ASCII
+/// bytes (RM's `OS_ERROR_LOG` and `POST_NOCAT_RECORD` carry the error as text, `RC_TRIGGERED` and `MMU_FAULT_QUEUED` as words: engine, chid,
+/// fault address and type). Pure, so it is tested here and the kernel only prints it.
+pub fn payload_summary(payload: &[u8], max_words: usize) -> alloc::string::String {
+    use core::fmt::Write;
+    let mut out = alloc::string::String::new();
+    let _ = write!(out, "{} bytes, words:", payload.len());
+    for w in payload.chunks(4).take(max_words) {
+        let mut b = [0u8; 4];
+        b[..w.len()].copy_from_slice(w);
+        let _ = write!(out, " {:#x}", u32::from_le_bytes(b));
+    }
+    if payload.len() > 4 * max_words {
+        out.push_str(" ...");
+    }
+    let mut run = alloc::string::String::new();
+    let mut texts = 0;
+    let mut flush = |run: &mut alloc::string::String, out: &mut alloc::string::String| {
+        if run.len() >= 4 && texts < 6 {
+            let _ = write!(out, "; text \"{}\"", run);
+            texts += 1;
+        }
+        run.clear();
+    };
+    for &c in payload {
+        if (0x20..0x7f).contains(&c) {
+            if run.len() < 120 {
+                run.push(c as char);
+            }
+        } else {
+            flush(&mut run, &mut out);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
+/// What an `RC_TRIGGERED` payload says about the fault (`rpc_rc_triggered_v17_02`: engine, chid, gfid, exceptLevel, exceptType, scope,
+/// partitionAttributionId (u16, padded), mmuFaultAddrLo, mmuFaultAddrHi, mmuFaultType, ...): `(exceptType, fault address, mmuFaultType)`.
+/// exceptType 31 is Xid 31, a GPU MMU fault; mmuFaultType 0 is "PDE" (nothing mapped there at all), 1 "PTE" (not valid), 2 a range violation...
+pub fn rc_fault(payload: &[u8]) -> Option<(u32, u64, u32)> {
+    let w = |i: usize| payload.get(4 * i..4 * i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    Some((w(4)?, (u64::from(w(8)?) << 32) | u64::from(w(7)?), w(9)?))
+}
+
 pub fn event_name(function: u32) -> &'static str {
     match function {
         EVENT_GSP_INIT_DONE => "INIT_DONE",
@@ -1211,5 +1256,32 @@ mod tests {
         p[4..8].copy_from_slice(&5u32.to_le_bytes());
         assert_eq!(rc_chid(&p), Some(5));
         assert_eq!(rc_chid(&p[..7]), None);
+    }
+
+    #[test]
+    fn payload_summary_shows_words_and_the_text_of_an_error_log() {
+        let mut p = alloc::vec::Vec::new();
+        p.extend_from_slice(&1u32.to_le_bytes());
+        p.extend_from_slice(&3u32.to_le_bytes());
+        p.extend_from_slice(b"Xid 31: MMU fault at 0xdeadb000\0\0\0");
+        p.extend_from_slice(&[7, 0, 0xff]);
+        let s = payload_summary(&p, 2);
+        assert!(s.starts_with(&alloc::format!("{} bytes, words: 0x1 0x3 ...", p.len())), "{s}");
+        assert!(s.contains("text \"Xid 31: MMU fault at 0xdeadb000\""), "{s}");
+        // a short payload is padded with zeros, not read past its end; no text, no text part
+        assert_eq!(payload_summary(&[1, 2, 3], 4), "3 bytes, words: 0x30201");
+        assert_eq!(payload_summary(&[], 4), "0 bytes, words:");
+        // short runs of printable bytes are noise
+        assert!(!payload_summary(b"ab\0cd\0", 0).contains("text"));
+    }
+
+    #[test]
+    fn rc_fault_reads_the_exception_the_address_and_the_fault_type() {
+        // Ryzen #187: GR0, chid 1, gfid 0, level 2, Xid 31, scope 1, partition 0xe9, address 0x14_792a7000, type 0
+        let words: [u32; 12] = [1, 1, 0, 2, 0x1f, 1, 0xe9, 0x792a7000, 0x14, 0, 1, 0x2658];
+        let p: alloc::vec::Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(rc_chid(&p), Some(1));
+        assert_eq!(rc_fault(&p), Some((31, 0x14_792a_7000, 0)));
+        assert_eq!(rc_fault(&p[..36]), None, "a payload that stops before the fault type says nothing");
     }
 }

@@ -796,8 +796,21 @@ fn drain(rt: &mut Runtime) -> usize {
             rt.stats.log.pop_front();
         }
         rt.stats.log.push_back((m.function, m.payload.len()));
+        // what RM says about an error (the words of an RC / MMU fault, the text of an error log): the reason a channel died, which
+        // `[nvgpu] channel .. is dead` alone does not know. The first few only: a faulting client can repeat them for ever.
+        if matches!(
+            m.function,
+            rpc::EVENT_RC_TRIGGERED | rpc::EVENT_MMU_FAULT_QUEUED | rpc::EVENT_OS_ERROR_LOG | rpc::EVENT_GSP_POST_NOCAT_RECORD
+        ) && ERROR_EVENTS_LOGGED.fetch_add(1, Ordering::Relaxed) < 32
+        {
+            crate::serial_println!("[gsp] event {} ({:#x}): {}", rpc::event_name(m.function), m.function, rpc::payload_summary(&m.payload, 24));
+        }
         if m.function == rpc::EVENT_RC_TRIGGERED {
             RC_EVENTS.fetch_add(1, Ordering::Release);
+            if let Some((except, addr, kind)) = rpc::rc_fault(&m.payload) {
+                RC_FAULT.store(addr, Ordering::Release);
+                RC_FAULT_INFO.store(((kind as u64) << 32) | except as u64 | (1 << 63), Ordering::Release);
+            }
             // which channel: one bit per hardware chid; bit 63 when the payload does not say
             let bit = rpc::rc_chid(&m.payload).map_or(63, |c| c & 63);
             RC_MASK.fetch_or(1u64 << bit, Ordering::Release);
@@ -813,6 +826,19 @@ fn drain(rt: &mut Runtime) -> usize {
     }
     n
 }
+
+/// The fault address and `(mmuFaultType << 32) | exceptType` of the latest `RC_TRIGGERED` (bit 63 of the second: one was seen).
+static RC_FAULT: AtomicU64 = AtomicU64::new(0);
+static RC_FAULT_INFO: AtomicU64 = AtomicU64::new(0);
+
+/// `(exceptType, fault address, mmuFaultType)` of the latest `RC_TRIGGERED`, if there was one.
+pub(super) fn last_rc_fault() -> Option<(u32, u64, u32)> {
+    let info = RC_FAULT_INFO.load(Ordering::Acquire);
+    (info >> 63 != 0).then(|| (info as u32, RC_FAULT.load(Ordering::Acquire), ((info >> 32) & 0x7fff_ffff) as u32))
+}
+
+/// Error events whose payload was printed (`drain`).
+static ERROR_EVENTS_LOGGED: AtomicU64 = AtomicU64::new(0);
 
 /// Events read so far (a run-time counter, lock-free for a test that waits for one).
 static EVENTS_SEEN: AtomicU64 = AtomicU64::new(0);

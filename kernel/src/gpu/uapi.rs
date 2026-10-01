@@ -304,6 +304,9 @@ impl Chan {
 }
 
 struct Hw {
+    /// The latest binds and unbinds of GPU virtual addresses (oldest first, at most [`VA_LOG_MAX`]): what explains a fault RM reports
+    /// (`hwq::describe_va`).
+    va_log: Vec<hwq::VaEvent>,
     regs: Bar0,
     bar1: u64,
     pt: PageTables,
@@ -352,6 +355,9 @@ static TLB_US_MAX: AtomicU64 = AtomicU64::new(0);
 static TABLES_WRITTEN: AtomicU64 = AtomicU64::new(0);
 static DEAD: AtomicU32 = AtomicU32::new(0);
 static CHANS_DEAD: AtomicU64 = AtomicU64::new(0);
+
+/// Binds and unbinds `Hw::va_log` keeps.
+const VA_LOG_MAX: usize = 256;
 static CHANS_MADE: AtomicU64 = AtomicU64::new(0);
 /// The last run-time channel creation that failed, for /proc/kdebug.
 static LAST_ERR: spin::Mutex<String> = spin::Mutex::new(String::new());
@@ -501,6 +507,7 @@ pub(super) fn install(r: &mut String, regs: &Bar0, mut pt: PageTables, ch: Chann
         grcopy: ch.copy,
         topo: ch.topo,
         host: ch.host,
+        va_log: Vec::new(),
         dead: false,
         rt_reserved: 0,
         rc_pending: 0,
@@ -530,6 +537,13 @@ pub fn dead() -> bool {
 }
 
 impl Hw {
+    fn log_va(&mut self, bind: bool, va: u64, size: u64) {
+        if self.va_log.len() == VA_LOG_MAX {
+            self.va_log.remove(0);
+        }
+        self.va_log.push(hwq::VaEvent { bind, va, size, at_ms: crate::time::ktime_get() / 1_000_000 });
+    }
+
     /// The whole device is wedged.
     fn mark_dead(&mut self, why: &str) {
         if !self.dead {
@@ -553,7 +567,12 @@ impl Hw {
             // nothing told us the GPU stopped touching its memory
             self.leak = true;
         }
-        crate::serial_println!("[nvgpu] channel {} (chid {}) is dead: {}", id, c.chid, why);
+        let chid = c.chid;
+        // RM said it was a fault: where was the address
+        let fault = super::gsp::last_rc_fault().filter(|_| !hung).map(|(except, addr, kind)| {
+            alloc::format!("; exception {} (31 = MMU fault), mmu fault type {} (0 = no PDE, 1 = PTE not valid), address {:#x}: {}", except, kind, addr, hwq::describe_va(&self.va_log, addr))
+        });
+        crate::serial_println!("[nvgpu] channel {} (chid {}) is dead: {}{}", id, chid, why, fault.as_deref().unwrap_or(""));
         crate::kalert!("nvgpu: a GPU channel was lost ({})", why);
     }
 
@@ -912,6 +931,7 @@ pub fn bind(arena: &ShmObject, va: u64, size: u64, backing: Backing, bo_off: u64
             return Err(e);
         }
         BINDS.fetch_add(1, Ordering::Relaxed);
+        hw.log_va(true, va, size);
         PAGES_BOUND.fetch_add(size / 0x1000, Ordering::Relaxed);
         if !hw.publish_tables() {
             return Err(Error::Io);
@@ -935,6 +955,7 @@ pub fn unbind(va: u64, size: u64) {
     }
     hwq::unbind_range(&mut hw.pt, va, size);
     UNBINDS.fetch_add(1, Ordering::Relaxed);
+    hw.log_va(false, va, size);
     let flushed = hw.publish_tables();
     if flushed && !hw.leak {
         for pa in frames {
