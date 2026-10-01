@@ -160,6 +160,25 @@ pub fn clear_interlock(m: &dyn Mmio, head: u32) {
     m.wr32(chan(head).user_base() + USER_INTERLOCK_FLAGS, 0);
 }
 
+/// What `hdmi::head_methods` pushes for head 1 and nobody pushes for head 0 (whose state is the GOP's): the head's procamp and dither control
+/// (`clc67d.h:489,705`) and the usage bounds of its window (`clc67d.h:364,416,471`; head `h` scans out window `2h`). Ryzen #212: the cursor enables on head 1,
+/// which this driver programs whole, and raises INVALID_STATE (code 0x43) on head 0.
+pub const fn core_procamp(h: u32) -> u32 {
+    0x2000 + h * 0x400
+}
+pub const fn core_dither(h: u32) -> u32 {
+    0x2018 + h * 0x400
+}
+pub const fn window_usage_format(h: u32) -> u32 {
+    0x1004 + 2 * h * 0x80
+}
+pub const fn window_usage_rotated(h: u32) -> u32 {
+    0x1008 + 2 * h * 0x80
+}
+pub const fn window_usage(h: u32) -> u32 {
+    0x1010 + 2 * h * 0x80
+}
+
 /// The only core methods `/dev/dispctl cursor raw` may push for `head`: the five the cursor uses and the OLUT context DMA control (a debugging ladder, one
 /// method per push).
 pub fn core_method_allowed(head: u32, method: u32) -> bool {
@@ -174,6 +193,11 @@ pub fn core_method_allowed(head: u32, method: u32) -> bool {
         core_composition(head),
         core_olut_context_dma(head),
         evo::CORE_SET_INTERLOCK_FLAGS,
+        core_procamp(head),
+        core_dither(head),
+        window_usage_format(head),
+        window_usage_rotated(head),
+        window_usage(head),
     ]
     .contains(&method)
 }
@@ -342,14 +366,14 @@ mod tests {
 
     #[test]
     fn raw_pushes_are_limited_to_the_cursors_methods_of_that_head() {
-        for m in [0x2030, 0x2088, 0x208c, 0x2090, 0x2094, 0x2098, 0x209c, 0x20a0, 0x2288] {
+        for m in [0x2030, 0x2088, 0x208c, 0x2090, 0x2094, 0x2098, 0x209c, 0x20a0, 0x2288, 0x2000, 0x2018, 0x1004, 0x1008, 0x1010] {
             assert!(core_method_allowed(0, m), "{m:#x}");
         }
-        for m in [0x2430, 0x2488, 0x248c, 0x2490, 0x2494, 0x2498, 0x249c, 0x24a0, 0x2688] {
+        for m in [0x2430, 0x2488, 0x248c, 0x2490, 0x2494, 0x2498, 0x249c, 0x24a0, 0x2688, 0x2400, 0x2418, 0x1104, 0x1108, 0x1110] {
             assert!(core_method_allowed(1, m), "{m:#x}");
             assert!(!core_method_allowed(0, m), "{m:#x}");
         }
-        for m in [0x200, 0x21c, 0x2034, 0x2084, 0x2084, 0x20a4, 0x300, 0x2284, 0x228c, 0x2080, 0x209d] {
+        for m in [0x200, 0x21c, 0x2034, 0x2084, 0x2084, 0x20a4, 0x300, 0x2284, 0x228c, 0x2080, 0x209d, 0x2004, 0x201c, 0x1000, 0x1100, 0x100c, 0x1014] {
             assert!(!core_method_allowed(0, m), "{m:#x}");
         }
     }

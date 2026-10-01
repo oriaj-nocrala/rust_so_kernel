@@ -45,19 +45,32 @@ echo 'cursor probe' > /dev/dispctl && sum "gpu-cursor-ladder: channel allocated:
 # cursor channel positioned first and with nouveau's whole curs_set in one push. NVIDIA's own driver (nvkms-evo3.c EvoSetCursorImageC3) also pushes
 # PRESENT_CONTROL_CURSOR (0x2098 = MONO) and the context DMA and offset of the second slot (0x208c, 0x2094) ("HW ignores it unless stereo", but validation may not).
 variants() {
-# Ryzen #204-#210 (also at gpu=hdmi, before the GSP): the enable alone raised INVALID_STATE code 0x43 in every variant; interlocked from one side the core waited for
-# ever. Variants not tried: the bounds only count after a mode switch. `onmode`: detach (supervisors), then ONE push with the cursor's whole set AND the SOR attach
-# (`Cmd::Mode`), wait for the supervisors and the latch. The screen goes dark for a moment.
+# Ryzen #212: the same cursor sequence ENABLES on head 1 (the HDMI head this driver programs whole: `hdmi::head_methods`), so what fails on head 0 is its inherited GOP
+# state. What head 1 gets that head 0 does not: HEAD_SET_PROCAMP (0x2000 = 0), HEAD_SET_DITHER_CONTROL (0x2018 = 0x10) and the usage bounds of its window
+# (WINDOW_SET_WINDOW_FORMAT_USAGE_BOUNDS 0x1004 = 0xf, ROTATED 0x1008 = 0, WINDOW_USAGE_BOUNDS 0x1010 = 0x117fff; head 0's window is 0). The GOP's values first
+# (head 0 ARMED at 0x688000 + method), then the enable, then the missing state added step by step with an enable attempt after each (a failed one is recovered).
+for o in 0x68a000 0x68a018 0x68a030 0x689004 0x689008 0x689010 0x689000 0x68a420 0x68a400 0x68a418 0x68a430 0x689104 0x689108 0x689110 0x689100; do echo "peek $o" > /dev/dispctl; done
+sum "gpu-cursor-ladder: ARMED head0 procamp/dither/bounds, window0 usage x3/owner, then head1 the same: $(grep -a '^peek:' /dev/dispctl | cut -c1-400)"
 enabled=0
-if echo "cursor onmode 32" > /dev/dispctl; then enabled=1; sum "gpu-cursor-ladder: 7 onmode (detach, cursor + attach in one push): ENABLED"
-else
-  sum "gpu-cursor-ladder: 7 onmode: failed: $(grep -a 'cursor: onmode failed' /proc/gpu | tail -n 1 | cut -c1-400)"
-  sum "gpu-cursor-ladder: 7: $(st2)"; sum "gpu-cursor-ladder: 7: $(grep -a '^dispctl' /dev/dispctl | cut -c1-300)"
-  echo "cursor recover" > /dev/dispctl; sum "gpu-cursor-ladder: recovered: $(grep -a 'cursor: recover' /proc/gpu | tail -n 1 | cut -c1-300)"
-  fail=1
+attempt() { # attempt <label>
+  if echo "cursor raw 0x209c 0x800000cf" > /dev/dispctl; then enabled=1; sum "gpu-cursor-ladder: $1: enable ENABLED"
+  else
+    sum "gpu-cursor-ladder: $1: enable failed: $(rawlog | cut -c1-300)"; sum "gpu-cursor-ladder: $1: $(st2)"
+    echo "cursor recover" > /dev/dispctl; sum "gpu-cursor-ladder: recovered: $(grep -a 'cursor: recover' /proc/gpu | tail -n 1 | cut -c1-200)"
+  fi
+}
+attempt "A baseline"
+if [ $enabled = 0 ]; then
+  echo "cursor raw 0x1004 0xf" > /dev/dispctl; echo "cursor raw 0x1008 0" > /dev/dispctl; echo "cursor raw 0x1010 0x117fff" > /dev/dispctl
+  sum "gpu-cursor-ladder: window 0 usage bounds pushed: $(st2)"
+  attempt "B + window 0 usage bounds"
 fi
-sum "gpu-cursor-ladder: gpu_super: $(grep -a '^gpu_super' /proc/kdebug | cut -c1-300)"
-[ $enabled = 1 ] || stopped=1
+if [ $enabled = 0 ]; then
+  echo "cursor raw 0x2000 0" > /dev/dispctl; echo "cursor raw 0x2018 0x10" > /dev/dispctl
+  sum "gpu-cursor-ladder: procamp and dither pushed: $(st2)"
+  attempt "C + procamp + dither"
+fi
+[ $enabled = 1 ] || { fail=1; stopped=1; }
 sum "gpu-cursor-ladder: after the enable attempts: $(st)"
 }
 [ $stopped = 0 ] && variants
