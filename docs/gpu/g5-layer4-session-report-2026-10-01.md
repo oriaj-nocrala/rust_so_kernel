@@ -7,7 +7,7 @@ and the *how we got there*. Status of the layer: `g5-layer4-handoff.md`. Plan: `
 
 Contents: 1 summary · 2 what was built · 3 the Ryzen runs · 4 bug: `comp.frag` helper lanes · 5 bug: block-cache lock · 6 QEMU TLB flake ·
 7 smaller defects · 8 open: cursor pacing · 9 tried and ruled out · 10 my mistakes · 11 deeper architecture problems · 12 harness and recipes ·
-13 test and sabotage ledger · 14 next steps.
+13 test and sabotage ledger · 14 next steps · **15 part 2 of the day (pacing, VRAM windows, damage rows, the hardware cursor, the instance-memory finding)**.
 
 ## 1. Summary
 
@@ -264,3 +264,37 @@ visible pattern. What the data says, honestly:
 6. **GPU isolation**: guard gap between session slices now; per-channel address spaces later.
 7. Make `qemu-debug.sh` default to 4 CPUs; give the jobs a per-job output file on the data partition; add the input counters to `gpu-apps.sh`.
 8. Explicit sync with shared timelines (`SYNC_EXPORT`), still untouched.
+
+
+## 15. Part 2 of the day (after the cursor question): what was measured, built, found and left open
+
+Everything below is committed (the last commits are `a448648` docs, `ba1a5b1` ladder job). The stick was deployed from that tree (section 15.6).
+
+### 15.1 Why the compositor ran at 30 fps (Ryzen #190-#193; `docs/gpu/hw-cursor-plan.md` sections 12-13)
+- The 30 fps lock of the load "cpumon + snake3d in a window" was **not** the pointer and not queueing behind the snake. The GPU's P-state falls to P8 under a light load (GSP-RM does the DVFS), the frame budget (`COMP_DELAY_MS` 2 ms + render + blit, `PRESENT` within ~9 ms of the previous flip) then overruns and every flip lands a vblank late.
+- New permanent instrument: `nvgpu::pacing` + `kernel/src/gpu/pacing.rs` (`/proc/kdebug` `gpu_pacing:` / `gpu_pacing_trace:`, `dispctl trace reset`, 12 mutants killed), job `gpu-comp-pacing.sh`.
+- Per frame at P0/P5/P8: render 1.8/3.4/6.8 ms, blit 0.13/1.0/2.3 ms, `PRESENT` ioctl 4-5 us. The control (snake alone) renders in 2.3 ms at P8 and makes 60 fps; **the CPU-drawn window (cpumon) was read from host memory by the fragment shader every frame (+4.3 ms at P8)**.
+- The user's decision, binding: **never pin the GPU clock high for the compositor's life** (peak watts all day). The answer is less work per frame.
+
+### 15.2 Fixes (compositor, `probes/nvk/comp_render.h`)
+1. CPU windows live in a **device-local VRAM buffer** and are copied from a staging buffer in the frame's command buffer only when their `version` moves (`COMP_CPU_HOST=1` = the old way, for A/B). Ryzen #194: the load went from 30 fps to ~55-60 fps with no clock change; render + blit 4.55 -> ~1.9 ms at P8.
+2. **Damage by comparison** (`comp_plan_upload`): a CPU shadow copy of each window; only the changed row ranges (up to 16, ranges closer than 4 rows merged) are copied. Ryzen #195: cpumon alone 4266 -> 1815 KiB per upload, 1.8 ms average per submission pair at P8 (whole-window copy to VRAM had made it 8-10 ms). The harness is pixel-exact in both modes and proves it by sabotage; `COMP quit` now prints the KiB uploaded.
+3. `COMP_DELAY_MS=0` changed nothing measurable.
+
+### 15.3 The hardware cursor (design: `docs/gpu/hw-cursor-plan.md`; state: its section 14)
+Phases 1-2 are done and **disabled by default**: the code lives behind `/dev/dispctl cursor ...` and nothing in the compositor calls it (the pointer is still the software quad). On head 1 (HDMI) the cursor enables and moves for 1-2 us; on head 0 (the ASUS on DP) the enable raises INVALID_STATE code 0x43 and every variant tried failed (list in the plan). Head 1 versus head 0 differ only by the head's dither, display id, usage bounds, output LUT, DSC control and window usage bounds, and none of them alone or together fixes it.
+
+### 15.4 The finding that matters beyond the cursor
+After the GSP-RM boots, **every core context DMA lookup hung** when the display's instance memory was where nouveau puts it (top of VRAM, inside the GSP's reserved region): `CHNSTATUS_CORE = 0xa20c0005`, `STG1_STATE = CTX_DMA_LOOKUP`. `evo::INST_VRAM` is now 104 MiB (the display ran fine from it in every run since, compositor regression #220). It had never shown because window flips do not look the handle up again.
+
+### 15.5 Reusable method learned
+- A display exception stays in ASSEMBLY; clear it with `0x611020 + chid*12 = 0x90000000` AND push the disabled state back.
+- Compare the ARMED state of a head that works with one that does not (`scripts/metal-jobs/gpu-head-diff.sh`) and the nouveau fixtures (`nvgpu/fixtures/modeset-core-round*.txt`, the `*` marks what nouveau changed) before guessing; NVIDIA's `open-gpu-kernel-modules/src/nvidia-modeset/src/nvkms-evo3.c` is a second reference next to nouveau.
+- One method per push finds which one the display rejects, but groups valid only whole (the output LUT) must go in one push (`cursor raw m v m v ...`).
+- **A job that passes because it did nothing is a trap** (Ryzen #203: `OK` with `/dev/dispctl does not open`): the ladder job now fails if `/proc/gpu` has a STOP.
+
+### 15.6 What is on the stick (2026-10-01, deployed by hand, no job pending)
+Kernel from commit `ba1a5b1` (stripped, boot-tested in QEMU, read back byte for byte), data partition synced (programs, `vk_comp`, `snake3d`, `cpumon`, fonts, `/mnt/etc/kernel.conf` = `gpu=uapi`). Try it: boot, in the shell `vk_comp cpumon snake3d` (F11 = fullscreen on the focused window; `SNAKE3D_WINDOW=1` is set by `vk_comp` for the client). Expect ~55-60 fps at any P-state, the software cursor at the compositor's pace, and no hardware cursor. `target/metal/budget` was set to 0 so no session resumes by itself.
+
+### 15.7 Next steps
+(1) The pointer: a window channel as the cursor plane on head 0 (plan, section 14, option b) or the head-1 flow replayed on head 0; (2) per-frame work still left: the 2.3 ms blit at P8 (direct scanout of the swapchain image) and rendering only the damaged rectangle; (3) the open items of section 14 above.
