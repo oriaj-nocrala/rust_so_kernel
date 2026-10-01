@@ -57,16 +57,19 @@ attempt() { # attempt <label>
   else
     sum "gpu-cursor-ladder: $1: enable failed: $(rawlog | cut -c1-300)"; sum "gpu-cursor-ladder: $1: $(st2)"
     echo "cursor recover" > /dev/dispctl; sum "gpu-cursor-ladder: recovered: $(grep -a 'cursor: recover' /proc/gpu | tail -n 1 | cut -c1-200)"
+    # the recovery skips the failed UPDATE but the enable stays in the core's ASSEMBLY state: every later UPDATE would fail the same way (Ryzen #213: the window usage
+    # bounds pushes raised the exception again). Put the disabled control back first.
+    if echo "cursor raw 0x209c 0xcf" > /dev/dispctl; then sum "gpu-cursor-ladder: assembly cursor control back to disabled"; else sum "gpu-cursor-ladder: could not disable it again: $(rawlog | cut -c1-300)"; fi
   fi
 }
 attempt "A baseline"
 if [ $enabled = 0 ]; then
-  echo "cursor raw 0x1004 0xf" > /dev/dispctl; echo "cursor raw 0x1008 0" > /dev/dispctl; echo "cursor raw 0x1010 0x117fff" > /dev/dispctl
+  for pair in "0x1004 0xf" "0x1008 0" "0x1010 0x117fff"; do echo "cursor raw $pair" > /dev/dispctl && sum "gpu-cursor-ladder: window 0 usage $pair ok" || sum "gpu-cursor-ladder: window 0 usage $pair FAILED: $(rawlog | cut -c1-300)"; done
   sum "gpu-cursor-ladder: window 0 usage bounds pushed: $(st2)"
   attempt "B + window 0 usage bounds"
 fi
 if [ $enabled = 0 ]; then
-  echo "cursor raw 0x2000 0" > /dev/dispctl; echo "cursor raw 0x2018 0x10" > /dev/dispctl
+  for pair in "0x2000 0" "0x2018 0x10"; do echo "cursor raw $pair" > /dev/dispctl && sum "gpu-cursor-ladder: head $pair ok" || sum "gpu-cursor-ladder: head $pair FAILED: $(rawlog | cut -c1-300)"; done
   sum "gpu-cursor-ladder: procamp and dither pushed: $(st2)"
   attempt "C + procamp + dither"
 fi
