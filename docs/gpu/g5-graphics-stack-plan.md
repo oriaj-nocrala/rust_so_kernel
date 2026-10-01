@@ -37,9 +37,29 @@ Decisión (2026-09-30, usuario + análisis): **WSI estándar de Vulkan como cimi
 - **Deuda que queda**: un segundo cliente no ve sus frames (`EBUSY`, hasta el compositor); solo FIFO.
 - **Siguiente**: luego `vk_draw` al WSI y el camino ventanado (imágenes exportadas con `BO_EXPORT`, timelines con `SYNC_EXPORT`) para la capa 4.
 
+## Capa 4 (compositor en GPU y camino ventanado): diseño (decidido 2026-09-30 con el usuario)
+
+**Decisiones:** (1) **la app posee la ventana** (modelo Wayland): crea el socket y la superficie con el protocolo existente (`constanos_gui_wire.h`) y se los entrega al WSI; así la entrada (teclado, ratón, cierre) sigue por su conexión, como en `constanos_gfx.h`. (2) **Directo al compositor en GPU**, sin etapa intermedia por CPU.
+
+**Piezas y por qué son así**
+- **Superficie.** Una función C `nvk_constanos_surface_create(instance, {socket, surface_id, ...})` en `nvkmd_constanos.c` (sin extensión Vulkan nueva: la app y NVK son un solo ejecutable estático, así que no hacen falta entrypoints generados, como ya pasa con `nvk_constanos_wait_flip`). Devuelve un `VkSurfaceKHR` de la plataforma headless con una ventana detrás; `vkCreateSwapchainKHR`/`acquire`/`present` son los estándar. Sin ventana, la superficie sigue siendo la pantalla (camino directo, capa 3).
+- **Imágenes.** Las del swapchain son BOs lineales de VRAM (el camino de copia de `wsi_common`, igual que el directo, con el pitch que toque); el WSI exporta cada uno con `BO_EXPORT` y se lo manda al compositor por `SCM_RIGHTS`. *Versión 1 de la sincronización:* el WSI espera por CPU el fence de su copia antes de hacer `commit` (ya lo hace hoy), así que el compositor puede leer en cuanto llega el `commit`; las timelines compartidas (`SYNC_EXPORT`) quedan para después. El cliente reutiliza una imagen cuando el compositor le manda `release` (un `acquire` que espera eventos del socket).
+- **Protocolo** (`gui/src/protocol.rs`): petición nueva `create_gpu_buffer(id, fd, width, height, stride, format, size)` en el objeto compositor (opcode 3); el resto (`attach`/`damage`/`commit`/`frame`/`release`) no cambia. XRGB8888 lineal, 1:1 (el escalado HIDPI lo hace el cliente).
+- **El gestor de ventanas es `gui::Compositor`** (puro, con tests), no se reescribe en C. Se le añade un modo GPU: un buffer GPU es una referencia opaca (no se copia a `store`), el compositor *devuelve efectos como datos*: `GpuOp::{Import, Drop}` (a qué buffers tiene que dar acceso el anfitrión, y cuándo soltarlos), una lista de dibujo ordenada (`DrawOp::{Fill, Window, Chrome...}`) y los `release` diferidos hasta que el anfitrión avise de que su fotograma terminó (la GPU puede seguir leyendo el buffer que el cliente ya cambió).
+- **El anfitrión** es un programa C sobre NVK (`probes/nvk/vk_comp.c`, ejecutable estático con NVK como `vk_snake`) que habla con el WM Rust a través de una capa C (`gui` como `staticlib` para musl con una API `extern "C"`), importa los BOs con `vkImportMemoryFd`, y dibuja con una tubería gráfica: un cuadrilátero por ventana que lee su buffer como SSBO por píxel (1:1, sin muestreador ni formatos), rellenos de color para barras y fondo, y una textura de "cromo" (títulos con el motor de texto, cursor) subida por CPU cuando cambia. Posee el display (`PRESENT`) y presenta con el mismo WSI directo.
+- **Sin GPU** (QEMU o fallo) sigue el compositor actual por CPU (`userspace/src/bin/compositor.rs`).
+
+**Rebanadas** (cada una verificable por sí sola; la imagen real solo en la Ryzen):
+1. `gui`: protocolo + modo GPU del WM + lista de dibujo + `release` diferido (tests de host, sabotaje).
+2. Cliente: `nvk_constanos_surface_create` + swapchain ventanado en el WSI, y una app de prueba contra un compositor de mentira en C que importa el BO y comprueba los píxeles (se puede probar en QEMU con el dispositivo software: memoria de sistema, el compositor lee con la CPU).
+3. Anfitrión `vk_comp` (Vulkan): primero una ventana, luego varias, decoraciones, cursor, entrada; medida en la Ryzen.
+4. `snake3d` en ventana, dos clientes a la vez, rendimiento (los relojes de arriba: el primer fotograma tras un reposo va lento).
+
+**Incógnitas a resolver al llegar:** sacar el protocolo del WM Rust a C (`staticlib` + cabecera C) sin arrastrar `std`; cuántos descriptores de buffer por cliente caben en la tabla de fds; qué hace NVK con un SSBO de 8 MiB importado y leído de otro proceso en el mismo fotograma (el almacenamiento tiene holders: ver el skill `gpu-g5`).
+
 ## Siguiente paso
 
-Capa 3: el camino directo está cerrado (a falta de la mirada del usuario); ahora el camino ventanado (las imágenes se comparten con el compositor de la capa 4, que ya tiene BOs y timelines compartibles).
+Capa 4, rebanada 1 (arriba): protocolo y modo GPU del gestor de ventanas en el crate `gui`.
 
 ## Notas para la capa 3 (WSI), para quien retome
 
