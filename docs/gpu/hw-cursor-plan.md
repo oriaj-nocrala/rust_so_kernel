@@ -257,3 +257,20 @@ Passes (exit 0, no channel lost). Per frame, from the traces; the budget is `COM
 - So the budget at the lowest P-state is 2 + 2.3 (render of a VRAM window) + 2.3 (blit) = 6.6 ms: it fits, with room for a few windows. **No clock pinning needed**; what is needed is that no window's pixels are read from system memory per frame.
 
 Order of the next changes (user to confirm; none started), cheapest and most decisive first: (a) CPU window sources into a VRAM image, uploaded (one staging copy on the transfer path) only when `version` moves; expected P8 render for L ~2.5-3 ms and 60 fps; (b) `COMP_DELAY_MS=0`/1 as a one-line experiment (frees 1-2 ms of the budget); (c) damage tracking and direct scanout (halve the memory traffic); (d) the hardware cursor (phases 1-4 above) for pointer-only frames.
+
+### 13c. Fix 1 measured: CPU windows in VRAM (Ryzen #194, `gpu-comp-pacing.sh`, 960x540 snake + cpumon, 15 s each, `COMP_CPU_HOST=1` = the old way)
+
+`comp_render.h` now keeps a CPU window's pixels in a device-local buffer and copies them from a host-visible staging buffer, inside the frame's command buffer, only when `version` moves. Host harness: pixel-exact in both modes, and removing the copy makes every frame differ (sabotage). QEMU `gui_comp_test` passes.
+
+| run | P-state in the 5 s windows | ch0 avg (render + blit) | `PRESENT` arrives after the vblank | presents per 5 s (310 vblanks) |
+|---|---|---|---|---|
+| L2 old way (host windows) | P8, P8, P8 | **4.55 ms** | 10-12 ms (all) | 144-161: **30 fps** |
+| L1 VRAM windows | P0, P5, P5 | 0.45 / 0.73 / 1.96 ms | 2-4 ms, then 4-6 ms | 262 / 305 / 294: **~57-60 fps** |
+| L3 VRAM + `COMP_DELAY_MS=0` | P8, P5, P5 | 2.26 / 2.0 / 1.9 ms | 2-4 ms (202-227 of ~290) | 283 / 298 / 278 |
+| L4 VRAM again | P5, P5, P8 | 2.3 / 1.95 / 1.94 ms | 4-6 ms | 269 / 295 / 275 (P8: 89% of vblanks) |
+
+- **The 30 fps lock is gone with no change to any clock**: the same load that gave 30 fps at P8 gives ~55-60 fps. Render + blit fell from 4.55 to ~1.9 ms at P8 and the `PRESENT` arrives 4-6 ms after the vblank (deadline ~9 ms). Confirms that the lock was the shader reading host memory per frame.
+- `COMP_DELAY_MS=0` moved nothing measurable (L3 ~ L4): not worth changing the default.
+- The GPU now settles at P5 rather than P8 under this load (it has more to do per second); no pinning was needed.
+- **What it costs: the frames that upload.** `cpumon only` (every frame is an upload of 4.7 MB; ~2 frames/s) now averages 8-10 ms per submission pair at P8 (was 4.5): the staging copy of a whole 1280x920 window goes through the GR channel at P8 and the `PRESENT` lands 2-16 ms after the vblank, so those frames can miss. They are rare (cpumon changes twice a second) but they are the visible hitch to expect when a CPU window updates. Next: upload only the rows that changed (the window manager knows the damage), or a copy on the CE channel off the frame's critical path.
+- Still the cursor-pacing question of Section 11: not touched here; the hardware cursor (phases 1-4) is the next piece, and damage tracking now has two uses.
