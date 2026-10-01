@@ -41,7 +41,31 @@ step 4 usage-bounds 0x2030 0x1114
 # DMA lookup hung because the instance memory was in GSP's reserved top of VRAM; it now lives at 256 MiB (`evo::INST_VRAM`).
 step 5 cursor-context-dma 0x2088 0xf0000001
 echo 'cursor probe' > /dev/dispctl && sum "gpu-cursor-ladder: channel allocated: $(st)" || { sum "gpu-cursor-ladder: probe FAILED"; fail=1; }
-step 6 control-enable 0x209c 0x800000cf
+# Ryzen #204: with the context DMA resolved (step 5), enabling the cursor raised INVALID_STATE (slot 0x5080 data 1 code 0x43; UPDATE). Variants, each recovered
+# from (`cursor recover` clears the exception slot as nouveau does) so the next one runs in the same boot:
+#   6a  the cursor channel gets a position + UPDATE first (its own state may have to be valid before the core enables it), then the enable alone
+#   6b  nouveau's whole `curs_set` in one push (control enable, composition, context DMA, offset) + UPDATE, usage bounds left as they are
+variants() {
+echo "cursor move 100 100" > /dev/dispctl && sum "gpu-cursor-ladder: channel positioned (its own UPDATE)" || { sum "gpu-cursor-ladder: move FAILED"; fail=1; }
+enabled=0
+if echo "cursor raw 0x209c 0x800000cf" > /dev/dispctl; then enabled=1; sum "gpu-cursor-ladder: 6a enable after the channel's UPDATE: idle again, ENABLED"
+else
+  sum "gpu-cursor-ladder: 6a enable after the channel's UPDATE: failed"; sum "gpu-cursor-ladder: 6a: $(rawlog)"; sum "gpu-cursor-ladder: 6a: $(st2)"
+  if echo "cursor recover" > /dev/dispctl; then sum "gpu-cursor-ladder: recovered: $(grep -a 'cursor: recover' /proc/gpu | tail -n 1 | cut -c1-300)"
+  else sum "gpu-cursor-ladder: recover FAILED: $(grep -a 'cursor: recover' /proc/gpu | tail -n 1 | cut -c1-300)"; stopped=1; fi
+  if [ $stopped = 0 ]; then
+    if echo "cursor on 32 nb" > /dev/dispctl; then enabled=1; sum "gpu-cursor-ladder: 6b whole curs_set in one push: ENABLED"
+    else
+      sum "gpu-cursor-ladder: 6b whole curs_set in one push: failed"; sum "gpu-cursor-ladder: 6b: $(grep -a 'cursor: the core did not latch' /proc/gpu | tail -n 1 | cut -c1-400)"; sum "gpu-cursor-ladder: 6b: $(st2)"
+      echo "cursor recover" > /dev/dispctl; sum "gpu-cursor-ladder: recovered: $(grep -a 'cursor: recover' /proc/gpu | tail -n 1 | cut -c1-300)"
+      stopped=1; fail=1
+    fi
+  else fail=1; fi
+fi
+[ $enabled = 1 ] || stopped=1
+sum "gpu-cursor-ladder: after the enable attempts: $(st)"
+}
+[ $stopped = 0 ] && variants
 if [ $stopped = 0 ]; then
   echo "cursor move 100 100" > /dev/dispctl
   sleep 2

@@ -90,6 +90,7 @@ impl FileHandle for DispctlDevice {
                     cur::move_to(x, y)
                 }
                 Some("off") => cur::off(),
+                Some("recover") => cur::recover(),
                 Some("intr") => match it.next() {
                     Some("on") => cur::intr(true),
                     Some("off") => cur::intr(false),

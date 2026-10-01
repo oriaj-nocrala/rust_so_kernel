@@ -99,6 +99,37 @@ pub fn intr(on: bool) -> Result<(), CursorError> {
     Ok(())
 }
 
+/// `cursor recover`: clears the core's exception slot the way nouveau does after one (`gv100_disp_exception`: `0x611020 + chid * 12 = 0x90000000`, restart
+/// with mode SKIP) and waits for the core to go idle again, so a ladder can try the next variant in the same boot.
+pub fn recover() -> Result<(), CursorError> {
+    let regs = supervisor::regs().ok_or(CursorError::NotReady)?;
+    let was_on = x86_64::instructions::interrupts::are_enabled();
+    if !was_on {
+        x86_64::instructions::interrupts::enable();
+    }
+    let before = (regs.rd32(evo::CORE.exception()), regs.rd32(evo::CORE.exception() + 4), regs.rd32(evo::CORE.exception() + 8), regs.rd32(0x61_0630));
+    regs.wr32(evo::CORE.exception(), 0x9000_0000);
+    let t0 = crate::cpu::tsc::read();
+    let idle = loop {
+        if evo::CORE.idle(regs) {
+            break true;
+        }
+        if crate::cpu::tsc::read().wrapping_sub(t0) / (crate::cpu::tsc::freq_hz() / 1000).max(1) >= LATCH_MS {
+            break false;
+        }
+        crate::memory::tlb::service_pending();
+        core::hint::spin_loop();
+    };
+    if !was_on {
+        x86_64::instructions::interrupts::disable();
+    }
+    log(alloc::format!(
+        "cursor: recover: slot {:#x},{:#x},{:#x} status {:#x} before; after: core idle {} status {:#x} slot {:#x},{:#x},{:#x}",
+        before.0, before.1, before.2, before.3, idle as u8, regs.rd32(0x61_0630), regs.rd32(evo::CORE.exception()), regs.rd32(evo::CORE.exception() + 4), regs.rd32(evo::CORE.exception() + 8)
+    ));
+    if idle { Ok(()) } else { Err(CursorError::Failed) }
+}
+
 /// `cursor image [size]`: the test arrow into VRAM (through PRAMIN: written once, read back).
 pub fn write_image(size: u32) -> Result<(), CursorError> {
     let regs = supervisor::regs().ok_or(CursorError::NotReady)?;
@@ -179,7 +210,7 @@ pub fn on(size: u32, bounds: bool) -> Result<(), CursorError> {
     probe()?;
     let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
     write_image(size)?;
-    let mut methods = nc::core_methods_set(head, nc::HANDLE_CURSOR_CTX, IMAGE_VRAM, size, 0, 0).ok_or(CursorError::Invalid)?;
+    let mut methods = nc::core_methods_set(head, nvgpu::hdmi::HANDLE_LUT, IMAGE_VRAM, size, 0, 0).ok_or(CursorError::Invalid)?;
     if !bounds {
         methods.remove(0);
     }
