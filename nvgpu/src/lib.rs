@@ -16,6 +16,7 @@ extern crate alloc;
 pub mod aux;
 pub mod booter;
 pub mod chan;
+pub mod cursor;
 pub mod dcb;
 pub mod devmodel;
 pub mod display;
