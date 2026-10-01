@@ -213,3 +213,28 @@ A desktop compositor can be the protagonist of the machine and idle most of the 
 4. **A hint to RM, bounded**: a burst boost while frames are in flight with a decay (`PERF_AGGRESSIVE_PSTATE_NOTIFY`-style), only if 1-3 are not enough. Never a pin.
 Whether `present`'s 9 ms at P8 is the copy itself or queueing behind the client's frame on the shared GR engine is not known: `vkCmdCopyImageToBuffer` timing and the GPU's own timestamps would say.
 
+## 13. Phase 0c: where a compositor frame's time goes (Ryzen #191/#192, the kernel pacing instrument)
+
+New permanent instrument (`nvgpu::pacing`, `kernel/src/gpu/pacing.rs`; 12 mutants killed): `/proc/kdebug` `gpu_pacing:` (per channel, submission -> first look that found it done; how long after the previous
+vblank each `PRESENT` arrives, in 2 ms buckets; the `PRESENT` ioctl's duration) and `gpu_pacing_trace:` (the latest 60 events: `S<chan>.<seq>` submitted,
+`D<chan>.<seq>` seen done, `P<us after the vblank>`, `E<us>`, `V<seq>`); `dispctl trace reset`. Job `scripts/metal-jobs/gpu-comp-pacing.sh`. Channel 0 is
+the compositor's, channel 2 the snake's; each compositor frame is two submissions (the render, then the buffer-blit of the WSI) and one `PRESENT`.
+
+One frame, read from the traces (`+us` from the previous vblank; the frame starts 2 ms after it, `COMP_DELAY_MS`):
+
+| | render S0->D0 | blit S0->D0 | `PRESENT` arrives | snake's frame (ch2) |
+|---|---|---|---|---|
+| P0, cpumon + snake3d | **1.8 ms** | 0.13 ms | 4.3 ms after the vblank | 0.23 + 0.07 ms |
+| P5 | 3.4 ms | 1.0 ms | 6.6-8.4 ms | 1.45 + 0.4 ms |
+| P8 | **6.8 ms** | 2.3 ms | **11-13 ms** (past the ~9 ms deadline) | 2.9 + 0.8 ms |
+| P8, **cpumon only** (no other GPU channel) | **6.0-6.5 ms** | 2.3 ms | 12-13 ms | - |
+| P3 (the 1880x1000 snake load) | 1.8 ms | 0.24 ms | 4.2-4.5 ms | 1.3 ms |
+
+- The `PRESENT` ioctl itself takes **4-5 us**: it is not a cost.
+- **Not "waiting behind the snake's channel"**: with only cpumon (no other GPU client) the render still takes 6 ms at P8; adding the snake adds ~0.5 ms.
+- **The blit scales with the memory clock** (0.13 -> 2.3 ms is 18x; the memory clock goes 7001 -> 405 MHz): it is bandwidth bound (16 MB moved per frame).
+- **The render has a floor of ~1.8 ms even at P0/P3**, for a background and three rectangles: far more than 4 Mpixel of shading needs on this GPU. With only cpumon at P8 it is 6 ms. **Working hypothesis (not yet tested): the CPU-drawn windows (cpumon's 1280x920 = 4.7 MB, titles, cursor) are read by the fragment shader straight from system memory over PCIe every frame, though cpumon changes twice a second**, and the PCIe link and the clocks fall with the P-state. The control that decides it is the snake alone (a VRAM source, no CPU window): the job now runs it.
+- Consequence for the argument of section 12: a GPU that runs a game at 60 fps is not slow; our compositor is wasteful (it renders the whole 1920x1080 screen and blits it, 24 MB of traffic per frame even when only the pointer moved, and may read pixels from host memory). A compositor on a proprietary driver sits at the lowest P-state all day and is smooth because its per-frame work is a fraction of ours.
+
+Candidate fixes, all about less work (none started; no clock pinning): (1) keep CPU windows' pixels in VRAM and upload only when their `version` moves (a staging copy); (2) damage tracking: render and blit only what changed (a pointer move or a cpumon update touches a few hundred KB), which with a hardware cursor makes pointer frames nearly free; (3) scan out the swapchain image without the blit; (4) pipelined or adaptive repaint to hide what is left.
+
