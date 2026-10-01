@@ -33,6 +33,8 @@ void abort(void) {
 }
 
 extern PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance instance, const char *name);
+/* NVK's constanos extension (nvkmd_constanos.c): sleeps (poll on /dev/vblank) until the last present has taken effect: 0, or -ETIMEDOUT / another negative errno. */
+extern int nvk_constanos_wait_flip(VkDevice device, int timeout_ms);
 
 #define MAX_SC_IMAGES 8
 
@@ -174,6 +176,11 @@ int cr_frame(const struct cr_op *ops, size_t n, uint64_t epoch) {
    if (pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR) { printf("COMP FAIL present (%d) at frame %llu\n", (int)pr, (unsigned long long)R.frames); return -3; }
    R.frames++;
    return 0;
+}
+
+int cr_wait_flip(void) {
+   /* the frame just presented is on screen once its flip has landed (the next vblank): headless or without a display this returns at once */
+   return nvk_constanos_wait_flip(R.device, 100);
 }
 
 void cr_get_stats(struct cr_stats *out) {

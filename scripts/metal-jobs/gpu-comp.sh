@@ -3,8 +3,8 @@
 #   touch build.rs; echo 5 > target/metal/budget
 #   scripts/metal-run.sh --kconf 'gpu=uapi' scripts/metal-jobs/gpu-comp.sh
 # vk_comp runs up to 30 s with no input devices (COMP_NO_INPUT: nobody is typing), starting two vk_window (900 frames each, a resize halfway: two
-# swapchains of three buffers each). Passes if vk_comp and both clients exit cleanly, vk_comp imported and dropped the 12 buffers, composed at
-# least 600 frames (the display's 60 Hz over the windows' life), nothing printed COMP FAIL / VK FAIL, the GPU is not dead and nothing is held
+# swapchains of three buffers each). Passes if vk_comp and both clients exit cleanly, vk_comp imported and dropped the 12 buffers, composed
+# between 600 and 1200 frames (the display's 60 Hz over the windows' life, both clients in each frame), nothing printed COMP FAIL / VK FAIL, the GPU is not dead and nothing is held
 # afterwards (gpu_share: 0 sessions, 0 storage allocations, 0 timelines). What it cannot say is what the screen looked like: that is for a person
 # (two coloured windows over the blue-grey background, their colours changing every frame, one growing halfway).
 cat /proc/gpu
@@ -31,6 +31,9 @@ imports=$(echo "$q" | sed -n 's/.*, \([0-9]*\) imports.*/\1/p')
 drops=$(echo "$q" | sed -n 's/.*, \([0-9]*\) drops.*/\1/p')
 sum "gpu-comp: frames=$frames imports=$imports drops=$drops"
 [ "${frames:-0}" -ge 600 ] 2>/dev/null || { sum "gpu-comp: only ${frames:-0} frames composed"; fail=1; }
+# two clients of 900 commits each, paced by the compositor: one composition per vblank serves both, so about 900 frames; far more means each vblank
+# served one client (Ryzen #177: 1800 frames, each client at 32 fps)
+[ "${frames:-0}" -le 1200 ] 2>/dev/null || { sum "gpu-comp: ${frames:-0} frames composed for 2 x 900 commits: the clients do not share frames"; fail=1; }
 [ "${imports:-0}" = 12 ] || { sum "gpu-comp: $imports buffers imported, expected 12"; fail=1; }
 [ "${drops:-0}" = 12 ] || { sum "gpu-comp: $drops buffers dropped, expected 12"; fail=1; }
 

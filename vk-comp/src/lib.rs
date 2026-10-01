@@ -393,6 +393,10 @@ fn run(args: &[String]) -> i32 {
                 break;
             }
             frames += 1;
+            // The frame is on the screen once its flip has landed, at the next vblank: only then do its clients hear it (the `frame` callbacks), so they
+            // draw their next frame in the interval and every client's commit is in the next composition. Composing as soon as one commit arrives
+            // would give each vblank to one client.
+            unsafe { cr_wait_flip() };
             comp.frame_done(uptime_ms());
             clients.flush(&mut comp);
         }

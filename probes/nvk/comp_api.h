@@ -37,6 +37,7 @@ int cr_import(uint64_t handle, int fd, uint64_t size, uint32_t stride_bytes);   
 void cr_drop(uint64_t handle);                                  /* nothing refers to it any more: freed at the next frame start */
 uint64_t cr_wait(void);                                         /* waits for the frame in flight; its number, 0 if none: that frame is done */
 int cr_frame(const struct cr_op *ops, size_t n, uint64_t epoch); /* acquire an image, draw `ops`, present: 0, or negative */
+int cr_wait_flip(void);                                         /* sleeps until the frame just presented is on the screen (its flip landed); 0, or negative (timeout, no display) */
 void cr_get_stats(struct cr_stats *out);
 void cr_shutdown(void);
 

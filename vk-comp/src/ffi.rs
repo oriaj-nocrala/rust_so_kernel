@@ -48,6 +48,7 @@ extern "C" {
     pub fn cr_drop(handle: u64);
     pub fn cr_wait() -> u64;
     pub fn cr_frame(ops: *const CrOp, n: usize, epoch: u64) -> c_int;
+    pub fn cr_wait_flip() -> c_int;
     pub fn cr_get_stats(out: *mut CrStats);
     pub fn cr_shutdown();
 }

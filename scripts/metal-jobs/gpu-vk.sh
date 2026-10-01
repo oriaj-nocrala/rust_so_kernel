@@ -117,13 +117,14 @@ grep -q 'VK present: [0-9]* frames' /tmp/vk_present.out || { sum "gpu-vk: no fra
 sum "gpu-vk: after the presentation: $(grep '^gpu_uapi:' /proc/kdebug)"
 
 # G4e zero-copy scanout: the same triangle rendered at the screen's size into a VRAM buffer laid out as the display scans out, and the display engine
-# pointed at that buffer (NVG_IOC_PRESENT, no copy by the CPU or the kernel), 20 s. Three buffers, the previous flip awaited through NVG_IOC_FLIP_STATE (no sleeping a frame): it must reach the display's 60 Hz. The kernel puts the
+# pointed at that buffer (NVG_IOC_PRESENT, no copy by the CPU or the kernel), 20 s. Three buffers, the previous flip awaited by poll() on /dev/vblank and NVG_IOC_FLIP_STATE (the client sleeps, it does not spin): it must reach the display's 60 Hz. The kernel puts the
 # console's picture back when the program ends.
 f0=$(grep '^gpu_flip:' /proc/kdebug)
 VK_DRAW_SCANOUT=20 VK_PROBE_REQUIRE_EXEC=1 NVK_CONSTANOS_DEBUG=1 /mnt/bin/vk_draw > /tmp/vk_scanout.out 2>&1
 src=$?
 grep -E 'VK scanout|FAIL|ASSERT|DRAW DONE' /tmp/vk_scanout.out | while read -r l; do sum "gpu-vk: scanout: $l"; done
 [ $src = 0 ] || { sum "gpu-vk: the scanout run exit=$src"; fail=1; tail -n 20 /tmp/vk_scanout.out >> /tmp/gpu-vk.sum; }
+grep -q 'waiting for the flip by poll() on /dev/vblank' /tmp/vk_scanout.out || { sum "gpu-vk: the scanout did not wait by poll() on /dev/vblank"; fail=1; }
 grep -q 'VK scanout: [0-9]* frames shown' /tmp/vk_scanout.out || { sum "gpu-vk: no frames were put on the screen"; fail=1; }
 f1=$(grep '^gpu_flip:' /proc/kdebug)
 sum "gpu-vk: flips before: $f0"
