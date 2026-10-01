@@ -209,7 +209,7 @@ int main(void) {
       if (vkWaitForFences(device, 1, &fence, VK_TRUE, 5000000000ull) != VK_SUCCESS) { failures++; printf("VK FAIL the frame never finished\n"); break; }
       frames++;
    }
-   printf("VK window: %u frames presented, %u buffers sent, %u commits, %u releases, %u buffers destroyed so far, %u waits for a release\n", frames, win.buffers_sent, win.commits, win.releases, win.buffers_destroyed, win.waits);
+   printf("VK window: %u frames presented, %u buffers sent, %u commits, %u releases, %u buffers destroyed so far, %u waits for a release, %u throttled by the compositor (%u timed out)\n", frames, win.buffers_sent, win.commits, win.releases, win.buffers_destroyed, win.waits, win.throttled, win.throttle_timeouts);
    CHECK(frames == frames_wanted, "every frame went through (%u of %u)", frames, frames_wanted);
    CHECK(win.commits == frames, "one commit per present (%u commits, %u frames)", win.commits, frames);
    CHECK(win.buffers_sent == cur.count * (resized ? 2u : 1u), "every image of every swapchain was sent once (%u buffers, %u images now)", win.buffers_sent, cur.count);

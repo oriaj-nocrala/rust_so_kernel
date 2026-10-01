@@ -55,6 +55,9 @@ static int fdq[16];
 static int nfdq;
 
 static uint32_t surface_id, current, pending;
+static uint32_t frame_ids[8];
+static int nframes;
+static unsigned frames_asked, frames_answered;
 static unsigned imported, destroyed, commits, releases, same_buffer_commits;
 static unsigned long long bytes_imported;
 static uint32_t last_w, last_h;
@@ -180,10 +183,24 @@ static void handle(const struct guiw_msg *m) {
          if (pending && !find_buf(pending)) FAIL("attach of buffer %u, which does not exist", pending);
          break;
       case 1: break; // damage
+      case 2: // frame(callback)
+         if (nframes < 8) frame_ids[nframes++] = guiw_arg(m, 0);
+         frames_asked++;
+         break;
       case 3: { // commit
          struct buf *b = find_buf(pending);
          if (!b) { FAIL("commit with no buffer attached"); break; }
          commits++;
+         /* the frame callbacks asked since the last commit are answered when it is "shown": here, at once (a real compositor does after drawing) */
+         for (int i = 0; i < nframes; i++) {
+            struct guiw_out d;
+            memset(&d, 0, sizeof(d));
+            guiw_begin(&d, frame_ids[i], GUIW_EV_DONE); guiw_put(&d, 0); guiw_end(&d);
+            send_msg(&d);
+            ev_delete_id(frame_ids[i]);
+            frames_answered++;
+         }
+         nframes = 0;
          note_size(b->w, b->h);
          if (current == pending) {
             same_buffer_commits++;
@@ -310,6 +327,7 @@ reap:;
    for (unsigned i = 0; i < sizes_seen; i++) printf(" %ux%u", size_list[i][0], size_list[i][1]);
    printf("\n");
    if (code != 0) FAIL("the client exited with %d", code);
+   if (frames_asked != commits || frames_answered != frames_asked) FAIL("%u frame callbacks asked, %u answered, %u commits: each commit must ask for one", frames_asked, frames_answered, commits);
    if (imported == 0 || commits == 0) FAIL("nothing was imported or committed");
    // what is still held was never destroyed by the client: the swapchain's last images are destroyed with it, so any left over is a leak
    if (left) FAIL("%u buffers were never destroyed", left);

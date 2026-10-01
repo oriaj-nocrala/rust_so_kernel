@@ -52,7 +52,8 @@ struct gvk_window {
     struct gvk_event q[GVK_QUEUE];
     unsigned qhead, qtail;
     // what the swapchain asked of the hooks, for tests
-    unsigned buffers_sent, buffers_destroyed, commits, releases, waits;
+    unsigned buffers_sent, buffers_destroyed, commits, releases, waits, throttled, throttle_timeouts;
+    uint32_t frame_cb;    // the `frame` callback of the last commit, 0 once the compositor said it showed it
     uint64_t surface_handle;  // the VkSurfaceKHR, to tell the swapchain what the compositor released
     struct constanos_window hooks;
 };
@@ -126,6 +127,8 @@ static void gvk_dispatch(struct gvk_window *w) {
                 break;
             case GUIW_EV_CLOSE: e.type = GVK_CLOSE; gvk_push(w, e); break;
             }
+        } else if (m.object == w->frame_cb && m.opcode == GUIW_EV_DONE && na == 1) {
+            w->frame_cb = 0;   // the compositor showed the frame the last commit asked about
         } else if (m.opcode == GUIW_EV_RELEASE && na == 0) {
             // a buffer the swapchain sent: the compositor let go of it
             w->releases++;
@@ -175,14 +178,27 @@ static int gvk_hook_send_buffer(void *user, uint32_t id, int fd, uint64_t size_B
     return r;
 }
 
+// A present is paced by the compositor, as in Wayland: each commit asks for a `frame` callback, and the next one waits until it was answered (the
+// compositor shows the frame, then says so). Without that a client that has free images presents as fast as it can and most of its frames are
+// replaced before anyone sees them. A compositor that never answers (a window nobody draws) is waited for 100 ms at most.
+#define GVK_THROTTLE_MS 100
+
 static int gvk_hook_commit(void *user, uint32_t id) {
     struct gvk_window *w = user;
+    if (w->frame_cb) {
+        w->throttled++;
+        for (int waited = 0; w->frame_cb && waited < GVK_THROTTLE_MS; waited += 5)
+            if (gvk_pump(w, 5) < 0) return -EPIPE;
+        if (w->frame_cb) { w->throttle_timeouts++; w->frame_cb = 0; }
+    }
     struct guiw_out o;
     memset(&o, 0, sizeof(o));
+    uint32_t cb = w->next_id++;
+    guiw_frame(&o, w->surface_id, cb);
     guiw_attach(&o, w->surface_id, id);
     guiw_commit(&o, w->surface_id);
     int r = gvk_send(w, &o);
-    if (r == 0) w->commits++;
+    if (r == 0) { w->commits++; w->frame_cb = cb; }
     return r;
 }
 

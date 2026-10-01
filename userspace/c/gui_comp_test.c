@@ -113,7 +113,7 @@ int main(void) {
       FAIL("no summary from vk_comp:\n%s", out);
    } else {
       printf("gui_comp_test: vk_comp composed %lu frames, imported %lu buffers, dropped %lu, uploaded %lu\n", frames, imports, drops, uploads);
-      if (frames < 10) FAIL("only %lu frames composed", frames);
+      if (frames < 40) FAIL("only %lu frames composed for 60 commits: the client is not paced by the compositor, or the compositor drops frames", frames);
       if (imports != 6) FAIL("%lu buffers imported, expected 6 (two swapchains of three)", imports);
       if (drops != 6) FAIL("%lu buffers dropped, expected 6", drops);
    }
