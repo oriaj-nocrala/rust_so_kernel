@@ -96,11 +96,11 @@ impl<'a> Pramin<'a> {
 // Instance memory: RAMHT and context DMA objects
 // ---------------------------------------------------------------------------
 
-/// Where nouveau put the display's instance memory on the target
-/// (`0x610014 = 0x1ffc9` in `modeset-1-disp-init.txt`), 64 KiB aligned.
-/// Reused as is: VRAM nouveau allocated from its heap, so nothing the GOP
-/// or the VBIOS keeps lives there.
-pub const INST_VRAM: u64 = 0x1_ffc9_0000;
+/// Where this driver puts the display's instance memory (RAMHT and context DMAs), 64 KiB aligned. nouveau's address on the target is `0x1ffc90000`
+/// (`0x610014 = 0x1ffc9` in `modeset-1-disp-init.txt`), at the very top of VRAM: **after GSP-RM boots that range is its reserved region and the display's
+/// context DMA lookups from it hang** (Ryzen #198-#201: the core stood in `CHNSTATUS_CORE.STG1_STATE = CTX_DMA_LOOKUP` for any handle; at `gpu=hdmi`,
+/// before the GSP, the same push resolved: #202). So it lives low, between the boot's carve-outs (below 176 MiB) and the user heap (1 GiB).
+pub const INST_VRAM: u64 = 0x1000_0000;
 pub const INST_SIZE: u32 = 0x1_0000;
 
 /// RAMHT: 0x2000 bytes (`engine/disp/tu102.c:221`) at the start of the
@@ -1045,7 +1045,8 @@ mod tests {
     #[test]
     fn instance_registers_match_the_trace() {
         let sim = Sim::new();
-        set_instance(&sim, INST_VRAM);
+        // nouveau's own address (the trace's): the function is the trace's whatever INST_VRAM is
+        set_instance(&sim, 0x1_ffc9_0000);
         let mut trace = disp_rows(DISP_INIT_FX, Some("init"));
         trace.extend(disp_rows(DISP_INIT_FX, Some("inst")));
         assert_eq!(*sim.writes.borrow(), trace);
@@ -1084,7 +1085,7 @@ mod tests {
         let t = Ramht { objects: alloc::vec![(1, HANDLE_WNDW_CTX, vram_ctxdma(8 << 30))] };
         let mut p = Pramin::new(&sim);
         t.write(&mut p, INST_VRAM).unwrap();
-        assert_eq!(sim.val(PRAMIN_BASE_REG), 0x1ffc0);
+        assert_eq!(sim.val(PRAMIN_BASE_REG), ((INST_VRAM >> 16) & !0xf) as u32);
         p.restore();
         assert_eq!(sim.val(PRAMIN_BASE_REG), 0x1ffe0);
         let v = sim.vram.borrow();

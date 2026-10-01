@@ -20,8 +20,6 @@ if [ -e /dev/dispctl ] && grep -q '^dispctl' /dev/dispctl 2>/dev/null; then :; e
   sum "gpu-cursor-ladder: /dev/dispctl does not open (needs gpu=super or higher)"; echo "---- summary (the log wraps) ----"; cat $sumfile; exit 0
 fi
 echo 'cursor image 32' > /dev/dispctl && sum "gpu-cursor-ladder: image written" || { sum "gpu-cursor-ladder: image FAILED"; fail=1; }
-# The cursor channel is NOT allocated yet: Ryzen #198-#200 hung in CTX_DMA_LOOKUP with it allocated (own handles, the core's LUT handle, the channel's
-# interrupt on). Is it the channel, or the lookup of head 0's core methods in general? 5a is the same lookup for the OLUT (resolves on head 1).
 stopped=0
 step() { # step <n> <label> <method> <value>
   [ $stopped = 1 ] && return
@@ -35,12 +33,10 @@ step 1 composition 0x20a0 0x72ff
 step 2 offset 0x2090 0x50000
 step 3 control-disabled 0x209c 0xcf
 step 4 usage-bounds 0x2030 0x1114
-# 5a: the OLUT's context DMA on head 0 (control: the same lookup, another method); 5b: the cursor's, same handle, channel still not allocated
-step 51 olut-context-dma 0x2288 0xf0000001
-step 52 cursor-context-dma-no-channel 0x2088 0xf0000001
-if [ $stopped = 0 ]; then
-  echo 'cursor probe' > /dev/dispctl && sum "gpu-cursor-ladder: channel allocated: $(st)" || { sum "gpu-cursor-ladder: probe FAILED"; fail=1; }
-fi
+# 5: the cursor's context DMA = the core's LUT one (nouveau's NV50_DISP_HANDLE_VRAM, 0xf0000001, serves both). Ryzen #198-#202: after the GSP boot every core context
+# DMA lookup hung because the instance memory was in GSP's reserved top of VRAM; it now lives at 256 MiB (`evo::INST_VRAM`).
+step 5 cursor-context-dma 0x2088 0xf0000001
+echo 'cursor probe' > /dev/dispctl && sum "gpu-cursor-ladder: channel allocated: $(st)" || { sum "gpu-cursor-ladder: probe FAILED"; fail=1; }
 step 6 control-enable 0x209c 0x800000cf
 if [ $stopped = 0 ]; then
   echo "cursor move 100 100" > /dev/dispctl
