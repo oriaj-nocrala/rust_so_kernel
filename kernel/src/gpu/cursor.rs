@@ -262,17 +262,18 @@ pub fn write_image(size: u32) -> Result<(), CursorError> {
 
 /// `cursor raw <method> <value>`: ONE core method plus UPDATE (a debugging ladder: Ryzen #196/#197 left the core not idle after the whole enable
 /// push, its exception slot naming method 0x2088 with type 0). Waits for the core to go idle, with IF=1, and logs where it stands.
-pub fn raw(method: u32, value: u32, interlock: bool) -> Result<(), CursorError> {
+pub fn raw(pairs: &[(u32, u32)], interlock: bool) -> Result<(), CursorError> {
     let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, target_head().ok_or(CursorError::NotReady)?);
-    if !nc::core_method_allowed(head, method) {
+    if pairs.is_empty() || pairs.len() > 8 || pairs.iter().any(|&(m, _)| !nc::core_method_allowed(head, m)) {
         return Err(CursorError::Invalid);
     }
+    let (method, value) = pairs[0];
     let was_on = x86_64::instructions::interrupts::are_enabled();
     if !was_on {
         x86_64::instructions::interrupts::enable();
     }
     let faults0 = evo::Faults::read(regs);
-    let mut methods = alloc::vec![(method, value)];
+    let mut methods: alloc::vec::Vec<(u32, u32)> = pairs.to_vec();
     if interlock {
         // the core's UPDATE waits for this head's cursor channel: send the flag first, the channel's own UPDATE right after the push
         methods.insert(0, (evo::CORE_SET_INTERLOCK_FLAGS, nc::core_interlock_with_cursor(head)));
@@ -302,9 +303,10 @@ pub fn raw(method: u32, value: u32, interlock: bool) -> Result<(), CursorError> 
     }
     let f = evo::Faults::read(regs).new_since(&faults0);
     log(alloc::format!(
-        "cursor: raw {:#x} = {:#x}{}: push {:?}, core idle {} status {:#x} put {:#x} get {:#x}, slot {:#x},{:#x},{:#x}, new faults ctrl_disp {:#x} exc_other {:#x}",
+        "cursor: raw {:#x} = {:#x}{}{}: push {:?}, core idle {} status {:#x} put {:#x} get {:#x}, slot {:#x},{:#x},{:#x}, new faults ctrl_disp {:#x} exc_other {:#x}",
         method,
         value,
+        if pairs.len() > 1 { alloc::format!(" (+{} more in the same push)", pairs.len() - 1) } else { String::new() },
         if interlock { " (interlocked with the cursor channel)" } else { "" },
         pushed,
         idle as u8,

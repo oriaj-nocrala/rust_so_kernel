@@ -102,16 +102,28 @@ impl FileHandle for DispctlDevice {
                 },
                 Some("image") => cur::write_image(it.next().map_or(Ok(32), |v| v.parse()).map_err(|_| FileError::InvalidArgument)?),
                 Some("raw") => {
-                    let num = |s: Option<&str>| -> Result<u32, FileError> {
-                        let s = s.ok_or(FileError::InvalidArgument)?;
+                    // `cursor raw <method> <value> [<method> <value>]... [il]`: those core methods and ONE UPDATE (a group that is only valid whole, like the output LUT's
+                    // four, has to go in one push); `il` = interlocked with the cursor channel
+                    let num = |s: &str| -> Result<u32, FileError> {
                         match s.strip_prefix("0x") {
                             Some(h) => u32::from_str_radix(h, 16),
                             None => s.parse(),
                         }
                         .map_err(|_| FileError::InvalidArgument)
                     };
-                    let (m, v) = (num(it.next())?, num(it.next())?);
-                    cur::raw(m, v, it.next() == Some("il"))
+                    let toks: alloc::vec::Vec<&str> = it.collect();
+                    let (il, toks) = match toks.split_last() {
+                        Some((&"il", rest)) => (true, rest.to_vec()),
+                        _ => (false, toks),
+                    };
+                    if toks.is_empty() || toks.len() % 2 != 0 {
+                        return Err(FileError::InvalidArgument);
+                    }
+                    let mut pairs = alloc::vec::Vec::new();
+                    for c in toks.chunks(2) {
+                        pairs.push((num(c[0])?, num(c[1])?));
+                    }
+                    cur::raw(&pairs, il)
                 }
                 _ => return Err(FileError::InvalidArgument),
             };
