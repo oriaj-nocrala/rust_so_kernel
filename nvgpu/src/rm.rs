@@ -219,6 +219,59 @@ pub fn set_page_directory_params(root: u64, entries: u32, aperture: u32, vaspace
     p
 }
 
+// ---- performance state (G5 note: clocks and pstate) --------------------------------
+
+/// `NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE` (`ctrl2080perf.h`): one `NvU32`, a `NV2080_CTRL_PERF_PSTATES_Pn` bit (P8 = `0x100`).
+pub const CTRL_PERF_GET_CURRENT_PSTATE: u32 = 0x2080_2068;
+pub const PSTATE_PARAMS_SIZE: usize = 4;
+/// `NV2080_CTRL_CMD_PERF_GET_LEVEL_INFO_V2`: `level`, `flags`, 32 x `GET_CLK_INFO` (24 bytes: flags, domain, current, default, min, max kHz), the list's length
+/// (sizes checked by `gen/perf.c`).
+pub const CTRL_PERF_GET_LEVEL_INFO_V2: u32 = 0x2080_200b;
+pub const LEVEL_INFO_PARAMS_SIZE: usize = 780;
+const CLK_INFO_SIZE: usize = 24;
+const CLK_INFO_MAX: usize = 32;
+const CLK_INFO_LIST: usize = 8;
+
+/// One clock domain of a performance level, frequencies in kHz as RM reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClkInfo {
+    pub domain: u32,
+    pub current: u32,
+    pub default: u32,
+    pub min: u32,
+    pub max: u32,
+}
+
+/// The parameters of `GET_LEVEL_INFO_V2` for `level` (flags 0: default type, no mode).
+pub fn level_info_params(level: u32) -> Vec<u8> {
+    let mut p = vec![0u8; LEVEL_INFO_PARAMS_SIZE];
+    put32(&mut p, 0, level);
+    p
+}
+
+/// The P-state in a `GET_CURRENT_PSTATE` reply: the number n of the `Pn` bit (`None` when zero or not a single bit).
+pub fn pstate_from_params(params: &[u8]) -> Option<u32> {
+    let bits = get32(params.get(..PSTATE_PARAMS_SIZE)?, 0);
+    (bits.count_ones() == 1 && bits <= 0x8000).then(|| bits.trailing_zeros())
+}
+
+/// The domains of a `GET_LEVEL_INFO_V2` reply (the first `perfGetClkInfoListSize`, at most 32).
+pub fn level_info_from_params(params: &[u8]) -> Option<Vec<ClkInfo>> {
+    let params = params.get(..LEVEL_INFO_PARAMS_SIZE)?;
+    let n = get32(params, CLK_INFO_LIST + CLK_INFO_MAX * CLK_INFO_SIZE) as usize;
+    if n > CLK_INFO_MAX {
+        return None;
+    }
+    Some(
+        (0..n)
+            .map(|i| {
+                let at = CLK_INFO_LIST + i * CLK_INFO_SIZE;
+                ClkInfo { domain: get32(params, at + 4), current: get32(params, at + 8), default: get32(params, at + 12), min: get32(params, at + 16), max: get32(params, at + 20) }
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +420,49 @@ mod tests {
         assert_eq!(get32(&d, 4), 0x5678);
         assert!(d[..4].iter().all(|&b| b == 0) && d[8..].iter().all(|&b| b == 0));
         assert_eq!(subdevice_params(), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn perf_controls_follow_the_c_layouts() {
+        // sizes and offsets from nvgpu/gen/perf.c (clang on ctrl2080perf.h)
+        assert_eq!((PSTATE_PARAMS_SIZE, LEVEL_INFO_PARAMS_SIZE), (4, 780));
+        assert_eq!(4 + 4 + CLK_INFO_MAX * CLK_INFO_SIZE + 4, LEVEL_INFO_PARAMS_SIZE);
+        assert_eq!((CTRL_PERF_GET_CURRENT_PSTATE, CTRL_PERF_GET_LEVEL_INFO_V2), (0x20802068, 0x2080200b));
+        let q = level_info_params(3);
+        assert_eq!((q.len(), get32(&q, 0), get32(&q, 4)), (780, 3, 0));
+        assert!(q[8..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn pstate_is_the_bit_number() {
+        assert_eq!(pstate_from_params(&0x100u32.to_le_bytes()), Some(8));
+        assert_eq!(pstate_from_params(&1u32.to_le_bytes()), Some(0));
+        assert_eq!(pstate_from_params(&0x8000u32.to_le_bytes()), Some(15));
+        assert_eq!(pstate_from_params(&0u32.to_le_bytes()), None);
+        assert_eq!(pstate_from_params(&0x180u32.to_le_bytes()), None, "two bits are not a state");
+        assert_eq!(pstate_from_params(&0x1_0000u32.to_le_bytes()), None, "SKIP_ENTRY is not a state");
+        assert_eq!(pstate_from_params(&[1, 0, 0]), None, "reply cut short");
+    }
+
+    #[test]
+    fn level_info_reads_the_list_with_its_fields_in_place() {
+        let mut p = level_info_params(1);
+        for (i, (dom, cur)) in [(0x10u32, 210_000u32), (0x4, 405_000)].iter().enumerate() {
+            let at = CLK_INFO_LIST + i * CLK_INFO_SIZE;
+            put32(&mut p, at, 0xf0f0);
+            for (k, v) in [*dom, *cur, cur + 1, cur + 2, cur + 3].iter().enumerate() {
+                put32(&mut p, at + 4 + 4 * k, *v);
+            }
+        }
+        put32(&mut p, 776, 2);
+        let l = level_info_from_params(&p).unwrap();
+        assert_eq!(l.len(), 2);
+        assert_eq!(l[0], ClkInfo { domain: 0x10, current: 210_000, default: 210_001, min: 210_002, max: 210_003 });
+        assert_eq!(l[1], ClkInfo { domain: 0x4, current: 405_000, default: 405_001, min: 405_002, max: 405_003 });
+        put32(&mut p, 776, 32);
+        assert_eq!(level_info_from_params(&p).unwrap().len(), 32);
+        put32(&mut p, 776, 33);
+        assert!(level_info_from_params(&p).is_none(), "a count past the array");
+        assert!(level_info_from_params(&p[..779]).is_none(), "reply cut short");
     }
 }

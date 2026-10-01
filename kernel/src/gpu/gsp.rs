@@ -738,6 +738,51 @@ pub fn runtime_name() -> Result<String, String> {
     .unwrap_or_else(|| Err(String::from("GSP-RM is not running")))
 }
 
+/// The last `gsp perf` report (`gpu_perf:` in `/proc/kdebug`).
+static PERF_REPORT: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new());
+
+/// `/dev/dispctl` `gsp perf`: ask RM for the current P-state and for the clocks of performance levels 0..8 (kHz), and keep the answer for
+/// `/proc/kdebug`. A control RM refuses is reported by name, not fatal: the point is to see what GSP-RM answers on this board.
+pub fn runtime_perf() -> Result<String, String> {
+    let report = with_rm(|rm| {
+        let mut out = String::new();
+        match rm.control(rm::H_SUBDEVICE, rm::CTRL_PERF_GET_CURRENT_PSTATE, &[0u8; rm::PSTATE_PARAMS_SIZE]) {
+            Ok(p) => match rm::pstate_from_params(&p) {
+                Some(n) => out += &alloc::format!("pstate=P{}", n),
+                None => out += &alloc::format!("pstate=raw:{:02x?}", p),
+            },
+            Err(e) => out += &alloc::format!("pstate=err({})", e),
+        }
+        for level in 0..8 {
+            match rm.control(rm::H_SUBDEVICE, rm::CTRL_PERF_GET_LEVEL_INFO_V2, &rm::level_info_params(level)) {
+                Ok(p) => match rm::level_info_from_params(&p) {
+                    Some(l) => {
+                        out += &alloc::format!(" L{}=[", level);
+                        for (i, c) in l.iter().enumerate() {
+                            out += &alloc::format!("{}{:#x}:{}/{}/{}-{}", if i > 0 { " " } else { "" }, c.domain, c.current, c.default, c.min, c.max);
+                        }
+                        out += "]";
+                    }
+                    None => out += &alloc::format!(" L{}=badlist", level),
+                },
+                Err(e) => {
+                    out += &alloc::format!(" L{}=err({})", level, e);
+                    break;
+                }
+            }
+        }
+        out
+    })
+    .ok_or_else(|| String::from("GSP-RM is not running"))?;
+    *PERF_REPORT.lock() = report.clone();
+    Ok(report)
+}
+
+pub fn render_perf_kdebug() -> String {
+    let r = PERF_REPORT.lock();
+    if r.is_empty() { String::new() } else { alloc::format!("gpu_perf: {} (domain:current/default/min-max kHz)", *r) }
+}
+
 /// Read what GSP-RM has queued, without waiting: events are counted and logged (a sequencer
 /// command is run, as at boot). Returns how many arrived.
 fn drain(rt: &mut Runtime) -> usize {
@@ -1055,7 +1100,7 @@ impl Rm<'_> {
 pub fn render_kdebug() -> String {
     let base = render_gsp_kdebug();
     let mut out = base;
-    for v in [super::vaspace::render_kdebug(), super::copy::render_kdebug(), super::compute::render_kdebug(), super::uapi::render_kdebug(), crate::drivers::dev_nvgpu::render_kdebug(), super::bench::render_kdebug(), super::intr::render_kdebug(), super::copy::render_irq_kdebug(), super::copy::render_fault_kdebug(), render_runtime_kdebug()] {
+    for v in [super::vaspace::render_kdebug(), super::copy::render_kdebug(), super::compute::render_kdebug(), super::uapi::render_kdebug(), crate::drivers::dev_nvgpu::render_kdebug(), super::bench::render_kdebug(), super::intr::render_kdebug(), super::copy::render_irq_kdebug(), super::copy::render_fault_kdebug(), render_runtime_kdebug(), render_perf_kdebug()] {
         if !v.is_empty() {
             out += "\n";
             out += &v;

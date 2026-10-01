@@ -217,6 +217,13 @@ pub fn fillwt_word(i: u32) -> u32 {
     fill_word(i) ^ FILLWT_XOR
 }
 
+/// `gen/shader/clock.cu`: measures the SM clock from inside the GPU. One thread per CTA reads `%globaltimer` (ns) and `clock64` (SM cycles), runs a chain of
+/// `iters` dependent FFMAs and reads both again; cycles / ns = GHz. Parameters: `out` at `c[0x0][0x160]`, `iters` (32 bits) at `c[0x0][0x168]`. Writes
+/// 8 u64 at `out + ctaid.x * 64` bytes: c0, c1, t0, t1, `%smid`, the float's bits, 0, 0. 0x300 bytes, 18 registers.
+pub const CLOCK: &[u8] = include_bytes!("../fixtures/shader-clock-sm86.bin");
+pub const CLOCK_REGISTERS: u8 = 18;
+pub const CLOCK_PARAM_ITERS: usize = 0x168;
+
 /// The words a launch's output page starts with, so a word the grid did not write cannot pass for one it did.
 pub fn scribble_word(i: u32) -> u32 {
     0x5c21_b000 | (i & 0xfff)
@@ -345,6 +352,7 @@ mod tests {
         assert_eq!(c_array("fill"), FILL, "userspace/c/nvgpu_shaders.h is stale: run scripts/gen-nvgpu-shader-header.py");
         assert_eq!(c_array("copy"), COPY, "userspace/c/nvgpu_shaders.h is stale: run scripts/gen-nvgpu-shader-header.py");
         assert_eq!(c_array("fillwt"), FILLWT, "userspace/c/nvgpu_shaders.h is stale: run scripts/gen-nvgpu-shader-header.py");
+        assert_eq!(c_array("clock"), CLOCK, "userspace/c/nvgpu_shaders.h is stale: run scripts/gen-nvgpu-shader-header.py");
     }
 
     const FIELDS: &str = include_str!("../fixtures/qmd-fields.txt");
@@ -583,6 +591,21 @@ mod tests {
     fn a_value_wider_than_its_field_is_refused() {
         let mut q = [0u32; QMD_WORDS];
         put(&mut q, (607, 592), 1 << 16);
+    }
+
+    #[test]
+    fn the_clock_fixture_is_the_sass_ptxas_makes() {
+        // nvdisasm -c -hex of nvcc -arch=sm_86 clock.cu: 48 instructions, NOP padding to 0x300 bytes, 18 registers, both reads are CS2R
+        assert_eq!(CLOCK.len(), 0x300);
+        let ins = |n: usize| u64::from_le_bytes(CLOCK[n * 16..n * 16 + 8].try_into().unwrap());
+        assert_eq!(ins(6), 0x0000_0000_0008_7805, "CS2R R8, SR_GLOBALTIMERLO");
+        assert_eq!(ins(7), 0x0000_0000_000a_7805, "CS2R R10, SR_CLOCKLO");
+        assert_eq!(ins(0x11), 0x33d6_bf95_0202_7423, "FFMA R2, R2, R3, 1.0000000116860974e-07: the dependent chain");
+        assert_eq!(ins(0x12), 0x0000_5a00_0000_7a0c, "ISETP.GE.U32 R0, c[0x0][0x168]: the loop's bound is the iteration parameter");
+        assert_eq!(ins(0x15), 0x0000_0000_000c_7805, "CS2R R12, SR_CLOCKLO: the end of the interval");
+        assert_eq!(ins(0x16), 0x0000_0000_000e_7805, "CS2R R14, SR_GLOBALTIMERLO");
+        assert_eq!(CLOCK_PARAM_ITERS, 0x168);
+        assert_eq!(ins(0x1b), 0x0000_5800_0404_7625, "IMAD.WIDE.U32 R4, R4, 0x40, c[0x0][0x160]: out + ctaid * 64");
     }
 
     #[test]

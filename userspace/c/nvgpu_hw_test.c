@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -261,17 +262,17 @@ static uint32_t copy_push(uint32_t *w, uint64_t src, uint64_t dst, uint32_t byte
    return n;
 }
 
-/// Set up slot `slot` of `r` to run `shader` (384 bytes, 8 registers) as 8 CTAs of 32 threads with kernel parameters `p0` and `p1`, and
+/// Set up slot `slot` of `r` to run `shader` (`shader_bytes` of SASS, `registers` of them; `launch_prepare`: 384 bytes, 8) as 8 CTAs of 32 threads with kernel parameters `p0` and `p1`, and
 /// scribble its output page. Returns the push segment to EXEC.
-static struct nvg_push launch_prepare(struct region *r, unsigned slot, const uint8_t *shader, uint64_t p0, uint64_t p1, uint32_t release_payload) {
+static struct nvg_push launch_prepare_ex(struct region *r, unsigned slot, const uint8_t *shader, unsigned shader_bytes, unsigned registers, uint64_t p0, uint64_t p1, uint32_t release_payload) {
    uint8_t *cpu = r->cpu + (uint64_t)slot * SLOT_BYTES;
    uint64_t va = r->va + (uint64_t)slot * SLOT_BYTES;
-   memcpy(cpu + OFF_SHADER, shader, 384);
+   memcpy(cpu + OFF_SHADER, shader, shader_bytes);
    memset(cpu + OFF_CB0, 0, CBUF0_BYTES);
    memcpy(cpu + OFF_CB0 + PARAM0, &p0, 8);
    memcpy(cpu + OFF_CB0 + PARAM1, &p1, 8);
    struct nvg_qmd_launch l = {
-      .program = va + OFF_SHADER, .registers = 8, .grid = { 8, 1, 1 }, .block = { 32, 1, 1 },
+      .program = va + OFF_SHADER, .registers = registers, .grid = { 8, 1, 1 }, .block = { 32, 1, 1 },
       .cbuf0 = va + OFF_CB0, .cbuf0_size = CBUF0_BYTES, .release = va + OFF_SEM + SEM_GRID, .release_payload = release_payload,
    };
    uint32_t q[64];
@@ -284,6 +285,10 @@ static struct nvg_push launch_prepare(struct region *r, unsigned slot, const uin
    for (uint32_t i = 0; i < 1024; i++) out[i] = scribble(i);
    *(volatile uint32_t *)(cpu + OFF_SEM + SEM_GRID) = 0;
    return (struct nvg_push){ .va = va + OFF_PUSH, .bytes = n * 4, .flags = 0 };
+}
+
+static struct nvg_push launch_prepare(struct region *r, unsigned slot, const uint8_t *shader, uint64_t p0, uint64_t p1, uint32_t release_payload) {
+   return launch_prepare_ex(r, slot, shader, 384, 8, p0, p1, release_payload);
 }
 
 static uint32_t *slot_out(struct region *r, unsigned slot) { return (uint32_t *)(r->cpu + (uint64_t)slot * SLOT_BYTES + OFF_OUT); }
@@ -410,7 +415,91 @@ static int rc_test(void) {
    return failures ? 1 : 0;
 }
 
+/// `nvgpu_hw_test clock [seconds [gap_ms [iterations]]]`: what clock the SMs run at, measured from inside the GPU (nvgpu/gen/shader/clock.cu: SM cycles over
+/// the nanoseconds of the GPU's global timer across a chain of dependent FFMAs, one thread in each of 8 CTAs). Launches back to back for `seconds`
+/// (`gap_ms` of sleep between them: 0 = a continuous load, more = a light duty cycle) and prints the clock of each launch (the first 8, then every
+/// 250 ms) and what it did over time: GSP-RM changes the P-state by itself, so the clock at the first launch after an idle is what a client that
+/// wakes the GPU gets. Nothing here fails on the value of the clock, only on a launch that did not run or numbers that cannot be a clock.
+static int cmp_u64(const void *a, const void *b) {
+   uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+   return x < y ? -1 : x > y;
+}
+
+static int clock_run(int seconds, int gap_ms, uint32_t iters) {
+   printf("nvgpu_hw_test clock: %d s, %d ms between launches, %u iterations per launch\n", seconds, gap_ms, iters);
+   fd = open("/dev/nvgpu", O_RDWR);
+   CHECK(fd >= 0, "open");
+   if (fd < 0) return 1;
+   struct nvg_info info;
+   call(NVG_IOC_INFO, &info);
+   hw = !(info.flags & NVG_INFO_SOFTWARE);
+   if (!hw) {
+      printf("  skip (software device: nothing runs)\n");
+      return 0;
+   }
+   uint32_t ctx = ctx_create(NVG_ENGINE_COMPUTE), tl = sync_create(0);
+   struct region r;
+   REQUIRE(ctx && tl && region_make(&r, SLOT_BYTES) == 0, "a compute context, a timeline and a region");
+   int64_t start = now_ms(), last_print = -1000;
+   uint64_t seq = 0, bad = 0, lo = ~0ull, hi = 0, first = 0, ramp_ms = 0, smids = 0;
+   // the ramp needs the maximum, known only at the end: keep every launch's median with its time
+   static uint64_t med_log[1 << 17];
+   static int64_t med_t[1 << 17];
+   unsigned nmed = 0;
+   while (now_ms() - start < (int64_t)seconds * 1000) {
+      struct nvg_push p = launch_prepare_ex(&r, 0, nvg_shader_clock, sizeof nvg_shader_clock, 18, slot_out_va(&r, 0), iters, 0x600 + (uint32_t)seq);
+      int64_t t_launch = now_us();
+      seq++;
+      if (exec_signal(ctx, &p, 1, tl, seq) != 0 || wait_timeline(tl, seq, 10000) != 0) {
+         printf("  FAIL launch %llu did not complete [errno %d]\n", (unsigned long long)seq, errno);
+         failures++;
+         break;
+      }
+      int64_t took_us = now_us() - t_launch;
+      const volatile uint64_t *o = (const volatile uint64_t *)slot_out(&r, 0);
+      uint64_t mhz[8];
+      unsigned nv = 0;
+      uint64_t dur_ns = 0, cyc = 0;
+      for (int c = 0; c < 8; c++) {
+         uint64_t c0 = o[c * 8], c1 = o[c * 8 + 1], t0 = o[c * 8 + 2], t1 = o[c * 8 + 3];
+         if (c1 > c0 && t1 > t0) {
+            mhz[nv++] = (c1 - c0) * 1000 / (t1 - t0);
+            if (!dur_ns) { dur_ns = t1 - t0; cyc = c1 - c0; }
+            smids |= 1ull << (o[c * 8 + 4] & 63);
+         }
+      }
+      if (nv == 0) {
+         bad++;
+         if (bad == 1) printf("  FAIL launch %llu wrote no sample: words %#llx %#llx %#llx %#llx\n", (unsigned long long)seq, (unsigned long long)o[0], (unsigned long long)o[1], (unsigned long long)o[2], (unsigned long long)o[3]);
+         continue;
+      }
+      qsort(mhz, nv, sizeof mhz[0], cmp_u64);
+      uint64_t med = mhz[nv / 2];
+      int64_t t_ms = now_ms() - start;
+      if (!first) first = med;
+      if (med < lo) lo = med;
+      if (med > hi) hi = med;
+      if (nmed < (1u << 17)) { med_log[nmed] = med; med_t[nmed] = t_ms; nmed++; }
+      if (seq <= 8 || t_ms - last_print >= 250) {
+         printf("CLOCK t=%lld ms launch %llu: %llu MHz (CTAs %llu..%llu, %u of 8 read), %llu cycles in %llu us, launch to fence %lld us\n", (long long)t_ms, (unsigned long long)seq,
+                (unsigned long long)med, (unsigned long long)mhz[0], (unsigned long long)mhz[nv - 1], nv, (unsigned long long)cyc, (unsigned long long)(dur_ns / 1000), (long long)took_us);
+         last_print = t_ms;
+      }
+      if (gap_ms > 0) nap_us(gap_ms * 1000L);
+   }
+   for (unsigned i = 0; i < nmed; i++)
+      if (med_log[i] * 100 >= hi * 95) { ramp_ms = med_t[i]; break; }
+   printf("CLOCK SUMMARY: %llu launches, %llu without a sample; first launch %llu MHz, lowest %llu, highest %llu; first reached 95%% of the highest at %llu ms; %d SMs seen\n",
+          (unsigned long long)seq, (unsigned long long)bad, (unsigned long long)first, (unsigned long long)(lo == ~0ull ? 0 : lo), (unsigned long long)hi, (unsigned long long)ramp_ms, __builtin_popcountll(smids));
+   CHECK(seq > 0 && bad == 0, "every launch ran and wrote a sample (%llu launches, %llu without)", (unsigned long long)seq, (unsigned long long)bad);
+   CHECK(hi >= 100 && hi <= 3500 && lo >= 50, "the numbers can be an SM clock (%llu..%llu MHz)", (unsigned long long)(lo == ~0ull ? 0 : lo), (unsigned long long)hi);
+   ctx_destroy(ctx);
+   printf("nvgpu_hw_test clock: %d failure(s)\n", failures);
+   return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+   if (argc > 1 && !strcmp(argv[1], "clock")) return clock_run(argc > 2 ? atoi(argv[2]) : 10, argc > 3 ? atoi(argv[3]) : 0, argc > 4 ? (uint32_t)atoi(argv[4]) : 400000);
    if (argc > 1 && !strcmp(argv[1], "rc")) return rc_test();
    if (argc > 1 && !strcmp(argv[1], "grcopy")) return grcopy(0);
    if (argc > 1 && !strcmp(argv[1], "grcopy-bind")) return grcopy(1);

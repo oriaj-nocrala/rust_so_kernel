@@ -63,9 +63,10 @@ impl FileHandle for DispctlDevice {
             };
         }
         if let Some(what) = text.strip_prefix("gsp ") {
-            // `gsp name`: a control on RM at run time; `gsp poll`: serve RM's status queue now (gpu=gsp)
+            // `gsp name`: a control on RM at run time; `gsp poll`: serve RM's status queue now; `gsp perf`: P-state and clocks from RM (gpu=gsp)
             return match what.trim() {
                 "name" => crate::gpu::gsp::runtime_name().map(|_| buf.len()).map_err(|_| FileError::IOError),
+                "perf" => crate::gpu::gsp::runtime_perf().map(|_| buf.len()).map_err(|_| FileError::IOError),
                 "poll" => crate::gpu::gsp::poll_events().map(|_| buf.len()).ok_or(FileError::IOError),
                 _ => Err(FileError::InvalidArgument),
             };
