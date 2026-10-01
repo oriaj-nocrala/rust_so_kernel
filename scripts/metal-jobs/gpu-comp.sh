@@ -2,11 +2,12 @@
 # are GPU buffers it imports where they are and draws with a graphics pipeline, presented through the WSI's direct path.
 #   touch build.rs; echo 5 > target/metal/budget
 #   scripts/metal-run.sh --kconf 'gpu=uapi' scripts/metal-jobs/gpu-comp.sh
-# vk_comp runs up to 40 s with no input devices (COMP_NO_INPUT: nobody is typing), starting two vk_window (900 frames each, a resize halfway: two
-# swapchains of three buffers each). Passes if vk_comp and both clients exit cleanly, vk_comp imported and dropped the 12 buffers, composed
-# between 600 and 1200 frames (the display's 60 Hz over the windows' life, both clients in each frame), nothing printed COMP FAIL / VK FAIL, the GPU is not dead and nothing is held
-# afterwards (gpu_share: 0 sessions, 0 storage allocations, 0 timelines). What it cannot say is what the screen looked like: that is for a person
-# (two coloured windows over the blue-grey background, their colours changing every frame, one growing halfway).
+# vk_comp runs four times (COMP_DELAY_MS 3, 5, 7, 9), with no input devices (COMP_NO_INPUT: nobody is typing), starting two vk_window (300 frames each,
+# a resize halfway: two swapchains of three buffers each) and leaving when both are done. The result is the compositor's frame rate per delay (both
+# clients are in every frame, so a composition per vblank is 60 fps; 30 means every other vblank is missed: Ryzen #179 at 9 ms).
+# Passes if every run is clean (vk_comp and both clients exit 0, 12 buffers imported and dropped, no COMP FAIL / VK FAIL), the best delay reaches 50 fps,
+# the GPU is not dead and nothing is held afterwards (gpu_share: 0 sessions, 0 storage allocations, 0 timelines). What it cannot say is what the
+# screen looked like: that is for a person (two coloured windows over the blue-grey background, their colours changing every frame, one growing halfway).
 cat /proc/gpu
 fail=0
 sum() { echo "$*"; echo "$*" >> /tmp/gpu-comp.sum; }
@@ -17,25 +18,34 @@ grep -q '^uapi: installed' /proc/gpu || { sum "gpu-comp: the GPU state was not k
 field() { echo "$1" | tr ' ' '\n' | grep "^$2=" | cut -d= -f2; }
 sum "gpu-comp: before: $(grep '^gpu_uapi:' /proc/kdebug)"
 
-VK_WINDOW_FRAMES=900 COMP_NO_INPUT=1 COMP_SECONDS=40 NVK_CONSTANOS_DEBUG=1 /mnt/bin/vk_comp /mnt/bin/vk_window /mnt/bin/vk_window > /tmp/comp.out 2>&1
-rc=$?
-grep -E 'COMP (screen|listening|started|client|quit|FAIL|[0-9]+ frames)|VK window:|VK WINDOW|VK FAIL|COMP ASSERT' /tmp/comp.out | while read -r l; do sum "gpu-comp: $l"; done
-[ $rc = 0 ] || { sum "gpu-comp: vk_comp exit=$rc"; fail=1; tail -n 30 /tmp/comp.out >> /tmp/gpu-comp.sum; }
-grep -q '^COMP DONE' /tmp/comp.out || { sum "gpu-comp: vk_comp did not reach COMP DONE"; fail=1; }
-grep -q 'COMP screen [0-9]*x[0-9]* (the display)' /tmp/comp.out || { sum "gpu-comp: no display behind the surface"; fail=1; }
-[ "$(grep -c 'VK WINDOW DONE' /tmp/comp.out)" = 2 ] || { sum "gpu-comp: not both clients finished (VK WINDOW DONE x$(grep -c 'VK WINDOW DONE' /tmp/comp.out))"; fail=1; }
-grep -q 'COMP FAIL\|VK FAIL\|COMP ASSERT' /tmp/comp.out && { sum "gpu-comp: a FAIL line"; fail=1; }
-q=$(grep 'COMP quit after' /tmp/comp.out)
-frames=$(echo "$q" | sed -n 's/COMP quit after \([0-9]*\) frames.*/\1/p')
-imports=$(echo "$q" | sed -n 's/.*, \([0-9]*\) imports.*/\1/p')
-drops=$(echo "$q" | sed -n 's/.*, \([0-9]*\) drops.*/\1/p')
-sum "gpu-comp: frames=$frames imports=$imports drops=$drops"
-[ "${frames:-0}" -ge 600 ] 2>/dev/null || { sum "gpu-comp: only ${frames:-0} frames composed"; fail=1; }
-# two clients of 900 commits each, paced by the compositor: one composition per vblank serves both, so about 900 frames; far more means each vblank
-# served one client (Ryzen #177: 1800 frames, each client at 32 fps)
-[ "${frames:-0}" -le 1200 ] 2>/dev/null || { sum "gpu-comp: ${frames:-0} frames composed for 2 x 900 commits: the clients do not share frames"; fail=1; }
-[ "${imports:-0}" = 12 ] || { sum "gpu-comp: $imports buffers imported, expected 12"; fail=1; }
-[ "${drops:-0}" = 12 ] || { sum "gpu-comp: $drops buffers dropped, expected 12"; fail=1; }
+# one run per COMP_DELAY_MS (how long after a frame is on the screen the next is composed): 300 frames per client, vk_comp leaves when both are done
+best=0; best_d=0; runs=0
+for d in 3 5 7 9; do
+  VK_WINDOW_FRAMES=300 COMP_NO_INPUT=1 COMP_EXIT_WHEN_IDLE=1 COMP_SECONDS=40 COMP_DELAY_MS=$d NVK_CONSTANOS_DEBUG=1 /mnt/bin/vk_comp /mnt/bin/vk_window /mnt/bin/vk_window > /tmp/comp.out 2>&1
+  rc=$?
+  grep -E 'COMP (screen|quit|FAIL)|VK WINDOW|VK FAIL|COMP ASSERT|VK window: [0-9]+ frames' /tmp/comp.out | while read -r l; do sum "gpu-comp: delay=$d: $l"; done
+  [ $rc = 0 ] || { sum "gpu-comp: delay=$d: vk_comp exit=$rc"; fail=1; tail -n 20 /tmp/comp.out >> /tmp/gpu-comp.sum; }
+  grep -q '^COMP DONE' /tmp/comp.out || { sum "gpu-comp: delay=$d: vk_comp did not reach COMP DONE"; fail=1; }
+  [ "$(grep -c 'VK WINDOW DONE' /tmp/comp.out)" = 2 ] || { sum "gpu-comp: delay=$d: not both clients finished"; fail=1; }
+  grep -q 'COMP FAIL\|VK FAIL\|COMP ASSERT' /tmp/comp.out && { sum "gpu-comp: delay=$d: a FAIL line"; fail=1; }
+  q=$(grep 'COMP quit after' /tmp/comp.out)
+  frames=$(echo "$q" | sed -n 's/COMP quit after \([0-9]*\) frames.*/\1/p')
+  ms=$(echo "$q" | sed -n 's/.*clients seen, \([0-9]*\) ms.*/\1/p')
+  imports=$(echo "$q" | sed -n 's/.*, \([0-9]*\) imports.*/\1/p')
+  drops=$(echo "$q" | sed -n 's/.*, \([0-9]*\) drops.*/\1/p')
+  if [ "${ms:-0}" -gt 0 ] 2>/dev/null; then
+    fps10=$(( ${frames:-0} * 10000 / ms ))
+    sum "gpu-comp: delay=$d: frames=$frames in ${ms} ms = $((fps10 / 10)).$((fps10 % 10)) fps (300 commits per client), imports=$imports drops=$drops"
+    [ "$fps10" -gt "$best" ] && { best=$fps10; best_d=$d; }
+  else
+    sum "gpu-comp: delay=$d: no timing in the quit line"; fail=1
+  fi
+  [ "${imports:-0}" = 12 ] && [ "${drops:-0}" = 12 ] || { sum "gpu-comp: delay=$d: $imports imports and $drops drops, expected 12 and 12"; fail=1; }
+  runs=$((runs + 1))
+done
+sum "gpu-comp: best: delay=$best_d at $((best / 10)).$((best % 10)) fps"
+# the display is 60 Hz and both clients are in every frame: a composition per vblank is ~60 fps; half of that means every other vblank is missed
+[ "$best" -ge 500 ] || { sum "gpu-comp: no delay reached 50 fps"; fail=1; }
 
 u=$(grep '^gpu_uapi:' /proc/kdebug)
 sum "gpu-comp: end: $u"

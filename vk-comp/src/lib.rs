@@ -7,6 +7,7 @@
 //!   COMP_HEADLESS=1          no display (QEMU's software device): render 640x360 without a screen
 //!   COMP_NO_INPUT=1          do not open (or grab) the input devices
 //!   COMP_SECONDS=<n>         quit after n seconds (unattended runs); SIGTERM quits too
+//!   COMP_EXIT_WHEN_IDLE=1    quit when every client that connected has gone (the quit line then says how long it all took)
 //!   COMP_SOCKET=<path>       the socket (default /tmp/gui-0)
 //!   COMP_DELAY_MS=<n>        how long after a frame is on the screen the next one is composed (default 9: at 60 Hz it leaves ~7 ms to render and
 //!                            present before the next vblank, and the rest of the interval to collect every client's commit into one composition)
@@ -188,6 +189,7 @@ fn run(args: &[String]) -> i32 {
     let no_input = env("COMP_NO_INPUT").is_some();
     let seconds: u64 = env("COMP_SECONDS").and_then(|s| s.parse().ok()).unwrap_or(0);
     let socket = env("COMP_SOCKET").unwrap_or_else(|| "/tmp/gui-0".into());
+    let exit_when_idle = env("COMP_EXIT_WHEN_IDLE").is_some();
     let compose_delay = Duration::from_millis(env("COMP_DELAY_MS").and_then(|s| s.parse().ok()).unwrap_or(9));
 
     let (mut w, mut h) = (0u32, 0u32);
@@ -254,6 +256,9 @@ fn run(args: &[String]) -> i32 {
 
     while !QUIT.load(Ordering::Relaxed) && !comp.quit_requested() {
         if seconds > 0 && t_start.elapsed() >= Duration::from_secs(seconds) {
+            break;
+        }
+        if exit_when_idle && clients.seen > 0 && clients.streams.is_empty() {
             break;
         }
         let busy = comp.has_damage() || comp.has_frame_callbacks();
@@ -417,7 +422,16 @@ fn run(args: &[String]) -> i32 {
     }
     let mut st = CrStats::default();
     unsafe { cr_get_stats(&mut st) };
-    println!("COMP quit after {} frames (up to {} draws), {} imports, {} drops, {} uploads, {} clients seen", frames, st.draws_max, st.imports, st.drops, st.uploads, clients.seen);
+    println!(
+        "COMP quit after {} frames (up to {} draws), {} imports, {} drops, {} uploads, {} clients seen, {} ms",
+        frames,
+        st.draws_max,
+        st.imports,
+        st.drops,
+        st.uploads,
+        clients.seen,
+        t_start.elapsed().as_millis()
+    );
 
     let ids: Vec<ClientId> = clients.streams.keys().copied().collect();
     for c in ids {
