@@ -2,14 +2,14 @@
  * comp_render.h: the GPU compositor's renderer (G5 layer 4, slice 3; docs/gpu/g5-graphics-stack-plan.md). Header-only, shared by
  * vk_comp.c (constanos: NVK linked in, the screen) and the host harness (-DCOMP_HOST: the system's Vulkan, an offscreen image, PPM dumps).
  *
- * It draws what gui_capi's draw list says, back to front, with one graphics pipeline: a rectangle per operation, whose fragment shader
+ * It draws a list of `cr_op` (comp_api.h), back to front, with one graphics pipeline: a rectangle per operation, whose fragment shader
  * shows a solid colour or reads the pixel of a client's buffer as a storage buffer, one for one (comp.vert, comp.frag). The buffers:
- *   - GPU buffers (GUI_DRAW_GPU): the client's memory, imported where it is (constanos: the opaque-fd import of a /dev/nvgpu BO; host
+ *   - GPU buffers (CR_GPU): the client's memory, imported where it is (constanos: the opaque-fd import of a /dev/nvgpu BO; host
  *     harness: a descriptor of a memfd, mapped and copied into a buffer of its own before every frame, standing in for shared memory);
- *   - pool windows (GUI_DRAW_CPU): the library's copy of their pixels, uploaded to a host-visible buffer when `version` moves;
+ *   - pool windows (CR_CPU): the library's copy of their pixels, uploaded to a host-visible buffer when `version` moves;
  *   - the cursor: a small buffer drawn with a colour key.
  * One frame in flight: a frame starts by waiting for the previous one, so uploads never race the GPU, and then tells the window manager
- * (gui_gpu_frame_done) that the previous frame is done, which is what lets it release buffers.
+ * the caller (comp_wait_frame returns the previous frame's number) that the previous frame is done, which is what lets it release buffers.
  */
 #ifndef COMP_RENDER_H
 #define COMP_RENDER_H
@@ -24,7 +24,7 @@
 #endif
 
 #include "comp_spv.h"
-#include "gui_capi.h"
+#include "comp_api.h"
 
 #define COMP_MAX_GPU 64
 #define COMP_MAX_CPU 32
@@ -54,6 +54,7 @@ struct comp_src {
    const uint32_t *shared;     /* host harness GPU: the client's memory (a mapped memfd), copied into `map` every frame */
    size_t shared_bytes;
 #endif
+   uint32_t used_frame;        /* CPU: the last frame that drew it */
    int dropped;                /* GPU: the window manager let go; freed once the frames that may read it are done */
 };
 
@@ -77,7 +78,6 @@ struct comp {
    struct comp_src gpu[COMP_MAX_GPU];
    struct comp_src cpu[COMP_MAX_CPU];
    struct comp_src dummy;      /* what solid fills bind (never read) */
-   struct comp_src cursor;
    uint32_t frames, draws, draws_max, imports, drops, uploads;
 };
 
@@ -186,14 +186,6 @@ static int comp_init(struct comp *c, VkDevice device, PFN_vkGetDeviceProcAddr gd
    /* the fixed sources: a page for solid fills to bind, and the cursor (0xFF000000 | colour, 0 = transparent) */
    if (comp_host_buffer(c, &c->dummy, 4096) != 0 || comp_alloc_set(c, &c->dummy) != 0) return -10;
    comp_write_set(c, &c->dummy);
-   if (comp_host_buffer(c, &c->cursor, GUI_CURSOR_W * GUI_CURSOR_H * 4) != 0 || comp_alloc_set(c, &c->cursor) != 0) return -11;
-   for (int y = 0; y < GUI_CURSOR_H; y++) {
-      const char *row = gui_cursor_bitmap((size_t)y);
-      for (int x = 0; x < GUI_CURSOR_W; x++)
-         c->cursor.map[y * GUI_CURSOR_W + x] = row[x] == 'X' ? 0xff000000u : row[x] == '.' ? 0xffffffffu : 0u;
-   }
-   c->cursor.stride_px = GUI_CURSOR_W;
-   comp_write_set(c, &c->cursor);
    return 0;
 }
 
@@ -203,7 +195,6 @@ static void comp_destroy(struct comp *c) {
    for (int i = 0; i < COMP_MAX_GPU; i++) if (c->gpu[i].key) comp_free_src(c, &c->gpu[i]);
    for (int i = 0; i < COMP_MAX_CPU; i++) if (c->cpu[i].key) comp_free_src(c, &c->cpu[i]);
    comp_free_src(c, &c->dummy);
-   comp_free_src(c, &c->cursor);
    c->vkDestroyFence(c->device, c->fence, NULL);
    c->vkDestroyCommandPool(c->device, c->cpool, NULL);
    c->vkDestroyDescriptorPool(c->device, c->pool, NULL);
@@ -222,33 +213,33 @@ static struct comp_src *comp_slot(struct comp_src *tab, int n) {
    return NULL;
 }
 
-/* A client's GPU buffer, from the window manager's GUI_GPU_IMPORT. Takes the descriptor (closes it). 0, or a negative step. */
-static int comp_import(struct comp *c, const struct gui_gpu_op *op) {
+/* A client's GPU buffer (`size` bytes of the descriptor `fd`, rows `stride_bytes` apart), from the window manager's import. Takes the descriptor (closes it). 0, or a negative step. */
+static int comp_import(struct comp *c, uint64_t handle, int fd, uint64_t size, uint32_t stride_bytes) {
    struct comp_src *s = comp_slot(c->gpu, COMP_MAX_GPU);
-   if (!s) { close(op->fd); return -1; }
+   if (!s) { close(fd); return -1; }
    memset(s, 0, sizeof(*s));
-   s->key = op->handle;
-   s->stride_px = op->stride / 4;
+   s->key = handle;
+   s->stride_px = stride_bytes / 4;
 #ifdef COMP_HOST
    /* the harness: the descriptor is a memfd the "client" wrote its pixels into; map it, and copy it into a buffer of ours every frame */
-   void *m = mmap(NULL, op->size, PROT_READ, MAP_SHARED, op->fd, 0);
-   close(op->fd);
+   void *m = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+   close(fd);
    if (m == MAP_FAILED) { s->key = 0; return -2; }
    s->shared = m;
-   s->shared_bytes = op->size;
-   if (comp_host_buffer(c, s, op->size) != 0 || comp_alloc_set(c, s) != 0) { comp_free_src(c, s); return -3; }
+   s->shared_bytes = size;
+   if (comp_host_buffer(c, s, size) != 0 || comp_alloc_set(c, s) != 0) { comp_free_src(c, s); return -3; }
 #else
    /* constanos: the memory of the client's BO, imported where it is (VRAM), read in place */
    VkExternalMemoryBufferCreateInfo ebi = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT };
-   VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &ebi, .size = op->size, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
-   if (c->vkCreateBuffer(c->device, &bci, NULL, &s->buf) != VK_SUCCESS) { close(op->fd); comp_free_src(c, s); return -2; }
+   VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &ebi, .size = size, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+   if (c->vkCreateBuffer(c->device, &bci, NULL, &s->buf) != VK_SUCCESS) { close(fd); comp_free_src(c, s); return -2; }
    VkMemoryRequirements req;
    c->vkGetBufferMemoryRequirements(c->device, s->buf, &req);
    int t = comp_type(c, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
    if (t < 0) t = comp_type(c, req.memoryTypeBits, 0, 0);
-   VkImportMemoryFdInfoKHR imp = { .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT, .fd = op->fd };
+   VkImportMemoryFdInfoKHR imp = { .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT, .fd = fd };
    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = req.size, .memoryTypeIndex = (uint32_t)(t < 0 ? 0 : t) };
-   if (c->vkAllocateMemory(c->device, &mai, NULL, &s->mem) != VK_SUCCESS) { close(op->fd); comp_free_src(c, s); return -3; }   /* the fd is the driver's only on success */
+   if (c->vkAllocateMemory(c->device, &mai, NULL, &s->mem) != VK_SUCCESS) { close(fd); comp_free_src(c, s); return -3; }   /* the fd is the driver's only on success */
    if (c->vkBindBufferMemory(c->device, s->buf, s->mem, 0) != VK_SUCCESS || comp_alloc_set(c, s) != 0) { comp_free_src(c, s); return -4; }
 #endif
    comp_write_set(c, s);
@@ -263,21 +254,22 @@ static void comp_drop(struct comp *c, uint64_t handle) {
    c->drops++;
 }
 
-static struct comp_src *comp_cpu_source(struct comp *c, const struct gui_draw_op *op, const uint32_t *px, size_t npx) {
-   uint64_t key = ((uint64_t)op->client << 32) | op->surface;
-   struct comp_src *s = comp_find(c->cpu, COMP_MAX_CPU, key);
-   if (s && s->capacity < npx * 4) { comp_free_src(c, s); s = NULL; }   /* the window got bigger */
+/* The buffer behind a CPU source (a window's pixels, a title, the cursor): made on first use, grown if the source did, uploaded when `version` moves. */
+static struct comp_src *comp_cpu_source(struct comp *c, const struct cr_op *op) {
+   uint64_t npx = op->npx;
+   struct comp_src *s = comp_find(c->cpu, COMP_MAX_CPU, op->key);
+   if (s && s->capacity < npx * 4) { comp_free_src(c, s); s = NULL; }   /* the source got bigger */
    if (!s) {
       s = comp_slot(c->cpu, COMP_MAX_CPU);
       if (!s) return NULL;
       memset(s, 0, sizeof(*s));
       if (comp_host_buffer(c, s, npx * 4) != 0 || comp_alloc_set(c, s) != 0) { comp_free_src(c, s); return NULL; }
-      s->key = key;
+      s->key = op->key;
       comp_write_set(c, s);
       s->version = ~0ull;
    }
    if (s->version != op->version || s->stride_px != (uint32_t)op->src_w) {
-      memcpy(s->map, px, npx * 4);
+      memcpy(s->map, op->px, npx * 4);
       s->version = op->version;
       s->stride_px = (uint32_t)op->src_w;
       c->uploads++;
@@ -285,36 +277,32 @@ static struct comp_src *comp_cpu_source(struct comp *c, const struct gui_draw_op
    return s;
 }
 
-/* Waits for the frame in flight and frees what it was reading: tells the window manager its buffers are no longer read. */
-static void comp_wait_frame(struct comp *c, gui_comp *g) {
+/* CPU sources nobody drew in the last `COMP_IDLE_FRAMES` frames are freed (a window that closed, a title that changed size): at the end of every frame. */
+#define COMP_IDLE_FRAMES 120
+
+/* Waits for the frame in flight. Returns its number (what the caller handed to comp_frame), 0 if none was in flight: that frame is done, so the
+ * buffers it read may be released to their clients. */
+static uint64_t comp_wait_frame(struct comp *c) {
+   uint64_t done = 0;
    if (c->fence_pending) {
       c->vkWaitForFences(c->device, 1, &c->fence, VK_TRUE, UINT64_MAX);
       c->fence_pending = 0;
-      gui_gpu_frame_done(g, c->epoch_pending);
+      done = c->epoch_pending;
    }
+   return done;
 }
 
-/* One frame: the draw list into `image` (`view`, `w` x `h`, of the `format` given to comp_init), submitted waiting on `wait_sem` (or none) and
- * signalling `signal_sem` (or none), the image left in `final_layout`. 0, or a negative step. */
-static int comp_frame(struct comp *c, gui_comp *g, VkImage image, VkImageView view, uint32_t w, uint32_t h, VkSemaphore wait_sem, VkSemaphore signal_sem, VkImageLayout final_layout) {
-   comp_wait_frame(c, g);
-   struct gui_gpu_op gop;
-   while (gui_pop_gpu_op(g, &gop)) {
-      if (gop.kind == GUI_GPU_IMPORT) {
-         int r = comp_import(c, &gop);
-         if (r) printf("COMP the import of buffer %llu failed (%d)\n", (unsigned long long)gop.handle, r);
-      } else {
-         comp_drop(c, gop.handle);
-      }
-   }
-   int32_t fd;
-   while (gui_pop_fd_to_close(g, &fd)) close(fd);
-   /* a Drop seen now may name a buffer the previous frame read: that frame is done (waited for above), so it may go */
+static void comp_free_dropped(struct comp *c) {
    for (int i = 0; i < COMP_MAX_GPU; i++)
       if (c->gpu[i].key && c->gpu[i].dropped) comp_free_src(c, &c->gpu[i]);
+}
 
-   uint64_t epoch = gui_draw_list(g);
-   const size_t n = gui_draw_count(g);
+/* One frame: `ops` (frame number `epoch`) into `image` (`view`, `w` x `h`, of the `format` given to comp_init), submitted waiting on `wait_sem` (or
+ * none) and signalling `signal_sem` (or none), the image left in `final_layout`. The previous frame must be waited for already (comp_wait_frame):
+ * what it was reading may be freed and rewritten now. 0, or a negative step. */
+static int comp_frame(struct comp *c, const struct cr_op *ops, size_t n, uint64_t epoch, VkImage image, VkImageView view, uint32_t w, uint32_t h, VkSemaphore wait_sem, VkSemaphore signal_sem, VkImageLayout final_layout) {
+   if (c->fence_pending) return -2;
+   comp_free_dropped(c);
 #ifdef COMP_HOST
    for (int i = 0; i < COMP_MAX_GPU; i++)
       if (c->gpu[i].key && c->gpu[i].shared) memcpy(c->gpu[i].map, c->gpu[i].shared, c->gpu[i].shared_bytes);
@@ -338,39 +326,31 @@ static int comp_frame(struct comp *c, gui_comp *g, VkImage image, VkImageView vi
 
    uint32_t draws = 0;
    for (size_t i = 0; i < n; i++) {
-      struct gui_draw_op op;
-      if (gui_draw_get(g, i, &op) != 0) break;
-      struct comp_push pc = { { op.x, op.y, op.w, op.h }, { 0, 0, 0, 0 }, { 0, w, h, 0 } };
+      const struct cr_op *op = &ops[i];
+      struct comp_push pc = { { op->x, op->y, op->w, op->h }, { 0, 0, 0, 0 }, { 0, w, h, 0 } };
       struct comp_src *src = &c->dummy;
-      switch (op.kind) {
-      case GUI_DRAW_FILL:
-         pc.misc[0] = op.color;
+      switch (op->kind) {
+      case CR_FILL:
+         pc.misc[0] = op->color;
          break;
-      case GUI_DRAW_GPU: {
-         struct comp_src *s = comp_find(c->gpu, COMP_MAX_GPU, op.handle);
+      case CR_GPU: {
+         struct comp_src *s = comp_find(c->gpu, COMP_MAX_GPU, op->key);
          if (!s) continue;   /* its import failed: nothing to show */
          src = s;
-         pc.src[0] = op.sx; pc.src[1] = op.sy; pc.src[2] = (int32_t)s->stride_px; pc.src[3] = 1;
+         pc.src[0] = op->sx; pc.src[1] = op->sy; pc.src[2] = (int32_t)s->stride_px; pc.src[3] = 1;
          break;
       }
-      case GUI_DRAW_CPU: {
-         size_t len = 0;
-         const uint32_t *px = gui_cpu_content(g, op.client, op.surface, &len);
-         if (!px) continue;
-         struct comp_src *s = comp_cpu_source(c, &op, px, len);
+      case CR_CPU: {
+         if (!op->px) continue;
+         struct comp_src *s = comp_cpu_source(c, op);
          if (!s) continue;
+         s->used_frame = c->frames;
          src = s;
-         pc.src[0] = op.sx; pc.src[1] = op.sy; pc.src[2] = op.src_w; pc.src[3] = 1;
+         pc.src[0] = op->sx; pc.src[1] = op->sy; pc.src[2] = op->src_w; pc.src[3] = op->keyed ? 2 : 1;
          break;
       }
-      case GUI_DRAW_CURSOR:
-         /* the whole bitmap at the pointer: what sticks out of the screen is clipped by the viewport, the pixels it hides are never read */
-         src = &c->cursor;
-         pc.dst[2] = GUI_CURSOR_W; pc.dst[3] = GUI_CURSOR_H;
-         pc.src[2] = GUI_CURSOR_W; pc.src[3] = 2;
-         break;
       default:
-         continue;   /* TITLE: the text is not drawn yet (the bar is) */
+         continue;
       }
       if (pc.dst[2] <= 0 || pc.dst[3] <= 0) continue;
       c->vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, c->pl, 0, 1, &src->set, 0, NULL);
@@ -396,6 +376,9 @@ static int comp_frame(struct comp *c, gui_comp *g, VkImage image, VkImageView vi
    c->fence_pending = 1;
    c->epoch_pending = epoch;
    c->frames++;
+   /* sources nobody drew for a long while (a closed window, a title that changed size) go back; the frame in flight only reads the ones it drew */
+   for (int i = 0; i < COMP_MAX_CPU; i++)
+      if (c->cpu[i].key && c->frames - c->cpu[i].used_frame > COMP_IDLE_FRAMES) comp_free_src(c, &c->cpu[i]);
    c->draws = draws;
    if (draws > c->draws_max) c->draws_max = draws;
    return 0;

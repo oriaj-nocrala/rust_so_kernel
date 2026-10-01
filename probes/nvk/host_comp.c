@@ -17,6 +17,7 @@
 
 #include "comp_render.h"
 #include "constanos_gui_wire.h"
+#include "gui_capi.h"
 
 #define W 640
 #define H 360
@@ -162,7 +163,52 @@ static int frame(struct vkctx *v, struct comp *c, const char *dir, const char *n
    PFN_vkCreateCommandPool ccp = (PFN_vkCreateCommandPool)v->gdpa(v->device, "vkCreateCommandPool");
    PFN_vkAllocateCommandBuffers acb = (PFN_vkAllocateCommandBuffers)v->gdpa(v->device, "vkAllocateCommandBuffers");
    (void)ccp; (void)acb; (void)pool; (void)cb;
-   int r = comp_frame(c, g, v->image, v->view, W, H, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+   /* what the compositor program does each frame, in C: the previous frame is done -> the window manager; its imports and drops -> the renderer;
+    * its draw list -> the renderer's operations (the cursor is a keyed pixel source) */
+   uint64_t done = comp_wait_frame(c);
+   if (done) gui_gpu_frame_done(g, done);
+   struct gui_gpu_op gop;
+   while (gui_pop_gpu_op(g, &gop)) {
+      if (gop.kind == GUI_GPU_IMPORT) { if (comp_import(c, gop.handle, gop.fd, gop.size, gop.stride)) printf("FAIL import\n"); }
+      else comp_drop(c, gop.handle);
+   }
+   int32_t cfd;
+   while (gui_pop_fd_to_close(g, &cfd)) close(cfd);
+   uint64_t epoch = gui_draw_list(g);
+   static uint32_t cursor_px[GUI_CURSOR_W * GUI_CURSOR_H];
+   for (int y = 0; y < GUI_CURSOR_H; y++)
+      for (int x = 0; x < GUI_CURSOR_W; x++) {
+         char ch = gui_cursor_bitmap((size_t)y)[x];
+         cursor_px[y * GUI_CURSOR_W + x] = ch == 'X' ? 0xff000000u : ch == '.' ? 0xffffffffu : 0u;
+      }
+   size_t nops = gui_draw_count(g);
+   struct cr_op *ops = calloc(nops + 1, sizeof(*ops));
+   size_t no = 0;
+   for (size_t i = 0; i < nops; i++) {
+      struct gui_draw_op d;
+      gui_draw_get(g, i, &d);
+      struct cr_op *o = &ops[no];
+      switch (d.kind) {
+      case GUI_DRAW_FILL: *o = (struct cr_op){ .kind = CR_FILL, .color = d.color, .x = d.x, .y = d.y, .w = d.w, .h = d.h }; no++; break;
+      case GUI_DRAW_GPU: *o = (struct cr_op){ .kind = CR_GPU, .key = d.handle, .x = d.x, .y = d.y, .w = d.w, .h = d.h, .sx = d.sx, .sy = d.sy }; no++; break;
+      case GUI_DRAW_CPU: {
+         size_t len = 0;
+         const uint32_t *px = gui_cpu_content(g, d.client, d.surface, &len);
+         *o = (struct cr_op){ .kind = CR_CPU, .key = ((uint64_t)d.client << 32) | d.surface, .version = d.version, .px = px, .npx = len, .src_w = d.src_w,
+                              .x = d.x, .y = d.y, .w = d.w, .h = d.h, .sx = d.sx, .sy = d.sy };
+         no++;
+         break;
+      }
+      case GUI_DRAW_CURSOR:
+         *o = (struct cr_op){ .kind = CR_CPU, .key = 1ull << 63, .version = 1, .px = cursor_px, .npx = GUI_CURSOR_W * GUI_CURSOR_H, .src_w = GUI_CURSOR_W, .keyed = 1,
+                              .x = d.x, .y = d.y, .w = GUI_CURSOR_W, .h = GUI_CURSOR_H };
+         no++;
+         break;
+      default: break;
+      }
+   }
+   int r = comp_frame(c, ops, no, epoch, v->image, v->view, W, H, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+   free(ops);
    if (r != 0) { printf("FAIL comp_frame -> %d\n", r); failures++; return -1; }
    /* the readback: a one-off command buffer copying the image to the host-visible buffer */
    VkCommandPoolCreateInfo cpi = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = v->family };

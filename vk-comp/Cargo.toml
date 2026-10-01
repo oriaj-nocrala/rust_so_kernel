@@ -1,0 +1,21 @@
+[package]
+name = "vk-comp"
+version = "0.1.0"
+edition = "2021"
+
+# The GPU compositor's machine (G5 layer 4): sockets, input, window titles and the window manager (`gui`), in Rust with std on
+# `x86_64-unknown-linux-musl`. A static library that exports `main`: `probes/nvk/build.py` links it with NVK and the renderer
+# (`probes/nvk/comp_vk.c`, C: it speaks Vulkan), the way probes/nvk/rust-link-probe/ showed works. Its own workspace, like `gui`.
+[workspace]
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+gui = { path = "../gui" }
+draw = { path = "../draw", features = ["noto"] }
+text = { path = "../text" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
