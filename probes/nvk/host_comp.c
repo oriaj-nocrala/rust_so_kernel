@@ -334,6 +334,7 @@ int main(int argc, char **argv) {
    for (int i = 0; i < COMP_MAX_GPU; i++) if (comp.gpu[i].key) live++;
    CHECK(live == 0 && comp.drops == 2, "both GPU buffers were dropped and freed (%d live, %u drops)", live, comp.drops);
 
+   comp_destroy(&comp);
    printf("host_comp: %u frames, up to %u draws each, %u imports, %u uploads\n", comp.frames, comp.draws_max, comp.imports, comp.uploads);
    if (failures) { printf("HOST_COMP FAILED (%d)\n", failures); return 1; }
    printf("HOST_COMP DONE\n");

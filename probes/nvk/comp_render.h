@@ -38,7 +38,8 @@
    X(vkUpdateDescriptorSets) X(vkFreeDescriptorSets) X(vkCreateCommandPool) X(vkAllocateCommandBuffers) X(vkResetCommandBuffer) \
    X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkCmdPipelineBarrier) X(vkCmdBeginRendering) X(vkCmdEndRendering) \
    X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
-   X(vkCreateFence) X(vkResetFences) X(vkWaitForFences) X(vkQueueSubmit) X(vkDeviceWaitIdle)
+   X(vkCreateFence) X(vkResetFences) X(vkWaitForFences) X(vkQueueSubmit) X(vkDeviceWaitIdle) \
+   X(vkDestroyPipeline) X(vkDestroyPipelineLayout) X(vkDestroyDescriptorSetLayout) X(vkDestroyDescriptorPool) X(vkDestroyCommandPool) X(vkDestroyFence)
 
 struct comp_src {
    uint64_t key;               /* GPU: the handle; CPU: client << 32 | surface; 0 = free */
@@ -194,6 +195,21 @@ static int comp_init(struct comp *c, VkDevice device, PFN_vkGetDeviceProcAddr gd
    c->cursor.stride_px = GUI_CURSOR_W;
    comp_write_set(c, &c->cursor);
    return 0;
+}
+
+/* Everything comp_init and the frames made, back to the driver (a device with live objects asserts when destroyed). */
+static void comp_destroy(struct comp *c) {
+   c->vkDeviceWaitIdle(c->device);
+   for (int i = 0; i < COMP_MAX_GPU; i++) if (c->gpu[i].key) comp_free_src(c, &c->gpu[i]);
+   for (int i = 0; i < COMP_MAX_CPU; i++) if (c->cpu[i].key) comp_free_src(c, &c->cpu[i]);
+   comp_free_src(c, &c->dummy);
+   comp_free_src(c, &c->cursor);
+   c->vkDestroyFence(c->device, c->fence, NULL);
+   c->vkDestroyCommandPool(c->device, c->cpool, NULL);
+   c->vkDestroyDescriptorPool(c->device, c->pool, NULL);
+   c->vkDestroyPipeline(c->device, c->pipe, NULL);
+   c->vkDestroyPipelineLayout(c->device, c->pl, NULL);
+   c->vkDestroyDescriptorSetLayout(c->device, c->dsl, NULL);
 }
 
 static struct comp_src *comp_find(struct comp_src *tab, int n, uint64_t key) {

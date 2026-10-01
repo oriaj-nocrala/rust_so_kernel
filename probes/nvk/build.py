@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """build.py : compile vk_probe.c and link it with the whole of NVK (built by Meson as probes/nak/README.md and mesa-port/README.md say)
-into one static musl executable, ~/src/gpu-ref/nvk-probe/vk-probe (and vk-draw from vk_draw.c, vk-snake from vk_snake.c, vk-share from vk_share.c, vk-window from vk_window.c). Needs the stubs in stubs.c for the few third-party symbols NVK
+into one static musl executable, ~/src/gpu-ref/nvk-probe/vk-probe (and vk-draw from vk_draw.c, vk-snake from vk_snake.c, vk-share from vk_share.c, vk-window from vk_window.c, vk-comp from vk_comp.c + gui-capi). Needs the stubs in stubs.c for the few third-party symbols NVK
 references that a constanos process never reaches (DRM, udev, libelf, SPIRV-Tools, libdisplay-info)."""
 import os, subprocess, sys
 home = os.path.expanduser('~/src/gpu-ref')
@@ -11,12 +11,16 @@ os.makedirs(out_dir, exist_ok=True)
 cc = ['clang', '--target=x86_64-linux-musl', '-nostdlibinc', '-isystem', '/usr/lib/musl/include', '-isystem', home + '/musl-inc',
       '-O2', '-g', '-D_GNU_SOURCE', '-fno-strict-aliasing', '-isystem', '/usr/lib/gcc/x86_64-pc-linux-gnu/16/include']
 objs = []
-for src in ['vk_probe.c', 'vk_draw.c', 'vk_snake.c', 'vk_share.c', 'vk_window.c', 'stubs.c']:
+# the window manager behind a C ABI (gui-capi), a static library for musl without std
+capi_dir = os.path.join(here, '../../gui-capi')
+subprocess.run(['cargo', 'build', '--release', '--target', 'x86_64-unknown-linux-musl', '--no-default-features'], cwd=capi_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+capi_lib = os.path.join(capi_dir, 'target/x86_64-unknown-linux-musl/release/libgui_capi.a')
+for src in ['vk_probe.c', 'vk_draw.c', 'vk_snake.c', 'vk_share.c', 'vk_window.c', 'vk_comp.c', 'stubs.c']:
     p = os.path.join(here, src)
     if not os.path.exists(p):
         continue
     o = os.path.join(out_dir, src.replace('.c', '.o'))
-    r = subprocess.run(cc + ['-I', here, '-I', os.path.join(here, '../../userspace/c/include'), '-c', p, '-o', o])
+    r = subprocess.run(cc + ['-I', here, '-I', os.path.join(here, '../../userspace/c/include'), '-I', os.path.join(here, '../../gui-capi/include'), '-c', p, '-o', o])
     if r.returncode:
         sys.exit(r.returncode)
     objs.append(o)
@@ -37,9 +41,11 @@ def link_cmd(out, objs):
         m + 'crt1.o', m + 'crti.o'] + objs + ['-Wl,--whole-archive', os.path.join(bdir, 'src/nouveau/vulkan/libnvk.a'), '-Wl,--no-whole-archive', '-Wl,--start-group'] + libs + ['-Wl,--end-group', '-Wl,--gc-sections', '-Wl,--build-id=sha1', '-Wl,--eh-frame-hdr',
         gcc + 'libstdc++.a', m + 'libm.a', m + 'libc.a', gcc + 'libgcc.a', rustlib + 'libunwind.a', m + 'libc.a', m + 'crtn.o']
 rc = 0
-for prog, src in [('vk-probe', 'vk_probe.o'), ('vk-draw', 'vk_draw.o'), ('vk-snake', 'vk_snake.o'), ('vk-share', 'vk_share.o'), ('vk-window', 'vk_window.o')]:
+for prog, src in [('vk-probe', 'vk_probe.o'), ('vk-draw', 'vk_draw.o'), ('vk-snake', 'vk_snake.o'), ('vk-share', 'vk_share.o'), ('vk-window', 'vk_window.o'), ('vk-comp', 'vk_comp.o')]:
     o = [x for x in objs if os.path.basename(x) in (src, 'stubs.o')]
     if not any(os.path.basename(x) == src for x in o):
         continue
+    if prog == 'vk-comp':
+        o = o + [capi_lib]
     rc |= subprocess.run(link_cmd(os.path.join(out_dir, prog), o)).returncode
 sys.exit(rc)

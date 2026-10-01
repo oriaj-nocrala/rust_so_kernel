@@ -141,6 +141,7 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "pty_test",
     "rss_test",
     "gui_fake_comp",
+    "gui_comp_test",
 ];
 
 /// Freestanding static-pie test programs (userspace/c/): no libc, no crt, linked `-static-pie` so they are `ET_DYN`
