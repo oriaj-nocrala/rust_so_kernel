@@ -45,30 +45,19 @@ echo 'cursor probe' > /dev/dispctl && sum "gpu-cursor-ladder: channel allocated:
 # cursor channel positioned first and with nouveau's whole curs_set in one push. NVIDIA's own driver (nvkms-evo3.c EvoSetCursorImageC3) also pushes
 # PRESENT_CONTROL_CURSOR (0x2098 = MONO) and the context DMA and offset of the second slot (0x208c, 0x2094) ("HW ignores it unless stereo", but validation may not).
 variants() {
-step 53 context-dma-slot1 0x208c 0xf0000001
-step 54 offset-slot1 0x2094 0x50000
-step 55 present-control-mono 0x2098 0
-[ $stopped = 1 ] && return
-# Ryzen #206: still INVALID_STATE code 0x43 with both slots and the present control. nouveau's core UPDATE carries SET_INTERLOCK_FLAGS (0x218) = the head's
-# cursor bit whenever a cursor changes and the cursor channel then gets its own UPDATE; a window's first update without its interlock raised the same
-# exception (#89). `il` pushes the flag with the method; before it the cursor channel's side is written (its own SET_INTERLOCK_FLAGS with the core, a position and
-# UPDATE: a window's first update is interlocked from both sides, #89). #207: UPDATE after the push, #208: before it without the flags: the core waited for ever.
+# Ryzen #204-#210 (also at gpu=hdmi, before the GSP): the enable alone raised INVALID_STATE code 0x43 in every variant; interlocked from one side the core waited for
+# ever. Variants not tried: the bounds only count after a mode switch. `onmode`: detach (supervisors), then ONE push with the cursor's whole set AND the SOR attach
+# (`Cmd::Mode`), wait for the supervisors and the latch. The screen goes dark for a moment.
 enabled=0
-if echo "cursor raw 0x209c 0x800000cf il" > /dev/dispctl; then enabled=1; sum "gpu-cursor-ladder: 6c enable interlocked with the cursor channel: idle again, ENABLED"
+if echo "cursor onmode 32" > /dev/dispctl; then enabled=1; sum "gpu-cursor-ladder: 7 onmode (detach, cursor + attach in one push): ENABLED"
 else
-  sum "gpu-cursor-ladder: 6c enable interlocked with the cursor channel: failed"; sum "gpu-cursor-ladder: 6c: $(rawlog)"; sum "gpu-cursor-ladder: 6c: $(st2)"
-  # does a plain cursor UPDATE free a core that waits in WAIT_FOR_UPD?
-  echo "cursor update" > /dev/dispctl; sleep 1; sum "gpu-cursor-ladder: 6c after a plain cursor UPDATE: $(st2)"
+  sum "gpu-cursor-ladder: 7 onmode: failed: $(grep -a 'cursor: onmode failed' /proc/gpu | tail -n 1 | cut -c1-400)"
+  sum "gpu-cursor-ladder: 7: $(st2)"; sum "gpu-cursor-ladder: 7: $(grep -a '^dispctl' /dev/dispctl | cut -c1-300)"
   echo "cursor recover" > /dev/dispctl; sum "gpu-cursor-ladder: recovered: $(grep -a 'cursor: recover' /proc/gpu | tail -n 1 | cut -c1-300)"
   fail=1
 fi
-if [ $enabled = 1 ]; then
-  # the flag persists in the core's ASSEMBLY state: reset it
-  echo "cursor raw 0x218 0" > /dev/dispctl && sum "gpu-cursor-ladder: interlock flags reset" || { sum "gpu-cursor-ladder: interlock reset FAILED"; fail=1; }
-  echo "cursor ilock off" > /dev/dispctl
-else
-  stopped=1
-fi
+sum "gpu-cursor-ladder: gpu_super: $(grep -a '^gpu_super' /proc/kdebug | cut -c1-300)"
+[ $enabled = 1 ] || stopped=1
 sum "gpu-cursor-ladder: after the enable attempts: $(st)"
 }
 [ $stopped = 0 ] && variants

@@ -130,6 +130,83 @@ pub fn recover() -> Result<(), CursorError> {
     if idle { Ok(()) } else { Err(CursorError::Failed) }
 }
 
+/// `cursor onmode [size]`: the cursor enabled in the same UPDATE that re-attaches the head, after a detach, like a mode set (Ryzen #204-#210: enabling it on a
+/// running head raised INVALID_STATE code 0x43 whatever the order, interlock or GSP; the head's usage bounds are applied by the supervisors of a mode switch
+/// and may not count for a bounds-only push). Detach, wait for its supervisor 3 and the SOR to be free, then `Cmd::Mode` with the cursor's methods (9, the
+/// last repeated) which also puts the GOP's SOR control back, wait for the next supervisor 3 and an idle core. The screen goes dark in between.
+pub fn on_with_attach(size: u32) -> Result<(), CursorError> {
+    if ON.load(Ordering::Acquire) || nc::size_code(size).is_none() {
+        return Err(CursorError::Invalid);
+    }
+    probe()?;
+    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
+    write_image(size)?;
+    let m = nc::core_methods_set(head, nvgpu::hdmi::HANDLE_LUT, IMAGE_VRAM, size, 0, 0).ok_or(CursorError::Invalid)?;
+    let mut nine = [(0u32, 0u32); 9];
+    for (i, slot) in nine.iter_mut().enumerate() {
+        *slot = m[i.min(m.len() - 1)];
+    }
+    let was_on = x86_64::instructions::interrupts::are_enabled();
+    if !was_on {
+        x86_64::instructions::interrupts::enable();
+    }
+    let wait = |done: &dyn Fn() -> bool| -> bool {
+        let t0 = crate::cpu::tsc::read();
+        loop {
+            if done() {
+                return true;
+            }
+            if crate::cpu::tsc::read().wrapping_sub(t0) / (crate::cpu::tsc::freq_hz() / 1000).max(1) >= 3000 {
+                return done();
+            }
+            crate::memory::tlb::service_pending();
+            core::hint::spin_loop();
+        }
+    };
+    let result = (|| {
+        wait(&|| supervisor::core_idle());
+        let before = supervisor::supers_done();
+        supervisor::request(supervisor::Cmd::Detach).map_err(|e| alloc::format!("detach: {:?}", e))?;
+        if !wait(&|| supervisor::supers_done() > before && supervisor::link_free()) {
+            return Err(String::from("the SOR was not free 3 s after the detach"));
+        }
+        let before = supervisor::supers_done();
+        supervisor::request(supervisor::Cmd::Mode(nine)).map_err(|e| alloc::format!("mode push: {:?}", e))?;
+        let want = nc::control(size, 0, 0).unwrap_or(0);
+        let a = evo::CORE.armed_base();
+        if !wait(&|| supervisor::supers_done() > before && supervisor::core_idle() && regs.rd32(a + nc::core_control(head)) == want) {
+            return Err(alloc::format!(
+                "not latched in 3 s: ARMED control {:#x} (want {:#x}) core idle {} status {:#x} slot {:#x},{:#x},{:#x}",
+                regs.rd32(a + nc::core_control(head)),
+                want,
+                evo::CORE.idle(regs) as u8,
+                regs.rd32(0x61_0630),
+                regs.rd32(evo::CORE.exception()),
+                regs.rd32(evo::CORE.exception() + 4),
+                regs.rd32(evo::CORE.exception() + 8)
+            ));
+        }
+        Ok(())
+    })();
+    if !was_on {
+        x86_64::instructions::interrupts::disable();
+    }
+    match result {
+        Ok(()) => {
+            SIZE.store(size, Ordering::Release);
+            SETS.fetch_add(1, Ordering::Relaxed);
+            ON.store(true, Ordering::Release);
+            log(alloc::format!("cursor: head {} on through a detach/attach, {}x{} at VRAM {:#x}", head, size, size, IMAGE_VRAM));
+            Ok(())
+        }
+        Err(why) => {
+            REFUSED.fetch_add(1, Ordering::Relaxed);
+            log(alloc::format!("cursor: onmode failed: {}", why));
+            Err(CursorError::Failed)
+        }
+    }
+}
+
 /// `cursor update`: only the cursor channel's UPDATE (frees a core that waits for it).
 pub fn update() -> Result<(), CursorError> {
     let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
