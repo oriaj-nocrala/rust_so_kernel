@@ -574,6 +574,39 @@ pub(super) fn disown_head(head: u32, sor: u8) {
     });
 }
 
+/// The display registers read by `/dev/dispctl peek` (offset, value), the latest few, shown by the next status read.
+static PEEKS: IrqMutex<VecDeque<(u32, u32)>, KernelIrq> = IrqMutex::new(VecDeque::new());
+const PEEKS_KEPT: usize = 48;
+
+/// Reads one display register (see `nvgpu::evo::peek_allowed`), keeps the value for [`peek_status`]. `None`: not allowed or not set up.
+pub fn peek(offset: u32) -> Option<u32> {
+    if !evo::peek_allowed(offset) {
+        return None;
+    }
+    let v = regs()?.rd32(offset);
+    PEEKS.with(|q| {
+        if q.len() == PEEKS_KEPT {
+            q.pop_front();
+        }
+        q.push_back((offset, v));
+    });
+    Some(v)
+}
+
+/// The registers read since the last status read, one `peek:` line (empty if none), and forget them.
+pub fn peek_status() -> String {
+    let taken: alloc::vec::Vec<(u32, u32)> = PEEKS.with(|q| q.drain(..).collect());
+    if taken.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("peek:");
+    for (o, v) in taken {
+        s.push_str(&alloc::format!(" {:#x}={:#x}", o, v));
+    }
+    s.push('\n');
+    s
+}
+
 /// The BAR0 window `setup` kept, for the modules that run on top of it.
 pub(super) fn regs() -> Option<&'static Bar0> {
     disp().map(|d| &d.regs)

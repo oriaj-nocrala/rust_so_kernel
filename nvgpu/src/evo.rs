@@ -789,6 +789,14 @@ pub const CORE_PUSHED: [u32; 3] = [CORE_UPDATE, CORE_SET_INTERLOCK_FLAGS, CORE_S
 pub const WNDW_PUSHED: [u32; 4] =
     [WNDW_UPDATE, WNDW_SET_CONTEXT_DMA_ISO0, WNDW_SET_INTERLOCK_FLAGS, WNDW_SET_WINDOW_INTERLOCK_FLAGS];
 
+/// Display registers the kernel reads on request (`/dev/dispctl peek <offset>`, an instrument: what the GOP left, what a channel holds): 4-aligned,
+/// in the control and status block (`0x610000-0x611fff`: channel control and status, exception slots, interrupt masks) or in the channels' user and
+/// state areas (`0x640000-0x6dffff`: the core's ASSEMBLY and ARMED, windows, cursors). Nothing else (not PRAMIN, not the other engines): the
+/// driver already reads these ranges in its own status lines, so a read is not expected to have a side effect (an instrument, to be used with that in mind).
+pub fn peek_allowed(offset: u32) -> bool {
+    offset % 4 == 0 && ((0x61_0000..0x61_2000).contains(&offset) || (0x64_0000..0x6e_0000).contains(&offset))
+}
+
 /// Registers that read `0xbadf5xxx` do not exist (PRI error); window 0's
 /// dump has 22 of them on the target. The gate skips them.
 pub fn is_pri_error(v: u32) -> bool {
@@ -1288,5 +1296,19 @@ mod tests {
         assert!(g.supervisor() && g.bad());
         assert_eq!(g.new_since(&f).ctrl_disp, 0x1);
         assert!(is_pri_error(0xbadf_5040) && !is_pri_error(0xbadf_1100));
+    }
+
+    #[test]
+    fn peek_reads_only_the_display_control_block_and_the_channel_areas() {
+        // allowed: the cursor channel's control and status, the interrupt mask, the core's ARMED head usage bounds, a cursor user region
+        for ok in [0x61_0604, 0x61_0784, 0x61_1dac, 0x61_138c, 0x68_8000 + 0x2030, 0x6d_8008] {
+            assert!(peek_allowed(ok), "{ok:#x}");
+        }
+        // refused: unaligned, PRAMIN, the other BAR0 engines, and the edges just outside
+        for bad in [0x61_0605, 0x70_0000, 0x10_0000, 0x60_fffc, 0x61_2000, 0x63_fffc, 0x6e_0000] {
+            assert!(!peek_allowed(bad), "{bad:#x}");
+        }
+        // the edges inside
+        assert!(peek_allowed(0x61_0000) && peek_allowed(0x61_1ffc) && peek_allowed(0x64_0000) && peek_allowed(0x6d_fffc));
     }
 }

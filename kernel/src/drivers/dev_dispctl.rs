@@ -22,6 +22,8 @@
 //   With `gpu=hdmi` (phase 5.8), `hdmi on` / `hdmi off` light the HP on
 //   HDMI with the kernel's own picture, or switch it off (`gpu/hdmi.rs`);
 //   EINVAL if already so, EAGAIN if busy, EIO if it failed.
+//   `peek <offset>` reads one display register from an allow-list (EINVAL
+//   otherwise); the value comes back on the next `read` as a `peek:` line.
 // - `read`: one status line (the SOR's ARMED control, the core channel's
 //   PUT/GET), with `gpu=modes` a second (`mode: ...`), then EOF.
 
@@ -46,6 +48,7 @@ impl FileHandle for DispctlDevice {
         let mut s = supervisor::status();
         s.push_str(&modeset::status());
         s.push_str(&hdmi::status());
+        s.push_str(&supervisor::peek_status());
         let n = s.len().min(buf.len());
         buf[..n].copy_from_slice(&s.as_bytes()[..n]);
         self.read_done = true;
@@ -54,6 +57,17 @@ impl FileHandle for DispctlDevice {
 
     fn write(&mut self, buf: &[u8]) -> FileResult<usize> {
         let text = core::str::from_utf8(buf).map(str::trim).map_err(|_| FileError::InvalidArgument)?;
+        if let Some(off) = text.strip_prefix("peek ") {
+            // `peek <offset>` (hex with 0x, or decimal): read one display register (allow-list in `nvgpu::evo::peek_allowed`); the value
+            // is on the next read of this device, a `peek:` line. An instrument: no side effects.
+            let off = off.trim();
+            let off = match off.strip_prefix("0x") {
+                Some(h) => u32::from_str_radix(h, 16),
+                None => off.parse(),
+            }
+            .map_err(|_| FileError::InvalidArgument)?;
+            return supervisor::peek(off).map(|_| buf.len()).ok_or(FileError::InvalidArgument);
+        }
         if let Some(req) = text.strip_prefix("mode ") {
             return match modeset::set(req.trim()) {
                 Ok(()) => Ok(buf.len()),
