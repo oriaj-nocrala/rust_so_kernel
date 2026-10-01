@@ -1141,7 +1141,7 @@ impl Rm<'_> {
 pub fn render_kdebug() -> String {
     let base = render_gsp_kdebug();
     let mut out = base;
-    for v in [super::vaspace::render_kdebug(), super::copy::render_kdebug(), super::compute::render_kdebug(), super::uapi::render_kdebug(), crate::drivers::dev_nvgpu::render_kdebug(), super::bench::render_kdebug(), super::intr::render_kdebug(), super::copy::render_irq_kdebug(), super::copy::render_fault_kdebug(), render_runtime_kdebug(), render_perf_kdebug()] {
+    for v in [super::vaspace::render_kdebug(), super::copy::render_kdebug(), super::compute::render_kdebug(), super::uapi::render_kdebug(), super::pacing::render_kdebug(), crate::drivers::dev_nvgpu::render_kdebug(), super::bench::render_kdebug(), super::intr::render_kdebug(), super::copy::render_irq_kdebug(), super::copy::render_fault_kdebug(), render_runtime_kdebug(), render_perf_kdebug()] {
         if !v.is_empty() {
             out += "\n";
             out += &v;

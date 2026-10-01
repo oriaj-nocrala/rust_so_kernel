@@ -101,6 +101,7 @@ fn on_msi(_vector: u8) {
         // number (Acquire) sees this vblank's time.
         LAST_NS.store(crate::time::ktime_get(), Ordering::Release);
         let n = SEQ.fetch_add(1, Ordering::Release) + 1;
+        super::pacing::vblank(n);
         // Phase 6d: GSP-RM raises no interrupt for what it queues (`gpu_intr`), so its status queue is
         // served from here, ten times a second, when no process is in the middle of an RPC.
         if n % 6 == 0 {

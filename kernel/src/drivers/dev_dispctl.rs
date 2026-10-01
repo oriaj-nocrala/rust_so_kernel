@@ -22,6 +22,7 @@
 //   With `gpu=hdmi` (phase 5.8), `hdmi on` / `hdmi off` light the HP on
 //   HDMI with the kernel's own picture, or switch it off (`gpu/hdmi.rs`);
 //   EINVAL if already so, EAGAIN if busy, EIO if it failed.
+//   `trace reset` restarts the pacing statistics (`gpu/pacing.rs`).
 //   `peek <offset>` reads one display register from an allow-list (EINVAL
 //   otherwise); the value comes back on the next `read` as a `peek:` line.
 //   `gsp pstate`: only the current P-state (`gpu_perf: pstate=Pn`), one RM control.
@@ -58,6 +59,11 @@ impl FileHandle for DispctlDevice {
 
     fn write(&mut self, buf: &[u8]) -> FileResult<usize> {
         let text = core::str::from_utf8(buf).map(str::trim).map_err(|_| FileError::InvalidArgument)?;
+        if text == "trace reset" {
+            // restart the pacing statistics (`/proc/kdebug` `gpu_pacing:`), to measure one phase
+            crate::gpu::pacing::reset();
+            return Ok(buf.len());
+        }
         if let Some(off) = text.strip_prefix("peek ") {
             // `peek <offset>` (hex with 0x, or decimal): read one display register (allow-list in `nvgpu::evo::peek_allowed`); the value
             // is on the next read of this device, a `peek:` line. An instrument: no side effects.

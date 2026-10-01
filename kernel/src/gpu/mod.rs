@@ -99,6 +99,7 @@ pub mod bench;
 pub mod intr;
 pub mod hdmi;
 pub mod modeset;
+pub mod pacing;
 pub mod scanout;
 pub mod supervisor;
 pub mod vblank;

@@ -37,6 +37,7 @@ pub mod lut;
 pub mod mmio;
 pub mod mmu;
 pub mod mode;
+pub mod pacing;
 pub mod pad;
 pub mod pattern;
 pub mod pll;

@@ -811,7 +811,9 @@ impl NvgpuHandle {
                     return Err(errno::EINVAL);
                 }
                 let pa = nvgpu::hwq::user_vram_pa(vram_off) + r.offset;
+                gpu::pacing::present_begin();
                 let res = crate::framebuffer::FRAMEBUFFER.lock().as_mut().map(|fb| fb.present_external(pa));
+                gpu::pacing::present_end();
                 match res {
                     Some(Ok(())) => {
                         self.session.presented.store(true, Ordering::SeqCst);

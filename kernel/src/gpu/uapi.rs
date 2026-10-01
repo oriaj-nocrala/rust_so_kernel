@@ -586,6 +586,7 @@ impl Hw {
         let before = c.queue.done_seq();
         if c.queue.observe(sem) {
             FENCES.fetch_add(c.queue.done_seq() - before, Ordering::Relaxed);
+            super::pacing::done(id, c.queue.done_seq());
             c.progress = crate::cpu::tsc::read();
         }
         if c.dead || c.queue.in_flight() == 0 {
@@ -1124,6 +1125,7 @@ pub fn submit(id: ChanId, pushes: &[Push]) -> Result<u64, Error> {
         io.finish();
         core::sync::atomic::fence(Ordering::SeqCst);
         hw.regs.wr32(DOORBELL, token);
+        super::pacing::submit(id, plan.seq);
         EXECS.fetch_add(1, Ordering::Relaxed);
         if kind == ChanKind::Ce {
             CE_EXECS.fetch_add(1, Ordering::Relaxed);
