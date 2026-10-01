@@ -197,6 +197,7 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("VFS: initramfs @ /bin, devfs @ /dev");
     // `/mnt/etc/kernel.conf` (+ `/mnt/autorun/kernel.conf`): the command line.
     crate::bootopts::load();
+    crate::fs::ext2::apply_boot_options();
     // Unattended run? From here on a panic resets instead of halting.
     crate::autorun::detect();
     // ...and the watchdog armed above stays armed only for that.

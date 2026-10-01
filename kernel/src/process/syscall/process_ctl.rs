@@ -1217,6 +1217,9 @@ pub(super) fn sys_waitpid(pid_arg: i64, status_ptr: usize, options: i32) -> Sysc
             scheduler.credit_reaped(&proc);
             scheduler.defer_stack_free(proc.kernel_stack);
             crate::debug::inc_reaps();
+            // A zombie holds the kernel's empty space (`kill_current`); queue
+            // anything else rather than free it under this lock.
+            crate::process::dead_files::release_space(proc.address_space.clone());
             if status_ptr != 0 {
                 // write_unaligned, not write: `validate_user_buffer` only
                 // checks that this pointer falls inside the user canonical

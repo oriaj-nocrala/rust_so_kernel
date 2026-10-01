@@ -108,6 +108,7 @@ Breaking one of these has cost days of debugging each time. The *why* is kept sh
 - Every PTE change invalidates through `memory::tlb` (`invalidate_page(pml4, addr)` / `invalidate_kernel_page`). Never `x86_64::instructions::tlb::*` or `MapperFlush::flush()`: call `.ignore()` and pass the page.
 - Every CR3 load goes through `tlb::switch_to`.
 - Never drop the last `Arc<AddressSpace>` of a table some CPU has loaded in CR3.
+- Never drop one that may be the last **under `SCHEDULER`** either (it frees every page: seconds for a big process, with every CPU waiting): `process::dead_files::release_space`. `/proc/kdebug` `space_frees_under_lock` must stay 0.
 
 **Blocking**
 - **Check-then-sleep is one step.** Mechanisms: FUTEX_WAIT holds the scheduler lock; poll and stdin register and block under it; pipes and sockets use `wake_pending`/`WAKE_EPOCH`. A new blocking path needs one of these.

@@ -19,6 +19,8 @@
 //! So `kill_current` moves the table here, and [`drain`] drops it from
 //! process context with no lock held — the context `sys_close` runs in:
 //! at the entry of every syscall, and in every CPU's idle loop.
+//!
+//! Address spaces ride the same queue for the same reason: the last drop of one frees every page it maps (`defer_space`).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -27,12 +29,17 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use diag::IrqMutex;
 
 use crate::allocator::KernelIrq;
+use crate::memory::address_space::AddressSpace;
 use crate::process::file::FileDescriptorTable;
 use crate::sync::Mutex;
 
 type Table = Arc<Mutex<FileDescriptorTable>>;
+type Space = Arc<AddressSpace>;
 
 static DEAD: IrqMutex<Vec<Table>, KernelIrq> = IrqMutex::new(Vec::new());
+/// Address spaces whose last owner may be going away: dropping one frees every page of it (seconds for a 15 MB Vulkan program),
+/// which no code holding `SCHEDULER` may do — every CPU's tick and syscall entry waits behind that lock.
+static DEAD_SPACES: IrqMutex<Vec<Space>, KernelIrq> = IrqMutex::new(Vec::new());
 /// Thread-group leaders that died, for `pidfd` readiness (`process::pidfd`); drained with the tables.
 static DEAD_PIDS: IrqMutex<Vec<usize>, KernelIrq> = IrqMutex::new(Vec::new());
 /// Something is queued: lets [`drain`] skip the lock on every syscall.
@@ -46,6 +53,24 @@ static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 pub fn defer(table: Table) {
     DEAD.with(|d| d.push(table));
     PENDING.store(true, Ordering::Release);
+}
+
+/// Queues an address space to be dropped by [`drain`], where freeing it holds up nobody. Callable under `SCHEDULER` and from the timer
+/// ISR, like [`defer`]. The caller must have switched its CPU off the space's table first (the queue keeps the `Arc`, so nothing is
+/// freed early, but `drain` may run on any CPU the moment this returns): see `Scheduler::retire_space`.
+pub fn defer_space(space: Space) {
+    DEAD_SPACES.with(|d| d.push(space));
+    PENDING.store(true, Ordering::Release);
+}
+
+/// Drops `space` where the caller stands if that frees nothing (the kernel's own space), else queues it. For code that holds
+/// `SCHEDULER` and has a process's space in hand: a plain `drop` there may be the one that frees it.
+pub fn release_space(space: Space) {
+    if space.is_kernel() {
+        drop(space);
+    } else {
+        defer_space(space);
+    }
 }
 
 /// Queues the death of thread-group leader `pid`: `drain` marks its pidfds ready and wakes whoever polls them.
@@ -71,6 +96,8 @@ pub fn drain() {
         if PENDING.swap(false, Ordering::SeqCst) {
             let tables = DEAD.with(core::mem::take);
             drop(tables);
+            let spaces = DEAD_SPACES.with(core::mem::take);
+            drop(spaces);
             for pid in DEAD_PIDS.with(core::mem::take) {
                 crate::process::pidfd::mark_exited(pid);
                 crate::process::syscall::poll_wakeup_for_pidfd(pid);

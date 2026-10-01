@@ -46,11 +46,12 @@ Code: `kernel/src/process/` (`scheduler.rs`, `timer_preempt.rs`, `trapframe.rs`,
 - **Every kernel stack is freed through `pending_stack_frees`**, including `waitpid`'s reap: the zombie's `sys_exit` may still be unwinding on another CPU.
 - **Never drop the last `Arc<AddressSpace>` of a table some CPU has in CR3.** Its PML4 would go back to the buddy and could be reused at once.
   - `sys_exec` drops the old space only after `activate()`.
-  - `kill_current` parks a dying thread's space in `retiring[cpu]` until the next one is loaded.
+  - `kill_current` parks a dying process's or thread's space in `retiring[cpu]`; `switch_in` queues it (`dead_files::release_space`) once the next table is loaded.
 - **Nothing that walks a whole address space runs under `SCHEDULER`**: every CPU's tick and syscall entry wait behind it (forking a client from a 15 MB Vulkan compositor froze the machine for seconds).
   - `fork_impl` clones the parent's `Arc<AddressSpace>` under the lock and calls `AddressSpace::fork` (which takes the space's own lock) after releasing it.
   - `sys_exec` returns the old space out of the locked block and drops it there, IF still 0 (the trapframe already holds the new image's entry).
-  - Still under the lock (open): `reap_zombie` dropping the last reference of a zombie's space, and `retiring` in `switch_in`.
+  - **No `Arc<AddressSpace>` that may be the last is dropped under the lock**: `dead_files::release_space`/`defer_space` queue it, and `dead_files::drain` (syscall entry, idle loop, `wait4`'s `settle`) drops it with no lock held. That covers `retiring`, `pending_vma_frees` (the timer tick) and the reap paths. `/proc/kdebug` `sched:` shows `space_frees_under_lock=`, which must stay 0 (`debug::note_space_freed`, from `OwnedPageTable::drop`).
+- **A process gives its memory back when it exits, not when it is reaped** (Linux's `exit_mm`): `kill_current` swaps a non-thread's space for the kernel's empty one (`AddressSpace::is_kernel`) before parking the zombie, so a zombie's `statm` is 0 and `wait4` has nothing big to free. Test: `userspace/c/zombie_mem_test.c`.
 
 ## Blocking and wakeups
 

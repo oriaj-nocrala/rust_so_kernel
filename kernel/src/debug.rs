@@ -51,7 +51,7 @@
 //   leaked) and exactly which call site is holding it, live, with no
 //   monitor session required.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 // ── What moved to the `diag` crate, and what stayed ─────────────────────────
 //
@@ -246,6 +246,32 @@ pub fn note_unexpected_irq(line: u8) {
 }
 
 pub fn inc_forks()         { FORKS_TOTAL.fetch_add(1, Ordering::Relaxed); }
+
+// ── Address spaces freed under SCHEDULER ─────────────────────────────────────
+//
+// Freeing an address space walks every page it maps; with `SCHEDULER` held every CPU's tick and syscall entry waits for that
+// (seconds, for a 15 MB Vulkan program). Nothing may do it: `process::dead_files::defer_space` exists for the code that holds the
+// lock. The flag says which CPUs hold it (set by `local_scheduler`, cleared when its guard drops; IF is 0 in between, so the CPU
+// cannot change), so the memory module — which must not import `process` — can tell, and count the violations here.
+
+static SCHED_HELD: [AtomicBool; crate::cpu::MAX_CPUS] = [const { AtomicBool::new(false) }; crate::cpu::MAX_CPUS];
+static SPACE_FREED_UNDER_SCHED: AtomicU64 = AtomicU64::new(0);
+
+/// `SCHEDULER` was just taken (`true`) or is about to be released (`false`) by this CPU.
+pub fn set_sched_held_here(held: bool) {
+    SCHED_HELD[crate::cpu::cpu_id()].store(held, Ordering::Relaxed);
+}
+
+/// Called when an owned address space is freed: counts (and says so on serial) a free done while this CPU holds `SCHEDULER`.
+pub fn note_space_freed() {
+    if SCHED_HELD[crate::cpu::cpu_id()].load(Ordering::Relaxed) {
+        SPACE_FREED_UNDER_SCHED.fetch_add(1, Ordering::Relaxed);
+        crate::serial_println!("WARNING: an address space was freed with SCHEDULER held (see process::dead_files::defer_space)");
+    }
+}
+
+/// How many address spaces were freed under `SCHEDULER` since boot; 0 is the rule (`/proc/kdebug` `sched:` line).
+pub fn space_freed_under_sched() -> u64 { SPACE_FREED_UNDER_SCHED.load(Ordering::Relaxed) }
 /// For `/proc/stat`'s `processes` and `ctxt` lines.
 pub fn forks_total() -> u64 { FORKS_TOTAL.load(Ordering::Relaxed) }
 pub fn switches_total() -> u64 { SWITCHES_TOTAL.load(Ordering::Relaxed) }
@@ -404,10 +430,13 @@ pub fn render_report() -> alloc::string::String {
         alloc::format!(
             "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             match crate::fs::ext2::cache_stats() {
-                Some(c) => alloc::format!(
-                    "ext2_cache: hits={} misses={} device_reads={} device_kib={} passthrough={}",
-                    c.hits, c.misses, c.device_reads, c.device_sectors / 2, c.passthrough
-                ),
+                Some(c) => {
+                    let (held, max) = crate::fs::ext2::cache_fill().unwrap_or((0, 0));
+                    alloc::format!(
+                        "ext2_cache: hits={} misses={} device_reads={} device_kib={} passthrough={} held_mib={} max_mib={}",
+                        c.hits, c.misses, c.device_reads, c.device_sectors / 2, c.passthrough, held * 4 / 1024, max * 4 / 1024
+                    )
+                }
                 None => alloc::string::String::from("ext2_cache: (no ext2 mount)"),
             },
             crate::watchdog::render(),

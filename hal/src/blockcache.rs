@@ -46,6 +46,20 @@ const CHUNK_BYTES: usize = CHUNK_SECTORS as usize * SECTOR_SIZE;
 /// which is also one USB mass-storage transfer (`usb::xhci::MAX_SECTORS`).
 pub const READAHEAD_CHUNKS: u32 = 16;
 
+/// The smallest cache [`default_cache_chunks`] picks: 32 MiB, enough for a 28 MiB game data file.
+pub const MIN_CACHE_CHUNKS: usize = 8 * 1024;
+/// The largest: 512 MiB. Nothing the system reads repeatedly is bigger than that, and the memory is never given back.
+pub const MAX_CACHE_CHUNKS: usize = 128 * 1024;
+
+/// How big the cache of a machine with `ram_bytes` of memory may grow: an eighth of it, between [`MIN_CACHE_CHUNKS`] and
+/// [`MAX_CACHE_CHUNKS`]. A fixed 32 MiB held `freedoom1.wad` but not two 16 MB Vulkan programs, so starting the second one read
+/// the first one's pages from the USB stick again, and each `exec` of a binary that size took seconds; the cache fills only as
+/// files are read, so a large ceiling costs nothing until something needs it.
+pub fn default_cache_chunks(ram_bytes: u64) -> usize {
+    let chunks = ram_bytes / 8 / CHUNK_BYTES as u64;
+    chunks.clamp(MIN_CACHE_CHUNKS as u64, MAX_CACHE_CHUNKS as u64) as usize
+}
+
 /// Counters, read with [`CachedDevice::stats`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CacheStats {
@@ -83,6 +97,8 @@ struct State {
     /// Where a miss's device read lands (`READAHEAD_CHUNKS` chunks),
     /// allocated on the first miss and kept.
     scratch: Vec<u8>,
+    /// Chunks the cache may hold: [`CachedDevice::set_max_chunks`] moves it.
+    max_chunks: usize,
 }
 
 impl State {
@@ -102,7 +118,6 @@ pub struct CachedDevice {
     /// Sectors the cache may read, read-ahead included: `0..capacity`.
     /// Anything reaching beyond goes straight to the device, uncached.
     capacity_sectors: u32,
-    max_chunks: usize,
     state: spin::Mutex<State>,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -119,8 +134,14 @@ impl CachedDevice {
         CachedDevice {
             inner,
             capacity_sectors,
-            max_chunks: max_chunks.max(1),
-            state: spin::Mutex::new(State { slots: Vec::new(), index: BTreeMap::new(), segments: Vec::new(), hand: 0, scratch: Vec::new() }),
+            state: spin::Mutex::new(State {
+                slots: Vec::new(),
+                index: BTreeMap::new(),
+                segments: Vec::new(),
+                hand: 0,
+                scratch: Vec::new(),
+                max_chunks: max_chunks.max(1),
+            }),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             device_reads: AtomicU64::new(0),
@@ -142,6 +163,25 @@ impl CachedDevice {
     /// Chunks cached right now.
     pub fn cached_chunks(&self) -> usize {
         self.state.lock().slots.len()
+    }
+
+    /// The most chunks the cache may hold.
+    pub fn max_chunks(&self) -> usize {
+        self.state.lock().max_chunks
+    }
+
+    /// Changes the ceiling. Growing is free (storage is allocated as the cache fills); shrinking drops the newest slots at once
+    /// and gives their storage back. What stays is still valid: slots are independent, and the CLOCK hand wraps on its own.
+    pub fn set_max_chunks(&self, max_chunks: usize) {
+        let mut st = self.state.lock();
+        st.max_chunks = max_chunks.max(1);
+        while st.slots.len() > st.max_chunks {
+            let last = st.slots.len() - 1;
+            Self::remove_slot(&mut st, last);
+        }
+        let segments = st.slots.len().div_ceil(SEGMENT_CHUNKS);
+        st.segments.truncate(segments);
+        st.segments.shrink_to_fit();
     }
 
     fn chunks_in_capacity(&self) -> u32 {
@@ -169,7 +209,7 @@ impl CachedDevice {
         // prefetch more than a quarter of the cache, or a read-ahead would
         // evict the very chunks being used.
         let limit = self.chunks_in_capacity();
-        let max_run = READAHEAD_CHUNKS.min((self.max_chunks / 4).max(1) as u32);
+        let max_run = READAHEAD_CHUNKS.min((st.max_chunks / 4).max(1) as u32);
         let mut run = 1u32;
         while run < max_run
             && chunk + run < limit
@@ -202,7 +242,7 @@ impl CachedDevice {
 
     /// Puts `bytes` in a free slot, or the one CLOCK evicts.
     fn store(&self, st: &mut State, chunk: u32, referenced: bool, bytes: &[u8]) -> usize {
-        let i = if st.slots.len() < self.max_chunks {
+        let i = if st.slots.len() < st.max_chunks {
             let i = st.slots.len();
             if i / SEGMENT_CHUNKS == st.segments.len() {
                 st.segments.push(vec![0u8; SEGMENT_CHUNKS * CHUNK_BYTES].into_boxed_slice());
@@ -493,5 +533,67 @@ mod tests {
         read(&c, 2 * 8, 1); // never referenced: evicted
         assert_eq!(reads.load(Ordering::Relaxed), before + 1);
         assert_eq!(c.cached_chunks(), 16);
+    }
+
+    #[test]
+    fn the_default_size_is_an_eighth_of_ram_within_bounds() {
+        const MIB: u64 = 1024 * 1024;
+        let mib = |chunks: usize| chunks as u64 * CHUNK_BYTES as u64 / MIB;
+        assert_eq!(mib(default_cache_chunks(128 * MIB)), 32, "a tiny machine still gets the floor");
+        assert_eq!(mib(default_cache_chunks(512 * MIB)), 64);
+        assert_eq!(mib(default_cache_chunks(2048 * MIB)), 256);
+        assert_eq!(mib(default_cache_chunks(32 * 1024 * MIB)), 512, "a big one stops at the ceiling");
+        assert_eq!(default_cache_chunks(0), MIN_CACHE_CHUNKS);
+        assert_eq!(default_cache_chunks(u64::MAX), MAX_CACHE_CHUNKS);
+    }
+
+    #[test]
+    fn growing_the_cache_keeps_what_was_evicted_from_the_small_one() {
+        let disk = patterned_disk();
+        // 24 slots, read-ahead capped at 6 chunks: reading 40 chunks one at a time cannot keep them all.
+        let (c, reads) = cache(&disk, DISK_SECTORS as u32, 24, false);
+        for k in 0..40u32 {
+            read(&c, k * 8, 1);
+        }
+        assert!(c.cached_chunks() <= 24);
+        c.set_max_chunks(128);
+        assert_eq!(c.max_chunks(), 128);
+        // The first pass over all 40 chunks fills the new room; the second must not touch the device.
+        for k in 0..40u32 {
+            assert_eq!(read(&c, k * 8, 8), read(&*disk, k * 8, 8));
+        }
+        let before = reads.load(Ordering::Relaxed);
+        for k in 0..40u32 {
+            assert_eq!(read(&c, k * 8, 8), read(&*disk, k * 8, 8));
+        }
+        assert_eq!(reads.load(Ordering::Relaxed), before, "40 chunks fit in 128 slots: the second pass is all hits");
+    }
+
+    #[test]
+    fn shrinking_the_cache_drops_slots_but_never_serves_stale_or_wrong_data() {
+        let disk = patterned_disk();
+        let (c, _) = cache(&disk, DISK_SECTORS as u32, 128, false);
+        read(&c, 0, 255);
+        read(&c, 255, 255);
+        read(&c, 510, 255);
+        let full = c.cached_chunks();
+        assert!(full >= 90);
+        // Write through the cache so a cached copy differs from the pattern, then shrink under it.
+        let data = vec![0x5Au8; 2 * SECTOR_SIZE];
+        c.write_sectors(100, 2, &data).unwrap();
+        c.set_max_chunks(20);
+        assert_eq!(c.cached_chunks(), 20, "shrinking is immediate");
+        assert_eq!(c.max_chunks(), 20);
+        assert_eq!(read(&c, 100, 2), data, "what was written is read back, from cache or device");
+        for k in (0..DISK_SECTORS as u32).step_by(8) {
+            // The wrapped disk saw the write too (write-through), so it is the reference everywhere.
+            assert_eq!(read(&c, k, 8), read(&*disk, k, 8), "chunk at sector {}", k);
+            assert!(c.cached_chunks() <= 20, "the cache outgrew its new ceiling");
+        }
+        // And it still grows back.
+        c.set_max_chunks(200);
+        read(&c, 0, 255);
+        read(&c, 255, 255);
+        assert!(c.cached_chunks() > 20);
     }
 }

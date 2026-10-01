@@ -140,6 +140,7 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "session_test",
     "pty_test",
     "rss_test",
+    "zombie_mem_test",
     "gui_fake_comp",
     "gui_comp_test",
 ];

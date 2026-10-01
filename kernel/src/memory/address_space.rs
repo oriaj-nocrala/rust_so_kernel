@@ -214,6 +214,12 @@ impl AddressSpace {
         self.page_table.root_frame()
     }
 
+    /// The kernel's own space (the idle processes'): empty, and dropping it
+    /// frees nothing. A zombie holds one in place of its real space.
+    pub fn is_kernel(&self) -> bool {
+        self.page_table.is_kernel()
+    }
+
     // ====================================================================
     // FORK (Copy-on-Write)
     // ====================================================================

@@ -135,6 +135,7 @@ use crate::sync::Mutex;
 use spin::Once;
 
 use crate::block::BlockDevice;
+use crate::serial_println;
 
 use crate::fs::{
     types::{DirEntry, Errno, FileType, OpenFlags, Stat},
@@ -222,6 +223,25 @@ static EXT2: Once<Ext2Fs> = Once::new();
 /// atomic loads.
 pub fn cache_stats() -> Option<hal::blockcache::CacheStats> {
     EXT2.get().map(|fs| fs.core.device.stats())
+}
+
+/// `(chunks cached now, chunk ceiling)` of the block cache, for `/proc/kdebug`.
+pub fn cache_fill() -> Option<(usize, usize)> {
+    EXT2.get().map(|fs| (fs.core.device.cached_chunks(), fs.core.device.max_chunks()))
+}
+
+/// `ext2cache=<MiB>` from kernel.conf: the block cache's ceiling (`CachedDevice::set_max_chunks`; shrinking drops the surplus at
+/// once). Called after `bootopts::load`, because the file is on the filesystem the cache belongs to.
+pub fn apply_boot_options() {
+    let Some(v) = crate::bootopts::get("ext2cache") else { return };
+    let Some(fs) = EXT2.get() else { return };
+    match v.parse::<usize>() {
+        Ok(mib) if mib >= 4 => {
+            fs.core.device.set_max_chunks(mib * 1024 / 4);
+            serial_println!("ext2: block cache set to up to {} MiB by ext2cache=", mib);
+        }
+        _ => serial_println!("bootopts: ext2cache={} is not a size in MiB (4 or more), keeping {} MiB", v, fs.core.device.max_chunks() * 4 / 1024),
+    }
 }
 
 /// Serializes every mutating ext2 operation — see the module-level
@@ -392,7 +412,13 @@ impl Ext2Fs {
     /// above calls those right after this returns, before publishing the
     /// result anywhere shared.
     fn mount(device: Box<dyn BlockDevice>) -> Result<Self, &'static str> {
-        let core = ext2::Ext2Core::mount(device).map_err(|e| match e {
+        // The cache is a fraction of the machine's memory (a fixed 32 MiB could not hold two 16 MB Vulkan programs, so every `exec`
+        // of the second read the stick again); `ext2cache=<MiB>` in kernel.conf overrides it once that file is read
+        // (`apply_boot_options`).
+        let (ram, _) = crate::allocator::mem_stats();
+        let chunks = hal::blockcache::default_cache_chunks(ram);
+        serial_println!("ext2: block cache up to {} MiB ({} MiB of RAM)", chunks * 4 / 1024, ram / (1024 * 1024));
+        let core = ext2::Ext2Core::mount_with_cache(device, chunks).map_err(|e| match e {
             ext2::Ext2Error::Io => "block device read of superblock failed",
             ext2::Ext2Error::BadMagic => "bad ext2 magic (not an ext2 filesystem, or wrong LBA)",
             ext2::Ext2Error::UnsupportedFeature => {

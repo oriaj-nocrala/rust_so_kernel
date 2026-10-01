@@ -73,6 +73,7 @@ impl core::ops::DerefMut for TrackedSchedulerGuard {
 
 impl Drop for TrackedSchedulerGuard {
     fn drop(&mut self) {
+        crate::debug::set_sched_held_here(false);
         self.0 = None;
         crate::debug::SCHEDULER_LOCK.record_release();
         assert!(
@@ -418,6 +419,7 @@ pub fn local_scheduler() -> TrackedSchedulerGuard {
          drop-time assertion catches on the other end; see its doc comment."
     );
     let guard = SCHEDULER.lock();
+    crate::debug::set_sched_held_here(true);
     crate::debug::SCHEDULER_LOCK.record_acquire(core::panic::Location::caller());
     TrackedSchedulerGuard(Some(guard))
 }
@@ -459,10 +461,12 @@ pub struct Scheduler {
     pending_vma_frees: Vec<(alloc::sync::Arc<AddressSpace>, u64, usize)>,
 
     /// An address space a CPU may still have loaded in CR3 while its last
-    /// owner goes away — a thread reaped by `kill_current`, possibly the
-    /// last holder of its process's space. Dropped by `switch_in` once that
-    /// CPU has loaded the next process's table: a PML4 freed while still
-    /// loaded is a frame another CPU can reuse under this one's feet.
+    /// owner goes away — a process or thread ended by `kill_current`,
+    /// possibly the last holder of its space. `switch_in` hands it to
+    /// `dead_files::defer_space` once that CPU has loaded the next
+    /// process's table: a PML4 freed while still loaded is a frame another
+    /// CPU can reuse under this one's feet, and the pages are freed by
+    /// `dead_files::drain`, not under this lock.
     retiring: [Option<alloc::sync::Arc<AddressSpace>>; MAX_CPUS],
 }
 
@@ -510,6 +514,21 @@ impl Scheduler {
     /// `pending_stack_frees` and `LEAVING`.
     pub fn defer_stack_free(&mut self, stack_top: VirtAddr) {
         self.pending_stack_frees.push(stack_top);
+    }
+
+    /// `space` is no longer its owner's, but CPU `me` still has it in CR3
+    /// (the process that owned it is ending on this CPU): `switch_in` queues
+    /// it for freeing once the next process's table is loaded. The only
+    /// caller, `kill_current`, is always followed by `switch_in` (through
+    /// `kill_and_switch_tf`), which empties the slot: a second space there
+    /// would be one whose table is still loaded and could not be queued.
+    fn retire_space(&mut self, me: usize, space: alloc::sync::Arc<AddressSpace>) {
+        assert!(
+            self.retiring[me].is_none(),
+            "kill_current twice on CPU {} without a switch_in between",
+            me
+        );
+        self.retiring[me] = Some(space);
     }
 
     /// Give `cpu` its idle process (pid 0). Never queued: see `idle`.
@@ -852,12 +871,24 @@ impl Scheduler {
                     self.pending_vma_frees.push((proc.address_space.clone(), start, size_pages));
                 }
                 // Its address space is still this CPU's CR3: see `retiring`.
-                self.retiring[me] = Some(proc.address_space.clone());
+                self.retire_space(me, proc.address_space.clone());
                 // `proc` drops here: releases the Process struct itself and its
                 // Arc references to the shared AddressSpace/FileDescriptorTable
                 // (safe immediately — unlike the kernel stack, that's ordinary
-                // kernel-heap memory, not the stack this code is executing on).
+                // kernel-heap memory, not the stack this code is executing on;
+                // and `retiring` holds another reference to the space).
             } else {
+                // Linux's `exit_mm`: the zombie keeps its `Process` (status,
+                // times) but not its memory, which is freed now rather than
+                // whenever the parent gets round to `wait`ing — a dead 19 MB
+                // compositor held 19 MB until reaped, and the reap itself
+                // freed it under this lock. The kernel's empty space takes
+                // its place (no VMAs, nothing to free), so `/proc/<pid>/statm`
+                // of a zombie reads 0 as on Linux.
+                if let Some(kernel) = self.idle[me].as_ref().map(|i| i.address_space.clone()) {
+                    let space = core::mem::replace(&mut proc.address_space, kernel);
+                    self.retire_space(me, space);
+                }
                 proc.state = ProcessState::Zombie;
                 self.core.park(proc);
             }
@@ -1389,6 +1420,10 @@ impl Scheduler {
         self.credit_reaped(&proc);
         self.defer_stack_free(proc.kernel_stack);
         crate::debug::inc_reaps();
+        // `kill_current` already gave up its memory (`exit_mm`); this is only
+        // the kernel's empty space, but a zombie parked before that change
+        // or without an idle slot would free a whole space here.
+        super::dead_files::release_space(proc.address_space.clone());
         true
     }
 
@@ -1581,9 +1616,18 @@ impl Scheduler {
         });
         // Same reasoning as pending_stack_frees above — see try_free_huge_vma's
         // doc comment for why this specific free needs the try_lock treatment.
-        self.pending_vma_frees.retain(|(address_space, start, size_pages)| {
-            !unsafe { address_space.try_free_huge_vma(*start, *size_pages) }
-        });
+        // The `Arc` of a finished entry may be the space's last reference
+        // (the thread's process is gone): it is queued, not dropped here.
+        let mut i = 0;
+        while i < self.pending_vma_frees.len() {
+            let (address_space, start, size_pages) = &self.pending_vma_frees[i];
+            if unsafe { address_space.try_free_huge_vma(*start, *size_pages) } {
+                let (space, ..) = self.pending_vma_frees.swap_remove(i);
+                super::dead_files::release_space(space);
+            } else {
+                i += 1;
+            }
+        }
 
         if aging_due {
             self.core.age_processes();
@@ -1712,8 +1756,11 @@ impl Scheduler {
         RUN_BASE_NS[me].store(proc.exec_ns, Ordering::Relaxed);
         RUN_SINCE_NS[me].store(proc.run_since_ns, Ordering::Relaxed);
         unsafe { proc.address_space.activate(); }
-        // The table this CPU had loaded is not its CR3 any more.
-        drop(self.retiring[me].take());
+        // The table this CPU had loaded is not its CR3 any more: its last
+        // owner (if it was) can be freed, by `drain`.
+        if let Some(space) = self.retiring[me].take() {
+            super::dead_files::release_space(space);
+        }
         super::tss::set_kernel_stack(proc.kernel_stack);
         write_fs_base(proc.fs_base);
         unsafe { super::fpu::restore(&proc.fpu_state); }
@@ -1883,12 +1930,13 @@ pub fn render() -> alloc::string::String {
     let invariants = x86_64::instructions::interrupts::without_interrupts(|| local_scheduler().check_invariants());
     let _ = writeln!(
         out,
-        "sched: nosmp={} max_concurrent={} max_threads_parallel={} resched_ipis={} leaving_skips={} invariants={}",
+        "sched: nosmp={} max_concurrent={} max_threads_parallel={} resched_ipis={} leaving_skips={} space_frees_under_lock={} invariants={}",
         crate::smp::nosmp(),
         MAX_CONCURRENT.load(Ordering::Relaxed),
         MAX_SAME_AS.load(Ordering::Relaxed),
         RESCHED_IPIS.load(Ordering::Relaxed),
         LEAVING_SKIPS.load(Ordering::Relaxed),
+        crate::debug::space_freed_under_sched(),
         match invariants { Ok(()) => alloc::string::String::from("ok"), Err(v) => alloc::format!("{:?}", v) },
     );
     for c in (0..MAX_CPUS).filter(|&c| is_scheduling(c)) {

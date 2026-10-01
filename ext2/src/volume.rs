@@ -66,10 +66,11 @@ pub struct Ext2Core {
     pub sb: Superblock,
 }
 
-/// Size of the block cache every mount gets, in `CHUNK_SECTORS`-sector
+/// Size of the block cache `mount` gives, in `CHUNK_SECTORS`-sector
 /// chunks: 8192 x 4 KiB = 32 MiB, allocated only as it fills — enough to
-/// hold all of `freedoom1.wad` (28 MiB), so a second `doom` never touches
-/// the pendrive.
+/// hold all of `freedoom1.wad` (28 MiB). The kernel does not use this: it
+/// sizes the cache to the machine (`hal::blockcache::default_cache_chunks`)
+/// and mounts with `mount_with_cache`.
 pub const CACHE_CHUNKS: usize = 8192;
 
 impl Ext2Core {
@@ -79,6 +80,11 @@ impl Ext2Core {
     /// step 5), which calls them right after this returns, before
     /// publishing the result anywhere shared.
     pub fn mount(device: Box<dyn BlockDevice>) -> Result<Self, Ext2Error> {
+        Self::mount_with_cache(device, CACHE_CHUNKS)
+    }
+
+    /// [`mount`](Self::mount) with a block cache of up to `cache_chunks` chunks (4 KiB each).
+    pub fn mount_with_cache(device: Box<dyn BlockDevice>, cache_chunks: usize) -> Result<Self, Ext2Error> {
         // Superblock is always at byte 1024, regardless of block size —
         // read it directly by sector before we know the block size at all.
         let mut raw = [0u8; 1024];
@@ -88,7 +94,7 @@ impl Ext2Core {
         // another partition's window, which `hal::block::Partition` refuses.
         let fs_sectors = sb.blocks_count as u64 * (sb.block_size as u64 / SECTOR_SIZE as u64);
         let capacity = fs_sectors.min(u32::MAX as u64 / CHUNK_SECTORS as u64 * CHUNK_SECTORS as u64) as u32;
-        let device = CachedDevice::new(device, capacity, CACHE_CHUNKS);
+        let device = CachedDevice::new(device, capacity, cache_chunks);
         Ok(Self { device, sb })
     }
 

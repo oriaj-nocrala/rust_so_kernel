@@ -42,7 +42,7 @@ Code: `kernel/src/fs/`, crates `vfs/` and `ext2/` (host tests: `cd vfs && cargo 
   - `UsbBlockDevice` (`kernel/src/block/usb.rs`, USB mass storage).
   - `hal::block::MemDisk`: RAM, for tests.
 - `hal::block::Partition` adds an offset and **refuses** any request outside its window (never clamps).
-- **Block cache** (`hal::blockcache::CachedDevice`, installed by `Ext2Core::mount`): write-through, 4 KiB chunks, 32 MiB cap, CLOCK eviction, up to 64 KiB of read-ahead. `/proc/kdebug`: `ext2_cache:`. **Nothing may write a mounted partition except through `Ext2Core::device`**, or the cache goes stale.
+- **Block cache** (`hal::blockcache::CachedDevice`, installed by `Ext2Core::mount`): write-through, 4 KiB chunks, CLOCK eviction, up to 64 KiB of read-ahead. The ceiling is an eighth of RAM between 32 and 512 MiB (`hal::blockcache::default_cache_chunks`, chosen in `fs/ext2.rs`; storage is allocated only as it fills, and never given back), and `ext2cache=<MiB>` in `kernel.conf` replaces it (`CachedDevice::set_max_chunks`; shrinking drops the surplus at once). A fixed 32 MiB did not hold two 16 MB Vulkan programs. `/proc/kdebug`: `ext2_cache:` (`held_mib`/`max_mib` too). **Nothing may write a mounted partition except through `Ext2Core::device`**, or the cache goes stale.
 
 ## ext2 (`ext2` crate + adapter `kernel/src/fs/ext2.rs`)
 

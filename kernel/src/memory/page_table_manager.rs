@@ -203,6 +203,11 @@ impl OwnedPageTable {
         self.pml4_frame
     }
 
+    /// The kernel's own table (`from_current`): nothing to free on drop.
+    pub fn is_kernel(&self) -> bool {
+        !self.owned
+    }
+
     #[inline]
     pub fn pml4_phys(&self) -> PhysAddr {
         self.pml4_frame.start_address()
@@ -617,6 +622,7 @@ impl Drop for OwnedPageTable {
             // Kernel page table (from_current) — never free, it belongs to the kernel.
             return;
         }
+        crate::debug::note_space_freed();
         unsafe { self.release_user_pages(); }
     }
 }
