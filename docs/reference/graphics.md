@@ -71,6 +71,7 @@ Code: `kernel/src/framebuffer.rs`, `kernel/src/drivers/{framebuffer_console,dev_
 
 - **Rust**: `userspace::gfx` (`Gfx::open(GUI_DISPLAY, …)`, `present`, `next_event`, `resizable`, `size`, `EV_GFX`) plus the `draw` crate (software 2D, integer-only).
 - **C**: `userspace/c/include/constanos_gfx.h` (header-only).
+- **Vulkan programs** (`userspace/c/include/constanos_gui_vk.h`, with `constanos_vk_window.h`): `gvk_open` connects and makes the surface, `gvk_surface_create` makes the `VkSurfaceKHR` over NVK's WSI (`docs/reference/gpu.md` "WSI windows"), `gvk_next_event` gives keys, the pointer and `GVK_CLOSE`. The program is the connection's only reader; the swapchain calls back into `gvk_pump`.
 - With `$GUI_DISPLAY` set, the program runs in a window (integer-scaled into shared memory); otherwise it uses `FBIO_BLIT` + `event0`/`event1`.
 - **HIDPI** (`gfx::HIDPI`, C `GFX_HIDPI`): the program draws at `w*scale × h*scale` itself. Use it for antialiased text; leave pixel art (DOOM, Quake, `fire`) without it.
 - Games lock the pointer (`lock_pointer`/`relative_motion`): only while focused; Ctrl+Alt releases it, a click takes it back.

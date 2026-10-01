@@ -35,6 +35,8 @@
 #define GUIW_EV_MOTION 3           // surface: (x, y)
 #define GUIW_EV_BUTTON 4           // surface: (code, pressed)
 #define GUIW_EV_RELATIVE_MOTION 5  // surface: (dx, dy), dy positive down
+#define GUIW_EV_RESIZE 6           // surface: (w, h)
+#define GUIW_EV_CLOSE 7            // surface: ()
 #define GUIW_EV_DONE 0             // callback: (ms)
 
 // ── Encoding ─────────────────────────────────────────────────────────────
@@ -89,12 +91,25 @@ static void guiw_create_pool(struct guiw_out *o, uint32_t id, int fd, uint32_t s
 static void guiw_create_surface(struct guiw_out *o, uint32_t id) {
     guiw_begin(o, GUIW_COMPOSITOR, 1); guiw_put(o, id); guiw_end(o);
 }
+// A buffer that lives on the GPU: `fd` is a descriptor of `size` bytes of it (nvgpu's BO_EXPORT), rows `stride` bytes apart. The compositor reads
+// it where it is; it is released (a `release` event on the buffer) once a later commit has replaced it and the frame that read it is done.
+static void guiw_create_gpu_buffer(struct guiw_out *o, uint32_t id, int fd, uint32_t size,
+                                   int32_t w, int32_t h, int32_t stride, uint32_t format) {
+    guiw_begin(o, GUIW_COMPOSITOR, 3);
+    guiw_put(o, id); guiw_fd(o, fd); guiw_put(o, size);
+    guiw_put(o, (uint32_t)w); guiw_put(o, (uint32_t)h); guiw_put(o, (uint32_t)stride); guiw_put(o, format);
+    guiw_end(o);
+}
 static void guiw_create_buffer(struct guiw_out *o, uint32_t pool, uint32_t id, int32_t offset,
                                int32_t w, int32_t h, int32_t stride, uint32_t format) {
     guiw_begin(o, pool, 0);
     guiw_put(o, id); guiw_put(o, (uint32_t)offset); guiw_put(o, (uint32_t)w);
     guiw_put(o, (uint32_t)h); guiw_put(o, (uint32_t)stride); guiw_put(o, format);
     guiw_end(o);
+}
+// A buffer object (pool or GPU) is destroyed; the compositor answers with delete_id.
+static void guiw_destroy_buffer(struct guiw_out *o, uint32_t buffer) {
+    guiw_begin(o, buffer, 0); guiw_end(o);
 }
 static void guiw_attach(struct guiw_out *o, uint32_t surface, uint32_t buffer) {
     guiw_begin(o, surface, 0); guiw_put(o, buffer); guiw_end(o);

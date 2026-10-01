@@ -52,6 +52,7 @@ fn c_requests_decode_to_what_they_meant() {
     let want = [
         (Interface::Compositor, Request::CreatePool { id: 2, fd: 17, size: 4096 }),
         (Interface::Compositor, Request::CreateSurface { id: 4 }),
+        (Interface::Compositor, Request::CreateGpuBuffer { id: 5, fd: 21, size: 8_294_400, width: 1920, height: 1080, stride: 7680, format: 1 }),
         (Interface::Pool, Request::CreateBuffer { pool: 2, id: 3, offset: 0, width: 320, height: -200, stride: 1280, format: 1 }),
         (Interface::Surface, Request::Attach { surface: 4, buffer: 3 }),
         (Interface::Surface, Request::Damage { surface: 4, x: -1, y: 2, w: 3, h: 4 }),

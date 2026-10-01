@@ -36,6 +36,24 @@ State and rules: `docs/reference/gpu.md` "`/dev/nvgpu`" (Sessions, Sharing buffe
 3. **The software device completes every EXEC at once**: it cannot show an in-flight race (work queued, not finished, nobody calling in). Those need a section in `nvgpu_hw_test` and a metal round: `touch build.rs; echo 5 > target/metal/budget; scripts/metal-run.sh --kconf 'gpu=uapi' scripts/metal-jobs/gpu-multi.sh`, then read `target/metal/runs/<nonce>/boot.log` (`grep -a gpu-multi`; the job prints its whole summary at the end because the log wraps).
 4. After staging a new Vulkan program: `strip -o disk-image-root/bin/<name> ~/src/gpu-ref/nvk-probe/<vk-...>`, **`touch build.rs`** and `cargo build` (else the image keeps the old binary), and check `dumpe2fs -h disk.img | grep Free` (each of these is 15 MB; `disk.img` is 288 MiB now).
 
+## Layer 4 (GPU compositor): slices 1-2 done (2026-09-30), slice 3 (`vk_comp`) next
+
+Design and slices: `docs/gpu/g5-graphics-stack-plan.md` "Capa 4". Slice 1 = the window manager in `gui` (`gui/src/compositor.rs`: `create_gpu_buffer`, `GpuOp`, `draw_list`, `gpu_frame_done`; `cd gui && cargo test`). Slice 2 = the client side:
+
+| What | Where |
+|---|---|
+| Hooks a program gives the WSI (a copy lives at `src/vulkan/wsi/constanos_window.h` in the Mesa tree: `apply.sh` copies it) | `userspace/c/include/constanos_vk_window.h` |
+| The program's connection + hooks over the wire | `userspace/c/include/constanos_gui_vk.h`, `constanos_gui_wire.h` (`guiw_create_gpu_buffer`, checked against Rust by `gui/tests/c_wire.rs`) |
+| WSI windows (`wsi_headless_surface`, windowed swapchain, `wsi_constanos_window_*`) | `mesa-port/patches/0001-nvk-constanos.patch` (`wsi_common_headless.c`, `wsi_common.h`) and `nvkmd_constanos.c` (`nvk_constanos_surface_*`) |
+| Test client / stand-in compositor | `probes/nvk/vk_window.c` (`vk-window`, staged as `disk-image-root/bin/vk_window`), `userspace/c/gui_fake_comp.c`; run `scripts/run-abi-suite.sh gui_fake_comp` |
+
+Rules and traps:
+- **The program is the connection's only reader.** The swapchain never reads the socket: an acquire with every image held calls the `pump` hook until a `release` arrives (the program passes it on with `nvk_constanos_surface_buffer_released`). Two readers on one stream split messages.
+- **A buffer is the compositor's from `commit` until its `release`**; the WSI never hands it out before. A present waits for the copy's fence *before* `commit` (the compositor reads without waiting).
+- Buffer ids come from the program's counter and are never reused (Wayland's rule: an id is free only after `delete_id`).
+- Edit the Mesa checkout, then `git -C ~/src/gpu-ref/mesa diff > mesa-port/patches/0001-nvk-constanos.patch` (new files go in the overlay or `apply.sh`), `ninja -C build-musl src/nouveau/vulkan/libnvk.a src/vulkan/wsi/libvulkan_wsi.a`, `python3 probes/nvk/build.py`, `strip -o disk-image-root/bin/<name> ~/src/gpu-ref/nvk-probe/<vk-name>` for **every** Vulkan program (they all link NVK: a stale one keeps the old WSI), `touch build.rs`, `cargo build`.
+- QEMU proves the protocol and the bookkeeping only: VRAM is not CPU-mappable and the software device draws nothing, so pixels need the Ryzen.
+
 ## Layer 3 (WSI): direct path written and measured on the Ryzen #168 (60.1 fps, 0 refused flips)
 
 Done (2026-09-30): the headless surface is the screen when the pdev has a display; `wsi_common_headless.c` + `nvk_wsi.c` + `wsi_common.h` in `mesa-port/patches/0001-nvk-constanos.patch` (edit the Mesa checkout, then `git -C ~/src/gpu-ref/mesa diff > .../0001-nvk-constanos.patch`; `apply.sh` copies the overlay). Hooks in `wsi_device.scanout`, backend in `nvkmd_constanos.c`. `snake3d` uses `VK_KHR_swapchain`. Test headless in QEMU: `PROBE=vk-snake PROBE_ENV='SNAKE3D_HEADLESS=1 SNAKE3D_AUTOPLAY=1 SNAKE3D_SECONDS=5' scripts/run-vk-probe.sh --no-build`; the scanout path only on metal (`gpu-snake.sh`). Details and known debt: `docs/reference/gpu.md` "WSI". Rebuild after a WSI edit: `ninja -C ~/src/gpu-ref/mesa/build-musl src/nouveau/vulkan/libnvk.a src/vulkan/wsi/libvulkan_wsi.a` then `python3 probes/nvk/build.py` (errors in the wsi lib are hidden by `mesa-port/build.sh`'s `ninja -k 0`). Original notes below (written before it existed).

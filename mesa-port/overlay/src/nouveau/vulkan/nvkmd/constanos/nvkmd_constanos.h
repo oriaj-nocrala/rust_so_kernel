@@ -125,6 +125,10 @@ int nvk_constanos_present(VkDevice device, VkDeviceMemory memory, uint64_t offse
 int nvk_constanos_flip_pending(VkDevice device);
 /* Sleeps (poll on /dev/vblank) until the last present has taken effect: 0, or -ETIMEDOUT after timeout_ms. */
 int nvk_constanos_wait_flip(VkDevice device, int timeout_ms);
+/* G5 layer 4: a surface that is a window of the program (constanos_window.h, which has the hooks); see wsi_common_headless.c. */
+struct constanos_window;
+VkResult nvk_constanos_surface_create(VkInstance instance, const struct constanos_window *window, VkSurfaceKHR *surface);
+void nvk_constanos_surface_buffer_released(VkSurfaceKHR surface, uint32_t id);
 /* The layout the display scans out, if there is a display driver and it scans out XRGB8888 (what the WSI can present to). */
 bool nvkmd_constanos_pdev_scanout(struct nvkmd_pdev *pdev, struct nvg_scanout_info *out);
 

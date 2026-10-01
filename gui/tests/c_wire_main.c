@@ -18,6 +18,7 @@ static int enc(void) {
     memset(&o, 0, sizeof(o));
     guiw_create_pool(&o, 2, 17, 4096);
     guiw_create_surface(&o, 4);
+    guiw_create_gpu_buffer(&o, 5, 21, 8294400, 1920, 1080, 7680, GUIW_FORMAT_XRGB8888);
     guiw_create_buffer(&o, 2, 3, 0, 320, -200, 1280, GUIW_FORMAT_XRGB8888);
     guiw_attach(&o, 4, 3);
     guiw_damage(&o, 4, -1, 2, 3, 4);

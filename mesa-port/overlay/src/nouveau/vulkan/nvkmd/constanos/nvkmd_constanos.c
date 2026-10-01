@@ -20,6 +20,8 @@
 #include "nvk_device_memory.h"
 
 #include "vk_alloc.h"
+#include "vk_instance.h"
+#include "wsi_common.h"
 #include "vk_log.h"
 #include "vk_sync.h"
 #include "vk_util.h"
@@ -1251,4 +1253,19 @@ nvk_constanos_wait_flip(VkDevice _device, int timeout_ms)
          usleep(200);
       }
    }
+}
+
+/* ---- windows (G5 layer 4): a VkSurfaceKHR of a window the program owns (constanos_window.h) ---------------------------------------------- */
+
+VkResult
+nvk_constanos_surface_create(VkInstance _instance, const struct constanos_window *window, VkSurfaceKHR *surface)
+{
+   VK_FROM_HANDLE(vk_instance, instance, _instance);
+   return wsi_constanos_window_surface_create(instance, window, &instance->alloc, surface);
+}
+
+void
+nvk_constanos_surface_buffer_released(VkSurfaceKHR surface, uint32_t id)
+{
+   wsi_constanos_window_buffer_released(surface, id);
 }
