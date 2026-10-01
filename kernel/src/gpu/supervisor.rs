@@ -608,6 +608,11 @@ pub fn peek_status() -> String {
 }
 
 /// The BAR0 window `setup` kept, for the modules that run on top of it.
+/// The head `/dev/dispctl` drives (the primary one, the GOP's).
+pub(super) fn primary_head() -> Option<u32> {
+    disp().map(|d| d.head)
+}
+
 pub(super) fn regs() -> Option<&'static Bar0> {
     disp().map(|d| &d.regs)
 }

@@ -93,6 +93,7 @@ pub mod evo;
 pub mod gsp;
 pub mod vaspace;
 pub mod copy;
+pub mod cursor;
 pub mod compute;
 pub mod uapi;
 pub mod bench;

@@ -50,6 +50,7 @@ impl FileHandle for DispctlDevice {
         let mut s = supervisor::status();
         s.push_str(&modeset::status());
         s.push_str(&hdmi::status());
+        s.push_str(&crate::gpu::cursor::status());
         s.push_str(&supervisor::peek_status());
         let n = s.len().min(buf.len());
         buf[..n].copy_from_slice(&s.as_bytes()[..n]);
@@ -63,6 +64,39 @@ impl FileHandle for DispctlDevice {
             // restart the pacing statistics (`/proc/kdebug` `gpu_pacing:`), to measure one phase
             crate::gpu::pacing::reset();
             return Ok(buf.len());
+        }
+        if let Some(args) = text.strip_prefix("cursor ") {
+            // `cursor probe | on [size] [nb] | move <x> <y> | off`: the hardware cursor of the primary head (`gpu/cursor.rs`, phase 2 of
+            // docs/gpu/hw-cursor-plan.md); EINVAL for a bad argument or state, EAGAIN if the core is busy, EIO if it failed
+            use crate::gpu::cursor::{self as cur, CursorError};
+            let mut it = args.split_whitespace();
+            let res = match it.next() {
+                Some("probe") => cur::probe(),
+                Some("on") => {
+                    let mut size = 32;
+                    let mut bounds = true;
+                    for a in it {
+                        if a == "nb" {
+                            bounds = false;
+                        } else {
+                            size = a.parse().map_err(|_| FileError::InvalidArgument)?;
+                        }
+                    }
+                    cur::on(size, bounds)
+                }
+                Some("move") => {
+                    let x = it.next().and_then(|v| v.parse().ok()).ok_or(FileError::InvalidArgument)?;
+                    let y = it.next().and_then(|v| v.parse().ok()).ok_or(FileError::InvalidArgument)?;
+                    cur::move_to(x, y)
+                }
+                Some("off") => cur::off(),
+                _ => return Err(FileError::InvalidArgument),
+            };
+            return match res {
+                Ok(()) => Ok(buf.len()),
+                Err(CursorError::Invalid) => Err(FileError::InvalidArgument),
+                Err(CursorError::NotReady | CursorError::Failed) => Err(FileError::IOError),
+            };
         }
         if let Some(off) = text.strip_prefix("peek ") {
             // `peek <offset>` (hex with 0x, or decimal): read one display register (allow-list in `nvgpu::evo::peek_allowed`); the value
