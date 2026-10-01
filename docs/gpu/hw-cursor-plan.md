@@ -180,11 +180,36 @@ State the GOP left, as read: head 0 `CONTROL_CURSOR = 0xe9` (disabled, A1R5G5B5,
 
 - Alone, the cursor path works at about the display's rate (50-56 compositions/s while the mouse reports ~85/s: coalescing, one composition per vblank at most).
 - **Load 2 is locked at 30 fps (95% of the flips 20-37 ms), compositor and snake together, with `present` a constant ~9.1 ms: the known 30 fps cliff, caught live. The cursor then updates 30 times a second.** That is the user's "not 60 fps".
-- **Load 3 runs at 60 with a window four times larger.** More GPU work, better pacing. Not "more load = slower". The most likely reading, **not tested yet**: GPU clocks. A light load keeps the GPU in a low P-state (measured earlier: P5, 560-940 MHz with `snake3d` alone, the ramp is by utilisation: `docs/gpu/g5-graphics-stack-plan.md` "relojes"), where the compositor's copy to the scanout buffer takes ~9 ms and misses the ~9 ms deadline after the flip; a heavier load pulls the GPU to a high P-state and `present` falls to 3 ms. Another candidate is a phase lock between the clients' frame callbacks, the 2 ms delay and the vblank. **Next measurement: sample the P-state and clocks (`gsp perf`, `gpu_perf:` in `/proc/kdebug`) every second during loads 2 and 3.**
+- **Load 3 runs at 60 with a window four times larger** (explained in section 12: the heavier load keeps the GPU at a higher P-state). More GPU work, better pacing. Not "more load = slower". The most likely reading, **not tested yet**: GPU clocks. A light load keeps the GPU in a low P-state (measured earlier: P5, 560-940 MHz with `snake3d` alone, the ramp is by utilisation: `docs/gpu/g5-graphics-stack-plan.md` "relojes"), where the compositor's copy to the scanout buffer takes ~9 ms and misses the ~9 ms deadline after the flip; a heavier load pulls the GPU to a high P-state and `present` falls to 3 ms. Another candidate is a phase lock between the clients' frame callbacks, the 2 ms delay and the vblank. **Next measurement: sample the P-state and clocks (`gsp perf`, `gpu_perf:` in `/proc/kdebug`) every second during loads 2 and 3.**
 - No channel died, 0 refused flips, `gpu_share` 0/0/0. The mouse counters worked (`COMP input`).
 
 ### What it changes in this plan
 
 - The hardware cursor is the right fix for the pointer **in every load** (load 2 shows why), but the 30 fps cliff of the *windows* is a separate problem and a P-state finding would be a separate fix (keep the GPU clocked while a compositor runs).
 - New first step of phase 2: the `HEAD_SET_HEAD_USAGE_BOUNDS = 0x1114` push and whether it raises supervisors (unknown 1); then channel allocation (`0x610604`), then `SET_CONTROL_CURSOR` and the image, then `MOVE`.
+
+## 12. Phase 0b: the 30 fps lock is the GPU's clocks (Ryzen #190, `scripts/metal-jobs/gpu-cursor-pstate.sh`)
+
+`dispctl gsp pstate` (new: one RM control instead of nine) sampled once a second beside the loads of section 11; same load, one variable per phase.
+
+| Phase (15 s, cpumon + snake3d autoplay) | P-state trace | `present` per 5 s window | compositor | snake3d |
+|---|---|---|---|---|
+| P1 960x540, mouse **not read** | P0 (t11-17) -> **P5 (t18-23) -> P8 (t24-26)**, *while the load went on* | **1.8 -> 4.2 -> 7.1 ms**; flips < 20 ms: 275, 276, 91 of ~290 | 60 fps, then 60, then half at 30 | 52.1 fps |
+| P2 960x540, mouse read and moved | **P8 all 15 s** (it started at P8 and never ramped) | **9.2, 9.1 ms constant**; flips < 20 ms: 2, 3 of ~150 | **30 fps lock** | 30.2 fps |
+| P3 same as P2, no sampler | (not sampled) | 9.2 -> 5.5 -> 9.1 ms | 30, 60, 30 | 38.1 fps |
+| P4 1880x1000, mouse read and moved | **P3/P5 alternating** (P8 -> P5 -> P3 within 2 s) | 3.2, 2.9, 3.0 ms | 60 fps | 58.6 fps |
+| P5 alone, mouse read and moved | P5 -> P8 | 4.3-4.7 ms | ~53/s (the mouse's pace) | - |
+
+- **The clocks are the cause; the mouse is not**: P1 (no mouse read) goes 60 -> 30 fps as its P-state falls P0 -> P5 -> P8; P2 and P3 show the lock with the mouse; P3 without the sampler behaves the same, so asking RM for the P-state does not disturb it.
+- **`present` is ~2 ms at P0, ~4 ms at P5, ~9 ms at P8**, and the compositor misses the ~9 ms deadline (flip seen -> `PRESENT`; `COMP_DELAY_MS` 2 + 9) at P8: the cliff of #179-#182 (delays of 4 and 6 ms gave 30 fps at P5-like costs for the same reason).
+- **A DVFS trap**: a light, frame-paced load keeps RM at P8; at P8 the frames take longer, so fewer frames are made (30 fps), so the load is lighter still, so RM stays at P8. A heavier load (P4) climbs to P3 and everything is fast. That is why a *bigger* window was *faster*.
+- The GPU starts at P0 after the boot and RM lowers it within ~7 s of a light load.
+
+### Decision (the user, 2026-10-01): **do not pin the GPU's clock high for the compositor's life.**
+A desktop compositor can be the protagonist of the machine and idle most of the time; holding peak clocks would burn peak watts for nothing. The fix is to stop the pacing from depending on the clock, not to buy it with power. In order of preference, none started:
+1. **Hardware cursor** (this document): the pointer stops depending on the frame loop at all, at any P-state.
+2. **Hide the composition's latency instead of shortening it**: the loop is serial (wait for the flip, 2 ms, compose + `present`, wait for the next flip); with `present` at 9 ms the `PRESENT` always leaves past the deadline. Start the composition *before* the flip it follows (render into the back image while the previous flip is pending; `PRESENT` the moment it lands), or schedule the repaint from an adaptive estimate of render + present time (Weston's repaint window, mutter's dynamic max render time). Costs one frame of latency for content and a buffer; makes 60 fps possible up to ~16 ms of composition at any clock.
+3. **Do less GPU work per frame**: scan out the swapchain image directly (block-linear window surface) instead of the buffer-blit copy that `wsi_common` does into a scanout-layout buffer (an 8 MB detile per frame at 1080p); less work also means less power.
+4. **A hint to RM, bounded**: a burst boost while frames are in flight with a decay (`PERF_AGGRESSIVE_PSTATE_NOTIFY`-style), only if 1-3 are not enough. Never a pin.
+Whether `present`'s 9 ms at P8 is the copy itself or queueing behind the client's frame on the shared GR engine is not known: `vkCmdCopyImageToBuffer` timing and the GPU's own timestamps would say.
 
