@@ -274,3 +274,18 @@ Order of the next changes (user to confirm; none started), cheapest and most dec
 - The GPU now settles at P5 rather than P8 under this load (it has more to do per second); no pinning was needed.
 - **What it costs: the frames that upload.** `cpumon only` (every frame is an upload of 4.7 MB; ~2 frames/s) now averages 8-10 ms per submission pair at P8 (was 4.5): the staging copy of a whole 1280x920 window goes through the GR channel at P8 and the `PRESENT` lands 2-16 ms after the vblank, so those frames can miss. They are rare (cpumon changes twice a second) but they are the visible hitch to expect when a CPU window updates. Next: upload only the rows that changed (the window manager knows the damage), or a copy on the CE channel off the frame's critical path.
 - Still the cursor-pacing question of Section 11: not touched here; the hardware cursor (phases 1-4) is the next piece, and damage tracking now has two uses.
+
+### 13d. Fix 1b: copy only the rows that changed (Ryzen #195, `gpu-comp-pacing.sh`)
+
+`comp_plan_upload` (`probes/nvk/comp_render.h`) compares a new version of a CPU window with the last one (a CPU shadow copy), and the frame copies only the changed row ranges (up to 16, ranges closer than 4 rows merged) from the staging buffer into VRAM: damage found by comparing, so it does not depend on what a client says it damaged (cpumon says the whole window). The quit line now shows the KiB uploaded. Host harness: three changed rows = exactly 1920 bytes and the picture exact; sabotage (every row "changed"; staging write skipped) is caught.
+
+| run | KiB per upload | ch0 avg per submission at P8 | note |
+|---|---|---|---|
+| cpumon alone, host windows (old way) | 4266 (the whole window is read every frame) | 4.45-5.7 ms | |
+| cpumon alone, VRAM, whole-window copy (#194) | 4266 | 8.3-9.7 ms | the regression this fixes |
+| cpumon alone, VRAM, **changed rows only** (#195) | **1815** | **1.8 ms** (the heaviest frame: render 5.6 + blit 3.0 ms) | |
+| cpumon + snake, VRAM rows only | 2009 | 1.9 ms, 295/309 and 276/309 presents at P5/P8 | as #194: the snake's frames do not upload |
+| cpumon + snake, host windows (old) | 4073 | 4.55-4.78 ms, 143-161 presents: 30 fps | |
+
+- cpumon changes ~43% of its bytes per update on average (row granularity); the mean frame is now cheap and the worst one (a big redraw) still costs ~8.6 ms at P8 (render 5.6, blit 3.0), which fits when it is alone on the GPU.
+- What is left per frame is the 2.3 ms blit (memory-clock bound) and the render of the whole screen: fix 3 (scan out the image directly / render and blit only the damaged rectangle) and the hardware cursor (pointer-only frames) are the remaining pieces; none started.
