@@ -6,7 +6,10 @@
 //!   vk_comp [prog...]        starts each prog once the socket listens (default: panel, if it exists); Ctrl+Alt+Backspace quits
 //!   COMP_HEADLESS=1          no display (QEMU's software device): render 640x360 without a screen
 //!   COMP_NO_INPUT=1          do not open (or grab) the input devices
-//!   COMP_SECONDS=<n>         quit after n seconds (unattended runs); SIGTERM quits too
+//!   COMP_SECONDS=<n>         quit after n seconds (unattended runs); SIGTERM quits too. The programs it started that are still running then are
+//!                            sent SIGTERM (SIGKILL after 3 s), so a session ends with its compositor
+//!   COMP_NO_PANEL=1          with no program to start, do not start the default panel
+//!   COMP_F11_AT=60,120       test hook: press F11 (fullscreen on the focused window) when that many frames have been composed
 //!   COMP_EXIT_WHEN_IDLE=1    quit when every client that connected has gone and every program it started has exited (the quit line then
 //!                            says how long it all took)
 //!
@@ -211,6 +214,26 @@ fn reap_children() -> bool {
     !children.is_empty() || LAUNCHING.load(Ordering::SeqCst) > 0
 }
 
+/// The programs we started that are still running when the compositor ends go with it, as a session's do: SIGTERM (their handlers were put back
+/// to the default when they started), SIGKILL after 3 s. How many had to be told.
+fn terminate_children() -> usize {
+    let pids: Vec<i32> = CHILDREN.lock().unwrap().clone();
+    for &p in &pids {
+        unsafe { kill(p, SIGTERM) };
+    }
+    let t = Instant::now();
+    while !pids.is_empty() && reap_children() && t.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for p in CHILDREN.lock().unwrap().clone() {
+        unsafe { kill(p, SIGKILL) };
+    }
+    if !pids.is_empty() {
+        reap_children();
+    }
+    pids.len()
+}
+
 /// Where the time of each composition goes, and how far apart its flips land, per 5 s window: the display is 60 Hz, so a flip every ~16.7 ms
 /// is a composition per vblank and ~33 ms means one vblank missed.
 #[derive(Default)]
@@ -297,6 +320,9 @@ fn run(args: &[String]) -> i32 {
     let socket = env("COMP_SOCKET").unwrap_or_else(|| "/tmp/gui-0".into());
     let exit_when_idle = env("COMP_EXIT_WHEN_IDLE").is_some();
     let compose_delay = Duration::from_millis(env("COMP_DELAY_MS").and_then(|s| s.parse().ok()).unwrap_or(2));
+    // A test hook: F11 is pressed (on the focused window) when this many frames have been composed, once per number in the list
+    // (COMP_F11_AT=60,120), so QEMU, which has no keyboard for the compositor to read, can take a window to fullscreen and back.
+    let f11_at: Vec<u64> = env("COMP_F11_AT").map(|l| l.split(',').filter_map(|n| n.trim().parse().ok()).collect()).unwrap_or_default();
 
     let (mut w, mut h) = (0u32, 0u32);
     if unsafe { cr_init(headless as c_int, &mut w, &mut h) } != 0 {
@@ -340,7 +366,7 @@ fn run(args: &[String]) -> i32 {
     println!("COMP listening on {}", socket);
     if args.len() > 1 {
         launch(args[1..].to_vec(), socket.clone());
-    } else if std::path::Path::new("/bin/panel").exists() || std::path::Path::new("/mnt/bin/panel").exists() {
+    } else if env("COMP_NO_PANEL").is_none() && (std::path::Path::new("/bin/panel").exists() || std::path::Path::new("/mnt/bin/panel").exists()) {
         launch(vec!["panel".into()], socket.clone());
     }
 
@@ -349,6 +375,10 @@ fn run(args: &[String]) -> i32 {
     let mut last_stat = Instant::now();
     let (mut mdx, mut mdy) = (0i32, 0i32);
     let mut frames = 0u64;
+    // what the input devices delivered (is the mouse alive?): key events, pointer motions, button events
+    let (mut n_keys, mut n_moves, mut n_buttons) = (0u64, 0u64, 0u64);
+    // the mouse, closer: poll() said it was readable, EV_REL records read, the sum of the deltas
+    let (mut n_mouse_wakes, mut n_rel, mut sum_dx, mut sum_dy) = (0u64, 0u64, 0i64, 0i64);
     let mut failures = 0;
     // No composition before this instant: a frame is composed once per vblank with whatever every client committed since the last one, not as soon as
     // the first commit arrives (that gave each vblank to one client, and each of two clients 30 frames per second).
@@ -403,22 +433,38 @@ fn run(args: &[String]) -> i32 {
                 }
                 x if x == u32::MAX - 1 => read_input(kbd, |ty, code, value| {
                     if ty == EV_KEY {
+                        n_keys += 1;
                         comp.key(code as u32, value != 0);
                     }
                 }),
-                x if x == u32::MAX - 2 => read_input(mouse, |ty, code, value| match (ty, code) {
-                    (EV_REL, REL_X) => mdx += value,
-                    (EV_REL, REL_Y) => mdy -= value, // PS/2: positive is up; the screen's is down
-                    (EV_KEY, _) => comp.pointer_button(code as u32, value != 0),
+                x if x == u32::MAX - 2 => {
+                  n_mouse_wakes += 1;
+                  read_input(mouse, |ty, code, value| match (ty, code) {
+                    (EV_REL, REL_X) => {
+                        n_rel += 1;
+                        sum_dx += value as i64;
+                        mdx += value
+                    }
+                    (EV_REL, REL_Y) => {
+                        n_rel += 1;
+                        sum_dy += value as i64;
+                        mdy -= value // PS/2: positive is up; the screen's is down
+                    }
+                    (EV_KEY, _) => {
+                        n_buttons += 1;
+                        comp.pointer_button(code as u32, value != 0)
+                    }
                     (EV_SYN, _) => {
                         if mdx != 0 || mdy != 0 {
+                            n_moves += 1;
                             comp.pointer_motion(mdx, mdy);
                         }
                         mdx = 0;
                         mdy = 0;
                     }
                     _ => {}
-                }),
+                  })
+                }
                 c => clients.readable(&mut comp, c),
             }
         }
@@ -517,6 +563,11 @@ fn run(args: &[String]) -> i32 {
                 break;
             }
             frames += 1;
+            if f11_at.contains(&frames) {
+                println!("COMP F11 at frame {}", frames);
+                comp.key(87, true);
+                comp.key(87, false);
+            }
             let t_presented = Instant::now();
             // The clients whose commits are in this frame hear it now (the `frame` callbacks, as Weston sends them at repaint): the present above
             // waited for this frame's GPU work, so they draw their next frame while it waits for the vblank, and their commits are in the next
@@ -556,6 +607,9 @@ fn run(args: &[String]) -> i32 {
             let mut st = CrStats::default();
             unsafe { cr_get_stats(&mut st) };
             println!("COMP {} frames, {} draws in the last, {} imports, {} uploads, {} clients seen", frames, st.draws, st.imports, st.uploads, clients.seen);
+            if kbd >= 0 {
+                println!("COMP input: {} key events, {} pointer motions, {} button events; mouse: {} poll wakes, {} REL records (sum {},{}), pointer at {:?}", n_keys, n_moves, n_buttons, n_mouse_wakes, n_rel, sum_dx, sum_dy, comp.pointer());
+            }
             if pace.n > 0 {
                 println!("COMP pace (5 s): {}", pace.line());
             }
@@ -580,12 +634,19 @@ fn run(args: &[String]) -> i32 {
         with_clients.map_or(0, |w| w.1.duration_since(w.0).as_millis())
     );
 
+    if kbd >= 0 {
+        println!("COMP input (all): {} key events, {} pointer motions, {} button events; mouse: {} poll wakes, {} REL records (sum {},{}), pointer at {:?}", n_keys, n_moves, n_buttons, n_mouse_wakes, n_rel, sum_dx, sum_dy, comp.pointer());
+    }
     let ids: Vec<ClientId> = clients.streams.keys().copied().collect();
     for c in ids {
         clients.drop_client(&mut comp, c);
     }
     drop(listener);
     let _ = std::fs::remove_file(&socket);
+    let told = terminate_children();
+    if told > 0 {
+        println!("COMP ended {} program(s) still running", told);
+    }
     if kbd >= 0 {
         drop(unsafe { OwnedFd::from_raw_fd(kbd) });
         drop(unsafe { OwnedFd::from_raw_fd(mouse) });

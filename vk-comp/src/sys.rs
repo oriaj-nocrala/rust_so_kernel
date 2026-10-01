@@ -45,6 +45,7 @@ extern "C" {
     pub fn ioctl(fd: c_int, req: u64, ...) -> c_int;
     pub fn open(path: *const i8, flags: c_int, ...) -> c_int;
     pub fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+    pub fn kill(pid: c_int, sig: c_int) -> c_int;
     pub fn signal(sig: c_int, handler: usize) -> usize;
     pub fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
     pub fn munmap(addr: *mut c_void, len: usize) -> c_int;
@@ -69,6 +70,7 @@ pub const O_NONBLOCK: c_int = 0x800;
 pub const EVIOCGRAB: u64 = 0x4004_4590;
 pub const SIGINT: c_int = 2;
 pub const SIGPIPE: c_int = 13;
+pub const SIGKILL: c_int = 9;
 pub const SIGTERM: c_int = 15;
 pub const SIGTSTP: c_int = 20;
 pub const SIG_DFL: usize = 0;
