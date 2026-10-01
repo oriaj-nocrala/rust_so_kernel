@@ -18,7 +18,11 @@ void main() {
         color = unpack(pc.misc.x);
         return;
     }
-    ivec2 p = ivec2(gl_FragCoord.xy) - pc.dst.xy + pc.src.xy;
+    // Helper invocations (the 2x2 quads that straddle the rectangle's edge when it starts on an odd pixel) run the loads too, with FragCoord
+    // outside the rectangle: an index of -1 is uint 0xFFFFFFFF, 16 GiB past the buffer, in another session's address space, and RM resets
+    // the channel (Ryzen #184-#187: the first time the pointer moved by one pixel). Their values are never shown, so clamp into the rectangle.
+    ivec2 rel = clamp(ivec2(gl_FragCoord.xy) - pc.dst.xy, ivec2(0), max(pc.dst.zw - 1, ivec2(0)));
+    ivec2 p = rel + pc.src.xy;
     uint v = pix.px[uint(p.y * pc.src.z + p.x)];
     if (pc.src.w == 2 && (v >> 24) == 0u) discard;
     color = unpack(v);
