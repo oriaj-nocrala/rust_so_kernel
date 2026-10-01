@@ -47,6 +47,10 @@ Code: `kernel/src/process/` (`scheduler.rs`, `timer_preempt.rs`, `trapframe.rs`,
 - **Never drop the last `Arc<AddressSpace>` of a table some CPU has in CR3.** Its PML4 would go back to the buddy and could be reused at once.
   - `sys_exec` drops the old space only after `activate()`.
   - `kill_current` parks a dying thread's space in `retiring[cpu]` until the next one is loaded.
+- **Nothing that walks a whole address space runs under `SCHEDULER`**: every CPU's tick and syscall entry wait behind it (forking a client from a 15 MB Vulkan compositor froze the machine for seconds).
+  - `fork_impl` clones the parent's `Arc<AddressSpace>` under the lock and calls `AddressSpace::fork` (which takes the space's own lock) after releasing it.
+  - `sys_exec` returns the old space out of the locked block and drops it there, IF still 0 (the trapframe already holds the new image's entry).
+  - Still under the lock (open): `reap_zombie` dropping the last reference of a zombie's space, and `retiring` in `switch_in`.
 
 ## Blocking and wakeups
 

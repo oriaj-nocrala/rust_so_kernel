@@ -705,7 +705,8 @@ impl Scheduler {
                         None => (0, None),
                     };
 
-                    tf = self.kill_and_switch_tf("uncaught signal");
+                    let reason = alloc::format!("uncaught signal {}", sig);
+                    tf = self.kill_and_switch_tf(&reason);
                     self.notify_child_death(dead_pid, parent_pid);
                     // Same side-table cleanup `sys_exit` does for a normal
                     // exit — see `syscall::cancel_all_waiters`'s doc comment

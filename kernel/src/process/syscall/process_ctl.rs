@@ -539,7 +539,7 @@ fn fork_impl(child_stack: u64, tls: Option<u64>, vfork: bool, share: Share) -> S
     unsafe { crate::process::fpu::save(&mut parent_fpu_state); }
 
     // Collect what we need from the running process
-    let (child_as, parent_pid, parent_fs_base, files_arc, child_tf, parent_cwd, (parent_pgid, parent_sid, parent_ctty), parent_exe_name, parent_signals, (parent_comm, parent_cmdline, parent_creds)) = {
+    let (parent_as, parent_pid, parent_fs_base, files_arc, child_tf, parent_cwd, (parent_pgid, parent_sid, parent_ctty), parent_exe_name, parent_signals, (parent_comm, parent_cmdline, parent_creds)) = {
         let scheduler = crate::process::scheduler::local_scheduler();
         match scheduler.running_ref() {
             Some(proc) => {
@@ -549,26 +549,32 @@ fn fork_impl(child_stack: u64, tls: Option<u64>, vfork: bool, share: Share) -> S
                 if child_stack != 0 {
                     tf_copy.rsp = child_stack;
                 }
-
-                let child_space = if share.vm {
-                    Ok(proc.address_space.clone())
-                } else {
-                    unsafe { proc.address_space.fork() }.map(alloc::sync::Arc::new)
-                };
-                match child_space {
-                    // FS base from the MSR, not `proc.fs_base`: that field is
-                    // only refreshed when the parent is switched out, so it is
-                    // stale if `arch_prctl` ran since — same reasoning as the
-                    // live `fpu::save` above.
-                    Ok(child_as) => (child_as, crate::process::Pid(proc.tgid), crate::process::scheduler::read_fs_base(), proc.files.clone(), tf_copy, proc.cwd.clone(), (proc.pgid, proc.sid, proc.ctty), proc.exe_name.clone(),
-                        (proc.signal_handlers, proc.sig_restart, proc.blocked_signals, proc.sig_extra, proc.altstack), (proc.name, proc.cmdline.clone(), proc.creds.clone())),
-                    Err(e) => {
-                        serial_println!("fork: address_space.fork() failed: {}", e);
-                        return errno::ENOMEM;
-                    }
-                }
+                // FS base from the MSR, not `proc.fs_base`: that field is
+                // only refreshed when the parent is switched out, so it is
+                // stale if `arch_prctl` ran since — same reasoning as the
+                // live `fpu::save` above.
+                (proc.address_space.clone(), crate::process::Pid(proc.tgid), crate::process::scheduler::read_fs_base(), proc.files.clone(), tf_copy, proc.cwd.clone(), (proc.pgid, proc.sid, proc.ctty), proc.exe_name.clone(),
+                    (proc.signal_handlers, proc.sig_restart, proc.blocked_signals, proc.sig_extra, proc.altstack), (proc.name, proc.cmdline.clone(), proc.creds.clone()))
             }
             None => return errno::ESRCH,
+        }
+    };
+
+    // The copy-on-write copy of the address space, with `SCHEDULER` released: it walks every page of every VMA (and copies the
+    // huge ones), which for a process with a big image and GPU heaps takes long enough to stall every CPU's timer tick and
+    // syscall entry behind the lock (a 15 MB Vulkan compositor starting a client froze the machine for seconds). The address
+    // space has its own lock, which `fork` takes.
+    let child_as = if share.vm {
+        parent_as
+    } else {
+        let forked = unsafe { parent_as.fork() };
+        drop(parent_as);
+        match forked {
+            Ok(space) => alloc::sync::Arc::new(space),
+            Err(e) => {
+                serial_println!("fork: address_space.fork() failed: {}", e);
+                return errno::ENOMEM;
+            }
         }
     };
 
@@ -1034,7 +1040,6 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
 
                 crate::ktrace!(crate::debug::SCHED, "exec: activating new CR3");
                 unsafe { proc.address_space.activate(); }
-                drop(old_space);
                 crate::ktrace!(crate::debug::SCHED, "exec: CR3 active, jumping to entry={:#x}", proc.trapframe.rip);
                 // This direct field-by-field rewrite (above) discards
                 // whatever trapframe content this process had before exec —
@@ -1051,12 +1056,17 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
                 // preemption already ran before this point and is unrelated.
                 crate::process::scheduler::tf_note_save(proc, "sys_exec");
                 crate::process::scheduler::tf_note_resume(proc, "sys_exec");
-                (&*proc.trapframe as *const TrapFrame, vfork_parent)
+                (&*proc.trapframe as *const TrapFrame, vfork_parent, old_space)
             }
             None => return errno::ESRCH,
         }
     };
-    let (next_tf, vfork_parent) = next_tf;
+    let (next_tf, vfork_parent, old_space) = next_tf;
+    // The old image goes now that the new page table is active, and with `SCHEDULER` released: freeing every page of a big
+    // process (a fork's copy of a 15 MB Vulkan compositor) under the lock stalled every CPU's tick and syscall entry for seconds.
+    // IF stays 0: this process's trapframe already holds the new image's entry, which a preemption would overwrite. Dropped before
+    // the `-> !` below in any case (nothing with a live `Drop` may be in scope there).
+    drop(old_space);
     // The image is replaced: a `vfork` parent waiting for that goes on (Linux releases it at exec as well as at exit).
     if let Some((parent, child)) = vfork_parent {
         crate::process::scheduler::local_scheduler().wake_with_retval(parent, child as u64);
