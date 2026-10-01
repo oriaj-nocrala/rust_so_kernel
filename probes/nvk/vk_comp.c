@@ -103,7 +103,8 @@ static void flush_outputs(void) {
    while ((len = gui_pop_event(gui, &who, buf, sizeof(buf))) > 0) {
       if (who > MAX_CLIENTS || !client_live[who]) continue;
       if (send(client_fd[who], buf, len, MSG_DONTWAIT | MSG_NOSIGNAL) != (long)len) {
-         printf("COMP client %u is not reading its events: dropped\n", who);
+         /* a client that closed its end is just leaving (its socket reads EOF next); one that left the socket full is not reading */
+         if (errno != EPIPE && errno != ECONNRESET) printf("COMP client %u is not reading its events: dropped\n", who);
          drop_client(who);
       }
    }
