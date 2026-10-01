@@ -151,7 +151,8 @@ visible pattern. What the data says, honestly:
   (1) the GPU shared with a full-size `snake3d` (the user maximized it to 1920x1040: its frames are slower and the compositor's work queues behind
   them, no priorities); (2) GPU clocks (P-state ramp 0.2-0.6 s; the first frame after idle ~9x slow, `docs/gpu/g5-graphics-stack-plan.md` "relojes");
   (3) more CPU uploads (`cpumon`, titles; 207 uploads in D); (4) the window sizes (the user also noticed snake slows a little after returning from F11).
-- USB mouse reports: 1367 in 21 s = ~65/s; the cursor is sampled at the frame rate anyway, with up to a frame of latency.
+- **Update, Ryzen #189 (`gpu-cursor-probe.sh`, `hw-cursor-plan.md` section 11): cursor alone ~50 compositions/s; with cpumon + snake3d in a 960x540 window the compositor is locked at 30 fps (95% of flips 20-37 ms, `present` a constant ~9.1 ms); with the snake window at 1880x1000 it runs at 59 fps (`present` 3 ms).** A bigger window is *faster*, which makes candidate (1) below unlikely and candidate (2), GPU clocks, the one to test (sample `gsp perf` during both loads).
+- USB mouse reports: 1367 in 21 s = ~65/s (85-96/s in #189); the cursor is sampled at the frame rate anyway, with up to a frame of latency.
 - **What to measure first** (in this order; one variable per boot): (a) keep the `COMP pace (5 s)` lines in the job summary (the jobs only kept
   `pace (all)`), with the window sizes at the time; (b) per-frame hitch ring in `vk_comp` (intervals over 25 ms with timestamps, as the metal-run
   skill describes); (c) the same load with the snake window small vs maximized; (d) the cursor alone with no clients (is the cursor path itself at
