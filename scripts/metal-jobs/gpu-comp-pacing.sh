@@ -58,12 +58,16 @@ run() { # run <label> <secs> env... command...
 # channel), the blit 0.13 / 1.0 / 2.3 ms (memory-clock bound), PRESENT itself ~5 us. The suspect for the render floor: the CPU-drawn windows (cpumon's 4.7 MB)
 # read from system memory by the shader every frame. So, in this order (cpumon first, right after the boot, while the GPU is still at P0):
 #   C  cpumon only (a CPU window, no other GPU channel), 20 s   S  snake3d only (a GPU window in VRAM, no CPU window), 20 s   L  both, 15 s
-TRACE_WINDOWS="1 2 3"
-run "C cpumon only" 20 /mnt/bin/vk_comp cpumon
-TRACE_WINDOWS="2 3"
-run "S snake3d only" 20 /mnt/bin/vk_comp snake3d
+# Ryzen #193 answered it: the snake alone makes 60 fps at P8 (render 2.3 ms), cpumon adds +4.3 ms (render 6.6) and lands the PRESENT past the deadline: 30 fps.
+# The CPU windows are now copied into VRAM when they change (probes/nvk/comp_render.h; COMP_CPU_HOST=1 = the old way, the control). Both cpumon + snake3d
+# (960x540) in turn, new / old / new with COMP_DELAY_MS=0 / new again, 15 s each, the P-state in every 5 s window: the new way should keep render near 2.5 ms
+# and 60 fps (presents in the 4-8 ms buckets) at P8, the old way 30 fps with render 6.6 ms.
 TRACE_WINDOWS="3"
-run "L 960x540 both" 15 /mnt/bin/vk_comp cpumon snake3d
+run "L1 VRAM windows" 15 /mnt/bin/vk_comp cpumon snake3d
+run "L2 host windows (old)" 15 COMP_CPU_HOST=1 /mnt/bin/vk_comp cpumon snake3d
+run "L3 VRAM, delay 0" 15 COMP_DELAY_MS=0 /mnt/bin/vk_comp cpumon snake3d
+run "L4 VRAM again" 15 /mnt/bin/vk_comp cpumon snake3d
+run "C VRAM cpumon only" 10 /mnt/bin/vk_comp cpumon
 
 sum "gpu-comp-pacing: end: $(grep '^gpu_uapi:' /proc/kdebug | cut -c1-200)"
 sum "gpu-comp-pacing: $(grep '^gpu_share:' /proc/kdebug)"

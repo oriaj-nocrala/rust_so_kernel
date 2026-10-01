@@ -6,7 +6,9 @@
  * shows a solid colour or reads the pixel of a client's buffer as a storage buffer, one for one (comp.vert, comp.frag). The buffers:
  *   - GPU buffers (CR_GPU): the client's memory, imported where it is (constanos: the opaque-fd import of a /dev/nvgpu BO; host
  *     harness: a descriptor of a memfd, mapped and copied into a buffer of its own before every frame, standing in for shared memory);
- *   - pool windows (CR_CPU): the library's copy of their pixels, uploaded to a host-visible buffer when `version` moves;
+ *   - pool windows (CR_CPU): the library's copy of their pixels: written to a host-visible staging buffer and copied into a device-local one
+ *     (VRAM) when `version` moves, so the fragment shader never reads them over PCIe (Ryzen #193: that cost 4 ms a frame at the lowest P-state);
+ *     COMP_CPU_HOST=1 keeps the old way (one host-visible buffer read in place) for comparison, and it is the fallback without a device-local type;
  *   - the cursor: a small buffer drawn with a colour key.
  * One frame in flight: a frame starts by waiting for the previous one, so uploads never race the GPU, and then tells the window manager
  * the caller (comp_wait_frame returns the previous frame's number) that the previous frame is done, which is what lets it release buffers.
@@ -38,7 +40,7 @@
    X(vkUpdateDescriptorSets) X(vkFreeDescriptorSets) X(vkCreateCommandPool) X(vkAllocateCommandBuffers) X(vkResetCommandBuffer) \
    X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkCmdPipelineBarrier) X(vkCmdBeginRendering) X(vkCmdEndRendering) \
    X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
-   X(vkCreateFence) X(vkResetFences) X(vkWaitForFences) X(vkQueueSubmit) X(vkDeviceWaitIdle) \
+   X(vkCmdCopyBuffer) X(vkCreateFence) X(vkResetFences) X(vkWaitForFences) X(vkQueueSubmit) X(vkDeviceWaitIdle) \
    X(vkDestroyPipeline) X(vkDestroyPipelineLayout) X(vkDestroyDescriptorSetLayout) X(vkDestroyDescriptorPool) X(vkDestroyCommandPool) X(vkDestroyFence)
 
 struct comp_src {
@@ -49,7 +51,11 @@ struct comp_src {
    uint32_t stride_px;
    uint64_t version;           /* CPU: the version uploaded */
    size_t capacity;            /* CPU: bytes the buffer holds */
-   uint32_t *map;              /* CPU: mapped; host harness GPU: the buffer's mapping */
+   uint32_t *map;              /* CPU: mapped (the staging buffer when `staged`); host harness GPU: the buffer's mapping */
+   VkBuffer stage_buf;         /* CPU, `staged`: the host-visible buffer `map` is of; `buf` is then device-local */
+   VkDeviceMemory stage_mem;
+   int staged;
+   size_t copy_bytes;          /* CPU, `staged`: bytes written to the staging buffer that the next frame has to copy */
 #ifdef COMP_HOST
    const uint32_t *shared;     /* host harness GPU: the client's memory (a mapped memfd), copied into `map` every frame */
    size_t shared_bytes;
@@ -79,6 +85,7 @@ struct comp {
    struct comp_src cpu[COMP_MAX_CPU];
    struct comp_src dummy;      /* what solid fills bind (never read) */
    uint32_t frames, draws, draws_max, imports, drops, uploads;
+   int cpu_in_host;            /* COMP_CPU_HOST=1: CPU sources stay in one host-visible buffer */
 };
 
 struct comp_push {
@@ -106,27 +113,35 @@ static int comp_alloc_set(struct comp *c, struct comp_src *s) {
    return c->vkAllocateDescriptorSets(c->device, &ai, &s->set) == VK_SUCCESS ? 0 : -1;
 }
 
-/* A host-visible, coherent storage buffer of `bytes` (rounded up to 4096), mapped. */
-static int comp_host_buffer(struct comp *c, struct comp_src *s, size_t bytes) {
+/* A buffer of `bytes` (rounded up to 4096) of memory with the `want` properties and none of `avoid`; mapped (into `*map`) when `map` is not NULL. */
+static int comp_buffer(struct comp *c, VkBuffer *buf, VkDeviceMemory *mem, uint32_t **map, size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid) {
    bytes = (bytes + 4095) & ~(size_t)4095;
-   VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
-   if (c->vkCreateBuffer(c->device, &bci, NULL, &s->buf) != VK_SUCCESS) return -1;
+   VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = bytes, .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+   if (c->vkCreateBuffer(c->device, &bci, NULL, buf) != VK_SUCCESS) return -1;
    VkMemoryRequirements req;
-   c->vkGetBufferMemoryRequirements(c->device, s->buf, &req);
-   int t = comp_type(c, req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+   c->vkGetBufferMemoryRequirements(c->device, *buf, &req);
+   int t = comp_type(c, req.memoryTypeBits, want, avoid);
    if (t < 0) return -2;
    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = (uint32_t)t };
-   if (c->vkAllocateMemory(c->device, &mai, NULL, &s->mem) != VK_SUCCESS) return -3;
-   if (c->vkBindBufferMemory(c->device, s->buf, s->mem, 0) != VK_SUCCESS) return -4;
-   if (c->vkMapMemory(c->device, s->mem, 0, VK_WHOLE_SIZE, 0, (void **)&s->map) != VK_SUCCESS) return -5;
-   s->capacity = bytes;
+   if (c->vkAllocateMemory(c->device, &mai, NULL, mem) != VK_SUCCESS) return -3;
+   if (c->vkBindBufferMemory(c->device, *buf, *mem, 0) != VK_SUCCESS) return -4;
+   if (map && c->vkMapMemory(c->device, *mem, 0, VK_WHOLE_SIZE, 0, (void **)map) != VK_SUCCESS) return -5;
    return 0;
+}
+
+/* A host-visible, coherent storage buffer of `bytes` (rounded up to 4096), mapped. */
+static int comp_host_buffer(struct comp *c, struct comp_src *s, size_t bytes) {
+   int r = comp_buffer(c, &s->buf, &s->mem, &s->map, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+   if (r == 0) s->capacity = (bytes + 4095) & ~(size_t)4095;
+   return r;
 }
 
 static void comp_free_src(struct comp *c, struct comp_src *s) {
    if (s->set) c->vkFreeDescriptorSets(c->device, c->pool, 1, &s->set);
    if (s->buf) c->vkDestroyBuffer(c->device, s->buf, NULL);
    if (s->mem) c->vkFreeMemory(c->device, s->mem, NULL);
+   if (s->stage_buf) c->vkDestroyBuffer(c->device, s->stage_buf, NULL);
+   if (s->stage_mem) c->vkFreeMemory(c->device, s->stage_mem, NULL);
 #ifdef COMP_HOST
    if (s->shared) munmap((void *)s->shared, s->shared_bytes);
 #endif
@@ -136,6 +151,7 @@ static void comp_free_src(struct comp *c, struct comp_src *s) {
 /* Creates the pipeline and the fixed buffers. `format`: the render target's. 0, or a negative step number. */
 static int comp_init(struct comp *c, VkDevice device, PFN_vkGetDeviceProcAddr gdpa, const VkPhysicalDeviceMemoryProperties *mp, uint32_t family, VkFormat format) {
    memset(c, 0, sizeof(*c));
+   c->cpu_in_host = getenv("COMP_CPU_HOST") && getenv("COMP_CPU_HOST")[0] == '1';
    c->device = device;
    c->mp = *mp;
    c->family = family;
@@ -263,13 +279,26 @@ static struct comp_src *comp_cpu_source(struct comp *c, const struct cr_op *op) 
       s = comp_slot(c->cpu, COMP_MAX_CPU);
       if (!s) return NULL;
       memset(s, 0, sizeof(*s));
-      if (comp_host_buffer(c, s, npx * 4) != 0 || comp_alloc_set(c, s) != 0) { comp_free_src(c, s); return NULL; }
+      /* the pixels live in VRAM and the library writes them into a staging buffer; without a device-local type (or asked to) they stay in host memory */
+      size_t bytes = (npx * 4 + 4095) & ~(size_t)4095;
+      if (!c->cpu_in_host &&
+          comp_buffer(c, &s->stage_buf, &s->stage_mem, &s->map, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0) == 0 &&
+          comp_buffer(c, &s->buf, &s->mem, NULL, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) {
+         s->staged = 1;
+         s->capacity = bytes;
+      } else {
+         comp_free_src(c, s);   /* a half-made pair goes back */
+         memset(s, 0, sizeof(*s));
+         if (comp_host_buffer(c, s, npx * 4) != 0) { comp_free_src(c, s); return NULL; }
+      }
+      if (comp_alloc_set(c, s) != 0) { comp_free_src(c, s); return NULL; }
       s->key = op->key;
       comp_write_set(c, s);
       s->version = ~0ull;
    }
    if (s->version != op->version || s->stride_px != (uint32_t)op->src_w) {
       memcpy(s->map, op->px, npx * 4);
+      if (s->staged) s->copy_bytes = npx * 4;
       s->version = op->version;
       s->stride_px = (uint32_t)op->src_w;
       c->uploads++;
@@ -310,6 +339,22 @@ static int comp_frame(struct comp *c, const struct cr_op *ops, size_t n, uint64_
    c->vkResetCommandBuffer(c->cb, 0);
    VkCommandBufferBeginInfo bbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
    c->vkBeginCommandBuffer(c->cb, &bbi);
+   /* the CPU sources first (a copy cannot be inside the render pass): new versions go from the staging buffers into VRAM */
+   int copied = 0;
+   for (size_t i = 0; i < n; i++) {
+      if (ops[i].kind != CR_CPU || !ops[i].px) continue;
+      struct comp_src *s = comp_cpu_source(c, &ops[i]);
+      if (s && s->staged && s->copy_bytes) {
+         VkBufferCopy bc = { 0, 0, s->copy_bytes };
+         c->vkCmdCopyBuffer(c->cb, s->stage_buf, s->buf, 1, &bc);
+         s->copy_bytes = 0;
+         copied = 1;
+      }
+   }
+   if (copied) {
+      VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT };
+      c->vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+   }
    VkImageMemoryBarrier to_color = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
       .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = image,
       .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
