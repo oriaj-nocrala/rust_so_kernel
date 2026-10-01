@@ -90,6 +90,19 @@ impl FileHandle for DispctlDevice {
                     cur::move_to(x, y)
                 }
                 Some("off") => cur::off(),
+                Some("image") => cur::write_image(it.next().map_or(Ok(32), |v| v.parse()).map_err(|_| FileError::InvalidArgument)?),
+                Some("raw") => {
+                    let num = |s: Option<&str>| -> Result<u32, FileError> {
+                        let s = s.ok_or(FileError::InvalidArgument)?;
+                        match s.strip_prefix("0x") {
+                            Some(h) => u32::from_str_radix(h, 16),
+                            None => s.parse(),
+                        }
+                        .map_err(|_| FileError::InvalidArgument)
+                    };
+                    let (m, v) = (num(it.next())?, num(it.next())?);
+                    cur::raw(m, v)
+                }
                 _ => return Err(FileError::InvalidArgument),
             };
             return match res {

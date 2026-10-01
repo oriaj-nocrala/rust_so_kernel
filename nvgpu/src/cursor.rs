@@ -99,6 +99,11 @@ pub fn core_methods_set(head: u32, handle: u32, vram: u64, size: u32, hot_x: u32
     ])
 }
 
+/// The only core methods `/dev/dispctl cursor raw` may push for `head`: the five the cursor uses (a debugging ladder, one method per push).
+pub fn core_method_allowed(head: u32, method: u32) -> bool {
+    [core_usage_bounds(head), core_context_dma(head), core_offset(head), core_control(head), core_composition(head)].contains(&method)
+}
+
 /// What `headc37d_curs_clr` pushes: disabled (format kept), context DMA 0 (`headc37d.c:104-119`).
 pub fn core_methods_clear(head: u32) -> Vec<(u32, u32)> {
     alloc::vec![(core_control(head), FORMAT_A8R8G8B8), (core_context_dma(head), 0)]
@@ -238,6 +243,20 @@ mod tests {
         assert!(core_methods_set(0, 1, 0xff_ffff_ff00, 64, 255, 255).is_some());
         assert_eq!(size_code(32), Some(0));
         assert_eq!(size_code(128), Some(2));
+    }
+
+    #[test]
+    fn raw_pushes_are_limited_to_the_cursors_methods_of_that_head() {
+        for m in [0x2030, 0x2088, 0x2090, 0x209c, 0x20a0] {
+            assert!(core_method_allowed(0, m), "{m:#x}");
+        }
+        for m in [0x2430, 0x2488, 0x2490, 0x249c, 0x24a0] {
+            assert!(core_method_allowed(1, m), "{m:#x}");
+            assert!(!core_method_allowed(0, m), "{m:#x}");
+        }
+        for m in [0x200, 0x218, 0x2034, 0x2084, 0x2094, 0x2098, 0x20a4, 0x300] {
+            assert!(!core_method_allowed(0, m), "{m:#x}");
+        }
     }
 
     #[test]

@@ -19,7 +19,7 @@ st() { grep -a '^cursor:' /dev/dispctl 2>/dev/null | head -n 1 | cut -c1-400; }
 st2() { grep -a '^cursor:' /dev/dispctl 2>/dev/null | sed -n 2p | cut -c1-300; }
 sts() { sum "gpu-cursor: $1: $(st)"; sum "gpu-cursor: $1: $(st2)"; }
 kd() { grep -a '^gpu_cursor:' /proc/kdebug; }
-logs() { grep -a 'cursor:' /proc/dmesg | tail -n 4 | cut -c1-300 | while read -r l; do sum "gpu-cursor: kernel: $l"; done; }
+logs() { grep -a 'cursor:' /proc/gpu | tail -n 4 | cut -c1-300 | while read -r l; do sum "gpu-cursor: kernel: $l"; done; }
 if [ -e /dev/dispctl ] && grep -q '^dispctl' /dev/dispctl 2>/dev/null; then
   sum "gpu-cursor: $(grep '^dispctl' /dev/dispctl | cut -c1-200)"
 else

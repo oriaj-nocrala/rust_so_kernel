@@ -91,14 +91,12 @@ pub fn probe() -> Result<(), CursorError> {
     }
 }
 
-/// `cursor on`: image, channel, the core push, the first position.
-pub fn on(size: u32, bounds: bool) -> Result<(), CursorError> {
-    if ON.load(Ordering::Acquire) || nc::size_code(size).is_none() {
+/// `cursor image [size]`: the test arrow into VRAM (through PRAMIN: written once, read back).
+pub fn write_image(size: u32) -> Result<(), CursorError> {
+    let regs = supervisor::regs().ok_or(CursorError::NotReady)?;
+    if nc::size_code(size).is_none() {
         return Err(CursorError::Invalid);
     }
-    probe()?;
-    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
-    // the image, through PRAMIN (a test image, written once; the compositor will bring its own BO)
     let px = arrow(size);
     let mut p = Pramin::new(regs);
     for (i, v) in px.iter().enumerate() {
@@ -110,6 +108,69 @@ pub fn on(size: u32, bounds: bool) -> Result<(), CursorError> {
         log(alloc::format!("cursor: image readback {:#x} != {:#x}", readback, px[(size + 1) as usize]));
         return Err(CursorError::Failed);
     }
+    Ok(())
+}
+
+/// `cursor raw <method> <value>`: ONE core method plus UPDATE (a debugging ladder: Ryzen #196/#197 left the core not idle after the whole enable
+/// push, its exception slot naming method 0x2088 with type 0). Waits for the core to go idle, with IF=1, and logs where it stands.
+pub fn raw(method: u32, value: u32) -> Result<(), CursorError> {
+    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
+    if !nc::core_method_allowed(head, method) {
+        return Err(CursorError::Invalid);
+    }
+    let was_on = x86_64::instructions::interrupts::are_enabled();
+    if !was_on {
+        x86_64::instructions::interrupts::enable();
+    }
+    let faults0 = evo::Faults::read(regs);
+    let pushed = supervisor::push_core("cursor raw", &[(method, value)], false);
+    let idle = pushed.is_ok() && {
+        let t0 = crate::cpu::tsc::read();
+        loop {
+            if evo::CORE.idle(regs) {
+                break true;
+            }
+            if crate::cpu::tsc::read().wrapping_sub(t0) / (crate::cpu::tsc::freq_hz() / 1000).max(1) >= LATCH_MS {
+                break false;
+            }
+            crate::memory::tlb::service_pending();
+            core::hint::spin_loop();
+        }
+    };
+    if !was_on {
+        x86_64::instructions::interrupts::disable();
+    }
+    let f = evo::Faults::read(regs).new_since(&faults0);
+    log(alloc::format!(
+        "cursor: raw {:#x} = {:#x}: push {:?}, core idle {} status {:#x} put {:#x} get {:#x}, slot {:#x},{:#x},{:#x}, new faults ctrl_disp {:#x} exc_other {:#x}",
+        method,
+        value,
+        pushed,
+        idle as u8,
+        regs.rd32(0x61_0630),
+        regs.rd32(evo::CORE.put()),
+        regs.rd32(evo::CORE.get()),
+        regs.rd32(evo::CORE.exception()),
+        regs.rd32(evo::CORE.exception() + 4),
+        regs.rd32(evo::CORE.exception() + 8),
+        f.ctrl_disp,
+        f.exc_other
+    ));
+    if pushed.is_err() || !idle {
+        REFUSED.fetch_add(1, Ordering::Relaxed);
+        return Err(CursorError::Failed);
+    }
+    Ok(())
+}
+
+/// `cursor on`: image, channel, the core push, the first position.
+pub fn on(size: u32, bounds: bool) -> Result<(), CursorError> {
+    if ON.load(Ordering::Acquire) || nc::size_code(size).is_none() {
+        return Err(CursorError::Invalid);
+    }
+    probe()?;
+    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
+    write_image(size)?;
     let mut methods = nc::core_methods_set(head, nc::HANDLE_CURSOR_CTX, IMAGE_VRAM, size, 0, 0).ok_or(CursorError::Invalid)?;
     if !bounds {
         methods.remove(0);
@@ -177,7 +238,7 @@ pub fn on(size: u32, bounds: bool) -> Result<(), CursorError> {
 
 /// `cursor move`: the position write. Counts and times itself (the time is the two stores' cost, an uncached BAR0 write each).
 pub fn move_to(x: i32, y: i32) -> Result<(), CursorError> {
-    if !ON.load(Ordering::Acquire) {
+    if !ALLOCATED.load(Ordering::Acquire) {
         return Err(CursorError::Invalid);
     }
     let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
@@ -249,7 +310,8 @@ pub fn status() -> String {
     );
     let _ = writeln!(
         s,
-        "cursor: core put {:#x} get {:#x} exception slot {:#x},{:#x},{:#x} ctrl_disp {:#x} exc_other {:#x} supers_done {}",
+        "cursor: core status {:#x} put {:#x} get {:#x} exception slot {:#x},{:#x},{:#x} ctrl_disp {:#x} exc_other {:#x} supers_done {}",
+        regs.rd32(0x61_0630),
         regs.rd32(evo::CORE.put()),
         regs.rd32(evo::CORE.get()),
         regs.rd32(evo::CORE.exception()),
