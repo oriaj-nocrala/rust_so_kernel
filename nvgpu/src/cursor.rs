@@ -329,6 +329,7 @@ mod tests {
             objects: alloc::vec![
                 (1, HANDLE_WNDW_CTX, vram_ctxdma(8 << 30)),
                 (0, HANDLE_CURSOR_CTX, vram_ctxdma(8 << 30)),
+                (0, HANDLE_CURSOR_CTX_PAGED, vram_ctxdma(8 << 30)),
             ],
         };
         assert!(table.words().is_ok());
@@ -338,3 +339,8 @@ mod tests {
 /// The handle the core uses for the context DMA that covers VRAM (the cursor image's): any handle on channel 0 (the core); nouveau's is its own VRAM
 /// context DMA's (`curs507a_prepare`). Registered in the RAMHT at boot (`kernel/src/gpu/evo.rs`).
 pub const HANDLE_CURSOR_CTX: u32 = 0xfb00_0100;
+
+/// Ryzen #198: with this handle (a context DMA of flags `0x05`, like window 0's surface) the core stood in `STG1_STATE = CTX_DMA_LOOKUP` for ever
+/// (`CHNSTATUS_CORE = 0xa20c0005`, exception slot naming method `0x2088`). The core's LUT context DMA (`hdmi::HANDLE_LUT`, flags `0x45` = PAGE | RW | VRAM) does
+/// resolve on the core. This is the same range with that flags value, under its own handle.
+pub const HANDLE_CURSOR_CTX_PAGED: u32 = 0xfb00_0101;

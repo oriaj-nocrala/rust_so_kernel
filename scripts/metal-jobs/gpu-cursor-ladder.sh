@@ -2,7 +2,8 @@
 # HEAD_SET_CONTEXT_DMA_CURSOR with type 0, put == get). Each step is ONE method + UPDATE through `cursor raw`, waits for the core to go idle and logs the
 # core's status, put/get and exception slot; the ladder stops at the first step that leaves the core busy. Least suspect first:
 #   1 composition 0x72ff   2 offset 0x50000 (80 MiB >> 8)   3 control 0xcf (format only, disabled)   4 usage bounds 0x1114
-#   5 context DMA 0xfb000100 (the core's VRAM context DMA, new in the RAMHT)   6 control 0x800000cf (enable, 32x32)
+#   5 context DMA 0xf0000001 (the core's LUT context DMA, flags 0x45; Ryzen #198: our own 0xfb000100, flags 0x05, left the core in CTX_DMA_LOOKUP)
+#   6 control 0x800000cf (enable, 32x32)
 # then, if the cursor is on: the arrow sweeps the screen and sits at the middle for 6 s (the person's eyes), and the cursor is turned off again
 # (control 0xcf, context DMA 0, usage bounds 0x1110: the GOP's value).
 #   touch build.rs; echo 3 > target/metal/budget; scripts/metal-run.sh --kconf 'gpu=uapi' scripts/metal-jobs/gpu-cursor-ladder.sh
@@ -33,7 +34,8 @@ step 1 composition 0x20a0 0x72ff
 step 2 offset 0x2090 0x50000
 step 3 control-disabled 0x209c 0xcf
 step 4 usage-bounds 0x2030 0x1114
-step 5 context-dma 0x2088 0xfb000100
+# 5: the core's own LUT context DMA (flags 0x45, resolves on the core: it is what the HDMI head's OLUT uses)
+step 5 context-dma-lut 0x2088 0xf0000001
 step 6 control-enable 0x209c 0x800000cf
 if [ $stopped = 0 ]; then
   echo "cursor move 100 100" > /dev/dispctl
@@ -48,6 +50,10 @@ if [ $stopped = 0 ]; then
   step 7 control-off 0x209c 0xcf
   step 8 context-dma-off 0x2088 0
   step 9 usage-bounds-back 0x2030 0x1110
+  # knowledge for the next round, last because a wedge ends the run: the cursor's own context DMAs (flags 0x45 first, then Ryzen #198's flags 0x05)
+  step 10 context-dma-own-paged 0x2088 0xfb000101
+  step 11 context-dma-own-paged-off 0x2088 0
+  step 12 context-dma-own-plain 0x2088 0xfb000100
 fi
 sum "gpu-cursor-ladder: end: $(st)"
 sum "gpu-cursor-ladder: end: $(st2)"
