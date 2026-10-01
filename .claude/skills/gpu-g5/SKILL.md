@@ -49,6 +49,8 @@ Design and slices: `docs/gpu/g5-graphics-stack-plan.md` "Capa 4". Slice 1 = the 
 
 Slice 3 (the compositor itself): `gui-capi/` (the `gui` window manager behind a C ABI, `gui_capi.h`; musl static lib built by `probes/nvk/build.py`), `probes/nvk/comp_render.h` + `comp.{vert,frag}` (the renderer; `probes/nvk/host-comp.sh` checks it pixel for pixel against a CPU reference on the host's Vulkan, no Ryzen), `vk-comp/` (Rust with std on musl: the program, `vk_comp [prog...]`, env `COMP_HEADLESS`, `COMP_NO_INPUT`, `COMP_SECONDS`, `COMP_SOCKET`; titles with `text`) + `probes/nvk/comp_vk.c` (the renderer's Vulkan bring-up, `cr_*` in `comp_api.h`); `gui-capi` is only for the host harness now, QEMU test `scripts/run-abi-suite.sh gui_comp_test` (vk_comp + vk_window), metal job `scripts/metal-jobs/gpu-comp.sh`. Stage `vk-comp` like the others (`strip -o disk-image-root/bin/vk_comp ...`, disk.img free space: each is 15 MB). One frame in flight (a frame waits for the previous one before uploading).
 
+**Open problem and full status: `docs/gpu/g5-layer4-handoff.md`** (compositor frame rate: 30 fps at 9 ms composition delay; runs with 3/5/7 ms ended after one frame on the Ryzen #180; read it before touching `vk-comp/` or `gpu-comp.sh`).
+
 Rules and traps:
 - **The program is the connection's only reader.** The swapchain never reads the socket: an acquire with every image held calls the `pump` hook until a `release` arrives (the program passes it on with `nvk_constanos_surface_buffer_released`). Two readers on one stream split messages.
 - **A buffer is the compositor's from `commit` until its `release`**; the WSI never hands it out before. A present waits for the copy's fence *before* `commit` (the compositor reads without waiting).
