@@ -62,7 +62,10 @@ attempt() { # attempt <label>
     if echo "cursor raw 0x209c 0xcf" > /dev/dispctl; then sum "gpu-cursor-ladder: assembly cursor control back to disabled"; else sum "gpu-cursor-ladder: could not disable it again: $(rawlog | cut -c1-300)"; fi
   fi
 }
-attempt "A baseline"
+# E (first): HEAD_SET_DISPLAY_ID(0): the GOP leaves 0, nouveau's round 2 has 0x10 (DCB output 4, the ASUS on DP) for head 0 and 0x80 for head 1 (where the cursor
+# enables). The bit mask of the output the head drives; the head 1 sequence has it (`hdmi::head_methods`), head 0 never got it from this driver.
+echo "cursor raw 0x2020 0x10" > /dev/dispctl && sum "gpu-cursor-ladder: head 0 display id 0x10 pushed: $(grep -a 'cursor: raw' /proc/gpu | tail -n 1 | cut -c1-260)" || sum "gpu-cursor-ladder: display id push FAILED: $(rawlog | cut -c1-300)"
+attempt "E display id"
 if [ $enabled = 0 ]; then
   # D: head 1 has an output LUT (identity, `hdmi::olut_methods`, in VRAM at 0x3e04000 since `gpu=hdmi` boot) and head 0, the GOP's, none while its usage bounds say
   # OLUT_ALLOWED: HEAD_SET_OLUT_CONTROL 0x40509, FP_NORM_SCALE 0xffffffff, CONTEXT_DMA_OLUT = the LUT handle, OFFSET_OLUT 0x3e040

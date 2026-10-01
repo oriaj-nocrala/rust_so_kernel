@@ -174,6 +174,12 @@ pub const fn core_dither(h: u32) -> u32 {
 pub const fn core_olut(h: u32) -> [u32; 4] {
     [0x2280 + h * 0x400, 0x2284 + h * 0x400, 0x2288 + h * 0x400, 0x228c + h * 0x400]
 }
+/// `HEAD_SET_DISPLAY_ID(h, 0)` (`clc67d.h:735`): the bit mask of the DCB output the head drives (`1 << dcb_index`). nouveau sets it for every lit head (`hdmi.rs`
+/// `head_methods`: `0x2020 + hd`; round 2 of the trace: head 0 = 0x10, head 1 = 0x80); the GOP leaves head 0's at 0, the one thing besides the usage bounds that
+/// `modeset-core-round1/2.txt` show nouveau changing on head 0 (Ryzen #212: the cursor enables on head 1, which has it, and not on head 0).
+pub const fn core_display_id(h: u32) -> u32 {
+    0x2020 + h * 0x400
+}
 pub const fn window_usage_format(h: u32) -> u32 {
     0x1004 + 2 * h * 0x80
 }
@@ -201,6 +207,7 @@ pub fn core_method_allowed(head: u32, method: u32) -> bool {
         core_olut(head)[0],
         core_olut(head)[1],
         core_olut(head)[3],
+        core_display_id(head),
         core_procamp(head),
         core_dither(head),
         window_usage_format(head),
@@ -374,14 +381,14 @@ mod tests {
 
     #[test]
     fn raw_pushes_are_limited_to_the_cursors_methods_of_that_head() {
-        for m in [0x2030, 0x2088, 0x208c, 0x2090, 0x2094, 0x2098, 0x209c, 0x20a0, 0x2288, 0x2280, 0x2284, 0x228c, 0x2000, 0x2018, 0x1004, 0x1008, 0x1010] {
+        for m in [0x2030, 0x2088, 0x208c, 0x2090, 0x2094, 0x2098, 0x209c, 0x20a0, 0x2288, 0x2280, 0x2284, 0x228c, 0x2020, 0x2000, 0x2018, 0x1004, 0x1008, 0x1010] {
             assert!(core_method_allowed(0, m), "{m:#x}");
         }
-        for m in [0x2430, 0x2488, 0x248c, 0x2490, 0x2494, 0x2498, 0x249c, 0x24a0, 0x2688, 0x2680, 0x2684, 0x268c, 0x2400, 0x2418, 0x1104, 0x1108, 0x1110] {
+        for m in [0x2430, 0x2488, 0x248c, 0x2490, 0x2494, 0x2498, 0x249c, 0x24a0, 0x2688, 0x2680, 0x2684, 0x268c, 0x2420, 0x2400, 0x2418, 0x1104, 0x1108, 0x1110] {
             assert!(core_method_allowed(1, m), "{m:#x}");
             assert!(!core_method_allowed(0, m), "{m:#x}");
         }
-        for m in [0x200, 0x21c, 0x2034, 0x2084, 0x2084, 0x20a4, 0x300, 0x2290, 0x2294, 0x2080, 0x209d, 0x2004, 0x201c, 0x1000, 0x1100, 0x100c, 0x1014] {
+        for m in [0x200, 0x21c, 0x2034, 0x2084, 0x2084, 0x20a4, 0x300, 0x2290, 0x2294, 0x2080, 0x209d, 0x2024, 0x2004, 0x201c, 0x1000, 0x1100, 0x100c, 0x1014] {
             assert!(!core_method_allowed(0, m), "{m:#x}");
         }
     }
