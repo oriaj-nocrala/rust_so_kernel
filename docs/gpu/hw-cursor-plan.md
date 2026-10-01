@@ -238,3 +238,22 @@ One frame, read from the traces (`+us` from the previous vblank; the frame start
 
 Candidate fixes, all about less work (none started; no clock pinning): (1) keep CPU windows' pixels in VRAM and upload only when their `version` moves (a staging copy); (2) damage tracking: render and blit only what changed (a pointer move or a cpumon update touches a few hundred KB), which with a hardware cursor makes pointer frames nearly free; (3) scan out the swapchain image without the blit; (4) pipelined or adaptive repaint to hide what is left.
 
+
+### 13b. The control (Ryzen #193, `gpu-comp-pacing.sh` phases C / S / L, run in that order)
+
+Passes (exit 0, no channel lost). Per frame, from the traces; the budget is `COMP_DELAY_MS` (2 ms) + render + blit ≤ ~9 ms (the `PRESENT` deadline of Ryzen #181):
+
+| load | P-state | render | blit | `PRESENT` arrives after the vblank | flips |
+|---|---|---|---|---|---|
+| **S** snake3d only (960x540, a VRAM window, no CPU window) | P8 | **2.3 ms** | 2.3 ms | 4.7-7.3 ms (buckets 4-8 ms) | **308 of 309 vblanks: 60 fps at P8** |
+| S | P5 | 1.3 ms | 1.5-1.8 ms | 4.7-5.7 ms | 309 of 309 |
+| **C** cpumon only (1280x920, CPU window) | P0 | 1.6 ms | 0.13 ms | 2.5 ms | (a frame every 0.5 s: cpumon's rate) |
+| C | P8 | **6.4 ms** | 2.9-3.9 ms | 5.6-17 ms | |
+| **L** both | P8 | **6.6 ms** | 2.3 ms | **11.2-11.3 ms** (bucket 10-12 ms, 142-154 of ~155 presents) | ~150 per 5 s: **30 fps** |
+
+- **The 30 fps lock is the CPU-drawn window, not the GPU's clock as such**: with the snake alone the same compositor, at the same P8, makes 60 fps (render 2.3 + blit 2.3 + 2 ms delay = 6.8 ms < 9). Adding cpumon moves the render from 2.3 to 6.6 ms (+4.3 ms) and the `PRESENT` to 11.3 ms: it lands past the deadline, the flip lands a vblank late, and the loop (which starts the next frame 2 ms after the flip) runs at one frame per two vblanks.
+- Why a CPU window costs that: `comp_cpu_source` (`probes/nvk/comp_render.h`) keeps its pixels in a **host-visible buffer** (system memory); the fragment shader reads them over PCIe on every frame in which the window is on screen, whether or not it changed (uploads are 34 in 454 frames). The cost scales with the P-state (P0 1.6 ms for cpumon alone, P8 6.4 ms). What the control does not separate is that cost from the cpumon rectangle simply being bigger (1280x920 vs 960x540 of shading): a VRAM copy of the window (fix 1 below) is the experiment that tells them apart, and it is the next change to make.
+- The blit is the same 2.3 ms at P8 in S and L (memory-clock bound, independent of the content): the second biggest item, and the one a direct scanout (fix 3) removes.
+- So the budget at the lowest P-state is 2 + 2.3 (render of a VRAM window) + 2.3 (blit) = 6.6 ms: it fits, with room for a few windows. **No clock pinning needed**; what is needed is that no window's pixels are read from system memory per frame.
+
+Order of the next changes (user to confirm; none started), cheapest and most decisive first: (a) CPU window sources into a VRAM image, uploaded (one staging copy on the transfer path) only when `version` moves; expected P8 render for L ~2.5-3 ms and 60 fps; (b) `COMP_DELAY_MS=0`/1 as a one-line experiment (frees 1-2 ms of the budget); (c) damage tracking and direct scanout (halve the memory traffic); (d) the hardware cursor (phases 1-4 above) for pointer-only frames.
