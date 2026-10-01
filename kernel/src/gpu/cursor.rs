@@ -136,6 +136,13 @@ pub fn update() -> Result<(), CursorError> {
     nc::update(regs, head).map_err(|_| CursorError::Failed)
 }
 
+/// `cursor ilock off`: the cursor channel's interlock flags back to 0 (they persist in its state, like the core's).
+pub fn interlock_off() -> Result<(), CursorError> {
+    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
+    nc::clear_interlock(regs, head);
+    Ok(())
+}
+
 /// `cursor image [size]`: the test arrow into VRAM (through PRAMIN: written once, read back).
 pub fn write_image(size: u32) -> Result<(), CursorError> {
     let regs = supervisor::regs().ok_or(CursorError::NotReady)?;
@@ -177,7 +184,7 @@ pub fn raw(method: u32, value: u32, interlock: bool) -> Result<(), CursorError> 
     // then `nv50_disp_atomic_commit_core`): the core's interlocked UPDATE then finds it waiting. Sent after the push (Ryzen #207) the core stood in
     // WAIT_FOR_UPD for ever: the channel's UPDATE had been taken as an independent one.
     if interlock {
-        let _ = nc::update(regs, head);
+        let _ = nc::update_interlocked(regs, head, 100, 100);
     }
     let pushed = supervisor::push_core("cursor raw", &methods, false);
     let idle = pushed.is_ok() && {

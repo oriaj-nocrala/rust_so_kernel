@@ -138,6 +138,28 @@ pub fn update(m: &dyn Mmio, head: u32) -> Result<(), CursorError> {
     Ok(())
 }
 
+/// The cursor channel's own `SET_INTERLOCK_FLAGS` (`clc67a.h:80-97`): bit 16 = `INTERLOCK_WITH_CORE`. A window's first update is interlocked from BOTH sides (its
+/// `SET_INTERLOCK_FLAGS = 1`, the core's window bit: the HDMI window, Ryzen #89); nouveau's cursor path only flags the core's side, and then the core stood
+/// in WAIT_FOR_UPD for ever (Ryzen #207/#208).
+pub const USER_INTERLOCK_FLAGS: u32 = 0x204;
+pub const INTERLOCK_WITH_CORE: u32 = 1 << 16;
+
+/// The cursor channel's side of an interlocked core update: its flags (with the core), the position, UPDATE. `clear` = flags back to 0 afterwards.
+pub fn update_interlocked(m: &dyn Mmio, head: u32, x: i32, y: i32) -> Result<(), CursorError> {
+    let base = chan(head).user_base();
+    if !evo::wait(m, || m.rd32(base + USER_FREE) & 0x3f >= 3) {
+        return Err(CursorError::NoRoom(m.rd32(base + USER_FREE)));
+    }
+    m.wr32(base + USER_INTERLOCK_FLAGS, INTERLOCK_WITH_CORE);
+    m.wr32(base + USER_POINT, point(x, y));
+    m.wr32(base + USER_UPDATE, UPDATE_RELEASE_ELV);
+    Ok(())
+}
+
+pub fn clear_interlock(m: &dyn Mmio, head: u32) {
+    m.wr32(chan(head).user_base() + USER_INTERLOCK_FLAGS, 0);
+}
+
 /// The only core methods `/dev/dispctl cursor raw` may push for `head`: the five the cursor uses and the OLUT context DMA control (a debugging ladder, one
 /// method per push).
 pub fn core_method_allowed(head: u32, method: u32) -> bool {
@@ -404,6 +426,19 @@ mod tests {
         let full = Sim { free: 0, ..Sim::new(true) };
         assert_eq!(update(&full, 0), Err(CursorError::NoRoom(0)));
         assert!(full.writes.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_cursor_side_of_an_interlocked_update() {
+        let m = Sim::new(true);
+        update_interlocked(&m, 0, 7, 9).unwrap();
+        assert_eq!(*m.writes.borrow(), alloc::vec![(0x6d8204, 0x10000), (0x6d8208, point(7, 9)), (0x6d8200, 1)]);
+        let tight = Sim { free: 2, ..Sim::new(true) };
+        assert_eq!(update_interlocked(&tight, 0, 0, 0), Err(CursorError::NoRoom(2)));
+        assert!(tight.writes.borrow().is_empty());
+        let c = Sim::new(true);
+        clear_interlock(&c, 1);
+        assert_eq!(*c.writes.borrow(), alloc::vec![(0x6d9204, 0)]);
     }
 
     #[test]

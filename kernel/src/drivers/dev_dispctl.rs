@@ -92,6 +92,7 @@ impl FileHandle for DispctlDevice {
                 Some("off") => cur::off(),
                 Some("recover") => cur::recover(),
                 Some("update") => cur::update(),
+                Some("ilock") => cur::interlock_off(),
                 Some("intr") => match it.next() {
                     Some("on") => cur::intr(true),
                     Some("off") => cur::intr(false),

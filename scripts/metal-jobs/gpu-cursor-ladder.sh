@@ -51,17 +51,21 @@ step 55 present-control-mono 0x2098 0
 [ $stopped = 1 ] && return
 # Ryzen #206: still INVALID_STATE code 0x43 with both slots and the present control. nouveau's core UPDATE carries SET_INTERLOCK_FLAGS (0x218) = the head's
 # cursor bit whenever a cursor changes and the cursor channel then gets its own UPDATE; a window's first update without its interlock raised the same
-# exception (#89). `il` pushes the flag with the method and sends the cursor channel's UPDATE right after the push.
+# exception (#89). `il` pushes the flag with the method; before it the cursor channel's side is written (its own SET_INTERLOCK_FLAGS with the core, a position and
+# UPDATE: a window's first update is interlocked from both sides, #89). #207: UPDATE after the push, #208: before it without the flags: the core waited for ever.
 enabled=0
 if echo "cursor raw 0x209c 0x800000cf il" > /dev/dispctl; then enabled=1; sum "gpu-cursor-ladder: 6c enable interlocked with the cursor channel: idle again, ENABLED"
 else
   sum "gpu-cursor-ladder: 6c enable interlocked with the cursor channel: failed"; sum "gpu-cursor-ladder: 6c: $(rawlog)"; sum "gpu-cursor-ladder: 6c: $(st2)"
+  # does a plain cursor UPDATE free a core that waits in WAIT_FOR_UPD?
+  echo "cursor update" > /dev/dispctl; sleep 1; sum "gpu-cursor-ladder: 6c after a plain cursor UPDATE: $(st2)"
   echo "cursor recover" > /dev/dispctl; sum "gpu-cursor-ladder: recovered: $(grep -a 'cursor: recover' /proc/gpu | tail -n 1 | cut -c1-300)"
   fail=1
 fi
 if [ $enabled = 1 ]; then
   # the flag persists in the core's ASSEMBLY state: reset it
   echo "cursor raw 0x218 0" > /dev/dispctl && sum "gpu-cursor-ladder: interlock flags reset" || { sum "gpu-cursor-ladder: interlock reset FAILED"; fail=1; }
+  echo "cursor ilock off" > /dev/dispctl
 else
   stopped=1
 fi
