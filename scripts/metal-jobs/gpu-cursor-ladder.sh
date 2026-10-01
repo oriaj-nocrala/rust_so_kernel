@@ -20,6 +20,9 @@ if [ -e /dev/dispctl ] && grep -q '^dispctl' /dev/dispctl 2>/dev/null; then :; e
   sum "gpu-cursor-ladder: /dev/dispctl does not open (needs gpu=super or higher)"; echo "---- summary (the log wraps) ----"; cat $sumfile; exit 0
 fi
 echo 'cursor image 32' > /dev/dispctl && sum "gpu-cursor-ladder: image written" || { sum "gpu-cursor-ladder: image FAILED"; fail=1; }
+# nouveau enables the cursor channel's interrupt (0x611dac bit 16) before it allocates the channel (the oracle: W 0x611dac 0x10001, W 0x610604 1); the
+# core's cursor context DMA lookup hung in #198/#199 without it
+echo 'cursor intr on' > /dev/dispctl && sum "gpu-cursor-ladder: channel interrupt enabled" || { sum "gpu-cursor-ladder: intr FAILED"; fail=1; }
 echo 'cursor probe' > /dev/dispctl && sum "gpu-cursor-ladder: channel allocated: $(st)" || { sum "gpu-cursor-ladder: probe FAILED"; fail=1; }
 stopped=0
 step() { # step <n> <label> <method> <value>
@@ -35,7 +38,7 @@ step 2 offset 0x2090 0x50000
 step 3 control-disabled 0x209c 0xcf
 step 4 usage-bounds 0x2030 0x1114
 # 5: the core's own LUT context DMA (flags 0x45, resolves on the core: it is what the HDMI head's OLUT uses)
-step 5 context-dma-lut 0x2088 0xf0000001
+step 5 context-dma-own-paged 0x2088 0xfb000101
 step 6 control-enable 0x209c 0x800000cf
 if [ $stopped = 0 ]; then
   echo "cursor move 100 100" > /dev/dispctl
@@ -51,8 +54,8 @@ if [ $stopped = 0 ]; then
   step 8 context-dma-off 0x2088 0
   step 9 usage-bounds-back 0x2030 0x1110
   # knowledge for the next round, last because a wedge ends the run: the cursor's own context DMAs (flags 0x45 first, then Ryzen #198's flags 0x05)
-  step 10 context-dma-own-paged 0x2088 0xfb000101
-  step 11 context-dma-own-paged-off 0x2088 0
+  step 10 context-dma-lut 0x2088 0xf0000001
+  step 11 context-dma-off 0x2088 0
   step 12 context-dma-own-plain 0x2088 0xfb000100
 fi
 sum "gpu-cursor-ladder: end: $(st)"

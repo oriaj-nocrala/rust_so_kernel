@@ -90,6 +90,11 @@ impl FileHandle for DispctlDevice {
                     cur::move_to(x, y)
                 }
                 Some("off") => cur::off(),
+                Some("intr") => match it.next() {
+                    Some("on") => cur::intr(true),
+                    Some("off") => cur::intr(false),
+                    _ => return Err(FileError::InvalidArgument),
+                },
                 Some("image") => cur::write_image(it.next().map_or(Ok(32), |v| v.parse()).map_err(|_| FileError::InvalidArgument)?),
                 Some("raw") => {
                     let num = |s: Option<&str>| -> Result<u32, FileError> {

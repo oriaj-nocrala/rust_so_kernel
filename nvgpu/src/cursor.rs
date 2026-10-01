@@ -139,6 +139,14 @@ pub fn init(m: &dyn Mmio, head: u32) -> Result<(), CursorError> {
     Ok(())
 }
 
+/// `gv100_disp_curs_intr` (`gv100.c:568-575`): the channel's interrupt enable is bit `16 + head` of `0x611dac`. nouveau sets it BEFORE it allocates the
+/// channel (Ryzen oracle: `W 0x611dac 0x10001`, then `W 0x610604 1`); this driver left it off until the core's cursor context DMA lookup hung (Ryzen #198/#199).
+pub const INTR_ENABLE: u32 = 0x61_1dac;
+pub fn intr(m: &dyn Mmio, head: u32, enable: bool) {
+    let bit = 0x0001_0000 << head;
+    m.mask(INTR_ENABLE, bit, if enable { bit } else { 0 });
+}
+
 /// `gv100_disp_curs_fini` (`gv100.c:577-585`): ask to disable, wait for idle, clear the allocation bit.
 pub fn fini(m: &dyn Mmio, head: u32) -> Result<(), CursorError> {
     let c = chan(head);
@@ -309,6 +317,18 @@ mod tests {
     }
 
     #[test]
+    fn the_interrupt_enable_is_bit_16_plus_the_head() {
+        let m = Sim::new(true);
+        m.regs.borrow_mut().insert(0x611dac, 0x1);
+        intr(&m, 0, true);
+        assert_eq!(*m.writes.borrow(), alloc::vec![(0x611dac, 0x10001)]);
+        intr(&m, 1, true);
+        assert_eq!(m.regs.borrow()[&0x611dac], 0x30001);
+        intr(&m, 0, false);
+        assert_eq!(m.regs.borrow()[&0x611dac], 0x20001); // only head 0's bit, the core's stays
+    }
+
+    #[test]
     fn move_writes_the_point_then_the_update() {
         let m = Sim::new(true);
         move_to(&m, 0, 640, -3).unwrap();
@@ -330,6 +350,7 @@ mod tests {
                 (1, HANDLE_WNDW_CTX, vram_ctxdma(8 << 30)),
                 (0, HANDLE_CURSOR_CTX, vram_ctxdma(8 << 30)),
                 (0, HANDLE_CURSOR_CTX_PAGED, vram_ctxdma(8 << 30)),
+                (CHID_BASE, HANDLE_CURSOR_CTX_PAGED, vram_ctxdma(8 << 30)),
             ],
         };
         assert!(table.words().is_ok());

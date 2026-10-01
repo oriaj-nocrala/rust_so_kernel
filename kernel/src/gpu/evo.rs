@@ -171,7 +171,9 @@ pub fn bring_up(r: &mut String, regs: &Bar0, bdf: (u8, u8, u8), hdmi: bool) -> O
     // does before its first channel.
     // window 0's surface context DMA, and the core's own for the hardware cursor's image (`nvgpu::cursor`, HEAD_SET_CONTEXT_DMA_CURSOR is a core method)
     let mut objects = alloc::vec![(w0.user, evo::HANDLE_WNDW_CTX, evo::vram_ctxdma(vram)), (evo::CORE.user, nvgpu::cursor::HANDLE_CURSOR_CTX, evo::vram_ctxdma(vram)),
-        (evo::CORE.user, nvgpu::cursor::HANDLE_CURSOR_CTX_PAGED, evo::CtxDma { flags0: evo::CTXDMA_PAGE | evo::CTXDMA_RW | evo::CTXDMA_VRAM, start: 0, limit: vram - 1 })];
+        (evo::CORE.user, nvgpu::cursor::HANDLE_CURSOR_CTX_PAGED, evo::CtxDma { flags0: evo::CTXDMA_PAGE | evo::CTXDMA_RW | evo::CTXDMA_VRAM, start: 0, limit: vram - 1 }),
+        // the same under the cursor channel's own id, in case the lookup is made on its behalf (Ryzen #198/#199: it hung for chid 0)
+        (nvgpu::cursor::CHID_BASE, nvgpu::cursor::HANDLE_CURSOR_CTX_PAGED, evo::CtxDma { flags0: evo::CTXDMA_PAGE | evo::CTXDMA_RW | evo::CTXDMA_VRAM, start: 0, limit: vram - 1 })];
     if hdmi {
         objects.extend(nvgpu::hdmi::ramht_objects(vram));
     }

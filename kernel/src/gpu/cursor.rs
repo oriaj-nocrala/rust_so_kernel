@@ -91,6 +91,14 @@ pub fn probe() -> Result<(), CursorError> {
     }
 }
 
+/// `cursor intr on|off`: the channel's interrupt enable (see `nvgpu::cursor::intr`).
+pub fn intr(on: bool) -> Result<(), CursorError> {
+    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
+    nc::intr(regs, head, on);
+    log(alloc::format!("cursor: head {} channel interrupt {}: {:#x} = {:#x}", head, if on { "enabled" } else { "disabled" }, nc::INTR_ENABLE, regs.rd32(nc::INTR_ENABLE)));
+    Ok(())
+}
+
 /// `cursor image [size]`: the test arrow into VRAM (through PRAMIN: written once, read back).
 pub fn write_image(size: u32) -> Result<(), CursorError> {
     let regs = supervisor::regs().ok_or(CursorError::NotReady)?;
