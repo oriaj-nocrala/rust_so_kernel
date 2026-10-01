@@ -2,7 +2,7 @@
 # are GPU buffers it imports where they are and draws with a graphics pipeline, presented through the WSI's direct path.
 #   touch build.rs; echo 5 > target/metal/budget
 #   scripts/metal-run.sh --kconf 'gpu=uapi' scripts/metal-jobs/gpu-comp.sh
-# vk_comp runs four times (COMP_DELAY_MS 3, 5, 7, 9), with no input devices (COMP_NO_INPUT: nobody is typing), starting two vk_window (300 frames each,
+# vk_comp runs four times (COMP_DELAY_MS 9, 3, 5, 7), with no input devices (COMP_NO_INPUT: nobody is typing), starting two vk_window (300 frames each,
 # a resize halfway: two swapchains of three buffers each) and leaving when both are done. The result is the compositor's frame rate per delay (both
 # clients are in every frame, so a composition per vblank is 60 fps; 30 means every other vblank is missed: Ryzen #179 at 9 ms).
 # Passes if every run is clean (vk_comp and both clients exit 0, 12 buffers imported and dropped, no COMP FAIL / VK FAIL), the best delay reaches 50 fps,
@@ -20,10 +20,10 @@ sum "gpu-comp: before: $(grep '^gpu_uapi:' /proc/kdebug)"
 
 # one run per COMP_DELAY_MS (how long after a frame is on the screen the next is composed): 300 frames per client, vk_comp leaves when both are done
 best=0; best_d=0; runs=0
-for d in 3 5 7 9; do
+for d in 9 3 5 7; do
   VK_WINDOW_FRAMES=300 COMP_NO_INPUT=1 COMP_EXIT_WHEN_IDLE=1 COMP_SECONDS=40 COMP_DELAY_MS=$d NVK_CONSTANOS_DEBUG=1 /mnt/bin/vk_comp /mnt/bin/vk_window /mnt/bin/vk_window > /tmp/comp.out 2>&1
   rc=$?
-  grep -E 'COMP (screen|quit|FAIL)|VK WINDOW|VK FAIL|COMP ASSERT|VK window: [0-9]+ frames' /tmp/comp.out | while read -r l; do sum "gpu-comp: delay=$d: $l"; done
+  grep -E '^COMP|VK WINDOW|VK FAIL|VK window:' /tmp/comp.out | grep -v 'COMP [0-9]* frames,' | head -n 24 | while read -r l; do sum "gpu-comp: delay=$d: $l"; done
   [ $rc = 0 ] || { sum "gpu-comp: delay=$d: vk_comp exit=$rc"; fail=1; tail -n 20 /tmp/comp.out >> /tmp/gpu-comp.sum; }
   grep -q '^COMP DONE' /tmp/comp.out || { sum "gpu-comp: delay=$d: vk_comp did not reach COMP DONE"; fail=1; }
   [ "$(grep -c 'VK WINDOW DONE' /tmp/comp.out)" = 2 ] || { sum "gpu-comp: delay=$d: not both clients finished"; fail=1; }
