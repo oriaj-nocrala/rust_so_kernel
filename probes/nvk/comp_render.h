@@ -55,7 +55,11 @@ struct comp_src {
    VkBuffer stage_buf;         /* CPU, `staged`: the host-visible buffer `map` is of; `buf` is then device-local */
    VkDeviceMemory stage_mem;
    int staged;
-   size_t copy_bytes;          /* CPU, `staged`: bytes written to the staging buffer that the next frame has to copy */
+   uint32_t *shadow;           /* CPU, `staged`: what the staging buffer and VRAM hold (the last version), to find the rows a new version changed */
+   uint64_t shadow_npx;
+#define COMP_MAX_REGIONS 16
+   VkBufferCopy regions[COMP_MAX_REGIONS];   /* CPU, `staged`: the byte ranges written to the staging buffer that the next frame has to copy */
+   uint32_t nregions;
 #ifdef COMP_HOST
    const uint32_t *shared;     /* host harness GPU: the client's memory (a mapped memfd), copied into `map` every frame */
    size_t shared_bytes;
@@ -85,6 +89,7 @@ struct comp {
    struct comp_src cpu[COMP_MAX_CPU];
    struct comp_src dummy;      /* what solid fills bind (never read) */
    uint32_t frames, draws, draws_max, imports, drops, uploads;
+   uint64_t upload_bytes;      /* bytes the frames copied into VRAM (staged sources) or wrote in place (host sources) */
    int cpu_in_host;            /* COMP_CPU_HOST=1: CPU sources stay in one host-visible buffer */
 };
 
@@ -142,6 +147,7 @@ static void comp_free_src(struct comp *c, struct comp_src *s) {
    if (s->mem) c->vkFreeMemory(c->device, s->mem, NULL);
    if (s->stage_buf) c->vkDestroyBuffer(c->device, s->stage_buf, NULL);
    if (s->stage_mem) c->vkFreeMemory(c->device, s->stage_mem, NULL);
+   free(s->shadow);
 #ifdef COMP_HOST
    if (s->shared) munmap((void *)s->shared, s->shared_bytes);
 #endif
@@ -270,6 +276,53 @@ static void comp_drop(struct comp *c, uint64_t handle) {
    c->drops++;
 }
 
+/* A new version of a CPU source: writes it into `map` and, for a staged one, plans the copy into VRAM of only the rows that differ from the last version
+ * (damage found by comparing: it holds whatever the client said it damaged, and catches a client that damages everything while changing a little).
+ * Rows that changed less than COMP_GAP_ROWS apart go in one range; past COMP_MAX_REGIONS ranges the last one grows. A first version, a size change or a
+ * second version in the same frame copy everything. */
+#define COMP_GAP_ROWS 4
+static void comp_plan_upload(struct comp *c, struct comp_src *s, const uint32_t *px, uint64_t npx, uint32_t w) {
+   size_t bytes = (size_t)npx * 4;
+   if (!s->staged) { memcpy(s->map, px, bytes); c->upload_bytes += bytes; return; }
+   if (!s->shadow || s->shadow_npx != npx || s->stride_px != w || w == 0 || s->nregions) {
+      if (!s->shadow || s->shadow_npx != npx) { free(s->shadow); s->shadow = malloc(bytes); s->shadow_npx = npx; }
+      if (!s->shadow) { s->shadow_npx = 0; memcpy(s->map, px, bytes); s->regions[0] = (VkBufferCopy){ 0, 0, bytes }; s->nregions = 1; c->upload_bytes += bytes; return; }
+      memcpy(s->shadow, px, bytes);
+      memcpy(s->map, px, bytes);
+      s->regions[0] = (VkBufferCopy){ 0, 0, bytes };
+      s->nregions = 1;
+      c->upload_bytes += bytes;
+      return;
+   }
+   uint64_t rows = (npx + w - 1) / w;
+   int64_t r0 = -1, r1 = -1;   /* the range being built, in rows: [r0, r1] */
+   for (uint64_t r = 0; r <= rows; r++) {
+      int changed = 0;
+      if (r < rows) {
+         uint64_t off = r * w, len = npx - off < w ? npx - off : w;
+         changed = memcmp(s->shadow + off, px + off, (size_t)len * 4) != 0;
+      }
+      if (changed && r0 < 0) { r0 = (int64_t)r; r1 = (int64_t)r; }
+      else if (changed) r1 = (int64_t)r;
+      /* a range closes when a gap of unchanged rows is long enough, or at the end */
+      if (r0 >= 0 && (r == rows || (!changed && (int64_t)r - r1 > COMP_GAP_ROWS))) {
+         uint64_t b0 = (uint64_t)r0 * w, b1 = ((uint64_t)r1 + 1) * w;
+         if (b1 > npx) b1 = npx;
+         if (s->nregions == COMP_MAX_REGIONS) {   /* out of ranges: the last one grows to cover this one */
+            VkBufferCopy *l = &s->regions[COMP_MAX_REGIONS - 1];
+            l->size = b1 * 4 - l->srcOffset;
+            b0 = l->srcOffset / 4;
+         } else {
+            s->regions[s->nregions++] = (VkBufferCopy){ b0 * 4, b0 * 4, (b1 - b0) * 4 };
+         }
+         memcpy(s->shadow + b0, px + b0, (size_t)(b1 - b0) * 4);
+         memcpy(s->map + b0, px + b0, (size_t)(b1 - b0) * 4);
+         c->upload_bytes += (b1 - b0) * 4;
+         r0 = -1;
+      }
+   }
+}
+
 /* The buffer behind a CPU source (a window's pixels, a title, the cursor): made on first use, grown if the source did, uploaded when `version` moves. */
 static struct comp_src *comp_cpu_source(struct comp *c, const struct cr_op *op) {
    uint64_t npx = op->npx;
@@ -297,8 +350,7 @@ static struct comp_src *comp_cpu_source(struct comp *c, const struct cr_op *op) 
       s->version = ~0ull;
    }
    if (s->version != op->version || s->stride_px != (uint32_t)op->src_w) {
-      memcpy(s->map, op->px, npx * 4);
-      if (s->staged) s->copy_bytes = npx * 4;
+      comp_plan_upload(c, s, op->px, npx, (uint32_t)op->src_w);
       s->version = op->version;
       s->stride_px = (uint32_t)op->src_w;
       c->uploads++;
@@ -344,10 +396,9 @@ static int comp_frame(struct comp *c, const struct cr_op *ops, size_t n, uint64_
    for (size_t i = 0; i < n; i++) {
       if (ops[i].kind != CR_CPU || !ops[i].px) continue;
       struct comp_src *s = comp_cpu_source(c, &ops[i]);
-      if (s && s->staged && s->copy_bytes) {
-         VkBufferCopy bc = { 0, 0, s->copy_bytes };
-         c->vkCmdCopyBuffer(c->cb, s->stage_buf, s->buf, 1, &bc);
-         s->copy_bytes = 0;
+      if (s && s->staged && s->nregions) {
+         c->vkCmdCopyBuffer(c->cb, s->stage_buf, s->buf, s->nregions, s->regions);
+         s->nregions = 0;
          copied = 1;
       }
    }

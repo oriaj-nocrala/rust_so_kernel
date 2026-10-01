@@ -43,6 +43,7 @@ pub struct CrStats {
     pub acquire_us: u32,
     pub render_us: u32,
     pub present_us: u32,
+    pub upload_kb: u32,
 }
 
 extern "C" {

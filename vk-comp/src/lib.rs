@@ -622,12 +622,13 @@ fn run(args: &[String]) -> i32 {
     let mut st = CrStats::default();
     unsafe { cr_get_stats(&mut st) };
     println!(
-        "COMP quit after {} frames (up to {} draws), {} imports, {} drops, {} uploads, {} clients seen, {} ms; with clients: {} frames in {} ms",
+        "COMP quit after {} frames (up to {} draws), {} imports, {} drops, {} uploads ({} KiB), {} clients seen, {} ms; with clients: {} frames in {} ms",
         frames,
         st.draws_max,
         st.imports,
         st.drops,
         st.uploads,
+        st.upload_kb,
         clients.seen,
         t_start.elapsed().as_millis(),
         with_clients.map_or(0, |w| w.2.saturating_sub(1)),

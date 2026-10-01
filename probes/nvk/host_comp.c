@@ -355,6 +355,21 @@ int main(int argc, char **argv) {
    failures += frame(&v, &comp, dir, "5-unchanged") != 0;
    CHECK(comp.uploads == up2, "nothing is uploaded when nothing changed");
 
+   /* ---- a few rows of the pool window change: only those rows are copied into VRAM, and the picture is still exact (the reference compares every pixel) */
+   {
+      for (int x = 0; x < 160; x++) { b.px[20 * 160 + x] ^= 0x00ff00ffu; b.px[60 * 160 + x] ^= 0x0000ffffu; b.px[61 * 160 + x] ^= 0x00ffff00u; }
+      memset(&o, 0, sizeof(o));
+      guiw_attach(&o, 4, 3);
+      guiw_damage(&o, 4, 0, 0, 160, 90);   /* the client says everything: the renderer finds the three rows */
+      guiw_commit(&o, 4);
+      send_out(b.id, &o);
+      gui_set_time(g, 230);
+      uint64_t before = comp.upload_bytes;
+      failures += frame(&v, &comp, dir, "5b-three-rows") != 0;
+      CHECK(comp.upload_bytes - before == (comp.cpu_in_host ? 160u * 90 * 4 : 3u * 160 * 4),
+            "only the three changed rows were copied (%llu bytes)", (unsigned long long)(comp.upload_bytes - before));
+   }
+
    /* ---- the pool window grows (a bigger buffer than the one its upload buffer was made for), and the pointer sits on the right/bottom edges */
    {
       int bw = 220, bh = 130;

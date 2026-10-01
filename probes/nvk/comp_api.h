@@ -32,6 +32,7 @@ struct cr_stats {
    /* the last cr_frame's phases, microseconds: acquire the image, record and submit the draw, present (the WSI's copy to the scanout buffer,
     * its CPU wait for that copy and the PRESENT ioctl) */
    uint32_t acquire_us, render_us, present_us;
+   uint32_t upload_kb;      /* KiB of CPU windows' pixels the frames copied (only the rows that changed) */
 };
 
 /* The renderer's entry points (comp_vk.c), what the compositor program in Rust calls. All on one thread. */

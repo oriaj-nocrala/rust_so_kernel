@@ -208,6 +208,7 @@ void cr_get_stats(struct cr_stats *out) {
    out->acquire_us = R.acquire_us;
    out->render_us = R.render_us;
    out->present_us = R.present_us;
+   out->upload_kb = (uint32_t)(R.comp.upload_bytes >> 10);
 }
 
 void cr_shutdown(void) {
