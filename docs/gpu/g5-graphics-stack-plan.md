@@ -57,7 +57,7 @@ Decisión (2026-09-30, usuario + análisis): **WSI estándar de Vulkan como cimi
 
 **Incógnitas a resolver al llegar:** sacar el protocolo del WM Rust a C (`staticlib` + cabecera C) sin arrastrar `std`; cuántos descriptores de buffer por cliente caben en la tabla de fds; qué hace NVK con un SSBO de 8 MiB importado y leído de otro proceso en el mismo fotograma (el almacenamiento tiene holders: ver el skill `gpu-g5`).
 
-**Estado actual y problema abierto (2026-09-30): `docs/gpu/g5-layer4-handoff.md`** (qué hay, cómo se prueba, mediciones de la Ryzen #175-#180, el problema del ritmo de fotogramas y qué datos faltan).
+**Estado actual: `docs/gpu/g5-layer4-handoff.md`** (qué hay, cómo se prueba, mediciones de la Ryzen #175-#182). El problema del ritmo quedó resuelto en la Ryzen #182: **60,0 fps con dos clientes** (los `frame` callbacks se responden al componer, `COMP_DELAY_MS` = 2) y los programas se lanzan en un hilo (un `exec` de 15 MB ya no deja a los clientes sin respuesta).
 
 ## Siguiente paso
 

@@ -7,10 +7,14 @@
 //!   COMP_HEADLESS=1          no display (QEMU's software device): render 640x360 without a screen
 //!   COMP_NO_INPUT=1          do not open (or grab) the input devices
 //!   COMP_SECONDS=<n>         quit after n seconds (unattended runs); SIGTERM quits too
-//!   COMP_EXIT_WHEN_IDLE=1    quit when every client that connected has gone (the quit line then says how long it all took)
+//!   COMP_EXIT_WHEN_IDLE=1    quit when every client that connected has gone and every program it started has exited (the quit line then
+//!                            says how long it all took)
+//!
+//! Every 5 s (and at the end) a `COMP pace` line says where each composition's time went and how far apart its flips landed.
 //!   COMP_SOCKET=<path>       the socket (default /tmp/gui-0)
-//!   COMP_DELAY_MS=<n>        how long after a frame is on the screen the next one is composed (default 9: at 60 Hz it leaves ~7 ms to render and
-//!                            present before the next vblank, and the rest of the interval to collect every client's commit into one composition)
+//!   COMP_DELAY_MS=<n>        how long after a frame is on the screen the next one is composed (default 2). Its PRESENT must go out within
+//!                            ~9-11 ms of the previous flip being seen or it lands a vblank late (Ryzen #181); the clients draw after the
+//!                            previous composition's present, so their commits are already in by then
 //!
 //! Exported as C's `main`: build.py links this static library with NVK and the renderer.
 
@@ -25,7 +29,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use gui::compositor::{scale_for, ClientId, Compositor, DrawOp, GpuOp, CURSOR, CURSOR_H, CURSOR_W};
@@ -163,6 +168,107 @@ fn start_program(cmd: &str, socket: &str) -> Option<u32> {
     c.spawn().ok().map(|ch| ch.id())
 }
 
+/// Programs not started yet, and the ones started and not reaped (their pids).
+static LAUNCHING: AtomicUsize = AtomicUsize::new(0);
+static CHILDREN: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+/// Starts `cmds` on a thread of their own. `spawn` returns only once the child's exec has loaded the program, which takes seconds for a 15 MB
+/// static binary the block cache no longer holds; the compositor must keep answering the clients already running meanwhile (one waits 5 s for
+/// its first `configure` and then gives up: every client of three runs of Ryzen #180 left before the first frame).
+fn launch(cmds: Vec<String>, socket: String) {
+    LAUNCHING.store(cmds.len(), Ordering::SeqCst);
+    std::thread::spawn(move || {
+        for cmd in cmds {
+            let t = Instant::now();
+            match start_program(&cmd, &socket) {
+                Some(pid) => {
+                    CHILDREN.lock().unwrap().push(pid as i32);
+                    println!("COMP started {} (pid {}, {} ms)", cmd, pid, t.elapsed().as_millis());
+                }
+                None => println!("COMP cannot start {}", cmd),
+            }
+            LAUNCHING.fetch_sub(1, Ordering::SeqCst); // after the push: "nothing launching and no children" is never seen in between
+        }
+    });
+}
+
+/// Reaps the programs we started that have exited (by pid: a `waitpid(-1)` could take a child whose exec failed from under `spawn`, which
+/// waits for it itself). Whether any is still to start or running.
+fn reap_children() -> bool {
+    let mut children = CHILDREN.lock().unwrap();
+    children.retain(|&pid| {
+        let mut status = 0;
+        let r = unsafe { waitpid(pid, &mut status, WNOHANG) };
+        if r == pid {
+            if status & 0x7f == 0 {
+                println!("COMP program pid {} exited ({})", pid, (status >> 8) & 0xff);
+            } else {
+                println!("COMP program pid {} killed by signal {}", pid, status & 0x7f);
+            }
+        }
+        r == 0
+    });
+    !children.is_empty() || LAUNCHING.load(Ordering::SeqCst) > 0
+}
+
+/// Where the time of each composition goes, and how far apart its flips land, per 5 s window: the display is 60 Hz, so a flip every ~16.7 ms
+/// is a composition per vblank and ~33 ms means one vblank missed.
+#[derive(Default)]
+struct Pace {
+    n: u64,
+    sum: [u64; PACE_PHASES],
+    max: [u64; PACE_PHASES],
+    /// Flip-to-flip intervals: under 20 ms, 20-37 ms, over 37 ms.
+    gaps: [u64; 3],
+    /// When the PRESENT went out, from the previous flip landing: the latest that still made the next vblank and the earliest that missed it
+    /// (the real deadline is between them).
+    hit_max: u64,
+    miss_min: u64,
+}
+
+const PACE_PHASES: usize = 8;
+const PACE_NAMES: [&str; PACE_PHASES] = ["late", "wait", "build", "acquire", "render", "present", "flip", "interval"];
+
+impl Pace {
+    /// `us`: microseconds of each phase (`PACE_NAMES`): "late" is from the previous flip landing to this composition starting, "interval" from
+    /// that flip landing to this one's (0 for the first frame).
+    fn add(&mut self, us: [u64; PACE_PHASES]) {
+        self.n += 1;
+        for i in 0..PACE_PHASES {
+            self.sum[i] += us[i];
+            self.max[i] = self.max[i].max(us[i]);
+        }
+        let iv = us[PACE_PHASES - 1];
+        if iv > 0 {
+            self.gaps[if iv < 20_000 { 0 } else if iv <= 37_000 { 1 } else { 2 }] += 1;
+            let sent = us[..6].iter().sum::<u64>(); // late + wait + build + acquire + render + present
+            if iv < 20_000 {
+                self.hit_max = self.hit_max.max(sent);
+            } else if iv <= 37_000 && (self.miss_min == 0 || sent < self.miss_min) {
+                self.miss_min = sent;
+            }
+        }
+    }
+
+    fn line(&self) -> String {
+        let ms = |v: u64| format!("{}.{}", v / 1000, v % 1000 / 100);
+        let mut s = format!(
+            "{} frames, flips <20ms {} 20-37ms {} >37ms {}; PRESENT after the flip: latest on time {} earliest late {}; avg/max ms:",
+            self.n,
+            self.gaps[0],
+            self.gaps[1],
+            self.gaps[2],
+            ms(self.hit_max),
+            if self.miss_min == 0 { "-".into() } else { ms(self.miss_min) }
+        );
+        for i in 0..PACE_PHASES {
+            let avg = self.sum[i] / self.n.max(1);
+            s += &format!(" {} {}.{}/{}.{}", PACE_NAMES[i], avg / 1000, avg % 1000 / 100, self.max[i] / 1000, self.max[i] % 1000 / 100);
+        }
+        s
+    }
+}
+
 fn cursor_pixels() -> Vec<u32> {
     let mut px = vec![0u32; (CURSOR_W * CURSOR_H) as usize];
     for (y, row) in CURSOR.iter().enumerate() {
@@ -190,7 +296,7 @@ fn run(args: &[String]) -> i32 {
     let seconds: u64 = env("COMP_SECONDS").and_then(|s| s.parse().ok()).unwrap_or(0);
     let socket = env("COMP_SOCKET").unwrap_or_else(|| "/tmp/gui-0".into());
     let exit_when_idle = env("COMP_EXIT_WHEN_IDLE").is_some();
-    let compose_delay = Duration::from_millis(env("COMP_DELAY_MS").and_then(|s| s.parse().ok()).unwrap_or(9));
+    let compose_delay = Duration::from_millis(env("COMP_DELAY_MS").and_then(|s| s.parse().ok()).unwrap_or(2));
 
     let (mut w, mut h) = (0u32, 0u32);
     if unsafe { cr_init(headless as c_int, &mut w, &mut h) } != 0 {
@@ -233,14 +339,9 @@ fn run(args: &[String]) -> i32 {
     }
     println!("COMP listening on {}", socket);
     if args.len() > 1 {
-        for cmd in &args[1..] {
-            match start_program(cmd, &socket) {
-                Some(pid) => println!("COMP started {} (pid {})", cmd, pid),
-                None => println!("COMP cannot start {}", cmd),
-            }
-        }
+        launch(args[1..].to_vec(), socket.clone());
     } else if std::path::Path::new("/bin/panel").exists() || std::path::Path::new("/mnt/bin/panel").exists() {
-        start_program("panel", &socket);
+        launch(vec!["panel".into()], socket.clone());
     }
 
     let mut clients = Clients { streams: BTreeMap::new(), seen: 0 };
@@ -253,12 +354,20 @@ fn run(args: &[String]) -> i32 {
     // the first commit arrives (that gave each vblank to one client, and each of two clients 30 frames per second).
     let mut compose_not_before = Instant::now();
     let uptime_ms = || t_start.elapsed().as_millis() as u32;
+    let (mut pace, mut pace_all) = (Pace::default(), Pace::default());
+    let mut last_flip: Option<Instant> = None;
+    let mut programs_alive = true;
+    // The frame rate while there are clients: from the first frame composed with one connected to the last such frame (the programs' start, a
+    // 15 MB exec each, is not the compositor's rate).
+    let mut with_clients: Option<(Instant, Instant, u64)> = None;
 
     while !QUIT.load(Ordering::Relaxed) && !comp.quit_requested() {
         if seconds > 0 && t_start.elapsed() >= Duration::from_secs(seconds) {
             break;
         }
-        if exit_when_idle && clients.seen > 0 && clients.streams.is_empty() {
+        // idle: every program we were given has been started and has exited, and every client has gone (programs that are still loading
+        // have not connected yet: the first client to finish is not the end)
+        if exit_when_idle && clients.seen > 0 && clients.streams.is_empty() && !programs_alive {
             break;
         }
         let busy = comp.has_damage() || comp.has_frame_callbacks();
@@ -277,7 +386,7 @@ fn run(args: &[String]) -> i32 {
         }
         unsafe { poll(pfds.as_mut_ptr(), pfds.len() as u64, wait_ms) };
         comp.set_time(uptime_ms());
-        while unsafe { waitpid(-1, std::ptr::null_mut(), WNOHANG) } > 0 {} // what we started and has exited
+        programs_alive = reap_children();
         for (p, id) in pfds.iter().zip(&who) {
             if p.revents & (POLLIN | POLLHUP) == 0 {
                 continue;
@@ -316,8 +425,10 @@ fn run(args: &[String]) -> i32 {
         clients.flush(&mut comp);
 
         if (comp.has_damage() || comp.has_frame_callbacks()) && Instant::now() >= compose_not_before {
+            let t_compose = Instant::now();
             // the previous frame is done: the buffers it read may be released to their clients, and what was dropped may go
             let done = unsafe { cr_wait() };
+            let t_waited = Instant::now();
             if done != 0 {
                 comp.gpu_frame_done(done);
             }
@@ -399,38 +510,74 @@ fn run(args: &[String]) -> i32 {
                 }
             }
             titles.retain(|id| live_titles.contains(&id));
+            let t_built = Instant::now();
             if unsafe { cr_frame(ops.as_ptr(), ops.len(), epoch) } != 0 {
                 println!("COMP FAIL frame {}", frames);
                 failures += 1;
                 break;
             }
             frames += 1;
-            // The frame is on the screen once its flip has landed, at the next vblank: only then do its clients hear it (the `frame` callbacks), so they
-            // draw their next frame in the interval and every client's commit is in the next composition. Composing as soon as one commit arrives
-            // would give each vblank to one client.
-            unsafe { cr_wait_flip() };
-            compose_not_before = Instant::now() + compose_delay;
+            let t_presented = Instant::now();
+            // The clients whose commits are in this frame hear it now (the `frame` callbacks, as Weston sends them at repaint): the present above
+            // waited for this frame's GPU work, so they draw their next frame while it waits for the vblank, and their commits are in the next
+            // composition. Answering only once the flip had landed made their drawing overlap that next composition on the GPU (its present took
+            // 5-6 ms instead of 1.3) and pushed its PRESENT past the vblank: 30 fps (Ryzen #181).
             comp.frame_done(uptime_ms());
             clients.flush(&mut comp);
+            // One composition per vblank: the next starts COMP_DELAY_MS after this frame is on the screen, with whatever every client committed
+            // meanwhile. Composing as soon as one commit arrives would give each vblank to one client.
+            unsafe { cr_wait_flip() };
+            let t_flip = Instant::now();
+            let mut st = CrStats::default();
+            unsafe { cr_get_stats(&mut st) };
+            let us = |a: Instant, b: Instant| b.saturating_duration_since(a).as_micros() as u64;
+            let sample = [
+                last_flip.map_or(0, |f| us(f, t_compose)),
+                us(t_compose, t_waited),
+                us(t_waited, t_built),
+                st.acquire_us as u64,
+                st.render_us as u64,
+                st.present_us as u64,
+                us(t_presented, t_flip),
+                last_flip.map_or(0, |f| us(f, t_flip)),
+            ];
+            pace.add(sample);
+            pace_all.add(sample);
+            last_flip = Some(t_flip);
+            if !clients.streams.is_empty() {
+                let w = with_clients.get_or_insert((t_flip, t_flip, 0));
+                w.1 = t_flip;
+                w.2 += 1;
+            }
+            compose_not_before = t_flip + compose_delay;
         }
         if last_stat.elapsed() >= Duration::from_secs(5) {
             last_stat = Instant::now();
             let mut st = CrStats::default();
             unsafe { cr_get_stats(&mut st) };
             println!("COMP {} frames, {} draws in the last, {} imports, {} uploads, {} clients seen", frames, st.draws, st.imports, st.uploads, clients.seen);
+            if pace.n > 0 {
+                println!("COMP pace (5 s): {}", pace.line());
+            }
+            pace = Pace::default();
         }
+    }
+    if pace_all.n > 0 {
+        println!("COMP pace (all): {}", pace_all.line());
     }
     let mut st = CrStats::default();
     unsafe { cr_get_stats(&mut st) };
     println!(
-        "COMP quit after {} frames (up to {} draws), {} imports, {} drops, {} uploads, {} clients seen, {} ms",
+        "COMP quit after {} frames (up to {} draws), {} imports, {} drops, {} uploads, {} clients seen, {} ms; with clients: {} frames in {} ms",
         frames,
         st.draws_max,
         st.imports,
         st.drops,
         st.uploads,
         clients.seen,
-        t_start.elapsed().as_millis()
+        t_start.elapsed().as_millis(),
+        with_clients.map_or(0, |w| w.2.saturating_sub(1)),
+        with_clients.map_or(0, |w| w.1.duration_since(w.0).as_millis())
     );
 
     let ids: Vec<ClientId> = clients.streams.keys().copied().collect();

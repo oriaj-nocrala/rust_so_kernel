@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <unwind.h>
 
@@ -52,6 +53,7 @@ static struct {
    struct comp comp;
    int comp_ready;
    uint64_t frames;
+   uint32_t acquire_us, render_us, present_us;   /* the last cr_frame's phases */
    PFN_vkGetDeviceProcAddr gdpa;
    PFN_vkDestroySwapchainKHR vkDestroySwapchainKHR;
    PFN_vkAcquireNextImageKHR vkAcquireNextImageKHR;
@@ -162,18 +164,31 @@ void cr_drop(uint64_t handle) { comp_drop(&R.comp, handle); }
 
 uint64_t cr_wait(void) { return comp_wait_frame(&R.comp); }
 
+static uint64_t now_us(void) {
+   struct timespec t;
+   clock_gettime(CLOCK_MONOTONIC, &t);
+   return (uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u;
+}
+
 int cr_frame(const struct cr_op *ops, size_t n, uint64_t epoch) {
    uint32_t idx = 0;
+   const uint64_t t0 = now_us();
    VkResult ar = R.vkAcquireNextImageKHR(R.device, R.swapchain, 1000000000ull, R.acquire_sem, VK_NULL_HANDLE, &idx);
    if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) { printf("COMP FAIL acquire (%d) at frame %llu\n", (int)ar, (unsigned long long)R.frames); return -1; }
+   const uint64_t t1 = now_us();
    if (comp_frame(&R.comp, ops, n, epoch, R.images[idx], R.views[idx], R.w, R.h, R.acquire_sem, R.render_sem[idx], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) != 0) {
       printf("COMP FAIL frame %llu\n", (unsigned long long)R.frames);
       return -2;
    }
+   const uint64_t t2 = now_us();
    VkPresentInfoKHR pinfo = { .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &R.render_sem[idx],
       .swapchainCount = 1, .pSwapchains = &R.swapchain, .pImageIndices = &idx };
    VkResult pr = R.vkQueuePresentKHR(R.queue, &pinfo);
    if (pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR) { printf("COMP FAIL present (%d) at frame %llu\n", (int)pr, (unsigned long long)R.frames); return -3; }
+   const uint64_t t3 = now_us();
+   R.acquire_us = (uint32_t)(t1 - t0);
+   R.render_us = (uint32_t)(t2 - t1);
+   R.present_us = (uint32_t)(t3 - t2);
    R.frames++;
    return 0;
 }
@@ -190,6 +205,9 @@ void cr_get_stats(struct cr_stats *out) {
    out->imports = R.comp.imports;
    out->drops = R.comp.drops;
    out->uploads = R.comp.uploads;
+   out->acquire_us = R.acquire_us;
+   out->render_us = R.render_us;
+   out->present_us = R.present_us;
 }
 
 void cr_shutdown(void) {

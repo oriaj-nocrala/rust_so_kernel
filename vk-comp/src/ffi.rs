@@ -40,6 +40,9 @@ pub struct CrStats {
     pub imports: u32,
     pub drops: u32,
     pub uploads: u32,
+    pub acquire_us: u32,
+    pub render_us: u32,
+    pub present_us: u32,
 }
 
 extern "C" {
