@@ -1,0 +1,30 @@
+[package]
+name = "gui-capi"
+version = "0.1.0"
+edition = "2021"
+
+# The window manager of `gui` behind a C ABI, for a compositor written in C that composes on the GPU (G5 layer 4, slice 3:
+# `probes/nvk/vk_comp.c`). A static library with no std: built for `x86_64-unknown-linux-musl` (what NVK is linked against) and, for the
+# tests, for the host. Its own workspace, like `gui`: the parent's `panic = "abort"` would break the test harness.
+[workspace]
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+gui = { path = "../gui" }
+
+# `std` (the default) is for the host: `cargo test` needs the standard library's panic machinery. The library for musl, the one linked into the
+# C compositor, is built without it: `cargo build --release --target x86_64-unknown-linux-musl --no-default-features` (no std, the C library's
+# allocator, abort on panic).
+[features]
+default = ["std"]
+std = []
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true

@@ -11,6 +11,7 @@
 /mm/target/
 /vfs/target/
 /diag/target/
+/gui-capi/target/
 /sched/target/
 /usock/target/
 /gui/target/
