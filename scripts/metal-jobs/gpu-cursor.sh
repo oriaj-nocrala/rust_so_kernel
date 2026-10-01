@@ -15,7 +15,9 @@ sum() { echo "$*"; echo "$*" >> $sumfile; }
 : > $sumfile
 up() { cut -d' ' -f1 /proc/uptime; }
 sum "gpu-cursor: start at uptime $(up) s"
-st() { grep -a '^cursor:' /dev/dispctl 2>/dev/null | cut -c1-400; }
+st() { grep -a '^cursor:' /dev/dispctl 2>/dev/null | head -n 1 | cut -c1-400; }
+st2() { grep -a '^cursor:' /dev/dispctl 2>/dev/null | sed -n 2p | cut -c1-300; }
+sts() { sum "gpu-cursor: $1: $(st)"; sum "gpu-cursor: $1: $(st2)"; }
 kd() { grep -a '^gpu_cursor:' /proc/kdebug; }
 logs() { grep -a 'cursor:' /proc/dmesg | tail -n 4 | cut -c1-300 | while read -r l; do sum "gpu-cursor: kernel: $l"; done; }
 if [ -e /dev/dispctl ] && grep -q '^dispctl' /dev/dispctl 2>/dev/null; then
@@ -32,16 +34,22 @@ step() { # step <label> <command>
 step "1 probe" "cursor probe"
 sleep 1
 sum "gpu-cursor: after probe: $(st)"
-step "2 on 32" "cursor on 32"
-# the core latches the push when the display takes it; give it a few seconds and show the registers each second
-n=0
-while [ $n -lt 4 ]; do
-  sleep 1
-  n=$((n + 1))
-  sum "gpu-cursor: after on +${n}s: $(st)"
-done
+# 2a: without touching the usage bounds (the GOP's 0x1110 says "no cursor": the display may refuse it, and that exception is worth reading); 2b with them
+# (nouveau's 0x1114). `on` waits 1.5 s for the core to latch the push and, if it did not, logs where the core stands; the second try only happens if the
+# core is idle again (a core that stays busy is not poked further).
+if echo "cursor on 32 nb" > /dev/dispctl; then sum "gpu-cursor: 2a on 32 nb: latched"; mode=nb
+else
+  sum "gpu-cursor: 2a on 32 nb: did not latch"; sts "after 2a"
+  if st | grep -q 'idle 1$'; then
+    if echo "cursor on 32" > /dev/dispctl; then sum "gpu-cursor: 2b on 32 (usage bounds pushed): latched"; mode=bounds
+    else sum "gpu-cursor: 2b on 32 (usage bounds pushed): did not latch"; sts "after 2b"; fail=1; mode=none; fi
+  else
+    sum "gpu-cursor: the core is not idle after 2a: no further push"; fail=1; mode=none
+  fi
+fi
+sts "after on"
 armed=$(st | sed 's/.*core ARMED control //; s/ .*//')
-[ "$armed" = "0x800000cf" ] || { sum "gpu-cursor: ARMED control is $armed, expected 0x800000cf: the push did not latch"; fail=1; }
+[ "$armed" = "0x800000cf" ] || { sum "gpu-cursor: ARMED control is $armed, expected 0x800000cf"; fail=1; }
 step "3a move to 100,100" "cursor move 100 100"
 sleep 2
 sum "gpu-cursor: after first move: $(st)"
@@ -59,7 +67,7 @@ sleep 6
 sum "gpu-cursor: at the middle: $(st)"
 step "4 off" "cursor off"
 sleep 2
-sum "gpu-cursor: after off: $(st)"
+sts "after off"
 exc=$(st | sed 's/.* exc //; s/ free.*//')
 [ "$exc" = "0x0,0x0,0x0" ] || sum "gpu-cursor: exception slot of the cursor channel after off: $exc (read it: type bits 14:12)"
 sum "gpu-cursor: $(kd)"

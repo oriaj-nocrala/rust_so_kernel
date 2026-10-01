@@ -21,6 +21,9 @@ use super::supervisor::{self, RequestError};
 /// Where the test image lives: VRAM 80 MiB (between the page-table pool at 64 MiB and the 6b test mapping at 96 MiB, `docs/reference/gpu.md` memory map).
 pub const IMAGE_VRAM: u64 = 80 << 20;
 
+/// How long `on` waits for the core to latch its push (a supervisor may have to be served first).
+const LATCH_MS: u64 = 1500;
+
 static ALLOCATED: AtomicBool = AtomicBool::new(false);
 static ON: AtomicBool = AtomicBool::new(false);
 static SIZE: AtomicU32 = AtomicU32::new(0);
@@ -111,16 +114,59 @@ pub fn on(size: u32, bounds: bool) -> Result<(), CursorError> {
     if !bounds {
         methods.remove(0);
     }
-    match supervisor::push_core("cursor on", &methods.iter().map(|&m| m).collect::<alloc::vec::Vec<_>>(), false) {
-        Ok(()) => {}
-        Err(e) => {
-            REFUSED.fetch_add(1, Ordering::Relaxed);
-            log(alloc::format!("cursor: core push refused: {:?}", e));
-            return Err(match e {
-                RequestError::NotReady => CursorError::NotReady,
-                _ => CursorError::Failed,
-            });
+    // the supervisors (a usage-bounds change may raise them) come by MSI on CPU 0: wait with IF=1, as `modeset::set` and `hdmi::locked` do
+    let was_on = x86_64::instructions::interrupts::are_enabled();
+    if !was_on {
+        x86_64::instructions::interrupts::enable();
+    }
+    let faults0 = evo::Faults::read(regs);
+    let pushed = supervisor::push_core("cursor on", &methods, false);
+    let want = nc::control(size, 0, 0).unwrap_or(0);
+    let a = evo::CORE.armed_base();
+    let latched = pushed.is_ok() && {
+        let t0 = crate::cpu::tsc::read();
+        let ms = |t0: u64| crate::cpu::tsc::read().wrapping_sub(t0) / (crate::cpu::tsc::freq_hz() / 1000).max(1);
+        loop {
+            if regs.rd32(a + nc::core_control(head)) == want && evo::CORE.idle(regs) {
+                break true;
+            }
+            if ms(t0) >= LATCH_MS {
+                break false;
+            }
+            crate::memory::tlb::service_pending();
+            core::hint::spin_loop();
         }
+    };
+    if !was_on {
+        x86_64::instructions::interrupts::disable();
+    }
+    if let Err(e) = pushed {
+        REFUSED.fetch_add(1, Ordering::Relaxed);
+        log(alloc::format!("cursor: core push refused: {:?}", e));
+        return Err(match e {
+            RequestError::NotReady => CursorError::NotReady,
+            _ => CursorError::Failed,
+        });
+    }
+    if !latched {
+        REFUSED.fetch_add(1, Ordering::Relaxed);
+        let f = evo::Faults::read(regs).new_since(&faults0);
+        log(alloc::format!(
+            "cursor: the core did not latch the push in {} ms: ARMED control {:#x} (want {:#x}) core idle {} put {:#x} get {:#x} | new faults: ctrl_disp {:#x} exc_other {:#x} core slot {:#x}; slot now {:#x},{:#x},{:#x}",
+            LATCH_MS,
+            regs.rd32(a + nc::core_control(head)),
+            want,
+            evo::CORE.idle(regs) as u8,
+            regs.rd32(evo::CORE.put()),
+            regs.rd32(evo::CORE.get()),
+            f.ctrl_disp,
+            f.exc_other,
+            f.core_exc,
+            regs.rd32(evo::CORE.exception()),
+            regs.rd32(evo::CORE.exception() + 4),
+            regs.rd32(evo::CORE.exception() + 8),
+        ));
+        return Err(CursorError::Failed);
     }
     SIZE.store(size, Ordering::Release);
     SETS.fetch_add(1, Ordering::Relaxed);
@@ -200,6 +246,18 @@ pub fn status() -> String {
         regs.rd32(a + nc::core_offset(head)),
         regs.rd32(a + nc::core_usage_bounds(head)),
         evo::CORE.idle(regs) as u8
+    );
+    let _ = writeln!(
+        s,
+        "cursor: core put {:#x} get {:#x} exception slot {:#x},{:#x},{:#x} ctrl_disp {:#x} exc_other {:#x} supers_done {}",
+        regs.rd32(evo::CORE.put()),
+        regs.rd32(evo::CORE.get()),
+        regs.rd32(evo::CORE.exception()),
+        regs.rd32(evo::CORE.exception() + 4),
+        regs.rd32(evo::CORE.exception() + 8),
+        regs.rd32(evo::CTRL_DISP_STAT),
+        regs.rd32(0x61_1854),
+        supervisor::supers_done()
     );
     s
 }
