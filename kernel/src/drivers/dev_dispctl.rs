@@ -91,6 +91,7 @@ impl FileHandle for DispctlDevice {
                 }
                 Some("off") => cur::off(),
                 Some("recover") => cur::recover(),
+                Some("head") => cur::select_head(it.next().and_then(|v| v.parse().ok()).ok_or(FileError::InvalidArgument)?),
                 Some("update") => cur::update(),
                 Some("onmode") => cur::on_with_attach(it.next().map_or(Ok(32), |v| v.parse()).map_err(|_| FileError::InvalidArgument)?),
                 Some("ilock") => cur::interlock_off(),

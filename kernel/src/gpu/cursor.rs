@@ -24,6 +24,26 @@ pub const IMAGE_VRAM: u64 = 80 << 20;
 /// How long `on` waits for the core to latch its push (a supervisor may have to be served first).
 const LATCH_MS: u64 = 1500;
 
+/// The head the commands act on: the primary one (the GOP's), or the one `cursor head <n>` chose (head 1 is the HDMI one `hdmi on` lights, whose whole state
+/// this driver programs, unlike head 0's: the GOP's). 0xff = the primary.
+static HEAD_SEL: AtomicU32 = AtomicU32::new(0xff);
+
+fn target_head() -> Option<u32> {
+    match HEAD_SEL.load(Ordering::Relaxed) {
+        0xff => supervisor::primary_head(),
+        h => Some(h),
+    }
+}
+
+/// `cursor head <n>`: only before anything was allocated.
+pub fn select_head(h: u32) -> Result<(), CursorError> {
+    if ALLOCATED.load(Ordering::Acquire) || ON.load(Ordering::Acquire) || h > 3 {
+        return Err(CursorError::Invalid);
+    }
+    HEAD_SEL.store(h, Ordering::Relaxed);
+    Ok(())
+}
+
 static ALLOCATED: AtomicBool = AtomicBool::new(false);
 static ON: AtomicBool = AtomicBool::new(false);
 static SIZE: AtomicU32 = AtomicU32::new(0);
@@ -68,7 +88,7 @@ fn arrow(size: u32) -> alloc::vec::Vec<u32> {
 /// `cursor probe`: allocate the primary head's channel and say what it looks like (control, status, exception slot, user region), without enabling
 /// anything on the display.
 pub fn probe() -> Result<(), CursorError> {
-    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
+    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, target_head().ok_or(CursorError::NotReady)?);
     if ALLOCATED.load(Ordering::Acquire) {
         return Ok(());
     }
@@ -93,7 +113,7 @@ pub fn probe() -> Result<(), CursorError> {
 
 /// `cursor intr on|off`: the channel's interrupt enable (see `nvgpu::cursor::intr`).
 pub fn intr(on: bool) -> Result<(), CursorError> {
-    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
+    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, target_head().ok_or(CursorError::NotReady)?);
     nc::intr(regs, head, on);
     log(alloc::format!("cursor: head {} channel interrupt {}: {:#x} = {:#x}", head, if on { "enabled" } else { "disabled" }, nc::INTR_ENABLE, regs.rd32(nc::INTR_ENABLE)));
     Ok(())
@@ -139,7 +159,7 @@ pub fn on_with_attach(size: u32) -> Result<(), CursorError> {
         return Err(CursorError::Invalid);
     }
     probe()?;
-    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
+    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, target_head().ok_or(CursorError::NotReady)?);
     write_image(size)?;
     let m = nc::core_methods_set(head, nvgpu::hdmi::HANDLE_LUT, IMAGE_VRAM, size, 0, 0).ok_or(CursorError::Invalid)?;
     let mut nine = [(0u32, 0u32); 9];
@@ -209,13 +229,13 @@ pub fn on_with_attach(size: u32) -> Result<(), CursorError> {
 
 /// `cursor update`: only the cursor channel's UPDATE (frees a core that waits for it).
 pub fn update() -> Result<(), CursorError> {
-    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
+    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, target_head().ok_or(CursorError::NotReady)?);
     nc::update(regs, head).map_err(|_| CursorError::Failed)
 }
 
 /// `cursor ilock off`: the cursor channel's interlock flags back to 0 (they persist in its state, like the core's).
 pub fn interlock_off() -> Result<(), CursorError> {
-    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
+    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, target_head().ok_or(CursorError::NotReady)?);
     nc::clear_interlock(regs, head);
     Ok(())
 }
@@ -243,7 +263,7 @@ pub fn write_image(size: u32) -> Result<(), CursorError> {
 /// `cursor raw <method> <value>`: ONE core method plus UPDATE (a debugging ladder: Ryzen #196/#197 left the core not idle after the whole enable
 /// push, its exception slot naming method 0x2088 with type 0). Waits for the core to go idle, with IF=1, and logs where it stands.
 pub fn raw(method: u32, value: u32, interlock: bool) -> Result<(), CursorError> {
-    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
+    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, target_head().ok_or(CursorError::NotReady)?);
     if !nc::core_method_allowed(head, method) {
         return Err(CursorError::Invalid);
     }
@@ -310,7 +330,7 @@ pub fn on(size: u32, bounds: bool) -> Result<(), CursorError> {
         return Err(CursorError::Invalid);
     }
     probe()?;
-    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
+    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, target_head().ok_or(CursorError::NotReady)?);
     write_image(size)?;
     let mut methods = nc::core_methods_set(head, nvgpu::hdmi::HANDLE_LUT, IMAGE_VRAM, size, 0, 0).ok_or(CursorError::Invalid)?;
     if !bounds {
@@ -382,7 +402,7 @@ pub fn move_to(x: i32, y: i32) -> Result<(), CursorError> {
     if !ALLOCATED.load(Ordering::Acquire) {
         return Err(CursorError::Invalid);
     }
-    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
+    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, target_head().ok_or(CursorError::NotReady)?);
     let t0 = crate::time::ktime_get();
     let r = nc::move_to(regs, head, x, y);
     let dt = crate::time::ktime_get().saturating_sub(t0) / 1000;
@@ -405,7 +425,7 @@ pub fn off() -> Result<(), CursorError> {
     if !ON.swap(false, Ordering::AcqRel) {
         return Err(CursorError::Invalid);
     }
-    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
+    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, target_head().ok_or(CursorError::NotReady)?);
     let res = supervisor::push_core("cursor off", &nc::core_methods_clear(head), false);
     if let Err(e) = res {
         REFUSED.fetch_add(1, Ordering::Relaxed);
@@ -426,7 +446,7 @@ pub fn off() -> Result<(), CursorError> {
 
 /// What the core has armed for the cursor and what the channel says, for the job's evidence.
 pub fn status() -> String {
-    let (Some(regs), Some(head)) = (supervisor::regs(), supervisor::primary_head()) else { return String::new() };
+    let (Some(regs), Some(head)) = (supervisor::regs(), target_head()) else { return String::new() };
     let c = nc::chan(head);
     let a = evo::CORE.armed_base();
     let mut s = String::new();
