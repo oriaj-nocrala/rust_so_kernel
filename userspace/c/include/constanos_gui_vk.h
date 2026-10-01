@@ -31,6 +31,8 @@
 #define GVK_FOCUS 4     // value 1 gained, 0 lost
 #define GVK_CLOSE 5     // the user asked for the window to close
 #define GVK_CONFIGURE 6 // value = w, code unused, y = h (the compositor's suggestion; the program picks its own size)
+#define GVK_RESIZE 7    // value = w, y = h: the size the compositor gives the window (maximize, a resize drag, F11 fullscreen); a program that sent
+                        // gvk_set_resizable makes its swapchain this size, and the next buffer it sends is the window's new size
 
 struct gvk_event {
     uint16_t type;
@@ -125,6 +127,7 @@ static void gvk_dispatch(struct gvk_window *w) {
                 if (a) { e.type = GVK_REL; e.code = 0; e.value = (int)a; gvk_push(w, e); }
                 if (b) { e.type = GVK_REL; e.code = 1; e.value = (int)b; gvk_push(w, e); }
                 break;
+            case GUIW_EV_RESIZE: e.type = GVK_RESIZE; e.value = (int)a; e.y = (int)b; gvk_push(w, e); break;
             case GUIW_EV_CLOSE: e.type = GVK_CLOSE; gvk_push(w, e); break;
             }
         } else if (m.object == w->frame_cb && m.opcode == GUIW_EV_DONE && na == 1) {
@@ -254,6 +257,14 @@ static int gvk_surface_create(struct gvk_window *w, VkInstance instance, VkSurfa
     VkResult r = nvk_constanos_surface_create(instance, &w->hooks, surface);
     if (r == VK_SUCCESS) w->surface_handle = (uint64_t)*surface;
     return r == VK_SUCCESS ? 0 : -1;
+}
+
+// Says the window can take any size from min_w x min_h (maximize, resize drag, F11); `resize` events (GVK_RESIZE) then say which.
+static int gvk_set_resizable(struct gvk_window *w, int min_w, int min_h) {
+    struct guiw_out o;
+    memset(&o, 0, sizeof(o));
+    guiw_set_resizable(&o, w->surface_id, min_w, min_h);
+    return gvk_send(w, &o);
 }
 
 static void gvk_close(struct gvk_window *w) {

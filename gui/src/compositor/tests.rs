@@ -1348,3 +1348,67 @@ fn the_cpu_painter_survives_a_gpu_window() {
     h.compose();
     assert_eq!(h.px(40, 40 + TITLE_H), WINDOW_BG, "nothing to show but the background");
 }
+
+// A: F11 makes the focused resizable window cover the whole screen without its bar, asks its client for the screen's size, and the second
+// press puts everything back. The key is the compositor's: the client never sees it.
+#[test]
+fn f11_toggles_fullscreen_and_the_client_never_sees_the_key() {
+    let mut h = H_::new();
+    let c = h.window(100, 50, 0x0012_3456);
+    h.send(c, &[R::SetResizable { surface: 4, min_w: 1, min_h: 1 }]);
+    h.comp.take_events();
+    h.comp.key(87, true);
+    h.comp.key(87, false);
+    assert!(h.comp.is_fullscreen(c, 4));
+    assert_eq!(h.comp.window_frame(c, 4), Some(Rect::new(0, 0, W, H)), "the whole screen, no title bar");
+    assert_eq!(h.comp.window_content(c, 4), Some(Rect::new(0, 0, W, H)));
+    assert_eq!(h.comp.stack().last(), Some(&(c, 4)));
+    let evs = h.events_for(c);
+    assert_eq!(resizes(&evs), vec![(W, H)]);
+    assert!(!evs.iter().any(|e| matches!(e, Event::Key { .. })), "F11 is not the client's: {evs:?}");
+    h.comp.key(87, true);
+    assert!(!h.comp.is_fullscreen(c, 4));
+    assert_eq!(h.comp.window_frame(c, 4), Some(Rect::new(40, 40, 100, 70)));
+    assert_eq!(resizes(&h.events_for(c)), Vec::<(i32, i32)>::new(), "back to the buffer's own size: nothing to ask");
+    // other keys still reach it
+    h.comp.key(30, true);
+    assert_eq!(h.events_for(c), vec![Event::Key { surface: 4, code: 30, pressed: true }]);
+}
+
+// B: a window that did not ask to be resizable is left alone, as with maximize; and nothing is focused, nothing happens.
+#[test]
+fn f11_needs_a_resizable_window() {
+    let mut h = H_::new();
+    h.comp.key(87, true); // no window at all
+    let c = h.window(100, 50, 0x0012_3456);
+    h.comp.take_events();
+    h.comp.key(87, true);
+    assert!(!h.comp.is_fullscreen(c, 4));
+    assert_eq!(h.comp.window_frame(c, 4), Some(Rect::new(40, 40, 100, 70)));
+    assert!(resizes(&h.events_for(c)).is_empty());
+}
+
+// A: leaving fullscreen restores a maximized window as maximized (its own restore geometry kept), and a fullscreen window has no resize grip
+// in its corner (a game's corner is the game's) and its pointer events are all content.
+#[test]
+fn leaving_fullscreen_restores_maximized_and_a_fullscreen_window_has_no_grip() {
+    let mut h = H_::new();
+    let c = h.window(100, 50, 0x0012_3456);
+    h.send(c, &[R::SetResizable { surface: 4, min_w: 1, min_h: 1 }]);
+    h.comp.key(87, true); // placed -> maximized would be a button; here straight to fullscreen from placed
+    h.comp.key(87, true);
+    let max_btn = (140 - TITLE_H - TITLE_H / 2, 50);
+    click(&mut h, max_btn.0, max_btn.1);
+    assert!(h.comp.is_maximized(c, 4));
+    h.comp.take_events();
+    h.comp.key(87, true);
+    assert!(h.comp.is_fullscreen(c, 4));
+    assert!(!h.comp.is_maximized(c, 4), "fullscreen is not the work area");
+    assert_eq!(h.comp.hit(W - 2, H - 2), Some(((c, 4), Zone::Content)), "no grip");
+    assert_eq!(h.comp.hit(5, 5), Some(((c, 4), Zone::Content)), "no title bar");
+    h.comp.key(87, true);
+    assert!(h.comp.is_maximized(c, 4), "maximized again");
+    assert_eq!(h.comp.window_frame(c, 4), Some(Rect::new(0, 0, W, H)));
+    assert_eq!(h.comp.hit(5, 5), Some(((c, 4), Zone::Title)), "its bar is back");
+    assert_eq!(resizes(&h.events_for(c)).last(), Some(&(W, H - TITLE_H)), "its client is asked for the maximized size again");
+}

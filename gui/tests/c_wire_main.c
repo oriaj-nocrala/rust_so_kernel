@@ -29,6 +29,7 @@ static int enc(void) {
     guiw_set_title(&o, 4, "");
     guiw_lock_pointer(&o, 4, 1);
     guiw_lock_pointer(&o, 4, 0);
+    guiw_set_resizable(&o, 4, 320, 200);
     if (o.overflow) return 2;
     for (size_t i = 0; i < o.len; i++) printf("%02x", o.bytes[i]);
     printf("\n");

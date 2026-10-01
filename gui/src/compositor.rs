@@ -65,6 +65,10 @@
 //!   maximized*: it gets an invisible border and a grip in its bottom-right
 //!   corner. Dragging them draws an outline only; the release sends one
 //!   `resize`. Double-click on the title bar toggles maximize.
+//! - *F11* is this crate's key, not the client's: a window that sent
+//!   `set_resizable` covers the whole screen with no title bar (and no
+//!   resize grip) and is asked for the screen's size; pressed again it goes
+//!   back to its placed or maximized geometry.
 //! - *Close* sends `close`; the client decides. Nothing here kills.
 //! - *The panel* (`set_panel`) is a strip along the bottom: undecorated,
 //!   above every window, outside the work area (maximize and placement
@@ -111,6 +115,7 @@ pub const DOUBLE_CLICK_MS: u32 = 400;
 
 pub const BTN_LEFT: u32 = 0x110;
 const KEY_BACKSPACE: u32 = 14;
+const KEY_F11: u32 = 87;
 const KEY_LEFTCTRL: u32 = 29;
 const KEY_RIGHTCTRL: u32 = 97;
 const KEY_LEFTALT: u32 = 56;
@@ -304,6 +309,9 @@ struct Surface<M> {
     resizable: Option<(i32, i32)>,
     /// Geometry (`x, y, fw, fh`) to go back to when unmaximized.
     maximized: Option<Rect>,
+    /// Fullscreen (F11): the content box and the maximized state to go back to. While it lasts the window has no title bar and covers
+    /// the whole screen.
+    fullscreen: Option<(Rect, Option<Rect>)>,
     /// Has a title bar (every window but the panel).
     decorated: bool,
     /// Toplevel id while mapped as a window, 0 otherwise.
@@ -651,6 +659,7 @@ impl<M: PoolMem> Compositor<M> {
                     wants_lock: false,
                     resizable: None,
                     maximized: None,
+                    fullscreen: None,
                     decorated: true,
                     tid: 0,
                     x: 0,
@@ -1133,6 +1142,38 @@ impl<M: PoolMem> Compositor<M> {
         self.request_size(key, g.w, g.h);
     }
 
+    /// F11: the window covers the whole screen without its title bar, and goes back to what it was (placed or maximized) the next time.
+    /// Only a window that sent `set_resizable` can, like maximize: it is how a client says it can take any size.
+    fn toggle_fullscreen(&mut self, key: Key) {
+        let (sw, sh) = (self.width, self.height);
+        let th = self.th;
+        let Some(s) = self.surface_mut(key) else { return };
+        if s.resizable.is_none() || !s.mapped {
+            return;
+        }
+        let before = s.frame(th);
+        let g = match s.fullscreen.take() {
+            Some((saved, maximized)) => {
+                s.decorated = true;
+                s.maximized = maximized;
+                saved
+            }
+            None => {
+                s.fullscreen = Some((Rect::new(s.x, s.y, s.fw, s.fh), s.maximized.take()));
+                s.decorated = false;
+                Rect::new(0, 0, sw, sh)
+            }
+        };
+        s.x = g.x;
+        s.y = g.y;
+        s.fw = g.w;
+        s.fh = g.h;
+        let after = s.frame(th);
+        self.damage.add(before);
+        self.damage.add(after);
+        self.request_size(key, g.w, g.h);
+    }
+
     /// The content box a resize drag gives for the pointer at `(x, y)`,
     /// kept between the client's minimum and the work area.
     fn resize_geometry(&self, r: &ResizeDrag, x: i32, y: i32) -> Rect {
@@ -1194,7 +1235,7 @@ impl<M: PoolMem> Compositor<M> {
         for &k in self.stack.iter().rev() {
             let Some(s) = self.surface(k) else { continue };
             let f = s.frame(th);
-            let resizable = s.resizable.is_some();
+            let resizable = s.resizable.is_some() && s.fullscreen.is_none(); // a fullscreen window has no grip: its corner is the game's
             if f.contains(x, y) {
                 if resizable && s.content(th).contains(x, y) && x >= f.right() - g && y >= f.bottom() - g {
                     return Some((k, Zone::Edge(EDGE_RIGHT | EDGE_BOTTOM)));
@@ -1388,6 +1429,15 @@ impl<M: PoolMem> Compositor<M> {
         }
         if pressed && code == KEY_BACKSPACE && self.ctrl > 0 && self.alt > 0 {
             self.quit = true;
+            return;
+        }
+        if code == KEY_F11 {
+            // the compositor's own key: not the client's, press or release
+            if pressed {
+                if let Some(k) = self.focus {
+                    self.toggle_fullscreen(k);
+                }
+            }
             return;
         }
         let modifier = matches!(code, KEY_LEFTCTRL | KEY_RIGHTCTRL | KEY_LEFTALT | KEY_RIGHTALT);
@@ -1724,6 +1774,10 @@ impl<M: PoolMem> Compositor<M> {
 
     pub fn window_title(&self, c: ClientId, surface: u32) -> Option<&str> {
         self.surface((c, surface)).map(|s| s.title.as_str())
+    }
+
+    pub fn is_fullscreen(&self, c: ClientId, surface: u32) -> bool {
+        self.surface((c, surface)).is_some_and(|s| s.fullscreen.is_some())
     }
 
     pub fn is_maximized(&self, c: ClientId, surface: u32) -> bool {

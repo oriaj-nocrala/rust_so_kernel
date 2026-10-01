@@ -63,6 +63,7 @@ fn c_requests_decode_to_what_they_meant() {
         (Interface::Surface, Request::SetTitle { surface: 4, title: "".into() }),
         (Interface::Surface, Request::LockPointer { surface: 4, on: true }),
         (Interface::Surface, Request::LockPointer { surface: 4, on: false }),
+        (Interface::Surface, Request::SetResizable { surface: 4, min_w: 320, min_h: 200 }),
     ];
 
     // Byte for byte what the Rust encoder makes of the same requests.

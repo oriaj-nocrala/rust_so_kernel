@@ -26,7 +26,7 @@
 //! `XRGB8888` (value 1, as `wl_shm`'s).
 //!
 //! Window management (phase 4): `set_resizable` is `xdg_toplevel`'s
-//! `set_min_size` and the opt-in to `resize`, a *request* for a content of
+//! `set_min_size` and the opt-in to `resize` (and to F11 fullscreen), a *request* for a content of
 //! `w x h` (the real size stays that of the next committed buffer, so
 //! there is no `ack_configure`); `close` is `xdg_toplevel.close`.
 //! `set_panel` is a `wlr-layer-shell`-like role — a strip along the bottom,

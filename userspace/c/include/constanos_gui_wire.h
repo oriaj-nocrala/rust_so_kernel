@@ -128,6 +128,11 @@ static void guiw_commit(struct guiw_out *o, uint32_t surface) {
 static void guiw_set_title(struct guiw_out *o, uint32_t surface, const char *title) {
     guiw_begin(o, surface, 4); guiw_string(o, title); guiw_end(o);
 }
+// A window that can take any size from min_w x min_h up: it gets the maximize button, the resize grip and F11 (fullscreen), and is told the
+// size it is given with `resize` (GUIW_EV_RESIZE); the buffer it creates after that one gives the window its new size.
+static void guiw_set_resizable(struct guiw_out *o, uint32_t surface, int32_t min_w, int32_t min_h) {
+    guiw_begin(o, surface, 7); guiw_put(o, (uint32_t)min_w); guiw_put(o, (uint32_t)min_h); guiw_end(o);
+}
 static void guiw_lock_pointer(struct guiw_out *o, uint32_t surface, int on) {
     guiw_begin(o, surface, 6); guiw_put(o, on ? 1u : 0u); guiw_end(o);
 }
