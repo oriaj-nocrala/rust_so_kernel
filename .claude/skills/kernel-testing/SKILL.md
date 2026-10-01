@@ -61,3 +61,11 @@ description: Playbook for verifying a change to rust_so_kernel: which test suite
 - **The software GPU device (QEMU) completes every EXEC at once.** It cannot show "work queued, not finished, nobody calling in" races. Put those in an `nvgpu_hw_test` section and prove them on metal; say so when a mutant survives in QEMU for that reason.
 - **A flaky test that appears only in the full suite** (here: "the slot is still busy right after waitpid") can be a real pre-existing race made likelier by the change: repeat the single test in one boot first (`for i in ...; do /mnt/bin/x; done` through `qemu-debug.sh send`), then read the kernel path (`wait4` settled only on entry) before editing the test. Fix the kernel, then run the whole suite three times.
 - Tests that count concurrent resources across `fork` must make every child open, report, and wait for a "go" byte: in QEMU a child finishes and releases its slot before the next one opens.
+
+## Flakes, baselines and what a harness cannot see (2026-10-01)
+
+- **Measure the baseline of the unchanged tree before engineering a fix** for a failure in a test. The QEMU TLB-shootdown panic looked like a regression of the new test and was 6/6 on the unchanged kernel (`scripts/tlb-stress.sh`); a long block-cache "fix" was built before that was known and then reverted. State sample sizes (n=4-5 is an order of magnitude, not a rate).
+- `gui_comp_test` (3 cases, QEMU) falls to that panic roughly one run in three; repeat before concluding anything. It runs 4 CPUs (`run-abi-suite.sh`) with `TEST_TIMEOUT` (default 90 s per test; the 3 cases need ~45-70 s).
+- **A host test that compares against a reference proves only what it can observe.** `host-comp.sh` passed while the shader read 16 GiB out of range, because the host GPU returns zero for such loads. For GPU-side memory safety the only oracle is the real device and the kernel's fault report (`[nvgpu] channel .. is dead: ... address A: <where>`); say what a harness cannot see in the test's own comment.
+- When a check in a job or test can fail on a healthy run (a counter printed before an asynchronous cleanup), make it informational and check the real invariant at the end (`gpu_share` 0/0/0).
+- Mutation-check new pure helpers before documenting them as tested (the nvgpu fault decoders: 9 mutants, 8 killed, 1 equivalent).

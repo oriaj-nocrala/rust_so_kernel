@@ -77,3 +77,13 @@ Iterating on metal costs a physical reboot per try. Make QEMU look like the Ryze
 ## GUI
 
 `scripts/gui-e2e.sh [term|wm|text]` drives the compositor through the monitor and checks screendumps pixel by pixel; the checks are listed in its header.
+
+## Live panic or hang, with every CPU (what cracked the 2026-10-01 cases)
+
+- `qemu-debug.sh` runs **one CPU by default** and the target is SMP: use `QEMU_DEBUG_SMP=4` for anything with fork/exec or blocking I/O. Some hangs exist only at one CPU (the ext2 block-cache lock), some panics only at four.
+- **Boot without an autorun job** for a live post-mortem: with a job, a panic resets the machine and `-no-reboot` makes QEMU exit, so the state is gone. Type the workload with `send`/`enter`, wait for `KERNEL PANIC` in `serial.log`, then:
+  `echo "gdbserver tcp::1234" | socat - UNIX-CONNECT:$STATE/monitor.sock` and `QEMU_DEBUG_STATE_DIR=$STATE scripts/qemu-debug.sh gdb "thread apply all bt 12"`; `echo "info registers -a" | socat - UNIX-CONNECT:$STATE/monitor.sock` shows each CPU's RIP, IF (RFL) and TR.
+- A job that "never finishes" may be slow, not stuck: take the snapshot twice and compare a loop variable (an advancing LBA was progress). Do not call a TIMEOUT a hang.
+- **Inject input into a headless run** through the monitor socket directly: `mouse_move 20 10`, `sendkey a`, `mouse_button 1`/`mouse_button 0` (the `qemu-debug.sh mouse-move/key` subcommands answered "Not running" with a custom `QEMU_DEBUG_STATE_DIR`). Wait for a line the *job* prints at its start, not one the program prints at its end.
+- Parallel runs: one `QEMU_DEBUG_STATE_DIR` each (short path) and a copy of `disk.img` (`scripts/tlb-stress.sh`). **Never `pkill -f` a pattern that appears in your own command line** (it kills the shell running it).
+- **A `TLB shootdown ... never acknowledged` panic in QEMU/TCG is a known pre-existing flake** (`docs/reference/cpu.md`): run `scripts/tlb-stress.sh` on the unchanged tree before blaming a change.

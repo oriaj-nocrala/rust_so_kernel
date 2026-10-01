@@ -53,6 +53,7 @@ Code: `kernel/src/cpu/`, `kernel/src/smp.rs`, `kernel/src/interrupts/`, `kernel/
   - USB transfer waits.
 - The COW path swaps frames with `replace_frame` (a single PTE store).
 - Tests: `hw_tests::tlb_shootdown_leaves_no_stale_translation`, `kdebug tlbtest`. Observe: `tlb:` in `/proc/kdebug`.
+- **Known issue (QEMU/TCG, 4 CPUs; not seen on the Ryzen):** under concurrent fork/exec and cold file reads the 1 s ack wait can expire (`never acknowledged`, `unmap_kernel_guard_page` in `fork_impl` or `remap_kernel_guard_page` in `try_free_kernel_stack` on the sender). `scripts/tlb-stress.sh` reproduces it (6/6 runs); `scripts/run-abi-suite.sh gui_comp_test` hits it about one run in three. Seen with gdb (a live panic, no autorun): two CPUs in `shoot` at once, the one that holds `SENDER` waits for the other, which is in the `SENDER` loop calling `service_pending`, and the ack only lands later (PENDING was clear when looked at afterwards): a CPU that does not run for over a second of guest time, which points at the emulator's scheduling of the vCPU rather than at the protocol; not proven. Do not read a panic of this shape in QEMU as a regression of whatever was being tested: run `scripts/tlb-stress.sh` on the unchanged tree first.
 
 ## Time
 

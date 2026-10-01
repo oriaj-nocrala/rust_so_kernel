@@ -78,3 +78,13 @@ Write-combining and VRAM speed, APERF/MPERF, k10temp, RAPL, torn xHCI event TRBs
 An average hides it (58.6 fps vs 60.1). What worked, in two rounds: (1) make the program log every frame interval over 25 ms with its time since start **and** the absolute `CLOCK_MONOTONIC` of its start; stamp each phase of the job with `cut -d' ' -f1 /proc/uptime` (same clock base); run the program alone first as a baseline; (2) add a kernel-side record of what it suspects (a ring of lock holds over 2 ms: operation, when, how long: `gpu_uapi_slow:` in /proc/kdebug) and print it in the job's summary. Lining the two up located the cause (a global lock held across RM calls) and, after the fix, showed it gone (0 intervals over 25 ms). Pattern: measure first, one round per hypothesis, put every independent diagnostic in the same boot.
 
 Job summary lines are printed twice and the log wraps (64 KiB): print the whole summary at the end of the job (`cat /tmp/<job>.sum`) and read it with `grep -a <job-name> boot.log | awk '!seen[$0]++'`. `scripts/metal-jobs/gpu-multi.sh` is a template for a multi-program job with phases, baselines and a leak check (`gpu_share:` must read 0/0/0 at the end).
+
+## Designing a job that finds a cause in few boots (lessons of Ryzen #184-#188)
+
+- **Make the failure explain itself before varying the load.** After the first unexplained failure, the next change is a diagnostic (here: the kernel printing RM's fault event and a decoded address), not another experiment. Then one *discriminating* experiment (here: the same load with input arriving but not read vs read: `scripts/metal-jobs/gpu-apps-d3.sh`).
+- Print the stimulus's own counters before and after each run (the kernel's `usb_*` lines) so a negative result is credible, and the program's own counters (`COMP input`).
+- Keep **everything** the program printed (the last N lines), not a whitelist of greps: `gpu-apps.sh` dropped the `COMP input` lines and its own `dmesg` grep matched its summary.
+- Phases the person has to watch go first; give the job its own time budget under the watchdog (`left()` from `/proc/uptime`, 300 s from boot, never pinged) and skip or shorten phases that would not fit. A phase that needs a person says so in the summary and in the chat before the reboot.
+- **Ask the person what they see** (before and after): the clue that mattered ("the pointer never moves") came from them. Tell them what to do during the run (move the mouse all the time, drag a window to an odd position).
+- The kernel log is lossy (64 KiB ring, wraps): the job prints its whole summary at the end; check `grep -a '\[nvgpu\]\|\[gsp\] event' /proc/dmesg` too.
+- Templates: `gpu-apps.sh` (phases A-E with a budget), `gpu-apps-d3.sh` (discriminating pair), `gpu-multi.sh` (leak check).
