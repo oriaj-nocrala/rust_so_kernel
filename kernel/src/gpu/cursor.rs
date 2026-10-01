@@ -130,6 +130,12 @@ pub fn recover() -> Result<(), CursorError> {
     if idle { Ok(()) } else { Err(CursorError::Failed) }
 }
 
+/// `cursor update`: only the cursor channel's UPDATE (frees a core that waits for it).
+pub fn update() -> Result<(), CursorError> {
+    let (regs, head) = (supervisor::regs().ok_or(CursorError::NotReady)?, supervisor::primary_head().ok_or(CursorError::NotReady)?);
+    nc::update(regs, head).map_err(|_| CursorError::Failed)
+}
+
 /// `cursor image [size]`: the test arrow into VRAM (through PRAMIN: written once, read back).
 pub fn write_image(size: u32) -> Result<(), CursorError> {
     let regs = supervisor::regs().ok_or(CursorError::NotReady)?;
@@ -167,10 +173,13 @@ pub fn raw(method: u32, value: u32, interlock: bool) -> Result<(), CursorError> 
         // the core's UPDATE waits for this head's cursor channel: send the flag first, the channel's own UPDATE right after the push
         methods.insert(0, (evo::CORE_SET_INTERLOCK_FLAGS, nc::core_interlock_with_cursor(head)));
     }
-    let pushed = supervisor::push_core("cursor raw", &methods, false);
-    if interlock && pushed.is_ok() {
+    // nouveau commits the cursor channel's UPDATE BEFORE the core's (`nv50_disp_atomic_commit_tail`: `nv50_wndw_flush_set` writes the point and the update,
+    // then `nv50_disp_atomic_commit_core`): the core's interlocked UPDATE then finds it waiting. Sent after the push (Ryzen #207) the core stood in
+    // WAIT_FOR_UPD for ever: the channel's UPDATE had been taken as an independent one.
+    if interlock {
         let _ = nc::update(regs, head);
     }
+    let pushed = supervisor::push_core("cursor raw", &methods, false);
     let idle = pushed.is_ok() && {
         let t0 = crate::cpu::tsc::read();
         loop {
