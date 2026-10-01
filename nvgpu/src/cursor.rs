@@ -169,6 +169,11 @@ pub const fn core_procamp(h: u32) -> u32 {
 pub const fn core_dither(h: u32) -> u32 {
     0x2018 + h * 0x400
 }
+/// The head's output LUT methods (`hdmi::olut_methods`: `HEAD_SET_OLUT_CONTROL`, `_FP_NORM_SCALE`, `CONTEXT_DMA_OLUT`, `OFFSET_OLUT`, `headc57d.c:120-128`):
+/// head 1 has them, head 0 (the GOP's) has no output LUT while its usage bounds say OLUT_ALLOWED.
+pub const fn core_olut(h: u32) -> [u32; 4] {
+    [0x2280 + h * 0x400, 0x2284 + h * 0x400, 0x2288 + h * 0x400, 0x228c + h * 0x400]
+}
 pub const fn window_usage_format(h: u32) -> u32 {
     0x1004 + 2 * h * 0x80
 }
@@ -193,6 +198,9 @@ pub fn core_method_allowed(head: u32, method: u32) -> bool {
         core_composition(head),
         core_olut_context_dma(head),
         evo::CORE_SET_INTERLOCK_FLAGS,
+        core_olut(head)[0],
+        core_olut(head)[1],
+        core_olut(head)[3],
         core_procamp(head),
         core_dither(head),
         window_usage_format(head),
@@ -366,14 +374,14 @@ mod tests {
 
     #[test]
     fn raw_pushes_are_limited_to_the_cursors_methods_of_that_head() {
-        for m in [0x2030, 0x2088, 0x208c, 0x2090, 0x2094, 0x2098, 0x209c, 0x20a0, 0x2288, 0x2000, 0x2018, 0x1004, 0x1008, 0x1010] {
+        for m in [0x2030, 0x2088, 0x208c, 0x2090, 0x2094, 0x2098, 0x209c, 0x20a0, 0x2288, 0x2280, 0x2284, 0x228c, 0x2000, 0x2018, 0x1004, 0x1008, 0x1010] {
             assert!(core_method_allowed(0, m), "{m:#x}");
         }
-        for m in [0x2430, 0x2488, 0x248c, 0x2490, 0x2494, 0x2498, 0x249c, 0x24a0, 0x2688, 0x2400, 0x2418, 0x1104, 0x1108, 0x1110] {
+        for m in [0x2430, 0x2488, 0x248c, 0x2490, 0x2494, 0x2498, 0x249c, 0x24a0, 0x2688, 0x2680, 0x2684, 0x268c, 0x2400, 0x2418, 0x1104, 0x1108, 0x1110] {
             assert!(core_method_allowed(1, m), "{m:#x}");
             assert!(!core_method_allowed(0, m), "{m:#x}");
         }
-        for m in [0x200, 0x21c, 0x2034, 0x2084, 0x2084, 0x20a4, 0x300, 0x2284, 0x228c, 0x2080, 0x209d, 0x2004, 0x201c, 0x1000, 0x1100, 0x100c, 0x1014] {
+        for m in [0x200, 0x21c, 0x2034, 0x2084, 0x2084, 0x20a4, 0x300, 0x2290, 0x2294, 0x2080, 0x209d, 0x2004, 0x201c, 0x1000, 0x1100, 0x100c, 0x1014] {
             assert!(!core_method_allowed(0, m), "{m:#x}");
         }
     }

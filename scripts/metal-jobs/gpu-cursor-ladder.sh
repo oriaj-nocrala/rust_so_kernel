@@ -64,6 +64,13 @@ attempt() { # attempt <label>
 }
 attempt "A baseline"
 if [ $enabled = 0 ]; then
+  # D: head 1 has an output LUT (identity, `hdmi::olut_methods`, in VRAM at 0x3e04000 since `gpu=hdmi` boot) and head 0, the GOP's, none while its usage bounds say
+  # OLUT_ALLOWED: HEAD_SET_OLUT_CONTROL 0x40509, FP_NORM_SCALE 0xffffffff, CONTEXT_DMA_OLUT = the LUT handle, OFFSET_OLUT 0x3e040
+  for pair in "0x2280 0x40509" "0x2284 0xffffffff" "0x2288 0xf0000001" "0x228c 0x3e040"; do echo "cursor raw $pair" > /dev/dispctl && sum "gpu-cursor-ladder: head 0 olut $pair ok" || sum "gpu-cursor-ladder: head 0 olut $pair FAILED: $(rawlog | cut -c1-300)"; done
+  sum "gpu-cursor-ladder: output LUT pushed: $(st2)"
+  attempt "D + output LUT"
+fi
+if [ $enabled = 0 ]; then
   for pair in "0x1004 0xf" "0x1008 0" "0x1010 0x117fff"; do echo "cursor raw $pair" > /dev/dispctl && sum "gpu-cursor-ladder: window 0 usage $pair ok" || sum "gpu-cursor-ladder: window 0 usage $pair FAILED: $(rawlog | cut -c1-300)"; done
   sum "gpu-cursor-ladder: window 0 usage bounds pushed: $(st2)"
   attempt "B + window 0 usage bounds"
