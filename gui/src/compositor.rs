@@ -18,6 +18,15 @@
 //! lets a window that gets uncovered be repainted at all, and means a
 //! client scribbling on its pool mid-compose can tear nothing.
 //!
+//! **GPU buffers** (`create_gpu_buffer`, layer 4 of `docs/gpu/g5-graphics-stack-plan.md`) are the exception to
+//! that rule: a GPU compositor reads the client's buffer itself, so nothing is copied and `release` is *not*
+//! sent at `commit`. The buffer stays the surface's content until a later commit replaces it, and then it
+//! is released only once the host says the frame that may have read it is done
+//! ([`Compositor::gpu_frame_done`]). As with everything here, effects come back as data: [`GpuOp`]
+//! (import this descriptor, drop that buffer) and [`Compositor::draw_list`] (what to draw, back to front)
+//! instead of [`Compositor::compose`]'s pixels. Windows with ordinary shm pools (the panel, `term`) keep
+//! working: they come out of the list as [`DrawOp::Cpu`], their store to be uploaded.
+//!
 //! **A buffer that does not fit its pool is a protocol error**, checked at
 //! `create_buffer` against the pool's size — never a read out of bounds.
 //! (A pool cannot shrink under us: `ftruncate` of a mapped memfd is
@@ -64,6 +73,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
+use core::cell::RefCell;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -120,7 +130,7 @@ pub fn title_height_for(height: i32) -> i32 {
 
 /// The software cursor: `X` black, `.` white, space transparent. Hotspot
 /// at its top-left corner.
-const CURSOR: [&[u8; 11]; 16] = [
+pub const CURSOR: [&[u8; 11]; 16] = [
     b"X          ",
     b"XX         ",
     b"X.X        ",
@@ -192,10 +202,87 @@ impl<M> Clone for BufRef<M> {
     }
 }
 
+/// What the host of a GPU compositor must do for the buffers clients create. Taken with [`Compositor::take_gpu_ops`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GpuOp {
+    /// Make the descriptor `fd` (`size` bytes of a client's GPU buffer, rows `stride` bytes apart) readable as buffer `handle`. The host owns
+    /// the descriptor from now on: it closes it, whether or not the import works.
+    Import { handle: u64, fd: i32, size: usize, width: i32, height: i32, stride: usize },
+    /// Nothing refers to `handle` any more. Free it once every frame that was started before this op is done: the GPU may still be reading it.
+    /// Every `Import` is followed by exactly one `Drop`, even when the client was disconnected for the request.
+    Drop { handle: u64 },
+}
+
+type GpuOps = Rc<RefCell<Vec<GpuOp>>>;
+
+/// The compositor's reference to an imported buffer; the last one going away queues `GpuOp::Drop`.
+struct GpuBuf {
+    handle: u64,
+    ops: GpuOps,
+}
+
+impl Drop for GpuBuf {
+    fn drop(&mut self) {
+        self.ops.borrow_mut().push(GpuOp::Drop { handle: self.handle });
+    }
+}
+
+/// A GPU buffer object of a client.
+#[derive(Clone)]
+struct GpuRef {
+    id: u32,
+    serial: u64,
+    w: i32,
+    h: i32,
+    buf: Rc<GpuBuf>,
+}
+
+/// What a surface has attached: a copy-at-commit buffer or a GPU one.
+enum Attached<M> {
+    Cpu(BufRef<M>),
+    Gpu(GpuRef),
+}
+
+/// A replaced GPU buffer waiting for the frames that may have read it.
+struct Retired {
+    client: ClientId,
+    buf: GpuRef,
+    /// Released once frame `after` is done.
+    after: u64,
+}
+
+/// One thing to draw, from [`Compositor::draw_list`]. Rectangles are in screen pixels and already clipped to the screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DrawOp {
+    /// A solid `0x00RRGGBB` rectangle.
+    Fill { rect: Rect, color: u32 },
+    /// `dst` shows the GPU buffer `handle` (see [`GpuOp::Import`]) starting at pixel (`sx`, `sy`) of it, one pixel to one.
+    Gpu { handle: u64, dst: Rect, sx: i32, sy: i32 },
+    /// `dst` shows the pixels [`Compositor::cpu_content`] returns for (`client`, `surface`): `w x h`, from (`sx`, `sy`). `version` changes
+    /// whenever the pixels do.
+    Cpu { client: ClientId, surface: u32, version: u64, dst: Rect, sx: i32, sy: i32, w: i32, h: i32 },
+    /// A window's title, to paint over its bar (colour for `focused`), left-aligned in `area` and touching only `clip`; `id` is stable while
+    /// the window is mapped (a cache key).
+    Title { id: u32, title: String, focused: bool, area: Rect, clip: Rect },
+    /// The pointer, its hotspot at (`x`, `y`): the bitmap is [`CURSOR`].
+    Cursor { x: i32, y: i32 },
+}
+
+/// A fill clipped to the screen.
+fn push_fill(ops: &mut Vec<DrawOp>, scr: Rect, rect: Rect, color: u32) {
+    if let Some(rect) = rect.intersect(&scr) {
+        ops.push(DrawOp::Fill { rect, color });
+    }
+}
+
 struct Surface<M> {
     /// `None`: nothing attached since the last commit. `Some(None)`: a null
     /// attach (unmap at commit).
-    pending_buffer: Option<Option<BufRef<M>>>,
+    pending_buffer: Option<Option<Attached<M>>>,
+    /// The GPU buffer that is the content now (then `store` is empty).
+    gpu: Option<GpuRef>,
+    /// Counts the commits that changed the content: a host that keeps a copy of the store uploads it when this moves.
+    version: u64,
     pending_damage: Region,
     pending_frames: Vec<u32>,
     title: String,
@@ -255,6 +342,7 @@ impl<M> Surface<M> {
 enum Object<M> {
     Pool { mem: Rc<M>, size: usize },
     Buffer(BufRef<M>),
+    GpuBuffer(GpuRef),
     Surface(Surface<M>),
     Callback,
 }
@@ -263,7 +351,7 @@ impl<M> Object<M> {
     fn interface(&self) -> Interface {
         match self {
             Object::Pool { .. } => Interface::Pool,
-            Object::Buffer(_) => Interface::Buffer,
+            Object::Buffer(_) | Object::GpuBuffer(_) => Interface::Buffer,
             Object::Surface(_) => Interface::Surface,
             Object::Callback => Interface::Callback,
         }
@@ -339,6 +427,14 @@ pub struct Compositor<M> {
     events: Vec<(ClientId, Event)>,
     disconnects: Vec<ClientId>,
     fds_to_close: Vec<i32>,
+    /// `create_gpu_buffer` is only for a host that composes on the GPU ([`Compositor::enable_gpu_buffers`]); the CPU painter cannot show one.
+    gpu_enabled: bool,
+    gpu_ops: GpuOps,
+    next_gpu_handle: u64,
+    retired: Vec<Retired>,
+    /// The last frame handed out by `draw_list`, and the last the host said is done.
+    epoch_issued: u64,
+    epoch_done: u64,
 }
 
 impl<M: PoolMem> Compositor<M> {
@@ -375,6 +471,12 @@ impl<M: PoolMem> Compositor<M> {
             events: Vec::new(),
             disconnects: Vec::new(),
             fds_to_close: Vec::new(),
+            gpu_enabled: false,
+            gpu_ops: Rc::new(RefCell::new(Vec::new())),
+            next_gpu_handle: 1,
+            retired: Vec::new(),
+            epoch_issued: 0,
+            epoch_done: 0,
         }
     }
 
@@ -435,6 +537,7 @@ impl<M: PoolMem> Compositor<M> {
             }
         }
         self.frame_waiting.retain(|(fc, _)| *fc != c);
+        self.retired.retain(|r| r.client != c);
     }
 
     fn fail(&mut self, c: ClientId, object: u32, code: ErrorCode, message: &str) {
@@ -533,6 +636,8 @@ impl<M: PoolMem> Compositor<M> {
             Request::CreateSurface { id } => {
                 let s = Surface {
                     pending_buffer: None,
+                    gpu: None,
+                    version: 0,
                     pending_damage: Region::new(),
                     pending_frames: Vec::new(),
                     title: String::new(),
@@ -562,6 +667,35 @@ impl<M: PoolMem> Compositor<M> {
                     self.destroy_object(c, id);
                 }
             }
+            Request::CreateGpuBuffer { id, fd, size, width, height, stride, format } => {
+                let size = size as usize;
+                if !self.gpu_enabled {
+                    self.fds_to_close.push(fd);
+                    return self.fail(c, crate::protocol::COMPOSITOR_ID, ErrorCode::InvalidMethod, "this compositor has no GPU buffers");
+                }
+                if format != FORMAT_XRGB8888 {
+                    self.fds_to_close.push(fd);
+                    return self.fail(c, crate::protocol::COMPOSITOR_ID, ErrorCode::InvalidFormat, "only XRGB8888");
+                }
+                let fits = width > 0
+                    && height > 0
+                    && width <= MAX_SIDE
+                    && height <= MAX_SIDE
+                    && stride >= width * 4
+                    && stride % 4 == 0
+                    && (stride as u64) * (height as u64 - 1) + (width as u64) * 4 <= size as u64;
+                if !fits {
+                    self.fds_to_close.push(fd);
+                    return self.fail(c, crate::protocol::COMPOSITOR_ID, ErrorCode::InvalidBuffer, "buffer larger than its descriptor");
+                }
+                let handle = self.next_gpu_handle;
+                self.next_gpu_handle += 1;
+                self.buffers_created += 1;
+                // The import is queued first: a rejected id (the client is dropped below) still gets its `Drop`, so the host sees pairs.
+                self.gpu_ops.borrow_mut().push(GpuOp::Import { handle, fd, size, width, height, stride: stride as usize });
+                let buf = Rc::new(GpuBuf { handle, ops: self.gpu_ops.clone() });
+                self.new_object(c, id, Object::GpuBuffer(GpuRef { id, serial: self.buffers_created, w: width, h: height, buf }));
+            }
             Request::CreateBuffer { pool, id, offset, width, height, stride, format } => {
                 let Some(Object::Pool { mem, size }) = self.clients[&c].objects.get(&pool) else { unreachable!() };
                 let (mem, size) = (mem.clone(), *size);
@@ -588,7 +722,8 @@ impl<M: PoolMem> Compositor<M> {
                     None
                 } else {
                     match self.clients[&c].objects.get(&buffer) {
-                        Some(Object::Buffer(b)) => Some(b.clone()),
+                        Some(Object::Buffer(b)) => Some(Attached::Cpu(b.clone())),
+                        Some(Object::GpuBuffer(g)) => Some(Attached::Gpu(g.clone())),
                         _ => return self.fail(c, buffer, ErrorCode::InvalidObject, "not a buffer"),
                     }
                 };
@@ -694,6 +829,7 @@ impl<M: PoolMem> Compositor<M> {
         let damage = core::mem::take(&mut s.pending_damage);
         let mut screen_damage = Region::new();
         let mut released = None;
+        let mut retire: Option<GpuRef> = None;
         let mut newly_mapped = false;
         let mut unmapped = false;
         match s.pending_buffer.take() {
@@ -704,46 +840,76 @@ impl<M: PoolMem> Compositor<M> {
                     s.mapped = false;
                     unmapped = true;
                 }
+                retire = s.gpu.take();
             }
-            Some(Some(b)) => {
+            Some(Some(att)) => {
+                let (bw, bh, bserial) = match &att {
+                    Attached::Cpu(b) => (b.w, b.h, b.serial),
+                    Attached::Gpu(g) => (g.w, g.h, g.serial),
+                };
+                let full = Region::from_rect(Rect::new(0, 0, bw, bh));
                 let mut dmg = damage;
-                let new_size = b.w != s.w || b.h != s.h;
-                if new_size {
-                    s.w = b.w;
-                    s.h = b.h;
-                    s.store = alloc::vec![0; (b.w * b.h) as usize];
-                    dmg = Region::from_rect(Rect::new(0, 0, b.w, b.h));
+                if bw != s.w || bh != s.h {
+                    s.w = bw;
+                    s.h = bh;
+                    dmg = full.clone();
+                }
+                match &att {
+                    Attached::Cpu(_) => {
+                        if s.store.len() != (bw * bh) as usize {
+                            s.store = alloc::vec![0; (bw * bh) as usize];
+                            dmg = full.clone();
+                        }
+                    }
+                    // the host reads the whole buffer every frame
+                    Attached::Gpu(_) => {
+                        s.store = Vec::new();
+                        dmg = full.clone();
+                    }
                 }
                 // The frame follows the buffer, except for one from before
                 // our `resize` (see the module doc).
-                let answers = s.resize_pending.is_none_or(|ser| b.serial > ser);
+                let answers = s.resize_pending.is_none_or(|ser| bserial > ser);
                 if answers {
                     s.resize_pending = None;
-                    if (s.fw, s.fh) != (b.w, b.h) {
+                    if (s.fw, s.fh) != (bw, bh) {
                         if s.mapped {
                             screen_damage.add(s.frame(th)); // the old frame
                         }
-                        s.fw = b.w;
-                        s.fh = b.h;
+                        s.fw = bw;
+                        s.fh = bh;
                         screen_damage.add(s.frame(th));
                     }
                 }
                 if !s.mapped {
-                    dmg = Region::from_rect(Rect::new(0, 0, b.w, b.h));
+                    dmg = full.clone();
                     if let Some(ph) = panel {
                         s.x = 0;
                         s.y = sh - ph;
                     } else {
                         // Cascade from the top-left, kept in the work area.
                         let step = 32 * (placed % 8);
-                        s.x = (work.x + 40 + step).min((work.right() - b.w).max(work.x));
-                        s.y = (work.y + 40 + step).min((work.bottom() - b.h - th).max(work.y));
+                        s.x = (work.x + 40 + step).min((work.right() - bw).max(work.x));
+                        s.y = (work.y + 40 + step).min((work.bottom() - bh - th).max(work.y));
                     }
                     s.mapped = true;
                     newly_mapped = true;
                 }
-                dmg.intersect(Rect::new(0, 0, b.w, b.h));
-                copy_damage(&b, &mut s.store, &dmg);
+                dmg.intersect(Rect::new(0, 0, bw, bh));
+                match att {
+                    Attached::Cpu(b) => {
+                        copy_damage(&b, &mut s.store, &dmg);
+                        retire = s.gpu.take();
+                        released = Some(b.id);
+                    }
+                    Attached::Gpu(g) => {
+                        // the same buffer committed again keeps its place; another one replaces (and retires) the old
+                        if !s.gpu.as_ref().is_some_and(|o| Rc::ptr_eq(&o.buf, &g.buf)) {
+                            retire = s.gpu.replace(g);
+                        }
+                    }
+                }
+                s.version += 1;
                 let mut on_screen = dmg.clone();
                 let content = s.content(th);
                 on_screen.translate(content.x, content.y);
@@ -751,11 +917,13 @@ impl<M: PoolMem> Compositor<M> {
                 if newly_mapped {
                     screen_damage.add(s.frame(th));
                 }
-                released = Some(b.id);
             }
         }
         let title = s.title.clone();
         self.damage.add_region(&screen_damage);
+        if let Some(g) = retire {
+            self.retire_gpu(c, g);
+        }
         if let Some(id) = released {
             self.events.push((c, Event::Release { buffer: id }));
         }
@@ -773,6 +941,53 @@ impl<M: PoolMem> Compositor<M> {
         if unmapped {
             self.forget_surface(key);
         }
+    }
+
+    /// A GPU buffer stopped being a surface's content: tell its client it may reuse it, once the frames that may have read it are done.
+    fn retire_gpu(&mut self, c: ClientId, buf: GpuRef) {
+        if self.epoch_issued <= self.epoch_done {
+            self.release_gpu(c, &buf);
+        } else {
+            self.retired.push(Retired { client: c, buf, after: self.epoch_issued });
+        }
+    }
+
+    /// `release` for a GPU buffer, if the client still has that object (a destroyed one, whose id may be in use again, gets nothing).
+    fn release_gpu(&mut self, c: ClientId, buf: &GpuRef) {
+        let alive = matches!(
+            self.clients.get(&c).and_then(|cl| cl.objects.get(&buf.id)),
+            Some(Object::GpuBuffer(g)) if Rc::ptr_eq(&g.buf, &buf.buf)
+        );
+        if alive {
+            self.events.push((c, Event::Release { buffer: buf.id }));
+        }
+    }
+
+    /// The host finished frame `epoch` (as handed out by [`Compositor::draw_list`]; frames complete in order): the GPU buffers replaced
+    /// before it was started are released to their clients.
+    pub fn gpu_frame_done(&mut self, epoch: u64) {
+        self.epoch_done = self.epoch_done.max(epoch);
+        let done = self.epoch_done;
+        let mut i = 0;
+        while i < self.retired.len() {
+            if self.retired[i].after <= done {
+                let r = self.retired.remove(i);
+                self.release_gpu(r.client, &r.buf);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Accept `create_gpu_buffer` (the host takes [`GpuOp`]s and composes from [`Compositor::draw_list`]). Off by default: a client that
+    /// sends one to a compositor that paints on the CPU is disconnected, as for any request it does not have.
+    pub fn enable_gpu_buffers(&mut self) {
+        self.gpu_enabled = true;
+    }
+
+    /// What the GPU host has to do about buffers since the last call, in order.
+    pub fn take_gpu_ops(&mut self) -> Vec<GpuOp> {
+        core::mem::take(&mut *self.gpu_ops.borrow_mut())
     }
 
     /// Takes `key` out of the stack, the window list and every input role
@@ -1234,6 +1449,126 @@ impl<M: PoolMem> Compositor<M> {
         out
     }
 
+    // ── the draw list (GPU compositors) ───────────────────────────────────
+
+    /// Everything on screen as drawing operations, back to front, for a host that composes on the GPU: the whole screen every time (a GPU
+    /// does not mind), clipped to it. Returns the frame's number, which the host gives back to [`Compositor::gpu_frame_done`] when the GPU is
+    /// done with the frame, and clears the damage. The pixels are what [`Compositor::compose`] would paint (a test rasterises both and
+    /// compares); only the title text, the cursor's bitmap and the pixels of buffers are left to the host.
+    pub fn draw_list(&mut self) -> (u64, Vec<DrawOp>) {
+        self.epoch_issued += 1;
+        let scr = self.screen();
+        let mut ops = Vec::new();
+        push_fill(&mut ops, scr, scr, BACKGROUND);
+        for key in self.stack.clone() {
+            self.ops_surface(key, scr, &mut ops);
+        }
+        if let Some((k, _)) = self.panel {
+            if self.surface(k).is_some_and(|s| s.mapped) {
+                self.ops_surface(k, scr, &mut ops);
+            }
+        }
+        if let Some(rs) = &self.resize {
+            for e in self.outline_edges(rs.outline) {
+                push_fill(&mut ops, scr, e, OUTLINE);
+            }
+        }
+        if self.cursor_rect().intersect(&scr).is_some() {
+            ops.push(DrawOp::Cursor { x: self.pointer.0, y: self.pointer.1 });
+        }
+        self.damage.clear();
+        (self.epoch_issued, ops)
+    }
+
+    /// The pixels of a window that is not a GPU buffer (`w x h`, rows `w` pixels long), for a host to upload when its `version`
+    /// (in [`DrawOp::Cpu`]) changes.
+    pub fn cpu_content(&self, client: ClientId, surface: u32) -> Option<&[u32]> {
+        let s = self.surface((client, surface))?;
+        (!s.store.is_empty()).then_some(&s.store[..])
+    }
+
+    /// [`Compositor::paint_surface`] as operations, unclipped by damage (`scr` clips).
+    fn ops_surface(&self, key: Key, scr: Rect, ops: &mut Vec<DrawOp>) {
+        let th = self.th;
+        let s = self.surface(key).unwrap();
+        if s.decorated {
+            let focused = self.focus == Some(key);
+            let bar_color = if focused { TITLE_FOCUSED } else { TITLE_UNFOCUSED };
+            if let Some(t) = s.title_bar(th).intersect(&scr) {
+                push_fill(ops, scr, t, bar_color);
+                let pad = 6 * self.scale;
+                let left = s.x + pad;
+                let area = Rect::new(left, s.y, (s.buttons_left(th) - pad - left).max(0), th);
+                if let Some(clip) = area.intersect(&t) {
+                    ops.push(DrawOp::Title { id: s.tid, title: s.title.clone(), focused, area, clip });
+                }
+                let pressed = self.pressed.filter(|(k, _)| *k == key).map(|(_, b)| b);
+                let close = s.close_button(th);
+                if pressed == Some(ButtonKind::Close) {
+                    if let Some(c) = close.intersect(&t) {
+                        push_fill(ops, scr, c, CLOSE_PRESSED);
+                    }
+                }
+                self.ops_glyph_x(close, t, scr, ops);
+                if let Some(m) = s.max_button(th) {
+                    if pressed == Some(ButtonKind::Maximize) {
+                        if let Some(c) = m.intersect(&t) {
+                            push_fill(ops, scr, c, TITLE_UNFOCUSED);
+                        }
+                    }
+                    self.ops_glyph_square(m, t, scr, ops);
+                }
+            }
+        }
+        let content = s.content(th);
+        if let Some(i) = content.intersect(&scr) {
+            let shown = Rect::new(content.x, content.y, s.w.min(s.fw), s.h.min(s.fh));
+            let covered = shown.intersect(&i);
+            let mut rest = Region::from_rect(i);
+            if let Some(cv) = covered {
+                rest.subtract(cv);
+            }
+            for f in rest.rects() {
+                push_fill(ops, scr, *f, WINDOW_BG);
+            }
+            if let Some(cv) = covered {
+                let (sx, sy) = (cv.x - content.x, cv.y - content.y);
+                if let Some(g) = &s.gpu {
+                    ops.push(DrawOp::Gpu { handle: g.buf.handle, dst: cv, sx, sy });
+                } else if !s.store.is_empty() {
+                    ops.push(DrawOp::Cpu { client: key.0, surface: key.1, version: s.version, dst: cv, sx, sy, w: s.w, h: s.h });
+                }
+            }
+        }
+    }
+
+    fn ops_glyph_x(&self, b: Rect, clip: Rect, scr: Rect, ops: &mut Vec<DrawOp>) {
+        let (x0, y0, side) = self.glyph_box(b);
+        let t = self.scale;
+        for i in 0..side {
+            for (px, py) in [(x0 + i, y0 + i), (x0 + side - 1 - i, y0 + i)] {
+                if let Some(p) = Rect::new(px, py, t, t).intersect(&clip).and_then(|p| p.intersect(&b)) {
+                    push_fill(ops, scr, p, BUTTON_FG);
+                }
+            }
+        }
+    }
+
+    fn ops_glyph_square(&self, b: Rect, clip: Rect, scr: Rect, ops: &mut Vec<DrawOp>) {
+        let (x0, y0, side) = self.glyph_box(b);
+        let t = self.scale;
+        for e in [
+            Rect::new(x0, y0, side, t),
+            Rect::new(x0, y0 + side - t, side, t),
+            Rect::new(x0, y0, t, side),
+            Rect::new(x0 + side - t, y0, t, side),
+        ] {
+            if let Some(p) = e.intersect(&clip).and_then(|p| p.intersect(&b)) {
+                push_fill(ops, scr, p, BUTTON_FG);
+            }
+        }
+    }
+
     fn paint_surface(&self, key: Key, r: Rect, dst: &mut [u32], stride: usize, paint_title: &mut PaintTitle) {
         let th = self.th;
         let s = self.surface(key).unwrap();
@@ -1269,7 +1604,8 @@ impl<M: PoolMem> Compositor<M> {
         let content = s.content(th);
         if let Some(i) = content.intersect(&r) {
             let shown = Rect::new(content.x, content.y, s.w.min(s.fw), s.h.min(s.fh));
-            let covered = shown.intersect(&i);
+            // (a GPU buffer has no store to copy from: this painter shows the background for it)
+            let covered = shown.intersect(&i).filter(|_| !s.store.is_empty());
             // Whatever the buffer does not cover yet.
             let mut rest = Region::from_rect(i);
             if let Some(cv) = covered {

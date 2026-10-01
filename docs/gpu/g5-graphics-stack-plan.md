@@ -59,7 +59,7 @@ Decisión (2026-09-30, usuario + análisis): **WSI estándar de Vulkan como cimi
 
 ## Siguiente paso
 
-Capa 4, rebanada 1 (arriba): protocolo y modo GPU del gestor de ventanas en el crate `gui`.
+Capa 4, **rebanada 2** (arriba): el cliente (`nvk_constanos_surface_create` + swapchain ventanado, `create_gpu_buffer` en `constanos_gui_wire.h`) y un compositor de mentira en C que importa el BO. La rebanada 1 está hecha (`gui`: `create_gpu_buffer`, `GpuOp`, `draw_list`, `release` diferido; 62 tests de host, 20 mutantes detectados, ver `docs/reference/graphics.md` "GPU buffers").
 
 ## Notas para la capa 3 (WSI), para quien retome
 

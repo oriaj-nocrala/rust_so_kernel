@@ -6,11 +6,17 @@
 //!
 //! | interface  | requests (opcode)                                                        | events (opcode) |
 //! |------------|--------------------------------------------------------------------------|-----------------|
-//! | compositor | create_pool(id, fd, size) 0, create_surface(id) 1, sync(id) 2            | error(obj, code, msg) 0, delete_id(id) 1 |
+//! | compositor | create_pool(id, fd, size) 0, create_surface(id) 1, sync(id) 2, create_gpu_buffer(id, fd, size, w, h, stride, format) 3 | error(obj, code, msg) 0, delete_id(id) 1 |
 //! | pool       | create_buffer(id, offset, w, h, stride, format) 0, destroy 1             | — |
 //! | buffer     | destroy 0                                                                | release 0 |
 //! | surface    | attach(buffer) 0, damage(x, y, w, h) 1, frame(id) 2, commit 3, set_title(s) 4, destroy 5, lock_pointer(on) 6, set_resizable(min_w, min_h) 7, set_panel(height) 8, activate(toplevel) 9 | configure(w, h) 0, focus(in) 1, key(code, state) 2, motion(x, y) 3, button(code, state) 4, relative_motion(dx, dy) 5, resize(w, h) 6, close 7, toplevel(id, title) 8, toplevel_focus(id) 9, toplevel_gone(id) 10 |
 //! | callback   | —                                                                        | done(ms) 0 |
+//!
+//! `create_gpu_buffer` makes a buffer (a `buffer` object: `destroy`, `release`) out of a GPU
+//! buffer the client exports as a descriptor (`/dev/nvgpu`'s `BO_EXPORT`): the compositor does not
+//! copy it, it reads it on the GPU, so the buffer stays in use until the client's next `commit` has
+//! replaced it *and* the compositor's frame that read it is done; only then is `release` sent.
+//! The client must have finished writing it (waited for its GPU work) before `commit`.
 //!
 //! It folds `wl_display`, `wl_compositor`, `wl_shm`, `wl_surface`,
 //! `xdg_toplevel` and `wl_seat` into five interfaces; porting libwayland
@@ -74,6 +80,8 @@ pub enum Request {
     CreatePool { id: u32, fd: i32, size: u32 },
     CreateSurface { id: u32 },
     Sync { id: u32 },
+    /// A buffer that lives on the GPU: `fd` is a descriptor of `size` bytes of it, `stride` bytes per row.
+    CreateGpuBuffer { id: u32, fd: i32, size: u32, width: i32, height: i32, stride: i32, format: u32 },
     CreateBuffer { pool: u32, id: u32, offset: i32, width: i32, height: i32, stride: i32, format: u32 },
     DestroyPool { pool: u32 },
     DestroyBuffer { buffer: u32 },
@@ -155,6 +163,13 @@ impl Request {
             }
             (Interface::Compositor, 1) => Request::CreateSurface { id: a.uint()? },
             (Interface::Compositor, 2) => Request::Sync { id: a.uint()? },
+            (Interface::Compositor, 3) => {
+                let (id, size) = (a.uint()?, a.uint()?);
+                let (width, height, stride, format) = (a.int()?, a.int()?, a.int()?, a.uint()?);
+                a.finish()?;
+                let fd = fds.take_fd()?;
+                Request::CreateGpuBuffer { id, fd, size, width, height, stride, format }
+            }
             (Interface::Pool, 0) => Request::CreateBuffer {
                 pool: obj,
                 id: a.uint()?,
@@ -187,6 +202,9 @@ impl Request {
             Request::CreatePool { id, fd, size } => e.begin(COMPOSITOR_ID, 0).uint(*id).fd(*fd).uint(*size),
             Request::CreateSurface { id } => e.begin(COMPOSITOR_ID, 1).uint(*id),
             Request::Sync { id } => e.begin(COMPOSITOR_ID, 2).uint(*id),
+            Request::CreateGpuBuffer { id, fd, size, width, height, stride, format } => {
+                e.begin(COMPOSITOR_ID, 3).uint(*id).fd(*fd).uint(*size).int(*width).int(*height).int(*stride).uint(*format)
+            }
             Request::CreateBuffer { pool, id, offset, width, height, stride, format } => e
                 .begin(*pool, 0)
                 .uint(*id)
@@ -292,6 +310,7 @@ mod tests {
             (Interface::Compositor, Request::CreatePool { id: 2, fd: 17, size: 4096 }),
             (Interface::Compositor, Request::CreateSurface { id: 3 }),
             (Interface::Compositor, Request::Sync { id: 9 }),
+            (Interface::Compositor, Request::CreateGpuBuffer { id: 5, fd: 21, size: 8_294_400, width: 1920, height: 1080, stride: 7680, format: 1 }),
             (Interface::Pool, Request::CreateBuffer { pool: 2, id: 4, offset: 0, width: 10, height: 20, stride: 40, format: 1 }),
             (Interface::Pool, Request::DestroyPool { pool: 2 }),
             (Interface::Buffer, Request::DestroyBuffer { buffer: 4 }),
@@ -316,7 +335,7 @@ mod tests {
             r.encode(&mut e);
         }
         let (bytes, fds) = e.take();
-        assert_eq!(fds, vec![17]);
+        assert_eq!(fds, vec![17, 21]);
         let mut d = Decoder::new();
         d.push_bytes(&bytes);
         d.push_fds(&fds);

@@ -887,3 +887,464 @@ fn titles_are_painted_by_the_caller_inside_their_area() {
     h.send(c, &[R::SetTitle { surface: 4, title: "adiós".into() }]);
     assert!(h.comp.damage().contains(50, 45));
 }
+
+// ── GPU buffers and the draw list (layer 4 of docs/gpu/g5-graphics-stack-plan.md) ──────────────────────────────────────────────────────
+
+/// What a host's GPU would make of a draw list, in plain CPU memory: the oracle compares it with `compose`.
+fn raster(ops: &[DrawOp], comp: &Compositor<Mem>, gpu: &BTreeMap<u64, (i32, Vec<u32>)>) -> Vec<u32> {
+    let mut out = vec![PAD; STRIDE * H as usize];
+    for op in ops {
+        match op {
+            DrawOp::Fill { rect, color } => fill(&mut out, STRIDE, *rect, *color),
+            DrawOp::Gpu { handle, dst, sx, sy } => {
+                let (w, px) = &gpu[handle];
+                for y in 0..dst.h {
+                    for x in 0..dst.w {
+                        out[(dst.y + y) as usize * STRIDE + (dst.x + x) as usize] = px[((sy + y) * w + sx + x) as usize];
+                    }
+                }
+            }
+            DrawOp::Cpu { client, surface, dst, sx, sy, w, .. } => {
+                let px = comp.cpu_content(*client, *surface).unwrap();
+                for y in 0..dst.h {
+                    for x in 0..dst.w {
+                        out[(dst.y + y) as usize * STRIDE + (dst.x + x) as usize] = px[((sy + y) * w + sx + x) as usize];
+                    }
+                }
+            }
+            DrawOp::Title { .. } => {}
+            DrawOp::Cursor { x, y } => {
+                for (cy, row) in CURSOR.iter().enumerate() {
+                    for (cx, c) in row.iter().enumerate() {
+                        let (px, py) = (x + cx as i32, y + cy as i32);
+                        if px < 0 || py < 0 || px >= W || py >= H {
+                            continue;
+                        }
+                        let v = match c {
+                            b'X' => 0,
+                            b'.' => 0x00FF_FFFF,
+                            _ => continue,
+                        };
+                        out[py as usize * STRIDE + px as usize] = v;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The screen rows of both pictures, without the padding columns.
+fn same_picture(a: &[u32], b: &[u32]) -> Option<(i32, i32)> {
+    for y in 0..H {
+        for x in 0..W {
+            if a[y as usize * STRIDE + x as usize] != b[y as usize * STRIDE + x as usize] {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn the_draw_list_paints_what_compose_paints() {
+    let mut h = gpu_h();
+    // three overlapping windows (one of them resizable, so a maximize button), a panel, a pressed close button, a resize outline's absence
+    let a = h.window(120, 60, 0x00AA_0000);
+    let b = h.window(100, 80, 0x0000_AA00);
+    let c = h.window(90, 40, 0x0000_00AA);
+    h.send(b, &[R::SetResizable { surface: 4, min_w: 50, min_h: 30 }]);
+    let p = h.comp.add_client();
+    h.pool(500, 320 * 16 * 4);
+    h.draw(500, 0, 320 * 4, 0, 0, 320, 16, 0x0080_8080);
+    h.send(p, &[
+        R::CreatePool { id: 2, fd: 500, size: 320 * 16 * 4 },
+        R::CreateBuffer { pool: 2, id: 3, offset: 0, width: 320, height: 16, stride: 320 * 4, format: FORMAT_XRGB8888 },
+        R::CreateSurface { id: 4 },
+        R::SetPanel { surface: 4, height: 16 },
+        R::Attach { surface: 4, buffer: 3 },
+        R::Commit { surface: 4 },
+    ]);
+    let _ = (a, c);
+    // press the close button of the focused (top) window and park the pointer over a window
+    let f = h.comp.window_frame(c, 4).unwrap();
+    h.comp.pointer_motion(f.right() - 5 - h.comp.pointer().0, f.y + 5 - h.comp.pointer().1);
+    h.comp.pointer_button(BTN_LEFT, true);
+    h.compose();
+    let want = h.screen.clone();
+    let (epoch, ops) = h.comp.draw_list();
+    assert_eq!(epoch, 1);
+    let got = raster(&ops, &h.comp, &BTreeMap::new());
+    assert_eq!(same_picture(&got, &want), None, "the first differing pixel");
+    assert!(ops.iter().any(|o| matches!(o, DrawOp::Title { focused: true, .. })));
+    assert!(ops.iter().any(|o| matches!(o, DrawOp::Fill { color: CLOSE_PRESSED, .. })), "the pressed close button is in the list");
+    assert!(!h.comp.has_damage(), "a draw list takes the damage");
+    // and again after the pointer moved and a window was dragged: the whole screen every time, the same as a full recompose
+    h.comp.pointer_button(BTN_LEFT, false);
+    h.comp.pointer_motion(-60, 30);
+    h.comp.damage.add(Rect::new(0, 0, W, H));
+    h.compose();
+    let (epoch2, ops2) = h.comp.draw_list();
+    assert_eq!(epoch2, 2);
+    assert_eq!(same_picture(&raster(&ops2, &h.comp, &BTreeMap::new()), &h.screen), None);
+}
+
+#[test]
+fn the_draw_list_clips_to_the_screen() {
+    let mut h = gpu_h();
+    let c = h.window(100, 50, 0x00FF_FF00);
+    // drag the window half off the right edge
+    let f = h.comp.window_frame(c, 4).unwrap();
+    h.comp.pointer_motion(f.x + 10 - h.comp.pointer().0, f.y + 5 - h.comp.pointer().1);
+    h.comp.pointer_button(BTN_LEFT, true);
+    h.comp.pointer_motion(W - 60, 0);
+    h.comp.pointer_button(BTN_LEFT, false);
+    h.compose();
+    let (_, ops) = h.comp.draw_list();
+    let scr = Rect::new(0, 0, W, H);
+    for op in &ops {
+        let r = match op {
+            DrawOp::Fill { rect, .. } => *rect,
+            DrawOp::Gpu { dst, .. } | DrawOp::Cpu { dst, .. } => *dst,
+            _ => continue,
+        };
+        assert_eq!(r.intersect(&scr), Some(r), "{:?} sticks out of the screen", op);
+    }
+    assert_eq!(same_picture(&raster(&ops, &h.comp, &BTreeMap::new()), &h.screen), None);
+}
+
+/// A GPU buffer for a client: its descriptor is the fake fd `fd`, ids: buffer `id`.
+fn gpu_h() -> H_ {
+    let mut h = H_::new();
+    h.comp.enable_gpu_buffers();
+    h
+}
+
+fn gpu_buffer(id: u32, fd: i32, w: i32, h: i32) -> Request {
+    R::CreateGpuBuffer { id, fd, size: (w * h * 4) as u32, width: w, height: h, stride: w * 4, format: FORMAT_XRGB8888 }
+}
+
+fn import_of(ops: &[GpuOp], handle: u64) -> Option<&GpuOp> {
+    ops.iter().find(|o| matches!(o, GpuOp::Import { handle: h, .. } if *h == handle))
+}
+
+#[test]
+fn a_gpu_buffer_is_imported_by_the_host_and_is_not_a_pool() {
+    let mut h = gpu_h();
+    let c = h.comp.add_client();
+    h.send(c, &[gpu_buffer(3, 77, 64, 32)]);
+    assert_eq!(h.mapped_fds, Vec::<i32>::new(), "the pool callback is not asked to map it");
+    assert_eq!(h.comp.take_fds_to_close(), Vec::<i32>::new(), "the host owns the descriptor now");
+    assert_eq!(h.comp.take_gpu_ops(), vec![GpuOp::Import { handle: 1, fd: 77, size: 64 * 32 * 4, width: 64, height: 32, stride: 256 }]);
+    assert_eq!(h.comp.take_gpu_ops(), vec![], "taken once");
+    assert!(h.events_for(c).is_empty());
+}
+
+#[test]
+fn a_gpu_window_is_drawn_from_its_buffer_and_not_released_at_commit() {
+    let mut h = gpu_h();
+    let c = h.comp.add_client();
+    h.send(c, &[gpu_buffer(3, 77, 64, 32), R::CreateSurface { id: 4 }, R::Attach { surface: 4, buffer: 3 }, R::Commit { surface: 4 }]);
+    assert_eq!(h.events_for(c), vec![Event::Configure { surface: 4, width: W / 2, height: H / 2 }, Event::Focus { surface: 4, focused: true }], "no release");
+    assert!(h.comp.has_damage());
+    let f = h.comp.window_frame(c, 4).unwrap();
+    assert_eq!(f, Rect::new(40, 40, 64, 32 + TITLE_H));
+    let (_, ops) = h.comp.draw_list();
+    assert!(ops.contains(&DrawOp::Gpu { handle: 1, dst: Rect::new(40, 40 + TITLE_H, 64, 32), sx: 0, sy: 0 }));
+    assert!(h.comp.cpu_content(c, 4).is_none(), "nothing was copied");
+    // the picture, with the buffer's pixels
+    let px: Vec<u32> = (0..64 * 32).map(|i| 0x0100_0000 + i as u32).collect();
+    let mut gpu = BTreeMap::new();
+    gpu.insert(1u64, (64, px.clone()));
+    let pic = raster(&ops, &h.comp, &gpu);
+    assert_eq!(pic[(40 + TITLE_H) as usize * STRIDE + 40], px[0]);
+    assert_eq!(pic[(40 + TITLE_H + 31) as usize * STRIDE + 40 + 63], px[31 * 64 + 63]);
+}
+
+#[test]
+fn a_replaced_gpu_buffer_is_released_only_when_the_frame_that_read_it_is_done() {
+    let mut h = gpu_h();
+    let c = h.comp.add_client();
+    h.send(c, &[gpu_buffer(3, 77, 64, 32), gpu_buffer(5, 78, 64, 32), R::CreateSurface { id: 4 }, R::Attach { surface: 4, buffer: 3 }, R::Commit { surface: 4 }]);
+    h.events_for(c);
+    let (e1, _) = h.comp.draw_list(); // frame 1 reads buffer 3
+    // the client moves on to buffer 5
+    h.send(c, &[R::Attach { surface: 4, buffer: 5 }, R::Commit { surface: 4 }]);
+    assert!(h.events_for(c).is_empty(), "frame {} may still be reading it", e1);
+    let (e2, ops2) = h.comp.draw_list(); // frame 2 reads buffer 5
+    assert!(ops2.iter().any(|o| matches!(o, DrawOp::Gpu { handle: 2, .. })));
+    assert!(!ops2.iter().any(|o| matches!(o, DrawOp::Gpu { handle: 1, .. })));
+    h.comp.gpu_frame_done(0);
+    assert!(h.events_for(c).is_empty(), "nothing is done yet");
+    h.comp.gpu_frame_done(e1);
+    assert_eq!(h.events_for(c), vec![Event::Release { buffer: 3 }]);
+    h.comp.gpu_frame_done(e1);
+    h.comp.gpu_frame_done(e2);
+    assert!(h.events_for(c).is_empty(), "once");
+    // 3 is the client's again (its handle is dropped only when the object goes too: the surface let go, the client still has it)
+    assert_eq!(h.comp.take_gpu_ops().iter().filter(|o| matches!(o, GpuOp::Drop { .. })).count(), 0);
+}
+
+#[test]
+fn a_buffer_replaced_before_any_frame_was_started_is_released_at_once() {
+    let mut h = gpu_h();
+    let c = h.comp.add_client();
+    h.send(c, &[gpu_buffer(3, 77, 64, 32), gpu_buffer(5, 78, 64, 32), R::CreateSurface { id: 4 }, R::Attach { surface: 4, buffer: 3 }, R::Commit { surface: 4 }]);
+    h.events_for(c);
+    h.send(c, &[R::Attach { surface: 4, buffer: 5 }, R::Commit { surface: 4 }]);
+    assert_eq!(h.events_for(c), vec![Event::Release { buffer: 3 }], "no frame has read it: nothing to wait for");
+}
+
+#[test]
+fn the_same_gpu_buffer_committed_again_stays_and_is_not_released() {
+    let mut h = gpu_h();
+    let c = h.comp.add_client();
+    h.send(c, &[gpu_buffer(3, 77, 64, 32), R::CreateSurface { id: 4 }, R::Attach { surface: 4, buffer: 3 }, R::Commit { surface: 4 }]);
+    h.comp.draw_list();
+    h.events_for(c);
+    h.send(c, &[R::Attach { surface: 4, buffer: 3 }, R::Damage { surface: 4, x: 0, y: 0, w: 8, h: 8 }, R::Commit { surface: 4 }]);
+    assert!(h.comp.has_damage(), "a new frame of the same buffer repaints");
+    let (e, _) = h.comp.draw_list();
+    h.comp.gpu_frame_done(e);
+    assert!(h.events_for(c).is_empty());
+    assert_eq!(h.comp.take_gpu_ops().iter().filter(|o| matches!(o, GpuOp::Drop { .. })).count(), 0);
+}
+
+#[test]
+fn a_destroyed_gpu_buffer_gets_no_release_and_is_dropped_when_replaced() {
+    let mut h = gpu_h();
+    let c = h.comp.add_client();
+    h.send(c, &[gpu_buffer(3, 77, 64, 32), gpu_buffer(5, 78, 64, 32), R::CreateSurface { id: 4 }, R::Attach { surface: 4, buffer: 3 }, R::Commit { surface: 4 }]);
+    h.events_for(c);
+    let (e1, _) = h.comp.draw_list();
+    h.send(c, &[R::DestroyBuffer { buffer: 3 }]);
+    assert_eq!(h.events_for(c), vec![Event::DeleteId { id: 3 }]);
+    assert_eq!(h.comp.take_gpu_ops().len(), 2, "two imports so far");
+    // the window still shows it (the compositor keeps what it needs), until the client commits another
+    let (_, ops) = h.comp.draw_list();
+    assert!(ops.iter().any(|o| matches!(o, DrawOp::Gpu { handle: 1, .. })));
+    h.send(c, &[R::Attach { surface: 4, buffer: 5 }, R::Commit { surface: 4 }]);
+    // the id 3 may be a new object by now: a release for the old one would be a lie
+    h.send(c, &[gpu_buffer(3, 79, 8, 8)]);
+    h.events_for(c);
+    h.comp.gpu_frame_done(e1 + 1);
+    assert!(h.events_for(c).is_empty(), "no release for a buffer the client destroyed");
+    let ops = h.comp.take_gpu_ops();
+    assert!(ops.contains(&GpuOp::Drop { handle: 1 }), "the old buffer's last reference went with the frame: {:?}", ops);
+    assert!(import_of(&ops, 3).is_some());
+}
+
+#[test]
+fn a_disconnected_client_drops_every_buffer_and_gets_nothing() {
+    let mut h = gpu_h();
+    let c = h.comp.add_client();
+    h.send(c, &[gpu_buffer(3, 77, 64, 32), gpu_buffer(5, 78, 64, 32), R::CreateSurface { id: 4 }, R::Attach { surface: 4, buffer: 3 }, R::Commit { surface: 4 }]);
+    h.comp.draw_list();
+    h.send(c, &[R::Attach { surface: 4, buffer: 5 }, R::Commit { surface: 4 }]); // 3 waits for frame 1
+    h.comp.take_gpu_ops();
+    h.events_for(c);
+    h.comp.remove_client(c);
+    let mut drops: Vec<u64> = h.comp.take_gpu_ops().into_iter().filter_map(|o| if let GpuOp::Drop { handle } = o { Some(handle) } else { None }).collect();
+    drops.sort();
+    assert_eq!(drops, vec![1, 2], "both buffers, the retired one too");
+    h.comp.gpu_frame_done(1);
+    assert!(h.comp.take_events().is_empty(), "nobody to tell");
+    assert!(h.comp.draw_list().1.iter().all(|o| !matches!(o, DrawOp::Gpu { .. })));
+}
+
+#[test]
+fn unmapping_and_replacing_with_a_pool_buffer_retire_the_gpu_buffer() {
+    let mut h = gpu_h();
+    let c = h.comp.add_client();
+    h.send(c, &[gpu_buffer(3, 77, 64, 32), R::CreateSurface { id: 4 }, R::Attach { surface: 4, buffer: 3 }, R::Commit { surface: 4 }]);
+    let (e1, _) = h.comp.draw_list();
+    h.events_for(c);
+    h.pool(200, 64 * 32 * 4);
+    h.draw(200, 0, 256, 0, 0, 64, 32, 0x0033_4455);
+    h.send(c, &[
+        R::CreatePool { id: 6, fd: 200, size: 64 * 32 * 4 },
+        R::CreateBuffer { pool: 6, id: 7, offset: 0, width: 64, height: 32, stride: 256, format: FORMAT_XRGB8888 },
+        R::Attach { surface: 4, buffer: 7 },
+        R::Commit { surface: 4 },
+    ]);
+    assert_eq!(h.events_for(c), vec![Event::Release { buffer: 7 }], "the pool buffer is copied and released as always; the GPU one waits for frame 1");
+    let (_, ops) = h.comp.draw_list();
+    assert!(ops.iter().any(|o| matches!(o, DrawOp::Cpu { client, surface: 4, w: 64, h: 32, .. } if *client == c)));
+    assert!(!ops.iter().any(|o| matches!(o, DrawOp::Gpu { .. })));
+    assert_eq!(h.comp.cpu_content(c, 4).unwrap()[0], 0x0033_4455);
+    h.comp.gpu_frame_done(e1);
+    assert_eq!(h.events_for(c), vec![Event::Release { buffer: 3 }]);
+    // a null attach unmaps and retires too
+    h.send(c, &[gpu_buffer(8, 80, 64, 32), R::Attach { surface: 4, buffer: 8 }, R::Commit { surface: 4 }]);
+    let (e3, _) = h.comp.draw_list();
+    h.send(c, &[R::Attach { surface: 4, buffer: 0 }, R::Commit { surface: 4 }]);
+    assert!(h.events_for(c).is_empty());
+    h.comp.gpu_frame_done(e3);
+    assert_eq!(h.events_for(c), vec![Event::Release { buffer: 8 }]);
+    assert!(h.comp.window_frame(c, 4).is_none() || !h.comp.draw_list().1.iter().any(|o| matches!(o, DrawOp::Gpu { .. })));
+}
+
+#[test]
+fn a_bad_gpu_buffer_is_a_protocol_error_and_the_descriptor_is_closed() {
+    for (req, what) in [
+        (R::CreateGpuBuffer { id: 3, fd: 90, size: 4096, width: 64, height: 32, stride: 256, format: 0 }, "format"),
+        (R::CreateGpuBuffer { id: 3, fd: 90, size: 64 * 32 * 4 - 1, width: 64, height: 32, stride: 256, format: 1 }, "descriptor too small"),
+        (R::CreateGpuBuffer { id: 3, fd: 90, size: 1 << 20, width: 64, height: 32, stride: 255, format: 1 }, "stride below the row"),
+        (R::CreateGpuBuffer { id: 3, fd: 90, size: 1 << 20, width: 64, height: 32, stride: 258, format: 1 }, "stride not a multiple of 4"),
+        (R::CreateGpuBuffer { id: 3, fd: 90, size: 1 << 20, width: 0, height: 32, stride: 256, format: 1 }, "width 0"),
+        (R::CreateGpuBuffer { id: 3, fd: 90, size: u32::MAX, width: 9000, height: 32, stride: 36000, format: 1 }, "too wide"),
+        (R::CreateGpuBuffer { id: 1, fd: 90, size: 1 << 20, width: 64, height: 32, stride: 256, format: 1 }, "id 1"),
+    ] {
+        let mut h = gpu_h();
+        let c = h.comp.add_client();
+        h.send(c, &[req]);
+        let evs = h.comp.take_events();
+        assert!(evs.iter().any(|(k, e)| *k == c && matches!(e, Event::Error { .. })), "{}: an error event", what);
+        assert_eq!(h.comp.take_disconnects(), vec![c], "{}", what);
+        assert!(h.comp.take_fds_to_close().contains(&90) || h.comp.take_gpu_ops().iter().any(|o| matches!(o, GpuOp::Import { fd: 90, .. })), "{}: the descriptor goes to the host or is closed", what);
+    }
+    // an id in use: the import was queued, so it is dropped again (pairs)
+    let mut h = gpu_h();
+    let c = h.comp.add_client();
+    h.send(c, &[gpu_buffer(3, 77, 8, 8)]);
+    h.comp.take_gpu_ops();
+    h.send(c, &[gpu_buffer(3, 78, 8, 8)]);
+    assert_eq!(h.comp.take_disconnects(), vec![c]);
+    let ops = h.comp.take_gpu_ops();
+    assert!(import_of(&ops, 2).is_some() && ops.contains(&GpuOp::Drop { handle: 2 }) && ops.contains(&GpuOp::Drop { handle: 1 }), "{:?}", ops);
+}
+
+#[test]
+fn gpu_and_pool_windows_share_the_screen_in_stacking_order() {
+    let mut h = gpu_h();
+    let a = h.window(100, 50, 0x0012_3456);
+    let b = h.comp.add_client();
+    h.send(b, &[gpu_buffer(3, 77, 100, 50), R::CreateSurface { id: 4 }, R::Attach { surface: 4, buffer: 3 }, R::Commit { surface: 4 }]);
+    let (_, ops) = h.comp.draw_list();
+    let cpu_at = ops.iter().position(|o| matches!(o, DrawOp::Cpu { .. })).unwrap();
+    let gpu_at = ops.iter().position(|o| matches!(o, DrawOp::Gpu { .. })).unwrap();
+    assert!(cpu_at < gpu_at, "the pool window is below the GPU window that was mapped after it");
+    // raising the first window flips them
+    let fa = h.comp.window_frame(a, 4).unwrap();
+    h.comp.pointer_motion(fa.x + 3 - h.comp.pointer().0, fa.y + 3 - h.comp.pointer().1);
+    h.comp.pointer_button(BTN_LEFT, true);
+    h.comp.pointer_button(BTN_LEFT, false);
+    let (_, ops) = h.comp.draw_list();
+    let cpu_at = ops.iter().position(|o| matches!(o, DrawOp::Cpu { .. })).unwrap();
+    let gpu_at = ops.iter().position(|o| matches!(o, DrawOp::Gpu { .. })).unwrap();
+    assert!(gpu_at < cpu_at);
+}
+
+#[test]
+fn a_maximized_window_waiting_for_its_client_shows_the_rest_as_window_background() {
+    // the frame is bigger than the buffer until the client answers: the draw list fills the rest like compose does
+    let mut h = gpu_h();
+    let c = h.window(100, 50, 0x0012_3456);
+    h.send(c, &[R::SetResizable { surface: 4, min_w: 1, min_h: 1 }]);
+    click(&mut h, 140 - TITLE_H - TITLE_H / 2, 50);
+    assert!(h.comp.is_maximized(c, 4));
+    h.compose();
+    let (_, ops) = h.comp.draw_list();
+    assert!(ops.iter().any(|o| matches!(o, DrawOp::Fill { color: WINDOW_BG, .. })), "the part the buffer does not cover");
+    assert_eq!(same_picture(&raster(&ops, &h.comp, &BTreeMap::new()), &h.screen), None);
+}
+
+#[test]
+fn a_window_dragged_past_the_left_and_top_edges_is_drawn_from_the_inside_of_its_buffer() {
+    let mut h = gpu_h();
+    let c = h.window(100, 50, 0x0012_3456);
+    let g = h.comp.add_client();
+    h.send(g, &[gpu_buffer(3, 77, 100, 50), R::CreateSurface { id: 4 }, R::Attach { surface: 4, buffer: 3 }, R::Commit { surface: 4 }]);
+    // both windows to the top-left, past the edges: the GPU one is on top, take its bar and carry it to (-30, -10) - the pool one the same
+    for (client, key) in [(g, 4u32), (c, 4u32)] {
+        let f = h.comp.window_frame(client, key).unwrap();
+        h.comp.pointer_motion(f.x + 10 - h.comp.pointer().0, f.y + 5 - h.comp.pointer().1);
+        h.comp.pointer_button(BTN_LEFT, true);
+        h.comp.pointer_motion(-40 - f.x + 0, -(f.y + 5) + 5 - 20);
+        h.comp.pointer_button(BTN_LEFT, false);
+    }
+    h.compose();
+    let (_, ops) = h.comp.draw_list();
+    let cut = ops.iter().filter(|o| matches!(o, DrawOp::Gpu { sx, sy, .. } | DrawOp::Cpu { sx, sy, .. } if *sx > 0 || *sy > 0)).count();
+    assert!(cut >= 1, "a window cut by the screen's edge starts inside its buffer: {:?}", ops.iter().filter(|o| matches!(o, DrawOp::Gpu { .. } | DrawOp::Cpu { .. })).collect::<Vec<_>>());
+    let mut gpu = BTreeMap::new();
+    gpu.insert(1u64, (100, (0..100 * 50).map(|i| 0x0200_0000 + i as u32).collect::<Vec<u32>>()));
+    let pic = raster(&ops, &h.comp, &gpu);
+    // the CPU window's pixels are right wherever they landed (the oracle compares them to compose); the GPU window's are the buffer's, shifted
+    let f = h.comp.window_content(g, 4).unwrap();
+    let (x, y) = (f.x.max(0), f.y.max(0));
+    assert_eq!(pic[y as usize * STRIDE + x as usize], 0x0200_0000 + ((y - f.y) * 100 + (x - f.x)) as u32);
+}
+
+#[test]
+fn a_draw_list_takes_the_damage_and_a_gpu_commit_without_damage_still_asks_for_a_frame() {
+    let mut h = gpu_h();
+    let c = h.comp.add_client();
+    h.send(c, &[gpu_buffer(3, 77, 64, 32), R::CreateSurface { id: 4 }, R::Attach { surface: 4, buffer: 3 }, R::Commit { surface: 4 }]);
+    assert!(h.comp.has_damage());
+    h.comp.draw_list();
+    assert!(!h.comp.has_damage(), "taken");
+    // no `damage` request at all: the host reads the whole buffer, so the whole content must be redrawn
+    h.send(c, &[gpu_buffer(5, 78, 64, 32), R::Attach { surface: 4, buffer: 5 }, R::Commit { surface: 4 }]);
+    assert!(h.comp.has_damage());
+    assert_eq!(h.comp.damage().rects().len(), 1);
+    assert_eq!(h.comp.damage().rects()[0], Rect::new(40, 40 + TITLE_H, 64, 32));
+}
+
+#[test]
+fn a_pool_windows_version_moves_with_each_commit() {
+    let mut h = gpu_h();
+    let c = h.window(60, 30, 0x0011_1111);
+    let v = |h: &mut H_| h.comp.draw_list().1.iter().find_map(|o| if let DrawOp::Cpu { version, .. } = o { Some(*version) } else { None }).unwrap();
+    let v1 = v(&mut h);
+    assert_eq!(v(&mut h), v1, "nothing committed: the same pixels");
+    h.send(c, &[R::Attach { surface: 4, buffer: 3 }, R::Damage { surface: 4, x: 0, y: 0, w: 4, h: 4 }, R::Commit { surface: 4 }]);
+    assert!(v(&mut h) > v1);
+}
+
+#[test]
+fn the_host_telling_frames_done_out_of_order_never_goes_back() {
+    let mut h = gpu_h();
+    let c = h.comp.add_client();
+    h.send(c, &[gpu_buffer(3, 77, 8, 8), gpu_buffer(5, 78, 8, 8), gpu_buffer(6, 79, 8, 8), R::CreateSurface { id: 4 }, R::Attach { surface: 4, buffer: 3 }, R::Commit { surface: 4 }]);
+    h.comp.draw_list();
+    let (e2, _) = h.comp.draw_list();
+    h.comp.gpu_frame_done(e2);
+    h.comp.gpu_frame_done(1); // a late report of an older frame
+    h.events_for(c);
+    h.send(c, &[R::Attach { surface: 4, buffer: 5 }, R::Commit { surface: 4 }]);
+    assert_eq!(h.events_for(c), vec![Event::Release { buffer: 3 }], "frame 2 was done and nobody started another: nothing to wait for");
+}
+
+#[test]
+fn every_windows_title_op_says_whether_it_is_focused() {
+    let mut h = gpu_h();
+    let a = h.window(100, 50, 0x0012_3456);
+    let b = h.window(100, 50, 0x0065_4321);
+    h.send(a, &[R::SetTitle { surface: 4, title: "a".into() }]);
+    h.send(b, &[R::SetTitle { surface: 4, title: "b".into() }]);
+    let (_, ops) = h.comp.draw_list();
+    let t: Vec<(String, bool)> = ops.iter().filter_map(|o| if let DrawOp::Title { title, focused, .. } = o { Some((title.clone(), *focused)) } else { None }).collect();
+    assert_eq!(t, vec![(String::from("a"), false), (String::from("b"), true)], "bottom to top: b was mapped last and has the focus");
+}
+
+#[test]
+fn a_compositor_that_paints_on_the_cpu_refuses_gpu_buffers() {
+    let mut h = H_::new();
+    let c = h.comp.add_client();
+    h.send(c, &[gpu_buffer(3, 77, 64, 32)]);
+    assert!(h.comp.take_events().iter().any(|(k, e)| *k == c && matches!(e, Event::Error { code, .. } if *code == ErrorCode::InvalidMethod as u32)));
+    assert_eq!(h.comp.take_disconnects(), vec![c]);
+    assert_eq!(h.comp.take_fds_to_close(), vec![77], "the descriptor is closed, not leaked");
+    assert_eq!(h.comp.take_gpu_ops(), vec![]);
+}
+
+#[test]
+fn the_cpu_painter_survives_a_gpu_window() {
+    // a host that enabled GPU buffers and still calls compose() must not index an empty store
+    let mut h = gpu_h();
+    let c = h.comp.add_client();
+    h.send(c, &[gpu_buffer(3, 77, 64, 32), R::CreateSurface { id: 4 }, R::Attach { surface: 4, buffer: 3 }, R::Commit { surface: 4 }]);
+    h.compose();
+    assert_eq!(h.px(40, 40 + TITLE_H), WINDOW_BG, "nothing to show but the background");
+}
