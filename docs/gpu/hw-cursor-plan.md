@@ -1,6 +1,6 @@
-# Hardware cursor for the GA106 display engine — design (not started)
+# Hardware cursor for the GA106 display engine — design, phases 1-2 done, head 0 blocked
 
-**Status: design, plus Phase 0 (answers to the unknowns and a baseline measurement, section 11) done on the Ryzen #189. Nothing of the cursor itself is implemented.** Written 2026-10-01 after Ryzen #188, from a question the user asked while
+**Status (2026-10-01, Ryzen #212-#219): phase 0 (section 11), `nvgpu::cursor` (phase 1) and the `/dev/dispctl cursor ...` adapter (phase 2) are done. The cursor ENABLES and MOVES on head 1 (HDMI; one move = 1-2 us) but the enable raises INVALID_STATE (code 0x43) on head 0, the ASUS on DP, whatever was tried: section 14. Phases 3-4 (ioctls, compositor) not started.** Written 2026-10-01 after Ryzen #188, from a question the user asked while
 reading `g5-layer4-session-report-2026-10-01.md` section 8 ("the cursor does not move at 60 fps"). Everything under "What the hardware offers"
 was checked against NVIDIA's own headers and nouveau's source (citations inline); everything under "Unknowns" was not.
 
@@ -289,3 +289,22 @@ Order of the next changes (user to confirm; none started), cheapest and most dec
 
 - cpumon changes ~43% of its bytes per update on average (row granularity); the mean frame is now cheap and the worst one (a big redraw) still costs ~8.6 ms at P8 (render 5.6, blit 3.0), which fits when it is alone on the GPU.
 - What is left per frame is the 2.3 ms blit (memory-clock bound) and the render of the whole screen: fix 3 (scan out the image directly / render and blit only the damaged rectangle) and the hardware cursor (pointer-only frames) are the remaining pieces; none started.
+
+
+## 14. Phases 1-2: what the hardware taught (Ryzen #196-#220)
+
+Code: `nvgpu/src/cursor.rs` (pure, 14 tests, mutation-checked), `kernel/src/gpu/cursor.rs` (adapter), `/dev/dispctl cursor probe | image | raw <m> <v>... [il] | on | onmode | move | update | recover | ilock off | head <n> | intr`,
+jobs `scripts/metal-jobs/gpu-cursor.sh` (probe, on, sweep, off), `gpu-cursor-ladder.sh` (one core method per push), `gpu-cursor-head1.sh`, `gpu-head-diff.sh` (ARMED head 0 vs head 1).
+
+**What works (measured).** The cursor channel (chid 73 + head, PIO) allocates exactly as nouveau does (control `0x610604` = 1, status `0x610784` = `0x40000`). On **head 1** the whole sequence enables the cursor (ARMED `HEAD_SET_CONTROL_CURSOR = 0x800000cf`) and `move` is two stores costing 1-2 us (#212). Every core method of the set is accepted on head 0 *one at a time while the cursor is disabled*: composition `0x72ff`, offset, control disabled, usage bounds `0x1114` (one supervisor cycle, served), the context DMA in both slots, `PRESENT_CONTROL_CURSOR`.
+
+**Found on the way (each of these was a real bug, none about the cursor itself).**
+1. **GSP-RM's boot makes the display's context DMA lookups hang when the instance memory is at the top of VRAM.** Any `HEAD_SET_CONTEXT_DMA_*` on the core left `CHNSTATUS_CORE = 0xa20c0005` (`STG1_STATE = 5 CTX_DMA_LOOKUP`) for ever (#198-#201: own handles, flags 0x05 and 0x45, the channel's interrupt on, the OLUT's handle). At `gpu=hdmi` (before the GSP) the same push resolved (#202). `evo::INST_VRAM` moved from `0x1ffc90000` (nouveau's address, inside GSP's reserved top) to **104 MiB**; 256 MiB read back `0xbad0ac82` through PRAMIN (#203). Window flips never showed it (no lookup after the first). Compositor regression-checked on the Ryzen #220.
+2. The core's exception slot: `0x611020 + chid*12`; `stat` bits 14:12 = reason (5 INVALID_STATE), 11:0 = method >> 2, `data`, `code`. After an exception the core sits in `WAIT_FOR_UPD` (`CHNSTATUS_CORE = 0xa00c0007`) until `0x611020 = 0x90000000` (nouveau's clear, `cursor recover`); **the failed state stays in ASSEMBLY**, so every later UPDATE fails again until the offending method is pushed back (`control = 0xcf`). A group of methods that is only valid whole (the output LUT's four) must go in one push (`cursor raw m v m v ...`).
+3. `CHNSTATUS_CORE` decodes: bits 3:0 `STG1_STATE`, 20:16 `STATE` (0xb IDLE, 0xc BUSY), 31 method executing (`dev_display_withoffset.ref.txt:421-470`).
+
+**The open problem: head 0 refuses the enable (INVALID_STATE, data 1, code 0x43, at the UPDATE).** Tried, all with the same exception:
+the plain enable; the channel positioned and UPDATEd first; nouveau's whole `curs_set` in one push; NVIDIA's (`nvkms-evo3.c EvoSetCursorImageC3`: present control, both slots); interlocked from the core side only (the core then waits for ever in `WAIT_FOR_UPD`) and from both sides; at `gpu=hdmi` (no GSP); in the push that re-attaches the head after a detach (`onmode`); the head's display id (`0x10`, nouveau's value; the GOP leaves 0); dither `0x10`; procamp; `HEAD_SET_DSC_CONTROL = 8`; window 0's usage bounds (`0xf`, `0x117fff`); all of those in one push. The output LUT (head 1 has one) raises code `0x41` on head 0 even as a four-method push.
+`gpu-head-diff.sh` (#218) read the ARMED core state of both heads after `hdmi on`: the ONLY differences are exactly that list (dither, display id, usage bounds, the LUT 0x2280-0x228c, DSC control, window usage/owner). So what is left is **not a head method**: most likely what the HDMI flow does around the LUT, which head 0 never got: window 0 with its own ILUT and notifier, interlocked with the core's OLUT push (`hdmi.rs`: head push, window push with `SET_INTERLOCK_FLAGS = 1` + `SET_WINDOW_INTERLOCK_FLAGS`, core push with the OLUT and the window bit; #89/#90 showed a window UPDATE without them raising INVALID_STATE `0x2d`), i.e. nouveau's full head-0 programming instead of the GOP's.
+
+Next steps, in order of cost: (a) replay that flow on head 0 (window 0's state with ILUT + notifier through `scanout.rs`'s window 0 push buffer, then the core's OLUT push interlocked), then the enable; (b) use a **window channel as the cursor plane** on head 0 (the design's alternative A: window 1 owned by head 0, alpha blended, position by a window update; the machinery is the HDMI window's, proven); (c) enable the hardware cursor only on head 1 (useless for the ASUS). Do not pin or hack the compositor around it: the software cursor (a quad) stays the fallback.
