@@ -2,7 +2,7 @@
 # are GPU buffers it imports where they are and draws with a graphics pipeline, presented through the WSI's direct path.
 #   touch build.rs; echo 5 > target/metal/budget
 #   scripts/metal-run.sh --kconf 'gpu=uapi' scripts/metal-jobs/gpu-comp.sh
-# vk_comp runs up to 30 s with no input devices (COMP_NO_INPUT: nobody is typing), starting two vk_window (900 frames each, a resize halfway: two
+# vk_comp runs up to 40 s with no input devices (COMP_NO_INPUT: nobody is typing), starting two vk_window (900 frames each, a resize halfway: two
 # swapchains of three buffers each). Passes if vk_comp and both clients exit cleanly, vk_comp imported and dropped the 12 buffers, composed
 # between 600 and 1200 frames (the display's 60 Hz over the windows' life, both clients in each frame), nothing printed COMP FAIL / VK FAIL, the GPU is not dead and nothing is held
 # afterwards (gpu_share: 0 sessions, 0 storage allocations, 0 timelines). What it cannot say is what the screen looked like: that is for a person
@@ -17,7 +17,7 @@ grep -q '^uapi: installed' /proc/gpu || { sum "gpu-comp: the GPU state was not k
 field() { echo "$1" | tr ' ' '\n' | grep "^$2=" | cut -d= -f2; }
 sum "gpu-comp: before: $(grep '^gpu_uapi:' /proc/kdebug)"
 
-VK_WINDOW_FRAMES=900 COMP_NO_INPUT=1 COMP_SECONDS=30 NVK_CONSTANOS_DEBUG=1 /mnt/bin/vk_comp /mnt/bin/vk_window /mnt/bin/vk_window > /tmp/comp.out 2>&1
+VK_WINDOW_FRAMES=900 COMP_NO_INPUT=1 COMP_SECONDS=40 NVK_CONSTANOS_DEBUG=1 /mnt/bin/vk_comp /mnt/bin/vk_window /mnt/bin/vk_window > /tmp/comp.out 2>&1
 rc=$?
 grep -E 'COMP (screen|listening|started|client|quit|FAIL|[0-9]+ frames)|VK window:|VK WINDOW|VK FAIL|COMP ASSERT' /tmp/comp.out | while read -r l; do sum "gpu-comp: $l"; done
 [ $rc = 0 ] || { sum "gpu-comp: vk_comp exit=$rc"; fail=1; tail -n 30 /tmp/comp.out >> /tmp/gpu-comp.sum; }

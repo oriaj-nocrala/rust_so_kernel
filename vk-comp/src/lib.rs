@@ -8,6 +8,8 @@
 //!   COMP_NO_INPUT=1          do not open (or grab) the input devices
 //!   COMP_SECONDS=<n>         quit after n seconds (unattended runs); SIGTERM quits too
 //!   COMP_SOCKET=<path>       the socket (default /tmp/gui-0)
+//!   COMP_DELAY_MS=<n>        how long after a frame is on the screen the next one is composed (default 9: at 60 Hz it leaves ~7 ms to render and
+//!                            present before the next vblank, and the rest of the interval to collect every client's commit into one composition)
 //!
 //! Exported as C's `main`: build.py links this static library with NVK and the renderer.
 
@@ -186,6 +188,7 @@ fn run(args: &[String]) -> i32 {
     let no_input = env("COMP_NO_INPUT").is_some();
     let seconds: u64 = env("COMP_SECONDS").and_then(|s| s.parse().ok()).unwrap_or(0);
     let socket = env("COMP_SOCKET").unwrap_or_else(|| "/tmp/gui-0".into());
+    let compose_delay = Duration::from_millis(env("COMP_DELAY_MS").and_then(|s| s.parse().ok()).unwrap_or(9));
 
     let (mut w, mut h) = (0u32, 0u32);
     if unsafe { cr_init(headless as c_int, &mut w, &mut h) } != 0 {
@@ -244,6 +247,9 @@ fn run(args: &[String]) -> i32 {
     let (mut mdx, mut mdy) = (0i32, 0i32);
     let mut frames = 0u64;
     let mut failures = 0;
+    // No composition before this instant: a frame is composed once per vblank with whatever every client committed since the last one, not as soon as
+    // the first commit arrives (that gave each vblank to one client, and each of two clients 30 frames per second).
+    let mut compose_not_before = Instant::now();
     let uptime_ms = || t_start.elapsed().as_millis() as u32;
 
     while !QUIT.load(Ordering::Relaxed) && !comp.quit_requested() {
@@ -251,6 +257,7 @@ fn run(args: &[String]) -> i32 {
             break;
         }
         let busy = comp.has_damage() || comp.has_frame_callbacks();
+        let wait_ms = if busy { compose_not_before.saturating_duration_since(Instant::now()).as_millis() as c_int } else { 200 };
         let mut pfds = vec![PollFd { fd: listener.as_raw_fd(), events: POLLIN, revents: 0 }];
         let mut who: Vec<u32> = vec![0];
         if kbd >= 0 {
@@ -263,7 +270,7 @@ fn run(args: &[String]) -> i32 {
             pfds.push(PollFd { fd: s.as_raw_fd(), events: POLLIN, revents: 0 });
             who.push(*c);
         }
-        unsafe { poll(pfds.as_mut_ptr(), pfds.len() as u64, if busy { 0 } else { 200 }) };
+        unsafe { poll(pfds.as_mut_ptr(), pfds.len() as u64, wait_ms) };
         comp.set_time(uptime_ms());
         while unsafe { waitpid(-1, std::ptr::null_mut(), WNOHANG) } > 0 {} // what we started and has exited
         for (p, id) in pfds.iter().zip(&who) {
@@ -303,7 +310,7 @@ fn run(args: &[String]) -> i32 {
         }
         clients.flush(&mut comp);
 
-        if comp.has_damage() || comp.has_frame_callbacks() {
+        if (comp.has_damage() || comp.has_frame_callbacks()) && Instant::now() >= compose_not_before {
             // the previous frame is done: the buffers it read may be released to their clients, and what was dropped may go
             let done = unsafe { cr_wait() };
             if done != 0 {
@@ -397,6 +404,7 @@ fn run(args: &[String]) -> i32 {
             // draw their next frame in the interval and every client's commit is in the next composition. Composing as soon as one commit arrives
             // would give each vblank to one client.
             unsafe { cr_wait_flip() };
+            compose_not_before = Instant::now() + compose_delay;
             comp.frame_done(uptime_ms());
             clients.flush(&mut comp);
         }
