@@ -99,8 +99,9 @@ impl<'a> Pramin<'a> {
 /// Where this driver puts the display's instance memory (RAMHT and context DMAs), 64 KiB aligned. nouveau's address on the target is `0x1ffc90000`
 /// (`0x610014 = 0x1ffc9` in `modeset-1-disp-init.txt`), at the very top of VRAM: **after GSP-RM boots that range is its reserved region and the display's
 /// context DMA lookups from it hang** (Ryzen #198-#201: the core stood in `CHNSTATUS_CORE.STG1_STATE = CTX_DMA_LOOKUP` for any handle; at `gpu=hdmi`,
-/// before the GSP, the same push resolved: #202). So it lives low, between the boot's carve-outs (below 176 MiB) and the user heap (1 GiB).
-pub const INST_VRAM: u64 = 0x1000_0000;
+/// before the GSP, the same push resolved: #202). So it lives low, at 104 MiB (free: the page-table pool is [64, 96) MiB, the 6b test mapping
+/// sits at 96 MiB, the channel at 128 MiB). 256 MiB was tried first: PRAMIN reads there came back `0xbad0ac82` (Ryzen #203, `chan: STOP: instance memory`).
+pub const INST_VRAM: u64 = 104 << 20;
 pub const INST_SIZE: u32 = 0x1_0000;
 
 /// RAMHT: 0x2000 bytes (`engine/disp/tu102.c:221`) at the start of the

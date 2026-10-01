@@ -17,7 +17,11 @@ st() { grep -a '^cursor:' /dev/dispctl 2>/dev/null | head -n 1 | cut -c1-400; }
 st2() { grep -a '^cursor:' /dev/dispctl 2>/dev/null | sed -n 2p | cut -c1-300; }
 rawlog() { grep -a 'cursor: raw' /proc/gpu | tail -n 1 | cut -c1-400; }
 if [ -e /dev/dispctl ] && grep -q '^dispctl' /dev/dispctl 2>/dev/null; then :; else
-  sum "gpu-cursor-ladder: /dev/dispctl does not open (needs gpu=super or higher)"; echo "---- summary (the log wraps) ----"; cat $sumfile; exit 0
+  sum "gpu-cursor-ladder: /dev/dispctl does not open (needs gpu=super or higher)"
+  # on a machine with the GPU a missing dispctl is a failure to bring up (chan: STOP ...), not a pass
+  grep -a '^chan:\|^super:\|STOP' /proc/gpu 2>/dev/null | head -n 6 | cut -c1-300 | while read -r l; do sum "gpu-cursor-ladder: /proc/gpu: $l"; done
+  if grep -aq 'STOP' /proc/gpu 2>/dev/null; then fail=1; fi
+  echo "---- summary (the log wraps) ----"; cat $sumfile; exit $fail
 fi
 echo 'cursor image 32' > /dev/dispctl && sum "gpu-cursor-ladder: image written" || { sum "gpu-cursor-ladder: image FAILED"; fail=1; }
 stopped=0
