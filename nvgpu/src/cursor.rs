@@ -99,9 +99,16 @@ pub fn core_methods_set(head: u32, handle: u32, vram: u64, size: u32, hot_x: u32
     ])
 }
 
-/// The only core methods `/dev/dispctl cursor raw` may push for `head`: the five the cursor uses (a debugging ladder, one method per push).
+/// `HEAD_SET_CONTEXT_DMA_OLUT(h)` (`hdmi.rs`, `clc67d.h`): the head's output LUT context DMA, which resolves on the core for head 1. A control for the cursor's
+/// lookup hanging on head 0 (Ryzen #198-#200): the same lookup, another method.
+pub const fn core_olut_context_dma(h: u32) -> u32 {
+    0x2288 + h * 0x400
+}
+
+/// The only core methods `/dev/dispctl cursor raw` may push for `head`: the five the cursor uses and the OLUT context DMA control (a debugging ladder, one
+/// method per push).
 pub fn core_method_allowed(head: u32, method: u32) -> bool {
-    [core_usage_bounds(head), core_context_dma(head), core_offset(head), core_control(head), core_composition(head)].contains(&method)
+    [core_usage_bounds(head), core_context_dma(head), core_offset(head), core_control(head), core_composition(head), core_olut_context_dma(head)].contains(&method)
 }
 
 /// What `headc37d_curs_clr` pushes: disabled (format kept), context DMA 0 (`headc37d.c:104-119`).
@@ -255,14 +262,14 @@ mod tests {
 
     #[test]
     fn raw_pushes_are_limited_to_the_cursors_methods_of_that_head() {
-        for m in [0x2030, 0x2088, 0x2090, 0x209c, 0x20a0] {
+        for m in [0x2030, 0x2088, 0x2090, 0x209c, 0x20a0, 0x2288] {
             assert!(core_method_allowed(0, m), "{m:#x}");
         }
-        for m in [0x2430, 0x2488, 0x2490, 0x249c, 0x24a0] {
+        for m in [0x2430, 0x2488, 0x2490, 0x249c, 0x24a0, 0x2688] {
             assert!(core_method_allowed(1, m), "{m:#x}");
             assert!(!core_method_allowed(0, m), "{m:#x}");
         }
-        for m in [0x200, 0x218, 0x2034, 0x2084, 0x2094, 0x2098, 0x20a4, 0x300] {
+        for m in [0x200, 0x218, 0x2034, 0x2084, 0x2094, 0x2098, 0x20a4, 0x300, 0x2284, 0x228c] {
             assert!(!core_method_allowed(0, m), "{m:#x}");
         }
     }
