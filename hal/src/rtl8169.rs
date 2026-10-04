@@ -57,6 +57,11 @@ pub const EARLY_SIZE: u8 = 0x27;
 /// Size of the register window the driver maps (`ethtool -d` dumps this much).
 pub const REG_WINDOW: usize = 0x100;
 
+/// `OCPDR`: the MAC OCP window (`r8168_mac_ocp_read`/`write`): one register,
+/// the address in bits 30:16 (byte address / 2), `OCPAR_FLAG` for a write.
+pub const OCPDR: usize = 0xB0;
+pub const OCPAR_FLAG: u32 = 1 << 31;
+
 /// The extended register interface (ERI): data at `ERIDR`, command at `ERIAR`.
 pub const ERIDR: usize = 0x70;
 pub const ERIAR: usize = 0x74;
@@ -476,6 +481,86 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
         link_from_phy_status(self.regs.r8(PHY_STATUS))
     }
 
+    /// `PHY page select` (register 0x1f), a paged read, write and modify, as
+    /// Linux's `phy_{read,write,modify}_paged` (the page goes back to 0).
+    fn phy_page_read(&self, page: u16, reg: u8, relax: &mut impl FnMut()) -> Option<u16> {
+        self.phy_write(0x1f, page, &mut *relax).then_some(())?;
+        let v = self.phy_read(reg, &mut *relax);
+        self.phy_write(0x1f, 0, &mut *relax).then_some(())?;
+        v
+    }
+
+    fn phy_page_write(&self, page: u16, reg: u8, value: u16, relax: &mut impl FnMut()) -> Option<()> {
+        self.phy_write(0x1f, page, &mut *relax).then_some(())?;
+        let ok = self.phy_write(reg, value, &mut *relax);
+        self.phy_write(0x1f, 0, &mut *relax).then_some(())?;
+        ok.then_some(())
+    }
+
+    fn phy_page_modify(&self, page: u16, reg: u8, clear: u16, set: u16, relax: &mut impl FnMut()) -> Option<()> {
+        let v = self.phy_page_read(page, reg, relax)?;
+        self.phy_page_write(page, reg, (v & !clear) | set, relax)
+    }
+
+    /// `r8168g_phy_param`: an indirect PHY parameter (page 0xa43, regs 0x13/0x14).
+    fn phy_param(&self, param: u16, clear: u16, set: u16, relax: &mut impl FnMut()) -> Option<()> {
+        self.phy_write(0x1f, 0x0a43, &mut *relax).then_some(())?;
+        let r = (|| {
+            self.phy_write(0x13, param, &mut *relax).then_some(())?;
+            let v = self.phy_read(0x14, &mut *relax)?;
+            self.phy_write(0x14, (v & !clear) | set, &mut *relax).then_some(())
+        })();
+        self.phy_write(0x1f, 0, &mut *relax).then_some(())?;
+        r
+    }
+
+    /// `r8168_mac_ocp_read` / `write`.
+    fn mac_ocp_read(&self, reg: u16) -> u16 {
+        self.regs.w32(OCPDR, (reg as u32) << 15);
+        self.regs.r32(OCPDR) as u16
+    }
+
+    fn mac_ocp_write(&self, reg: u16, data: u16) {
+        self.regs.w32(OCPDR, OCPAR_FLAG | (reg as u32) << 15 | data as u32);
+    }
+
+    /// Linux's `rtl8168h_2_hw_phy_config` for this chip (XID 0x541, VER_46),
+    /// without the PHY firmware patch (`rtl8168h-2.fw`) it applies first:
+    /// channel-estimation and R-tune parameters, the ADC bias offset and TX
+    /// LPF level read from the MAC, and the power-saving features off
+    /// (PFM, 10M PLL off, ALDPS), EEE on. Linux runs it before the link comes
+    /// up; without it the board's PHY dropped gigabit link ~13 s after boot
+    /// and came back at 100 Mb/s. `false` on an MDIO timeout.
+    pub fn phy_config_8168h(&self, mut relax: impl FnMut()) -> bool {
+        let r = &mut relax;
+        let mut run = || -> Option<()> {
+            self.phy_param(0x808a, 0x003f, 0x000a, r)?; // CHIN EST parameter update
+            self.phy_param(0x0811, 0x0000, 0x0800, r)?; // enable R-tune and PGA-retune
+            self.phy_page_modify(0x0a42, 0x16, 0x0000, 0x0002, r)?;
+            self.phy_page_modify(0x0a44, 0x11, 0x0000, 1 << 11, r)?; // enable gphy 10M
+            // ADC bias offset from the MAC OCP.
+            self.mac_ocp_write(0xdd02, 0x807d);
+            let data1 = self.mac_ocp_read(0xdd02);
+            let data2 = self.mac_ocp_read(0xdd00);
+            let mut ioffset = (data2 >> 1) & 0x7ff8 | data2 & 0x0007;
+            if data1 & (1 << 7) != 0 {
+                ioffset |= 1 << 15;
+            }
+            if ioffset != 0xffff {
+                self.phy_page_write(0x0bcf, 0x16, ioffset, r)?;
+            }
+            // TX LPF corner frequency level.
+            let level = self.phy_page_read(0x0bcd, 0x16, r)? & 0x000f;
+            let rlen = if level > 3 { level - 3 } else { 0 };
+            self.phy_page_write(0x0bcd, 0x17, rlen | rlen << 4 | rlen << 8 | rlen << 12, r)?;
+            self.phy_page_modify(0x0a44, 0x11, 1 << 7, 0, r)?; // disable PHY PFM mode
+            self.phy_page_modify(0x0a43, 0x10, 1 << 0, 0, r)?; // disable 10M PLL off
+            self.phy_page_modify(0x0a43, 0x10, 1 << 2, 0, r)?; // disable ALDPS
+            self.phy_page_modify(0x0a43, 0x11, 0, 1 << 4, r) // EEE
+        };
+        run().is_some()
+    }
+
     /// Software reset: `ChipCmd.Reset`, then wait for it to clear. `relax`
     /// is called between polls (the adapter spins, answering TLB shootdowns).
     pub fn reset(&self, mut relax: impl FnMut()) -> Result<(), InitError> {
@@ -855,6 +940,9 @@ mod tests {
         link_status: u8,
         reset_stuck: bool,
         eri: alloc::collections::BTreeMap<u32, u32>,
+        /// PHY registers behind a non-zero page (register 0x1f).
+        paged: alloc::collections::BTreeMap<(u16, usize), u16>,
+        ocp: alloc::collections::BTreeMap<u16, u16>,
     }
 
     #[derive(Clone)]
@@ -877,6 +965,8 @@ mod tests {
                 link_status: PHYST_LINK | PHYST_FULL_DUP | PHYST_1000,
                 reset_stuck: false,
                 eri: Default::default(),
+                paged: Default::default(),
+                ocp: Default::default(),
             })))
         }
 
@@ -970,10 +1060,17 @@ mod tests {
                 // MDIO: the read (flag clear) completes with the flag set; a write completes with it clear.
                 let v = Self::rd32(&m, PHYAR);
                 let reg = ((v >> 16) & 0x1F) as usize;
+                let page = m.phy[0x1f];
+                let banked = page != 0 && reg != 0x1f;
                 if v & PHYAR_FLAG == 0 {
-                    return PHYAR_FLAG | (reg as u32) << 16 | m.phy[reg] as u32;
+                    let val = if banked { m.paged.get(&(page, reg)).copied().unwrap_or(0) } else { m.phy[reg] };
+                    return PHYAR_FLAG | (reg as u32) << 16 | val as u32;
                 }
-                m.phy[reg] = v as u16;
+                if banked {
+                    m.paged.insert((page, reg), v as u16);
+                } else {
+                    m.phy[reg] = v as u16;
+                }
                 m.regs[PHYAR..PHYAR + 4].copy_from_slice(&(v & !PHYAR_FLAG).to_le_bytes());
                 return v & !PHYAR_FLAG;
             }
@@ -1027,6 +1124,16 @@ mod tests {
                     let data = m.eri.get(&addr).copied().unwrap_or(0);
                     m.regs[ERIDR..ERIDR + 4].copy_from_slice(&data.to_le_bytes());
                     m.regs[ERIAR..ERIAR + 4].copy_from_slice(&(val | ERIAR_FLAG).to_le_bytes());
+                }
+                return;
+            }
+            if off == OCPDR {
+                let reg = ((val >> 15) & 0xFFFE) as u16;
+                if val & OCPAR_FLAG != 0 {
+                    m.ocp.insert(reg, val as u16);
+                } else {
+                    let data = m.ocp.get(&reg).copied().unwrap_or(0);
+                    m.regs[OCPDR..OCPDR + 4].copy_from_slice(&(data as u32).to_le_bytes());
                 }
                 return;
             }
@@ -1436,6 +1543,32 @@ mod tests {
         let mut out = String::new();
         d.report(&mut out).unwrap();
         assert!(out.contains("58 B: tcp 192.168.100.8:49152 > 34.223.124.45:80 SYN seq 1000 ack 0 win 65535"), "{}", out);
+    }
+
+    #[test]
+    fn phy_config_matches_linux_8168h_2() {
+        let dev = Dev::new(0x1000_0000);
+        let d = Rtl8168::new(dev.clone(), dev.clone());
+        {
+            let mut m = dev.0.borrow_mut();
+            m.ocp.insert(0xdd00, 0x0abc);
+            // Reset values that the sequence must change.
+            m.paged.insert((0x0a44, 0x11), 1 << 7);
+            m.paged.insert((0x0a43, 0x10), 0x0005);
+            m.paged.insert((0x0bcd, 0x16), 0x0007);
+            m.paged.insert((0x0a43, 0x14), 0xffff);
+        }
+        assert!(d.phy_config_8168h(|| {}));
+        let m = dev.0.borrow();
+        let reg = |page: u16, r: usize| m.paged.get(&(page, r)).copied().unwrap_or(0);
+        assert_eq!(reg(0x0bcf, 0x16), 0x055c, "ADC bias offset from MAC OCP 0xdd00");
+        assert_eq!(reg(0x0bcd, 0x17), 0x4444, "level 7 -> rlen 4 in every nibble");
+        assert_eq!(reg(0x0a44, 0x11), 1 << 11, "gphy 10M on, PFM off");
+        assert_eq!(reg(0x0a43, 0x10) & 0x0005, 0, "10M PLL off and ALDPS cleared");
+        assert_eq!(reg(0x0a43, 0x11) & (1 << 4), 1 << 4, "EEE");
+        assert_eq!(reg(0x0a42, 0x16) & 2, 2);
+        assert_eq!(m.phy[0x1f], 0, "page restored");
+        assert!(m.violations.is_empty());
     }
 
     #[test]

@@ -245,7 +245,13 @@ pub fn probe(level: NicLevel, irq_apic: Option<u32>) -> Option<Rtl> {
         serial_println!("rtl8168: reset failed: {:?}", e);
         return None;
     }
-    serial_println!("rtl8168: reset done, restarting auto-negotiation");
+    // Linux configures the PHY before the link comes up; this chip's
+    // (XID 0x541) dropped gigabit ~13 s after boot without it.
+    if id.xid == 0x541 {
+        let ok = drv.phy_config_8168h(relax);
+        serial_println!("rtl8168: PHY configured as Linux's rtl8168h_2 ({})", if ok { "ok" } else { "MDIO TIMED OUT" });
+    }
+    serial_println!("rtl8168: reset done, restarting auto-negotiation at {} ms", crate::cpu::tsc::uptime_ms());
     let aneg = drv.phy_autoneg(relax);
     serial_println!("rtl8168: MDIO writes {}", if aneg { "completed" } else { "TIMED OUT" });
     let start = crate::cpu::tsc::uptime_ms();
@@ -254,7 +260,7 @@ pub fn probe(level: NicLevel, irq_apic: Option<u32>) -> Option<Rtl> {
         relax();
         link = drv.link();
     }
-    serial_println!("rtl8168: link {:?} after {} ms", link, crate::cpu::tsc::uptime_ms() - start);
+    serial_println!("rtl8168: link {:?} after {} ms (uptime {} ms)", link, crate::cpu::tsc::uptime_ms() - start, crate::cpu::tsc::uptime_ms());
     log_dump(drv.regs(), "after reset");
     // The reset must keep the station address: log it again so a difference shows.
     let after = drv.identify();
