@@ -118,6 +118,10 @@ pub const COMMON_QUEUE_DESC: usize = 0x20;
 pub const COMMON_QUEUE_DRIVER: usize = 0x28;
 pub const COMMON_QUEUE_DEVICE: usize = 0x30;
 
+/// `VIRTIO_MSI_NO_VECTOR`: written to `msix_config` / `queue_msix_vector` for "no
+/// interrupt" (and what the device answers when it refuses a vector).
+pub const MSIX_NO_VECTOR: u16 = 0xFFFF;
+
 // ── Device status (§2.1) ────────────────────────────────────────────────────
 
 pub const STATUS_ACKNOWLEDGE: u8 = 1;

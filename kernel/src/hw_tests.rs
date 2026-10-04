@@ -1144,7 +1144,7 @@ fn virtio_net_pings_the_gateway() {
         EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address,
     };
 
-    let nic = crate::network::virtio_net::VirtioNet::probe().unwrap_or_else(|e| panic!("virtio-net: {:?}", e));
+    let nic = crate::network::virtio_net::VirtioNet::probe(None).unwrap_or_else(|e| panic!("virtio-net: {:?}", e));
     assert_eq!(nic.mac(), [0x52, 0x54, 0x00, 0x12, 0x34, 0x56], "QEMU's default NIC MAC");
     assert!(nic.link_up(), "link down");
 
@@ -1209,6 +1209,7 @@ fn virtio_net_pings_the_gateway() {
 #[test_case]
 fn dhcp_lease_from_qemu() {
     let lease = net_up();
+    assert!(crate::network::irq_count() > 0, "the lease arrived without a single NIC interrupt");
     use net::smoltcp::wire::Ipv4Address;
     assert_eq!(lease.addr, Ipv4Address::new(10, 0, 2, 15));
     assert_eq!(lease.prefix, 24);
@@ -1216,19 +1217,26 @@ fn dhcp_lease_from_qemu() {
     assert_eq!(lease.dns, Some(Ipv4Address::new(10, 0, 2, 3)));
 }
 
-/// Brings the global stack up once for the network tests (`network::init`
-/// twice would reset the NIC under the first stack) and waits for DHCP.
+/// Brings the global stack up once for the network tests and waits for DHCP.
+/// (`network::init` twice would reset the NIC under the first stack.) The
+/// NIC's MSI-X vector goes to CPU 1: a test boot's BSP spins with IF=0 and
+/// never takes an interrupt, while the APs idle with IF=1. The wait does
+/// **not** call `network::tick`, so the lease only arrives if receive really
+/// is driven by the interrupt (DHCP's replies, and the REQUEST each OFFER
+/// triggers, all go through `network::irq`).
 fn net_up() -> net::Lease {
     static UP: spin::Once<net::Lease> = spin::Once::new();
     *UP.call_once(|| {
-        crate::network::init();
+        assert!(crate::smp::is_online_ap(1), "test boot has no CPU 1");
+        crate::network::init_with(Some(1));
         let mut lease = None;
         assert!(
-            wait_net(10_000, || {
+            crate::edu::wait_ms(10_000, || {
                 lease = crate::network::lease();
                 lease.is_some()
             }),
-            "no DHCP lease in 10 s"
+            "no DHCP lease in 10 s without a tick: the NIC interrupt did not drive receive (irq count {})",
+            crate::network::irq_count()
         );
         lease.unwrap()
     })

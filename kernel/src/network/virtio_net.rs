@@ -129,6 +129,7 @@ fn setup_queue(
     notify: &Mmio,
     mult: u32,
     index: u16,
+    msix_vector: u16,
 ) -> Result<(DmaBuf, v::SplitQueue, Mmio), InitError> {
     common.w16(v::COMMON_QUEUE_SELECT, index);
     let max = common.r16(v::COMMON_QUEUE_SIZE);
@@ -142,7 +143,11 @@ fn setup_queue(
     let mem = unsafe { core::slice::from_raw_parts_mut(dma.virt(), dma.len()) };
     let sq = v::SplitQueue::new(layout, mem);
     common.w16(v::COMMON_QUEUE_SIZE, size);
-    common.w16(v::COMMON_QUEUE_MSIX_VECTOR, 0xFFFF);
+    common.w16(v::COMMON_QUEUE_MSIX_VECTOR, msix_vector);
+    if msix_vector != v::MSIX_NO_VECTOR && common.r16(v::COMMON_QUEUE_MSIX_VECTOR) == v::MSIX_NO_VECTOR {
+        // The device refused the vector (out of its MSI-X table): fall back to polling.
+        common.w16(v::COMMON_QUEUE_MSIX_VECTOR, v::MSIX_NO_VECTOR);
+    }
     common.w64(v::COMMON_QUEUE_DESC, dma.bus_addr() + layout.desc as u64);
     common.w64(v::COMMON_QUEUE_DRIVER, dma.bus_addr() + layout.avail as u64);
     common.w64(v::COMMON_QUEUE_DEVICE, dma.bus_addr() + layout.used as u64);
@@ -155,8 +160,12 @@ fn setup_queue(
 
 impl VirtioNet {
     /// Finds the first virtio-net function and brings it to DRIVER_OK.
-    /// Boot-only: it maps MMIO and busy-waits on the device.
-    pub fn probe() -> Result<VirtioNet, InitError> {
+    /// Boot-only: it maps MMIO and busy-waits on the device. With `irq_apic`
+    /// (a local APIC id) it also sets up one MSI-X vector, shared by the
+    /// config change and both queues, delivered there and handled by
+    /// `network::irq`; without it, or when anything about MSI-X is missing,
+    /// the device stays polled (`network::tick`).
+    pub fn probe(irq_apic: Option<u32>) -> Result<VirtioNet, InitError> {
         let mut found = None;
         crate::pci::for_each_function(|f| {
             if found.is_none() && v::is_net(f.vendor, f.device_id) {
@@ -172,6 +181,7 @@ impl VirtioNet {
         crate::pci::enable_mem_and_bus_master(bus, dev, func);
 
         let common = map_region(&bars, caps.common)?;
+        let irq_vector = irq_apic.and_then(|apic| Self::setup_msix(bus, dev, func, &bars, apic));
         let notify = map_region(&bars, caps.notify)?;
         let device_cfg = match caps.device {
             Some(r) => Some(map_region(&bars, r)?),
@@ -201,8 +211,11 @@ impl VirtioNet {
             return Err(InitError::Rejected);
         }
 
-        let (rx_dma, rx_sq, rx_bell) = setup_queue(&common, &notify, caps.notify_off_multiplier, v::NET_QUEUE_RX)?;
-        let (tx_dma, tx_sq, tx_bell) = setup_queue(&common, &notify, caps.notify_off_multiplier, v::NET_QUEUE_TX)?;
+        // MSI-X table entry 0 for the config change and for both queues.
+        let msix = if irq_vector.is_some() { 0 } else { v::MSIX_NO_VECTOR };
+        common.w16(v::COMMON_MSIX_CONFIG, msix);
+        let (rx_dma, rx_sq, rx_bell) = setup_queue(&common, &notify, caps.notify_off_multiplier, v::NET_QUEUE_RX, msix)?;
+        let (tx_dma, tx_sq, tx_bell) = setup_queue(&common, &notify, caps.notify_off_multiplier, v::NET_QUEUE_TX, msix)?;
         let rx_n = rx_sq.layout().size as usize;
         let tx_n = tx_sq.layout().size as usize;
         let rx_bufs = DmaBuf::alloc(rx_n * SLOT, DMA_MASK).map_err(|_| InitError::Dma)?;
@@ -225,8 +238,12 @@ impl VirtioNet {
         rx.notify(v::NET_QUEUE_RX);
 
         crate::serial_println!(
-            "virtio-net: {:02x}:{:02x}.{} mac {:02x?} queues rx={} tx={} features {:#x}",
-            bus, dev, func, mac, rx_n, tx_n, chosen
+            "virtio-net: {:02x}:{:02x}.{} mac {:02x?} queues rx={} tx={} features {:#x} irq {}",
+            bus, dev, func, mac, rx_n, tx_n, chosen,
+            match irq_vector {
+                Some(vec) => alloc::format!("MSI-X vector {:#x}", vec),
+                None => alloc::string::String::from("polled"),
+            }
         );
         Ok(VirtioNet {
             mac,
@@ -241,6 +258,20 @@ impl VirtioNet {
             tx_frames: 0,
             tx_dropped: 0,
         })
+    }
+
+    /// Reserves a vector, programs MSI-X entry 0 to deliver it to `apic`, and
+    /// returns it. Logs and returns `None` (polled) if any step fails.
+    fn setup_msix(bus: u8, dev: u8, func: u8, bars: &[Option<hal::pcicfg::Bar>; 6], apic: u32) -> Option<u8> {
+        let vector = crate::interrupts::msi::alloc(crate::network::irq)?;
+        match crate::pci::enable_msix(bus, dev, func, bars, apic, vector) {
+            Ok(()) => Some(vector),
+            Err(e) => {
+                crate::interrupts::msi::free(vector);
+                crate::serial_println!("virtio-net: no MSI-X ({}), polling", e);
+                None
+            }
+        }
     }
 
     pub fn mac(&self) -> [u8; 6] {

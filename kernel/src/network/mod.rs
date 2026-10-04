@@ -140,7 +140,14 @@ fn with_net<R>(f: impl FnOnce(&mut Net) -> R) -> Option<R> {
 /// Best-effort, bounded boot step: absent hardware is not an error (the
 /// Ryzen has no virtio device; its NIC driver is a later step).
 pub fn init() {
-    let nic = match VirtioNet::probe() {
+    init_with(Some(0));
+}
+
+/// `init` with the NIC's MSI-X vector aimed at CPU `irq_cpu` (`None`: polled
+/// only). The real boot uses the BSP; the QEMU tests, whose BSP spins with
+/// IF=0, use an AP.
+pub fn init_with(irq_cpu: Option<usize>) {
+    let nic = match VirtioNet::probe(irq_cpu.map(crate::smp::apic_id)) {
         Ok(nic) => nic,
         Err(virtio_net::InitError::NoDevice) => return,
         Err(e) => {
@@ -157,8 +164,24 @@ pub fn init() {
     NET.with(|n| *n = Some(Net { stack, socks: Vec::new() }));
 }
 
-/// The BSP's 100 Hz timer tick: drives the stack (receive, retransmit
-/// timers, DHCP) and wakes waiters. Runs in the ISR, so it only `try`s the
+/// Interrupts taken from the NIC (the MSI-X handler, `irq`).
+static IRQS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn irq_count() -> u64 {
+    IRQS.load(Ordering::Relaxed)
+}
+
+/// The NIC's MSI-X handler (an ISR, IF=0): receive, and wake whoever it
+/// made ready, now instead of at the next 100 Hz tick. Like `tick`, it only
+/// `try`s the lock: if another CPU holds it, that CPU polls the interface
+/// when it finishes (`with_net`), and the tick is the backstop.
+pub fn irq(_vector: u8) {
+    IRQS.fetch_add(1, Ordering::Relaxed);
+    tick();
+}
+
+/// The BSP's 100 Hz timer tick: drives the stack (retransmit timers, DHCP,
+/// and receive when the NIC has no interrupt) and wakes waiters. Runs in the ISR, so it only `try`s the
 /// lock; the next tick catches up. Global work: CPU 0 only.
 pub fn tick() {
     let wakes = NET.try_with(|n| n.as_mut().map(|n| n.poll())).flatten();

@@ -1,6 +1,6 @@
 # Networking (`net/`, `hal/src/virtio.rs`, `kernel/src/network/`)
 
-Status: steps 1-2b of `docs/net/net-plan.md`. A polled virtio-net driver, DHCP, **AF_INET UDP, TCP (client and server) and raw ICMP sockets** work. Not yet: `sendmsg`/`recvmsg` on inet sockets (`EOPNOTSUPP`), raw sockets for other protocols, `SOCK_DGRAM`+`IPPROTO_ICMP` "ping sockets", IPv6, loopback (a packet to the machine's own address leaves through the NIC).
+Status: steps 1-2b of `docs/net/net-plan.md`. A virtio-net driver (MSI-X, with polling as the fallback), DHCP, **AF_INET UDP, TCP (client and server) and raw ICMP sockets** work. Not yet: `sendmsg`/`recvmsg` on inet sockets (`EOPNOTSUPP`), raw sockets for other protocols, `SOCK_DGRAM`+`IPPROTO_ICMP` "ping sockets", IPv6, loopback (a packet to the machine's own address leaves through the NIC).
 
 ## Layers
 
@@ -33,14 +33,15 @@ Status: steps 1-2b of `docs/net/net-plan.md`. A polled virtio-net driver, DHCP, 
 
 ## Rules
 
-- One descriptor per buffer; a 2 KiB slot holds the 12-byte virtio-net header followed by the frame. No offloads, no `MRG_RXBUF`, no MSI-X yet (`queue_msix_vector = 0xFFFF`).
+- One descriptor per buffer; a 2 KiB slot holds the 12-byte virtio-net header followed by the frame. No offloads, no `MRG_RXBUF`.
+- **Interrupts**: one MSI-X vector (table entry 0, `interrupts::msi::alloc`) shared by the config change and both queues (`msix_config` = `queue_msix_vector` = 0). `pci::enable_msix` programs the table (the decoding and the entry layout are `hal::pcicfg::{MsixCap, msix_entry}`, host-tested), masks the other entries and enables MSI-X. The handler `network::irq` counts and runs the same `network::tick` the timer runs, so it only `try`s `NET`: a busy lock means the holder polls when it finishes (`with_net`) and the 100 Hz tick is the backstop (it is also what drives retransmit timers and DHCP). `network::init()` aims the vector at the BSP; the QEMU tests use `init_with(Some(1))` because their BSP spins with IF=0. If the capability, the APIC, a vector or the device's acceptance of it is missing, the driver logs `irq polled` and works as before. TX needs no interrupt (slots are reclaimed lazily in `send`).
+- Measured: `ping` RTT to QEMU's gateway is the same with and without the interrupt (about 6-9 ms): it is bound by something else (QEMU's user network, TCG, the wake-to-run path of the sleeping process), not by the 10 ms tick. The interrupt's proof is the test below, not a latency number.
 - RX buffers are re-posted inside `recv` (which maps head -> slot); TX slots are reclaimed lazily in `send`. A full TX ring drops the frame (TCP resends).
-- The kernel's `NIC` lock is a real `sync::Mutex`: nothing takes it from an ISR yet. When an interrupt path is added it must become an `IrqMutex` and follow the lock order in `CLAUDE.md`.
 
 ## Testing
 
 - `cd net && cargo test`, `cd hal && cargo test virtio`.
-- `scripts/run-kernel-tests.sh`: `hw_tests::dhcp_lease_from_qemu` (10.0.2.15/24, router .2, DNS .3) and `hw_tests::virtio_net_pings_the_gateway` pings QEMU's user-mode gateway 10.0.2.2 (ARP + ICMP through both queues). The runner, `cargo run` and `scripts/qemu-debug.sh` (opt out with `QEMU_DEBUG_NO_NET=1`) all attach `-netdev user -device virtio-net-pci,disable-legacy=on`.
+- `scripts/run-kernel-tests.sh`: `hw_tests::dhcp_lease_from_qemu` (10.0.2.15/24, router .2, DNS .3; `net_up()` waits for the lease **without calling `network::tick`**, so it passes only if the MSI-X interrupt to CPU 1 drives receive, and it asserts the interrupt count is non-zero; sabotage: make `network::irq` skip its poll -> `no DHCP lease in 10 s without a tick`) and `hw_tests::virtio_net_pings_the_gateway` pings QEMU's user-mode gateway 10.0.2.2 (ARP + ICMP through both queues). The runner, `cargo run` and `scripts/qemu-debug.sh` (opt out with `QEMU_DEBUG_NO_NET=1`) all attach `-netdev user -device virtio-net-pci,disable-legacy=on`.
 - `hw_tests::raw_icmp_pings_the_gateway`: a raw socket sends an echo request to 10.0.2.2 and checks the reply's IP header, checksum and ICMP id/seq/payload.
 - `icmp_test` (guest, `userspace/c/icmp_test.c`): the same from user space through mlibc; `scripts/net-e2e.sh` also runs `ping -c 3 10.0.2.2`.
 - `hw_tests::tcp_with_the_host`: `qemu-test-runner` starts two host peers (an echo server on 127.0.0.1:47001, reached as 10.0.2.2, and a client that reaches the guest's port 7777 through `hostfwd` from 127.0.0.1:47003); the test connects, echoes 200 KB with flow control, half-closes, then listens/accepts the host client. Ports 47001/47003 must be free on the machine running the tests.
