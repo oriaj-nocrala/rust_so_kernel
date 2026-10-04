@@ -230,6 +230,35 @@ pub enum Family {
 }
 
 /// The `XID` (11 bits) of a `TxConfig` value, masked like Linux does (`0x7cf`).
+/// Linux's `ether_crc`: CRC-32 (poly 0x04c11db7), bits taken LSB first, no
+/// final inversion. The chip's multicast hash is its top 6 bits.
+pub fn ether_crc(addr: &[u8; 6]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in addr {
+        let mut data = byte;
+        for _ in 0..8 {
+            let carry = (crc >> 31) as u8 ^ (data & 1) != 0;
+            crc <<= 1;
+            if carry {
+                crc ^= 0x04C1_1DB7;
+            }
+            data >>= 1;
+        }
+    }
+    crc
+}
+
+/// The `MAR0`/`MAR0+4` words (`rtl_set_rx_mode`, 8168 family: the two halves
+/// swapped and byte-reversed) that pass exactly the groups in `groups`.
+pub fn multicast_filter(groups: &[[u8; 6]]) -> [u32; 2] {
+    let mut f = [0u32; 2];
+    for g in groups {
+        let bit = ether_crc(g) >> 26;
+        f[(bit >> 5) as usize] |= 1 << (bit & 31);
+    }
+    [f[1].swap_bytes(), f[0].swap_bytes()]
+}
+
 pub fn xid(tx_config: u32) -> u16 {
     ((tx_config >> TXCFG_XID_SHIFT) & 0x7CF) as u16
 }
@@ -644,6 +673,28 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
         self.tx_frames += 1;
         self.regs.w8(TX_POLL, TXPOLL_NPQ);
         true
+    }
+
+    /// Receives frames for exactly these multicast groups (none: only
+    /// broadcast and our own address), through the chip's 64-bit hash, so
+    /// other groups that hash alike still get through: the stack must still
+    /// ignore what is not for it.
+    pub fn set_multicast(&mut self, groups: &[[u8; 6]]) {
+        self.write_multicast(multicast_filter(groups), !groups.is_empty());
+    }
+
+    /// Receives every multicast frame (the hash fully open).
+    pub fn accept_all_multicast(&mut self) {
+        self.write_multicast([u32::MAX; 2], true);
+    }
+
+    fn write_multicast(&mut self, mar: [u32; 2], accept: bool) {
+        let r = &self.regs;
+        r.w32(MAR0 + 4, mar[1]);
+        r.w32(MAR0, mar[0]);
+        let cfg = r.r32(RX_CONFIG);
+        let cfg = if accept { cfg | RXCFG_ACCEPT_MULTICAST } else { cfg & !RXCFG_ACCEPT_MULTICAST };
+        r.w32(RX_CONFIG, cfg);
     }
 
     /// Unmasks the chip's interrupts (`IRQ_MASK`), after clearing whatever
@@ -1289,6 +1340,35 @@ mod tests {
         dev.0.borrow_mut().link_status = was | PHYST_LINK;
         assert_eq!(d.poll_link(), Some(true));
         assert_eq!(d.link_changes, 2);
+    }
+
+    #[test]
+    fn multicast_hash_matches_linux_ether_crc() {
+        // 01:00:5e:00:00:01 (all hosts): CRC 0x7fa32d9b, bit 31 of the hash,
+        // which the 8168's swapped layout puts in MAR0+4 as 0x80.
+        let all_hosts = [0x01, 0x00, 0x5e, 0x00, 0x00, 0x01];
+        assert_eq!(ether_crc(&all_hosts), 0x7fa3_2d9b);
+        assert_eq!(multicast_filter(&[all_hosts]), [0, 0x80]);
+        assert_eq!(multicast_filter(&[]), [0, 0]);
+    }
+
+    #[test]
+    fn set_multicast_programs_the_hash_and_the_accept_bit() {
+        let (mut d, dev) = up(0x1000_0000);
+        let rd = |dev: &Dev| {
+            let m = dev.0.borrow();
+            (Dev::rd32(&m, MAR0), Dev::rd32(&m, MAR0 + 4), Dev::rd32(&m, RX_CONFIG))
+        };
+        assert_eq!(rd(&dev).2 & RXCFG_ACCEPT_MULTICAST, 0, "off by default");
+        d.set_multicast(&[[0x01, 0x00, 0x5e, 0x00, 0x00, 0x01]]);
+        assert_eq!(rd(&dev), (0, 0x80, rd(&dev).2));
+        assert_ne!(rd(&dev).2 & RXCFG_ACCEPT_MULTICAST, 0);
+        d.accept_all_multicast();
+        assert_eq!((rd(&dev).0, rd(&dev).1), (u32::MAX, u32::MAX));
+        d.set_multicast(&[]);
+        assert_eq!(rd(&dev), (0, 0, rd(&dev).2));
+        assert_eq!(rd(&dev).2 & RXCFG_ACCEPT_MULTICAST, 0, "other RxConfig bits untouched");
+        assert_ne!(rd(&dev).2 & RXCFG_ACCEPT_BROADCAST, 0);
     }
 
     #[test]
