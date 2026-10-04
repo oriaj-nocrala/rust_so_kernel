@@ -42,7 +42,7 @@ int main(void) {
     int s = socket(AF_INET, SOCK_DGRAM, 0);
     check(s >= 0, "socket(AF_INET, SOCK_DGRAM)");
     errno = 0;
-    check(socket(AF_INET, SOCK_RAW, 0) < 0 && errno == ESOCKTNOSUPPORT, "SOCK_RAW is not supported (ESOCKTNOSUPPORT)");
+    check(socket(AF_INET, SOCK_RDM, 0) < 0 && errno == ESOCKTNOSUPPORT, "an unsupported socket type -> ESOCKTNOSUPPORT");
     errno = 0;
     check(socket(AF_INET, SOCK_DGRAM, IPPROTO_TCP) < 0 && errno == EPROTONOSUPPORT, "a datagram socket with protocol TCP -> EPROTONOSUPPORT");
 

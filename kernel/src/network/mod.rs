@@ -47,14 +47,18 @@ type KStack = Stack<net::NicDevice<VirtioNet>>;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Udp(Handle),
+    /// A raw IP socket for one protocol (ICMP).
+    Raw(Handle),
     Tcp(TcpId),
 }
 
-/// `SOCK_DGRAM` or `SOCK_STREAM`, as the syscall layer sees them.
+/// `SOCK_DGRAM`, `SOCK_STREAM` or `SOCK_RAW` (with its IP protocol), as the
+/// syscall layer sees them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SockKind {
     Dgram,
     Stream,
+    Raw(u8),
 }
 
 struct Sock {
@@ -113,6 +117,7 @@ impl Net {
             .into_iter()
             .filter_map(|e| self.id_of(match e {
                 Event::Udp(h) => Kind::Udp(h),
+                Event::Raw(h) => Kind::Raw(h),
                 Event::Tcp(t) => Kind::Tcp(t),
             }))
             .collect();
@@ -186,6 +191,7 @@ pub fn open(kind: SockKind) -> Result<usize, NetError> {
         let k = match kind {
             SockKind::Dgram => Kind::Udp(n.stack.udp_open()),
             SockKind::Stream => Kind::Tcp(n.stack.tcp_open()),
+            SockKind::Raw(proto) => Kind::Raw(n.stack.raw_open(proto)),
         };
         n.insert(k)
     })
@@ -196,6 +202,7 @@ pub fn kind_of(id: usize) -> Option<SockKind> {
     NET.with(|n| match n.as_ref()?.kind(id).ok()? {
         Kind::Udp(_) => Some(SockKind::Dgram),
         Kind::Tcp(_) => Some(SockKind::Stream),
+        Kind::Raw(_) => Some(SockKind::Raw(1)),
     })
 }
 
@@ -227,6 +234,7 @@ fn release(id: usize) {
         if done {
             match slot.take().unwrap().kind {
                 Kind::Udp(h) => n.stack.udp_close(h),
+                Kind::Raw(h) => n.stack.raw_close(h),
                 Kind::Tcp(t) => n.stack.tcp_close(t),
             }
         }
@@ -242,6 +250,9 @@ pub fn bind(id: usize, addr: Option<Ipv4Address>, port: u16) -> Result<u16, NetE
     on_sock(id, |s, k| match k {
         Kind::Udp(h) => s.udp_bind(h, addr, port),
         Kind::Tcp(t) => s.tcp_bind(t, addr, port),
+        // A raw socket sees every packet of its protocol; the local address
+        // filter is not kept.
+        Kind::Raw(_) => Ok(0),
     })
 }
 
@@ -249,6 +260,9 @@ pub fn bind(id: usize, addr: Option<Ipv4Address>, port: u16) -> Result<u16, NetE
 pub fn connect(id: usize, peer: IpEndpoint) -> Result<Connect, NetError> {
     on_sock(id, |s, k| match k {
         Kind::Udp(h) => s.udp_connect(h, peer).map(|()| Connect::Done),
+        Kind::Raw(h) => match peer.addr {
+            IpAddress::Ipv4(a) => s.raw_connect(h, a).map(|()| Connect::Done),
+        },
         Kind::Tcp(t) => s.tcp_connect(t, peer),
     })
 }
@@ -256,7 +270,7 @@ pub fn connect(id: usize, peer: IpEndpoint) -> Result<Connect, NetError> {
 pub fn listen(id: usize, backlog: usize) -> Result<(), NetError> {
     on_sock(id, |s, k| match k {
         Kind::Tcp(t) => s.tcp_listen(t, backlog),
-        Kind::Udp(_) => Err(NetError::NotListening),
+        Kind::Udp(_) | Kind::Raw(_) => Err(NetError::NotListening),
     })
 }
 
@@ -267,7 +281,7 @@ pub fn accept(id: usize) -> Result<(usize, IpEndpoint), NetError> {
             let (nt, from) = n.stack.tcp_accept(t)?;
             Ok((n.insert(Kind::Tcp(nt)), from))
         }
-        Kind::Udp(_) => Err(NetError::NotListening),
+        Kind::Udp(_) | Kind::Raw(_) => Err(NetError::NotListening),
     })
     .unwrap_or(Err(NetError::NetUnreachable))
 }
@@ -277,6 +291,8 @@ pub fn send(id: usize, data: &[u8], dest: Option<IpEndpoint>) -> Result<usize, N
     on_sock(id, |s, k| match k {
         Kind::Udp(h) => s.udp_send(h, data, dest),
         Kind::Tcp(t) => s.tcp_send(t, data),
+        // The payload (an ICMP message): the stack adds the IPv4 header.
+        Kind::Raw(h) => s.raw_send(h, data, dest.and_then(|d| ipv4_of(&d))),
     })
 }
 
@@ -292,6 +308,10 @@ pub fn recv(id: usize, buf: &mut [u8], peek: bool) -> Result<Recvd, NetError> {
     on_sock(id, |s, k| match k {
         Kind::Udp(h) => s.udp_recv(h, buf, peek).map(|(n, full, from)| Recvd { n, full, from: Some(from) }),
         Kind::Tcp(t) => s.tcp_recv(t, buf, peek).map(|n| Recvd { n, full: n, from: None }),
+        // The whole IP packet, header included, as Linux raw sockets deliver it.
+        Kind::Raw(h) => s
+            .raw_recv(h, buf, peek)
+            .map(|(n, full, from)| Recvd { n, full, from: Some(IpEndpoint::new(IpAddress::Ipv4(from), 0)) }),
     })
 }
 
@@ -299,6 +319,7 @@ pub fn local(id: usize) -> Result<(Ipv4Address, u16), NetError> {
     on_sock(id, |s, k| match k {
         Kind::Udp(h) => s.udp_local(h),
         Kind::Tcp(t) => s.tcp_local(t),
+        Kind::Raw(_) => Ok((Ipv4Address::UNSPECIFIED, 0)),
     })
 }
 
@@ -306,6 +327,10 @@ pub fn peer(id: usize) -> Result<IpEndpoint, NetError> {
     on_sock(id, |s, k| match k {
         Kind::Udp(h) => s.udp_peer(h)?.ok_or(NetError::NotConnected),
         Kind::Tcp(t) => s.tcp_peer(t),
+        Kind::Raw(h) => s
+            .raw_peer(h)?
+            .map(|a| IpEndpoint::new(IpAddress::Ipv4(a), 0))
+            .ok_or(NetError::NotConnected),
     })
 }
 
@@ -313,7 +338,7 @@ pub fn peer(id: usize) -> Result<IpEndpoint, NetError> {
 pub fn shutdown_write(id: usize) -> Result<(), NetError> {
     on_sock(id, |s, k| match k {
         Kind::Tcp(t) => s.tcp_shutdown_write(t),
-        Kind::Udp(_) => Err(NetError::NotConnected),
+        Kind::Udp(_) | Kind::Raw(_) => Err(NetError::NotConnected),
     })
 }
 
@@ -321,7 +346,7 @@ pub fn shutdown_write(id: usize) -> Result<(), NetError> {
 pub fn take_error(id: usize) -> Result<Option<NetError>, NetError> {
     on_sock(id, |s, k| match k {
         Kind::Tcp(t) => s.tcp_take_error(t),
-        Kind::Udp(_) => Ok(None),
+        Kind::Udp(_) | Kind::Raw(_) => Ok(None),
     })
 }
 
@@ -336,6 +361,10 @@ pub fn poll_mask(id: usize) -> Option<PollMask> {
                 (r, w, false)
             }
             Kind::Tcp(t) => n.stack.tcp_mask(t).ok()?,
+            Kind::Raw(h) => {
+                let (r, w) = n.stack.raw_mask(h).ok()?;
+                (r, w, false)
+            }
         };
         Some(PollMask { readable, writable, hup, err: false })
     })

@@ -25,6 +25,10 @@ pub(super) const AF_INET: i32 = 2;
 const AF_UNSPEC: u16 = 0;
 const SOCK_STREAM: i32 = 1;
 const SOCK_DGRAM: i32 = 2;
+const SOCK_RAW: i32 = 3;
+const IPPROTO_ICMP: i32 = 1;
+const IPPROTO_IP: i32 = 0;
+const SOL_RAW: i32 = 255;
 const IPPROTO_TCP: i32 = 6;
 const IPPROTO_UDP: i32 = 17;
 const SOCK_NONBLOCK: i32 = 0o4000;
@@ -111,6 +115,10 @@ pub(super) fn socket(ty: i32, protocol: i32) -> SyscallResult {
     let kind = match ty & !(SOCK_NONBLOCK | SOCK_CLOEXEC) {
         SOCK_DGRAM if protocol == 0 || protocol == IPPROTO_UDP => SockKind::Dgram,
         SOCK_STREAM if protocol == 0 || protocol == IPPROTO_TCP => SockKind::Stream,
+        // ICMP only (`ping`): the caller sends ICMP messages and receives whole
+        // IP packets. There is no permission model, so no EPERM.
+        SOCK_RAW if protocol == IPPROTO_ICMP => SockKind::Raw(IPPROTO_ICMP as u8),
+        SOCK_RAW => return EPROTONOSUPPORT,
         SOCK_DGRAM | SOCK_STREAM => return EPROTONOSUPPORT,
         _ => return ESOCKTNOSUPPORT,
     };
@@ -322,6 +330,8 @@ pub(super) fn setsockopt(level: i32, optname: i32, optval: u64, optlen: u32) -> 
         (SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT | SO_BROADCAST | SO_KEEPALIVE | SO_RCVBUF | SO_SNDBUF)
         | (SOL_SOCKET, SO_LINGER | SO_RCVTIMEO | SO_SNDTIMEO)
         | (IPPROTO_TCP, TCP_NODELAY) => 0,
+        // IP_TTL, IP_TOS, ICMP_FILTER, ...: `ping` sets some; none changes anything here.
+        (IPPROTO_IP, _) | (SOL_RAW, _) => 0,
         _ => ENOPROTOOPT,
     }
 }
@@ -339,6 +349,7 @@ pub(super) fn getsockopt(id: usize, level: i32, optname: i32, optval: u64, optle
         (SOL_SOCKET, SO_TYPE) => match network::kind_of(id) {
             Some(SockKind::Dgram) => SOCK_DGRAM,
             Some(SockKind::Stream) => SOCK_STREAM,
+            Some(SockKind::Raw(_)) => SOCK_RAW,
             None => return errno::EBADF,
         },
         // A failed non-blocking connect() reports here, once.

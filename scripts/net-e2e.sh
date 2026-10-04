@@ -108,6 +108,12 @@ echo "$out" | grep -q "$HOST_MD5"; report $((! $?)) "wget of 300 KB matches the 
 out=$(guest 60 'wget -T 3 -O - http://10.0.2.2:47020/')
 echo "$out" | grep -q 'download timed out'; report $((! $?)) "wget -T times out on a silent server (setitimer/SIGALRM)"
 
+out=$(guest 120 icmp_test)
+echo "$out" | grep -q 'icmp_test: PASS'; report $((! $?)) "icmp_test (raw ICMP socket, whole IP packets)"
+
+out=$(guest 60 'ping -c 3 10.0.2.2')
+echo "$out" | grep -q '3 packets received'; report $((! $?)) "BusyBox ping to the gateway"
+
 out=$(guest 120 itimer_test)
 echo "$out" | grep -q 'itimer_test: PASS'; report $((! $?)) "itimer_test (alarm, setitimer, SIGALRM)"
 

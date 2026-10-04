@@ -9,6 +9,6 @@ edition = "2021"
 [workspace]
 
 [dependencies]
-smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "proto-dns", "socket-tcp", "socket-udp", "socket-icmp", "socket-dhcpv4", "socket-dns", "alloc"] }
+smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "proto-dns", "socket-tcp", "socket-udp", "socket-raw", "auto-icmp-echo-reply", "socket-icmp", "socket-dhcpv4", "socket-dns", "alloc"] }
 
 [dev-dependencies]

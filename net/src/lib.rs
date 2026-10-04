@@ -564,4 +564,91 @@ mod tests {
         pump(&mut a, &mut b, &mut clock, 20);
         assert!(b.tcp_accept(l).is_ok());
     }
+
+    // ── Raw ICMP ──────────────────────────────────────────────────────────
+
+    use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr, IpProtocol, Ipv4Packet};
+
+    /// An ICMP echo request message (type 8) with `id`/`seq` and a payload.
+    fn echo_request(id: u16, seq: u16, data: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0u8; 8 + data.len()];
+        Icmpv4Repr::EchoRequest { ident: id, seq_no: seq, data }
+            .emit(&mut Icmpv4Packet::new_unchecked(&mut buf[..]), &ChecksumCapabilities::default());
+        buf
+    }
+
+    #[test]
+    fn raw_icmp_echo_round_trip_with_ip_headers() {
+        let (mut a, mut b) = pair();
+        let ra = a.raw_open(1);
+        a.raw_send(ra, &echo_request(0x1234, 7, b"constanos"), Some(Ipv4Address::new(10, 0, 0, 2))).unwrap();
+        // The first packet may be lost to ARP (smoltcp keeps it once resolved); allow retries.
+        let mut clock = 0;
+        let mut buf = [0u8; 128];
+        let mut got = None;
+        for _ in 0..50 {
+            pump(&mut a, &mut b, &mut clock, 20);
+            if let Ok(r) = a.raw_recv(ra, &mut buf, false) {
+                got = Some(r);
+                break;
+            }
+            let _ = a.raw_send(ra, &echo_request(0x1234, 7, b"constanos"), Some(Ipv4Address::new(10, 0, 0, 2)));
+        }
+        let (n, full, from) = got.expect("an echo reply came back");
+        assert_eq!(n, full);
+        assert_eq!(from, Ipv4Address::new(10, 0, 0, 2));
+        let ip = Ipv4Packet::new_checked(&buf[..n]).expect("a whole IP packet: header + ICMP");
+        assert_eq!(ip.next_header(), IpProtocol::Icmp);
+        assert_eq!(ip.dst_addr(), Ipv4Address::new(10, 0, 0, 1));
+        assert!(ip.verify_checksum(), "IP header checksum");
+        let icmp = Icmpv4Packet::new_checked(ip.payload()).unwrap();
+        match Icmpv4Repr::parse(&icmp, &ChecksumCapabilities::default()).unwrap() {
+            Icmpv4Repr::EchoReply { ident, seq_no, data } => {
+                assert_eq!((ident, seq_no, data), (0x1234, 7, &b"constanos"[..]));
+            }
+            other => panic!("not an echo reply: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn raw_socket_sees_only_its_protocol_and_reports_edges() {
+        let (mut a, mut b) = pair();
+        let mut clock = 0;
+        let rb = b.raw_open(1);
+        assert_eq!(b.raw_mask(rb), Ok((false, true)));
+        // UDP to B must not reach an ICMP raw socket.
+        let (ua, ub) = (a.udp_open(), b.udp_open());
+        b.udp_bind(ub, None, 9).unwrap();
+        a.udp_send(ua, b"x", Some(ep(2, 9))).unwrap();
+        let ev = pump(&mut a, &mut b, &mut clock, 20);
+        assert!(!ev.contains(&Event::Raw(rb)));
+        assert_eq!(b.raw_recv(rb, &mut [0u8; 64], false), Err(NetError::Again));
+
+        // An echo request does (B also answers it by itself).
+        let ra = a.raw_open(1);
+        a.raw_connect(ra, Ipv4Address::new(10, 0, 0, 2)).unwrap();
+        a.raw_send(ra, &echo_request(1, 1, b"hi"), None).unwrap();
+        let ev = pump(&mut a, &mut b, &mut clock, 50);
+        assert!(ev.contains(&Event::Raw(rb)), "the request wakes B's raw socket");
+        let mut small = [0u8; 10];
+        let (n, full, from) = b.raw_recv(rb, &mut small, true).unwrap();
+        assert_eq!((n, from), (10, Ipv4Address::new(10, 0, 0, 1)));
+        assert_eq!(full, 20 + 8 + 2, "peek reports the whole packet and keeps it");
+        assert!(b.raw_recv(rb, &mut small, false).is_ok());
+        assert_eq!(b.raw_recv(rb, &mut small, false), Err(NetError::Again));
+    }
+
+    #[test]
+    fn raw_send_rules() {
+        let (mut a, _b) = pair();
+        let r = a.raw_open(1);
+        assert_eq!(a.raw_send(r, b"x", None), Err(NetError::DestAddrRequired));
+        assert_eq!(a.raw_send(r, &[0u8; 2000], Some(Ipv4Address::new(10, 0, 0, 2))), Err(NetError::MsgSize));
+        let dev = NicDevice::new(Cable { rx: Default::default(), tx: Default::default(), tx_room: None });
+        let mut unconfigured = Stack::new(dev, [2, 0, 0, 0, 0, 9], 1, Instant::from_millis(0));
+        let r2 = unconfigured.raw_open(1);
+        assert_eq!(unconfigured.raw_send(r2, b"x", Some(Ipv4Address::new(10, 0, 0, 2))), Err(NetError::NetUnreachable));
+        a.raw_close(r);
+        assert_eq!(a.raw_mask(r), Err(NetError::BadHandle));
+    }
 }

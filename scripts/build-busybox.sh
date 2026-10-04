@@ -73,6 +73,9 @@ COMMON=(
     -fomit-frame-pointer
     -mno-red-zone
     -D_GNU_SOURCE
+    # ping.c uses ICMP_MINLEN (the 8-byte ICMP header), which glibc's
+    # <netinet/ip_icmp.h> defines and mlibc's does not.
+    -DICMP_MINLEN=8
     # struct sysinfo for free/uptime/nmeter/init: they include
     # <sys/sysinfo.h> only under \`#ifdef __linux__\`, which this target
     # does not define (and must not: BusyBox has hundreds of other

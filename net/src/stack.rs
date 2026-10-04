@@ -6,9 +6,13 @@
 use alloc::vec::Vec;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::Device;
-use smoltcp::socket::{dhcpv4, tcp, udp};
+use smoltcp::socket::{dhcpv4, raw, tcp, udp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address};
+use smoltcp::phy::ChecksumCapabilities;
+use smoltcp::wire::{
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersion, Ipv4Address,
+    Ipv4Packet, Ipv4Repr,
+};
 
 pub type Handle = SocketHandle;
 
@@ -77,6 +81,7 @@ pub struct TcpId(u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     Udp(Handle),
+    Raw(Handle),
     Tcp(TcpId),
 }
 
@@ -135,6 +140,15 @@ struct TcpReady {
     state: tcp::State,
 }
 
+struct RawInfo {
+    handle: Handle,
+    proto: u8,
+    /// `connect`: the default destination.
+    peer: Option<Ipv4Address>,
+    was_readable: bool,
+    was_writable: bool,
+}
+
 pub struct Stack<D: Device> {
     dev: D,
     iface: Interface,
@@ -143,6 +157,7 @@ pub struct Stack<D: Device> {
     dhcp: Option<Handle>,
     lease: Option<Lease>,
     udp: Vec<UdpInfo>,
+    raw: Vec<RawInfo>,
     tcp: Vec<TcpInfo>,
     /// Closed by the application, still finishing the connection.
     orphans: Vec<SocketHandle>,
@@ -169,7 +184,7 @@ impl<D: Device> Stack<D> {
         cfg.random_seed = seed;
         let iface = Interface::new(cfg, &mut dev, now);
         let sockets = SocketSet::new(Vec::new());
-        Stack { dev, iface, sockets, dhcp: None, lease: None, udp: Vec::new(), tcp: Vec::new(), orphans: Vec::new(), next_tcp: 1, next_port: EPHEMERAL_FIRST }
+        Stack { dev, iface, sockets, dhcp: None, lease: None, udp: Vec::new(), raw: Vec::new(), tcp: Vec::new(), orphans: Vec::new(), next_tcp: 1, next_port: EPHEMERAL_FIRST }
     }
 
     pub fn device(&mut self) -> &mut D {
@@ -241,6 +256,15 @@ impl<D: Device> Stack<D> {
             let (r, w) = (s.can_recv(), s.can_send());
             if (r && !info.was_readable) || (w && !info.was_writable) {
                 woken.push(Event::Udp(info.handle));
+            }
+            info.was_readable = r;
+            info.was_writable = w;
+        }
+        for info in self.raw.iter_mut() {
+            let s = self.sockets.get::<raw::Socket>(info.handle);
+            let (r, w) = (s.can_recv(), s.can_send());
+            if (r && !info.was_readable) || (w && !info.was_writable) {
+                woken.push(Event::Raw(info.handle));
             }
             info.was_readable = r;
             info.was_writable = w;
@@ -750,5 +774,98 @@ impl<D: Device> Stack<D> {
                 }
             }
         }
+    }
+}
+
+
+// ── Raw IP sockets (one protocol each; `SOCK_RAW`) ─────────────────────────
+
+const RAW_QUEUE_PACKETS: usize = 16;
+const RAW_QUEUE_BYTES: usize = 32 * 1024;
+
+impl<D: Device> Stack<D> {
+    fn raw_info(&mut self, h: Handle) -> Result<&mut RawInfo, NetError> {
+        self.raw.iter_mut().find(|i| i.handle == h).ok_or(NetError::BadHandle)
+    }
+
+    /// A raw socket for IP protocol `proto` (1 = ICMP). It receives every
+    /// packet of that protocol *with its IP header*, as Linux's do; `raw_send`
+    /// takes the payload and adds the header.
+    pub fn raw_open(&mut self, proto: u8) -> Handle {
+        let rx = raw::PacketBuffer::new(
+            alloc::vec![raw::PacketMetadata::EMPTY; RAW_QUEUE_PACKETS],
+            alloc::vec![0; RAW_QUEUE_BYTES],
+        );
+        let tx = raw::PacketBuffer::new(
+            alloc::vec![raw::PacketMetadata::EMPTY; RAW_QUEUE_PACKETS],
+            alloc::vec![0; RAW_QUEUE_BYTES],
+        );
+        let handle = self.sockets.add(raw::Socket::new(Some(IpVersion::Ipv4), Some(IpProtocol::from(proto)), rx, tx));
+        self.raw.push(RawInfo { handle, proto, peer: None, was_readable: false, was_writable: true });
+        handle
+    }
+
+    pub fn raw_connect(&mut self, h: Handle, peer: Ipv4Address) -> Result<(), NetError> {
+        self.raw_info(h)?.peer = Some(peer);
+        Ok(())
+    }
+
+    pub fn raw_peer(&mut self, h: Handle) -> Result<Option<Ipv4Address>, NetError> {
+        Ok(self.raw_info(h)?.peer)
+    }
+
+    /// Sends `payload` (an ICMP message, say) in an IPv4 packet to `dest`
+    /// (or the connected address), from the interface's address.
+    pub fn raw_send(&mut self, h: Handle, payload: &[u8], dest: Option<Ipv4Address>) -> Result<usize, NetError> {
+        let info = self.raw_info(h)?;
+        let (proto, peer) = (info.proto, info.peer);
+        let dst_addr = dest.or(peer).ok_or(NetError::DestAddrRequired)?;
+        let src_addr = self.lease.ok_or(NetError::NetUnreachable)?.addr;
+        if payload.len() > 1500 - 20 {
+            return Err(NetError::MsgSize);
+        }
+        let repr = Ipv4Repr {
+            src_addr,
+            dst_addr,
+            next_header: IpProtocol::from(proto),
+            payload_len: payload.len(),
+            hop_limit: 64,
+        };
+        let mut packet = alloc::vec![0u8; 20 + payload.len()];
+        repr.emit(&mut Ipv4Packet::new_unchecked(&mut packet[..20]), &ChecksumCapabilities::default());
+        packet[20..].copy_from_slice(payload);
+        match self.sockets.get_mut::<raw::Socket>(h).send_slice(&packet) {
+            Ok(()) => Ok(payload.len()),
+            Err(raw::SendError::BufferFull) => Err(NetError::Again),
+        }
+    }
+
+    /// The next packet, IP header included: `(bytes copied, packet length,
+    /// sender)`. A short `buf` truncates.
+    pub fn raw_recv(&mut self, h: Handle, buf: &mut [u8], peek: bool) -> Result<(usize, usize, Ipv4Address), NetError> {
+        self.raw_info(h)?;
+        let s = self.sockets.get_mut::<raw::Socket>(h);
+        let r = if peek { s.peek() } else { s.recv() };
+        match r {
+            Ok(data) => {
+                let n = data.len().min(buf.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                let from = Ipv4Packet::new_checked(data).map(|p| p.src_addr()).unwrap_or(Ipv4Address::UNSPECIFIED);
+                Ok((n, data.len(), from))
+            }
+            Err(_) => Err(NetError::Again),
+        }
+    }
+
+    /// `(readable, writable)`.
+    pub fn raw_mask(&mut self, h: Handle) -> Result<(bool, bool), NetError> {
+        self.raw_info(h)?;
+        let s = self.sockets.get::<raw::Socket>(h);
+        Ok((s.can_recv(), s.can_send()))
+    }
+
+    pub fn raw_close(&mut self, h: Handle) {
+        self.raw.retain(|i| i.handle != h);
+        self.sockets.remove(h);
     }
 }

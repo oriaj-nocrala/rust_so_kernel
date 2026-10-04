@@ -1378,3 +1378,54 @@ fn tcp_with_the_host() {
     drop(conn);
     drop(listener);
 }
+
+/// Case: a raw ICMP socket through `network::*`, the way BusyBox `ping`
+/// uses one: send an echo request message to the gateway (the stack adds the
+/// IPv4 header), receive the reply as a whole IP packet. Checks the header
+/// (source, protocol, checksum) and that the ICMP id/sequence/payload come
+/// back untouched.
+#[test_case]
+fn raw_icmp_pings_the_gateway() {
+    use crate::network::{self, InetSocketHandle, SockKind};
+    use net::smoltcp::phy::ChecksumCapabilities;
+    use net::smoltcp::wire::{
+        Icmpv4Packet, Icmpv4Repr, IpAddress, IpEndpoint, IpProtocol, Ipv4Address, Ipv4Packet,
+    };
+
+    net_up();
+    let id = network::open(SockKind::Raw(1)).expect("open raw");
+    let _sock = InetSocketHandle::new(id); // closes it on drop
+    let gw = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 2)), 0);
+
+    let mut request = [0u8; 8 + 13];
+    Icmpv4Repr::EchoRequest { ident: 0xBEEF, seq_no: 3, data: b"raw-ping-test" }
+        .emit(&mut Icmpv4Packet::new_unchecked(&mut request[..]), &ChecksumCapabilities::default());
+
+    let mut reply = None;
+    let mut buf = [0u8; 256];
+    assert!(
+        wait_net(8_000, || {
+            // The first packet can be lost to ARP resolution: resend until a reply shows up.
+            match network::recv(id, &mut buf, false) {
+                Ok(r) => {
+                    reply = Some((r.n, r.from));
+                    return true;
+                }
+                Err(_) => {}
+            }
+            let _ = network::send(id, &request, Some(gw));
+            false
+        }),
+        "no echo reply"
+    );
+    let (n, from) = reply.unwrap();
+    assert_eq!(network::ipv4_of(&from.unwrap()), Some(Ipv4Address::new(10, 0, 2, 2)));
+    let ip = Ipv4Packet::new_checked(&buf[..n]).expect("a whole IP packet");
+    assert_eq!(ip.next_header(), IpProtocol::Icmp);
+    assert!(ip.verify_checksum());
+    let icmp = Icmpv4Packet::new_checked(ip.payload()).expect("an ICMP message");
+    match Icmpv4Repr::parse(&icmp, &ChecksumCapabilities::default()).expect("valid ICMP") {
+        Icmpv4Repr::EchoReply { ident: 0xBEEF, seq_no: 3, data: b"raw-ping-test" } => {}
+        other => panic!("unexpected reply {:?}", other),
+    }
+}
