@@ -8,6 +8,7 @@
 /hal/target/
 /nvgpu/target/
 /ext2/target/
+/net/target/
 /mm/target/
 /vfs/target/
 /diag/target/

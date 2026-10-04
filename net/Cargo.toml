@@ -1,0 +1,14 @@
+[package]
+name = "net"
+version = "0.1.0"
+edition = "2021"
+
+# Detached from the parent workspace, same shape as `usock`/`vfs`/`sched`:
+# the root profile is `panic = "abort"`, which would break this crate's own
+# unwinding `cargo test`.
+[workspace]
+
+[dependencies]
+smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "proto-dns", "socket-tcp", "socket-udp", "socket-icmp", "socket-dhcpv4", "socket-dns", "alloc"] }
+
+[dev-dependencies]
