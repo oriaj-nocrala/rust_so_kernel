@@ -3,8 +3,9 @@
 // End-to-end AF_INET/SOCK_DGRAM test through mlibc: sockaddr_in layout,
 // bind/getsockname/connect/getpeername, EAGAIN and blocking behaviour, poll,
 // and a real DNS round trip to QEMU's user-mode resolver (10.0.2.3) once
-// DHCP has configured the interface. Prints one line per check, then
-// PASS/FAIL.
+// DHCP has configured the interface. `udp_test [dns-ip]` queries that server
+// instead of QEMU's 10.0.2.3 (on a real LAN: the one in /etc/resolv.conf).
+// Prints one line per check, then PASS/FAIL.
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -38,7 +39,9 @@ static const unsigned char QUERY[] = {
     0x00, 0x01, 0x00, 0x01,
 };
 
-int main(void) {
+int main(int argc, char **argv) {
+    /* The resolver to query: QEMU's by default, or the first argument (a real LAN's). */
+    const char *dns_ip = argc > 1 ? argv[1] : "10.0.2.3";
     int s = socket(AF_INET, SOCK_DGRAM, 0);
     check(s >= 0, "socket(AF_INET, SOCK_DGRAM)");
     errno = 0;
@@ -69,7 +72,7 @@ int main(void) {
     close(nb);
 
     /* DHCP runs in the background from boot: wait for an address. */
-    struct sockaddr_in dns = addr_of("10.0.2.3", 53);
+    struct sockaddr_in dns = addr_of(dns_ip, 53);
     ssize_t sent = -1;
     for (int i = 0; i < 100 && sent < 0; i++) {
         sent = sendto(s, QUERY, sizeof QUERY, 0, (struct sockaddr *)&dns, sizeof dns);

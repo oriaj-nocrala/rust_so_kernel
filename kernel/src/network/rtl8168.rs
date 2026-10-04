@@ -95,6 +95,15 @@ impl Rtl {
     }
 }
 
+impl Rtl {
+    /// `/proc/nic`: the driver's counters, registers, ring cursors and last frames.
+    pub fn report(&self) -> alloc::string::String {
+        let mut out = alloc::string::String::new();
+        let _ = self.drv.report(&mut out);
+        out
+    }
+}
+
 impl net::Nic for Rtl {
     fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
         self.drv.recv(buf)
