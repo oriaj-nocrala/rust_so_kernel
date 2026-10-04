@@ -214,6 +214,8 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> Resume 
     let bsp = crate::cpu::cpu_id() == 0;
     let mut wake_pids = [(0usize, 0u32); 8];
     let mut wake_count = 0;
+    let mut sigalrm_pids = [0usize; 4];
+    let mut sigalrm_count = 0;
     if bsp && tick {
         crate::drivers::framebuffer_console::tick_cursor_blink();
 
@@ -239,7 +241,17 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> Resume 
     // returns a list of PIDs to wake. QUEUE is always released before we acquire the scheduler lock below (ABBA-deadlock
     // prevention).
     if bsp || crate::interrupts::apic::oneshot() {
-        wake_count = crate::time::hrtimer::tick(now_ns, &mut wake_pids);
+        let mut alarms = [(0usize, 0u32); 4];
+        let alarm_count;
+        (wake_count, alarm_count) = crate::time::hrtimer::tick(now_ns, &mut wake_pids, &mut alarms);
+        // ITIMER_REAL expiries: re-arm periodic timers (takes its own lock,
+        // not the scheduler's) and note whom to signal below.
+        for &(pid, id) in &alarms[..alarm_count] {
+            if crate::time::itimer::on_expiry(pid, id, now_ns) {
+                sigalrm_pids[sigalrm_count] = pid;
+                sigalrm_count += 1;
+            }
+        }
 
         // A timed-out poll/epoll waiter is removed *before* its process is
         // woken, not after: once woken it can run on another CPU at once and
@@ -264,6 +276,10 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> Resume 
         // interrupted.
         crate::ktrace!(crate::debug::SCHED, "hrtimer waking PID {}", pid);
         scheduler.wake(pid);
+    }
+
+    for &pid in &sigalrm_pids[..sigalrm_count] {
+        scheduler.signal_pid(pid, super::signal::SIGALRM);
     }
 
     // Not scheduling yet (boot, before `start_first_process`; the QEMU

@@ -9,7 +9,7 @@
 # wget (md5 of a big file), nc, nslookup, and httpd reached from the host.
 # Prints one line per check and exits nonzero if any fails.
 #
-# Host ports used: 47001 (echo), 47010 (http), 47003 (hostfwd -> guest 7777).
+# Host ports used: 47001 (echo), 47010 (http), 47020 (silent), 47003 (hostfwd -> guest 7777).
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DBG="$REPO/scripts/qemu-debug.sh"
@@ -21,6 +21,7 @@ cleanup() {
     "$DBG" stop >/dev/null 2>&1
     [ -n "${ECHO_PID:-}" ] && kill "$ECHO_PID" 2>/dev/null
     [ -n "${HTTP_PID:-}" ] && kill "$HTTP_PID" 2>/dev/null
+    [ -n "${SILENT_PID:-}" ] && kill "$SILENT_PID" 2>/dev/null
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -61,6 +62,16 @@ def h(c):
 while True:
     c, _ = ls.accept(); threading.Thread(target=h, args=(c,), daemon=True).start()
 PY
+# Accepts connections and never answers: what wget's timeout is for.
+cat > "$WORK/silent.py" <<'PY'
+import socket
+ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+ls.bind(("127.0.0.1", 47020)); ls.listen(4)
+held = []
+while True:
+    c, _ = ls.accept(); held.append(c)
+PY
+python3 "$WORK/silent.py" & SILENT_PID=$!
 mkdir -p "$WORK/www"
 head -c 300000 /dev/urandom | base64 > "$WORK/www/big.txt"
 echo "hello from the host http server" > "$WORK/www/index.html"
@@ -93,6 +104,12 @@ echo "$out" | grep -q 'Address.*[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+'; report $((!
 
 out=$(guest 120 'wget -q -O /tmp/big.txt http://10.0.2.2:47010/big.txt; md5sum /tmp/big.txt')
 echo "$out" | grep -q "$HOST_MD5"; report $((! $?)) "wget of 300 KB matches the host's md5"
+
+out=$(guest 60 'wget -T 3 -O - http://10.0.2.2:47020/')
+echo "$out" | grep -q 'download timed out'; report $((! $?)) "wget -T times out on a silent server (setitimer/SIGALRM)"
+
+out=$(guest 120 itimer_test)
+echo "$out" | grep -q 'itimer_test: PASS'; report $((! $?)) "itimer_test (alarm, setitimer, SIGALRM)"
 
 # tcp_test serve: the guest listens, the host connects through hostfwd.
 serve_from=$(wc -l < "$LOG")

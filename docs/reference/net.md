@@ -27,7 +27,7 @@ Status: steps 1-2b of `docs/net/net-plan.md`. A polled virtio-net driver, DHCP, 
 
 - BusyBox has `wget` (HTTP only, no TLS), `nc` (client and `-l` server), `nslookup` and `httpd` (`busybox-config/minimal.config`). Not built: `telnet` (mlibc has no `arpa/telnet.h`), `ping` (needs `SOCK_RAW`/ICMP sockets, unsupported), `ifconfig`.
 - Name resolution is mlibc's own (`lookup.cpp`): `/etc/resolv.conf` (first `nameserver`), `/etc/hosts`, `/etc/services`. They live in the initramfs `/etc` (`fs/initramfs.rs`): `hosts` and `services` are static; **`resolv.conf` is rendered on every open from the DHCP lease** (`network::resolv_conf`: its DNS server, else its router, else empty) through `procfs::rendered`. mlibc's resolver has no timeout: a dead DNS server blocks `getaddrinfo` forever.
-- **`setitimer`/`alarm` are not implemented** (the kernel has no interval timers or `SIGALRM`, mlibc's sysdep is missing): `wget` and `httpd` call them for timeouts, and mlibc prints `__ensure(... missing sysdep) failed` for each call but carries on. Next kernel work item for a clean console.
+- `wget -T` and `httpd` timeouts rely on `alarm`/`setitimer(ITIMER_REAL)` (`kernel/src/time/itimer.rs`, see `processes-and-scheduling.md`). A silent peer ends `wget` with `download timed out`.
 - Guest programs should retry for a few seconds after boot: DHCP takes about a second, until then a send fails with `ENETUNREACH` and `/etc/resolv.conf` is empty.
 
 ## Rules
@@ -44,5 +44,5 @@ Status: steps 1-2b of `docs/net/net-plan.md`. A polled virtio-net driver, DHCP, 
 - `tcp_test` (guest, `userspace/c/tcp_test.c`): needs the same peers by hand: a Python echo server on 127.0.0.1:47001, then `tcp_test` in the guest; for `tcp_test serve` start qemu-debug with `QEMU_DEBUG_HOSTFWD=tcp:127.0.0.1:47003-:7777` and connect from the host to 127.0.0.1:47003 (send `ping from host`, expect `pong`).
 - `udp_test` (guest, `userspace/c/udp_test.c`, run it from the shell): sockets through mlibc, EAGAIN/blocking/`poll`, and a real DNS round trip to QEMU's resolver (needs the host's DNS to answer; SERVFAIL is fine, it checks the id and QR bit).
 - Sabotage that fails a test: remove the TX doorbell (`rx 0 tx N`); remove `network::tick()` from the timer (`udp_test` fails at `poll`).
-- `scripts/net-e2e.sh [--no-build]`: the whole userland check. It starts an echo server and an HTTP server on the host, boots headless with `hostfwd`, and runs in the guest `udp_test`, `tcp_test` (client and `serve`), `nc`, `nslookup`, `wget` of 300 KB (md5 against the host), and `httpd` fetched from the host. Needs `socat` and `python3`; ports 47001/47003/47010.
+- `scripts/net-e2e.sh [--no-build]`: the whole userland check. It starts an echo server and an HTTP server on the host, boots headless with `hostfwd`, and runs in the guest `udp_test`, `tcp_test` (client and `serve`), `nc`, `nslookup`, `wget` of 300 KB (md5 against the host), `wget -T` against a silent server, `itimer_test`, and `httpd` fetched from the host. Needs `socat` and `python3`; ports 47001/47003/47010/47020.
 - `qemu-debug.sh send/key/screendump` need `socat` on the host.

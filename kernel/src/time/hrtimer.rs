@@ -29,6 +29,9 @@ pub enum HrTimerAction {
     Wake { pid: usize, cell: alloc::sync::Arc<crate::process::wait::WaitCell> },
     /// Call a kernel function (must not lock QUEUE).
     KernelFn(fn()),
+    /// An `ITIMER_REAL` expired for `pid` (`time::itimer`): `tick` reports it
+    /// and the ISR sends the signal once QUEUE is released.
+    Alarm { pid: usize },
 }
 
 pub struct HrTimer {
@@ -99,13 +102,15 @@ pub fn cancel(id: u32) -> bool {
 ///     QUEUE is released first. One that loses (the wait already ended) is
 ///     dropped here.
 ///
-/// Returns the number of `(pid, timer id)` pairs written into `pids_out`.
+/// Returns the number of `(pid, timer id)` pairs written into `pids_out` and into
+/// `alarms_out` (`Alarm` timers, same room rule).
 /// If more than 8 timers with Wake expire in the same tick, the rest stay
 /// queued and fire on the next tick, at most 10 ms later. (They used to be
 /// removed and dropped here, despite this comment saying otherwise — a lost
 /// wakeup for whoever slept on them.)
-pub fn tick(now_ns: u64, pids_out: &mut [(usize, u32); 8]) -> usize {
+pub fn tick(now_ns: u64, pids_out: &mut [(usize, u32); 8], alarms_out: &mut [(usize, u32); 4]) -> (usize, usize) {
     let mut count = 0usize;
+    let mut alarms = 0usize;
 
     let mut q = QUEUE.lock();
 
@@ -117,11 +122,18 @@ pub fn tick(now_ns: u64, pids_out: &mut [(usize, u32); 8]) -> usize {
         if count == pids_out.len() && matches!(t.action, HrTimerAction::Wake { .. }) {
             break; // no room: next tick
         }
+        if alarms == alarms_out.len() && matches!(t.action, HrTimerAction::Alarm { .. }) {
+            break;
+        }
         let timer = q.timers.remove(0);
         match timer.action {
             HrTimerAction::KernelFn(f) => {
                 // Call while holding the lock — caller's invariant says f won't re-lock.
                 f();
+            }
+            HrTimerAction::Alarm { pid } => {
+                alarms_out[alarms] = (pid, timer.id);
+                alarms += 1;
             }
             HrTimerAction::Wake { pid, cell } => {
                 if cell.claim() {
@@ -132,5 +144,5 @@ pub fn tick(now_ns: u64, pids_out: &mut [(usize, u32); 8]) -> usize {
         }
     }
 
-    count
+    (count, alarms)
 }

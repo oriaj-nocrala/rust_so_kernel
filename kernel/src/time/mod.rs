@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub mod clockevent;
 pub mod clocksource;
 pub mod hrtimer;
+pub mod itimer;
 
 pub use clocksource::ktime_get;
 
