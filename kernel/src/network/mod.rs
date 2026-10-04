@@ -28,7 +28,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use diag::IrqMutex;
 use net::smoltcp::time::Instant;
 use net::smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
-use net::{Handle, NetError, Stack};
+use net::{Connect, Event, Handle, NetError, Stack, TcpId};
 use usock::{PollMask, Wakes};
 
 use crate::allocator::KernelIrq;
@@ -44,8 +44,21 @@ pub fn is_inet(id: usize) -> bool {
 
 type KStack = Stack<net::NicDevice<VirtioNet>>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Udp(Handle),
+    Tcp(TcpId),
+}
+
+/// `SOCK_DGRAM` or `SOCK_STREAM`, as the syscall layer sees them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SockKind {
+    Dgram,
+    Stream,
+}
+
 struct Sock {
-    handle: Handle,
+    kind: Kind,
     /// Open file descriptions sharing this socket (`dup`, `fork`).
     refs: usize,
 }
@@ -63,24 +76,46 @@ fn now() -> Instant {
 }
 
 impl Net {
-    fn handle(&self, id: usize) -> Result<Handle, NetError> {
+    fn kind(&self, id: usize) -> Result<Kind, NetError> {
         id.checked_sub(INET_BASE)
             .and_then(|i| self.socks.get(i))
             .and_then(|s| s.as_ref())
-            .map(|s| s.handle)
+            .map(|s| s.kind)
             .ok_or(NetError::BadHandle)
     }
 
-    fn id_of(&self, h: Handle) -> Option<usize> {
-        self.socks.iter().position(|s| s.as_ref().is_some_and(|s| s.handle == h)).map(|i| INET_BASE + i)
+    fn id_of(&self, k: Kind) -> Option<usize> {
+        self.socks.iter().position(|s| s.as_ref().is_some_and(|s| s.kind == k)).map(|i| INET_BASE + i)
+    }
+
+    /// Puts a socket in the first free slot.
+    fn insert(&mut self, kind: Kind) -> usize {
+        let sock = Some(Sock { kind, refs: 1 });
+        let slot = match self.socks.iter().position(|s| s.is_none()) {
+            Some(i) => {
+                self.socks[i] = sock;
+                i
+            }
+            None => {
+                self.socks.push(sock);
+                self.socks.len() - 1
+            }
+        };
+        INET_BASE + slot
     }
 
     /// Drives the stack and reports the sockets whose readiness changed.
     /// Both lists get every id: a waiter re-executes its syscall and finds
     /// out which of readable/writable it was.
     fn poll(&mut self) -> Wakes {
-        let woken = self.stack.poll(now());
-        let ids: Vec<usize> = woken.into_iter().filter_map(|h| self.id_of(h)).collect();
+        let events = self.stack.poll(now());
+        let ids: Vec<usize> = events
+            .into_iter()
+            .filter_map(|e| self.id_of(match e {
+                Event::Udp(h) => Kind::Udp(h),
+                Event::Tcp(t) => Kind::Tcp(t),
+            }))
+            .collect();
         Wakes { readable: ids.clone(), writable: ids, acceptable: Vec::new() }
     }
 }
@@ -131,25 +166,24 @@ pub fn lease() -> Option<net::Lease> {
     NET.with(|n| n.as_ref().and_then(|n| n.stack.lease()))
 }
 
-// ── UDP sockets ──────────────────────────────────────────────────────────
+// ── Sockets ──────────────────────────────────────────────────────────────
 
-pub fn udp_open() -> Result<usize, NetError> {
+pub fn open(kind: SockKind) -> Result<usize, NetError> {
     with_net(|n| {
-        let handle = n.stack.udp_open();
-        let sock = Some(Sock { handle, refs: 1 });
-        let slot = match n.socks.iter().position(|s| s.is_none()) {
-            Some(i) => {
-                n.socks[i] = sock;
-                i
-            }
-            None => {
-                n.socks.push(sock);
-                n.socks.len() - 1
-            }
+        let k = match kind {
+            SockKind::Dgram => Kind::Udp(n.stack.udp_open()),
+            SockKind::Stream => Kind::Tcp(n.stack.tcp_open()),
         };
-        INET_BASE + slot
+        n.insert(k)
     })
     .ok_or(NetError::NetUnreachable)
+}
+
+pub fn kind_of(id: usize) -> Option<SockKind> {
+    NET.with(|n| match n.as_ref()?.kind(id).ok()? {
+        Kind::Udp(_) => Some(SockKind::Dgram),
+        Kind::Tcp(_) => Some(SockKind::Stream),
+    })
 }
 
 fn retain(id: usize) -> bool {
@@ -166,8 +200,9 @@ fn retain(id: usize) -> bool {
 }
 
 fn release(id: usize) {
-    NET.with(|n| {
-        let Some(n) = n.as_mut() else { return };
+    // A TCP close queues a FIN: let the stack send it now rather than at the
+    // next tick (`with_net` polls and applies the wakeups).
+    let _ = with_net(|n| {
         let Some(slot) = n.socks.get_mut(id.wrapping_sub(INET_BASE)) else { return };
         let done = match slot {
             Some(s) => {
@@ -177,39 +212,104 @@ fn release(id: usize) {
             None => false,
         };
         if done {
-            let h = slot.take().unwrap().handle;
-            n.stack.udp_close(h);
+            match slot.take().unwrap().kind {
+                Kind::Udp(h) => n.stack.udp_close(h),
+                Kind::Tcp(t) => n.stack.tcp_close(t),
+            }
         }
     });
 }
 
-/// `op` on socket `id`'s UDP side. `Err(BadHandle)` for a dead id.
-fn on_sock<R>(id: usize, op: impl FnOnce(&mut KStack, Handle) -> Result<R, NetError>) -> Result<R, NetError> {
-    with_net(|n| n.handle(id).and_then(|h| op(&mut n.stack, h))).unwrap_or(Err(NetError::NetUnreachable))
+/// `op` on the stack with the socket's kind. `Err(BadHandle)` for a dead id.
+fn on_sock<R>(id: usize, op: impl FnOnce(&mut KStack, Kind) -> Result<R, NetError>) -> Result<R, NetError> {
+    with_net(|n| n.kind(id).and_then(|k| op(&mut n.stack, k))).unwrap_or(Err(NetError::NetUnreachable))
 }
 
-pub fn udp_bind(id: usize, addr: Option<Ipv4Address>, port: u16) -> Result<u16, NetError> {
-    on_sock(id, |s, h| s.udp_bind(h, addr, port))
+pub fn bind(id: usize, addr: Option<Ipv4Address>, port: u16) -> Result<u16, NetError> {
+    on_sock(id, |s, k| match k {
+        Kind::Udp(h) => s.udp_bind(h, addr, port),
+        Kind::Tcp(t) => s.tcp_bind(t, addr, port),
+    })
 }
 
-pub fn udp_connect(id: usize, peer: IpEndpoint) -> Result<(), NetError> {
-    on_sock(id, |s, h| s.udp_connect(h, peer))
+/// A datagram `connect` completes at once; a stream one may be `Pending`.
+pub fn connect(id: usize, peer: IpEndpoint) -> Result<Connect, NetError> {
+    on_sock(id, |s, k| match k {
+        Kind::Udp(h) => s.udp_connect(h, peer).map(|()| Connect::Done),
+        Kind::Tcp(t) => s.tcp_connect(t, peer),
+    })
 }
 
-pub fn udp_send(id: usize, data: &[u8], dest: Option<IpEndpoint>) -> Result<usize, NetError> {
-    on_sock(id, |s, h| s.udp_send(h, data, dest))
+pub fn listen(id: usize, backlog: usize) -> Result<(), NetError> {
+    on_sock(id, |s, k| match k {
+        Kind::Tcp(t) => s.tcp_listen(t, backlog),
+        Kind::Udp(_) => Err(NetError::NotListening),
+    })
 }
 
-pub fn udp_recv(id: usize, buf: &mut [u8], peek: bool) -> Result<(usize, usize, IpEndpoint), NetError> {
-    on_sock(id, |s, h| s.udp_recv(h, buf, peek))
+/// Takes a connection off a listener; the new socket has one reference.
+pub fn accept(id: usize) -> Result<(usize, IpEndpoint), NetError> {
+    with_net(|n| match n.kind(id)? {
+        Kind::Tcp(t) => {
+            let (nt, from) = n.stack.tcp_accept(t)?;
+            Ok((n.insert(Kind::Tcp(nt)), from))
+        }
+        Kind::Udp(_) => Err(NetError::NotListening),
+    })
+    .unwrap_or(Err(NetError::NetUnreachable))
 }
 
-pub fn udp_local(id: usize) -> Result<(Ipv4Address, u16), NetError> {
-    on_sock(id, |s, h| s.udp_local(h))
+/// `dest` only applies to datagram sockets. A stream send may be partial.
+pub fn send(id: usize, data: &[u8], dest: Option<IpEndpoint>) -> Result<usize, NetError> {
+    on_sock(id, |s, k| match k {
+        Kind::Udp(h) => s.udp_send(h, data, dest),
+        Kind::Tcp(t) => s.tcp_send(t, data),
+    })
 }
 
-pub fn udp_peer(id: usize) -> Result<Option<IpEndpoint>, NetError> {
-    on_sock(id, |s, h| s.udp_peer(h))
+pub struct Recvd {
+    /// Bytes copied into the buffer; 0 on a stream means end of file.
+    pub n: usize,
+    /// The datagram's full length (`MSG_TRUNC`); equals `n` on a stream.
+    pub full: usize,
+    pub from: Option<IpEndpoint>,
+}
+
+pub fn recv(id: usize, buf: &mut [u8], peek: bool) -> Result<Recvd, NetError> {
+    on_sock(id, |s, k| match k {
+        Kind::Udp(h) => s.udp_recv(h, buf, peek).map(|(n, full, from)| Recvd { n, full, from: Some(from) }),
+        Kind::Tcp(t) => s.tcp_recv(t, buf, peek).map(|n| Recvd { n, full: n, from: None }),
+    })
+}
+
+pub fn local(id: usize) -> Result<(Ipv4Address, u16), NetError> {
+    on_sock(id, |s, k| match k {
+        Kind::Udp(h) => s.udp_local(h),
+        Kind::Tcp(t) => s.tcp_local(t),
+    })
+}
+
+pub fn peer(id: usize) -> Result<IpEndpoint, NetError> {
+    on_sock(id, |s, k| match k {
+        Kind::Udp(h) => s.udp_peer(h)?.ok_or(NetError::NotConnected),
+        Kind::Tcp(t) => s.tcp_peer(t),
+    })
+}
+
+/// `shutdown(SHUT_WR | SHUT_RDWR)`: a stream sends its FIN.
+pub fn shutdown_write(id: usize) -> Result<(), NetError> {
+    on_sock(id, |s, k| match k {
+        Kind::Tcp(t) => s.tcp_shutdown_write(t),
+        Kind::Udp(_) => Err(NetError::NotConnected),
+    })
+}
+
+/// `SO_ERROR`: the pending asynchronous error, cleared by reading it.
+pub fn take_error(id: usize) -> Result<Option<NetError>, NetError> {
+    on_sock(id, |s, k| match k {
+        Kind::Tcp(t) => s.tcp_take_error(t),
+        Kind::Udp(_) => Ok(None),
+    })
 }
 
 /// Readiness for `poll`/`epoll`. Pure read of the stack's state: it runs
@@ -217,9 +317,14 @@ pub fn udp_peer(id: usize) -> Result<Option<IpEndpoint>, NetError> {
 pub fn poll_mask(id: usize) -> Option<PollMask> {
     NET.with(|n| {
         let n = n.as_mut()?;
-        let h = n.handle(id).ok()?;
-        let (readable, writable) = n.stack.udp_mask(h).ok()?;
-        Some(PollMask { readable, writable, hup: false, err: false })
+        let (readable, writable, hup) = match n.kind(id).ok()? {
+            Kind::Udp(h) => {
+                let (r, w) = n.stack.udp_mask(h).ok()?;
+                (r, w, false)
+            }
+            Kind::Tcp(t) => n.stack.tcp_mask(t).ok()?,
+        };
+        Some(PollMask { readable, writable, hup, err: false })
     })
 }
 
@@ -231,7 +336,7 @@ pub fn ipv4_of(ep: &IpEndpoint) -> Option<Ipv4Address> {
 
 // ── The fd-facing handle ─────────────────────────────────────────────────
 
-/// An AF_INET datagram socket behind a file descriptor. Same contract as
+/// An AF_INET socket (datagram or stream) behind a file descriptor. Same contract as
 /// `UnixSocketHandle`: `read`/`write` never block internally, they return
 /// `WouldBlock` after `register_retry` and let `sys_read`/`sys_write` park.
 pub struct InetSocketHandle {
@@ -240,7 +345,7 @@ pub struct InetSocketHandle {
 }
 
 impl InetSocketHandle {
-    /// Wraps a socket `udp_open` returned (the handle owns its one reference).
+    /// Wraps a socket `open`/`accept` returned (the handle owns its one reference).
     pub fn new(id: usize) -> Self {
         Self { id, nonblock: Arc::new(AtomicBool::new(false)) }
     }
@@ -255,6 +360,9 @@ fn file_error_of(e: NetError) -> FileError {
         NetError::Again => FileError::Again,
         NetError::InvalidArg | NetError::DestAddrRequired => FileError::InvalidArgument,
         NetError::BadHandle => FileError::BadFileDescriptor,
+        NetError::BrokenPipe => FileError::BrokenPipe,
+        NetError::NotConnected => FileError::NotConnected,
+        NetError::ConnReset => FileError::ConnectionReset,
         _ => FileError::IOError,
     }
 }
@@ -263,8 +371,8 @@ impl FileHandle for InetSocketHandle {
     fn read(&mut self, buf: &mut [u8]) -> FileResult<usize> {
         loop {
             let epoch = unix::wake_epoch();
-            return match udp_recv(self.id, buf, false) {
-                Ok((n, _, _)) => Ok(n),
+            return match recv(self.id, buf, false) {
+                Ok(r) => Ok(r.n),
                 Err(NetError::Again) if self.nonblock.load(Ordering::Relaxed) => Err(FileError::Again),
                 Err(NetError::Again) => {
                     if !unix::register_retry(self.id, epoch) {
@@ -280,7 +388,7 @@ impl FileHandle for InetSocketHandle {
     fn write(&mut self, buf: &[u8]) -> FileResult<usize> {
         loop {
             let epoch = unix::wake_epoch();
-            return match udp_send(self.id, buf, None) {
+            return match send(self.id, buf, None) {
                 Ok(n) => Ok(n),
                 Err(NetError::Again) if self.nonblock.load(Ordering::Relaxed) => Err(FileError::Again),
                 Err(NetError::Again) => {

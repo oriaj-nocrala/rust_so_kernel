@@ -311,8 +311,8 @@ pub(super) fn sys_bind(fd: i32, addr_ptr: u64, addrlen: u64) -> SyscallResult {
 }
 
 pub(super) fn sys_listen(fd: i32, backlog: i32) -> SyscallResult {
-    if inet_sock(fd).is_some() {
-        return super::inet::unsupported();
+    if let Some(id) = inet_sock(fd) {
+        return super::inet::listen(id, backlog);
     }
     let id = match unix::socket_of_fd(fd) {
         Ok(id) => id,
@@ -328,7 +328,7 @@ pub(super) fn sys_listen(fd: i32, backlog: i32) -> SyscallResult {
 
 pub(super) fn sys_connect(fd: i32, addr_ptr: u64, addrlen: u64) -> SyscallResult {
     if let Some(id) = inet_sock(fd) {
-        return super::inet::connect(id, addr_ptr, addrlen);
+        return super::inet::connect(id, fd, addr_ptr, addrlen);
     }
     let id = match unix::socket_of_fd(fd) {
         Ok(id) => id,
@@ -390,8 +390,8 @@ pub(super) fn sys_connect(fd: i32, addr_ptr: u64, addrlen: u64) -> SyscallResult
 }
 
 pub(super) fn sys_accept4(fd: i32, addr_ptr: u64, len_ptr: u64, flags: i32) -> SyscallResult {
-    if inet_sock(fd).is_some() {
-        return super::inet::unsupported();
+    if let Some(id) = inet_sock(fd) {
+        return super::inet::accept(id, fd, addr_ptr, len_ptr, flags);
     }
     let id = match unix::socket_of_fd(fd) {
         Ok(id) => id,
@@ -632,8 +632,8 @@ pub(super) fn sys_recvmsg(fd: i32, msg_ptr: u64, flags: u32) -> SyscallResult {
 // ── shutdown / names ────────────────────────────────────────────────────
 
 pub(super) fn sys_shutdown(fd: i32, how: i32) -> SyscallResult {
-    if inet_sock(fd).is_some() {
-        return super::inet::shutdown();
+    if let Some(id) = inet_sock(fd) {
+        return super::inet::shutdown(id, how);
     }
     let id = match unix::socket_of_fd(fd) {
         Ok(id) => id,
@@ -730,8 +730,8 @@ pub(super) fn sys_getsockopt(
     optval: u64,
     optlen_ptr: u64,
 ) -> SyscallResult {
-    if inet_sock(fd).is_some() {
-        return super::inet::getsockopt(level, optname, optval, optlen_ptr);
+    if let Some(id) = inet_sock(fd) {
+        return super::inet::getsockopt(id, level, optname, optval, optlen_ptr);
     }
     let id = match unix::socket_of_fd(fd) {
         Ok(id) => id,

@@ -1208,20 +1208,173 @@ fn virtio_net_pings_the_gateway() {
 /// drives the stack by hand with `network::tick`, as the BSP's timer would.
 #[test_case]
 fn dhcp_lease_from_qemu() {
-    crate::network::init();
-    let start = crate::cpu::tsc::uptime_ms();
-    let lease = loop {
-        crate::network::tick();
-        if let Some(l) = crate::network::lease() {
-            break l;
-        }
-        assert!(crate::cpu::tsc::uptime_ms() - start < 10_000, "no DHCP lease in 10 s");
-        crate::memory::tlb::service_pending();
-        core::hint::spin_loop();
-    };
+    let lease = net_up();
     use net::smoltcp::wire::Ipv4Address;
     assert_eq!(lease.addr, Ipv4Address::new(10, 0, 2, 15));
     assert_eq!(lease.prefix, 24);
     assert_eq!(lease.router, Some(Ipv4Address::new(10, 0, 2, 2)));
     assert_eq!(lease.dns, Some(Ipv4Address::new(10, 0, 2, 3)));
+}
+
+/// Brings the global stack up once for the network tests (`network::init`
+/// twice would reset the NIC under the first stack) and waits for DHCP.
+fn net_up() -> net::Lease {
+    static UP: spin::Once<net::Lease> = spin::Once::new();
+    *UP.call_once(|| {
+        crate::network::init();
+        let mut lease = None;
+        assert!(
+            wait_net(10_000, || {
+                lease = crate::network::lease();
+                lease.is_some()
+            }),
+            "no DHCP lease in 10 s"
+        );
+        lease.unwrap()
+    })
+}
+
+/// Waits for `done`, driving the stack the way the BSP's timer tick would
+/// (a test boot has no timer ISR).
+fn wait_net(ms: u64, mut done: impl FnMut() -> bool) -> bool {
+    crate::edu::wait_ms(ms, || {
+        crate::network::tick();
+        done()
+    })
+}
+
+/// Case: TCP through `network::*`, against real peers on the host
+/// (`qemu-test-runner` starts them): an echo server at 10.0.2.2:47001 that
+/// the guest connects to (banner, 200 KB echoed both ways under flow
+/// control, half-close, EOF), and a host client that reaches the guest's
+/// listener on port 7777 through QEMU's `hostfwd` (accept, ping/pong, EOF).
+#[test_case]
+fn tcp_with_the_host() {
+    use crate::network::{self, InetSocketHandle, SockKind};
+    use net::smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
+    use net::{Connect, NetError};
+
+    net_up();
+
+    // ── client: connect to the host's echo server ──
+    let id = network::open(SockKind::Stream).expect("open");
+    let sock = InetSocketHandle::new(id); // closes it on drop
+    let host = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 2)), 47001);
+    let mut connected = false;
+    let mut err = None;
+    assert!(
+        wait_net(10_000, || match network::connect(id, host) {
+            Ok(Connect::Done) => {
+                connected = true;
+                true
+            }
+            Ok(Connect::Pending) => false,
+            Err(e) => {
+                err = Some(e);
+                true
+            }
+        }) && connected,
+        "connect: {:?}",
+        err
+    );
+
+    let mut got = alloc::vec::Vec::new();
+    let mut buf = [0u8; 4096];
+    let banner = b"HELLO FROM HOST\n";
+    assert!(
+        wait_net(5_000, || {
+            if let Ok(r) = network::recv(id, &mut buf, false) {
+                got.extend_from_slice(&buf[..r.n]);
+            }
+            got.len() >= banner.len()
+        }),
+        "no banner, got {:?}",
+        got
+    );
+    assert_eq!(&got[..banner.len()], banner);
+    let mut echoed: alloc::vec::Vec<u8> = got[banner.len()..].to_vec();
+
+    let blob: alloc::vec::Vec<u8> = (0..200_000u32).map(|i| (i * 31 + 7) as u8).collect();
+    let mut sent = 0;
+    assert!(
+        wait_net(30_000, || {
+            if sent < blob.len() {
+                let end = (sent + 16_384).min(blob.len());
+                match network::send(id, &blob[sent..end], None) {
+                    Ok(n) => sent += n,
+                    Err(NetError::Again) => {}
+                    Err(e) => panic!("send: {:?}", e),
+                }
+            }
+            while let Ok(r) = network::recv(id, &mut buf, false) {
+                assert!(r.n > 0, "EOF before the echo finished");
+                echoed.extend_from_slice(&buf[..r.n]);
+            }
+            echoed.len() >= blob.len()
+        }),
+        "echo stalled: sent {} of {}, got {}",
+        sent,
+        blob.len(),
+        echoed.len()
+    );
+    assert!(echoed == blob, "echoed bytes differ");
+
+    network::shutdown_write(id).expect("shutdown(WR)");
+    let mut eof = false;
+    assert!(
+        wait_net(5_000, || {
+            match network::recv(id, &mut buf, false) {
+                Ok(r) if r.n == 0 => eof = true,
+                Ok(_) => panic!("unexpected extra data"),
+                Err(_) => {}
+            }
+            eof
+        }),
+        "no EOF after the half-close"
+    );
+    drop(sock);
+
+    // ── server: the host connects to us through hostfwd ──
+    let lid = network::open(SockKind::Stream).expect("open listener");
+    let listener = InetSocketHandle::new(lid);
+    network::bind(lid, None, 7777).expect("bind 7777");
+    network::listen(lid, 4).expect("listen");
+    let mut accepted = None;
+    assert!(
+        wait_net(40_000, || {
+            if let Ok((nid, from)) = network::accept(lid) {
+                accepted = Some((nid, from));
+            }
+            accepted.is_some()
+        }),
+        "the host client never arrived"
+    );
+    let (nid, from) = accepted.unwrap();
+    let conn = InetSocketHandle::new(nid);
+    assert_eq!(network::ipv4_of(&from), Some(Ipv4Address::new(10, 0, 2, 2)), "hostfwd arrives from the gateway");
+    let mut msg = alloc::vec::Vec::new();
+    assert!(
+        wait_net(5_000, || {
+            if let Ok(r) = network::recv(nid, &mut buf, false) {
+                msg.extend_from_slice(&buf[..r.n]);
+            }
+            msg.len() >= 14
+        }),
+        "got {:?}",
+        msg
+    );
+    assert_eq!(&msg, b"ping from host");
+    assert_eq!(network::send(nid, b"pong", None), Ok(4));
+    let mut eof = false;
+    assert!(
+        wait_net(5_000, || {
+            if let Ok(r) = network::recv(nid, &mut buf, false) {
+                eof = r.n == 0;
+            }
+            eof
+        }),
+        "the host client did not close"
+    );
+    drop(conn);
+    drop(listener);
 }

@@ -560,6 +560,7 @@ pub mod errno {
     pub const EPIPE: i64 = -32;
     pub const ENOTSOCK: i64 = -88;
     pub const ENOTCONN: i64 = -107;
+    pub const ECONNRESET: i64 = -104;
     pub const ETIMEDOUT: i64 = -110;
     pub const ECONNREFUSED: i64 = -111;
 }

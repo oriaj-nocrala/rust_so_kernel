@@ -8,7 +8,7 @@ extern crate alloc;
 pub use smoltcp;
 
 pub mod stack;
-pub use stack::{Handle, Lease, NetError, Stack};
+pub use stack::{Connect, Event, Handle, Lease, NetError, Stack, TcpId};
 
 use alloc::vec::Vec;
 use smoltcp::phy::{self, Checksum, ChecksumCapabilities, DeviceCapabilities, Medium};
@@ -244,7 +244,7 @@ mod tests {
         (stack(1, b_to_a.clone(), a_to_b.clone()), stack(2, a_to_b, b_to_a))
     }
 
-    fn run(a: &mut Stack<NicDevice<Cable>>, b: &mut Stack<NicDevice<Cable>>, now: i64) -> Vec<crate::Handle> {
+    fn run(a: &mut Stack<NicDevice<Cable>>, b: &mut Stack<NicDevice<Cable>>, now: i64) -> Vec<crate::Event> {
         let mut woken = Vec::new();
         for _ in 0..4 {
             woken.extend(a.poll(Instant::from_millis(now)));
@@ -349,9 +349,9 @@ mod tests {
         assert_eq!(b.udp_mask(sb), Ok((false, true)));
         a.udp_send(sa, b"x", Some(ep(2, 7))).unwrap();
         let woken = run(&mut a, &mut b, 5);
-        assert!(woken.contains(&sb), "arrival wakes the reader");
+        assert!(woken.contains(&crate::Event::Udp(sb)), "arrival wakes the reader");
         assert_eq!(b.udp_mask(sb), Ok((true, true)));
-        assert!(!run(&mut a, &mut b, 6).contains(&sb), "no new edge, no new wake");
+        assert!(!run(&mut a, &mut b, 6).contains(&crate::Event::Udp(sb)), "no new edge, no new wake");
         let mut buf = [0u8; 4];
         b.udp_recv(sb, &mut buf, false).unwrap();
         assert_eq!(b.udp_mask(sb), Ok((false, true)));
@@ -366,5 +366,202 @@ mod tests {
         assert_eq!(a.udp_recv(s, &mut buf, false), Err(NetError::BadHandle));
         assert_eq!(NetError::BadHandle.errno(), 9);
         assert_eq!(NetError::Again.errno(), 11);
+    }
+
+    // ── TCP ───────────────────────────────────────────────────────────────
+
+    use crate::stack::{Connect, Event};
+
+    type S = Stack<NicDevice<Cable>>;
+
+    /// Advances both stacks by `ms` milliseconds of simulated time.
+    fn pump(a: &mut S, b: &mut S, clock: &mut i64, ms: i64) -> Vec<Event> {
+        let mut ev = Vec::new();
+        for _ in 0..ms {
+            *clock += 1;
+            ev.extend(run(a, b, *clock));
+        }
+        ev
+    }
+
+    /// B listens on `port`; A connects; both sides established.
+    fn connected(port: u16) -> (S, S, crate::TcpId, crate::TcpId, i64) {
+        let (mut a, mut b) = pair();
+        let mut clock = 0;
+        let l = b.tcp_open();
+        b.tcp_bind(l, None, port).unwrap();
+        b.tcp_listen(l, 4).unwrap();
+        let c = a.tcp_open();
+        assert_eq!(a.tcp_connect(c, ep(2, port)), Ok(Connect::Pending));
+        pump(&mut a, &mut b, &mut clock, 50);
+        assert_eq!(a.tcp_connect(c, ep(2, port)), Ok(Connect::Done));
+        let (srv, from) = b.tcp_accept(l).unwrap();
+        assert_eq!(from.addr, IpAddress::v4(10, 0, 0, 1));
+        (a, b, c, srv, clock)
+    }
+
+    #[test]
+    fn tcp_handshake_reports_done_once() {
+        let (mut a, _b, c, _srv, _) = connected(80);
+        assert_eq!(a.tcp_connect(c, ep(2, 80)), Err(NetError::AlreadyConnected));
+        assert_eq!(a.tcp_peer(c).unwrap(), ep(2, 80));
+        assert_eq!(a.tcp_mask(c), Ok((false, true, false)));
+    }
+
+    #[test]
+    fn tcp_moves_data_both_ways_and_half_closes() {
+        let (mut a, mut b, c, srv, mut clock) = connected(80);
+        // 300 KB each way, more than either buffer: needs flow control.
+        let blob: Vec<u8> = (0..300_000u32).map(|i| (i * 7 + 3) as u8).collect();
+        let (mut sent_a, mut got_b) = (0usize, Vec::new());
+        let (mut sent_b, mut got_a) = (0usize, Vec::new());
+        let mut buf = vec![0u8; 8192];
+        for _ in 0..4000 {
+            if sent_a < blob.len() {
+                match a.tcp_send(c, &blob[sent_a..(sent_a + 5000).min(blob.len())]) {
+                    Ok(n) => sent_a += n,
+                    Err(NetError::Again) => {}
+                    Err(e) => panic!("send {:?}", e),
+                }
+            }
+            if sent_b < blob.len() {
+                match b.tcp_send(srv, &blob[sent_b..(sent_b + 3000).min(blob.len())]) {
+                    Ok(n) => sent_b += n,
+                    Err(NetError::Again) => {}
+                    Err(e) => panic!("send {:?}", e),
+                }
+            }
+            pump(&mut a, &mut b, &mut clock, 1);
+            while let Ok(n) = b.tcp_recv(srv, &mut buf, false) {
+                assert!(n > 0, "no EOF yet");
+                got_b.extend_from_slice(&buf[..n]);
+            }
+            while let Ok(n) = a.tcp_recv(c, &mut buf, false) {
+                assert!(n > 0, "no EOF yet");
+                got_a.extend_from_slice(&buf[..n]);
+            }
+            if got_a.len() == blob.len() && got_b.len() == blob.len() {
+                break;
+            }
+        }
+        assert!(got_b == blob, "A -> B stream differs ({} bytes)", got_b.len());
+        assert!(got_a == blob, "B -> A stream differs ({} bytes)", got_a.len());
+
+        // A half-closes: B reads EOF but can still send.
+        a.tcp_shutdown_write(c).unwrap();
+        pump(&mut a, &mut b, &mut clock, 50);
+        assert_eq!(b.tcp_recv(srv, &mut buf, false), Ok(0), "EOF after the FIN");
+        assert_eq!(b.tcp_mask(srv).unwrap().0, true, "EOF is readable");
+        assert_eq!(b.tcp_send(srv, b"still here"), Ok(10));
+        pump(&mut a, &mut b, &mut clock, 50);
+        let n = a.tcp_recv(c, &mut buf, false).unwrap();
+        assert_eq!(&buf[..n], b"still here");
+        assert_eq!(a.tcp_send(c, b"x"), Err(NetError::BrokenPipe), "A already shut down writing");
+    }
+
+    #[test]
+    fn tcp_data_queued_before_fin_is_still_readable() {
+        let (mut a, mut b, c, srv, mut clock) = connected(80);
+        a.tcp_send(c, b"last words").unwrap();
+        a.tcp_close(c);
+        pump(&mut a, &mut b, &mut clock, 100);
+        let mut buf = [0u8; 32];
+        let n = b.tcp_recv(srv, &mut buf, false).unwrap();
+        assert_eq!(&buf[..n], b"last words");
+        assert_eq!(b.tcp_recv(srv, &mut buf, false), Ok(0));
+        b.tcp_close(srv);
+        pump(&mut a, &mut b, &mut clock, 70_000);
+        assert_eq!((a.tcp_orphans(), b.tcp_orphans()), (0, 0), "closed sockets are reaped");
+    }
+
+    #[test]
+    fn tcp_refused_when_nothing_listens() {
+        let (mut a, mut b) = pair();
+        let mut clock = 0;
+        let c = a.tcp_open();
+        assert_eq!(a.tcp_connect(c, ep(2, 81)), Ok(Connect::Pending));
+        let ev = pump(&mut a, &mut b, &mut clock, 50);
+        assert!(ev.contains(&Event::Tcp(c)), "the failure wakes the connector");
+        assert_eq!(a.tcp_mask(c), Ok((true, true, true)));
+        assert_eq!(a.tcp_connect(c, ep(2, 81)), Err(NetError::ConnRefused));
+        assert_eq!(a.tcp_take_error(c), Ok(None), "reported once");
+    }
+
+    #[test]
+    fn tcp_listener_rules() {
+        let (mut a, _b) = pair();
+        let l = a.tcp_open();
+        let other = a.tcp_open();
+        assert_eq!(a.tcp_accept(other), Err(NetError::NotListening));
+        a.tcp_bind(l, None, 8080).unwrap();
+        assert_eq!(a.tcp_bind(other, None, 8080), Err(NetError::AddrInUse));
+        a.tcp_listen(l, 2).unwrap();
+        assert_eq!(a.tcp_accept(l), Err(NetError::Again));
+        assert_eq!(a.tcp_mask(l), Ok((false, false, false)));
+        assert_eq!(a.tcp_bind(other, None, 8080), Err(NetError::AddrInUse), "still claimed while listening");
+        a.tcp_close(l);
+        assert_eq!(a.tcp_bind(other, None, 8080), Ok(8080), "closing the listener frees the port");
+        assert_eq!(a.tcp_send(other, b"x"), Err(NetError::NotConnected));
+        let mut buf = [0u8; 4];
+        assert_eq!(a.tcp_recv(other, &mut buf, false), Err(NetError::NotConnected));
+    }
+
+    #[test]
+    fn tcp_events_fire_on_connect_data_and_close() {
+        let (mut a, mut b) = pair();
+        let mut clock = 0;
+        let l = b.tcp_open();
+        b.tcp_bind(l, None, 80).unwrap();
+        b.tcp_listen(l, 1).unwrap();
+        let c = a.tcp_open();
+        a.tcp_connect(c, ep(2, 80)).unwrap();
+        let ev = pump(&mut a, &mut b, &mut clock, 50);
+        assert!(ev.contains(&Event::Tcp(c)), "connector wakes when established");
+        assert!(ev.contains(&Event::Tcp(l)), "listener becomes readable");
+        let (srv, _) = b.tcp_accept(l).unwrap();
+        pump(&mut a, &mut b, &mut clock, 10);
+        a.tcp_send(c, b"ping").unwrap();
+        let ev = pump(&mut a, &mut b, &mut clock, 20);
+        assert!(ev.contains(&Event::Tcp(srv)), "data wakes the reader");
+        assert!(!pump(&mut a, &mut b, &mut clock, 20).contains(&Event::Tcp(srv)), "no new edge");
+    }
+
+    #[test]
+    fn tcp_unknown_id_is_ebadf() {
+        let (mut a, _b) = pair();
+        let c = a.tcp_open();
+        a.tcp_close(c);
+        let mut buf = [0u8; 1];
+        assert_eq!(a.tcp_recv(c, &mut buf, false), Err(NetError::BadHandle));
+        assert_eq!(NetError::ConnRefused.errno(), 111);
+        assert_eq!(NetError::InProgress.errno(), 115);
+    }
+
+    #[test]
+    fn tcp_accept_waits_for_the_handshake_to_finish() {
+        let (mut a, mut b) = pair();
+        let mut clock = 0;
+        // Resolve ARP both ways first, so the handshake packets are not lost to it.
+        let (ua, ub) = (a.udp_open(), b.udp_open());
+        b.udp_bind(ub, None, 9).unwrap();
+        a.udp_send(ua, b"arp", Some(ep(2, 9))).unwrap();
+        pump(&mut a, &mut b, &mut clock, 10);
+        let mut tmp = [0u8; 8];
+        let (_, _, from) = b.udp_recv(ub, &mut tmp, false).unwrap();
+        b.udp_send(ub, b"arp", Some(from)).unwrap();
+        pump(&mut a, &mut b, &mut clock, 10);
+
+        let l = b.tcp_open();
+        b.tcp_bind(l, None, 80).unwrap();
+        b.tcp_listen(l, 2).unwrap();
+        let c = a.tcp_open();
+        a.tcp_connect(c, ep(2, 80)).unwrap();
+        // SYN reaches B, whose SYN-ACK is still on the wire: half-open.
+        a.poll(Instant::from_millis(clock));
+        b.poll(Instant::from_millis(clock));
+        assert_eq!(b.tcp_accept(l), Err(NetError::Again), "SYN_RECEIVED is not acceptable");
+        assert_eq!(b.tcp_mask(l), Ok((false, false, false)));
+        pump(&mut a, &mut b, &mut clock, 20);
+        assert!(b.tcp_accept(l).is_ok());
     }
 }

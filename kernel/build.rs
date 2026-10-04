@@ -125,6 +125,7 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "fpu_test",
     "socket_test",
     "udp_test",
+    "tcp_test",
     "cputime_test",
     "fstime_test",
     "fbbench",

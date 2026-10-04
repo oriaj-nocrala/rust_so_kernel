@@ -145,6 +145,8 @@ pub(super) fn sys_read(fd: i32, buf: usize, count: usize) -> SyscallResult {
                 unsafe { crate::process::trapframe::jump_to_user(next_tf) }
             }
             Err(crate::process::file::FileError::InvalidInput) => errno::EINVAL,
+            Err(crate::process::file::FileError::NotConnected) => errno::ENOTCONN,
+            Err(crate::process::file::FileError::ConnectionReset) => errno::ECONNRESET,
             Err(_) => errno::EIO,
         }
     }
@@ -293,6 +295,8 @@ pub(super) fn sys_write(fd: i32, buf: usize, count: usize) -> SyscallResult {
         Err(crate::process::file::FileError::BrokenPipe) => errno::EPIPE,
         Err(crate::process::file::FileError::NoSpace) => errno::ENOSPC,
         Err(crate::process::file::FileError::InvalidInput) => errno::EINVAL,
+        Err(crate::process::file::FileError::NotConnected) => errno::ENOTCONN,
+        Err(crate::process::file::FileError::ConnectionReset) => errno::ECONNRESET,
         Err(crate::process::file::FileError::WouldBlock) => {
             // Same as `sys_read`'s WouldBlock arm: `jump_to_user` never
             // returns, so drop the fd-table `Arc` before it or the table

@@ -267,7 +267,7 @@ cmd_start() {
         qemu_args+=(-audiodev "$audiodev" -device "AC97,audiodev=snd0")
     fi
     if [ -z "${QEMU_DEBUG_NO_NET:-}" ]; then
-        qemu_args+=(-netdev "user,id=n0" -device "virtio-net-pci,netdev=n0,disable-legacy=on")
+        qemu_args+=(-netdev "user,id=n0${QEMU_DEBUG_HOSTFWD:+,hostfwd=$QEMU_DEBUG_HOSTFWD}" -device "virtio-net-pci,netdev=n0,disable-legacy=on")
     fi
     # xHCI controller (kernel/src/usb/) — present by default so the USB
     # driver's bring-up runs on every boot; QEMU_DEBUG_NO_USB=1 omits it
