@@ -46,6 +46,7 @@ pub mod pcicfg;
 pub mod pit;
 pub mod random;
 pub mod ring;
+pub mod rtl8169;
 pub mod rtc;
 pub mod smp;
 pub mod sp5100_tco;

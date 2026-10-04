@@ -183,8 +183,6 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     let mut usb_driver = crate::usb::UsbDriver::new();
     crate::hal::run_all(&mut [&mut usb_driver]);
 
-    // ── Network (virtio-net, polled; docs/reference/net.md) ──
-    crate::network::init();
 
     // ── No-input escape hatch ──────────────────────────────────────
     // If nothing on this machine can type, the shell about to start is
@@ -216,6 +214,11 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     // After the log partition, so a metal run keeps what it printed; before
     // the APs are released, which BAR sizing needs (see `gpu`).
     crate::gpu::probe();
+
+    // ── Network (virtio-net under QEMU; the Realtek behind `nic=`) ──────
+    // After the options and the log partition, like the GPU: `nic=` is read
+    // from kernel.conf, and a metal run keeps what the driver printed.
+    crate::network::init();
 
     // ── FPU/SSE ────────────────────────────────────────────────────
     // Must run before the first `Process` is created below — every

@@ -51,3 +51,12 @@ Status: steps 1-2b of `docs/net/net-plan.md`. A virtio-net driver (MSI-X, with p
 - Sabotage that fails a test: remove the TX doorbell (`rx 0 tx N`); remove `network::tick()` from the timer (`udp_test` fails at `poll`).
 - `scripts/net-e2e.sh [--no-build]`: the whole userland check, about 70-90 s (boot included). The host starts an echo server, an HTTP server (a 300 KB file + its md5) and a silent server, boots headless with `hostfwd`, copies `disk-image-root/e2e.sh` onto `disk.img` (only `bin/` is synced by the build) and types **one** command, `sh /mnt/e2e.sh`. The guest script runs `udp_test`, `icmp_test`, `ping`, `tcp_test`, `nc`, `nslookup`, `itimer_test`, `wget -T` against the silent server, `wget` of 300 KB (md5), and `tcp_test serve` and `httpd` (the host does its half when it sees `E2E-READY serve|httpd` on the serial log). Each guest command runs under `timeout`. **Why one command:** `qemu-debug.sh send` types at 0.15 s per key, so typing a command per check (with a long marker) cost 10-30 s each and the run took ~285 s. Step times are wall-clock from the host (`/proc/uptime` and `date` in the guest do not track real time under TCG). The run is bounded: `NET_E2E_DEADLINE` (default 240 s) overall and `NET_E2E_STEP_LIMIT` (default 90 s) per step; a hang prints `HUNG: ... E2E-STEP <name>`. Needs `socat` and `python3`; ports 47001/47003/47010/47020.
 - `qemu-debug.sh send/key/screendump` need `socat` on the host.
+
+## The AM4 board's NIC (Realtek RTL8111/8168)
+
+`hal/src/rtl8169.rs` + `kernel/src/network/rtl8168.rs`, behind `nic=` (default `off`): a ladder `probe` (read-only) -> `reset`
+-> `net` (rings, TX/RX, the stack on it). Polled, no interrupts. **Never run on the hardware**: QEMU has no such device, the
+constants are from memory of Linux's `r8169`, and the 17 host tests check the driver against a software model of itself.
+Everything (status, what is not done, how to run the rungs on the Ryzen, what to bring back, known unknowns) is in
+`docs/net/rtl8168.md`. `network::init` now runs after `bootopts::load` and `logpart::init` (it moved from just after USB) so
+`nic=` is known and a metal run keeps the driver's log.

@@ -18,6 +18,7 @@
 // `unix::block_on`, `dispatch_wakes` and poll's fd→socket snapshot work
 // unchanged. Ids below `INET_BASE` are AF_UNIX.
 
+pub mod rtl8168;
 pub mod virtio_net;
 
 use alloc::boxed::Box;
@@ -36,13 +37,43 @@ use crate::ipc::unix;
 use crate::process::file::{FileError, FileHandle, FileResult};
 use virtio_net::VirtioNet;
 
+/// The NIC behind the stack: virtio-net under QEMU, the Realtek on the AM4 board.
+pub enum AnyNic {
+    Virtio(VirtioNet),
+    Rtl(rtl8168::Rtl),
+}
+
+impl net::Nic for AnyNic {
+    fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
+        match self {
+            AnyNic::Virtio(n) => n.recv(buf),
+            AnyNic::Rtl(n) => n.recv(buf),
+        }
+    }
+    fn send(&mut self, frame: &[u8]) -> bool {
+        match self {
+            AnyNic::Virtio(n) => n.send(frame),
+            AnyNic::Rtl(n) => n.send(frame),
+        }
+    }
+}
+
+impl AnyNic {
+    fn mac(&self) -> [u8; 6] {
+        match self {
+            AnyNic::Virtio(n) => n.mac(),
+            AnyNic::Rtl(n) => n.mac(),
+        }
+    }
+}
+
 pub const INET_BASE: usize = 1 << 32;
 
 pub fn is_inet(id: usize) -> bool {
     id >= INET_BASE
 }
 
-type KStack = Stack<net::NicDevice<VirtioNet>>;
+type KStack = Stack<net::NicDevice<AnyNic>>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -148,8 +179,12 @@ pub fn init() {
 /// IF=0, use an AP.
 pub fn init_with(irq_cpu: Option<usize>) {
     let nic = match VirtioNet::probe(irq_cpu.map(crate::smp::apic_id)) {
-        Ok(nic) => nic,
-        Err(virtio_net::InitError::NoDevice) => return,
+        Ok(nic) => AnyNic::Virtio(nic),
+        // No virtio device: the real machine. The Realtek driver is opt-in (`nic=`).
+        Err(virtio_net::InitError::NoDevice) => match rtl8168::probe(crate::bootopts::nic_level()) {
+            Some(nic) => AnyNic::Rtl(nic),
+            None => return,
+        },
         Err(e) => {
             crate::serial_println!("virtio-net: init failed: {:?}", e);
             return;

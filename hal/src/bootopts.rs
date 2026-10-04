@@ -48,6 +48,38 @@ impl BootOpts {
     }
 }
 
+/// How far the Realtek NIC driver may go (`nic=`, `docs/net/rtl8168.md`).
+/// Ordered: each level includes the ones before it. Does not affect virtio-net
+/// (QEMU), which is always brought up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NicLevel {
+    /// Default: the NIC is not touched at all.
+    Off,
+    /// Read-only: size and map BAR2, read the registers (XID, MAC, PHY
+    /// status) and log them with a hex dump of the window. Writes nothing
+    /// to the device (it only turns on the PCI memory decode if firmware
+    /// left it off).
+    Probe,
+    /// Also reset the chip, restart auto-negotiation and wait for link. No
+    /// DMA: bus mastering stays off, no rings, no packets.
+    Reset,
+    /// Also the rings, TX/RX and the network stack on it (DHCP, sockets).
+    Net,
+}
+
+impl NicLevel {
+    /// `None` for a value this kernel does not know.
+    pub fn parse(v: &str) -> Option<NicLevel> {
+        match v {
+            "off" => Some(NicLevel::Off),
+            "probe" => Some(NicLevel::Probe),
+            "reset" => Some(NicLevel::Reset),
+            "net" => Some(NicLevel::Net),
+            _ => None,
+        }
+    }
+}
+
 /// How far the GPU driver may go (`gpu=`, `docs/gpu/gpu-plan.md`,
 /// principle 6). Ordered: each level includes the ones before it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -213,5 +245,15 @@ mod tests {
         assert!(GpuLevel::Super > GpuLevel::Scanout && GpuLevel::Scanout > GpuLevel::Chan);
         assert!(GpuLevel::Chan > GpuLevel::Dispstate && GpuLevel::Dispstate > GpuLevel::Vblank);
         assert!(GpuLevel::Vblank > GpuLevel::Disp && GpuLevel::Disp > GpuLevel::Probe && GpuLevel::Probe > GpuLevel::Off);
+    }
+
+    #[test]
+    fn nic_levels() {
+        assert_eq!(NicLevel::parse("off"), Some(NicLevel::Off));
+        assert_eq!(NicLevel::parse("probe"), Some(NicLevel::Probe));
+        assert_eq!(NicLevel::parse("reset"), Some(NicLevel::Reset));
+        assert_eq!(NicLevel::parse("net"), Some(NicLevel::Net));
+        assert_eq!(NicLevel::parse("on"), None);
+        assert!(NicLevel::Off < NicLevel::Probe && NicLevel::Probe < NicLevel::Reset && NicLevel::Reset < NicLevel::Net);
     }
 }
