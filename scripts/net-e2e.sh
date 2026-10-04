@@ -3,127 +3,114 @@
 #
 #   scripts/net-e2e.sh [--no-build]
 #
-# Starts host peers (an echo server, an HTTP server with a 300 KB file),
-# boots the kernel headless with QEMU's user network plus a hostfwd into the
-# guest, then drives the guest shell: udp_test, tcp_test (client and serve),
-# wget (md5 of a big file), nc, nslookup, and httpd reached from the host.
-# Prints one line per check and exits nonzero if any fails.
+# Starts host peers (an echo server, an HTTP server with a 300 KB file, a
+# server that never answers), boots the kernel headless with QEMU's user
+# network plus a hostfwd into the guest, and types ONE command: `sh
+# /mnt/e2e.sh` (disk-image-root/e2e.sh). The guest runs every check itself and
+# reports on the serial log; the host only coordinates the two checks that
+# need it (the guest listening, httpd) and enforces an overall deadline, so a
+# hang is reported with the step it hung in instead of waiting for ever.
 #
-# Host ports used: 47001 (echo), 47010 (http), 47020 (silent), 47003 (hostfwd -> guest 7777).
+# Typing is slow (qemu-debug.sh paces keys), which is why the checks do not
+# go through it one by one.
+#
+# Host ports: 47001 echo, 47010 http, 47020 silent, 47003 hostfwd -> guest 7777.
+# NET_E2E_DEADLINE (seconds, default 240) bounds the guest run; NET_E2E_STEP_LIMIT
+# (default 90) aborts early when one step makes no progress.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DBG="$REPO/scripts/qemu-debug.sh"
 LOG=/tmp/qemu-debug-rust_so_kernel/serial.log
+DEADLINE="${NET_E2E_DEADLINE:-240}"
 WORK="$(mktemp -d)"
 FAILS=0
+T0=$(date +%s)
+PIDS=()
+declare -A done_at
+order=()
 
 cleanup() {
     "$DBG" stop >/dev/null 2>&1
-    [ -n "${ECHO_PID:-}" ] && kill "$ECHO_PID" 2>/dev/null
-    [ -n "${HTTP_PID:-}" ] && kill "$HTTP_PID" 2>/dev/null
-    [ -n "${SILENT_PID:-}" ] && kill "$SILENT_PID" 2>/dev/null
+    for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
     rm -rf "$WORK"
 }
 trap cleanup EXIT
 
-report() { # ok? name
-    if [ "$1" = 1 ]; then echo "  ok    $2"; else echo "  FAIL  $2"; FAILS=$((FAILS + 1)); fi
-}
-
-# Runs a guest command and waits for it to finish (an upper-case marker the
-# typed command line, which is lower case, cannot match; unique per call, since
-# this runs in a subshell). Output: the lines the guest printed, from the log.
-guest() { # timeout command...
-    local timeout="$1"; shift
-    local id
-    id=$(date +%s%N)
-    local mark="NETE2E-DONE-$id"
-    local from
-    from=$(wc -l < "$LOG")
-    "$DBG" send "$* ; echo nete2e-done-$id | tr a-z A-Z" >/dev/null
-    "$DBG" enter >/dev/null
-    "$DBG" wait-for "$mark" "$timeout" >/dev/null 2>&1
-    # Not only [fb] lines: output that follows an unterminated line has no prefix.
-    tail -n +"$((from + 1))" "$LOG" | sed 's/^\[fb\] //'
-}
-
 # ── host peers ──
-cat > "$WORK/echo.py" <<'PY'
-import socket, sys, threading
-ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-ls.bind(("127.0.0.1", 47001)); ls.listen(8)
-def h(c):
+cat > "$WORK/peers.py" <<'PY'
+import socket, threading
+def listener(port):
+    ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ls.bind(("127.0.0.1", port)); ls.listen(8)
+    return ls
+def echo(c):
     c.sendall(b"HELLO FROM HOST\n")
     while True:
         d = c.recv(8192)
         if not d: break
         c.sendall(d)
     c.shutdown(socket.SHUT_WR); c.close()
-while True:
-    c, _ = ls.accept(); threading.Thread(target=h, args=(c,), daemon=True).start()
+def serve_echo(ls):
+    while True:
+        c, _ = ls.accept(); threading.Thread(target=echo, args=(c,), daemon=True).start()
+def serve_silent(ls):
+    held = []
+    while True:
+        c, _ = ls.accept(); held.append(c)   # accepts, never answers
+threading.Thread(target=serve_echo, args=(listener(47001),), daemon=True).start()
+threading.Thread(target=serve_silent, args=(listener(47020),), daemon=True).start()
+threading.Event().wait()
 PY
-# Accepts connections and never answers: what wget's timeout is for.
-cat > "$WORK/silent.py" <<'PY'
-import socket
-ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-ls.bind(("127.0.0.1", 47020)); ls.listen(4)
-held = []
-while True:
-    c, _ = ls.accept(); held.append(c)
-PY
-python3 "$WORK/silent.py" & SILENT_PID=$!
 mkdir -p "$WORK/www"
 head -c 300000 /dev/urandom | base64 > "$WORK/www/big.txt"
-echo "hello from the host http server" > "$WORK/www/index.html"
-python3 "$WORK/echo.py" & ECHO_PID=$!
-(cd "$WORK/www" && exec python3 -m http.server 47010 --bind 127.0.0.1 >/dev/null 2>&1) & HTTP_PID=$!
+md5sum "$WORK/www/big.txt" | cut -c1-32 > "$WORK/www/big.md5"
+python3 "$WORK/peers.py" & PIDS+=($!)
+(cd "$WORK/www" && exec python3 -m http.server 47010 --bind 127.0.0.1 >/dev/null 2>&1) & PIDS+=($!)
 sleep 1
-HOST_MD5=$(md5sum "$WORK/www/big.txt" | cut -c1-32)
 
-# ── boot ──
+# ── boot, then one typed command ──
 "$DBG" stop >/dev/null 2>&1
+# disk.img only syncs disk-image-root/bin, so put the guest script on it here (QEMU is stopped).
+debugfs -w -R "rm /e2e.sh" "$REPO/disk.img" >/dev/null 2>&1
+debugfs -w -R "write $REPO/disk-image-root/e2e.sh /e2e.sh" "$REPO/disk.img" >/dev/null 2>&1
 BUILD_FLAG=""; [ "${1:-}" = "--no-build" ] && BUILD_FLAG="--no-build"
 QEMU_DEBUG_HOSTFWD="tcp:127.0.0.1:47003-:7777" "$DBG" start $BUILD_FLAG >/dev/null 2>&1
 "$DBG" wait-for 'built-in shell' 300 >/dev/null 2>&1 || { echo "FAIL: no shell"; exit 1; }
-sleep 15
+echo "booted in $(( $(date +%s) - T0 ))s"
+FROM=$(wc -l < "$LOG")
+"$DBG" send "sh /mnt/e2e.sh" >/dev/null
+"$DBG" enter >/dev/null
+GUEST_T0=$(date +%s)
 
-out=$(guest 60 'cat /etc/resolv.conf')
-echo "$out" | grep -q 'nameserver 10.0.2.3'; report $((! $?)) "DHCP lease reaches /etc/resolv.conf"
-
-out=$(guest 120 udp_test)
-echo "$out" | grep -q 'udp_test: PASS'; report $((! $?)) "udp_test (UDP sockets, DNS round trip)"
-
-out=$(guest 120 tcp_test)
-echo "$out" | grep -q 'tcp_test: PASS'; report $((! $?)) "tcp_test (TCP client)"
-
-out=$(guest 60 'echo hi-from-nc | nc 10.0.2.2 47001')
-echo "$out" | grep -q 'hi-from-nc'; report $((! $?)) "nc to the host echo server"
-
-out=$(guest 60 'nslookup example.com 10.0.2.3')
-echo "$out" | grep -q 'Address.*[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+'; report $((! $?)) "nslookup resolves a name"
-
-out=$(guest 120 'wget -q -O /tmp/big.txt http://10.0.2.2:47010/big.txt; md5sum /tmp/big.txt')
-echo "$out" | grep -q "$HOST_MD5"; report $((! $?)) "wget of 300 KB matches the host's md5"
-
-out=$(guest 60 'wget -T 3 -O - http://10.0.2.2:47020/')
-echo "$out" | grep -q 'download timed out'; report $((! $?)) "wget -T times out on a silent server (setitimer/SIGALRM)"
-
-out=$(guest 120 icmp_test)
-echo "$out" | grep -q 'icmp_test: PASS'; report $((! $?)) "icmp_test (raw ICMP socket, whole IP packets)"
-
-out=$(guest 60 'ping -c 3 10.0.2.2')
-echo "$out" | grep -q '3 packets received'; report $((! $?)) "BusyBox ping to the gateway"
-
-out=$(guest 120 itimer_test)
-echo "$out" | grep -q 'itimer_test: PASS'; report $((! $?)) "itimer_test (alarm, setitimer, SIGALRM)"
-
-# tcp_test serve: the guest listens, the host connects through hostfwd.
-serve_from=$(wc -l < "$LOG")
-"$DBG" send "tcp_test serve" >/dev/null; "$DBG" enter >/dev/null
-sleep 3
-python3 - <<'PY'
+# ── coordinate until the guest is done or the deadline passes ──
+# "name PASS|FAIL" for every result the guest has printed.
+results() { tail -n +"$((FROM + 1))" "$LOG" | grep -ao 'E2E-RESULT [a-z_0-9]* [A-Z]*' | awk '{print $2, $3}'; }
+seen() { tail -n +"$((FROM + 1))" "$LOG" | grep -q "$1"; }
+HOST_SERVE=1; HOST_HTTPD=1
+served=0; fetched=0
+STEP_LIMIT="${NET_E2E_STEP_LIMIT:-90}"   # seconds one step may take before the run is aborted
+cur_step=""; cur_since=$(date +%s)
+while ! seen 'E2E-GUEST-DONE'; do
+    now=$(date +%s)
+    step=$(tail -n +"$((FROM + 1))" "$LOG" | grep -ao 'E2E-STEP [a-z_0-9]*' | tail -1)
+    if [ "$step" != "$cur_step" ]; then cur_step="$step"; cur_since=$now; fi
+    # Wall-clock timing from the host: the guest's own clocks are not reliable under TCG.
+    while read -r name; do
+        [ -n "$name" ] && [ -z "${done_at[$name]:-}" ] && done_at[$name]=$now && order+=("$name")
+    done < <(tail -n +"$((FROM + 1))" "$LOG" | grep -ao 'E2E-RESULT [a-z_0-9]* ' | awk '{print $2}')
+    if [ $((now - GUEST_T0)) -ge "$DEADLINE" ]; then
+        echo "DEADLINE: the guest did not finish in ${DEADLINE}s; last step: ${cur_step:-none started}"
+        FAILS=$((FAILS + 1)); break
+    fi
+    if [ $((now - cur_since)) -ge "$STEP_LIMIT" ]; then
+        echo "HUNG: no progress for ${STEP_LIMIT}s in: ${cur_step:-before the first step}"
+        FAILS=$((FAILS + 1)); break
+    fi
+    if [ $served = 0 ] && seen 'E2E-READY serve'; then
+        served=1
+        python3 - <<'PY'
 import socket, sys, time
-end = time.time() + 60
+end = time.time() + 40
 while time.time() < end:
     try:
         c = socket.create_connection(("127.0.0.1", 47003), timeout=3)
@@ -140,22 +127,36 @@ while time.time() < end:
     time.sleep(0.3)
 sys.exit(1)
 PY
-host_ok=$?
-serve_ok=1
-for _ in $(seq 30); do # only output newer than this step counts
-    if tail -n +"$((serve_from + 1))" "$LOG" | grep -q 'tcp_test: PASS'; then serve_ok=0; break; fi
-    sleep 1
-done
-[ $host_ok = 0 ] && [ $serve_ok = 0 ]; report $((! $?)) "tcp_test serve (listen/accept from the host)"
-
-"$DBG" send "httpd -p 7777 -h /mnt &" >/dev/null; "$DBG" enter >/dev/null
-sleep 5
-body=$(python3 -c "
+        HOST_SERVE=$?
+    fi
+    if [ $fetched = 0 ] && seen 'E2E-READY httpd'; then
+        fetched=1
+        body=$(python3 -c "
 import urllib.request
-try: print(urllib.request.urlopen('http://127.0.0.1:47003/hello.txt', timeout=15).read().decode()[:20])
+try: print(urllib.request.urlopen('http://127.0.0.1:47003/hello.txt', timeout=8).read().decode()[:20])
 except Exception as e: print('ERR', e)")
-echo "$body" | grep -q 'Hola desde /mnt'; report $((! $?)) "httpd serves a file from /mnt to the host"
+        echo "$body" | grep -q 'Hola desde /mnt'; HOST_HTTPD=$?
+    fi
+    sleep 0.5
+done
 
+# ── report ──
 echo
+prev=$GUEST_T0
+for name in "${order[@]:-}"; do
+    [ -z "$name" ] && continue
+    res=$(results | awk -v n="$name" '$1 == n {print $2; exit}')
+    printf "  %-5s %-16s %4ss\n" "$([ "$res" = PASS ] && echo ok || echo FAIL)" "$name" "$(( ${done_at[$name]} - prev ))"
+    prev=${done_at[$name]}
+done
+fails=$(results | grep -c ' FAIL$')
+FAILS=$((FAILS + fails))
+if [ $served = 1 ] && [ $HOST_SERVE != 0 ]; then echo "  FAIL  host client of the guest listener"; FAILS=$((FAILS + 1)); fi
+if [ $fetched = 1 ]; then
+    if [ $HOST_HTTPD = 0 ]; then echo "  ok    httpd served /mnt/hello.txt to the host"; else echo "  FAIL  httpd served /mnt/hello.txt to the host"; FAILS=$((FAILS + 1)); fi
+else
+    echo "  FAIL  httpd was never reached"; FAILS=$((FAILS + 1))
+fi
+echo "guest ran $(( $(date +%s) - GUEST_T0 ))s, total $(( $(date +%s) - T0 ))s"
 if [ "$FAILS" = 0 ]; then echo "net-e2e: PASS"; else echo "net-e2e: FAIL ($FAILS)"; fi
 exit $((FAILS != 0))
