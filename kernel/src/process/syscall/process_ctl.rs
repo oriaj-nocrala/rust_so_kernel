@@ -491,6 +491,7 @@ pub(super) fn sys_exit_group(status: i32) -> SyscallResult {
 /// by starting an interactive `ash` — its own `poll()`-based input loop
 /// intermittently died after 1-2 characters, traced back to exactly this.
 pub(crate) fn cancel_all_waiters(pid: usize) {
+    crate::time::itimer::cancel_for(pid);
     super::poll::poll_cancel_waiter(pid);
     super::sync::futex_cancel_waiter(pid);
     // A socket waiter left behind would later wake whatever process
@@ -1536,3 +1537,89 @@ pub(super) fn sys_setsid() -> SyscallResult {
     })
 }
 
+
+
+// ── interval timers: ITIMER_REAL ─────────────────────────────────────────────
+
+const ITIMER_REAL: u64 = 0;
+
+/// `struct timeval` (`tv_sec`, `tv_usec`) to ns; `None` if malformed.
+fn timeval_ns(sec: i64, usec: i64) -> Option<u64> {
+    if sec < 0 || !(0..1_000_000).contains(&usec) {
+        return None;
+    }
+    Some((sec as u64).saturating_mul(1_000_000_000).saturating_add(usec as u64 * 1_000))
+}
+
+/// `struct itimerval` out: `it_interval` then `it_value`, each a `timeval`.
+fn write_itimerval(ptr: u64, (value_ns, interval_ns): (u64, u64)) -> Result<(), i64> {
+    validate_user_buffer(ptr, 32)?;
+    let tv = |ns: u64| ((ns / 1_000_000_000) as i64, ((ns % 1_000_000_000) / 1_000) as i64);
+    let (is, iu) = tv(interval_ns);
+    let (vs, vu) = tv(value_ns);
+    // SAFETY: validated as a user-space range above.
+    unsafe {
+        let p = ptr as *mut i64;
+        p.write(is);
+        p.add(1).write(iu);
+        p.add(2).write(vs);
+        p.add(3).write(vu);
+    }
+    Ok(())
+}
+
+fn current_pid_for_timer() -> usize {
+    super::with_current_process(|p| p.pid.0 as i64) as usize
+}
+
+/// setitimer(38): int setitimer(int which, const struct itimerval *new, struct itimerval *old)
+pub(super) fn sys_setitimer(which: u64, new: u64, old: u64) -> SyscallResult {
+    if which != ITIMER_REAL {
+        return errno::EINVAL;
+    }
+    if new == 0 {
+        return errno::EFAULT;
+    }
+    if validate_user_buffer(new, 32).is_err() || (old != 0 && validate_user_buffer(old, 32).is_err()) {
+        return errno::EFAULT;
+    }
+    // SAFETY: validated as a user-space range above.
+    let (is, iu, vs, vu) = unsafe {
+        let p = new as *const i64;
+        (p.read(), p.add(1).read(), p.add(2).read(), p.add(3).read())
+    };
+    let (Some(interval_ns), Some(value_ns)) = (timeval_ns(is, iu), timeval_ns(vs, vu)) else {
+        return errno::EINVAL;
+    };
+    let pid = current_pid_for_timer();
+    let before = crate::time::itimer::set(pid, value_ns, interval_ns, crate::time::ktime_get());
+    if old != 0 {
+        if let Err(e) = write_itimerval(old, before) {
+            return e;
+        }
+    }
+    0
+}
+
+/// getitimer(36): int getitimer(int which, struct itimerval *cur)
+pub(super) fn sys_getitimer(which: u64, cur: u64) -> SyscallResult {
+    if which != ITIMER_REAL {
+        return errno::EINVAL;
+    }
+    let now = crate::time::ktime_get();
+    match write_itimerval(cur, crate::time::itimer::get(current_pid_for_timer(), now)) {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// alarm(37): unsigned alarm(unsigned seconds): the seconds that were left (rounded up).
+pub(super) fn sys_alarm(seconds: u64) -> SyscallResult {
+    let before = crate::time::itimer::set(
+        current_pid_for_timer(),
+        seconds.saturating_mul(1_000_000_000),
+        0,
+        crate::time::ktime_get(),
+    );
+    before.0.div_ceil(1_000_000_000) as i64
+}

@@ -36,6 +36,10 @@ pub enum FileError {
     /// Write to a pipe with no open read ends (maps to EPIPE, and the
     /// caller additionally raises SIGPIPE — see `pipe.rs`/`sys_write`).
     BrokenPipe,
+    /// A socket operation on a stream that is not connected (`ENOTCONN`).
+    NotConnected,
+    /// The peer reset the connection (`ECONNRESET`).
+    ConnectionReset,
     /// Backing store (ext2 block/inode bitmap) is full — maps to ENOSPC,
     /// distinct from `IOError` so `sys_write` can report the real reason a
     /// write to a disk-backed filesystem failed.

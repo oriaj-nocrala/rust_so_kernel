@@ -46,11 +46,13 @@ pub mod pcicfg;
 pub mod pit;
 pub mod random;
 pub mod ring;
+pub mod rtl8169;
 pub mod rtc;
 pub mod smp;
 pub mod sp5100_tco;
 pub mod tlb;
 pub mod usb;
+pub mod virtio;
 pub mod xhci;
 
 /// Legacy x86 port I/O seam. The production implementation (kernel side)

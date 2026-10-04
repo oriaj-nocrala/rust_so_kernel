@@ -66,3 +66,7 @@ How to add a program or change mlibc/BusyBox: the `userspace-programs` skill. Th
 - Both are rebuilt when the output is missing or the port file is newer. Both use `FBIO_BLIT` on the console, or a window under the compositor.
 - A game must drain `/dev/input/event0` at startup: the ring fills from boot.
 - Never edit a submodule checkout: patch it from its build script.
+
+## ABI header fixes (networking)
+
+- `abi-bits/in.h` is Linux's (`mlibc/abis/linux/in.h`, copied into `mlibc-port/constanos-sysdeps/include/abi-bits/`). The port used to ship mlibc's generic table, which numbered the protocols 1..8 (`IPPROTO_TCP` 5, `UDP` 6, `ICMP` 3, `IP` 1): every program passing them to `socket`/`setsockopt` was wrong. Re-check any new `abi-bits` header the same way: diff it against `mlibc/abis/linux/`.

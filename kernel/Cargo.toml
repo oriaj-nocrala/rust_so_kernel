@@ -29,6 +29,7 @@ diag = { path = "../diag" }
 sched = { path = "../sched" }
 usock = { path = "../usock" }
 tty = { path = "../tty" }
+net = { path = "../net" }
 
 # Para manejo de interrupciones y excepciones
 spin = "0.10.0"

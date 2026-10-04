@@ -33,6 +33,7 @@
 #include <sys/statvfs.h>
 #include <sys/sysinfo.h>
 #include <sys/select.h>
+#include <sys/time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/utsname.h>
@@ -130,6 +131,8 @@ constexpr long SYS_pipe = 22;
 constexpr long SYS_munmap = 11;
 constexpr long SYS_ioctl = 16;
 constexpr long SYS_nanosleep = 35;
+constexpr long SYS_getitimer = 36;
+constexpr long SYS_setitimer = 38;
 constexpr long SYS_getpid = 39;
 constexpr long SYS_getppid = 110;
 constexpr long SYS_fork = 57;
@@ -921,6 +924,18 @@ int sys_sleep(time_t *secs, long *nanos) {
 	*secs = 0;
 	*nanos = 0;
 	return 0;
+}
+
+// ITIMER_REAL only (kernel/src/time/itimer.rs): `alarm()` and `ualarm()` are
+// built on these, and BusyBox wget/httpd use them for timeouts.
+int sys_getitimer(int which, struct itimerval *curr_value) {
+	long ret = raw_syscall(SYS_getitimer, which, (long)curr_value);
+	return ret < 0 ? (int)-ret : 0;
+}
+
+int sys_setitimer(int which, const struct itimerval *new_value, struct itimerval *old_value) {
+	long ret = raw_syscall(SYS_setitimer, which, (long)new_value, (long)old_value);
+	return ret < 0 ? (int)-ret : 0;
 }
 
 int sys_fork(pid_t *child) {

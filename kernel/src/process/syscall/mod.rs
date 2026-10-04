@@ -36,6 +36,7 @@ mod fs;
 mod process_ctl;
 mod signal;
 mod ipc;
+mod inet;
 mod sync;
 mod poll;
 mod misc;
@@ -279,6 +280,9 @@ pub enum SyscallNumber {
     Writev = 20,
     Yield = 24,
     Nanosleep = 35,
+    Getitimer = 36,
+    Alarm = 37,
+    Setitimer = 38,
     GetPid = 39,
     GetPpid = 110,
     Socket = 41,
@@ -422,6 +426,9 @@ impl SyscallNumber {
             20 => Some(Self::Writev),
             24 => Some(Self::Yield),
             35 => Some(Self::Nanosleep),
+            36 => Some(Self::Getitimer),
+            37 => Some(Self::Alarm),
+            38 => Some(Self::Setitimer),
             39 => Some(Self::GetPid),
             110 => Some(Self::GetPpid),
             41 => Some(Self::Socket),
@@ -559,6 +566,7 @@ pub mod errno {
     pub const EPIPE: i64 = -32;
     pub const ENOTSOCK: i64 = -88;
     pub const ENOTCONN: i64 = -107;
+    pub const ECONNRESET: i64 = -104;
     pub const ETIMEDOUT: i64 = -110;
     pub const ECONNREFUSED: i64 = -111;
 }
@@ -762,6 +770,9 @@ pub fn syscall_handler(
         SyscallNumber::Writev => fs::sys_writev(arg1 as i32, arg2, arg3 as usize),
         SyscallNumber::Yield => process_ctl::sys_yield(),
         SyscallNumber::Nanosleep => process_ctl::sys_nanosleep(arg1, arg2),
+        SyscallNumber::Getitimer => process_ctl::sys_getitimer(arg1, arg2),
+        SyscallNumber::Alarm => process_ctl::sys_alarm(arg1),
+        SyscallNumber::Setitimer => process_ctl::sys_setitimer(arg1, arg2, arg3),
         SyscallNumber::GetPid => process_ctl::sys_getpid(),
         SyscallNumber::GetPpid => process_ctl::sys_getppid(),
         SyscallNumber::Socket  => ipc::sys_socket(arg1 as i32, arg2 as i32, arg3 as i32),

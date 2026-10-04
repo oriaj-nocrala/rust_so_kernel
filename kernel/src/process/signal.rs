@@ -52,6 +52,7 @@ pub const SIGUSR1: u32 = 10;
 pub const SIGSEGV: u32 = 11;
 pub const SIGUSR2: u32 = 12;
 pub const SIGPIPE: u32 = 13;
+pub const SIGALRM: u32 = 14;
 pub const SIGTERM: u32 = 15;
 pub const SIGCHLD: u32 = 17;
 pub const SIGCONT: u32 = 18;

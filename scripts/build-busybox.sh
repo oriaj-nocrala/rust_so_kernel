@@ -73,6 +73,9 @@ COMMON=(
     -fomit-frame-pointer
     -mno-red-zone
     -D_GNU_SOURCE
+    # ping.c uses ICMP_MINLEN (the 8-byte ICMP header), which glibc's
+    # <netinet/ip_icmp.h> defines and mlibc's does not.
+    -DICMP_MINLEN=8
     # struct sysinfo for free/uptime/nmeter/init: they include
     # <sys/sysinfo.h> only under \`#ifdef __linux__\`, which this target
     # does not define (and must not: BusyBox has hundreds of other
@@ -83,6 +86,23 @@ COMMON=(
     -isystem "\$SYSROOT/usr/include"
     -isystem "\$RESOURCE_INC"
 )
+
+# Assembly sources (libbb/*_shaNI.S) must not get the C-only header
+# force-included: clang would try to assemble the struct declaration.
+for arg in "\$@"; do
+    case "\$arg" in
+        *.S)
+            filtered=()
+            skip=0
+            for c in "\${COMMON[@]}"; do
+                if [ "\$skip" = "1" ]; then skip=0; continue; fi
+                if [ "\$c" = "-include" ]; then skip=1; continue; fi
+                filtered+=("\$c")
+            done
+            COMMON=("\${filtered[@]}")
+            break ;;
+    esac
+done
 
 if [ "\$is_link" = "1" ]; then
     # No separate libm.a/librt.a exist — musl's math functions are already

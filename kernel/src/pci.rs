@@ -416,6 +416,56 @@ pub fn enable_msi(bus: u8, device: u8, function: u8, dest_apic_id: u32, vector: 
     Ok(())
 }
 
+/// Routes the function's MSI-X to one vector: table entry 0 delivers
+/// `vector` to local APIC `dest_apic_id`, every other entry stays masked, then
+/// MSI-X is enabled (and INTx disabled). The device uses entry 0 by naming
+/// it in its own registers (virtio: `msix_config`, `queue_msix_vector`).
+/// `bars` is what `size_bars` returned; memory decoding must be on already.
+/// Boot-only (it maps the table, `memory::mmio`). The vector must already
+/// have a handler (`interrupts::msi::alloc`).
+pub fn enable_msix(
+    bus: u8,
+    device: u8,
+    function: u8,
+    bars: &[Option<hal::pcicfg::Bar>; 6],
+    dest_apic_id: u32,
+    vector: u8,
+) -> Result<(), &'static str> {
+    use hal::pcicfg::{MsixCap, COMMAND_INTX_DISABLE};
+    if !crate::interrupts::apic::active() {
+        return Err("MSI-X needs the local APIC, and this boot fell back to the 8259");
+    }
+    let cfg = config_space(bus, device, function);
+    let cap = MsixCap::decode(&cfg).ok_or("function has no MSI-X capability")?;
+    let bar = bars.get(cap.table_bar as usize).copied().flatten().ok_or("MSI-X table BAR is not assigned")?;
+    let end = cap.table_offset as u64 + cap.table_bytes() as u64;
+    if end > bar.size {
+        return Err("MSI-X table does not fit in its BAR");
+    }
+    let entry = hal::pcicfg::msix_entry(dest_apic_id, vector).ok_or("APIC ID or vector out of MSI range")?;
+    // SAFETY: a device register window (the table inside a PCI BAR); boot-only.
+    let virt = unsafe {
+        crate::memory::mmio::map(x86_64::PhysAddr::new(bar.addr + cap.table_offset as u64), cap.table_bytes() as usize)
+    }
+    .ok_or("cannot map the MSI-X table")?;
+    let base = virt.as_mut_ptr::<u32>();
+    // SAFETY: inside the mapped table (`entry_offset` is checked against `table_size`).
+    unsafe {
+        // Mask everything first (vector control bit 0), then fill entry 0 and unmask it last.
+        for i in 0..cap.table_size as usize {
+            base.add(i * 4 + 3).write_volatile(1);
+        }
+        base.write_volatile(entry[0]);
+        base.add(1).write_volatile(entry[1]);
+        base.add(2).write_volatile(entry[2]);
+        base.add(3).write_volatile(entry[3]);
+    }
+    update_command(bus, device, function, COMMAND_INTX_DISABLE, 0);
+    let flags_now = config_read16(bus, device, function, cap.flags_offset());
+    config_write16(bus, device, function, cap.flags_offset(), MsixCap::enabled_flags(flags_now));
+    Ok(())
+}
+
 // ── Claims and /proc/pci ──────────────────────────────────────────────────────
 //
 // Which driver owns which function, so `/proc/pci` can say what nothing

@@ -309,6 +309,12 @@ impl Inode for RenderedInode {
     }
 }
 
+/// A read-only file regenerated on every `open()`, for another filesystem
+/// to hand out (`/etc/resolv.conf` in the initramfs).
+pub(super) fn rendered(ino: u64, render: fn() -> String) -> Arc<dyn Inode> {
+    Arc::new(RenderedInode { ino, render })
+}
+
 /// Renders `/proc/fbinfo` — the framebuffer console's instrument panel:
 /// real geometry, the memory type its mapping actually has, and the cost
 /// of every drawing primitive since boot.

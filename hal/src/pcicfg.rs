@@ -188,6 +188,10 @@ const MSIX_FLAGS: u8 = 2;
 const MSIX_FLAGS_QSIZE: u16 = 0x07FF;
 /// `PCI_MSIX_FLAGS_ENABLE` (`pci_regs.h:335`).
 const MSIX_FLAGS_ENABLE: u16 = 0x8000;
+/// `PCI_MSIX_FLAGS_MASKALL` (`pci_regs.h:334`): masks every vector of the function.
+const MSIX_FLAGS_MASKALL: u16 = 0x4000;
+/// Bytes per MSI-X table entry: address low, address high, data, vector control.
+pub const MSIX_ENTRY_SIZE: u32 = 16;
 /// `PCI_MSIX_TABLE` (`pci_regs.h:336`).
 const MSIX_TABLE: u8 = 4;
 /// `PCI_MSIX_TABLE_BIR` (`pci_regs.h:337`).
@@ -267,8 +271,9 @@ impl MsiCap {
     }
 }
 
-/// A function's MSI-X capability, decoded (reported only: nothing here
-/// programs MSI-X yet; the GA106 has none).
+/// A function's MSI-X capability, decoded. The pieces to program it
+/// (`enabled_flags`, `entry_offset`, [`msix_entry`]) are here; the kernel
+/// writes them (`pci::enable_msix`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MsixCap {
     pub offset: u8,
@@ -295,6 +300,41 @@ impl MsixCap {
             table_offset: table & MSIX_TABLE_OFFSET,
         })
     }
+}
+
+impl MsixCap {
+    /// Where the Message Control register lives in configuration space.
+    pub fn flags_offset(&self) -> u8 {
+        self.offset + MSIX_FLAGS
+    }
+
+    /// The Message Control value that turns MSI-X on and clears the
+    /// function-wide mask, keeping everything else (the table size).
+    pub fn enabled_flags(flags_now: u16) -> u16 {
+        (flags_now | MSIX_FLAGS_ENABLE) & !MSIX_FLAGS_MASKALL
+    }
+
+    /// Byte offset of table entry `index` inside the table's BAR; `None`
+    /// past the table.
+    pub fn entry_offset(&self, index: u16) -> Option<u32> {
+        if index >= self.table_size {
+            return None;
+        }
+        self.table_offset.checked_add(index as u32 * MSIX_ENTRY_SIZE)
+    }
+
+    /// Bytes the table spans (for mapping it).
+    pub fn table_bytes(&self) -> u32 {
+        self.table_size as u32 * MSIX_ENTRY_SIZE
+    }
+}
+
+/// One MSI-X table entry that delivers `vector` to local APIC
+/// `dest_apic_id`, **unmasked**: `[address low, address high, data, vector
+/// control]`, the layout of PCI 3.0 §6.8.2.
+pub fn msix_entry(dest_apic_id: u32, vector: u8) -> Option<[u32; 4]> {
+    let (address, data) = x86_msi_message(dest_apic_id, vector)?;
+    Some([address as u32, (address >> 32) as u32, data as u32, 0])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -498,5 +538,27 @@ mod tests {
         assert_eq!(x86_msi_message(3, 0x5f), Some((0xfee0_3000, 0x5f)));
         assert_eq!(x86_msi_message(0x100, 0x50), None);
         assert_eq!(x86_msi_message(0, 14), None);
+    }
+
+    #[test]
+    fn msix_programming_pieces() {
+        let cap = MsixCap { offset: 0x98, enabled: false, table_size: 3, table_bar: 1, table_offset: 0x1000 };
+        assert_eq!(cap.flags_offset(), 0x9A);
+        assert_eq!(cap.entry_offset(0), Some(0x1000));
+        assert_eq!(cap.entry_offset(2), Some(0x1020));
+        assert_eq!(cap.entry_offset(3), None, "past the table");
+        assert_eq!(cap.table_bytes(), 48);
+        // Table size bits (10:0) survive; enable set, function mask cleared.
+        assert_eq!(MsixCap::enabled_flags(0x4002), 0x8002);
+        assert_eq!(MsixCap::enabled_flags(0x0002), 0x8002);
+        assert_eq!(MsixCap::enabled_flags(0x8002), 0x8002);
+    }
+
+    #[test]
+    fn msix_entry_is_the_x86_message_unmasked() {
+        // APIC 1, vector 0x50: address 0xfee01000, data 0x50, control 0 (unmasked).
+        assert_eq!(msix_entry(1, 0x50), Some([0xfee0_1000, 0, 0x50, 0]));
+        assert_eq!(msix_entry(0x100, 0x50), None, "APIC ID needs more than 8 bits");
+        assert_eq!(msix_entry(0, 0x1f), None, "an exception vector");
     }
 }

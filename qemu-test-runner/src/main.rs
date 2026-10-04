@@ -30,7 +30,8 @@
 // command line minimal also sidesteps needing a host audio backend just
 // to run tests.
 
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -47,7 +48,58 @@ const QEMU_EXIT_FAILED: i32 = (0x11 << 1) | 1; // 35
 /// time instead of hanging the caller forever.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The guest reaches the host as 10.0.2.2 (QEMU user networking), so this is
+/// where `hw_tests::tcp_with_the_host` connects to.
+const HOST_ECHO_PORT: u16 = 47001;
+/// `hostfwd` maps this host port to guest port 7777 (the test's listener).
+const GUEST_FWD_PORT: u16 = 47003;
+
+/// The two host-side peers the TCP test needs, as threads (they die with the
+/// runner): an echo server the guest connects to, and a client that keeps
+/// trying to reach the guest's listener until it gets its `pong`.
+fn start_host_services() {
+    let listener = TcpListener::bind(("127.0.0.1", HOST_ECHO_PORT))
+        .unwrap_or_else(|e| panic!("qemu-test-runner: cannot listen on 127.0.0.1:{}: {}", HOST_ECHO_PORT, e));
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut conn = conn;
+                let _ = conn.write_all(b"HELLO FROM HOST\n");
+                let mut buf = [0u8; 8192];
+                loop {
+                    match conn.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if conn.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let _ = conn.shutdown(Shutdown::Write);
+            });
+        }
+    });
+    std::thread::spawn(|| {
+        let deadline = Instant::now() + Duration::from_secs(55);
+        while Instant::now() < deadline {
+            // Before the guest listens, the forward accepts and then drops us.
+            if let Ok(mut c) = TcpStream::connect(("127.0.0.1", GUEST_FWD_PORT)) {
+                let _ = c.set_read_timeout(Some(Duration::from_secs(3)));
+                if c.write_all(b"ping from host").is_ok() {
+                    let mut reply = [0u8; 4];
+                    if c.read_exact(&mut reply).is_ok() && &reply == b"pong" {
+                        return;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    });
+}
+
 fn main() {
+    start_host_services();
     let elf_path = match std::env::args().nth(1) {
         Some(p) => PathBuf::from(p),
         None => {
@@ -108,6 +160,12 @@ fn main() {
         // cannot be targeted by the buddy allocator.
         .arg("-device")
         .arg("edu,dma_mask=0xffffffffffff")
+        // `hw_tests::virtio_net_pings_the_gateway`: QEMU's user-mode network
+        // (gateway 10.0.2.2) behind a modern-only virtio-net function.
+        .arg("-netdev")
+        .arg(format!("user,id=n0,hostfwd=tcp:127.0.0.1:{}-:7777", GUEST_FWD_PORT))
+        .arg("-device")
+        .arg("virtio-net-pci,netdev=n0,disable-legacy=on")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -175,6 +233,7 @@ fn print_serial_log(path: &Path) {
 fn find_system_ovmf() -> Option<(PathBuf, PathBuf)> {
     const CANDIDATES: &[(&str, &str)] = &[
         ("/usr/share/edk2/x64/OVMF_CODE.4m.fd", "/usr/share/edk2/x64/OVMF_VARS.4m.fd"),
+        ("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"),
         ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
         ("/usr/share/ovmf/x64/OVMF_CODE.fd", "/usr/share/ovmf/x64/OVMF_VARS.fd"),
         ("/usr/share/ovmf/OVMF_CODE.fd", "/usr/share/ovmf/OVMF_VARS.fd"),

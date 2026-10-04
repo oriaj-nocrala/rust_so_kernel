@@ -112,3 +112,12 @@ Code: `kernel/src/process/` (`scheduler.rs`, `timer_preempt.rs`, `trapframe.rs`,
 
 - `FileDescriptorTable` (`process/file.rs`) is two `Vec`s (handles, close-on-exec flags) that grow on demand to `MAX_FILES` = 256; a full table is `EMFILE`. **Never make it an inline array or put a per-fd array in a `BTreeMap` value**: at opt-level 0 those are copied by value several times and overflowed the boot stack (PID 1) and a kernel stack (`EPOLL_FD_MAP`, now keyed by `(pid, fd)`).
 - `poll`/`epoll` snapshot the table into a boxed slice sized to the highest open fd (`open_extent`).
+
+## Interval timers (`kernel/src/time/itimer.rs`)
+
+- `alarm(37)`, `getitimer(36)`, `setitimer(38)`: **`ITIMER_REAL` only** (`ITIMER_VIRTUAL`/`ITIMER_PROF` -> `EINVAL`). One timer per pid; not inherited by `fork`, kept across `exec`, dropped when the process dies (`cancel_all_waiters`).
+- Each armed timer is one hrtimer with `HrTimerAction::Alarm { pid }`. `hrtimer::tick` reports the expiries (a second out array, 4 per tick); `timer_preempt_handler` calls `itimer::on_expiry` *before* taking the scheduler lock (it re-arms a periodic timer on its fixed cadence, skipping missed periods), then `scheduler.signal_pid(pid, SIGALRM)` once it holds it.
+- Lock order: `TIMERS` (an `IrqLock`) -> hrtimer `QUEUE`; never nested with `SCHEDULER`. A stale expiry (the timer was replaced after `tick` popped the old one) is ignored by matching the hrtimer id.
+- Signals reach a *running* process at the next tick (<= 10 ms), a blocked one at once (`interrupt_blocked`).
+- mlibc: `sys_setitimer`/`sys_getitimer` in `mlibc-port/constanos-sysdeps/generic/generic.cpp` (`alarm`/`ualarm` are built on them).
+- Test: `itimer_test` (guest C program), and `wget -T` in `scripts/net-e2e.sh`.

@@ -400,7 +400,7 @@ pub fn block_on(sock: SocketId, epoch: u64) -> ! {
 /// already broken for a pipe today (it loses its running total instead),
 /// and fixing it properly means making `sys_writev` a single `write()` of a
 /// gathered buffer — out of scope here.
-fn register_retry(sock: SocketId, epoch: u64) -> bool {
+pub(crate) fn register_retry(sock: SocketId, epoch: u64) -> bool {
     let tf = crate::process::syscall::current_tf_ptr() as *mut crate::process::TrapFrame;
     if tf.is_null() {
         // No syscall frame: the caller is kernel code driving a socket
@@ -507,6 +507,9 @@ pub fn cancel_waiters_for(pid: usize) {
 // ────────────────────────────────────────────────────────────────────────
 
 pub fn poll_mask(id: SocketId) -> Option<PollMask> {
+    if crate::network::is_inet(id) {
+        return crate::network::poll_mask(id);
+    }
     SOCKETS.with(|t| t.poll(id).ok())
 }
 

@@ -1128,3 +1128,312 @@ fn edu_mmio_dma_msi() {
     ));
     crate::interrupts::msi::free(vector);
 }
+
+/// Case: virtio-net end to end (docs/net/). Brings the device up through
+/// `network::virtio_net` (modern PCI transport, polled), gives it QEMU's
+/// user-mode address 10.0.2.15/24 and pings the gateway 10.0.2.2: the
+/// reply proves ARP, ICMP, both virtqueues, the DMA buffers and the
+/// doorbells at once. The MAC is QEMU's default for the first NIC.
+#[test_case]
+fn virtio_net_pings_the_gateway() {
+    use net::smoltcp::iface::{Config, Interface, SocketSet};
+    use net::smoltcp::phy::ChecksumCapabilities;
+    use net::smoltcp::socket::icmp;
+    use net::smoltcp::time::Instant;
+    use net::smoltcp::wire::{
+        EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address,
+    };
+
+    let nic = crate::network::virtio_net::VirtioNet::probe(None).unwrap_or_else(|e| panic!("virtio-net: {:?}", e));
+    assert_eq!(nic.mac(), [0x52, 0x54, 0x00, 0x12, 0x34, 0x56], "QEMU's default NIC MAC");
+    assert!(nic.link_up(), "link down");
+
+    let mut dev = net::NicDevice::new(nic);
+    let mut iface = Interface::new(
+        Config::new(HardwareAddress::Ethernet(EthernetAddress(dev.nic.mac()))),
+        &mut dev,
+        Instant::from_millis(0),
+    );
+    iface.update_ip_addrs(|a| {
+        a.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).unwrap();
+    });
+    let rx = icmp::PacketBuffer::new(alloc::vec![icmp::PacketMetadata::EMPTY; 4], alloc::vec![0; 512]);
+    let tx = icmp::PacketBuffer::new(alloc::vec![icmp::PacketMetadata::EMPTY; 4], alloc::vec![0; 512]);
+    let mut sockets = SocketSet::new(alloc::vec::Vec::new());
+    let handle = sockets.add(icmp::Socket::new(rx, tx));
+    sockets.get_mut::<icmp::Socket>(handle).bind(icmp::Endpoint::Ident(0x4242)).unwrap();
+
+    let gw = IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 2));
+    let mut payload = [0u8; 8 + 16];
+    let req = Icmpv4Repr::EchoRequest { ident: 0x4242, seq_no: 1, data: b"constanos-ping!!" };
+    req.emit(&mut Icmpv4Packet::new_unchecked(&mut payload[..]), &ChecksumCapabilities::default());
+    sockets.get_mut::<icmp::Socket>(handle).send_slice(&payload, gw).unwrap();
+
+    let start = crate::cpu::tsc::uptime_ms();
+    let mut got = false;
+    for i in 0u64..u64::MAX {
+        let now = Instant::from_millis((crate::cpu::tsc::uptime_ms() - start) as i64);
+        iface.poll(now, &mut dev, &mut sockets);
+        let s = sockets.get_mut::<icmp::Socket>(handle);
+        if let Ok((data, from)) = s.recv() {
+            let pkt = Icmpv4Packet::new_checked(data).expect("well-formed reply");
+            let repr = Icmpv4Repr::parse(&pkt, &ChecksumCapabilities::default()).expect("valid ICMP");
+            assert_eq!(from, gw);
+            assert!(
+                matches!(repr, Icmpv4Repr::EchoReply { ident: 0x4242, seq_no: 1, data: b"constanos-ping!!" }),
+                "unexpected reply {:?}",
+                repr
+            );
+            got = true;
+            break;
+        }
+        if crate::cpu::tsc::uptime_ms() - start > 5_000 {
+            break;
+        }
+        if i % 64 == 0 {
+            crate::memory::tlb::service_pending();
+        }
+        core::hint::spin_loop();
+    }
+    assert!(
+        got,
+        "no echo reply in 5 s (rx {} tx {} dropped {}, device status {:#x})",
+        dev.nic.rx_frames, dev.nic.tx_frames, dev.nic.tx_dropped, dev.nic.device_status()
+    );
+}
+
+/// Case: DHCP through the global stack (`network::init`, which `init::boot`
+/// runs too). QEMU's user-mode network hands out 10.0.2.15/24 with router
+/// 10.0.2.2 and DNS 10.0.2.3. No timer ISR runs in a test boot, so this
+/// drives the stack by hand with `network::tick`, as the BSP's timer would.
+#[test_case]
+fn dhcp_lease_from_qemu() {
+    let lease = net_up();
+    assert!(crate::network::irq_count() > 0, "the lease arrived without a single NIC interrupt");
+    use net::smoltcp::wire::Ipv4Address;
+    assert_eq!(lease.addr, Ipv4Address::new(10, 0, 2, 15));
+    assert_eq!(lease.prefix, 24);
+    assert_eq!(lease.router, Some(Ipv4Address::new(10, 0, 2, 2)));
+    assert_eq!(lease.dns, Some(Ipv4Address::new(10, 0, 2, 3)));
+}
+
+/// Brings the global stack up once for the network tests and waits for DHCP.
+/// (`network::init` twice would reset the NIC under the first stack.) The
+/// NIC's MSI-X vector goes to CPU 1: a test boot's BSP spins with IF=0 and
+/// never takes an interrupt, while the APs idle with IF=1. The wait does
+/// **not** call `network::tick`, so the lease only arrives if receive really
+/// is driven by the interrupt (DHCP's replies, and the REQUEST each OFFER
+/// triggers, all go through `network::irq`).
+fn net_up() -> net::Lease {
+    static UP: spin::Once<net::Lease> = spin::Once::new();
+    *UP.call_once(|| {
+        assert!(crate::smp::is_online_ap(1), "test boot has no CPU 1");
+        crate::network::init_with(Some(1));
+        let mut lease = None;
+        assert!(
+            crate::edu::wait_ms(10_000, || {
+                lease = crate::network::lease();
+                lease.is_some()
+            }),
+            "no DHCP lease in 10 s without a tick: the NIC interrupt did not drive receive (irq count {})",
+            crate::network::irq_count()
+        );
+        lease.unwrap()
+    })
+}
+
+/// Waits for `done`, driving the stack the way the BSP's timer tick would
+/// (a test boot has no timer ISR).
+fn wait_net(ms: u64, mut done: impl FnMut() -> bool) -> bool {
+    crate::edu::wait_ms(ms, || {
+        crate::network::tick();
+        done()
+    })
+}
+
+/// Case: TCP through `network::*`, against real peers on the host
+/// (`qemu-test-runner` starts them): an echo server at 10.0.2.2:47001 that
+/// the guest connects to (banner, 200 KB echoed both ways under flow
+/// control, half-close, EOF), and a host client that reaches the guest's
+/// listener on port 7777 through QEMU's `hostfwd` (accept, ping/pong, EOF).
+#[test_case]
+fn tcp_with_the_host() {
+    use crate::network::{self, InetSocketHandle, SockKind};
+    use net::smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
+    use net::{Connect, NetError};
+
+    net_up();
+
+    // ── client: connect to the host's echo server ──
+    let id = network::open(SockKind::Stream).expect("open");
+    let sock = InetSocketHandle::new(id); // closes it on drop
+    let host = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 2)), 47001);
+    let mut connected = false;
+    let mut err = None;
+    assert!(
+        wait_net(10_000, || match network::connect(id, host) {
+            Ok(Connect::Done) => {
+                connected = true;
+                true
+            }
+            Ok(Connect::Pending) => false,
+            Err(e) => {
+                err = Some(e);
+                true
+            }
+        }) && connected,
+        "connect: {:?}",
+        err
+    );
+
+    let mut got = alloc::vec::Vec::new();
+    let mut buf = [0u8; 4096];
+    let banner = b"HELLO FROM HOST\n";
+    assert!(
+        wait_net(5_000, || {
+            if let Ok(r) = network::recv(id, &mut buf, false) {
+                got.extend_from_slice(&buf[..r.n]);
+            }
+            got.len() >= banner.len()
+        }),
+        "no banner, got {:?}",
+        got
+    );
+    assert_eq!(&got[..banner.len()], banner);
+    let mut echoed: alloc::vec::Vec<u8> = got[banner.len()..].to_vec();
+
+    let blob: alloc::vec::Vec<u8> = (0..200_000u32).map(|i| (i * 31 + 7) as u8).collect();
+    let mut sent = 0;
+    assert!(
+        wait_net(30_000, || {
+            if sent < blob.len() {
+                let end = (sent + 16_384).min(blob.len());
+                match network::send(id, &blob[sent..end], None) {
+                    Ok(n) => sent += n,
+                    Err(NetError::Again) => {}
+                    Err(e) => panic!("send: {:?}", e),
+                }
+            }
+            while let Ok(r) = network::recv(id, &mut buf, false) {
+                assert!(r.n > 0, "EOF before the echo finished");
+                echoed.extend_from_slice(&buf[..r.n]);
+            }
+            echoed.len() >= blob.len()
+        }),
+        "echo stalled: sent {} of {}, got {}",
+        sent,
+        blob.len(),
+        echoed.len()
+    );
+    assert!(echoed == blob, "echoed bytes differ");
+
+    network::shutdown_write(id).expect("shutdown(WR)");
+    let mut eof = false;
+    assert!(
+        wait_net(5_000, || {
+            match network::recv(id, &mut buf, false) {
+                Ok(r) if r.n == 0 => eof = true,
+                Ok(_) => panic!("unexpected extra data"),
+                Err(_) => {}
+            }
+            eof
+        }),
+        "no EOF after the half-close"
+    );
+    drop(sock);
+
+    // ── server: the host connects to us through hostfwd ──
+    let lid = network::open(SockKind::Stream).expect("open listener");
+    let listener = InetSocketHandle::new(lid);
+    network::bind(lid, None, 7777).expect("bind 7777");
+    network::listen(lid, 4).expect("listen");
+    let mut accepted = None;
+    assert!(
+        wait_net(40_000, || {
+            if let Ok((nid, from)) = network::accept(lid) {
+                accepted = Some((nid, from));
+            }
+            accepted.is_some()
+        }),
+        "the host client never arrived"
+    );
+    let (nid, from) = accepted.unwrap();
+    let conn = InetSocketHandle::new(nid);
+    assert_eq!(network::ipv4_of(&from), Some(Ipv4Address::new(10, 0, 2, 2)), "hostfwd arrives from the gateway");
+    let mut msg = alloc::vec::Vec::new();
+    assert!(
+        wait_net(5_000, || {
+            if let Ok(r) = network::recv(nid, &mut buf, false) {
+                msg.extend_from_slice(&buf[..r.n]);
+            }
+            msg.len() >= 14
+        }),
+        "got {:?}",
+        msg
+    );
+    assert_eq!(&msg, b"ping from host");
+    assert_eq!(network::send(nid, b"pong", None), Ok(4));
+    let mut eof = false;
+    assert!(
+        wait_net(5_000, || {
+            if let Ok(r) = network::recv(nid, &mut buf, false) {
+                eof = r.n == 0;
+            }
+            eof
+        }),
+        "the host client did not close"
+    );
+    drop(conn);
+    drop(listener);
+}
+
+/// Case: a raw ICMP socket through `network::*`, the way BusyBox `ping`
+/// uses one: send an echo request message to the gateway (the stack adds the
+/// IPv4 header), receive the reply as a whole IP packet. Checks the header
+/// (source, protocol, checksum) and that the ICMP id/sequence/payload come
+/// back untouched.
+#[test_case]
+fn raw_icmp_pings_the_gateway() {
+    use crate::network::{self, InetSocketHandle, SockKind};
+    use net::smoltcp::phy::ChecksumCapabilities;
+    use net::smoltcp::wire::{
+        Icmpv4Packet, Icmpv4Repr, IpAddress, IpEndpoint, IpProtocol, Ipv4Address, Ipv4Packet,
+    };
+
+    net_up();
+    let id = network::open(SockKind::Raw(1)).expect("open raw");
+    let _sock = InetSocketHandle::new(id); // closes it on drop
+    let gw = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 2)), 0);
+
+    let mut request = [0u8; 8 + 13];
+    Icmpv4Repr::EchoRequest { ident: 0xBEEF, seq_no: 3, data: b"raw-ping-test" }
+        .emit(&mut Icmpv4Packet::new_unchecked(&mut request[..]), &ChecksumCapabilities::default());
+
+    let mut reply = None;
+    let mut buf = [0u8; 256];
+    assert!(
+        wait_net(8_000, || {
+            // The first packet can be lost to ARP resolution: resend until a reply shows up.
+            match network::recv(id, &mut buf, false) {
+                Ok(r) => {
+                    reply = Some((r.n, r.from));
+                    return true;
+                }
+                Err(_) => {}
+            }
+            let _ = network::send(id, &request, Some(gw));
+            false
+        }),
+        "no echo reply"
+    );
+    let (n, from) = reply.unwrap();
+    assert_eq!(network::ipv4_of(&from.unwrap()), Some(Ipv4Address::new(10, 0, 2, 2)));
+    let ip = Ipv4Packet::new_checked(&buf[..n]).expect("a whole IP packet");
+    assert_eq!(ip.next_header(), IpProtocol::Icmp);
+    assert!(ip.verify_checksum());
+    let icmp = Icmpv4Packet::new_checked(ip.payload()).expect("an ICMP message");
+    match Icmpv4Repr::parse(&icmp, &ChecksumCapabilities::default()).expect("valid ICMP") {
+        Icmpv4Repr::EchoReply { ident: 0xBEEF, seq_no: 3, data: b"raw-ping-test" } => {}
+        other => panic!("unexpected reply {:?}", other),
+    }
+}
