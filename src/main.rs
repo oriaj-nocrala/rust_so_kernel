@@ -49,6 +49,9 @@ fn main() {
     let audiodev = if qemu_has_audiodev("pipewire") { "pipewire" } else { "none" };
     cmd.arg("-audiodev").arg(format!("{},id=snd0", audiodev));
     cmd.arg("-device").arg("AC97,audiodev=snd0");
+    // virtio-net on QEMU's user-mode network (gateway 10.0.2.2).
+    cmd.arg("-netdev").arg("user,id=n0");
+    cmd.arg("-device").arg("virtio-net-pci,netdev=n0,disable-legacy=on");
 
     // xHCI USB controller (kernel/src/usb/) — always present, so the USB
     // driver's bring-up path runs on every `cargo run` instead of only on

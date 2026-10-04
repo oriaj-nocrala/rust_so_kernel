@@ -1128,3 +1128,76 @@ fn edu_mmio_dma_msi() {
     ));
     crate::interrupts::msi::free(vector);
 }
+
+/// Case: virtio-net end to end (docs/net/). Brings the device up through
+/// `network::virtio_net` (modern PCI transport, polled), gives it QEMU's
+/// user-mode address 10.0.2.15/24 and pings the gateway 10.0.2.2: the
+/// reply proves ARP, ICMP, both virtqueues, the DMA buffers and the
+/// doorbells at once. The MAC is QEMU's default for the first NIC.
+#[test_case]
+fn virtio_net_pings_the_gateway() {
+    use net::smoltcp::iface::{Config, Interface, SocketSet};
+    use net::smoltcp::phy::ChecksumCapabilities;
+    use net::smoltcp::socket::icmp;
+    use net::smoltcp::time::Instant;
+    use net::smoltcp::wire::{
+        EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address,
+    };
+
+    let nic = crate::network::virtio_net::VirtioNet::probe().unwrap_or_else(|e| panic!("virtio-net: {:?}", e));
+    assert_eq!(nic.mac(), [0x52, 0x54, 0x00, 0x12, 0x34, 0x56], "QEMU's default NIC MAC");
+    assert!(nic.link_up(), "link down");
+
+    let mut dev = net::NicDevice::new(nic);
+    let mut iface = Interface::new(
+        Config::new(HardwareAddress::Ethernet(EthernetAddress(dev.nic.mac()))),
+        &mut dev,
+        Instant::from_millis(0),
+    );
+    iface.update_ip_addrs(|a| {
+        a.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).unwrap();
+    });
+    let rx = icmp::PacketBuffer::new(alloc::vec![icmp::PacketMetadata::EMPTY; 4], alloc::vec![0; 512]);
+    let tx = icmp::PacketBuffer::new(alloc::vec![icmp::PacketMetadata::EMPTY; 4], alloc::vec![0; 512]);
+    let mut sockets = SocketSet::new(alloc::vec::Vec::new());
+    let handle = sockets.add(icmp::Socket::new(rx, tx));
+    sockets.get_mut::<icmp::Socket>(handle).bind(icmp::Endpoint::Ident(0x4242)).unwrap();
+
+    let gw = IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 2));
+    let mut payload = [0u8; 8 + 16];
+    let req = Icmpv4Repr::EchoRequest { ident: 0x4242, seq_no: 1, data: b"constanos-ping!!" };
+    req.emit(&mut Icmpv4Packet::new_unchecked(&mut payload[..]), &ChecksumCapabilities::default());
+    sockets.get_mut::<icmp::Socket>(handle).send_slice(&payload, gw).unwrap();
+
+    let start = crate::cpu::tsc::uptime_ms();
+    let mut got = false;
+    for i in 0u64..u64::MAX {
+        let now = Instant::from_millis((crate::cpu::tsc::uptime_ms() - start) as i64);
+        iface.poll(now, &mut dev, &mut sockets);
+        let s = sockets.get_mut::<icmp::Socket>(handle);
+        if let Ok((data, from)) = s.recv() {
+            let pkt = Icmpv4Packet::new_checked(data).expect("well-formed reply");
+            let repr = Icmpv4Repr::parse(&pkt, &ChecksumCapabilities::default()).expect("valid ICMP");
+            assert_eq!(from, gw);
+            assert!(
+                matches!(repr, Icmpv4Repr::EchoReply { ident: 0x4242, seq_no: 1, data: b"constanos-ping!!" }),
+                "unexpected reply {:?}",
+                repr
+            );
+            got = true;
+            break;
+        }
+        if crate::cpu::tsc::uptime_ms() - start > 5_000 {
+            break;
+        }
+        if i % 64 == 0 {
+            crate::memory::tlb::service_pending();
+        }
+        core::hint::spin_loop();
+    }
+    assert!(
+        got,
+        "no echo reply in 5 s (rx {} tx {} dropped {}, device status {:#x})",
+        dev.nic.rx_frames, dev.nic.tx_frames, dev.nic.tx_dropped, dev.nic.device_status()
+    );
+}

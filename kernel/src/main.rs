@@ -38,6 +38,7 @@ mod keyboard_buffer;
 mod klog;
 mod memory;
 mod mouse;
+mod network;
 #[cfg(not(test))]
 mod panic;
 mod pci;

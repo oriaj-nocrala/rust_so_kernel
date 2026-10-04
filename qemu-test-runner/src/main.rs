@@ -108,6 +108,12 @@ fn main() {
         // cannot be targeted by the buddy allocator.
         .arg("-device")
         .arg("edu,dma_mask=0xffffffffffff")
+        // `hw_tests::virtio_net_pings_the_gateway`: QEMU's user-mode network
+        // (gateway 10.0.2.2) behind a modern-only virtio-net function.
+        .arg("-netdev")
+        .arg("user,id=n0")
+        .arg("-device")
+        .arg("virtio-net-pci,netdev=n0,disable-legacy=on")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -175,6 +181,7 @@ fn print_serial_log(path: &Path) {
 fn find_system_ovmf() -> Option<(PathBuf, PathBuf)> {
     const CANDIDATES: &[(&str, &str)] = &[
         ("/usr/share/edk2/x64/OVMF_CODE.4m.fd", "/usr/share/edk2/x64/OVMF_VARS.4m.fd"),
+        ("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"),
         ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
         ("/usr/share/ovmf/x64/OVMF_CODE.fd", "/usr/share/ovmf/x64/OVMF_VARS.fd"),
         ("/usr/share/ovmf/OVMF_CODE.fd", "/usr/share/ovmf/OVMF_VARS.fd"),

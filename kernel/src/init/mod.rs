@@ -183,6 +183,9 @@ pub fn boot(boot_info: &'static mut BootInfo) -> ! {
     let mut usb_driver = crate::usb::UsbDriver::new();
     crate::hal::run_all(&mut [&mut usb_driver]);
 
+    // ── Network (virtio-net, polled; docs/reference/net.md) ──
+    crate::network::init();
+
     // ── No-input escape hatch ──────────────────────────────────────
     // If nothing on this machine can type, the shell about to start is
     // unreachable and the screen is the only diagnostic channel there is.
