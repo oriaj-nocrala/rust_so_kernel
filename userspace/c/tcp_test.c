@@ -112,6 +112,38 @@ static void client(unsigned port) {
     }
     check(ok && sent == N && recvd == N && memcmp(in, out, N) == 0, "120 KB echoed back intact under poll()");
 
+    /* sendmsg gathers several iovecs into the stream; recvmsg scatters what comes back. */
+    char a[] = "AAAA", b[] = "BBBBBB", c2[] = "CC";
+    struct iovec siov[3] = { { a, 4 }, { b, 6 }, { c2, 2 } };
+    struct msghdr sm;
+    memset(&sm, 0, sizeof sm);
+    sm.msg_iov = siov;
+    sm.msg_iovlen = 3;
+    check(sendmsg(s, &sm, 0) == 12, "sendmsg of three iovecs on a stream");
+    char r1[5], r2[20];
+    char echoed2[12];
+    size_t have = 0;
+    for (int i = 0; i < 100 && have < 12; i++) {
+        struct iovec riov[2] = { { r1, sizeof r1 }, { r2, sizeof r2 } };
+        struct msghdr rm;
+        struct sockaddr_in none;
+        memset(&rm, 0, sizeof rm);
+        rm.msg_name = &none;
+        rm.msg_namelen = sizeof none;
+        rm.msg_iov = riov;
+        rm.msg_iovlen = 2;
+        struct pollfd rp = { .fd = s, .events = POLLIN };
+        if (poll(&rp, 1, 5000) != 1) break;
+        ssize_t got = recvmsg(s, &rm, 0);
+        if (got <= 0) break;
+        size_t first = (size_t)got < sizeof r1 ? (size_t)got : sizeof r1;
+        memcpy(echoed2 + have, r1, first);
+        if ((size_t)got > first) memcpy(echoed2 + have + first, r2, (size_t)got - first);
+        have += (size_t)got;
+        if (rm.msg_namelen != 0) have = 1000; /* a stream has no sender address */
+    }
+    check(have == 12 && memcmp(echoed2, "AAAABBBBBBCC", 12) == 0, "recvmsg scatters the echoed bytes over two iovecs, msg_namelen is 0");
+
     check(shutdown(s, SHUT_WR) == 0, "shutdown(SHUT_WR)");
     check(read(s, buf, sizeof buf) == 0, "read returns 0 (EOF) once the host closes");
     errno = 0;

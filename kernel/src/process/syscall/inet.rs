@@ -19,6 +19,7 @@ use net::{Connect, NetError};
 use crate::ipc::unix;
 use crate::network::{self, InetSocketHandle, SockKind};
 
+use super::ipc::{gather_iovecs, iovec_total, read_msghdr, scatter_iovecs, set_controllen, set_msg_flags};
 use super::{errno, validate_user_buffer, SyscallResult};
 
 pub(super) const AF_INET: i32 = 2;
@@ -293,6 +294,104 @@ pub(super) fn recvfrom(
     if flags & MSG_TRUNC != 0 { got.full as i64 } else { got.n as i64 }
 }
 
+/// `sendmsg(2)` on an inet socket: the iovecs are gathered into one datagram
+/// (or stream chunk), `msg_name` is the destination (a `sockaddr_in`).
+/// Control messages (`IP_PKTINFO`, ...) are ignored.
+pub(super) fn sendmsg(id: usize, fd: i32, msg_ptr: u64, flags: u32) -> SyscallResult {
+    let msg = match read_msghdr(msg_ptr) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    let dest = if msg.msg_name != 0 && msg.msg_namelen >= 2 {
+        match read_sockaddr_in(msg.msg_name, msg.msg_namelen as u64) {
+            Ok((a, p)) => Some(endpoint(a, p)),
+            Err(e) => return e,
+        }
+    } else {
+        None
+    };
+    let data = match gather_iovecs(&msg) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let epoch = unix::wake_epoch();
+    match network::send(id, &data, dest) {
+        Ok(n) => n as i64,
+        Err(NetError::Again) => {
+            if flags & MSG_DONTWAIT != 0 || unix::fd_is_nonblocking(fd) {
+                return errno::EAGAIN;
+            }
+            // `block_on` never returns: free the gathered copy first.
+            drop(data);
+            unix::block_on(id, epoch)
+        }
+        Err(e) => errno_of(e),
+    }
+}
+
+/// `recvmsg(2)` on an inet socket: receives into a staging buffer sized by
+/// the iovecs and scatters it; `msg_name` gets the sender's `sockaddr_in`,
+/// `msg_flags` gets `MSG_TRUNC` when a datagram did not fit, and
+/// `msg_controllen` is set to 0 (no ancillary data).
+pub(super) fn recvmsg(id: usize, fd: i32, msg_ptr: u64, flags: u32) -> SyscallResult {
+    let msg = match read_msghdr(msg_ptr) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    let total = match iovec_total(&msg) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let mut staging = alloc::vec![0u8; total];
+    let epoch = unix::wake_epoch();
+    let got = match network::recv(id, &mut staging, flags & MSG_PEEK != 0) {
+        Ok(g) => g,
+        Err(NetError::Again) => {
+            if flags & MSG_DONTWAIT != 0 || unix::fd_is_nonblocking(fd) {
+                return errno::EAGAIN;
+            }
+            drop(staging);
+            unix::block_on(id, epoch)
+        }
+        Err(e) => return errno_of(e),
+    };
+    if let Err(e) = scatter_iovecs(&msg, &staging[..got.n]) {
+        return e;
+    }
+    let mut msg_flags = 0i32;
+    if got.full > got.n {
+        msg_flags |= MSG_TRUNC as i32;
+    }
+    if msg.msg_controllen > 0 {
+        if let Err(e) = set_controllen(msg_ptr, 0) {
+            return e;
+        }
+    }
+    if let Some(from) = got.from {
+        if let Some(a) = network::ipv4_of(&from) {
+            // `msg_namelen` (a u32) sits right after `msg_name` in the struct.
+            if let Err(e) = write_sockaddr_in(a, from.port, msg.msg_name, msg_ptr + 8) {
+                return e;
+            }
+        }
+    } else if msg.msg_name != 0 {
+        // A stream has no sender address to report.
+        let _ = write_namelen_zero(msg_ptr);
+    }
+    if let Err(e) = set_msg_flags(msg_ptr, msg_flags) {
+        return e;
+    }
+    if flags & MSG_TRUNC != 0 { got.full as i64 } else { got.n as i64 }
+}
+
+/// Sets `msg_namelen` to 0 (the `u32` right after `msg_name`).
+fn write_namelen_zero(msg_ptr: u64) -> Result<(), i64> {
+    validate_user_buffer(msg_ptr + 8, 4)?;
+    // SAFETY: validated above.
+    unsafe { *((msg_ptr + 8) as *mut u32) = 0 };
+    Ok(())
+}
+
 pub(super) fn name(id: usize, addr_ptr: u64, len_ptr: u64, peer: bool) -> SyscallResult {
     let (addr, port) = if peer {
         match network::peer(id) {
@@ -384,6 +483,3 @@ pub(super) fn shutdown(id: usize, how: i32) -> SyscallResult {
     }
 }
 
-pub(super) fn unsupported() -> SyscallResult {
-    EOPNOTSUPP
-}

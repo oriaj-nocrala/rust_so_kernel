@@ -87,6 +87,45 @@ int main(void) {
     check(n >= 12 && (unsigned char)buf[0] == 0x42 && (unsigned char)buf[1] == 0x42 && (buf[2] & 0x80), "DNS response carries our id and QR bit");
     check(n > 0 && from.sin_addr.s_addr == dns.sin_addr.s_addr && ntohs(from.sin_port) == 53, "recvfrom reports the server as the sender");
 
+    /* sendmsg/recvmsg: the query gathered from two iovecs, the answer scattered over two. */
+    struct iovec siov[2] = { { (void *)QUERY, 12 }, { (void *)(QUERY + 12), sizeof QUERY - 12 } };
+    struct msghdr sm;
+    memset(&sm, 0, sizeof sm);
+    sm.msg_name = &dns;
+    sm.msg_namelen = sizeof dns;
+    sm.msg_iov = siov;
+    sm.msg_iovlen = 2;
+    check(sendmsg(s, &sm, 0) == (ssize_t)sizeof QUERY, "sendmsg gathers two iovecs into one datagram");
+    p.events = POLLIN;
+    check(poll(&p, 1, 8000) == 1, "poll reports the sendmsg answer");
+    char head[12], rest[400];
+    struct iovec riov[2] = { { head, sizeof head }, { rest, sizeof rest } };
+    struct sockaddr_in src;
+    struct msghdr rm;
+    memset(&rm, 0, sizeof rm);
+    rm.msg_name = &src;
+    rm.msg_namelen = sizeof src;
+    rm.msg_iov = riov;
+    rm.msg_iovlen = 2;
+    n = recvmsg(s, &rm, 0);
+    check(n > 12 && (unsigned char)head[0] == 0x42 && (head[2] & 0x80), "recvmsg scatters the answer over two iovecs");
+    check(src.sin_addr.s_addr == dns.sin_addr.s_addr && ntohs(src.sin_port) == 53 && rm.msg_namelen == sizeof src, "msg_name reports the sender, msg_namelen its length");
+    check(!(rm.msg_flags & MSG_TRUNC), "msg_flags has no MSG_TRUNC for a datagram that fit");
+
+    /* A datagram larger than the buffers: MSG_TRUNC in msg_flags, the rest dropped. */
+    sendmsg(s, &sm, 0);
+    p.events = POLLIN;
+    poll(&p, 1, 8000);
+    char tiny[4];
+    struct iovec tiov = { tiny, sizeof tiny };
+    memset(&rm, 0, sizeof rm);
+    rm.msg_iov = &tiov;
+    rm.msg_iovlen = 1;
+    n = recvmsg(s, &rm, 0);
+    check(n == 4 && (rm.msg_flags & MSG_TRUNC), "a short iovec truncates and sets MSG_TRUNC");
+    errno = 0;
+    check(recvmsg(s, &rm, MSG_DONTWAIT) < 0 && errno == EAGAIN, "recvmsg with nothing queued and MSG_DONTWAIT -> EAGAIN");
+
     /* connect() makes send/write/recv work and getpeername answer. */
     check(connect(s, (struct sockaddr *)&dns, sizeof dns) == 0, "connect() to the resolver");
     struct sockaddr_in peer;

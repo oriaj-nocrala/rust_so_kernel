@@ -79,15 +79,15 @@ struct UserIovec {
 /// not `int`, which is what this port's `abi-bits/socket.h` used to say.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct UserMsghdr {
-    msg_name: u64,
-    msg_namelen: u32,
+pub(super) struct UserMsghdr {
+    pub(super) msg_name: u64,
+    pub(super) msg_namelen: u32,
     _pad0: u32,
-    msg_iov: u64,
-    msg_iovlen: u64,
-    msg_control: u64,
-    msg_controllen: u64,
-    msg_flags: i32,
+    pub(super) msg_iov: u64,
+    pub(super) msg_iovlen: u64,
+    pub(super) msg_control: u64,
+    pub(super) msg_controllen: u64,
+    pub(super) msg_flags: i32,
     _pad1: u32,
 }
 
@@ -520,8 +520,8 @@ pub(super) fn sys_recvfrom(
 }
 
 pub(super) fn sys_sendmsg(fd: i32, msg_ptr: u64, flags: u32) -> SyscallResult {
-    if inet_sock(fd).is_some() {
-        return super::inet::unsupported();
+    if let Some(id) = inet_sock(fd) {
+        return super::inet::sendmsg(id, fd, msg_ptr, flags);
     }
     let msg = match read_msghdr(msg_ptr) {
         Ok(m) => m,
@@ -562,8 +562,8 @@ pub(super) fn sys_sendmsg(fd: i32, msg_ptr: u64, flags: u32) -> SyscallResult {
 }
 
 pub(super) fn sys_recvmsg(fd: i32, msg_ptr: u64, flags: u32) -> SyscallResult {
-    if inet_sock(fd).is_some() {
-        return super::inet::unsupported();
+    if let Some(id) = inet_sock(fd) {
+        return super::inet::recvmsg(id, fd, msg_ptr, flags);
     }
     let msg = match read_msghdr(msg_ptr) {
         Ok(m) => m,
@@ -890,21 +890,21 @@ unsafe fn user_slice_mut<'a>(ptr: u64, len: usize) -> &'a mut [u8] {
     unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) }
 }
 
-fn read_msghdr(ptr: u64) -> Result<UserMsghdr, i64> {
+pub(super) fn read_msghdr(ptr: u64) -> Result<UserMsghdr, i64> {
     validate_user_buffer(ptr, core::mem::size_of::<UserMsghdr>())?;
     Ok(unsafe { core::ptr::read_unaligned(ptr as *const UserMsghdr) })
 }
 
 /// `msghdr.msg_flags` sits at a fixed offset; only that field is written
 /// back, never the whole struct (the caller owns the rest).
-fn set_msg_flags(ptr: u64, flags: i32) -> Result<(), i64> {
+pub(super) fn set_msg_flags(ptr: u64, flags: i32) -> Result<(), i64> {
     let off = core::mem::offset_of!(UserMsghdr, msg_flags) as u64;
     validate_user_buffer(ptr + off, 4)?;
     unsafe { *((ptr + off) as *mut i32) = flags };
     Ok(())
 }
 
-fn set_controllen(ptr: u64, len: u64) -> Result<(), i64> {
+pub(super) fn set_controllen(ptr: u64, len: u64) -> Result<(), i64> {
     let off = core::mem::offset_of!(UserMsghdr, msg_controllen) as u64;
     validate_user_buffer(ptr + off, 8)?;
     unsafe { *((ptr + off) as *mut u64) = len };
@@ -935,11 +935,11 @@ fn read_iovecs(msg: &UserMsghdr) -> Result<Vec<UserIovec>, i64> {
     Ok(out)
 }
 
-fn iovec_total(msg: &UserMsghdr) -> Result<usize, i64> {
+pub(super) fn iovec_total(msg: &UserMsghdr) -> Result<usize, i64> {
     Ok(read_iovecs(msg)?.iter().map(|v| v.len as usize).sum())
 }
 
-fn gather_iovecs(msg: &UserMsghdr) -> Result<Vec<u8>, i64> {
+pub(super) fn gather_iovecs(msg: &UserMsghdr) -> Result<Vec<u8>, i64> {
     let iovs = read_iovecs(msg)?;
     let total: usize = iovs.iter().map(|v| v.len as usize).sum();
     let mut out = Vec::with_capacity(total);
@@ -949,7 +949,7 @@ fn gather_iovecs(msg: &UserMsghdr) -> Result<Vec<u8>, i64> {
     Ok(out)
 }
 
-fn scatter_iovecs(msg: &UserMsghdr, data: &[u8]) -> Result<(), i64> {
+pub(super) fn scatter_iovecs(msg: &UserMsghdr, data: &[u8]) -> Result<(), i64> {
     let iovs = read_iovecs(msg)?;
     let mut off = 0usize;
     for iov in iovs {
