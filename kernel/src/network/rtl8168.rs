@@ -113,6 +113,28 @@ impl net::Nic for Rtl {
     }
 }
 
+/// Reserves a vector and aims the function's MSI-X (else MSI) at it. `None`
+/// (polled) when none of that works; the reason is logged.
+fn setup_irq(bus: u8, dev: u8, func: u8, bars: &[Option<hal::pcicfg::Bar>; 6], apic: u32) -> Option<u8> {
+    let vector = crate::interrupts::msi::alloc(crate::network::irq)?;
+    let via = match crate::pci::enable_msix(bus, dev, func, bars, apic, vector) {
+        Ok(()) => "MSI-X",
+        Err(e) => {
+            serial_println!("rtl8168: no MSI-X ({}), trying MSI", e);
+            match crate::pci::enable_msi(bus, dev, func, apic, vector) {
+                Ok(()) => "MSI",
+                Err(e) => {
+                    serial_println!("rtl8168: no MSI ({}), polling", e);
+                    crate::interrupts::msi::free(vector);
+                    return None;
+                }
+            }
+        }
+    };
+    serial_println!("rtl8168: {} to vector {:#x}, APIC {}", via, vector, apic);
+    Some(vector)
+}
+
 fn log_dump(regs: &KRegs, what: &str) {
     use r::Regs;
     serial_println!("rtl8168: register window ({}):", what);
@@ -125,10 +147,11 @@ fn log_dump(regs: &KRegs, what: &str) {
     }
 }
 
-/// Finds the NIC and brings it as far as `level` allows. `None`: no such
+/// Finds the NIC and brings it as far as `level` allows. At `Net` with an
+/// `irq_apic` the chip's MSI-X (else MSI) goes to `network::irq` on that CPU. `None`: no such
 /// function, `level` is `Off`, or the ladder stopped before `Net` (the
 /// reason is in the log). Boot-only: it maps MMIO and busy-waits.
-pub fn probe(level: NicLevel) -> Option<Rtl> {
+pub fn probe(level: NicLevel, irq_apic: Option<u32>) -> Option<Rtl> {
     if level == NicLevel::Off {
         return None;
     }
@@ -241,5 +264,19 @@ pub fn probe(level: NicLevel) -> Option<Rtl> {
         drv.regs().r8(r::CHIP_CMD)
     });
     log_dump(drv.regs(), "after init");
+    let mut irq = None;
+    if let (NicLevel::Net, Some(apic)) = (level, irq_apic) {
+        irq = setup_irq(bus, dev, func, &bars, apic);
+        if irq.is_some() {
+            drv.enable_irq();
+        }
+    }
+    serial_println!(
+        "rtl8168: irq {}",
+        match irq {
+            Some(v) => alloc::format!("vector {:#x}", v),
+            None => alloc::string::String::from("polled"),
+        }
+    );
     Some(Rtl { drv, mac: id.mac })
 }

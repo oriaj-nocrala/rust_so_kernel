@@ -59,7 +59,7 @@ Status: steps 1-2b of `docs/net/net-plan.md`. A virtio-net driver (MSI-X, with p
 constants are from memory of Linux's `r8169`, and the 17 host tests check the driver against a software model of itself.
 Everything (status, what is not done, how to run the rungs on the Ryzen, what to bring back, known unknowns) is in
 `docs/net/rtl8168.md`. `network::init` now runs after `bootopts::load` and `logpart::init` (it moved from just after USB) so
-`nic=` is known and a metal run keeps the driver's log.
+`nic=net` takes MSI-X/MSI (`nic=netpoll` is the polled fallback). `nic=` is known and a metal run keeps the driver's log.
 
 `/proc/nic` (`network::render_nic`): stack/interrupt counters, MAC, the DHCP lease and the NIC's own report (for the Realtek,
 `hal::rtl8169::Rtl8168::report`). The RTL8168 was run on the board: identification, reset, link and register writes verified

@@ -105,6 +105,9 @@ pub const INT_TX_DESC_UNAVAIL: u16 = 0x0080;
 pub const INT_SW: u16 = 0x0100;
 pub const INT_PCS_TIMEOUT: u16 = 0x4000;
 pub const INT_SYS_ERR: u16 = 0x8000;
+/// What an interrupt-driven driver unmasks: Linux's `0x2f` (RxOK, RxErr,
+/// TxOK, TxErr, LinkChg) plus the two ways the chip says it lost frames.
+pub const IRQ_MASK: u16 = INT_RX_OK | INT_RX_ERR | INT_TX_OK | INT_TX_ERR | INT_LINK_CHG | INT_RX_OVERFLOW | INT_RX_FIFO_OVER;
 
 // `RxConfig` (`rtl_init_rxcfg` for the 8168 family).
 pub const RXCFG_ACCEPT_ERR: u32 = 0x20;
@@ -555,12 +558,19 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
     /// Copies the next received frame into `buf`; `None` when there is none.
     /// Bad frames are counted and skipped.
     pub fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
+        let mut acked = false;
         for _ in 0..SLOTS {
             let i = self.rx_next;
             let opts1 = self.read_opts1(RX_RING_OFF, i);
             match rx_status(opts1) {
                 RxStatus::Owned => {
-                    self.ack_status();
+                    // Acknowledge, then look once more: a frame that landed
+                    // between the ring check and the ack had its RxOK cleared
+                    // with it, and would wait for the next event otherwise.
+                    if !acked && self.ack_status() != 0 {
+                        acked = true;
+                        continue;
+                    }
                     return None;
                 }
                 RxStatus::Frame(n) if n <= buf.len() && n <= BUF_SIZE => {
@@ -614,6 +624,18 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
         self.tx_frames += 1;
         self.regs.w8(TX_POLL, TXPOLL_NPQ);
         true
+    }
+
+    /// Unmasks the chip's interrupts (`IRQ_MASK`), after clearing whatever
+    /// is pending. Call it once the function's MSI/MSI-X routes somewhere.
+    pub fn enable_irq(&mut self) {
+        self.regs.w16(INTR_STATUS, 0xFFFF);
+        self.regs.w16(INTR_MASK, IRQ_MASK);
+    }
+
+    /// Masks every interrupt again (polled operation).
+    pub fn disable_irq(&mut self) {
+        self.regs.w16(INTR_MASK, 0);
     }
 
     /// Reads `IntrStatus`, remembers which bits were set and clears them
@@ -1210,6 +1232,30 @@ mod tests {
         let tx = Dev::rd32(&m, TX_CONFIG);
         assert!(tx & TXCFG_AUTO_FIFO != 0, "AUTO_FIFO set, as Linux does");
         assert_eq!(m.regs[MAX_TX_PACKET_SIZE], 0x27);
+    }
+
+    #[test]
+    fn enable_irq_unmasks_what_linux_does_and_disable_masks_all() {
+        let (mut d, dev) = up(0x1000_0000);
+        d.enable_irq();
+        let mask = |dev: &Dev| {
+            let m = dev.0.borrow();
+            u16::from_le_bytes([m.regs[INTR_MASK], m.regs[INTR_MASK + 1]])
+        };
+        assert_eq!(mask(&dev), IRQ_MASK);
+        assert_eq!(IRQ_MASK & 0x2f, 0x2f, "Linux's RxOK|RxErr|TxOK|TxErr|LinkChg");
+        assert_eq!(IRQ_MASK & INT_SYS_ERR, 0);
+        d.disable_irq();
+        assert_eq!(mask(&dev), 0);
+    }
+
+    #[test]
+    fn recv_acknowledges_the_status_once_the_ring_is_empty() {
+        let (mut d, dev) = up(0x1000_0000);
+        dev.0.borrow_mut().regs[INTR_STATUS..INTR_STATUS + 2].copy_from_slice(&INT_TX_OK.to_le_bytes());
+        let mut buf = [0u8; 2048];
+        assert_eq!(d.recv(&mut buf), None);
+        assert_eq!(d.intr_seen, INT_TX_OK, "seen and acknowledged by an empty receive");
     }
 
     #[test]

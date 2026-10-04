@@ -43,7 +43,7 @@ cd kernel && cargo build --target x86_64-unknown-none  # the kernel crate alone
 | `kernel/src/drivers/`, `pci.rs`, `ac97.rs` | `/dev` files, PCI, audio | `docs/reference/drivers.md` |
 | `kernel/src/framebuffer.rs`, `drivers/framebuffer_console.rs` + crates `gui`, `vt`, `draw`, `text`, `img` | framebuffer, console, `/dev/fb0`, compositor, GUI libraries, PNG + alpha blits | `docs/reference/graphics.md` |
 | `kernel/src/gpu/`, `interrupts/msi.rs`, `memory/dma.rs`, `firmware.rs`, `bootopts.rs` + crate `nvgpu` | NVIDIA GA106 driver (behind `gpu=`, off by default), MSI vectors, DMA buffers, firmware loading, boot options (`/mnt/etc/kernel.conf`) | `docs/reference/gpu.md`, plan `docs/gpu/gpu-plan.md` |
-| `kernel/src/network/` + crate `net`, `hal/src/virtio.rs` | virtio-net driver (MSI-X, polled fallback), Realtek RTL8168 driver behind `nic=` (works on the Ryzen, polled: `docs/net/rtl8168.md`), smoltcp stack, DHCP, AF_INET UDP, TCP and raw ICMP sockets | `docs/reference/net.md`, plan `docs/net/net-plan.md` |
+| `kernel/src/network/` + crate `net`, `hal/src/virtio.rs` | virtio-net driver (MSI-X, polled fallback), Realtek RTL8168 driver behind `nic=` (works on the Ryzen; interrupts unverified on metal: `docs/net/rtl8168.md`), smoltcp stack, DHCP, AF_INET UDP, TCP and raw ICMP sockets | `docs/reference/net.md`, plan `docs/net/net-plan.md` |
 | `kernel/src/usb/` | xHCI keyboard, mouse, mass storage | `docs/reference/usb.md` |
 | `kernel/src/cpu/`, `smp.rs`, `interrupts/`, `time/` | per-CPU init, APs, APIC, TLB shootdown, time, sensors | `docs/reference/cpu.md` |
 | `kernel/src/klog.rs`, `autorun.rs`, `watchdog.rs`, `block/logpart.rs` | kernel log, log partition, unattended runs | `docs/reference/metal.md` |

@@ -63,8 +63,12 @@ pub enum NicLevel {
     /// Also reset the chip, restart auto-negotiation and wait for link. No
     /// DMA: bus mastering stays off, no rings, no packets.
     Reset,
-    /// Also the rings, TX/RX and the network stack on it (DHCP, sockets).
+    /// Also the rings, TX/RX and the network stack on it (DHCP, sockets),
+    /// interrupt-driven through MSI-X or MSI (polled when neither works).
     Net,
+    /// `Net` without interrupts: the 100 Hz tick drives the NIC. The way back
+    /// if an interrupt misbehaves on a machine.
+    NetPoll,
 }
 
 impl NicLevel {
@@ -75,6 +79,7 @@ impl NicLevel {
             "probe" => Some(NicLevel::Probe),
             "reset" => Some(NicLevel::Reset),
             "net" => Some(NicLevel::Net),
+            "netpoll" => Some(NicLevel::NetPoll),
             _ => None,
         }
     }
@@ -253,6 +258,8 @@ mod tests {
         assert_eq!(NicLevel::parse("probe"), Some(NicLevel::Probe));
         assert_eq!(NicLevel::parse("reset"), Some(NicLevel::Reset));
         assert_eq!(NicLevel::parse("net"), Some(NicLevel::Net));
+        assert_eq!(NicLevel::parse("netpoll"), Some(NicLevel::NetPoll));
+        assert!(NicLevel::Net < NicLevel::NetPoll);
         assert_eq!(NicLevel::parse("on"), None);
         assert!(NicLevel::Off < NicLevel::Probe && NicLevel::Probe < NicLevel::Reset && NicLevel::Reset < NicLevel::Net);
     }

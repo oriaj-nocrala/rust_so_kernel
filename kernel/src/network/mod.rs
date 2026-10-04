@@ -189,7 +189,7 @@ pub fn init_with(irq_cpu: Option<usize>) {
     let nic = match VirtioNet::probe(irq_cpu.map(crate::smp::apic_id)) {
         Ok(nic) => AnyNic::Virtio(nic),
         // No virtio device: the real machine. The Realtek driver is opt-in (`nic=`).
-        Err(virtio_net::InitError::NoDevice) => match rtl8168::probe(crate::bootopts::nic_level()) {
+        Err(virtio_net::InitError::NoDevice) => match rtl8168::probe(crate::bootopts::nic_level(), irq_cpu.map(crate::smp::apic_id)) {
             Some(nic) => AnyNic::Rtl(nic),
             None => return,
         },
