@@ -115,7 +115,12 @@ struct Net {
     stack: KStack,
     /// Slot `i` is socket id `INET_BASE + i`.
     socks: Vec<Option<Sock>>,
+    link: net::LinkWatch,
 }
+
+/// A link that was down at least this long may be another network: ask DHCP
+/// again. Shorter drops keep the lease.
+const LINK_REDHCP_MS: i64 = 3_000;
 
 static NET: IrqMutex<Option<Net>, KernelIrq> = IrqMutex::new(None);
 
@@ -157,8 +162,10 @@ impl Net {
     /// out which of readable/writable it was.
     fn poll(&mut self) -> Wakes {
         POLLS.fetch_add(1, Ordering::Relaxed);
-        if net::Nic::link_change(&mut self.stack.device().nic) == Some(true) {
-            self.stack.restart_dhcp();
+        if let Some(up) = net::Nic::link_change(&mut self.stack.device().nic) {
+            if self.link.event(up, (crate::time::ktime_get() / 1_000_000) as i64, LINK_REDHCP_MS) {
+                self.stack.restart_dhcp();
+            }
         }
         let events = self.stack.poll(now());
         let ids: Vec<usize> = events
@@ -213,7 +220,7 @@ pub fn init_with(irq_cpu: Option<usize>) {
     let mut stack = Stack::new(net::NicDevice::new(nic), mac, u64::from_le_bytes(seed), now());
     stack.enable_dhcp();
     stack.poll(now());
-    NET.with(|n| *n = Some(Net { stack, socks: Vec::new() }));
+    NET.with(|n| *n = Some(Net { stack, socks: Vec::new(), link: net::LinkWatch::new() }));
 }
 
 /// Times the stack was driven (tick, interrupt or a socket call): `/proc/nic`

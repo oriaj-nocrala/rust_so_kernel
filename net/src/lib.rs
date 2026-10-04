@@ -35,6 +35,34 @@ pub trait Nic {
     }
 }
 
+/// Decides what a link transition means for the DHCP lease. A cable pulled
+/// and replugged (down for seconds) may be another network, so the lease is
+/// asked for again; a flap of a few milliseconds (a PHY renegotiating) must
+/// keep it, or the stack has no address until DHCP answers.
+#[derive(Default)]
+pub struct LinkWatch {
+    down_at: Option<i64>,
+}
+
+impl LinkWatch {
+    pub fn new() -> Self {
+        LinkWatch { down_at: None }
+    }
+
+    /// Feeds one transition (`up`) seen at `now_ms`. `true`: the link is back
+    /// after at least `min_down_ms` down, so DHCP should start over.
+    pub fn event(&mut self, up: bool, now_ms: i64, min_down_ms: i64) -> bool {
+        if !up {
+            self.down_at.get_or_insert(now_ms);
+            return false;
+        }
+        match self.down_at.take() {
+            Some(t) => now_ms - t >= min_down_ms,
+            None => false,
+        }
+    }
+}
+
 /// smoltcp `Device` over a [`Nic`]. Checksums are computed in software on
 /// both directions: the virtio device is configured with no offloads.
 pub struct NicDevice<N: Nic> {
@@ -96,6 +124,18 @@ impl<N: Nic> phy::Device for NicDevice<N> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn link_watch_restarts_dhcp_only_after_a_long_outage() {
+        use super::LinkWatch;
+        let mut w = LinkWatch::new();
+        assert!(!w.event(false, 1_000, 3_000));
+        assert!(!w.event(true, 1_040, 3_000), "a 40 ms flap keeps the lease");
+        assert!(!w.event(false, 5_000, 3_000));
+        assert!(!w.event(false, 6_000, 3_000), "a second down does not move the start");
+        assert!(w.event(true, 8_000, 3_000), "3 s down: another network, ask again");
+        assert!(!w.event(true, 9_000, 3_000), "an up without a down does nothing");
+    }
+
     use super::*;
     use alloc::collections::VecDeque;
     use alloc::rc::Rc;

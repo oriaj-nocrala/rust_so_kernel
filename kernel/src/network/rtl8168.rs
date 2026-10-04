@@ -114,7 +114,7 @@ impl net::Nic for Rtl {
     fn link_change(&mut self) -> Option<bool> {
         let change = self.drv.poll_link();
         if let Some(up) = change {
-            serial_println!("rtl8168: link {} ({:?})", if up { "up" } else { "down" }, self.drv.link());
+            serial_println!("rtl8168: link {} at {} ms ({:?})", if up { "up" } else { "down" }, crate::cpu::tsc::uptime_ms(), self.drv.link());
         }
         change
     }
