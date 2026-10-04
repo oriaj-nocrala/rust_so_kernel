@@ -313,6 +313,48 @@ pub enum InitError {
     NoDevice,
 }
 
+/// Writes ` tcp 1.2.3.4:80 > 5.6.7.8:1234 SYN|ACK seq 1 ack 2 win 3` for an
+/// IPv4 TCP frame (or ` icmp type N` / ` udp a:p > b:p`); `false` (nothing
+/// written) when the note is another protocol or too short to say.
+fn write_decoded(out: &mut impl core::fmt::Write, n: &FrameNote) -> Result<bool, core::fmt::Error> {
+    let h = &n.head;
+    if (n.len as usize) < 34 || h[12] != 0x08 || h[13] != 0x00 || h[14] >> 4 != 4 {
+        return Ok(false);
+    }
+    let ip = |o: usize| (h[o], h[o + 1], h[o + 2], h[o + 3]);
+    let (s, d) = (ip(26), ip(30));
+    let be16 = |o: usize| u16::from_be_bytes([h[o], h[o + 1]]);
+    let be32 = |o: usize| u32::from_be_bytes([h[o], h[o + 1], h[o + 2], h[o + 3]]);
+    match h[23] {
+        6 if (n.len as usize) >= 54 && h[14] & 0xF == 5 => {
+            let flags = h[47];
+            write!(out, " tcp {}.{}.{}.{}:{} > {}.{}.{}.{}:{} ", s.0, s.1, s.2, s.3, be16(34), d.0, d.1, d.2, d.3, be16(36))?;
+            let mut any = false;
+            for (bit, name) in [(0x02, "SYN"), (0x10, "ACK"), (0x08, "PSH"), (0x01, "FIN"), (0x04, "RST")] {
+                if flags & bit != 0 {
+                    write!(out, "{}{}", if any { "|" } else { "" }, name)?;
+                    any = true;
+                }
+            }
+            write!(out, " seq {} ack {} win {}", be32(38), be32(42), be16(48))?;
+            Ok(true)
+        }
+        6 => {
+            write!(out, " tcp {}.{}.{}.{}:{} > {}.{}.{}.{}:{} (options)", s.0, s.1, s.2, s.3, be16(34), d.0, d.1, d.2, d.3, be16(36))?;
+            Ok(true)
+        }
+        17 => {
+            write!(out, " udp {}.{}.{}.{}:{} > {}.{}.{}.{}:{}", s.0, s.1, s.2, s.3, be16(34), d.0, d.1, d.2, d.3, be16(36))?;
+            Ok(true)
+        }
+        1 => {
+            write!(out, " icmp {}.{}.{}.{} > {}.{}.{}.{} type {}", s.0, s.1, s.2, s.3, d.0, d.1, d.2, d.3, h[34])?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 /// What the chip reports about the link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Link {
@@ -337,11 +379,12 @@ pub fn link_from_phy_status(st: u8) -> Link {
 // ── The driver ──────────────────────────────────────────────────────────────
 
 /// Bytes of a frame kept in the diagnostic log, and how many frames per direction.
-pub const NOTE_BYTES: usize = 24;
-pub const NOTES: usize = 8;
+/// Enough for Ethernet + IPv4 + TCP headers without options (14 + 20 + 20).
+pub const NOTE_BYTES: usize = 54;
+pub const NOTES: usize = 16;
 
 /// The start of a frame seen by the driver (diagnostics: `/proc/nic`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameNote {
     pub len: u16,
     pub head: [u8; NOTE_BYTES],
@@ -763,8 +806,10 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
             for k in 0..shown {
                 let n = &notes[((count as usize) - 1 - k) % NOTES];
                 write!(out, "  {:4} B:", n.len)?;
-                for b in &n.head[..(n.len as usize).min(NOTE_BYTES)] {
-                    write!(out, " {:02x}", b)?;
+                if !write_decoded(out, n)? {
+                    for b in &n.head[..(n.len as usize).min(24)] {
+                        write!(out, " {:02x}", b)?;
+                    }
                 }
                 writeln!(out)?;
             }
@@ -1369,6 +1414,28 @@ mod tests {
         assert_eq!(rd(&dev), (0, 0, rd(&dev).2));
         assert_eq!(rd(&dev).2 & RXCFG_ACCEPT_MULTICAST, 0, "other RxConfig bits untouched");
         assert_ne!(rd(&dev).2 & RXCFG_ACCEPT_BROADCAST, 0);
+    }
+
+    #[test]
+    fn report_decodes_tcp_frames_for_the_proc_file() {
+        use alloc::string::String;
+        let (mut d, _dev) = up(0x1000_0000);
+        let mut f = [0u8; 58];
+        f[12] = 0x08;
+        f[14] = 0x45;
+        f[23] = 6;
+        f[26..30].copy_from_slice(&[192, 168, 100, 8]);
+        f[30..34].copy_from_slice(&[34, 223, 124, 45]);
+        f[34..36].copy_from_slice(&49152u16.to_be_bytes());
+        f[36..38].copy_from_slice(&80u16.to_be_bytes());
+        f[38..42].copy_from_slice(&1000u32.to_be_bytes());
+        f[46] = 0x70;
+        f[47] = 0x02;
+        f[48..50].copy_from_slice(&65535u16.to_be_bytes());
+        assert!(d.send(&f));
+        let mut out = String::new();
+        d.report(&mut out).unwrap();
+        assert!(out.contains("58 B: tcp 192.168.100.8:49152 > 34.223.124.45:80 SYN seq 1000 ack 0 win 65535"), "{}", out);
     }
 
     #[test]
