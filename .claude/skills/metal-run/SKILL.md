@@ -71,7 +71,7 @@ Then Read the image (upscale first with `ffmpeg -i x.jpg -vf scale=1600:-1 x.png
 
 ## What only metal shows
 
-Write-combining and VRAM speed, APERF/MPERF, k10temp, RAPL, torn xHCI event TRBs, HDA/NVMe, and the RTL8111 driver (`nic=`, `docs/net/rtl8168.md`: written, never run on metal), a composite USB mouse, and all RAM above 512 MiB.
+Write-combining and VRAM speed, APERF/MPERF, k10temp, RAPL, torn xHCI event TRBs, HDA/NVMe, and the RTL8111 driver (`nic=`, default `net`, works on metal: `docs/net/rtl8168.md`), a composite USB mouse, and all RAM above 512 MiB.
 
 ## When the user reports a glitch seen on the screen ("a stutter at 2 seconds")
 

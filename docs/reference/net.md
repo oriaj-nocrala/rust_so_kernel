@@ -54,7 +54,7 @@ Status: steps 1-2b of `docs/net/net-plan.md`. A virtio-net driver (MSI-X, with p
 
 ## The AM4 board's NIC (Realtek RTL8111/8168)
 
-`hal/src/rtl8169.rs` + `kernel/src/network/rtl8168.rs`, behind `nic=` (default `off`): a ladder `probe` (read-only) -> `reset`
+`hal/src/rtl8169.rs` + `kernel/src/network/rtl8168.rs`, behind `nic=` (default `net`; `nic=off` leaves the chip alone): a ladder `probe` (read-only) -> `reset`
 -> `net` (rings, TX/RX, the stack on it). Polled, no interrupts. **Never run on the hardware**: QEMU has no such device, the
 constants are from memory of Linux's `r8169`, and the 17 host tests check the driver against a software model of itself.
 Everything (status, what is not done, how to run the rungs on the Ryzen, what to bring back, known unknowns) is in

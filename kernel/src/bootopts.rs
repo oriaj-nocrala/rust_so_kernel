@@ -51,12 +51,12 @@ pub fn gpu_level() -> GpuLevel {
     }
 }
 
-/// `nic=` (default `off`): how far the Realtek driver may go. An unknown
-/// value is logged and read as `off`.
+/// `nic=` (default `net`: the driver is part of the normal boot, MSI-X): how
+/// far the Realtek driver may go. An unknown value is logged and read as `off`.
 pub fn nic_level() -> hal::bootopts::NicLevel {
     use hal::bootopts::NicLevel;
     match get("nic") {
-        None => NicLevel::Off,
+        None => NicLevel::Net,
         Some(v) => NicLevel::parse(v).unwrap_or_else(|| {
             serial_println!("bootopts: unknown nic={}, using off", v);
             NicLevel::Off

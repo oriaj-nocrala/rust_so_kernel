@@ -53,7 +53,7 @@ impl BootOpts {
 /// (QEMU), which is always brought up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NicLevel {
-    /// Default: the NIC is not touched at all.
+    /// The NIC is not touched at all (`nic=off`).
     Off,
     /// Read-only: size and map BAR2, read the registers (XID, MAC, PHY
     /// status) and log them with a hex dump of the window. Writes nothing
@@ -65,6 +65,7 @@ pub enum NicLevel {
     Reset,
     /// Also the rings, TX/RX and the network stack on it (DHCP, sockets),
     /// interrupt-driven through MSI-X or MSI (polled when neither works).
+    /// The default.
     Net,
     /// `Net` without interrupts: the 100 Hz tick drives the NIC. The way back
     /// if an interrupt misbehaves on a machine.
