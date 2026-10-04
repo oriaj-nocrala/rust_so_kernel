@@ -13,7 +13,7 @@ cd kernel && cargo build --target x86_64-unknown-none  # the kernel crate alone
 ```
 
 - The root `build.rs` builds the kernel with a **nested** `cargo build` (not `bindeps`, which panics with `-Z build-std`) and wraps it in a UEFI image. `kernel/build.rs` builds and strips every userspace program (see the `userspace-programs` skill).
-- **A root `cargo build` does not compile `hal`/`ext2`/`mm`/`vfs`/`diag`/`sched`/`usock`/`tty`/`nvgpu`/`net`**: the root `build.rs` doesn't watch them, so cargo skips the nested build and exits 0. Verify them with `cd kernel && cargo build --target x86_64-unknown-none` (or `touch build.rs`).
+- A root `cargo build` rebuilds the kernel when `hal`/`ext2`/`mm`/`vfs`/`diag`/`sched`/`usock`/`tty`/`nvgpu`/`net` change (the root `build.rs` watches their `src/` and `Cargo.toml`); a crate added to that list in `build.rs` must be added there too. Their own `cargo test` is still the way to test them.
 - `disk.img` (ext2, mounted at `/mnt`) is created once and then kept. Each build syncs `disk-image-root/` into it with `debugfs`. To regenerate it: delete it and `touch build.rs`.
 
 ## Skills (load the one that matches the task)
