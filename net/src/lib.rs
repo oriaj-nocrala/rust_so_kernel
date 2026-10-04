@@ -7,6 +7,9 @@ extern crate alloc;
 
 pub use smoltcp;
 
+pub mod stack;
+pub use stack::{Handle, Lease, NetError, Stack};
+
 use alloc::vec::Vec;
 use smoltcp::phy::{self, Checksum, ChecksumCapabilities, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
@@ -222,5 +225,146 @@ mod tests {
         a.sockets.get_mut::<udp::Socket>(ha).send_slice(b"x", dst).unwrap();
         a.iface.poll(Instant::from_millis(1), &mut a.dev, &mut a.sockets);
         assert!(a_to_b.borrow().is_empty());
+    }
+
+    // ── Stack (socket layer) ──────────────────────────────────────────────
+
+    use crate::stack::{NetError, Stack};
+
+    fn stack(last: u8, rx: Wire, tx: Wire) -> Stack<NicDevice<Cable>> {
+        let dev = NicDevice::new(Cable { rx, tx, tx_room: None });
+        let mut s = Stack::new(dev, [2, 0, 0, 0, 0, last], 7, Instant::from_millis(0));
+        s.set_static(Ipv4Address::new(10, 0, 0, last), 24, None);
+        s
+    }
+
+    fn pair() -> (Stack<NicDevice<Cable>>, Stack<NicDevice<Cable>>) {
+        let a_to_b: Wire = Default::default();
+        let b_to_a: Wire = Default::default();
+        (stack(1, b_to_a.clone(), a_to_b.clone()), stack(2, a_to_b, b_to_a))
+    }
+
+    fn run(a: &mut Stack<NicDevice<Cable>>, b: &mut Stack<NicDevice<Cable>>, now: i64) -> Vec<crate::Handle> {
+        let mut woken = Vec::new();
+        for _ in 0..4 {
+            woken.extend(a.poll(Instant::from_millis(now)));
+            woken.extend(b.poll(Instant::from_millis(now)));
+        }
+        woken
+    }
+
+    fn ep(last: u8, port: u16) -> IpEndpoint {
+        IpEndpoint::new(IpAddress::v4(10, 0, 0, last), port)
+    }
+
+    #[test]
+    fn bind_rules() {
+        let (mut a, _b) = pair();
+        let s1 = a.udp_open();
+        let s2 = a.udp_open();
+        assert_eq!(a.udp_bind(s1, None, 5000), Ok(5000));
+        assert_eq!(a.udp_bind(s2, None, 5000), Err(NetError::AddrInUse));
+        assert_eq!(a.udp_bind(s1, None, 5001), Err(NetError::InvalidArg), "already bound");
+        let p = a.udp_bind(s2, None, 0).unwrap();
+        assert!(p >= 49152, "ephemeral port {}", p);
+        assert_ne!(p, 5000);
+        a.udp_close(s1);
+        let s3 = a.udp_open();
+        assert_eq!(a.udp_bind(s3, None, 5000), Ok(5000), "closing frees the port");
+    }
+
+    #[test]
+    fn echo_between_stacks_with_the_socket_api() {
+        let (mut a, mut b) = pair();
+        let sa = a.udp_open();
+        let sb = b.udp_open();
+        b.udp_bind(sb, None, 7).unwrap();
+        // Unbound send picks an ephemeral source port.
+        assert_eq!(a.udp_send(sa, b"hola", Some(ep(2, 7))), Ok(4));
+        let (_, port) = a.udp_local(sa).unwrap();
+        assert!(port >= 49152);
+        run(&mut a, &mut b, 10);
+
+        let mut buf = [0u8; 64];
+        let (n, full, from) = b.udp_recv(sb, &mut buf, false).unwrap();
+        assert_eq!((&buf[..n], full), (&b"hola"[..], 4));
+        assert_eq!(from, ep(1, port));
+        assert_eq!(b.udp_recv(sb, &mut buf, false), Err(NetError::Again));
+
+        b.udp_send(sb, &buf[..n], Some(from)).unwrap();
+        run(&mut a, &mut b, 20);
+        let (n, _, from) = a.udp_recv(sa, &mut buf, false).unwrap();
+        assert_eq!(&buf[..n], b"hola");
+        assert_eq!(from, ep(2, 7));
+    }
+
+    #[test]
+    fn short_buffer_truncates_and_peek_keeps_the_datagram() {
+        let (mut a, mut b) = pair();
+        let sa = a.udp_open();
+        let sb = b.udp_open();
+        b.udp_bind(sb, None, 9).unwrap();
+        a.udp_send(sa, b"0123456789", Some(ep(2, 9))).unwrap();
+        run(&mut a, &mut b, 5);
+        let mut small = [0u8; 4];
+        let (n, full, _) = b.udp_recv(sb, &mut small, true).unwrap();
+        assert_eq!((n, full, &small[..n]), (4, 10, &b"0123"[..]));
+        let (n, full, _) = b.udp_recv(sb, &mut small, false).unwrap();
+        assert_eq!((n, full), (4, 10), "peek left it queued; this read consumed it");
+        assert_eq!(b.udp_recv(sb, &mut small, false), Err(NetError::Again));
+    }
+
+    #[test]
+    fn connected_socket_sends_by_default_and_drops_strangers() {
+        let (mut a, mut b) = pair();
+        let sa = a.udp_open();
+        let sb = b.udp_open();
+        b.udp_bind(sb, None, 7).unwrap();
+        assert_eq!(a.udp_send(sa, b"x", None), Err(NetError::DestAddrRequired));
+        a.udp_connect(sa, ep(2, 7)).unwrap();
+        assert_eq!(a.udp_peer(sa), Ok(Some(ep(2, 7))));
+        a.udp_send(sa, b"to-peer", None).unwrap();
+        run(&mut a, &mut b, 5);
+        let mut buf = [0u8; 16];
+        let (n, _, from) = b.udp_recv(sb, &mut buf, false).unwrap();
+        assert_eq!(&buf[..n], b"to-peer");
+
+        // B answers from a *different* port: A's connected socket ignores it.
+        let other = b.udp_open();
+        b.udp_bind(other, None, 8).unwrap();
+        b.udp_send(other, b"stranger", Some(from)).unwrap();
+        b.udp_send(sb, b"friend", Some(from)).unwrap();
+        run(&mut a, &mut b, 10);
+        let (n, _, _) = a.udp_recv(sa, &mut buf, false).unwrap();
+        assert_eq!(&buf[..n], b"friend");
+        assert_eq!(a.udp_recv(sa, &mut buf, false), Err(NetError::Again));
+    }
+
+    #[test]
+    fn poll_reports_readiness_edges_once() {
+        let (mut a, mut b) = pair();
+        let sa = a.udp_open();
+        let sb = b.udp_open();
+        b.udp_bind(sb, None, 7).unwrap();
+        assert_eq!(b.udp_mask(sb), Ok((false, true)));
+        a.udp_send(sa, b"x", Some(ep(2, 7))).unwrap();
+        let woken = run(&mut a, &mut b, 5);
+        assert!(woken.contains(&sb), "arrival wakes the reader");
+        assert_eq!(b.udp_mask(sb), Ok((true, true)));
+        assert!(!run(&mut a, &mut b, 6).contains(&sb), "no new edge, no new wake");
+        let mut buf = [0u8; 4];
+        b.udp_recv(sb, &mut buf, false).unwrap();
+        assert_eq!(b.udp_mask(sb), Ok((false, true)));
+    }
+
+    #[test]
+    fn unknown_handle_is_ebadf() {
+        let (mut a, _b) = pair();
+        let s = a.udp_open();
+        a.udp_close(s);
+        let mut buf = [0u8; 1];
+        assert_eq!(a.udp_recv(s, &mut buf, false), Err(NetError::BadHandle));
+        assert_eq!(NetError::BadHandle.errno(), 9);
+        assert_eq!(NetError::Again.errno(), 11);
     }
 }
