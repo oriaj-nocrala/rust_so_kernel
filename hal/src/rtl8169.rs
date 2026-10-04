@@ -50,9 +50,30 @@ pub const INTR_MITIGATE: usize = 0xE2;
 pub const RX_DESC_START_LO: usize = 0xE4;
 pub const RX_DESC_START_HI: usize = 0xE8;
 pub const MAX_TX_PACKET_SIZE: usize = 0xEC;
+/// `EarlySize` for `MaxTxPacketSize` (units of 128 bytes): what Linux's `r8169` leaves in the register on this
+/// chip (`ethtool -d` of the RTL8168H on the AM4 board shows 0x27).
+pub const EARLY_SIZE: u8 = 0x27;
 
 /// Size of the register window the driver maps (`ethtool -d` dumps this much).
 pub const REG_WINDOW: usize = 0x100;
+
+/// The extended register interface (ERI): data at `ERIDR`, command at `ERIAR`.
+pub const ERIDR: usize = 0x70;
+pub const ERIAR: usize = 0x74;
+pub const ERIAR_FLAG: u32 = 1 << 31;
+pub const ERIAR_MASK_0001: u32 = 0x1 << 12;
+pub const ERIAR_MASK_0011: u32 = 0x3 << 12;
+pub const ERIAR_MASK_1111: u32 = 0xf << 12;
+/// `DLLPR` / `MISC_1` / `MISC` (Linux names): power-feature bits and the RX gate.
+pub const DLLPR: usize = 0xD0;
+pub const DLLPR_PFM_EN: u8 = 1 << 6;
+pub const DLLPR_TX_10M_PS_EN: u8 = 1 << 7;
+pub const MISC: usize = 0xF0;
+/// `RXDV_GATED_EN`: while set, the MAC drops everything the PHY delivers. A
+/// reset leaves it set on the 8168g/h; Linux clears it in `rtl_hw_start_8168h_1`.
+pub const MISC_RXDV_GATED_EN: u32 = 1 << 19;
+pub const MISC_1: usize = 0xF2;
+pub const MISC_1_PFM_D3COLD_EN: u8 = 1 << 6;
 
 // `ChipCmd` bits.
 pub const CMD_RESET: u8 = 0x10;
@@ -283,6 +304,26 @@ pub fn link_from_phy_status(st: u8) -> Link {
 
 // ── The driver ──────────────────────────────────────────────────────────────
 
+/// Bytes of a frame kept in the diagnostic log, and how many frames per direction.
+pub const NOTE_BYTES: usize = 24;
+pub const NOTES: usize = 8;
+
+/// The start of a frame seen by the driver (diagnostics: `/proc/nic`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FrameNote {
+    pub len: u16,
+    pub head: [u8; NOTE_BYTES],
+}
+
+impl FrameNote {
+    fn of(frame: &[u8]) -> FrameNote {
+        let mut head = [0u8; NOTE_BYTES];
+        let n = frame.len().min(NOTE_BYTES);
+        head[..n].copy_from_slice(&frame[..n]);
+        FrameNote { len: frame.len() as u16, head }
+    }
+}
+
 pub struct Rtl8168<R: Regs, D: DmaMem> {
     regs: R,
     dma: D,
@@ -293,11 +334,29 @@ pub struct Rtl8168<R: Regs, D: DmaMem> {
     pub rx_dropped: u64,
     pub tx_frames: u64,
     pub tx_dropped: u64,
+    /// Every `IntrStatus` bit seen set since init (it is acknowledged, not acted on).
+    pub intr_seen: u16,
+    /// The last frames sent and received, oldest overwritten (index = count % NOTES).
+    pub tx_notes: [FrameNote; NOTES],
+    pub rx_notes: [FrameNote; NOTES],
 }
 
 impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
     pub fn new(regs: R, dma: D) -> Self {
-        Rtl8168 { regs, dma, tx_head: 0, tx_tail: 0, rx_next: 0, rx_frames: 0, rx_dropped: 0, tx_frames: 0, tx_dropped: 0 }
+        Rtl8168 {
+            regs,
+            dma,
+            tx_head: 0,
+            tx_tail: 0,
+            rx_next: 0,
+            rx_frames: 0,
+            rx_dropped: 0,
+            tx_frames: 0,
+            tx_dropped: 0,
+            intr_seen: 0,
+            tx_notes: [FrameNote { len: 0, head: [0; NOTE_BYTES] }; NOTES],
+            rx_notes: [FrameNote { len: 0, head: [0; NOTE_BYTES] }; NOTES],
+        }
     }
 
     pub fn regs(&self) -> &R {
@@ -400,7 +459,10 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
         }
         r.w16(C_PLUS_CMD, cp);
         r.w16(RX_MAX_SIZE, (BUF_SIZE - 1) as u16);
-        r.w8(MAX_TX_PACKET_SIZE, 0x3B);
+        r.w8(MAX_TX_PACKET_SIZE, EARLY_SIZE);
+        if matches!(family(xid(r.r32(TX_CONFIG))), Family::Rtl8168H | Family::Rtl8168G) {
+            self.mac_start_8168gh();
+        }
         let tx = self.dma.bus_addr(TX_RING_OFF);
         let rx = self.dma.bus_addr(RX_RING_OFF);
         r.w32(TX_DESC_START_HI, (tx >> 32) as u32);
@@ -410,7 +472,8 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
         // The unused high-priority queue gets its registers cleared.
         r.w32(TX_HDESC_START_HI, 0);
         r.w32(TX_HDESC_START_LO, 0);
-        r.w32(TX_CONFIG, TXCFG_DMA_BURST | TXCFG_IFG);
+        // `AUTO_FIFO` is set by Linux on this family (`ethtool -d` shows TxConfig 0x57100f80).
+        r.w32(TX_CONFIG, TXCFG_DMA_BURST | TXCFG_IFG | TXCFG_AUTO_FIFO);
         r.w8(CHIP_CMD, CMD_TX_ENB | CMD_RX_ENB);
         r.w32(RX_CONFIG, RXCFG_128_INT_EN | RXCFG_MULTI_EN | RXCFG_DMA_BURST | RXCFG_EARLY_OFF | RXCFG_ACCEPT_BROADCAST | RXCFG_ACCEPT_MY_PHYS);
         for i in 0..8 {
@@ -419,6 +482,59 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
         r.w16(INTR_MASK, 0); // polled
         r.w16(INTR_STATUS, 0xFFFF); // clear anything pending
         r.w8(CFG9346, CFG9346_LOCK);
+    }
+
+    /// One ERI write (`_rtl_eri_write`): data first, then the command, then
+    /// wait for the chip to clear the flag (bounded; a stuck flag is ignored).
+    fn eri_write(&self, addr: u32, mask: u32, val: u32) {
+        let r = &self.regs;
+        r.w32(ERIDR, val);
+        r.w32(ERIAR, ERIAR_FLAG | mask | addr);
+        for _ in 0..100_000u32 {
+            if r.r32(ERIAR) & ERIAR_FLAG == 0 {
+                break;
+            }
+        }
+    }
+
+    fn eri_read(&self, addr: u32) -> u32 {
+        let r = &self.regs;
+        r.w32(ERIAR, ERIAR_MASK_1111 | addr);
+        for _ in 0..100_000u32 {
+            if r.r32(ERIAR) & ERIAR_FLAG != 0 {
+                return r.r32(ERIDR);
+            }
+        }
+        !0
+    }
+
+    fn eri_modify(&self, addr: u32, set: u32, clear: u32) {
+        let v = self.eri_read(addr);
+        self.eri_write(addr, ERIAR_MASK_1111, (v & !clear) | set);
+    }
+
+    /// The MAC-side start-up Linux does for the 8168g/h (`rtl_hw_start_8168h_1`,
+    /// minus the PHY/EPHY/OCP tuning): RX/TX FIFO sizes, pause thresholds, a
+    /// packet-filter reset, and — the one that matters — opening the RXDV
+    /// gate, without which no frame ever reaches the RX ring.
+    fn mac_start_8168gh(&self) {
+        let r = &self.regs;
+        // rtl_set_fifo_size(0x08, 0x10, 0x02, 0x06); pause thresholds 0x38/0x48.
+        self.eri_write(0xC8, ERIAR_MASK_1111, 0x08 << 16 | 0x02);
+        self.eri_write(0xE8, ERIAR_MASK_1111, 0x10 << 16 | 0x06);
+        self.eri_write(0xCC, ERIAR_MASK_0001, 0x38);
+        self.eri_write(0xD0, ERIAR_MASK_0001, 0x48);
+        // rtl_reset_packet_filter, then the 0xdc bits Linux sets.
+        self.eri_modify(0xDC, 0, 1);
+        self.eri_modify(0xDC, 1, 0);
+        self.eri_modify(0xDC, 0x1C, 0);
+        self.eri_write(0x5F0, ERIAR_MASK_0011, 0x4F87);
+        r.w32(MISC, r.r32(MISC) & !MISC_RXDV_GATED_EN);
+        self.eri_write(0xC0, ERIAR_MASK_0011, 0);
+        self.eri_write(0xB8, ERIAR_MASK_0011, 0);
+        r.w8(DLLPR, r.r8(DLLPR) & !(DLLPR_PFM_EN | DLLPR_TX_10M_PS_EN));
+        r.w8(MISC_1, r.r8(MISC_1) & !MISC_1_PFM_D3COLD_EN);
+        self.eri_modify(0x1B0, 0, 1 << 12);
     }
 
     fn write_desc(&self, ring: usize, i: usize, addr: u64, opts1: u32) {
@@ -443,9 +559,13 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
             let i = self.rx_next;
             let opts1 = self.read_opts1(RX_RING_OFF, i);
             match rx_status(opts1) {
-                RxStatus::Owned => return None,
+                RxStatus::Owned => {
+                    self.ack_status();
+                    return None;
+                }
                 RxStatus::Frame(n) if n <= buf.len() && n <= BUF_SIZE => {
                     self.dma.read(RX_BUFS_OFF + i * BUF_SIZE, &mut buf[..n]);
+                    self.rx_notes[(self.rx_frames as usize) % NOTES] = FrameNote::of(&buf[..n]);
                     self.rx_frames += 1;
                     self.rearm_rx(i);
                     return Some(n);
@@ -490,9 +610,23 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         self.dma.write(TX_RING_OFF + i * DESC_SIZE, &tx_arm(len, i + 1 == SLOTS).to_le_bytes());
         self.tx_head = (i + 1) % SLOTS;
+        self.tx_notes[(self.tx_frames as usize) % NOTES] = FrameNote::of(frame);
         self.tx_frames += 1;
         self.regs.w8(TX_POLL, TXPOLL_NPQ);
         true
+    }
+
+    /// Reads `IntrStatus`, remembers which bits were set and clears them
+    /// (writing the bits back). With the mask at 0 nothing interrupts, but the
+    /// chip still raises the flags: RxOK/TxOK say packets moved, RxOverflow and
+    /// RxFIFOOver say frames were lost, SysErr says the PCIe side failed.
+    pub fn ack_status(&mut self) -> u16 {
+        let v = self.regs.r16(INTR_STATUS);
+        if v != 0 && v != 0xFFFF {
+            self.intr_seen |= v;
+            self.regs.w16(INTR_STATUS, v);
+        }
+        v
     }
 
     /// Frees TX slots the chip is done with.
@@ -500,6 +634,49 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
         while self.tx_tail != self.tx_head && self.read_opts1(TX_RING_OFF, self.tx_tail) & DESC_OWN == 0 {
             self.tx_tail = (self.tx_tail + 1) % SLOTS;
         }
+    }
+
+    /// A human-readable state dump for `/proc/nic`: counters, the registers
+    /// that say whether the chip is moving packets, the ring cursors and the
+    /// descriptors there, and the first bytes of the last frames each way.
+    pub fn report(&self, out: &mut impl core::fmt::Write) -> core::fmt::Result {
+        let r = &self.regs;
+        writeln!(out, "rtl8168: rx {} (dropped {}) tx {} (dropped {}, in flight {})", self.rx_frames, self.rx_dropped, self.tx_frames, self.tx_dropped, self.tx_in_flight())?;
+        writeln!(out, "regs: ChipCmd {:#04x} TxPoll {:#04x} IntrMask {:#06x} IntrStatus {:#06x}", r.r8(CHIP_CMD), r.r8(TX_POLL), r.r16(INTR_MASK), r.r16(INTR_STATUS))?;
+        writeln!(out, "regs: TxConfig {:#010x} RxConfig {:#010x} CPlusCmd {:#06x} MaxTxPkt {:#04x} RxMaxSize {:#06x}", r.r32(TX_CONFIG), r.r32(RX_CONFIG), r.r16(C_PLUS_CMD), r.r8(MAX_TX_PACKET_SIZE), r.r16(RX_MAX_SIZE))?;
+        writeln!(out, "regs: MISC {:#010x} (RXDV gate {}) DLLPR {:#04x}", r.r32(MISC), if r.r32(MISC) & MISC_RXDV_GATED_EN != 0 { "CLOSED" } else { "open" }, r.r8(DLLPR))?;
+        writeln!(out, "regs: TxDesc {:#010x}:{:08x} RxDesc {:#010x}:{:08x} PHYstatus {:#04x} {:?}", r.r32(TX_DESC_START_HI), r.r32(TX_DESC_START_LO), r.r32(RX_DESC_START_HI), r.r32(RX_DESC_START_LO), r.r8(PHY_STATUS), link_from_phy_status(r.r8(PHY_STATUS)))?;
+        let names: [(u16, &str); 11] = [
+            (INT_RX_OK, "RxOK"), (INT_RX_ERR, "RxErr"), (INT_TX_OK, "TxOK"), (INT_TX_ERR, "TxErr"), (INT_RX_OVERFLOW, "RxOverflow"),
+            (INT_LINK_CHG, "LinkChg"), (INT_RX_FIFO_OVER, "RxFIFOOver"), (INT_TX_DESC_UNAVAIL, "TxDescUnavail"), (INT_SW, "SWInt"),
+            (INT_PCS_TIMEOUT, "PCSTimeout"), (INT_SYS_ERR, "SysErr"),
+        ];
+        write!(out, "events seen since init ({:#06x}):", self.intr_seen)?;
+        for (bit, name) in names {
+            if self.intr_seen & bit != 0 {
+                write!(out, " {}", name)?;
+            }
+        }
+        writeln!(out)?;
+        writeln!(
+            out,
+            "tx: head {} tail {} head.opts1 {:#010x} tail.opts1 {:#010x}",
+            self.tx_head, self.tx_tail, self.read_opts1(TX_RING_OFF, self.tx_head), self.read_opts1(TX_RING_OFF, self.tx_tail)
+        )?;
+        writeln!(out, "rx: next {} next.opts1 {:#010x} (OWN set = waiting for a frame)", self.rx_next, self.read_opts1(RX_RING_OFF, self.rx_next))?;
+        for (what, notes, count) in [("tx", &self.tx_notes, self.tx_frames), ("rx", &self.rx_notes, self.rx_frames)] {
+            let shown = (count as usize).min(NOTES);
+            writeln!(out, "last {} {} frames (newest first):", shown, what)?;
+            for k in 0..shown {
+                let n = &notes[((count as usize) - 1 - k) % NOTES];
+                write!(out, "  {:4} B:", n.len)?;
+                for b in &n.head[..(n.len as usize).min(NOTE_BYTES)] {
+                    write!(out, " {:02x}", b)?;
+                }
+                writeln!(out)?;
+            }
+        }
+        Ok(())
     }
 
     /// Slots in flight (diagnostics and tests).
@@ -539,6 +716,7 @@ mod tests {
         phy: [u16; 32],
         link_status: u8,
         reset_stuck: bool,
+        eri: alloc::collections::BTreeMap<u32, u32>,
     }
 
     #[derive(Clone)]
@@ -560,6 +738,7 @@ mod tests {
                 phy: [0; 32],
                 link_status: PHYST_LINK | PHYST_FULL_DUP | PHYST_1000,
                 reset_stuck: false,
+                eri: Default::default(),
             })))
         }
 
@@ -574,6 +753,9 @@ mod tests {
         /// The chip receives `frame` (adds the FCS, as it leaves it on).
         fn inject(&self, frame: &[u8], extra: u32) -> bool {
             let mut m = self.0.borrow_mut();
+            if Self::rd32(&m, MISC) & MISC_RXDV_GATED_EN != 0 {
+                return false; // the gate drops it before it reaches a descriptor
+            }
             let ring = (Self::rd32(&m, RX_DESC_START_LO) as u64 | (Self::rd32(&m, RX_DESC_START_HI) as u64) << 32) - m.base;
             let i = m.rx_cursor;
             let d = ring as usize + i * DESC_SIZE;
@@ -671,6 +853,8 @@ mod tests {
                         m.regs = [0; REG_WINDOW];
                         m.regs[MAC0..MAC0 + 6].copy_from_slice(&keep_mac);
                         m.regs[TX_CONFIG..TX_CONFIG + 4].copy_from_slice(&keep_tx);
+                        // The 8168g/h comes out of reset with the RXDV gate closed.
+                        m.regs[MISC..MISC + 4].copy_from_slice(&MISC_RXDV_GATED_EN.to_le_bytes());
                     } else {
                         m.regs[CHIP_CMD] = CMD_RESET;
                     }
@@ -691,6 +875,23 @@ mod tests {
         }
         fn w32(&self, off: usize, val: u32) {
             let mut m = self.0.borrow_mut();
+            if off == ERIAR {
+                let addr = val & 0xFFF;
+                if val & ERIAR_FLAG != 0 {
+                    let mask = (val >> 12) & 0xF;
+                    if addr & 3 != 0 || mask == 0 {
+                        m.violations.push("misaligned or empty-mask ERI write");
+                    }
+                    let data = Self::rd32(&m, ERIDR);
+                    m.eri.insert(addr, data);
+                    m.regs[ERIAR..ERIAR + 4].copy_from_slice(&(val & !ERIAR_FLAG).to_le_bytes());
+                } else {
+                    let data = m.eri.get(&addr).copied().unwrap_or(0);
+                    m.regs[ERIDR..ERIDR + 4].copy_from_slice(&data.to_le_bytes());
+                    m.regs[ERIAR..ERIAR + 4].copy_from_slice(&(val | ERIAR_FLAG).to_le_bytes());
+                }
+                return;
+            }
             m.regs[off..off + 4].copy_from_slice(&val.to_le_bytes());
         }
     }
@@ -796,6 +997,32 @@ mod tests {
         let o = u32::from_le_bytes(m.arena[TX_RING_OFF..TX_RING_OFF + 4].try_into().unwrap());
         assert_eq!(o & DESC_OWN, 0);
         assert_eq!(m.regs[C_PLUS_CMD] as u16 & CPCMD_PCIDAC, 0, "low addresses: no DAC");
+    }
+
+    #[test]
+    fn init_opens_the_rxdv_gate_and_sets_the_fifo_thresholds() {
+        let (_d, dev) = up(0x1000_0000);
+        let m = dev.0.borrow();
+        assert!(m.violations.is_empty(), "{:?}", m.violations);
+        assert_eq!(Dev::rd32(&m, MISC) & MISC_RXDV_GATED_EN, 0, "gate open");
+        assert_eq!(m.eri[&0xC8], 0x08 << 16 | 0x02);
+        assert_eq!(m.eri[&0xE8], 0x10 << 16 | 0x06);
+        assert_eq!(m.eri[&0xCC] & 0xFF, 0x38);
+        assert_eq!(m.eri[&0xD0] & 0xFF, 0x48);
+        assert_eq!(m.eri[&0x5F0] & 0xFFFF, 0x4F87);
+        assert_eq!(m.eri[&0xDC] & 0x1D, 0x1D, "filter reset ends with bit 0 set, plus 0x1c");
+    }
+
+    #[test]
+    fn frames_are_dropped_while_the_rxdv_gate_is_closed() {
+        let dev = Dev::new(0x1000_0000);
+        let mut d = Rtl8168::new(dev.clone(), dev.clone());
+        d.reset(|| {}).unwrap();
+        assert!(!dev.inject(&[0u8; 60], 0), "closed gate: nothing arrives");
+        d.init_rings();
+        assert!(dev.inject(&[0u8; 60], 0), "open gate: frame arrives");
+        let mut buf = [0u8; 2048];
+        assert_eq!(d.recv(&mut buf), Some(60));
     }
 
     #[test]
@@ -973,5 +1200,109 @@ mod tests {
         assert_eq!(w.len(), 2);
         assert_eq!(w[0], (3 * DESC_SIZE + 4, 12), "opts2 + address first");
         assert_eq!(w[1], (3 * DESC_SIZE, 4), "opts1 (with OWN) last");
+    }
+
+    #[test]
+    fn init_matches_what_linux_leaves_in_the_registers() {
+        // `ethtool -d` of the same chip under r8169: TxConfig 0x57100f80, MaxTxPacketSize 0x27.
+        let (_d, dev) = up(0x1000_0000);
+        let m = dev.0.borrow();
+        let tx = Dev::rd32(&m, TX_CONFIG);
+        assert!(tx & TXCFG_AUTO_FIFO != 0, "AUTO_FIFO set, as Linux does");
+        assert_eq!(m.regs[MAX_TX_PACKET_SIZE], 0x27);
+    }
+
+    #[test]
+    fn ack_status_accumulates_and_clears_event_bits() {
+        let (mut d, dev) = up(0x1000_0000);
+        dev.0.borrow_mut().regs[INTR_STATUS..INTR_STATUS + 2].copy_from_slice(&(INT_RX_OK | INT_RX_OVERFLOW).to_le_bytes());
+        assert_eq!(d.ack_status(), INT_RX_OK | INT_RX_OVERFLOW);
+        assert_eq!(d.intr_seen, INT_RX_OK | INT_RX_OVERFLOW);
+        // The model has no write-1-to-clear: the driver wrote the bits back, which the model stores.
+        dev.0.borrow_mut().regs[INTR_STATUS..INTR_STATUS + 2].copy_from_slice(&INT_SYS_ERR.to_le_bytes());
+        d.ack_status();
+        assert_eq!(d.intr_seen, INT_RX_OK | INT_RX_OVERFLOW | INT_SYS_ERR, "bits accumulate");
+        // An all-ones read (device gone) is not an event.
+        dev.0.borrow_mut().regs[INTR_STATUS..INTR_STATUS + 2].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        let before = d.intr_seen;
+        d.ack_status();
+        assert_eq!(d.intr_seen, before);
+    }
+
+    #[test]
+    fn report_shows_counters_registers_and_recent_frames() {
+        use alloc::string::String;
+        let (mut d, dev) = up(0x1000_0000);
+        assert!(d.send(&[0xAB; 60]));
+        let mut f = [0u8; 100];
+        f[0] = 0xFF;
+        f[12] = 0x08;
+        assert!(dev.inject(&f, 0));
+        let mut buf = [0u8; 2048];
+        assert_eq!(d.recv(&mut buf), Some(100));
+        let mut out = String::new();
+        d.report(&mut out).unwrap();
+        assert!(out.contains("rx 1 (dropped 0) tx 1"), "{}", out);
+        assert!(out.contains("ChipCmd 0x0c"), "{}", out);
+        assert!(out.contains("AUTO_FIFO") || out.contains("TxConfig 0x"), "{}", out);
+        assert!(out.contains("last 1 tx frames"), "{}", out);
+        assert!(out.contains("60 B: ab ab ab"), "{}", out);
+        assert!(out.contains("100 B: ff"), "{}", out);
+    }
+
+    #[test]
+    fn frame_notes_keep_the_newest_and_wrap() {
+        let (mut d, _dev) = up(0x1000_0000);
+        for n in 0..(NOTES + 3) {
+            let mut f = [0u8; 64];
+            f[0] = n as u8;
+            d.send(&f);
+        }
+        let newest = &d.tx_notes[(d.tx_frames as usize - 1) % NOTES];
+        assert_eq!(newest.head[0], (NOTES + 2) as u8);
+        assert_eq!(newest.len, 64);
+    }
+
+    /// The real chip: `ethtool -d` of the AM4 board's RTL8168H under Linux's r8169
+    /// (`fixtures/rtl8168h-linux-regs.bin`, PCI rev 0x15, XID 0x541, MAC f0:2f:74:c9:80:a7,
+    /// 1000 Mb/s full duplex). The only part of this module checked against the hardware.
+    struct Fixture(&'static [u8]);
+
+    impl Regs for Fixture {
+        fn r8(&self, off: usize) -> u8 { self.0[off] }
+        fn r16(&self, off: usize) -> u16 { u16::from_le_bytes([self.0[off], self.0[off + 1]]) }
+        fn r32(&self, off: usize) -> u32 { u32::from_le_bytes(self.0[off..off + 4].try_into().unwrap()) }
+        fn w8(&self, _: usize, _: u8) { panic!("a read-only fixture") }
+        fn w16(&self, _: usize, _: u16) { panic!("a read-only fixture") }
+        fn w32(&self, _: usize, _: u32) { panic!("a read-only fixture") }
+    }
+
+    struct NoDma;
+    impl DmaMem for NoDma {
+        fn read(&self, _: usize, _: &mut [u8]) {}
+        fn write(&self, _: usize, _: &[u8]) {}
+        fn bus_addr(&self, _: usize) -> u64 { 0 }
+    }
+
+    #[test]
+    fn identify_decodes_the_real_chips_register_dump() {
+        let dump: &'static [u8] = include_bytes!("../fixtures/rtl8168h-linux-regs.bin");
+        assert_eq!(dump.len(), REG_WINDOW);
+        let d = Rtl8168::new(Fixture(dump), NoDma);
+        let id = d.identify().expect("a real dump is not all ones");
+        assert_eq!(id.xid, 0x541, "Linux's dmesg says XID 541");
+        assert_eq!(id.family, Family::Rtl8168H);
+        assert_eq!(id.mac, [0xf0, 0x2f, 0x74, 0xc9, 0x80, 0xa7], "Linux's `ip link`");
+        assert_eq!(id.link, Link { up: true, mbps: 1000, full_duplex: true }, "`ethtool`: 1000Mb/s Full");
+        assert_eq!(id.tx_config, 0x5710_0f80, "XID in bits 30:20; DMA burst 7, AUTO_FIFO");
+        // What this driver programs must match the registers Linux leaves in the same chip.
+        let r = d.regs();
+        assert_eq!(r.r32(TX_CONFIG) & TXCFG_AUTO_FIFO, TXCFG_AUTO_FIFO);
+        assert_eq!(r.r8(MAX_TX_PACKET_SIZE), EARLY_SIZE);
+        assert_eq!(r.r8(CHIP_CMD), CMD_RX_ENB | CMD_TX_ENB);
+        let rx = r.r32(RX_CONFIG);
+        assert!(rx & RXCFG_ACCEPT_BROADCAST != 0 && rx & RXCFG_ACCEPT_MY_PHYS != 0);
+        assert_eq!(rx & (RXCFG_DMA_BURST | RXCFG_EARLY_OFF | RXCFG_MULTI_EN | RXCFG_128_INT_EN), RXCFG_DMA_BURST | RXCFG_EARLY_OFF | RXCFG_MULTI_EN | RXCFG_128_INT_EN, "RxConfig bits as remembered");
+        assert_eq!(r.r16(INTR_MASK) & (INT_RX_OK | INT_TX_OK), INT_RX_OK | INT_TX_OK, "Linux runs interrupt-driven");
     }
 }

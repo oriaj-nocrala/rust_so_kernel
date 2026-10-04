@@ -59,6 +59,13 @@ impl net::Nic for AnyNic {
 }
 
 impl AnyNic {
+    fn report(&self) -> alloc::string::String {
+        match self {
+            AnyNic::Virtio(n) => alloc::format!("virtio-net: rx {} tx {} (dropped {})\n", n.rx_frames, n.tx_frames, n.tx_dropped),
+            AnyNic::Rtl(n) => n.report(),
+        }
+    }
+
     fn mac(&self) -> [u8; 6] {
         match self {
             AnyNic::Virtio(n) => n.mac(),
@@ -143,6 +150,7 @@ impl Net {
     /// Both lists get every id: a waiter re-executes its syscall and finds
     /// out which of readable/writable it was.
     fn poll(&mut self) -> Wakes {
+        POLLS.fetch_add(1, Ordering::Relaxed);
         let events = self.stack.poll(now());
         let ids: Vec<usize> = events
             .into_iter()
@@ -197,6 +205,34 @@ pub fn init_with(irq_cpu: Option<usize>) {
     stack.enable_dhcp();
     stack.poll(now());
     NET.with(|n| *n = Some(Net { stack, socks: Vec::new() }));
+}
+
+/// Times the stack was driven (tick, interrupt or a socket call): `/proc/nic`
+/// shows it moving, so a stack that is never polled is visible.
+static POLLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `/proc/nic`: which NIC the stack runs on, its state, and the DHCP lease.
+pub fn render_nic() -> alloc::string::String {
+    use alloc::format;
+    let body = NET.with(|n| {
+        let n = n.as_mut()?;
+        let lease = n.stack.lease();
+        let socks = n.socks.iter().filter(|s| s.is_some()).count();
+        let mut s = format!(
+            "stack polled {} times, NIC interrupts {}, sockets {}\nmac {:02x?}\n",
+            POLLS.load(Ordering::Relaxed),
+            IRQS.load(Ordering::Relaxed),
+            socks,
+            n.stack.device().nic.mac()
+        );
+        match lease {
+            Some(l) => s.push_str(&format!("lease: {}/{} router {:?} dns {:?}\n", l.addr, l.prefix, l.router, l.dns)),
+            None => s.push_str("lease: none (DHCP has not completed)\n"),
+        }
+        s.push_str(&n.stack.device().nic.report());
+        Some(s)
+    });
+    body.unwrap_or_else(|| alloc::string::String::from("no network interface (nic=off, or no supported NIC)\n"))
 }
 
 /// Interrupts taken from the NIC (the MSI-X handler, `irq`).

@@ -31,7 +31,9 @@ static uint16_t checksum(const void *data, size_t len) {
     return (uint16_t)~sum;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    /* The host to ping: QEMU's gateway by default, or the first argument. */
+    const char *target = argc > 1 ? argv[1] : "10.0.2.2";
     int s = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
     if (s < 0) printf("socket failed: errno %d\n", errno);
     check(s >= 0, "socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)");
@@ -55,7 +57,7 @@ int main(void) {
     struct sockaddr_in gw;
     memset(&gw, 0, sizeof gw);
     gw.sin_family = AF_INET;
-    inet_pton(AF_INET, "10.0.2.2", &gw.sin_addr);
+    inet_pton(AF_INET, target, &gw.sin_addr);
 
     /* Wait for the DHCP lease, then ping (the first packet may be lost to ARP: resend). */
     ssize_t n = -1;

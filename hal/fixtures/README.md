@@ -48,3 +48,8 @@ configuration space, the hex rows of `lspci -xxxx -s 09:00.0` on the target
 board (captured by `scripts/gpu-oracle.sh` into
 `~/constanos-gpu-oracle/static/lspci.txt`, under the `nvidia` driver, which
 had MSI enabled). Read by `hal/src/pcicfg.rs`'s tests.
+
+`rtl8168h-linux-regs.bin` / `rtl8168h-lspci.txt` — the 256-byte register window (`sudo ethtool -d <iface> raw on`) and
+the full config space (`sudo lspci -vvvnn -s 08:00.0 -xxxx`) of the AM4 board's RTL8111H (PCI `10ec:8168` rev 0x15, XID
+0x541) as Linux's r8169 leaves it, link up at 1000 Mb/s. Read by `hal/src/rtl8169.rs`'s tests as the oracle for what the
+driver must program and decode; the lspci text shows an MSI-X capability with 4 vectors (table and PBA in BAR4).
