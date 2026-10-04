@@ -71,7 +71,15 @@ const ETC_FILES: &[(&str, &[u8])] = &[
     // and the shell `/tmp/bin/sh`, BusyBox's, which is what exists.
     ("passwd", b"root:x:0:0:root:/tmp:/tmp/bin/sh\n"),
     ("group", b"root:x:0:\n"),
+    // mlibc's resolver and `getservbyname` read these (`lookup_name_hosts`,
+    // `services.cpp`); BusyBox wget/nc resolve "http", "domain", ... by name.
+    ("hosts", b"127.0.0.1 localhost\n"),
+    ("services", b"echo 7/tcp\necho 7/udp\nftp 21/tcp\nssh 22/tcp\ntelnet 23/tcp\ndomain 53/tcp\ndomain 53/udp\ntftp 69/udp\nhttp 80/tcp\nhttps 443/tcp\n"),
 ];
+
+/// `/etc/resolv.conf` is not in `ETC_FILES`: its content is the DHCP lease's
+/// DNS server, so it is rendered on every open (`network::resolv_conf`).
+const RESOLV_CONF: &str = "resolv.conf";
 
 const UTC_TZIF: [u8; 54] = {
     let mut b = [0u8; 54];
@@ -245,6 +253,9 @@ impl Inode for EtcDirInode {
     }
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>, Errno> {
+        if name == RESOLV_CONF {
+            return Ok(super::procfs::rendered(ETC_FILE_INO_BASE + ETC_FILES.len() as u64, crate::network::resolv_conf));
+        }
         ETC_FILES.iter().position(|(n, _)| *n == name)
             .map(|i| Arc::new(InitramfsFileInode {
                 ino: ETC_FILE_INO_BASE + i as u64,
@@ -258,6 +269,11 @@ impl Inode for EtcDirInode {
         match offset {
             0 => Ok(Some(DirEntry::new(ETC_INO, FileType::Directory, b"."))),
             1 => Ok(Some(DirEntry::new(ROOT_INO, FileType::Directory, b".."))),
+            n if (n - 2) as usize == ETC_FILES.len() => Ok(Some(DirEntry::new(
+                ETC_FILE_INO_BASE + n - 2,
+                FileType::Regular,
+                RESOLV_CONF.as_bytes(),
+            ))),
             n => Ok(ETC_FILES.get((n - 2) as usize).map(|(name, _)| {
                 DirEntry::new(ETC_FILE_INO_BASE + n - 2, FileType::Regular, name.as_bytes())
             })),

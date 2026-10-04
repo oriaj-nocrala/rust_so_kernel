@@ -166,6 +166,19 @@ pub fn lease() -> Option<net::Lease> {
     NET.with(|n| n.as_ref().and_then(|n| n.stack.lease()))
 }
 
+/// `/etc/resolv.conf`: the DHCP lease's DNS server (else its router, which
+/// usually forwards DNS); empty until there is a lease.
+pub fn resolv_conf() -> alloc::string::String {
+    use alloc::format;
+    match lease() {
+        Some(l) => match l.dns.or(l.router) {
+            Some(ns) => format!("nameserver {}\n", ns),
+            None => alloc::string::String::new(),
+        },
+        None => alloc::string::String::new(),
+    }
+}
+
 // ── Sockets ──────────────────────────────────────────────────────────────
 
 pub fn open(kind: SockKind) -> Result<usize, NetError> {
