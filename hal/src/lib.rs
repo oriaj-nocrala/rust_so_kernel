@@ -51,6 +51,7 @@ pub mod smp;
 pub mod sp5100_tco;
 pub mod tlb;
 pub mod usb;
+pub mod virtio;
 pub mod xhci;
 
 /// Legacy x86 port I/O seam. The production implementation (kernel side)
