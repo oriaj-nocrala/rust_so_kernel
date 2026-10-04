@@ -163,6 +163,11 @@ fn normalized(addr: UnixAddr) -> UnixAddr {
     }
 }
 
+/// The AF_INET socket behind `fd`, if it is one: those calls go to `inet.rs`.
+fn inet_sock(fd: i32) -> Option<SocketId> {
+    unix::socket_of_fd(fd).ok().filter(|&id| crate::network::is_inet(id))
+}
+
 // ── socket / socketpair ─────────────────────────────────────────────────
 
 fn parse_type(ty: i32) -> Result<(SockType, bool), i64> {
@@ -187,6 +192,9 @@ fn check_domain(domain: i32, protocol: i32) -> Result<(), i64> {
 }
 
 pub(super) fn sys_socket(domain: i32, ty: i32, protocol: i32) -> SyscallResult {
+    if domain == super::inet::AF_INET {
+        return super::inet::socket(ty, protocol);
+    }
     if let Err(e) = check_domain(domain, protocol) {
         return e;
     }
@@ -262,6 +270,9 @@ pub(super) fn sys_socketpair(domain: i32, ty: i32, protocol: i32, sv: u64) -> Sy
 // ── bind / listen ───────────────────────────────────────────────────────
 
 pub(super) fn sys_bind(fd: i32, addr_ptr: u64, addrlen: u64) -> SyscallResult {
+    if let Some(id) = inet_sock(fd) {
+        return super::inet::bind(id, addr_ptr, addrlen);
+    }
     let id = match unix::socket_of_fd(fd) {
         Ok(id) => id,
         Err(e) => return e,
@@ -300,6 +311,9 @@ pub(super) fn sys_bind(fd: i32, addr_ptr: u64, addrlen: u64) -> SyscallResult {
 }
 
 pub(super) fn sys_listen(fd: i32, backlog: i32) -> SyscallResult {
+    if inet_sock(fd).is_some() {
+        return super::inet::unsupported();
+    }
     let id = match unix::socket_of_fd(fd) {
         Ok(id) => id,
         Err(e) => return e,
@@ -313,6 +327,9 @@ pub(super) fn sys_listen(fd: i32, backlog: i32) -> SyscallResult {
 // ── connect / accept ────────────────────────────────────────────────────
 
 pub(super) fn sys_connect(fd: i32, addr_ptr: u64, addrlen: u64) -> SyscallResult {
+    if let Some(id) = inet_sock(fd) {
+        return super::inet::connect(id, addr_ptr, addrlen);
+    }
     let id = match unix::socket_of_fd(fd) {
         Ok(id) => id,
         Err(e) => return e,
@@ -373,6 +390,9 @@ pub(super) fn sys_connect(fd: i32, addr_ptr: u64, addrlen: u64) -> SyscallResult
 }
 
 pub(super) fn sys_accept4(fd: i32, addr_ptr: u64, len_ptr: u64, flags: i32) -> SyscallResult {
+    if inet_sock(fd).is_some() {
+        return super::inet::unsupported();
+    }
     let id = match unix::socket_of_fd(fd) {
         Ok(id) => id,
         Err(e) => return e,
@@ -428,6 +448,9 @@ pub(super) fn sys_sendto(
     dest_ptr: u64,
     dest_len: u64,
 ) -> SyscallResult {
+    if let Some(id) = inet_sock(fd) {
+        return super::inet::sendto(id, fd, buf, len, flags, dest_ptr, dest_len);
+    }
     if len > 0 {
         if let Err(e) = validate_user_buffer(buf, len) {
             return e;
@@ -461,6 +484,9 @@ pub(super) fn sys_recvfrom(
     src_ptr: u64,
     src_len_ptr: u64,
 ) -> SyscallResult {
+    if let Some(id) = inet_sock(fd) {
+        return super::inet::recvfrom(id, fd, buf, len, flags, src_ptr, src_len_ptr);
+    }
     if len > 0 {
         if let Err(e) = validate_user_buffer(buf, len) {
             return e;
@@ -494,6 +520,9 @@ pub(super) fn sys_recvfrom(
 }
 
 pub(super) fn sys_sendmsg(fd: i32, msg_ptr: u64, flags: u32) -> SyscallResult {
+    if inet_sock(fd).is_some() {
+        return super::inet::unsupported();
+    }
     let msg = match read_msghdr(msg_ptr) {
         Ok(m) => m,
         Err(e) => return e,
@@ -533,6 +562,9 @@ pub(super) fn sys_sendmsg(fd: i32, msg_ptr: u64, flags: u32) -> SyscallResult {
 }
 
 pub(super) fn sys_recvmsg(fd: i32, msg_ptr: u64, flags: u32) -> SyscallResult {
+    if inet_sock(fd).is_some() {
+        return super::inet::unsupported();
+    }
     let msg = match read_msghdr(msg_ptr) {
         Ok(m) => m,
         Err(e) => return e,
@@ -600,6 +632,9 @@ pub(super) fn sys_recvmsg(fd: i32, msg_ptr: u64, flags: u32) -> SyscallResult {
 // ── shutdown / names ────────────────────────────────────────────────────
 
 pub(super) fn sys_shutdown(fd: i32, how: i32) -> SyscallResult {
+    if inet_sock(fd).is_some() {
+        return super::inet::shutdown();
+    }
     let id = match unix::socket_of_fd(fd) {
         Ok(id) => id,
         Err(e) => return e,
@@ -630,6 +665,9 @@ pub(super) fn sys_getpeername(fd: i32, addr_ptr: u64, len_ptr: u64) -> SyscallRe
 }
 
 fn name_of(fd: i32, addr_ptr: u64, len_ptr: u64, peer: bool) -> SyscallResult {
+    if let Some(id) = inet_sock(fd) {
+        return super::inet::name(id, addr_ptr, len_ptr, peer);
+    }
     let id = match unix::socket_of_fd(fd) {
         Ok(id) => id,
         Err(e) => return e,
@@ -653,6 +691,9 @@ pub(super) fn sys_setsockopt(
     optval: u64,
     optlen: u32,
 ) -> SyscallResult {
+    if inet_sock(fd).is_some() {
+        return super::inet::setsockopt(level, optname, optval, optlen);
+    }
     let id = match unix::socket_of_fd(fd) {
         Ok(id) => id,
         Err(e) => return e,
@@ -689,6 +730,9 @@ pub(super) fn sys_getsockopt(
     optval: u64,
     optlen_ptr: u64,
 ) -> SyscallResult {
+    if inet_sock(fd).is_some() {
+        return super::inet::getsockopt(level, optname, optval, optlen_ptr);
+    }
     let id = match unix::socket_of_fd(fd) {
         Ok(id) => id,
         Err(e) => return e,
@@ -1021,7 +1065,7 @@ fn install_scm_rights(msg: &UserMsghdr, fds: Vec<Box<dyn FileHandle>>) -> Result
 
 // ── fd-table plumbing ───────────────────────────────────────────────────
 
-fn current_files() -> alloc::sync::Arc<crate::sync::Mutex<crate::process::file::FileDescriptorTable>> {
+pub(super) fn current_files() -> alloc::sync::Arc<crate::sync::Mutex<crate::process::file::FileDescriptorTable>> {
     let guard = crate::process::irq_guard::SchedGuard::lock();
     guard
         .running_ref()

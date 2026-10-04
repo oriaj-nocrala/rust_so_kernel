@@ -1201,3 +1201,27 @@ fn virtio_net_pings_the_gateway() {
         dev.nic.rx_frames, dev.nic.tx_frames, dev.nic.tx_dropped, dev.nic.device_status()
     );
 }
+
+/// Case: DHCP through the global stack (`network::init`, which `init::boot`
+/// runs too). QEMU's user-mode network hands out 10.0.2.15/24 with router
+/// 10.0.2.2 and DNS 10.0.2.3. No timer ISR runs in a test boot, so this
+/// drives the stack by hand with `network::tick`, as the BSP's timer would.
+#[test_case]
+fn dhcp_lease_from_qemu() {
+    crate::network::init();
+    let start = crate::cpu::tsc::uptime_ms();
+    let lease = loop {
+        crate::network::tick();
+        if let Some(l) = crate::network::lease() {
+            break l;
+        }
+        assert!(crate::cpu::tsc::uptime_ms() - start < 10_000, "no DHCP lease in 10 s");
+        crate::memory::tlb::service_pending();
+        core::hint::spin_loop();
+    };
+    use net::smoltcp::wire::Ipv4Address;
+    assert_eq!(lease.addr, Ipv4Address::new(10, 0, 2, 15));
+    assert_eq!(lease.prefix, 24);
+    assert_eq!(lease.router, Some(Ipv4Address::new(10, 0, 2, 2)));
+    assert_eq!(lease.dns, Some(Ipv4Address::new(10, 0, 2, 3)));
+}

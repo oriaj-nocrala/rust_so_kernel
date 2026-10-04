@@ -225,6 +225,12 @@ pub extern "C" fn timer_preempt_handler(current_tf: *const TrapFrame) -> Resume 
         // deliver SIGINT, and a spin lock is not reentrant.
         crate::usb::poll();
 
+        // The network stack has no interrupt yet either (virtio-net is
+        // polled): receive, retransmit timers and DHCP run here, at 100 Hz.
+        // Before the scheduler lock is taken below — waking a socket's
+        // waiters takes it. `try`s its own lock; see `network::tick`.
+        crate::network::tick();
+
         TICK_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 

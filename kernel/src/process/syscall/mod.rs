@@ -36,6 +36,7 @@ mod fs;
 mod process_ctl;
 mod signal;
 mod ipc;
+mod inet;
 mod sync;
 mod poll;
 mod misc;

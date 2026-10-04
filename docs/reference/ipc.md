@@ -30,7 +30,7 @@
   Abstract names (`sun_path[0]==0`) skip the filesystem.
 - A stream `connect()` completes or fails immediately: it creates the server-side socket itself, as Linux does.
 - `SOCK_SEQPACKET` (`SockType::SeqPacket`): connects like a stream (`listen`/`accept`/`connect`, `socketpair`, half-close, EOF when the peer is gone) and keeps message boundaries like a datagram socket (one send = one recv, a short buffer truncates and drops the rest, `MSG_TRUNC` reports the real length, a message bigger than the receive buffer is `EMSGSIZE`). Rust's `Command` needs it for its exec-error pipe whenever it forks (uid/gid/`pre_exec`).
-- Out of scope: `SO_PEERCRED` (ids are bookkeeping only), `MSG_OOB`, `EINPROGRESS`, `AF_INET`.
+- Out of scope: `SO_PEERCRED` (ids are bookkeeping only), `MSG_OOB`, `EINPROGRESS`. `AF_INET` datagram sockets are in `net.md`.
 - Tests: `cd usock && cargo test`, `hw_tests::unix_socket_handle_roundtrip`, `socket_test` (end-to-end through mlibc), `ipc_ping`, `poll_test`.
 
 ## Pseudo-terminals (`tty/`, `ipc/pty.rs`)
