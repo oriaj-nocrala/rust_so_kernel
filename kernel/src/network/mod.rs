@@ -56,6 +56,12 @@ impl net::Nic for AnyNic {
             AnyNic::Rtl(n) => n.send(frame),
         }
     }
+    fn link_change(&mut self) -> Option<bool> {
+        match self {
+            AnyNic::Virtio(_) => None,
+            AnyNic::Rtl(n) => n.link_change(),
+        }
+    }
 }
 
 impl AnyNic {
@@ -151,6 +157,9 @@ impl Net {
     /// out which of readable/writable it was.
     fn poll(&mut self) -> Wakes {
         POLLS.fetch_add(1, Ordering::Relaxed);
+        if net::Nic::link_change(&mut self.stack.device().nic) == Some(true) {
+            self.stack.restart_dhcp();
+        }
         let events = self.stack.poll(now());
         let ids: Vec<usize> = events
             .into_iter()

@@ -203,6 +203,16 @@ impl<D: Device> Stack<D> {
         }
     }
 
+    /// The link came back, possibly to another network: drops the lease and
+    /// starts DHCP over (a no-op without a DHCP client). Going down needs
+    /// nothing: a flap to the same network then costs nothing.
+    pub fn restart_dhcp(&mut self) {
+        if let Some(h) = self.dhcp {
+            self.sockets.get_mut::<dhcpv4::Socket>(h).reset();
+            self.apply(None);
+        }
+    }
+
     /// Uses this address now and stops DHCP (tests, or a failed lease).
     pub fn set_static(&mut self, addr: Ipv4Address, prefix: u8, router: Option<Ipv4Address>) {
         if let Some(h) = self.dhcp.take() {

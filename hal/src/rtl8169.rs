@@ -342,6 +342,10 @@ pub struct Rtl8168<R: Regs, D: DmaMem> {
     /// The last frames sent and received, oldest overwritten (index = count % NOTES).
     pub tx_notes: [FrameNote; NOTES],
     pub rx_notes: [FrameNote; NOTES],
+    /// Link state as of the last `poll_link` (set by `init_rings`).
+    link_was_up: bool,
+    /// Link transitions seen by `poll_link`.
+    pub link_changes: u32,
 }
 
 impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
@@ -359,6 +363,8 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
             intr_seen: 0,
             tx_notes: [FrameNote { len: 0, head: [0; NOTE_BYTES] }; NOTES],
             rx_notes: [FrameNote { len: 0, head: [0; NOTE_BYTES] }; NOTES],
+            link_was_up: false,
+            link_changes: 0,
         }
     }
 
@@ -379,6 +385,19 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
         }
         let x = xid(tx_config);
         Some(Identity { tx_config, xid: x, family: family(x), mac, link: link_from_phy_status(self.regs.r8(PHY_STATUS)) })
+    }
+
+    /// `Some(up)` when the PHY's link state differs from the last call (or
+    /// from `init_rings`): a cable pulled or plugged, a switch rebooted. Reads
+    /// `PHYstatus` only, so polled operation sees it as well as `LinkChg`.
+    pub fn poll_link(&mut self) -> Option<bool> {
+        let up = self.link().up;
+        if up == self.link_was_up {
+            return None;
+        }
+        self.link_was_up = up;
+        self.link_changes += 1;
+        Some(up)
     }
 
     pub fn link(&self) -> Link {
@@ -485,6 +504,7 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
         r.w16(INTR_MASK, 0); // polled
         r.w16(INTR_STATUS, 0xFFFF); // clear anything pending
         r.w8(CFG9346, CFG9346_LOCK);
+        self.link_was_up = self.link().up;
     }
 
     /// One ERI write (`_rtl_eri_write`): data first, then the command, then
@@ -663,7 +683,7 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
     /// descriptors there, and the first bytes of the last frames each way.
     pub fn report(&self, out: &mut impl core::fmt::Write) -> core::fmt::Result {
         let r = &self.regs;
-        writeln!(out, "rtl8168: rx {} (dropped {}) tx {} (dropped {}, in flight {})", self.rx_frames, self.rx_dropped, self.tx_frames, self.tx_dropped, self.tx_in_flight())?;
+        writeln!(out, "rtl8168: rx {} (dropped {}) tx {} (dropped {}, in flight {}), link changes {}", self.rx_frames, self.rx_dropped, self.tx_frames, self.tx_dropped, self.tx_in_flight(), self.link_changes)?;
         writeln!(out, "regs: ChipCmd {:#04x} TxPoll {:#04x} IntrMask {:#06x} IntrStatus {:#06x}", r.r8(CHIP_CMD), r.r8(TX_POLL), r.r16(INTR_MASK), r.r16(INTR_STATUS))?;
         writeln!(out, "regs: TxConfig {:#010x} RxConfig {:#010x} CPlusCmd {:#06x} MaxTxPkt {:#04x} RxMaxSize {:#06x}", r.r32(TX_CONFIG), r.r32(RX_CONFIG), r.r16(C_PLUS_CMD), r.r8(MAX_TX_PACKET_SIZE), r.r16(RX_MAX_SIZE))?;
         writeln!(out, "regs: MISC {:#010x} (RXDV gate {}) DLLPR {:#04x}", r.r32(MISC), if r.r32(MISC) & MISC_RXDV_GATED_EN != 0 { "CLOSED" } else { "open" }, r.r8(DLLPR))?;
@@ -1256,6 +1276,19 @@ mod tests {
         let mut buf = [0u8; 2048];
         assert_eq!(d.recv(&mut buf), None);
         assert_eq!(d.intr_seen, INT_TX_OK, "seen and acknowledged by an empty receive");
+    }
+
+    #[test]
+    fn poll_link_reports_each_transition_once() {
+        let (mut d, dev) = up(0x1000_0000);
+        assert_eq!(d.poll_link(), None, "the state at init is the baseline");
+        let was = dev.0.borrow().link_status;
+        dev.0.borrow_mut().link_status = 0;
+        assert_eq!(d.poll_link(), Some(false));
+        assert_eq!(d.poll_link(), None, "reported once");
+        dev.0.borrow_mut().link_status = was | PHYST_LINK;
+        assert_eq!(d.poll_link(), Some(true));
+        assert_eq!(d.link_changes, 2);
     }
 
     #[test]

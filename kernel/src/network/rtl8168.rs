@@ -111,6 +111,13 @@ impl net::Nic for Rtl {
     fn send(&mut self, frame: &[u8]) -> bool {
         self.drv.send(frame)
     }
+    fn link_change(&mut self) -> Option<bool> {
+        let change = self.drv.poll_link();
+        if let Some(up) = change {
+            serial_println!("rtl8168: link {} ({:?})", if up { "up" } else { "down" }, self.drv.link());
+        }
+        change
+    }
 }
 
 /// Reserves a vector and aims the function's MSI-X (else MSI) at it. `None`

@@ -28,6 +28,11 @@ pub trait Nic {
     /// Queues one frame for sending. `false` when the device has no room
     /// (the stack retries on its next poll).
     fn send(&mut self, frame: &[u8]) -> bool;
+    /// `Some(up)` once per link transition (cable, switch); NICs that cannot
+    /// tell never report one.
+    fn link_change(&mut self) -> Option<bool> {
+        None
+    }
 }
 
 /// smoltcp `Device` over a [`Nic`]. Checksums are computed in software on
