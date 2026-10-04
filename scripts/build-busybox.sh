@@ -84,6 +84,23 @@ COMMON=(
     -isystem "\$RESOURCE_INC"
 )
 
+# Assembly sources (libbb/*_shaNI.S) must not get the C-only header
+# force-included: clang would try to assemble the struct declaration.
+for arg in "\$@"; do
+    case "\$arg" in
+        *.S)
+            filtered=()
+            skip=0
+            for c in "\${COMMON[@]}"; do
+                if [ "\$skip" = "1" ]; then skip=0; continue; fi
+                if [ "\$c" = "-include" ]; then skip=1; continue; fi
+                filtered+=("\$c")
+            done
+            COMMON=("\${filtered[@]}")
+            break ;;
+    esac
+done
+
 if [ "\$is_link" = "1" ]; then
     # No separate libm.a/librt.a exist — musl's math functions are already
     # bundled straight into libc.a — so drop -lm/-lrt rather than fail
