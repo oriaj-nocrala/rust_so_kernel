@@ -27,6 +27,8 @@ const DEVICE: u16 = 0x8168;
 const DMA_MASK: u64 = u64::MAX >> 17;
 /// Longest wait for auto-negotiation, in milliseconds.
 const LINK_WAIT_MS: u64 = 6_000;
+/// The PHY/MAC-MCU patch Linux applies to the RTL8168h (`FIRMWARE_8168H_2`), under `firmware::ROOT`.
+const FW_8168H_2: &str = "rtl_nic/rtl8168h-2.fw";
 
 /// The register window: volatile MMIO.
 pub struct KRegs {
@@ -255,6 +257,30 @@ pub fn probe(level: NicLevel, irq_apic: Option<u32>) -> Option<Rtl> {
     // Linux configures the PHY before the link comes up; this chip's
     // (XID 0x541) dropped gigabit ~13 s after boot without it.
     if id.xid == 0x541 {
+        // `rtl8168h_2_hw_phy_config` starts with the PHY/MAC-MCU patch Linux
+        // loads from linux-firmware (root build.rs stages it on disk.img).
+        match crate::firmware::load(FW_8168H_2) {
+            Ok(data) => match r::PhyFirmware::parse(&data) {
+                Ok(fw) => {
+                    let delay_ms = |ms: u32| {
+                        let end = crate::cpu::tsc::uptime_ms() + ms as u64 + 1;
+                        while crate::cpu::tsc::uptime_ms() < end {
+                            relax();
+                        }
+                    };
+                    let ok = drv.apply_phy_firmware(&fw, relax, delay_ms);
+                    serial_println!(
+                        "rtl8168: firmware {} ({}, {} actions) {}",
+                        FW_8168H_2,
+                        core::str::from_utf8(fw.version).unwrap_or("?"),
+                        fw.len(),
+                        if ok { "applied" } else { "FAILED (MDIO timeout or no end)" }
+                    );
+                }
+                Err(e) => serial_println!("rtl8168: firmware {} rejected: {:?}", FW_8168H_2, e),
+            },
+            Err(e) => serial_println!("rtl8168: firmware {} not loaded ({:?}); PHY left unpatched", FW_8168H_2, e),
+        }
         let ok = drv.phy_config_8168h(relax);
         serial_println!("rtl8168: PHY configured as Linux's rtl8168h_2 ({})", if ok { "ok" } else { "MDIO TIMED OUT" });
     }

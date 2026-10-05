@@ -355,7 +355,7 @@ fn ensure_fonts() {
     }
 }
 
-/// NVIDIA firmware the kernel loads from `/mnt/lib/firmware`
+/// Firmware the kernel loads from `/mnt/lib/firmware` (NVIDIA's, and the RTL8168h PHY patch)
 /// (`docs/gpu/gpu-plan.md`, decision D3): copied from the host's
 /// linux-firmware package and decompressed here, never committed (it is
 /// NVIDIA's, redistributable only with its licence, which goes along).
@@ -363,10 +363,12 @@ fn ensure_fonts() {
 /// (63 MB) is not here yet: it does not fit on the 96 MiB `disk.img`, and
 /// phase 4 decides where it lives. Best-effort: without the package the
 /// build goes on and the kernel reports the files missing.
-const FIRMWARE: [&str; 3] = [
+const FIRMWARE: [&str; 4] = [
     "nvidia/ga106/gsp/bootloader-570.144.bin",
     "nvidia/ga106/gsp/booter_load-570.144.bin",
     "nvidia/ga106/gsp/booter_unload-570.144.bin",
+    // The RTL8168h PHY/MAC-MCU patch (docs/net/rtl8168.md), from linux-firmware-realtek.
+    "rtl_nic/rtl8168h-2.fw",
 ];
 const FIRMWARE_LICENCE: &str = "/usr/share/licenses/linux-firmware-nvidia/LICENCE.nvidia";
 
@@ -380,7 +382,7 @@ fn ensure_firmware() {
         }
         let src = PathBuf::from("/usr/lib/firmware").join(format!("{rel}.zst"));
         if !src.exists() {
-            println!("cargo:warning=firmware {} not on the host (linux-firmware-nvidia?); disk.img goes without it", src.display());
+            println!("cargo:warning=firmware {} not on the host (linux-firmware-nvidia or -realtek?); disk.img goes without it", src.display());
             continue;
         }
         std::fs::create_dir_all(dst.parent().unwrap()).expect("creating disk-image-root/lib/firmware/...");

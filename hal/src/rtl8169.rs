@@ -10,9 +10,11 @@
 //! Linux `r8169` driver as remembered, not read from a document. What is
 //! verified: the host tests (which check this code against *itself* — the
 //! model encodes the same understanding) and, once someone runs it, the
-//! real board. What is deliberately **not** done: the per-chip `hw_start`
-//! sequences (EPHY/ERI/OCP/CSI writes) and PHY firmware/parameter tables
-//! that Linux applies per `XID`. The driver takes the generic path that
+//! real board. Ported for the RTL8168h (XID 0x541, the board's NIC) only:
+//! its PHY parameters (`phy_config_8168h`), the `rtl_fw` PHY/MAC-MCU patch
+//! interpreter (`PhyFirmware`), PHY access through `GPHY_OCP` (8168g/h).
+//! What is deliberately **not** done: the rest of the per-chip `hw_start`
+//! sequences (EPHY/CSI writes) and the tables of other `XID`s. The driver takes the generic path that
 //! other small drivers use (reset, rings, RxConfig/TxConfig, autoneg) and
 //! reports how far it got. See `docs/net/rtl8168.md` for the bring-up
 //! ladder and the list of unknowns.
@@ -61,6 +63,13 @@ pub const REG_WINDOW: usize = 0x100;
 /// the address in bits 30:16 (byte address / 2), `OCPAR_FLAG` for a write.
 pub const OCPDR: usize = 0xB0;
 pub const OCPAR_FLAG: u32 = 1 << 31;
+/// `GPHY_OCP`: the PHY's OCP window, how Linux reaches the PHY on the
+/// 8168g and later (`r8168_phy_ocp_read`/`write`, never `PHYAR`): same
+/// layout as `OCPDR`, completion in `OCPAR_FLAG`.
+pub const GPHY_OCP: usize = 0xB8;
+/// OCP address of the standard (page 0) PHY registers: register `n` is at
+/// `0xa400 + 2n`; page `p` register `0x10 + k` at `(p << 4) + 2k`.
+pub const OCP_STD_PHY_BASE: u16 = 0xa400;
 
 /// The extended register interface (ERI): data at `ERIDR`, command at `ERIAR`.
 pub const ERIDR: usize = 0x70;
@@ -326,6 +335,121 @@ pub enum InitError {
     NoDevice,
 }
 
+/// A Realtek PHY/MAC-MCU patch in Linux's `rtl_fw` format (`rtl_nic/*.fw`
+/// in linux-firmware), validated as `rtl_fw_format_ok` + `rtl_fw_data_ok`
+/// do (`r8169_firmware.c`). Run by `Rtl8168::apply_phy_firmware`.
+pub struct PhyFirmware<'a> {
+    /// The version string of the header (`rtl8168h-2_0.0.2 02/26/15`), or empty.
+    pub version: &'a [u8],
+    /// The actions, 4 little-endian bytes each.
+    code: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FwError {
+    /// Too short for a header or a single action, or not a whole number of actions.
+    Truncated,
+    /// The bytes do not sum to 0 (header format).
+    Checksum,
+    /// `fw_start`/`fw_len` outside the file.
+    BadBounds,
+    /// A jump or skip that leaves the program, or `MDIO_CHG` with a value above 1.
+    OutOfRange(usize),
+    /// An unknown opcode.
+    BadAction(u32),
+}
+
+// `rtl_fw_opcode`.
+const FW_PHY_READ: u32 = 0x0;
+const FW_PHY_DATA_OR: u32 = 0x1;
+const FW_PHY_DATA_AND: u32 = 0x2;
+const FW_PHY_BJMPN: u32 = 0x3;
+const FW_PHY_MDIO_CHG: u32 = 0x4;
+const FW_PHY_CLEAR_READCOUNT: u32 = 0x7;
+const FW_PHY_WRITE: u32 = 0x8;
+const FW_PHY_READCOUNT_EQ_SKIP: u32 = 0x9;
+const FW_PHY_COMP_EQ_SKIPN: u32 = 0xa;
+const FW_PHY_COMP_NEQ_SKIPN: u32 = 0xb;
+const FW_PHY_WRITE_PREVIOUS: u32 = 0xc;
+const FW_PHY_SKIPN: u32 = 0xd;
+const FW_PHY_DELAY_MS: u32 = 0xe;
+/// `struct fw_info`: magic, a 32-byte version, `fw_start`, `fw_len`, checksum byte.
+const FW_INFO_SIZE: usize = 4 + 32 + 4 + 4 + 1;
+/// Actions `apply_phy_firmware` runs before giving up on a program that
+/// loops (Linux has no bound; the real patches poll at most 100 times).
+const FW_MAX_STEPS: usize = 1_000_000;
+
+impl<'a> PhyFirmware<'a> {
+    pub fn parse(data: &'a [u8]) -> Result<Self, FwError> {
+        if data.len() < 4 {
+            return Err(FwError::Truncated);
+        }
+        let le32 = |off: usize| u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+        let fw = if le32(0) == 0 {
+            if data.len() < FW_INFO_SIZE {
+                return Err(FwError::Truncated);
+            }
+            if data.iter().fold(0u8, |a, b| a.wrapping_add(*b)) != 0 {
+                return Err(FwError::Checksum);
+            }
+            let start = le32(36) as usize;
+            let len = le32(40) as usize;
+            if start > data.len() || len > (data.len() - start) / 4 {
+                return Err(FwError::BadBounds);
+            }
+            let v = &data[4..36];
+            let vlen = v.iter().position(|b| *b == 0).unwrap_or(v.len());
+            PhyFirmware { version: &v[..vlen], code: &data[start..start + len * 4] }
+        } else {
+            if data.len() % 4 != 0 {
+                return Err(FwError::Truncated);
+            }
+            PhyFirmware { version: &[], code: data }
+        };
+        fw.check()?;
+        Ok(fw)
+    }
+
+    /// Number of actions.
+    pub fn len(&self) -> usize {
+        self.code.len() / 4
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.code.is_empty()
+    }
+
+    fn action(&self, i: usize) -> u32 {
+        u32::from_le_bytes(self.code[i * 4..i * 4 + 4].try_into().unwrap())
+    }
+
+    /// `rtl_fw_data_ok`.
+    fn check(&self) -> Result<(), FwError> {
+        let n = self.len();
+        for i in 0..n {
+            let a = self.action(i);
+            let val = a & 0xffff;
+            let regno = ((a >> 16) & 0xfff) as usize;
+            match a >> 28 {
+                FW_PHY_READ | FW_PHY_DATA_OR | FW_PHY_DATA_AND | FW_PHY_CLEAR_READCOUNT | FW_PHY_WRITE
+                | FW_PHY_WRITE_PREVIOUS | FW_PHY_DELAY_MS => {}
+                FW_PHY_MDIO_CHG if val > 1 => return Err(FwError::OutOfRange(i)),
+                FW_PHY_MDIO_CHG => {}
+                FW_PHY_BJMPN if regno > i => return Err(FwError::OutOfRange(i)),
+                FW_PHY_BJMPN => {}
+                FW_PHY_READCOUNT_EQ_SKIP if i + 2 >= n => return Err(FwError::OutOfRange(i)),
+                FW_PHY_READCOUNT_EQ_SKIP => {}
+                FW_PHY_COMP_EQ_SKIPN | FW_PHY_COMP_NEQ_SKIPN | FW_PHY_SKIPN if i + 1 + regno >= n => {
+                    return Err(FwError::OutOfRange(i))
+                }
+                FW_PHY_COMP_EQ_SKIPN | FW_PHY_COMP_NEQ_SKIPN | FW_PHY_SKIPN => {}
+                _ => return Err(FwError::BadAction(a)),
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Writes ` tcp 1.2.3.4:80 > 5.6.7.8:1234 SYN|ACK seq 1 ack 2 win 3` for an
 /// IPv4 TCP frame (or ` icmp type N` / ` udp a:p > b:p`); `false` (nothing
 /// written) when the note is another protocol or too short to say.
@@ -429,6 +553,10 @@ pub struct Rtl8168<R: Regs, D: DmaMem> {
     pub rx_notes: [FrameNote; NOTES],
     /// Energy-Efficient Ethernet advertised and TX LPI left alone; see `set_eee`.
     eee: bool,
+    /// The page that `phy_write(0x1f, page)` selected, as an OCP base
+    /// (Linux's `tp->ocp_base`; on the 8168g/h the page lives in software,
+    /// shared with the firmware's MAC MCU writes).
+    ocp_base: core::cell::Cell<u16>,
     /// Link state as of the last `poll_link` (set by `init_rings`).
     link_was_up: bool,
     /// Link transitions seen by `poll_link`.
@@ -451,6 +579,7 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
             tx_notes: [FrameNote { len: 0, head: [0; NOTE_BYTES] }; NOTES],
             rx_notes: [FrameNote { len: 0, head: [0; NOTE_BYTES] }; NOTES],
             eee: true,
+            ocp_base: core::cell::Cell::new(OCP_STD_PHY_BASE),
             link_was_up: false,
             link_changes: 0,
         }
@@ -590,9 +719,64 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
         Err(InitError::ResetTimeout)
     }
 
-    /// An MDIO read of PHY register `reg` (`rtl_readphy`): write the address,
-    /// the chip sets `PHYAR.Flag` when the data is in. `None` on timeout.
+    /// The PHY goes through `GPHY_OCP` (8168g and later, Linux's
+    /// `RTL_GIGA_MAC_VER_40..`), else through `PHYAR`.
+    fn gphy_ocp(&self) -> bool {
+        matches!(family(xid(self.regs.r32(TX_CONFIG))), Family::Rtl8168H | Family::Rtl8168G)
+    }
+
+    /// The OCP address `r8168g_mdio_{read,write}` compute for `reg` under
+    /// the selected page.
+    fn phy_ocp_addr(&self, reg: u8) -> u16 {
+        let base = self.ocp_base.get();
+        let reg = reg as u16 & 0x1f;
+        let reg = if base != OCP_STD_PHY_BASE { reg.wrapping_sub(0x10) } else { reg };
+        base.wrapping_add(reg.wrapping_mul(2))
+    }
+
+    /// `r8168_phy_ocp_read`: the address, then wait for `OCPAR_FLAG` set.
+    pub fn phy_ocp_read(&self, addr: u16, mut relax: impl FnMut()) -> Option<u16> {
+        if addr & 1 != 0 {
+            return None;
+        }
+        self.regs.w32(GPHY_OCP, (addr as u32) << 15);
+        for _ in 0..100_000u32 {
+            let v = self.regs.r32(GPHY_OCP);
+            if v & OCPAR_FLAG != 0 {
+                return Some(v as u16);
+            }
+            relax();
+        }
+        None
+    }
+
+    /// `r8168_phy_ocp_write`: flag, address and data, then wait for the flag to clear.
+    pub fn phy_ocp_write(&self, addr: u16, value: u16, mut relax: impl FnMut()) -> bool {
+        if addr & 1 != 0 {
+            return false;
+        }
+        self.regs.w32(GPHY_OCP, OCPAR_FLAG | (addr as u32) << 15 | value as u32);
+        for _ in 0..100_000u32 {
+            if self.regs.r32(GPHY_OCP) & OCPAR_FLAG == 0 {
+                return true;
+            }
+            relax();
+        }
+        false
+    }
+
+    /// A read of PHY register `reg` (`rtl_readphy`). On the 8168g/h register
+    /// 0x1f (page select) is the software page; elsewhere `PHYAR`: write
+    /// the address, the chip sets `PHYAR.Flag` when the data is in. `None`
+    /// on timeout.
     pub fn phy_read(&self, reg: u8, mut relax: impl FnMut()) -> Option<u16> {
+        if self.gphy_ocp() {
+            if reg == 0x1f {
+                let base = self.ocp_base.get();
+                return Some(if base == OCP_STD_PHY_BASE { 0 } else { base >> 4 });
+            }
+            return self.phy_ocp_read(self.phy_ocp_addr(reg), relax);
+        }
         self.regs.w32(PHYAR, (reg as u32 & 0x1F) << 16);
         for _ in 0..100_000u32 {
             let v = self.regs.r32(PHYAR);
@@ -604,14 +788,108 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
         None
     }
 
-    /// An MDIO write (`rtl_writephy`): the chip clears `PHYAR.Flag` when done.
+    /// A write of PHY register `reg` (`rtl_writephy`): on the 8168g/h a write
+    /// to 0x1f selects the page in software (`r8168g_mdio_write`); elsewhere
+    /// `PHYAR`, which the chip clears `Flag` of when done.
     pub fn phy_write(&self, reg: u8, value: u16, mut relax: impl FnMut()) -> bool {
+        if self.gphy_ocp() {
+            if reg == 0x1f {
+                self.ocp_base.set(if value != 0 { value << 4 } else { OCP_STD_PHY_BASE });
+                return true;
+            }
+            return self.phy_ocp_write(self.phy_ocp_addr(reg), value, relax);
+        }
         self.regs.w32(PHYAR, PHYAR_FLAG | (reg as u32 & 0x1F) << 16 | value as u32);
         for _ in 0..100_000u32 {
             if self.regs.r32(PHYAR) & PHYAR_FLAG == 0 {
                 return true;
             }
             relax();
+        }
+        false
+    }
+
+    /// `mac_mcu_write` / `mac_mcu_read`: the firmware's MAC MCU target,
+    /// paged through the same `ocp_base` as the PHY (`0x1f` sets it, no
+    /// `0xa400` special case), addresses not doubled.
+    fn mac_mcu_write(&self, reg: u16, value: u16) {
+        if reg == 0x1f {
+            self.ocp_base.set(value << 4);
+        } else {
+            self.mac_ocp_write(self.ocp_base.get().wrapping_add(reg), value);
+        }
+    }
+
+    fn mac_mcu_read(&self, reg: u16) -> u16 {
+        self.mac_ocp_read(self.ocp_base.get().wrapping_add(reg))
+    }
+
+    /// `rtl_fw_write_firmware` then the rest of `r8169_apply_firmware`:
+    /// the page back to 0 (one patch leaves it elsewhere) and up to 600 ms
+    /// for a PHY reset the patch may have started. 8168g/h only (the PHY
+    /// target is `GPHY_OCP`). `false` on an MDIO timeout or a program that
+    /// does not end.
+    pub fn apply_phy_firmware(&self, fw: &PhyFirmware, mut relax: impl FnMut(), mut delay_ms: impl FnMut(u32)) -> bool {
+        let r = &mut relax;
+        let ok = (|| {
+            let mut mcu = false;
+            let (mut predata, mut count) = (0u32, 0u32);
+            let mut index = 0usize;
+            let mut steps = 0usize;
+            while index < fw.len() {
+                steps += 1;
+                if steps > FW_MAX_STEPS {
+                    return false;
+                }
+                let a = fw.action(index);
+                let data = a & 0xffff;
+                let regno = (a >> 16) & 0xfff;
+                match a >> 28 {
+                    FW_PHY_READ => {
+                        predata = if mcu {
+                            self.mac_mcu_read(regno as u16) as u32
+                        } else {
+                            match self.phy_read(regno as u8, &mut *r) {
+                                Some(v) => v as u32,
+                                None => return false,
+                            }
+                        };
+                        count += 1;
+                    }
+                    FW_PHY_DATA_OR => predata |= data,
+                    FW_PHY_DATA_AND => predata &= data,
+                    FW_PHY_BJMPN => index = index.wrapping_sub(regno as usize + 1),
+                    FW_PHY_MDIO_CHG => mcu = data != 0,
+                    FW_PHY_CLEAR_READCOUNT => count = 0,
+                    FW_PHY_WRITE | FW_PHY_WRITE_PREVIOUS => {
+                        let v = if a >> 28 == FW_PHY_WRITE { data } else { predata } as u16;
+                        if mcu {
+                            self.mac_mcu_write(regno as u16, v);
+                        } else if !self.phy_write(regno as u8, v, &mut *r) {
+                            return false;
+                        }
+                    }
+                    FW_PHY_READCOUNT_EQ_SKIP if count == data => index += 1,
+                    FW_PHY_COMP_EQ_SKIPN if predata == data => index += regno as usize,
+                    FW_PHY_COMP_NEQ_SKIPN if predata != data => index += regno as usize,
+                    FW_PHY_SKIPN => index += regno as usize,
+                    FW_PHY_DELAY_MS => delay_ms(data),
+                    _ => {}
+                }
+                index = index.wrapping_add(1);
+            }
+            true
+        })();
+        self.ocp_base.set(OCP_STD_PHY_BASE);
+        if !ok {
+            return false;
+        }
+        for _ in 0..12 {
+            match self.phy_read(MII_BMCR, &mut *r) {
+                Some(v) if v & BMCR_RESET == 0 => return true,
+                Some(_) => delay_ms(50),
+                None => return false,
+            }
         }
         false
     }
@@ -997,6 +1275,8 @@ mod tests {
         reset_stuck: bool,
         eri: alloc::collections::BTreeMap<u32, u32>,
         bmcr_resets: u32,
+        /// Every PHY OCP write, in order: (address, value).
+        phy_ocp_writes: Vec<(u16, u16)>,
         /// PHY registers behind a non-zero page (register 0x1f).
         paged: alloc::collections::BTreeMap<(u16, usize), u16>,
         ocp: alloc::collections::BTreeMap<u16, u16>,
@@ -1023,6 +1303,7 @@ mod tests {
                 reset_stuck: false,
                 eri: Default::default(),
                 bmcr_resets: 0,
+                phy_ocp_writes: Vec::new(),
                 paged: Default::default(),
                 ocp: Default::default(),
             })))
@@ -1114,7 +1395,35 @@ mod tests {
         }
         fn r32(&self, off: usize) -> u32 {
             let mut m = self.0.borrow_mut();
+            if off == GPHY_OCP {
+                // PHY OCP: page 0 registers at 0xa400 + 2n, page p register 0x10 + k at (p << 4) + 2k.
+                let v = Self::rd32(&m, GPHY_OCP);
+                let addr = ((v >> 15) & 0xFFFF) as u16;
+                let (page, reg) = if (OCP_STD_PHY_BASE..OCP_STD_PHY_BASE + 0x20).contains(&addr) {
+                    (0u16, ((addr - OCP_STD_PHY_BASE) / 2) as usize)
+                } else {
+                    (addr >> 4, 0x10 + ((addr & 0xF) / 2) as usize)
+                };
+                if v & OCPAR_FLAG == 0 {
+                    let val = if page != 0 { m.paged.get(&(page, reg)).copied().unwrap_or(0) } else { m.phy[reg] };
+                    return OCPAR_FLAG | (addr as u32) << 15 | val as u32;
+                }
+                m.phy_ocp_writes.push((addr, v as u16));
+                if page != 0 {
+                    m.paged.insert((page, reg), v as u16);
+                } else if reg == MII_BMCR as usize {
+                    m.bmcr_resets += (v as u16 & BMCR_RESET != 0) as u32;
+                    m.phy[reg] = v as u16 & !BMCR_RESET;
+                } else {
+                    m.phy[reg] = v as u16;
+                }
+                m.regs[GPHY_OCP..GPHY_OCP + 4].copy_from_slice(&(v & !OCPAR_FLAG).to_le_bytes());
+                return v & !OCPAR_FLAG;
+            }
             if off == PHYAR {
+                if xid(Self::rd32(&m, TX_CONFIG)) == 0x541 {
+                    m.violations.push("PHYAR used on an 8168h (Linux goes through GPHY_OCP)");
+                }
                 // MDIO: the read (flag clear) completes with the flag set; a write completes with it clear.
                 let v = Self::rd32(&m, PHYAR);
                 let reg = ((v >> 16) & 0x1F) as usize;
@@ -1656,6 +1965,105 @@ mod tests {
         assert_eq!(m.regs[EEE_LED], 0x40, "LED frequency bits cleared, the rest kept");
         assert_eq!(m.phy[0x1f], 0, "page restored");
         assert_eq!(m.phy[MII_BMCR as usize], BMCR_ANENABLE | BMCR_ANRESTART);
+    }
+
+    fn fw_act(op: u32, reg: u32, data: u32) -> u32 {
+        op << 28 | reg << 16 | data
+    }
+
+    /// A file in the header format (`struct fw_info`), checksum fixed up.
+    fn fw_file(actions: &[u32]) -> Vec<u8> {
+        let start = 64usize;
+        let mut f = alloc::vec![0u8; start];
+        f[4..12].copy_from_slice(b"test 1.0");
+        f[36..40].copy_from_slice(&(start as u32).to_le_bytes());
+        f[40..44].copy_from_slice(&(actions.len() as u32).to_le_bytes());
+        for a in actions {
+            f.extend_from_slice(&a.to_le_bytes());
+        }
+        let sum = f.iter().fold(0u8, |a, b| a.wrapping_add(*b));
+        f[44] = 0u8.wrapping_sub(sum);
+        f
+    }
+
+    #[test]
+    fn fw_parse_as_rtl_fw_format_and_data_ok() {
+        let ok = fw_file(&[fw_act(FW_PHY_WRITE, 0x1f, 0x0a43), fw_act(FW_PHY_SKIPN, 0, 0), fw_act(FW_PHY_DELAY_MS, 0, 1)]);
+        let fw = PhyFirmware::parse(&ok).unwrap();
+        assert_eq!((fw.version, fw.len()), (&b"test 1.0"[..], 3));
+        let mut bad = ok.clone();
+        bad[50] ^= 1;
+        assert_eq!(PhyFirmware::parse(&bad).err(), Some(FwError::Checksum));
+        let jump_out = fw_file(&[fw_act(FW_PHY_WRITE, 0, 0), fw_act(FW_PHY_BJMPN, 2, 0)]);
+        assert_eq!(PhyFirmware::parse(&jump_out).err(), Some(FwError::OutOfRange(1)));
+        let skip_out = fw_file(&[fw_act(FW_PHY_SKIPN, 1, 0), fw_act(FW_PHY_WRITE, 0, 0)]);
+        assert_eq!(PhyFirmware::parse(&skip_out).err(), Some(FwError::OutOfRange(0)));
+        let chg = fw_file(&[fw_act(FW_PHY_MDIO_CHG, 0, 2)]);
+        assert_eq!(PhyFirmware::parse(&chg).err(), Some(FwError::OutOfRange(0)));
+        let unknown = fw_file(&[fw_act(0x5, 0, 0)]);
+        assert_eq!(PhyFirmware::parse(&unknown).err(), Some(FwError::BadAction(0x5000_0000)));
+        // Headerless: a bare list of actions (nonzero first word).
+        let bare: Vec<u8> = [fw_act(FW_PHY_WRITE, 1, 2)].iter().flat_map(|a| a.to_le_bytes()).collect();
+        assert_eq!(PhyFirmware::parse(&bare).map(|f| f.len()), Ok(1));
+        assert_eq!(PhyFirmware::parse(&bare[..3]).err(), Some(FwError::Truncated));
+    }
+
+    #[test]
+    fn fw_runs_mcu_and_phy_actions_as_rtl_fw_write_firmware() {
+        let dev = Dev::new(0x1000_0000);
+        let d = Rtl8168::new(dev.clone(), dev.clone());
+        dev.0.borrow_mut().paged.insert((0x0b82, 0x10), 0x0100);
+        dev.0.borrow_mut().paged.insert((0x0b80, 0x10), 0x0000);
+        let prog = fw_file(&[
+            // MAC MCU: page 0xfc2, two writes (addresses not doubled).
+            fw_act(FW_PHY_MDIO_CHG, 0, 1),
+            fw_act(FW_PHY_WRITE, 0x1f, 0x0fc2),
+            fw_act(FW_PHY_WRITE, 0x08, 0x1234),
+            fw_act(FW_PHY_WRITE, 0x0a, 0x5678),
+            // Back to the PHY: read-modify-write page 0xb82 reg 0x10 (OR 0x10).
+            fw_act(FW_PHY_MDIO_CHG, 0, 0),
+            fw_act(FW_PHY_WRITE, 0x1f, 0x0b82),
+            fw_act(FW_PHY_READ, 0x10, 0),
+            fw_act(FW_PHY_DATA_OR, 0, 0x0010),
+            fw_act(FW_PHY_WRITE_PREVIOUS, 0x10, 0),
+            // Poll page 0xb80 reg 0x10 bit 6, at most 3 reads, 1 ms apart.
+            fw_act(FW_PHY_WRITE, 0x1f, 0x0b80),
+            fw_act(FW_PHY_CLEAR_READCOUNT, 0, 0),
+            fw_act(FW_PHY_DELAY_MS, 0, 1),
+            fw_act(FW_PHY_READ, 0x10, 0),
+            fw_act(FW_PHY_DATA_AND, 0, 0x0040),
+            fw_act(FW_PHY_COMP_EQ_SKIPN, 2, 0x0040),
+            fw_act(FW_PHY_READCOUNT_EQ_SKIP, 0, 3),
+            fw_act(FW_PHY_BJMPN, 5, 0),
+            fw_act(FW_PHY_WRITE, 0x1f, 0x0a43),
+            fw_act(FW_PHY_COMP_NEQ_SKIPN, 1, 0x0040),
+            fw_act(FW_PHY_WRITE, 0x13, 0xdead), // skipped: predata is 0, not 0x40
+            fw_act(FW_PHY_WRITE, 0x14, 0x6201),
+        ]);
+        let fw = PhyFirmware::parse(&prog).unwrap();
+        let mut delays = Vec::new();
+        assert!(d.apply_phy_firmware(&fw, || {}, |ms| delays.push(ms)));
+        let m = dev.0.borrow();
+        assert_eq!(m.ocp.get(&0xfc28), Some(&0x1234));
+        assert_eq!(m.ocp.get(&0xfc2a), Some(&0x5678));
+        assert_eq!(m.paged[&(0x0b82, 0x10)], 0x0110, "read, OR, write previous");
+        assert_eq!(delays, alloc::vec![1, 1, 1], "three polls, then the read count ends the loop");
+        assert_eq!(m.paged.get(&(0x0a43, 0x13)), None, "NEQ skip taken");
+        assert_eq!(m.paged[&(0x0a43, 0x14)], 0x6201);
+        // Linux's OCP addresses: page p register 0x10 + k at (p << 4) + 2k.
+        assert_eq!(m.phy_ocp_writes, alloc::vec![(0xb820, 0x0110), (0xa438, 0x6201)]);
+        assert_eq!(d.ocp_base.get(), OCP_STD_PHY_BASE, "page back to 0 afterwards");
+        assert!(m.violations.is_empty(), "{:?}", m.violations);
+    }
+
+    #[test]
+    fn fw_that_never_ends_is_cut_off() {
+        let dev = Dev::new(0x1000_0000);
+        let d = Rtl8168::new(dev.clone(), dev.clone());
+        let prog = fw_file(&[fw_act(FW_PHY_DELAY_MS, 0, 0), fw_act(FW_PHY_BJMPN, 1, 0)]);
+        let fw = PhyFirmware::parse(&prog).unwrap();
+        assert!(!d.apply_phy_firmware(&fw, || {}, |_| {}));
+        assert_eq!(d.ocp_base.get(), OCP_STD_PHY_BASE);
     }
 
     #[test]
