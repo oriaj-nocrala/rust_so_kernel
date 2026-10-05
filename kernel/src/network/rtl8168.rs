@@ -116,7 +116,17 @@ impl net::Nic for Rtl {
     fn link_change(&mut self) -> Option<bool> {
         let change = self.drv.poll_link();
         if let Some(up) = change {
-            serial_println!("rtl8168: link {} at {} ms ({:?})", if up { "up" } else { "down" }, crate::cpu::tsc::uptime_ms(), self.drv.link());
+            // CTRL1000 (what we advertise) and STAT1000 (the partner's): the board came
+            // back from a drop at 100 Mb/s with our 1000BASE-T advertisement cleared.
+            let rd = |reg| self.drv.phy_read(reg, core::hint::spin_loop);
+            serial_println!(
+                "rtl8168: link {} at {} ms ({:?}) CTRL1000 {:04x?} STAT1000 {:04x?}",
+                if up { "up" } else { "down" },
+                crate::cpu::tsc::uptime_ms(),
+                self.drv.link(),
+                rd(r::MII_CTRL1000),
+                rd(10)
+            );
         }
         change
     }
