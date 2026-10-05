@@ -2,7 +2,9 @@
 // The colour of one pixel of a draw, premultiplied; the pipeline blends it "over" what is under it (ONE, ONE_MINUS_SRC_ALPHA), so an opaque
 // one (alpha 1) replaces it exactly. Modes: a solid colour; a client's buffer one for one (no sampler, no format, no filtering), its words
 // 0x00RRGGBB, with a colour key (2: top byte 0 = transparent, the cursor) or premultiplied 0xAARRGGBB (4); a shape (3): a rounded box with a
-// gradient, a border and a soft shadow, all from its signed distance, so edges are anti-aliased. host_comp.c's reference does the same maths.
+// gradient, a border and a soft shadow, all from its signed distance, so edges are anti-aliased; glass (misc.w bit 1): its fill over a
+// blurred copy of what is behind it, the bound buffer (blur.comp's output, the region at src.xy, src.z wide, misc.w >> 8 tall).
+// host_comp.c's reference does the same maths.
 layout(push_constant) uniform PC {
     ivec4 dst;
     ivec4 src;
@@ -45,6 +47,12 @@ vec4 shape() {
                           : mix(unpack_straight(pc.grad.z), unpack_straight(pc.grad.w), split < 1.0 ? (t - split) / (1.0 - split) : 1.0);
     float bw = pc.geom.y;
     if (bw > 0.0) fill = mix(unpack_straight(pc.extra.x), fill, clamp(0.5 - (d + bw), 0.0, 1.0));
+    if ((pc.misc.w & 2u) != 0u) {
+        // the blurred backdrop under the fill (opaque): clamped into the region, as the buffer loads of the other modes are
+        ivec2 q = clamp(ivec2(p) - pc.src.xy, ivec2(0), ivec2(pc.src.z - 1, int(pc.misc.w >> 8) - 1));
+        vec4 back = unpack(pix.px[uint(q.y * pc.src.z + q.x)]);
+        fill += back * (1.0 - fill.a);
+    }
     vec4 o = fill * cover;
     vec4 sc = unpack_straight(pc.extra.y);
     if (sc.a > 0.0) {

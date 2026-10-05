@@ -130,6 +130,9 @@ static void mixv(const float a[4], const float b[4], float t, float o[4]) {
 }
 
 /* A CR_SHAPE's premultiplied colour at the pixel (x, y), as comp.frag's shape() */
+/* A glass's blurred backdrop for the shape being drawn (reference_shape sets it): `px` holds `w x h` pixels of the screen from (x, y) */
+static struct { const uint32_t *px; int x, y, w, h; } glass_back;
+
 static void shape_pixel(const struct cr_op *op, int x, int y, float o[4]) {
    const struct cr_shape *s = &op->shape;
    float px = (float)x + 0.5f, py = (float)y + 0.5f;
@@ -148,6 +151,14 @@ static void shape_pixel(const struct cr_op *op, int x, int y, float o[4]) {
       float bc[4];
       unpack_straight(s->border_color, bc);
       mixv(bc, fill, clampf(0.5f - (d + s->border), 0.0f, 1.0f), fill);
+   }
+   if (glass_back.px) {
+      int qx = x - glass_back.x, qy = y - glass_back.y;
+      qx = qx < 0 ? 0 : qx >= glass_back.w ? glass_back.w - 1 : qx;
+      qy = qy < 0 ? 0 : qy >= glass_back.h ? glass_back.h - 1 : qy;
+      uint32_t v = glass_back.px[qy * glass_back.w + qx];
+      float back[4] = { (float)((v >> 16) & 255) / 255.0f, (float)((v >> 8) & 255) / 255.0f, (float)(v & 255) / 255.0f, 1.0f };
+      for (int i = 0; i < 4; i++) fill[i] += back[i] * (1.0f - fill[3]);
    }
    for (int i = 0; i < 4; i++) o[i] = fill[i] * cover;
    float sc[4];
@@ -170,7 +181,39 @@ static void blend_over(uint32_t *dst, const float src[4]) {
    *dst = out;
 }
 
-/* every pixel of the screen (or of its clip): a renderer that covers too little (the shadow's reach) shows as a difference */
+/* One pass of blur.comp's Gaussian over `w x h` words: along x (dir 0) or y (1), radius r, sigma r / 2, edges clamped, rounded to 8 bits. */
+static void blur_pass(const uint32_t *src, uint32_t *dst, int w, int h, int r, int dir) {
+   float s = (float)r * 0.5f < 0.5f ? 0.5f : (float)r * 0.5f;
+   for (int y = 0; y < h; y++)
+      for (int x = 0; x < w; x++) {
+         float acc[3] = { 0, 0, 0 }, total = 0;
+         for (int k = -r; k <= r; k++) {
+            int xx = dir == 0 ? x + k : x, yy = dir == 0 ? y : y + k;
+            xx = xx < 0 ? 0 : xx >= w ? w - 1 : xx;
+            yy = yy < 0 ? 0 : yy >= h ? h - 1 : yy;
+            float wt = expf(-(float)(k * k) / (2.0f * s * s));
+            uint32_t v = src[yy * w + xx];
+            acc[0] += wt * (float)((v >> 16) & 255) / 255.0f;
+            acc[1] += wt * (float)((v >> 8) & 255) / 255.0f;
+            acc[2] += wt * (float)(v & 255) / 255.0f;
+            total += wt;
+         }
+         uint32_t o = 0xff000000u;
+         for (int i = 0; i < 3; i++) o |= (uint32_t)(clampf(acc[i] / total, 0.0f, 1.0f) * 255.0f + 0.5f) << (16 - 8 * i);
+         dst[y * w + x] = o;
+      }
+}
+
+/* How rough a row of the screen is (the sum of its neighbours' differences, green): a blur makes it smoother */
+static long roughness(const uint32_t *out, int y, int x0, int x1) {
+   long sum = 0;
+   for (int x = x0; x + 1 < x1; x++) sum += labs((long)((out[y * W + x + 1] >> 8) & 255) - (long)((out[y * W + x] >> 8) & 255));
+   return sum;
+}
+static long glass_rough_before, glass_rough_after;
+
+/* every pixel of the screen (or of its clip): a renderer that covers too little (the shadow's reach) shows as a difference. A glass blurs
+ * what is behind its box first (its region: the box in its clip, grown by the radius, on the screen) */
 static void reference_shape(const struct cr_op *op, uint32_t *out) {
    const struct cr_shape *s = &op->shape;
    int x0 = 0, y0 = 0, x1 = W, y1 = H;
@@ -180,12 +223,39 @@ static void reference_shape(const struct cr_op *op, uint32_t *out) {
       x1 = s->clip_x + s->clip_w < W ? s->clip_x + s->clip_w : W;
       y1 = s->clip_y + s->clip_h < H ? s->clip_y + s->clip_h : H;
    }
+   uint32_t *back = NULL;
+   if (s->backdrop_blur > 0.0f) {
+      int r = (int)ceilf(s->backdrop_blur);
+      int bx0 = op->x > x0 ? op->x : x0, by0 = op->y > y0 ? op->y : y0;
+      int bx1 = op->x + op->w < x1 ? op->x + op->w : x1, by1 = op->y + op->h < y1 ? op->y + op->h : y1;
+      int gx0 = bx0 - r < 0 ? 0 : bx0 - r, gy0 = by0 - r < 0 ? 0 : by0 - r;
+      int gx1 = bx1 + r > W ? W : bx1 + r, gy1 = by1 + r > H ? H : by1 + r;
+      if (gx1 > gx0 && gy1 > gy0) {
+         int gw = gx1 - gx0, gh = gy1 - gy0;
+         uint32_t *a = malloc((size_t)gw * gh * 4), *b = malloc((size_t)gw * gh * 4);
+         for (int y = 0; y < gh; y++) memcpy(a + y * gw, out + (gy0 + y) * W + gx0, (size_t)gw * 4);
+         blur_pass(a, b, gw, gh, (int)(s->backdrop_blur + 0.5f), 0);
+         blur_pass(b, a, gw, gh, (int)(s->backdrop_blur + 0.5f), 1);
+         free(b);
+         back = a;
+         glass_back.px = a; glass_back.x = gx0; glass_back.y = gy0; glass_back.w = gw; glass_back.h = gh;
+         int ry = (by0 + by1) / 2;
+         glass_rough_before = roughness(out, ry, bx0 + 12, bx1 - 12);
+      }
+   }
    for (int y = y0; y < y1; y++)
       for (int x = x0; x < x1; x++) {
          float c[4];
          shape_pixel(op, x, y, c);
          if (c[3] > 0.0f) blend_over(&out[y * W + x], c);
       }
+   if (back) {
+      int bx0 = op->x > x0 ? op->x : x0, bx1 = op->x + op->w < x1 ? op->x + op->w : x1;
+      int by0 = op->y > y0 ? op->y : y0, by1 = op->y + op->h < y1 ? op->y + op->h : y1;
+      glass_rough_after = roughness(out, (by0 + by1) / 2, bx0 + 12, bx1 - 12);
+      glass_back.px = NULL;
+      free(back);
+   }
 }
 
 /* A GUI_DRAW_SHAPE as the renderer's operation (what vk-comp/src/lib.rs does with a DrawOp::Shape) */
@@ -532,6 +602,8 @@ int main(int argc, char **argv) {
       /* off the bottom-right corner, its shadow too; a 3-stop gradient (c1 == c2) */
       struct cr_shape corner = { .radius = 6, .border = 1, .split = 0.5f, .shadow_blur = 6, .c = { 0xffff0000u, 0xff00ff00u, 0xff00ff00u, 0xff0000ffu },
                                  .border_color = 0xff000000u, .shadow_color = 0xff000000u, .shadow_dx = 4, .shadow_dy = 4 };
+      struct cr_shape glassy = { .radius = 12, .border = 1, .split = 1, .c = { 0x50ffffffu, 0x30ffffffu, 0, 0 }, .border_color = 0x90ffffffu,
+                                 .backdrop_blur = 8, .shadow_color = 0x40000000u, .shadow_blur = 6, .shadow_dy = 3 };
       /* an icon: premultiplied ARGB, a disc whose alpha falls off to the edge (what `img` decodes) */
       static uint32_t icon[48 * 48];
       for (int y = 0; y < 48; y++)
@@ -547,6 +619,8 @@ int main(int argc, char **argv) {
          { .kind = CR_SHAPE, .x = 580, .y = 20, .w = 50, .h = 50, .shape = ring },
          { .kind = CR_SHAPE, .x = 60, .y = 20, .w = 240, .h = 18, .shape = title },
          { .kind = CR_SHAPE, .x = 600, .y = 320, .w = 80, .h = 80, .shape = corner },
+         /* glass over the windows' sharp pixels (the gradient window and the checkered pool window): blurred, a white tint, a border */
+         { .kind = CR_SHAPE, .x = 20, .y = 110, .w = 230, .h = 70, .shape = glassy },
          { .kind = CR_CPU, .key = 1ull << 62, .version = 1, .px = icon, .npx = 48 * 48, .src_w = 48, .alpha = CR_PREMUL, .x = 100, .y = 200, .w = 48, .h = 48 },
          { .kind = CR_CPU, .key = 1ull << 62, .version = 1, .px = icon, .npx = 48 * 48, .src_w = 48, .alpha = CR_PREMUL, .x = 0, .y = 150, .w = 38, .h = 48, .sx = 10 },
       };
@@ -577,6 +651,9 @@ int main(int argc, char **argv) {
       extra_ops = deco;
       n_extra = sizeof(deco) / sizeof(deco[0]);
       failures += frame(&v, &comp, dir, "5c-shapes") != 0;
+      CHECK(comp.glass_count == 1, "one blurred backdrop (%u)", comp.glass_count);
+      CHECK(glass_rough_before > 0 && glass_rough_after * 2 < glass_rough_before, "the glass blurs what is behind it (row roughness %ld -> %ld)",
+            glass_rough_before, glass_rough_after);
       extra_ops = NULL;
       n_extra = 0;
    }

@@ -3,7 +3,7 @@
 layout(push_constant) uniform PC {
     ivec4 dst;      // x, y, w, h on screen: what the draw covers
     ivec4 src;      // x, y inside the source, stride in pixels, mode (0 solid, 1 buffer, 2 buffer with a key, 3 shape, 4 premultiplied buffer)
-    uvec4 misc;     // colour, screen w, screen h, flags (shape: bit 0 = horizontal gradient)
+    uvec4 misc;     // colour, screen w, screen h, flags (shape: bit 0 horizontal gradient, bit 1 glass; glass: its region's height << 8)
     ivec4 box;      // shape: its box on screen (dst also covers the shadow)
     vec4 geom;      // shape: corner radius, border width, gradient split, shadow blur
     uvec4 grad;     // shape: the gradient's four colours, 0xAARRGGBB straight alpha

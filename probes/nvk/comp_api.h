@@ -34,6 +34,8 @@ struct cr_shape {
    uint32_t horizontal;     /* 1: the gradient runs left to right instead of top to bottom */
    int32_t clip_x, clip_y, clip_w, clip_h;   /* drawn only inside this rectangle (clip_w <= 0: no clip): a title bar's box reaches
                                               * under the window's content so only its top corners are round, and the clip keeps it out */
+   float backdrop_blur;     /* glass: > 0 draws the fill over what is behind the shape blurred by this radius in pixels (a Gaussian, sigma
+                             * radius / 2); 0: over what is behind, as it is. Needs a target the renderer can copy from (cr_stats.glass) */
 };
 
 struct cr_op {
@@ -57,6 +59,7 @@ struct cr_stats {
     * its CPU wait for that copy and the PRESENT ioctl) */
    uint32_t acquire_us, render_us, present_us;
    uint32_t upload_kb;      /* KiB of CPU windows' pixels the frames copied (only the rows that changed) */
+   uint32_t glass;          /* the last frame's blurred backdrops; ~0u if the target cannot be copied from (glass drawn without blur) */
 };
 
 /* The renderer's entry points (comp_vk.c), what the compositor program in Rust calls. All on one thread. */

@@ -564,6 +564,7 @@ fn run(args: &[String]) -> i32 {
                             clip_y: c.y,
                             clip_w: c.w,
                             clip_h: c.h,
+                            backdrop_blur: 0.0,
                         };
                         ops.push(CrOp { x: rect.x, y: rect.y, w: rect.w, h: rect.h, shape, ..CrOp::new(CR_SHAPE) });
                     }

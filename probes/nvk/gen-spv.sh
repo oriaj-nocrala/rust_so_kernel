@@ -34,3 +34,18 @@ for n in ("vert", "frag"):
     print("static const unsigned int comp_%s_spv_len = %d;" % (n, len(d)))
 PY
 rm -rf "$t"
+
+# the glass's blur (blur.comp -> blur_spv.h)
+t=$(mktemp -d)
+glslangValidator -V blur.comp -o "$t/comp.spv" >/dev/null
+python3 - "$t" <<'PY' > blur_spv.h
+import sys
+print("/* Generated from blur.comp with glslangValidator -V (gen-spv.sh): do not edit. */")
+d = open(sys.argv[1] + "/comp.spv", "rb").read()
+print("static const unsigned char blur_comp_spv[] = {")
+for i in range(0, len(d), 12):
+    print("  " + ", ".join("0x%02x" % b for b in d[i:i + 12]) + ",")
+print("};")
+print("static const unsigned int blur_comp_spv_len = %d;" % len(d))
+PY
+rm -rf "$t"

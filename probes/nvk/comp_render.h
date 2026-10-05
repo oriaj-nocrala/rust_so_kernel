@@ -5,7 +5,9 @@
  * It draws a list of `cr_op` (comp_api.h), back to front, with one graphics pipeline: a rectangle per operation, whose fragment shader
  * shows a solid colour, reads the pixel of a client's buffer as a storage buffer, one for one, or computes a shape (rounded box, gradient,
  * border, shadow) from its signed distance (comp.vert, comp.frag). Every draw blends "over" (premultiplied); an opaque one replaces what is
- * under it exactly. The buffers:
+ * under it exactly. Glass (a shape with `backdrop_blur`): the frame so far is paused there, the region behind the shape is copied out of the
+ * target into a buffer and blurred by a compute shader in two passes (blur.comp), and the shape's fill goes over that blurred copy. The
+ * buffers:
  *   - GPU buffers (CR_GPU): the client's memory, imported where it is (constanos: the opaque-fd import of a /dev/nvgpu BO; host
  *     harness: a descriptor of a memfd, mapped and copied into a buffer of its own before every frame, standing in for shared memory);
  *   - pool windows (CR_CPU): the library's copy of their pixels: written to a host-visible staging buffer and copied into a device-local one
@@ -28,11 +30,13 @@
 #endif
 
 #include "comp_spv.h"
+#include "blur_spv.h"
 #include "comp_api.h"
 
 #define COMP_MAX_GPU 64
 #define COMP_MAX_CPU 32
 #define COMP_MAX_SETS 160
+#define COMP_MAX_GLASS 4    /* blurred backdrops in one frame (the taskbar, the menu, ...); past that, glass is drawn unblurred */
 
 /* Every Vulkan entry point the renderer calls. */
 #define COMP_FUNCS(X) \
@@ -43,7 +47,8 @@
    X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkCmdPipelineBarrier) X(vkCmdBeginRendering) X(vkCmdEndRendering) \
    X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
    X(vkCmdCopyBuffer) X(vkCreateFence) X(vkResetFences) X(vkWaitForFences) X(vkQueueSubmit) X(vkDeviceWaitIdle) \
-   X(vkDestroyPipeline) X(vkDestroyPipelineLayout) X(vkDestroyDescriptorSetLayout) X(vkDestroyDescriptorPool) X(vkDestroyCommandPool) X(vkDestroyFence)
+   X(vkDestroyPipeline) X(vkDestroyPipelineLayout) X(vkDestroyDescriptorSetLayout) X(vkDestroyDescriptorPool) X(vkDestroyCommandPool) X(vkDestroyFence) \
+   X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkCmdCopyImageToBuffer)
 
 struct comp_src {
    uint64_t key;               /* GPU: the handle; CPU: client << 32 | surface; 0 = free */
@@ -70,6 +75,15 @@ struct comp_src {
    int dropped;                /* GPU: the window manager let go; freed once the frames that may read it are done */
 };
 
+/* A glass's backdrop: the region behind it copied out of the target (`a`), blurred along x into `b`, then along y back into `a`, which the
+ * shape reads. Grown as needed, kept across frames. */
+struct comp_glass {
+   VkBuffer a, b;
+   VkDeviceMemory am, bm;
+   size_t capacity;
+   VkDescriptorSet frag, h, v;   /* `a` for comp.frag; (a -> b) and (b -> a) for blur.comp */
+};
+
 struct comp {
    VkDevice device;
    VkPhysicalDeviceMemoryProperties mp;
@@ -93,6 +107,12 @@ struct comp {
    uint32_t frames, draws, draws_max, imports, drops, uploads;
    uint64_t upload_bytes;      /* bytes the frames copied into VRAM (staged sources) or wrote in place (host sources) */
    int cpu_in_host;            /* COMP_CPU_HOST=1: CPU sources stay in one host-visible buffer */
+   VkDescriptorSetLayout blur_dsl;
+   VkPipelineLayout blur_pl;
+   VkPipeline blur_pipe;
+   struct comp_glass glass[COMP_MAX_GLASS];
+   int backdrop;               /* the target can be copied from (TRANSFER_SRC): glass is blurred; else drawn over the scene as it is */
+   uint32_t glass_count;       /* the last frame's blurred backdrops */
 };
 
 /* comp.vert / comp.frag's push constants: 112 bytes (Vulkan guarantees 128) */
@@ -237,8 +257,28 @@ static int comp_init(struct comp *c, VkDevice device, PFN_vkGetDeviceProcAddr gd
    c->vkDestroyShaderModule(device, vmod, NULL);
    c->vkDestroyShaderModule(device, fmod, NULL);
 
-   VkDescriptorPoolSize psz = { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = COMP_MAX_SETS };
-   VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, .maxSets = COMP_MAX_SETS, .poolSizeCount = 1, .pPoolSizes = &psz };
+   /* the glass's blur: a compute pipeline over two storage buffers */
+   VkDescriptorSetLayoutBinding bb[2] = {
+      { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT },
+      { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT } };
+   VkDescriptorSetLayoutCreateInfo bdci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = bb };
+   if (c->vkCreateDescriptorSetLayout(device, &bdci, NULL, &c->blur_dsl) != VK_SUCCESS) return -11;
+   VkPushConstantRange bpcr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 16 };
+   VkPipelineLayoutCreateInfo bplci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &c->blur_dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &bpcr };
+   if (c->vkCreatePipelineLayout(device, &bplci, NULL, &c->blur_pl) != VK_SUCCESS) return -12;
+   VkShaderModule bmod;
+   VkShaderModuleCreateInfo bs = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = blur_comp_spv_len, .pCode = (const uint32_t *)blur_comp_spv };
+   if (c->vkCreateShaderModule(device, &bs, NULL, &bmod) != VK_SUCCESS) return -13;
+   VkComputePipelineCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = c->blur_pl,
+      .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = bmod, .pName = "main" } };
+   VkResult cr = c->vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci, NULL, &c->blur_pipe);
+   c->vkDestroyShaderModule(device, bmod, NULL);
+   if (cr != VK_SUCCESS) return -14;
+   c->backdrop = 1;   /* the caller says otherwise if its target cannot be copied from */
+
+   VkDescriptorPoolSize psz = { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = COMP_MAX_SETS + 5 * COMP_MAX_GLASS };
+   VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+      .maxSets = COMP_MAX_SETS + 3 * COMP_MAX_GLASS, .poolSizeCount = 1, .pPoolSizes = &psz };
    if (c->vkCreateDescriptorPool(device, &dpci, NULL, &c->pool) != VK_SUCCESS) return -6;
    VkCommandPoolCreateInfo cpi = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = family };
    if (c->vkCreateCommandPool(device, &cpi, NULL, &c->cpool) != VK_SUCCESS) return -7;
@@ -259,6 +299,16 @@ static void comp_destroy(struct comp *c) {
    for (int i = 0; i < COMP_MAX_GPU; i++) if (c->gpu[i].key) comp_free_src(c, &c->gpu[i]);
    for (int i = 0; i < COMP_MAX_CPU; i++) if (c->cpu[i].key) comp_free_src(c, &c->cpu[i]);
    comp_free_src(c, &c->dummy);
+   for (int i = 0; i < COMP_MAX_GLASS; i++) {
+      struct comp_glass *g = &c->glass[i];
+      if (g->a) c->vkDestroyBuffer(c->device, g->a, NULL);
+      if (g->b) c->vkDestroyBuffer(c->device, g->b, NULL);
+      if (g->am) c->vkFreeMemory(c->device, g->am, NULL);
+      if (g->bm) c->vkFreeMemory(c->device, g->bm, NULL);
+   }
+   c->vkDestroyPipeline(c->device, c->blur_pipe, NULL);
+   c->vkDestroyPipelineLayout(c->device, c->blur_pl, NULL);
+   c->vkDestroyDescriptorSetLayout(c->device, c->blur_dsl, NULL);
    c->vkDestroyFence(c->device, c->fence, NULL);
    c->vkDestroyCommandPool(c->device, c->cpool, NULL);
    c->vkDestroyDescriptorPool(c->device, c->pool, NULL);
@@ -400,6 +450,58 @@ static struct comp_src *comp_cpu_source(struct comp *c, const struct cr_op *op) 
    return s;
 }
 
+/* Glass slot `g`'s buffers, at least `bytes` each (device-local: only the GPU touches them), and its descriptor sets. 0, or negative. */
+static int comp_glass_buffers(struct comp *c, struct comp_glass *g, size_t bytes) {
+   if (g->capacity < bytes) {
+      if (g->a) c->vkDestroyBuffer(c->device, g->a, NULL);
+      if (g->b) c->vkDestroyBuffer(c->device, g->b, NULL);
+      if (g->am) c->vkFreeMemory(c->device, g->am, NULL);
+      if (g->bm) c->vkFreeMemory(c->device, g->bm, NULL);
+      g->a = g->b = VK_NULL_HANDLE;
+      g->am = g->bm = VK_NULL_HANDLE;
+      g->capacity = 0;
+      VkBufferUsageFlags u = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      if (comp_buffer(c, &g->a, &g->am, NULL, bytes, u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0) != 0 ||
+          comp_buffer(c, &g->b, &g->bm, NULL, bytes, u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0) != 0) return -1;
+      g->capacity = (bytes + 4095) & ~(size_t)4095;
+   }
+   if (!g->frag) {
+      VkDescriptorSetAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = c->pool, .descriptorSetCount = 1, .pSetLayouts = &c->dsl };
+      VkDescriptorSetAllocateInfo bi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = c->pool, .descriptorSetCount = 1, .pSetLayouts = &c->blur_dsl };
+      if (c->vkAllocateDescriptorSets(c->device, &ai, &g->frag) != VK_SUCCESS || c->vkAllocateDescriptorSets(c->device, &bi, &g->h) != VK_SUCCESS ||
+          c->vkAllocateDescriptorSets(c->device, &bi, &g->v) != VK_SUCCESS) return -2;
+   }
+   VkDescriptorBufferInfo a = { g->a, 0, VK_WHOLE_SIZE }, b = { g->b, 0, VK_WHOLE_SIZE };
+   VkWriteDescriptorSet w[5] = {
+      { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g->frag, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &a },
+      { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g->h, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &a },
+      { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g->h, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &b },
+      { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g->v, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &b },
+      { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g->v, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &a } };
+   c->vkUpdateDescriptorSets(c->device, 5, w, 0, NULL);
+   return 0;
+}
+
+/* The region a glass shape blurs: its box (in its clip) on the screen, grown by the radius on every side (what the blur reads), kept on
+ * the screen. Empty (w = 0) when nothing of it shows. */
+static void comp_glass_region(const struct cr_op *op, uint32_t sw, uint32_t sh, int32_t out[4]) {
+   const struct cr_shape *s = &op->shape;
+   int x0 = op->x, y0 = op->y, x1 = op->x + op->w, y1 = op->y + op->h;
+   if (s->clip_w > 0) {
+      if (x0 < s->clip_x) x0 = s->clip_x;
+      if (y0 < s->clip_y) y0 = s->clip_y;
+      if (x1 > s->clip_x + s->clip_w) x1 = s->clip_x + s->clip_w;
+      if (y1 > s->clip_y + s->clip_h) y1 = s->clip_y + s->clip_h;
+   }
+   int r = (int)(s->backdrop_blur + 0.999f);
+   x0 -= r; y0 -= r; x1 += r; y1 += r;
+   if (x0 < 0) x0 = 0;
+   if (y0 < 0) y0 = 0;
+   if (x1 > (int)sw) x1 = (int)sw;
+   if (y1 > (int)sh) y1 = (int)sh;
+   out[0] = x0; out[1] = y0; out[2] = x1 > x0 && y1 > y0 ? x1 - x0 : 0; out[3] = y1 > y0 && x1 > x0 ? y1 - y0 : 0;
+}
+
 /* CPU sources nobody drew in the last `COMP_IDLE_FRAMES` frames are freed (a window that closed, a title that changed size): at the end of every frame. */
 #define COMP_IDLE_FRAMES 120
 
@@ -461,12 +563,18 @@ static int comp_frame(struct comp *c, const struct cr_op *ops, size_t n, uint64_
    c->vkCmdSetViewport(c->cb, 0, 1, &vp);
    c->vkCmdSetScissor(c->cb, 0, 1, &sc);
    c->vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, c->pipe);
+   /* after a glass's blur the frame goes on where it was */
+   VkRenderingAttachmentInfo ca_load = ca;
+   ca_load.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+   VkRenderingInfo ri_load = ri;
+   ri_load.pColorAttachments = &ca_load;
 
-   uint32_t draws = 0;
+   uint32_t draws = 0, nglass = 0;
    for (size_t i = 0; i < n; i++) {
       const struct cr_op *op = &ops[i];
       struct comp_push pc = { .dst = { op->x, op->y, op->w, op->h }, .misc = { 0, w, h, 0 } };
       struct comp_src *src = &c->dummy;
+      VkDescriptorSet glass_set = VK_NULL_HANDLE;   /* a glass: its blurred backdrop instead */
       switch (op->kind) {
       case CR_FILL:
          pc.misc[0] = op->color;
@@ -490,12 +598,63 @@ static int comp_frame(struct comp *c, const struct cr_op *ops, size_t n, uint64_
       case CR_SHAPE:
          if (op->w <= 0 || op->h <= 0) continue;
          comp_shape_push(op, &pc);
+         if (op->shape.backdrop_blur > 0.0f && c->backdrop && nglass < COMP_MAX_GLASS && pc.dst[2] > 0 && pc.dst[3] > 0) {
+            int32_t g[4];
+            comp_glass_region(op, w, h, g);
+            struct comp_glass *gl = &c->glass[nglass];
+            if (g[2] <= 0 || comp_glass_buffers(c, gl, (size_t)g[2] * g[3] * 4) != 0) break;   /* nothing to blur, or no memory: plain */
+            nglass++;
+            /* the frame so far: the region behind the glass, out of the target into `a` */
+            c->vkCmdEndRendering(c->cb);
+            VkImageMemoryBarrier to_src = to_color;
+            to_src.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            to_src.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            c->vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &to_src);
+            VkBufferImageCopy bic = { .bufferRowLength = (uint32_t)g[2], .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                      .imageOffset = { g[0], g[1], 0 }, .imageExtent = { (uint32_t)g[2], (uint32_t)g[3], 1 } };
+            c->vkCmdCopyImageToBuffer(c->cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, gl->a, 1, &bic);
+            /* blurred along x into `b`, then along y back into `a` */
+            VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT };
+            c->vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+            c->vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, c->blur_pipe);
+            int32_t bp[4] = { g[2], g[3], (int32_t)(op->shape.backdrop_blur + 0.5f), 0 };
+            uint32_t groups = (uint32_t)(((int64_t)g[2] * g[3] + 63) / 64);
+            c->vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, c->blur_pl, 0, 1, &gl->h, 0, NULL);
+            c->vkCmdPushConstants(c->cb, c->blur_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bp), bp);
+            c->vkCmdDispatch(c->cb, groups, 1, 1);
+            VkMemoryBarrier cb2 = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+                                    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
+            c->vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &cb2, 0, NULL, 0, NULL);
+            bp[3] = 1;
+            c->vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, c->blur_pl, 0, 1, &gl->v, 0, NULL);
+            c->vkCmdPushConstants(c->cb, c->blur_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bp), bp);
+            c->vkCmdDispatch(c->cb, groups, 1, 1);
+            VkMemoryBarrier cb3 = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT };
+            c->vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &cb3, 0, NULL, 0, NULL);
+            /* back to drawing, where the frame was */
+            VkImageMemoryBarrier back = to_src;
+            back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            back.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            back.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            c->vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &back);
+            c->vkCmdBeginRendering(c->cb, &ri_load);
+            c->vkCmdSetViewport(c->cb, 0, 1, &vp);
+            c->vkCmdSetScissor(c->cb, 0, 1, &sc);
+            c->vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, c->pipe);
+            /* the shape reads the blurred region */
+            pc.src[0] = g[0]; pc.src[1] = g[1]; pc.src[2] = g[2];
+            pc.misc[3] |= 2u | ((uint32_t)g[3] << 8);
+            glass_set = gl->frag;
+         }
          break;
       default:
          continue;
       }
       if (pc.dst[2] <= 0 || pc.dst[3] <= 0) continue;
-      c->vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, c->pl, 0, 1, &src->set, 0, NULL);
+      c->vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, c->pl, 0, 1, glass_set ? &glass_set : &src->set, 0, NULL);
       c->vkCmdPushConstants(c->cb, c->pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
       c->vkCmdDraw(c->cb, 6, 1, 0, 0);
       draws++;
@@ -522,6 +681,7 @@ static int comp_frame(struct comp *c, const struct cr_op *ops, size_t n, uint64_
    for (int i = 0; i < COMP_MAX_CPU; i++)
       if (c->cpu[i].key && c->frames - c->cpu[i].used_frame > COMP_IDLE_FRAMES) comp_free_src(c, &c->cpu[i]);
    c->draws = draws;
+   c->glass_count = nglass;
    if (draws > c->draws_max) c->draws_max = draws;
    return 0;
 }

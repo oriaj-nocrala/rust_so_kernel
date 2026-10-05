@@ -132,7 +132,7 @@ int cr_init(int headless, uint32_t *width, uint32_t *height) {
    printf("COMP screen %ux%u (%s)\n", R.w, R.h, has_display ? "the display" : "headless");
    VkSwapchainCreateInfoKHR sci = { .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = R.surface, .minImageCount = caps.minImageCount < 3 ? 3 : caps.minImageCount,
       .imageFormat = VK_FORMAT_B8G8R8A8_UNORM, .imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR, .imageExtent = { R.w, R.h }, .imageArrayLayers = 1,
-      .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+      .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT), .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
       .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = VK_PRESENT_MODE_FIFO_KHR, .clipped = VK_TRUE };
    if (vkCreateSwapchainKHR(device, &sci, NULL, &R.swapchain) != VK_SUCCESS) FAILSTEP("vkCreateSwapchainKHR");
    R.count = MAX_SC_IMAGES;
@@ -148,6 +148,9 @@ int cr_init(int headless, uint32_t *width, uint32_t *height) {
    }
    int rc = comp_init(&R.comp, device, R.gdpa, &mp, (uint32_t)family, VK_FORMAT_B8G8R8A8_UNORM);
    if (rc) FAILSTEP("the renderer did not start (step %d)", rc);
+   /* glass blurs what is behind it by copying it out of the swapchain image: only if the images can be copied from */
+   R.comp.backdrop = (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
+   if (!R.comp.backdrop) printf("COMP the swapchain images cannot be copied from: glass without blur\n");
    R.comp_ready = 1;
    *width = R.w;
    *height = R.h;
@@ -209,6 +212,7 @@ void cr_get_stats(struct cr_stats *out) {
    out->render_us = R.render_us;
    out->present_us = R.present_us;
    out->upload_kb = (uint32_t)(R.comp.upload_bytes >> 10);
+   out->glass = R.comp.backdrop ? R.comp.glass_count : ~0u;
 }
 
 void cr_shutdown(void) {

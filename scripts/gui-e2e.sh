@@ -178,7 +178,8 @@ if [ "$MODE" = wm ]; then
         local tx=$1 ty=$2 i c dx dy
         for i in $(seq 20); do
             c=$(cursor "$(shot goto)")
-            if [ "$c" = none ]; then $Q mouse-move 40 -40 >/dev/null; sleep 0.3; continue; fi
+            # not found: it is past the right or bottom edge (its bitmap needs 10 x 10 pixels on the screen): bring it back up-left
+            if [ "$c" = none ]; then $Q mouse-move -40 -40 >/dev/null; sleep 0.3; continue; fi
             set -- $c
             [ "$1" = "$tx" ] && [ "$2" = "$ty" ] && return 0
             dx=$((tx - $1)); dy=$((ty - $2))

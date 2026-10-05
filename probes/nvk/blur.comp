@@ -1,0 +1,37 @@
+#version 450
+// One pass of a separable Gaussian blur over a region of the screen copied into a buffer (0xAARRGGBB words, `w` per row): along x
+// (direction 0) or y (1), radius `r` pixels, sigma r / 2, edges clamped. Two passes (x then y) make the glass's backdrop (comp_render.h).
+// host_comp.c's reference does the same sums.
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) readonly buffer Src { uint px[]; } src;
+layout(std430, set = 0, binding = 1) writeonly buffer Dst { uint px[]; } dst;
+layout(push_constant) uniform PC {
+    ivec4 p;        // w, h, radius, direction
+} pc;
+
+vec4 unpack(uint v) {
+    return vec4(float((v >> 16) & 255u), float((v >> 8) & 255u), float(v & 255u), 255.0) / 255.0;
+}
+
+uint pack(vec4 c) {
+    uvec3 u = uvec3(clamp(c.rgb, 0.0, 1.0) * 255.0 + 0.5);
+    return 0xFF000000u | (u.r << 16) | (u.g << 8) | u.b;
+}
+
+void main() {
+    int w = pc.p.x, h = pc.p.y, r = pc.p.z;
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= w * h) return;
+    int x = i % w, y = i / w;
+    float s = max(float(r) * 0.5, 0.5);
+    vec4 acc = vec4(0.0);
+    float total = 0.0;
+    for (int k = -r; k <= r; k++) {
+        int xx = pc.p.w == 0 ? clamp(x + k, 0, w - 1) : x;
+        int yy = pc.p.w == 0 ? y : clamp(y + k, 0, h - 1);
+        float wt = exp(-float(k * k) / (2.0 * s * s));
+        acc += wt * unpack(src.px[yy * w + xx]);
+        total += wt;
+    }
+    dst.px[i] = pack(acc / total);
+}
