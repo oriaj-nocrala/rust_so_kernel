@@ -118,7 +118,8 @@ impl Shape {
         for y in a.y..a.bottom() {
             let row_inside = inner.w > 0 && inner.h > 0 && y >= inner.y && y < inner.bottom();
             let row = &mut px[y as usize * stride..];
-            let mut last = (i32::MIN, [0.0f32; 4]);
+            // (key, colour, the colour as the pixel it makes when opaque: then "over" is that pixel whatever was under it)
+            let mut last = (i32::MIN, [0.0f32; 4], None::<u32>);
             let mut x = a.x;
             while x < a.right() {
                 let c = if row_inside && x >= inner.x && x < inner.right() {
@@ -128,7 +129,20 @@ impl Shape {
                     }
                     let key = if self.horizontal { x } else { y };
                     if key != last.0 {
-                        last = (key, self.pixel(rect, x, y));
+                        let c = self.pixel(rect, x, y);
+                        last = (key, c, (c[3] >= 1.0).then(|| over_f(0, c)));
+                    }
+                    if let Some(p) = last.2 {
+                        if self.horizontal {
+                            row[x as usize] = p;
+                            x += 1;
+                        } else {
+                            // a vertical gradient: the rest of this row's interior is the same pixel
+                            let end = inner.right().min(a.right());
+                            row[x as usize..end as usize].fill(p);
+                            x = end;
+                        }
+                        continue;
                     }
                     last.1
                 } else {

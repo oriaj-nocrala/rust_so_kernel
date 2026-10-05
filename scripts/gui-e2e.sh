@@ -176,7 +176,7 @@ if [ "$MODE" = wm ]; then
     BLACK=0,0,0
     goto() { # goto x y: moves the pointer there, correcting from screendumps
         local tx=$1 ty=$2 i c dx dy
-        for i in $(seq 20); do
+        for i in $(seq 40); do   # an animated window (fire) slows the CPU compositor under TCG: screendumps lag the moves
             c=$(cursor "$(shot goto)")
             # not found: it is past the right or bottom edge (its bitmap needs 10 x 10 pixels on the screen): bring it back up-left
             if [ "$c" = none ]; then $Q mouse-move -40 -40 >/dev/null; sleep 0.3; continue; fi
@@ -185,9 +185,9 @@ if [ "$MODE" = wm ]; then
             dx=$((tx - $1)); dy=$((ty - $2))
             [ $dx -gt 120 ] && dx=120; [ $dx -lt -120 ] && dx=-120
             [ $dy -gt 120 ] && dy=120; [ $dy -lt -120 ] && dy=-120
-            $Q mouse-move $dx $dy >/dev/null; sleep 0.3
+            $Q mouse-move $dx $dy >/dev/null; sleep 0.4
         done
-        echo "  (goto $tx $ty failed)"; return 1
+        echo "  (goto $tx $ty failed)" >&2; return 1
     }
     press()   { $Q mouse-button 1 >/dev/null; sleep 0.3; }
     release() { $Q mouse-button 0 >/dev/null; sleep 0.5; }
@@ -199,15 +199,15 @@ for label, x, w in re.findall(r' (.+?)@(\d+)\+(\d+)', sys.stdin.read().split('pa
     if label == '$1': print(int(x) + int(w) // 2)"
     }
     menuitem() { # menuitem <label>: "x y" of the centre of the open menu's item, on the screen
-        grep -a "panel: menu" "$STATE/serial.log" | tail -1 | python3 -c "
+        grep -a "panel: menu .*@" "$STATE/serial.log" | tail -1 | python3 -c "
 import re, sys
 for label, x, y in re.findall(r' (.+?)@(\d+),(\d+)', sys.stdin.read().split('panel: menu', 1)[1]):
     if label == '$1': print(x, y)"
     }
     launch() { # launch <label>: opens the start menu (a popup) and clicks the app
-        local n; n=$(grep -ac "panel: menu" "$STATE/serial.log")
+        local n; n=$(grep -ac "panel: menu .*@" "$STATE/serial.log")
         click "$(button Apps)" $PY_
-        for _ in $(seq 1 50); do [ "$(grep -ac "panel: menu" "$STATE/serial.log")" -gt "$n" ] && break; sleep 0.2; done
+        for _ in $(seq 1 50); do [ "$(grep -ac "panel: menu .*@" "$STATE/serial.log")" -gt "$n" ] && break; sleep 0.2; done
         # shellcheck disable=SC2046
         click $(menuitem "$1")
     }
@@ -295,25 +295,35 @@ print(next((x for x in range(150, im.size[0]) if (lambda p: p[0] > 150 and p[1] 
     goto $((c + 18 + 3)) 150; press; $Q mouse-move 100 0 >/dev/null; sleep 0.3; release   # just past the frame's right edge
     s=$(shot w6b)
     [ "$(edge "$s")" = "$c" ] && ok "W6 fire's size did not change ($c)" || bad "W6 fire resized: $c -> $(edge "$s")"
+    click $((c + 8)) 110   # fire's close button: its animation would slow everything after
+    sleep 2
 
     menu_open() { # opens the start menu, waits for its log line; "x y" of its first item
-        local n; n=$(grep -ac "panel: menu " "$STATE/serial.log")
+        local n; n=$(grep -ac "panel: menu .*@" "$STATE/serial.log")
         click "$(button Apps)" $PY_
-        for _ in $(seq 1 50); do [ "$(grep -ac "panel: menu " "$STATE/serial.log")" -gt "$n" ] && break; sleep 0.2; done
-        sleep 1
+        for _ in $(seq 1 75); do [ "$(grep -ac "panel: menu .*@" "$STATE/serial.log")" -gt "$n" ] && break; sleep 0.2; done
         menuitem Terminal
     }
     closed() { grep -ac "panel: menu closed" "$STATE/serial.log"; }
-    pre=$(shot w7pre)
+    shows() { # shows <png before> <x> <y> <want: same|differs>: polls screendumps (the CPU compositor is slow under TCG) up to ~15 s
+        local i s; for i in $(seq 1 30); do
+            s=$(shot "w7poll")
+            if [ "$4" = differs ]; then [ "$(px "$s" "$2" "$3")" != "$(px "$1" "$2" "$3")" ] && { echo "$s"; return 0; }
+            else [ "$(px "$s" "$2" "$3")" = "$(px "$1" "$2" "$3")" ] && { echo "$s"; return 0; }; fi
+            sleep 0.5
+        done; echo "$s"; return 1
+    }
+    pre=$(shot w7pre); cp "$pre" "$OUT/w7pre-kept.png"; pre="$OUT/w7pre-kept.png"
     read -r mx my <<< "$(menu_open)"
-    s=$(shot w7a)
+    s=$(shows "$pre" "$mx" "$my" differs)
     [ "$(px "$s" "$mx" "$my")" != "$(px "$pre" "$mx" "$my")" ] && [ "$my" -lt 768 ] && ok "W7 the menu shows above the strip" || bad "W7 no menu at $mx,$my: $(px "$s" "$mx" "$my")"
-    c0=$(closed); $Q key esc; sleep 1
-    s=$(shot w7b)
+    c0=$(closed); $Q key esc
+    s=$(shows "$pre" "$mx" "$my" same)
     [ "$(closed)" -gt "$c0" ] && [ "$(px "$s" "$mx" "$my")" = "$(px "$pre" "$mx" "$my")" ] && ok "W7 Escape closes it" \
         || bad "W7 Escape: closed $(closed) (was $c0), $(px "$s" "$mx" "$my") at the item"
     menu_open >/dev/null
-    c0=$(closed); click 1000 300; sleep 1
+    c0=$(closed); click 1000 300
+    for _ in $(seq 1 30); do [ "$(closed)" -gt "$c0" ] && break; sleep 0.5; done
     [ "$(closed)" -gt "$c0" ] && ok "W7 a click outside closes it" || bad "W7 a click outside did not close the menu"
     menu_open >/dev/null
     # shellcheck disable=SC2046
