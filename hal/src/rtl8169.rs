@@ -1191,6 +1191,29 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
         }
     }
 
+    /// The PHY side of `/proc/nic`: the MII registers (what we advertise, what
+    /// the link partner advertises, the 1000BASE-T status) and the Realtek
+    /// ones (EEE advertisement and partner's, `PHYSR` at page 0xa43 reg 0x1a).
+    fn report_phy(&self, out: &mut impl core::fmt::Write) -> core::fmt::Result {
+        let mut rd = |reg: u8| self.phy_read(reg, core::hint::spin_loop);
+        let mut pg = |page: u16, reg: u8| self.phy_page_read(page, reg, &mut core::hint::spin_loop);
+        let h = |v: Option<u16>| v.map_or(alloc::string::String::from("----"), |v| alloc::format!("{:04x}", v));
+        let (bmcr, bmsr, adv, lpa, ctrl1000, stat1000) = (rd(0), rd(1), rd(4), rd(5), rd(9), rd(10));
+        writeln!(
+            out,
+            "phy: BMCR {} BMSR {} ADV {} LPA {} CTRL1000 {} STAT1000 {} EEE adv {} lp {} PHYSR {}",
+            h(bmcr), h(bmsr), h(adv), h(lpa), h(ctrl1000), h(stat1000),
+            h(pg(PHY_EEE_ADV_PAGE, PHY_EEE_ADV_REG)), h(pg(PHY_EEE_ADV_PAGE, 0x11)), h(pg(0x0a43, 0x1a))
+        )?;
+        let bit = |v: Option<u16>, b: u16| v.map_or("?", |v| if v & b != 0 { "yes" } else { "no" });
+        writeln!(
+            out,
+            "phy: we offer 1000full {} 100full {}; partner offers 1000full {} 100full {}; master/slave fault {}, idle errors {}",
+            bit(ctrl1000, 1 << 9), bit(adv, 1 << 8), bit(stat1000, 1 << 11), bit(lpa, 1 << 8), bit(stat1000, 1 << 15),
+            stat1000.map_or(0, |v| v & 0xff)
+        )
+    }
+
     /// A human-readable state dump for `/proc/nic`: counters, the registers
     /// that say whether the chip is moving packets, the ring cursors and the
     /// descriptors there, and the first bytes of the last frames each way.
@@ -1201,6 +1224,7 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
         writeln!(out, "regs: TxConfig {:#010x} RxConfig {:#010x} CPlusCmd {:#06x} MaxTxPkt {:#04x} RxMaxSize {:#06x}", r.r32(TX_CONFIG), r.r32(RX_CONFIG), r.r16(C_PLUS_CMD), r.r8(MAX_TX_PACKET_SIZE), r.r16(RX_MAX_SIZE))?;
         writeln!(out, "regs: MISC {:#010x} (RXDV gate {}) DLLPR {:#04x}", r.r32(MISC), if r.r32(MISC) & MISC_RXDV_GATED_EN != 0 { "CLOSED" } else { "open" }, r.r8(DLLPR))?;
         writeln!(out, "regs: TxDesc {:#010x}:{:08x} RxDesc {:#010x}:{:08x} PHYstatus {:#04x} {:?}", r.r32(TX_DESC_START_HI), r.r32(TX_DESC_START_LO), r.r32(RX_DESC_START_HI), r.r32(RX_DESC_START_LO), r.r8(PHY_STATUS), link_from_phy_status(r.r8(PHY_STATUS)))?;
+        self.report_phy(out)?;
         let names: [(u16, &str); 11] = [
             (INT_RX_OK, "RxOK"), (INT_RX_ERR, "RxErr"), (INT_TX_OK, "TxOK"), (INT_TX_ERR, "TxErr"), (INT_RX_OVERFLOW, "RxOverflow"),
             (INT_LINK_CHG, "LinkChg"), (INT_RX_FIFO_OVER, "RxFIFOOver"), (INT_TX_DESC_UNAVAIL, "TxDescUnavail"), (INT_SW, "SWInt"),
@@ -2122,8 +2146,17 @@ mod tests {
         assert!(dev.inject(&f, 0));
         let mut buf = [0u8; 2048];
         assert_eq!(d.recv(&mut buf), Some(100));
+        {
+            let mut m = dev.0.borrow_mut();
+            m.phy[9] = 1 << 9;
+            m.phy[10] = 1 << 11 | 3;
+            m.paged.insert((0x0a43, 0x1a), 0x0b2a);
+        }
         let mut out = String::new();
         d.report(&mut out).unwrap();
+        assert!(out.contains("CTRL1000 0200 STAT1000 0803"), "{}", out);
+        assert!(out.contains("PHYSR 0b2a"), "{}", out);
+        assert!(out.contains("we offer 1000full yes 100full no; partner offers 1000full yes 100full no; master/slave fault no, idle errors 3"), "{}", out);
         assert!(out.contains("rx 1 (dropped 0) tx 1"), "{}", out);
         assert!(out.contains("ChipCmd 0x0c"), "{}", out);
         assert!(out.contains("AUTO_FIFO") || out.contains("TxConfig 0x"), "{}", out);
