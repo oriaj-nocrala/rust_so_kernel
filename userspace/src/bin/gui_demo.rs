@@ -176,7 +176,7 @@ fn main(args: Args) -> i32 {
                     return 0;
                 }
                 // Resize never comes (not resizable), toplevel* are the panel's.
-                Event::Resize { .. } | Event::Toplevel { .. } | Event::ToplevelFocus { .. } | Event::ToplevelGone { .. } | Event::Theme { .. } => {}
+                Event::Resize { .. } | Event::Toplevel { .. } | Event::ToplevelFocus { .. } | Event::ToplevelGone { .. } | Event::Theme { .. } | Event::PopupDone { .. } => {}
                 Event::Error { object, code, message } => {
                     println!("gui_demo: error {} on {}: {}", code, object, message);
                     return 1;

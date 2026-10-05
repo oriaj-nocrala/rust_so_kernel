@@ -116,6 +116,9 @@ pub const DOUBLE_CLICK_MS: u32 = 400;
 
 pub const BTN_LEFT: u32 = 0x110;
 const KEY_BACKSPACE: u32 = 14;
+const KEY_ESC: u32 = 1;
+/// How far past a popup its frame's shadow may reach, at scale 1: what is damaged around it when it shows or hides.
+const POPUP_MARGIN: i32 = 24;
 const KEY_F11: u32 = 87;
 const KEY_F12: u32 = 88;
 const KEY_LEFTCTRL: u32 = 29;
@@ -330,8 +333,10 @@ struct Surface<M> {
     /// Fullscreen (F11): the content box and the maximized state to go back to. While it lasts the window has no title bar and covers
     /// the whole screen.
     fullscreen: Option<(Rect, Option<Rect>)>,
-    /// Has a title bar (every window but the panel).
+    /// Has a title bar (every window but the panel and popups).
     decorated: bool,
+    /// The popup role: shown at (x, y) of this other surface's content.
+    popup: Option<(Key, i32, i32)>,
     /// The content is premultiplied `ARGB8888` (the last pool buffer committed was), shown "over" what is under it.
     premul: bool,
     /// Toplevel id while mapped as a window, 0 otherwise.
@@ -429,6 +434,8 @@ pub struct Compositor<M> {
     stack: Vec<Key>,
     /// The panel's surface and its height.
     panel: Option<(Key, i32)>,
+    /// Mapped popups, bottom to top: above everything, the panel included.
+    popups: Vec<Key>,
     /// Mapped windows by toplevel id, in the order they appeared.
     toplevels: Vec<(u32, Key)>,
     next_tid: u32,
@@ -479,6 +486,7 @@ impl<M: PoolMem> Compositor<M> {
             next_client: 1,
             stack: Vec::new(),
             panel: None,
+            popups: Vec::new(),
             toplevels: Vec::new(),
             next_tid: 1,
             focus: None,
@@ -697,6 +705,7 @@ impl<M: PoolMem> Compositor<M> {
                     decorated: true,
                     premul: false,
                     tid: 0,
+                    popup: None,
                     x: 0,
                     y: 0,
                 };
@@ -832,8 +841,8 @@ impl<M: PoolMem> Compositor<M> {
             Request::SetPanel { surface, height } => {
                 let key = (c, surface);
                 let taken = self.panel.is_some_and(|(k, _)| k != key);
-                if taken || self.surface(key).unwrap().mapped {
-                    return self.fail(c, surface, ErrorCode::Role, "panel role taken, or surface already a window");
+                if taken || self.surface(key).unwrap().mapped || self.surface(key).unwrap().popup.is_some() {
+                    return self.fail(c, surface, ErrorCode::Role, "panel role taken, or surface already a window or a popup");
                 }
                 let h = height.clamp(1, (self.height / 2).max(1));
                 let s = self.surface_mut(key).unwrap();
@@ -848,6 +857,29 @@ impl<M: PoolMem> Compositor<M> {
                 let fid = self.focus.and_then(|k| self.surface(k)).map_or(0, |s| s.tid);
                 self.events.push((c, Event::ToplevelFocus { surface, id: fid }));
                 self.events.push((c, Event::Theme { surface, name: String::from(self.theme.name) }));
+            }
+            Request::SetPopup { surface, parent, x, y } => {
+                let key = (c, surface);
+                let s = self.surface(key).unwrap();
+                let bad = parent == surface
+                    || self.surface((c, parent)).is_none()
+                    || s.mapped
+                    || s.popup.is_some()
+                    || self.panel.is_some_and(|(k, _)| k == key);
+                if bad {
+                    return self.fail(c, surface, ErrorCode::Role, "popup: no such parent, or the surface is mapped, a popup or the panel");
+                }
+                let s = self.surface_mut(key).unwrap();
+                s.decorated = false;
+                s.resizable = None;
+                s.popup = Some(((c, parent), x, y));
+            }
+            Request::SetTheme { surface, name } => {
+                if self.panel.is_some_and(|(k, _)| k == (c, surface)) {
+                    if let Some(t) = theme::by_name(&name) {
+                        self.set_theme(t);
+                    }
+                }
             }
             Request::Activate { surface, toplevel } => {
                 if self.panel.is_some_and(|(k, _)| k == (c, surface)) {
@@ -877,7 +909,12 @@ impl<M: PoolMem> Compositor<M> {
         let th = self.th;
         let work = self.work_area();
         let panel = self.panel.filter(|(k, _)| *k == key).map(|(_, h)| h);
-        let sh = self.height;
+        let (sw, sh) = (self.width, self.height);
+        // a popup: where its parent's content is
+        let popup = self.surface(key).and_then(|s| s.popup).map(|(pk, x, y)| {
+            let at = self.surface(pk).map_or(Rect::new(0, 0, 0, 0), |p| p.content(th));
+            (at.x + x, at.y + y)
+        });
         let s = self.surface_mut(key).unwrap();
         let frames = core::mem::take(&mut s.pending_frames);
         let damage = core::mem::take(&mut s.pending_damage);
@@ -942,6 +979,10 @@ impl<M: PoolMem> Compositor<M> {
                     if let Some(ph) = panel {
                         s.x = 0;
                         s.y = sh - ph;
+                    } else if let Some((px, py)) = popup {
+                        // where it was asked for, kept on the screen
+                        s.x = px.min(sw - bw).max(0);
+                        s.y = py.min(sh - bh).max(0);
                     } else {
                         // Cascade from the top-left, kept in the work area.
                         let step = 32 * (placed % 8);
@@ -984,7 +1025,12 @@ impl<M: PoolMem> Compositor<M> {
             self.events.push((c, Event::Release { buffer: id }));
         }
         self.frame_waiting.extend(frames.into_iter().map(|id| (c, id)));
-        if newly_mapped && panel.is_none() {
+        if newly_mapped && popup.is_some() {
+            self.popups.push(key);
+            let r = self.popup_extent(key);
+            self.damage.add(r);
+        }
+        if newly_mapped && panel.is_none() && popup.is_none() {
             self.placed += 1;
             let tid = self.next_tid;
             self.next_tid += 1;
@@ -1050,6 +1096,16 @@ impl<M: PoolMem> Compositor<M> {
     /// it had.
     fn forget_surface(&mut self, key: Key) {
         self.stack.retain(|k| *k != key);
+        if self.popups.contains(&key) {
+            let r = self.popup_extent(key);
+            self.damage.add(r);
+            self.popups.retain(|k| *k != key);
+        }
+        // its popups go with it
+        let orphans: Vec<Key> = self.popups.iter().copied().filter(|k| self.surface(*k).is_some_and(|s| s.popup.is_some_and(|(p, _, _)| p == key))).collect();
+        for k in orphans {
+            self.dismiss_popup(k);
+        }
         if let Some(i) = self.toplevels.iter().position(|(_, k)| *k == key) {
             let (tid, _) = self.toplevels.remove(i);
             if let Some(s) = self.surface_mut(key) {
@@ -1086,6 +1142,44 @@ impl<M: PoolMem> Compositor<M> {
                 self.tell_panel(|p| Event::ToplevelFocus { surface: p, id: 0 });
             }
         }
+    }
+
+    /// What a popup covers on screen, with room for its frame's shadow.
+    fn popup_extent(&self, key: Key) -> Rect {
+        let m = POPUP_MARGIN * self.scale;
+        self.surface(key).map_or(Rect::new(0, 0, 0, 0), |s| {
+            let f = s.frame(self.th);
+            Rect::new(f.x - m, f.y - m, f.w + 2 * m, f.h + 2 * m)
+        })
+    }
+
+    /// Hides a mapped popup and tells its client (`popup_done`); it stays a popup and shows again at its next commit with a buffer.
+    fn dismiss_popup(&mut self, key: Key) {
+        if !self.popups.contains(&key) {
+            return;
+        }
+        let r = self.popup_extent(key);
+        self.damage.add(r);
+        self.popups.retain(|k| *k != key);
+        if let Some(s) = self.surface_mut(key) {
+            s.mapped = false;
+        }
+        if self.button_target == Some(key) {
+            self.button_target = None;
+        }
+        self.events.push((key.0, Event::PopupDone { surface: key.1 }));
+    }
+
+    /// Every popup, top first.
+    fn dismiss_popups(&mut self) {
+        for k in self.popups.clone().into_iter().rev() {
+            self.dismiss_popup(k);
+        }
+    }
+
+    /// Mapped popups, bottom to top.
+    pub fn popups(&self) -> Vec<(ClientId, u32)> {
+        self.popups.clone()
     }
 
     fn set_focus(&mut self, key: Option<Key>) {
@@ -1273,6 +1367,11 @@ impl<M: PoolMem> Compositor<M> {
     /// The window (or panel) under a point, and which part of it.
     pub fn hit(&self, x: i32, y: i32) -> Option<((ClientId, u32), Zone)> {
         let th = self.th;
+        for &k in self.popups.iter().rev() {
+            if self.surface(k).is_some_and(|s| s.content(th).contains(x, y)) {
+                return Some((k, Zone::Content));
+            }
+        }
         if let Some((k, _)) = self.panel {
             if self.surface(k).is_some_and(|s| s.mapped && s.content(th).contains(x, y)) {
                 return Some((k, Zone::Content));
@@ -1420,9 +1519,14 @@ impl<M: PoolMem> Compositor<M> {
         if self.drag.is_some() || self.resize.is_some() || self.pressed.is_some() {
             return; // another button during a left-button gesture
         }
+        if !self.popups.is_empty() && !self.hit(x, y).is_some_and(|(k, _)| self.popups.contains(&k)) {
+            // a click outside the popups closes them, and goes nowhere
+            self.dismiss_popups();
+            return;
+        }
         let Some((k, zone)) = self.hit(x, y) else { return };
-        if self.panel.is_some_and(|(p, _)| p == k) {
-            // The panel takes clicks, never the focus.
+        if self.panel.is_some_and(|(p, _)| p == k) || self.popups.contains(&k) {
+            // The panel and popups take clicks, never the focus.
             self.button_target = Some(k);
             self.events.push((k.0, Event::Button { surface: k.1, code, pressed: true }));
             return;
@@ -1476,6 +1580,12 @@ impl<M: PoolMem> Compositor<M> {
         }
         if pressed && code == KEY_BACKSPACE && self.ctrl > 0 && self.alt > 0 {
             self.quit = true;
+            return;
+        }
+        if code == KEY_ESC && !self.popups.is_empty() {
+            if pressed {
+                self.dismiss_popups();
+            }
             return;
         }
         if code == KEY_F12 {
@@ -1579,6 +1689,12 @@ impl<M: PoolMem> Compositor<M> {
                 }
                 self.ops_surface(k, scr, &mut ops);
             }
+        }
+        for &k in &self.popups {
+            if let Some(m) = &self.theme.menu {
+                ops.push(DrawOp::Shape { rect: self.surface(k).unwrap().content(self.th), shape: m.frame.scaled(self.scale) });
+            }
+            self.ops_surface(k, scr, &mut ops);
         }
         if let Some(rs) = &self.resize {
             for e in self.outline_edges(rs.outline) {
@@ -1892,6 +2008,15 @@ impl<M: PoolMem> Compositor<M> {
                 }
                 self.paint_surface(k, r, dst, stride, paint_title);
             }
+        }
+        for &k in &self.popups {
+            if let Some(m) = &self.theme.menu {
+                let s = self.surface(k).unwrap();
+                let shape = m.frame.scaled(self.scale);
+                let c = s.content(self.th);
+                shape.paint(dst, stride, r, c);
+            }
+            self.paint_surface(k, r, dst, stride, paint_title);
         }
         if let Some(rs) = &self.resize {
             for e in self.outline_edges(rs.outline) {

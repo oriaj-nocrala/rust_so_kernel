@@ -281,6 +281,35 @@ pub struct Taskbar {
     pub tray_fg: u32,
 }
 
+/// The start menu's look (the panel's popup): the frame (its shadow, border and corners) is drawn by the compositor under the popup's
+/// surface; the panel draws the rest inside it, `inset` from the edge. Lengths at scale 1.
+#[derive(Debug, PartialEq)]
+pub struct Menu {
+    pub frame: Shape,
+    pub inset: i32,
+    /// Luna: a band across the top with the system's name.
+    pub header: Option<Shape>,
+    pub header_h: i32,
+    pub header_fg: u32,
+    /// 9x: a band down the left side with the name written bottom to top.
+    pub banner: Option<Shape>,
+    pub banner_w: i32,
+    pub banner_fg: u32,
+    /// The apps' column.
+    pub items_bg: u32,
+    pub items_fg: u32,
+    /// Luna: a second column (the theme selector) in another colour; `None`: one column, the themes under the apps.
+    pub side_bg: Option<u32>,
+    pub side_fg: u32,
+    /// Under the item the pointer is on, and that item's text.
+    pub hover: Shape,
+    pub hover_fg: u32,
+    /// Luna: a band across the bottom.
+    pub footer: Option<Shape>,
+    pub footer_h: i32,
+    pub separator: u32,
+}
+
 /// One look. See the module's documentation.
 #[derive(Debug, PartialEq)]
 pub struct Theme {
@@ -306,6 +335,8 @@ pub struct Theme {
     pub glyph_weight: i32,
     /// `None`: the panel draws its own flat look, opaque.
     pub taskbar: Option<Taskbar>,
+    /// `None`: the panel draws a flat menu, opaque.
+    pub menu: Option<Menu>,
 }
 
 /// The look `compose` paints: flat fills, no shapes.
@@ -323,6 +354,7 @@ pub static FLAT: Theme = Theme {
     glyph: crate::compositor::BUTTON_FG,
     glyph_weight: 1,
     taskbar: None,
+    menu: None,
 };
 
 /// "Luna 2026": Windows XP's Luna redone with shaders: glossy blue title bars with rounded tops, a blue frame, soft shadows, a red close
@@ -373,6 +405,25 @@ pub static LUNA: Theme = Theme {
         },
         tray_fg: 0x00FF_FFFF,
     }),
+    menu: Some(Menu {
+        frame: Shape::solid(0xFF1C_5ED8).radius(8.0).border(1.0, 0xFF0A_3A9A).shadow(12.0, 4, 4, 0x8000_0000),
+        inset: 2,
+        header: Some(Shape::gradient(0xFF4C_92F2, 0xFF1F_63D8, 0xFF19_58CC, 0xFF15_4FC0, 0.4).radius(6.0)),
+        header_h: 46,
+        header_fg: 0x00FF_FFFF,
+        banner: None,
+        banner_w: 0,
+        banner_fg: 0,
+        items_bg: 0x00FF_FFFF,
+        items_fg: 0x0000_0000,
+        side_bg: Some(0x00D3_E5FA),
+        side_fg: 0x0000_1E5A,
+        hover: Shape::solid(0xFF31_6AC5).radius(2.0),
+        hover_fg: 0x00FF_FFFF,
+        footer: Some(Shape::gradient(0xFF2A_6FE0, 0xFF19_58CC, 0xFF19_58CC, 0xFF14_4AB8, 1.0)),
+        footer_h: 30,
+        separator: 0x00C5_D4EA,
+    }),
 };
 
 /// "9x moderno": Windows 98's layout (grey bevelled frame and buttons, a navy-to-blue title running left to right, a teal desktop) with
@@ -408,6 +459,26 @@ pub static NINES: Theme = Theme {
         task_fg: 0x0000_0000,
         tray: Button::Bevel { face: 0x00D4_D0C8, light: 0x00FF_FFFF, dark: 0x0080_8080 },
         tray_fg: 0x0000_0000,
+    }),
+    menu: Some(Menu {
+        // the raised grey frame of a 98 menu, with a modern soft shadow
+        frame: Shape::solid(0xFFD4_D0C8).border(1.0, 0xFF40_4040).shadow(8.0, 3, 3, 0x6000_0000),
+        inset: 3,
+        header: None,
+        header_h: 0,
+        header_fg: 0,
+        banner: Some(Shape::gradient(0xFF10_84D0, 0xFF0A_246A, 0xFF0A_246A, 0xFF00_0080, 1.0)),
+        banner_w: 24,
+        banner_fg: 0x00D4_D0C8,
+        items_bg: 0x00D4_D0C8,
+        items_fg: 0x0000_0000,
+        side_bg: None,
+        side_fg: 0x0000_0000,
+        hover: Shape::solid(0xFF0A_246A),
+        hover_fg: 0x00FF_FFFF,
+        footer: None,
+        footer_h: 0,
+        separator: 0x0080_8080,
     }),
 };
 

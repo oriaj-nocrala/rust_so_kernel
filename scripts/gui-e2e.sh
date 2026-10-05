@@ -64,6 +64,9 @@
 #   W4. cpumon's close button ends it; term's ends term (ash hangs up).
 #   W6. `fire` (constanos_gfx.h, fixed size) has no maximize button, and
 #       dragging just past its right edge does not change it.
+#   W7. The start menu (a popup): it shows above the strip, Escape and a
+#       click outside close it, and a theme picked in it changes the
+#       taskbar (the strip is the compositor's), then back to flat.
 # Exit status: number of failed checks.
 set -u
 MODE=${1:-demo}
@@ -185,6 +188,19 @@ import re, sys
 for label, x, w in re.findall(r' (.+?)@(\d+)\+(\d+)', sys.stdin.read().split('panel: buttons', 1)[1]):
     if label == '$1': print(int(x) + int(w) // 2)"
     }
+    menuitem() { # menuitem <label>: "x y" of the centre of the open menu's item, on the screen
+        grep -a "panel: menu" "$STATE/serial.log" | tail -1 | python3 -c "
+import re, sys
+for label, x, y in re.findall(r' (.+?)@(\d+),(\d+)', sys.stdin.read().split('panel: menu', 1)[1]):
+    if label == '$1': print(x, y)"
+    }
+    launch() { # launch <label>: opens the start menu (a popup) and clicks the app
+        local n; n=$(grep -ac "panel: menu" "$STATE/serial.log")
+        click "$(button Apps)" $PY_
+        for _ in $(seq 1 50); do [ "$(grep -ac "panel: menu" "$STATE/serial.log")" -gt "$n" ] && break; sleep 0.2; done
+        # shellcheck disable=SC2046
+        click $(menuitem "$1")
+    }
     PY_=784                   # the panel's middle row (800 - 32/2)
     console() { # console <cmd>: runs it in the focused term, output to serial
         $Q send "$1 > /dev/console" && $Q enter; sleep 1.5
@@ -196,9 +212,8 @@ for label, x, w in re.findall(r' (.+?)@(\d+)\+(\d+)', sys.stdin.read().split('pa
     s=$(shot w1)
     [ "$(px "$s" 640 795)" = "$PANEL" ] && [ "$(px "$s" 640 760)" = "$BG" ] \
         && ok "W1 panel on the last strip" || bad "W1 panel: $(px "$s" 640 795) above: $(px "$s" 640 760)"
-    click "$(button Apps)" $PY_
-    $Q wait-for "panel: buttons.*Terminal@" 10 >/dev/null || bad "W1 the launcher did not open"
-    click "$(button Terminal)" $PY_
+    launch Terminal
+    grep -aq "panel: menu.*Terminal@" "$STATE/serial.log" || bad "W1 the start menu did not open"
     $Q wait-for "term: 80x25 cells" 30 >/dev/null || bad "W1 term never started"
     sleep 2
     s=$(shot w1b)
@@ -233,9 +248,7 @@ for label, x, w in re.findall(r' (.+?)@(\d+)\+(\d+)', sys.stdin.read().split('pa
     [ "$(px "$s" 5 5)" = "$BG" ] && [ "$(px "$s" 45 45)" = "$FOCUSED" ] \
         && ok "W3 restored" || bad "W3 restore: $(px "$s" 5 5) / $(px "$s" 45 45)"
 
-    click "$(button Apps)" $PY_
-    $Q wait-for "panel: buttons.*CPU monitor@" 10 >/dev/null
-    click "$(button 'CPU monitor')" $PY_
+    launch "CPU monitor"
     $Q wait-for "panel: buttons.* cpumon@" 30 >/dev/null || bad "W5 cpumon never mapped"
     sleep 4
     s=$(shot w5a)
@@ -256,9 +269,7 @@ for label, x, w in re.findall(r' (.+?)@(\d+)\+(\d+)', sys.stdin.read().split('pa
     s=$(shot w4)
     [ "$(px "$s" 45 45)" = "$BG" ] && ok "W4 both windows gone" || bad "W4 window left: $(px "$s" 45 45)"
 
-    click "$(button Apps)" $PY_
-    $Q wait-for "panel: buttons.*Fire@" 10 >/dev/null
-    click "$(button Fire)" $PY_
+    launch Fire
     $Q wait-for "panel: buttons.* fire@" 30 >/dev/null || bad "W6 fire never mapped"
     sleep 3
     edge() { # right end of the focused title bar on row 110, from x=110
@@ -274,6 +285,36 @@ print(x)"
     goto $((r + 3)) 150; press; $Q mouse-move 100 0 >/dev/null; sleep 0.3; release
     s=$(shot w6b)
     [ "$(edge "$s")" = "$r" ] && ok "W6 fire's size did not change ($r)" || bad "W6 fire resized: $r -> $(edge "$s")"
+
+    menu_open() { # opens the start menu, waits for its log line; "x y" of its first item
+        local n; n=$(grep -ac "panel: menu " "$STATE/serial.log")
+        click "$(button Apps)" $PY_
+        for _ in $(seq 1 50); do [ "$(grep -ac "panel: menu " "$STATE/serial.log")" -gt "$n" ] && break; sleep 0.2; done
+        sleep 1
+        menuitem Terminal
+    }
+    closed() { grep -ac "panel: menu closed" "$STATE/serial.log"; }
+    read -r mx my <<< "$(menu_open)"
+    s=$(shot w7a)
+    [ "$(px "$s" "$mx" "$my")" != "$BG" ] && [ "$my" -lt 768 ] && ok "W7 the menu shows above the strip" || bad "W7 no menu at $mx,$my: $(px "$s" "$mx" "$my")"
+    c0=$(closed); $Q key esc; sleep 1
+    s=$(shot w7b)
+    [ "$(closed)" -gt "$c0" ] && [ "$(px "$s" "$mx" "$my")" = "$BG" ] && ok "W7 Escape closes it" \
+        || bad "W7 Escape: closed $(closed) (was $c0), $(px "$s" "$mx" "$my") at the item"
+    menu_open >/dev/null
+    c0=$(closed); click 1000 300; sleep 1
+    [ "$(closed)" -gt "$c0" ] && ok "W7 a click outside closes it" || bad "W7 a click outside did not close the menu"
+    menu_open >/dev/null
+    # shellcheck disable=SC2046
+    click $(menuitem "Luna 2026")
+    $Q wait-for "panel: theme luna$" 10 >/dev/null || bad "W7 the menu did not set the theme"
+    sleep 2
+    s=$(shot w7c)
+    [ "$(px "$s" 640 795)" != "$PANEL" ] && ok "W7 Luna's taskbar ($(px "$s" 640 795))" || bad "W7 the strip is still flat"
+    menu_open >/dev/null
+    # shellcheck disable=SC2046
+    click $(menuitem Flat)
+    $Q wait-for "panel: theme flat$" 10 >/dev/null && ok "W7 back to flat" || bad "W7 could not go back to flat"
 
     $Q key ctrl-alt-backspace; sleep 2
     $Q send "echo console-is-back" && $Q enter

@@ -7,12 +7,13 @@
 //!
 //! From left to right:
 //!
-//! - **Apps**, the launcher: a click opens the list read from
-//!   `/mnt/etc/gui/apps` (one `name<TAB>command` per line) *in the strip
-//!   itself*, in place of the window list — the protocol has no pop-up
-//!   surfaces — and a click on one starts it (`userspace::launch::spawn`,
-//!   as the compositor starts its arguments). A click anywhere else, or on
-//!   Apps again, closes the list.
+//! - **Apps**, the start menu: a popup surface (`set_popup`) above the
+//!   strip with the apps read from `/mnt/etc/gui/apps` (one
+//!   `name<TAB>command` per line; a click starts one with
+//!   `userspace::launch::spawn`, as the compositor starts its arguments)
+//!   and the theme selector (`set_theme`). A click anywhere else, or
+//!   Escape, closes it (the compositor's `popup_done`). Its look follows the
+//!   theme: Luna's header and two columns, 9x's side banner, or flat.
 //! - **The window list**: a button per window (the `toplevel*` events the
 //!   compositor sends the panel alone), the focused one highlighted; a
 //!   click raises and focuses it (`activate`).
@@ -94,8 +95,33 @@ fn read_apps() -> Vec<App> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
     Menu,
-    Launch(usize),
     Activate(u32),
+}
+
+/// What a menu item does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Item {
+    App(usize),
+    Theme(&'static str),
+}
+
+/// The themes the menu offers: `gui::theme` name, label.
+const THEME_ITEMS: [(&str, &str); 3] = [("luna", "Luna 2026"), ("9x", "9x moderno"), ("flat", "Flat")];
+
+/// The menu laid out for the current theme: its size and where everything goes, in its own pixels.
+struct MenuLayout {
+    w: i32,
+    h: i32,
+    items: Vec<(Rect, String, Item)>,
+    /// The areas a theme fills: the apps' column, the second column, header, banner, footer.
+    left: Rect,
+    side: Option<Rect>,
+    header: Option<Rect>,
+    banner: Option<Rect>,
+    footer: Option<Rect>,
+    /// The line between the apps and the themes (one column), and the second column's title.
+    separator: Option<Rect>,
+    side_title: Option<(i32, i32)>,
 }
 
 struct Button {
@@ -116,6 +142,10 @@ struct Panel {
     focused: u32,
     theme: &'static Theme,
     menu_open: bool,
+    /// Screen height (the menu's log line gives screen coordinates).
+    screen_h: i32,
+    /// The item under the pointer in the open menu.
+    menu_hover: Option<usize>,
     hover_x: Option<i32>,
     clock: String,
     /// The buttons as last logged (`label@x+w`), for scripts: logged
@@ -150,8 +180,8 @@ impl Panel {
         String::new()
     }
 
-    /// The buttons, left to right: Apps, then the apps (menu open) or the
-    /// windows. Nothing reaches into the clock's space.
+    /// The buttons, left to right: Apps, then the windows. Nothing reaches
+    /// into the clock's space.
     fn layout(&mut self) -> Vec<Button> {
         let k = self.k;
         let gap = 4 * k;
@@ -163,14 +193,11 @@ impl Panel {
         let w = self.text_w("Apps") + 2 * pad;
         out.push(Button { x, w, label: "Apps".into(), action: Action::Menu });
         x += w + 3 * gap;
-        let items: Vec<(String, Action)> = if self.menu_open {
-            self.apps.iter().enumerate().map(|(i, a)| (a.name.clone(), Action::Launch(i))).collect()
-        } else {
-            self.windows
-                .iter()
-                .map(|(id, t)| (if t.is_empty() { String::from("(untitled)") } else { t.clone() }, Action::Activate(*id)))
-                .collect()
-        };
+        let items: Vec<(String, Action)> = self
+            .windows
+            .iter()
+            .map(|(id, t)| (if t.is_empty() { String::from("(untitled)") } else { t.clone() }, Action::Activate(*id)))
+            .collect();
         for (label, action) in items {
             let max = 200 * k;
             let label = self.fit(&label, max - 2 * pad);
@@ -295,6 +322,197 @@ impl Panel {
         self.text.draw(&mut cv, &self.clock, &st, None, w - 12 * k - cw, by + (bh - lh) / 2);
     }
 
+    /// The menu's geometry in the current theme.
+    fn menu_layout(&mut self) -> MenuLayout {
+        let k = self.k;
+        let row = 24 * k;
+        let pad = 6 * k;
+        let napps = self.apps.len() as i32;
+        let mut items = Vec::new();
+        let m = self.theme.menu.as_ref();
+        let inset = m.map_or(0, |m| m.inset * k);
+        let col_w = 190 * k;
+        match m {
+            // Luna: header, the apps on the left, the themes in a second column, footer
+            Some(m) if m.side_bg.is_some() => {
+                let side_w = 150 * k;
+                let hh = m.header_h * k;
+                let col_h = (napps * row).max(row + THEME_ITEMS.len() as i32 * row) + 2 * pad;
+                let w = 2 * inset + col_w + side_w;
+                let h = 2 * inset + hh + col_h + m.footer_h * k;
+                let top = inset + hh;
+                let left = Rect::new(inset, top, col_w, col_h);
+                let side = Rect::new(inset + col_w, top, side_w, col_h);
+                for (i, a) in self.apps.iter().enumerate() {
+                    items.push((Rect::new(left.x + pad, top + pad + i as i32 * row, col_w - 2 * pad, row), a.name.clone(), Item::App(i)));
+                }
+                for (i, (name, label)) in THEME_ITEMS.iter().enumerate() {
+                    let y = top + pad + row + i as i32 * row;
+                    items.push((Rect::new(side.x + pad, y, side_w - 2 * pad, row), String::from(*label), Item::Theme(name)));
+                }
+                MenuLayout {
+                    w,
+                    h,
+                    items,
+                    left,
+                    side: Some(side),
+                    header: Some(Rect::new(inset, inset, w - 2 * inset, hh)),
+                    banner: None,
+                    footer: Some(Rect::new(inset, top + col_h, w - 2 * inset, m.footer_h * k)),
+                    separator: None,
+                    side_title: Some((side.x + pad + 8 * k, top + pad)),
+                }
+            }
+            // one column (9x with its banner on the left, or flat): the apps, a line, the themes
+            _ => {
+                let bw = m.and_then(|m| m.banner.map(|_| m.banner_w * k)).unwrap_or(0);
+                let x0 = inset + bw;
+                let sep_h = 9 * k;
+                let col_h = (napps + THEME_ITEMS.len() as i32) * row + sep_h + 2 * pad;
+                let (w, h) = (x0 + col_w + inset, 2 * inset + col_h);
+                let mut y = inset + pad;
+                for (i, a) in self.apps.iter().enumerate() {
+                    items.push((Rect::new(x0 + pad, y, col_w - 2 * pad, row), a.name.clone(), Item::App(i)));
+                    y += row;
+                }
+                let separator = Rect::new(x0 + pad, y + sep_h / 2 - k, col_w - 2 * pad, k);
+                y += sep_h;
+                for (name, label) in THEME_ITEMS {
+                    items.push((Rect::new(x0 + pad, y, col_w - 2 * pad, row), String::from(label), Item::Theme(name)));
+                    y += row;
+                }
+                MenuLayout {
+                    w,
+                    h,
+                    items,
+                    left: Rect::new(x0, inset, col_w, col_h),
+                    side: None,
+                    header: None,
+                    banner: (bw > 0).then(|| Rect::new(inset, inset, bw, h - 2 * inset)),
+                    footer: None,
+                    separator: Some(separator),
+                    side_title: None,
+                }
+            }
+        }
+    }
+
+    /// The menu into `px` (`l.w x l.h`, premultiplied ARGB): in a theme with a menu style, transparent where the compositor's frame
+    /// shows (the inset); flat: opaque.
+    fn draw_menu(&mut self, px: &mut [u32], l: &MenuLayout) {
+        let (w, h, k) = (l.w as usize, l.h as usize, self.k);
+        let all = Rect::new(0, 0, l.w, l.h);
+        let fill = |px: &mut [u32], r: Rect, c: u32| {
+            let Some(r) = r.intersect(&all) else { return };
+            for y in r.y..r.bottom() {
+                px[y as usize * w + r.x as usize..][..r.w as usize].fill(0xFF00_0000 | c);
+            }
+        };
+        // the backgrounds; (the items' text colour, the hovered item's)
+        let (items_fg, hover_fg) = match &self.theme.menu {
+            Some(m) => {
+                px.fill(0);
+                fill(px, l.left, m.items_bg);
+                if let (Some(r), Some(c)) = (l.side, m.side_bg) {
+                    fill(px, r, c);
+                }
+                if let (Some(r), Some(sh)) = (l.header, m.header) {
+                    sh.scaled(k).paint(px, w, all, r);
+                }
+                if let (Some(r), Some(sh)) = (l.footer, m.footer) {
+                    sh.scaled(k).paint(px, w, all, r);
+                }
+                if let (Some(r), Some(sh)) = (l.banner, m.banner) {
+                    sh.scaled(k).paint(px, w, all, r);
+                }
+                if let Some(r) = l.separator {
+                    fill(px, r, m.separator);
+                    fill(px, Rect::new(r.x, r.y + k, r.w, k), 0x00FF_FFFF); // the etched line's light half
+                }
+                (m.items_fg, m.hover_fg)
+            }
+            None => {
+                px.fill(0xFF00_0000 | BG);
+                if let Some(r) = l.separator {
+                    fill(px, r, EDGE);
+                }
+                (TEXT, TEXT)
+            }
+        };
+        let side_fg = self.theme.menu.as_ref().map_or(TEXT, |m| m.side_fg);
+        // the item under the pointer, and a dot at the current theme
+        for (i, (r, _, item)) in l.items.iter().enumerate() {
+            if self.menu_hover == Some(i) {
+                match &self.theme.menu {
+                    Some(m) => m.hover.scaled(k).paint(px, w, all, *r),
+                    None => fill(px, *r, HOVER),
+                }
+            }
+            if let Item::Theme(name) = item {
+                if *name == self.theme.name {
+                    let d = 6 * k;
+                    let c = if self.menu_hover == Some(i) { hover_fg } else { side_fg };
+                    let dot = Rect::new(r.x + 6 * k, r.y + (r.h - d) / 2, d, d);
+                    theme::Shape::solid(0xFF00_0000 | c).radius(d as f32 / 2.0).paint(px, w, all, dot);
+                }
+            }
+        }
+        // the text, over opaque pixels only: drawing it writes 0x00RRGGBB, so the alpha is put back after
+        let alpha: Vec<u8> = px.iter().map(|p| (p >> 24) as u8).collect();
+        let size = 13.0 * k as f32;
+        let (_, lh) = self.text.measure("Hg", &Style::new(SANS, size), None);
+        let mut cv = Canvas::new(px, w, h, w);
+        for (i, (r, label, item)) in l.items.iter().enumerate() {
+            let in_side = matches!(item, Item::Theme(_)) && l.side.is_some();
+            let fg = if self.menu_hover == Some(i) { hover_fg } else if in_side { side_fg } else { items_fg };
+            let indent = if matches!(item, Item::Theme(_)) { 18 * k } else { 8 * k };
+            self.text.draw(&mut cv, label, &Style::new(SANS, size).color(fg), None, r.x + indent, r.y + (r.h - lh) / 2);
+        }
+        if let (Some((x, y)), Some(m)) = (l.side_title, &self.theme.menu) {
+            self.text.draw(&mut cv, "Tema", &Style::new(SANS, size).color(m.side_fg).bold(), None, x, y + (24 * k - lh) / 2);
+        }
+        if let (Some(r), Some(m)) = (l.header, &self.theme.menu) {
+            let st = Style::new(SANS, 18.0 * k as f32).color(m.header_fg).bold();
+            let (_, hl) = self.text.measure("constanos", &st, None);
+            self.text.draw(&mut cv, "constanos", &st, None, r.x + 14 * k, r.y + (r.h - hl) / 2);
+        }
+        drop(cv);
+        for (p, a) in px.iter_mut().zip(alpha) {
+            *p = (*p & 0x00FF_FFFF) | (a as u32) << 24;
+        }
+        // 9x: the name down the banner, bottom to top (drawn on its side, then turned)
+        if let (Some(r), Some(m)) = (l.banner, &self.theme.menu) {
+            let st = Style::new(SANS, 15.0 * k as f32).color(0x00FF_FFFF).bold();
+            let (tw, tl) = self.text.measure("constanos", &st, None);
+            let (cw, ch) = ((tw + 16 * k) as usize, r.w as usize);
+            let mut cov = alloc::vec![0u32; cw * ch];
+            let mut c2 = Canvas::new(&mut cov, cw, ch, cw);
+            self.text.draw(&mut c2, "constanos", &st, None, 8 * k, (r.w - tl) / 2);
+            for ty in 0..ch {
+                for tx in 0..cw {
+                    let a = (cov[ty * cw + tx] >> 8) & 255;
+                    // (tx, ty) on its side -> x = banner.x + ty, y = banner.bottom - 1 - tx
+                    let (x, y) = (r.x + ty as i32, r.bottom() - 1 - tx as i32);
+                    if a == 0 || y < r.y {
+                        continue;
+                    }
+                    let d = &mut px[y as usize * w + x as usize];
+                    let mut out = 0xFF00_0000;
+                    for sh in [16, 8, 0] {
+                        let (dc, fc) = ((*d >> sh) & 255, (m.banner_fg >> sh) & 255);
+                        out |= ((dc * (255 - a) + fc * a + 127) / 255) << sh;
+                    }
+                    *d = out;
+                }
+            }
+        }
+    }
+
+    /// The item at (`x`, `y`) of the menu.
+    fn menu_item_at(l: &MenuLayout, x: i32, y: i32) -> Option<usize> {
+        l.items.iter().position(|(r, _, _)| r.contains(x, y))
+    }
+
     fn button_at(&mut self, x: i32) -> Option<Action> {
         self.layout().into_iter().find(|b| x >= b.x && x < b.x + b.w).map(|b| b.action)
     }
@@ -346,6 +564,85 @@ fn wait_configure(fd: i32, dec: &mut Decoder) -> Option<(i32, i32)> {
         }
         dec.push_bytes(&buf[..n as usize]);
     }
+}
+
+/// The open menu: its popup surface, pool and buffer (fresh ids every time it opens: its size, and so its place above the strip, depend on
+/// the theme) and its pixels.
+struct OpenMenu {
+    sid: u32,
+    pool: u32,
+    buf: u32,
+    base: u64,
+    size: u64,
+    layout: MenuLayout,
+}
+
+impl OpenMenu {
+    fn px(&self) -> &'static mut [u32] {
+        unsafe { core::slice::from_raw_parts_mut(self.base as *mut u32, (self.layout.w * self.layout.h) as usize) }
+    }
+}
+
+/// First id of the menu's objects; the menu takes three each time it opens.
+const MENU_IDS: u32 = 1000;
+
+/// Opens the menu: a popup right above the strip's left end.
+fn open_menu(sock: i32, p: &mut Panel, next_id: &mut u32) -> Option<OpenMenu> {
+    let layout = p.menu_layout();
+    let size = (layout.w * layout.h * 4) as u64;
+    let mfd = syscall::memfd_create(b"panel-menu\0", 0) as i32;
+    let base = if mfd >= 0 && syscall::ftruncate(mfd, size) == 0 { syscall::mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0) } else { -1 };
+    if base <= 0 {
+        println!("panel: cannot create the menu's pool");
+        if mfd >= 0 {
+            syscall::close(mfd);
+        }
+        return None;
+    }
+    let (sid, pool, buf) = (*next_id, *next_id + 1, *next_id + 2);
+    *next_id += 3;
+    let m = OpenMenu { sid, pool, buf, base: base as u64, size, layout };
+    p.menu_hover = None;
+    p.draw_menu(m.px(), &m.layout);
+    let (w, h) = (m.layout.w, m.layout.h);
+    let ok = send(sock, &[
+        Request::CreateSurface { id: sid },
+        Request::SetPopup { surface: sid, parent: SURFACE, x: 0, y: -h },
+        Request::CreatePool { id: pool, fd: mfd, size: size as u32 },
+        Request::CreateBuffer { pool, id: buf, offset: 0, width: w, height: h, stride: w * 4, format: FORMAT_ARGB8888 },
+        Request::Attach { surface: sid, buffer: buf },
+        Request::Damage { surface: sid, x: 0, y: 0, w, h },
+        Request::Commit { surface: sid },
+    ]);
+    syscall::close(mfd);
+    // the items' centres on the screen, for scripts (the popup sits at the strip's left end, right above it)
+    let top = p.screen_h - p.h - h;
+    let mut desc = String::new();
+    for (r, label, _) in &m.layout.items {
+        desc.push_str(&alloc::format!(" {}@{},{}", label, r.x + r.w / 2, top + r.y + r.h / 2));
+    }
+    println!("panel: menu{}", desc);
+    ok.then_some(m)
+}
+
+/// Shows the menu's pixels again (the pointer moved to another item).
+fn redraw_menu(sock: i32, p: &mut Panel, m: &OpenMenu) {
+    p.draw_menu(m.px(), &m.layout);
+    let (w, h) = (m.layout.w, m.layout.h);
+    send(sock, &[
+        Request::Attach { surface: m.sid, buffer: m.buf },
+        Request::Damage { surface: m.sid, x: 0, y: 0, w, h },
+        Request::Commit { surface: m.sid },
+    ]);
+}
+
+/// Gives the menu's objects back (hiding it first if it still shows).
+fn close_menu(sock: i32, m: OpenMenu, hide: bool) {
+    if hide {
+        send(sock, &[Request::Attach { surface: m.sid, buffer: 0 }, Request::Commit { surface: m.sid }]);
+    }
+    send(sock, &[Request::DestroyBuffer { buffer: m.buf }, Request::DestroyPool { pool: m.pool }, Request::DestroySurface { surface: m.sid }]);
+    syscall::munmap(m.base, m.size);
 }
 
 fn main(_args: Args) -> i32 {
@@ -404,6 +701,8 @@ fn main(_args: Args) -> i32 {
         focused: 0,
         theme: &theme::FLAT,
         menu_open: false,
+        screen_h: half_h * 2,
+        menu_hover: None,
         hover_x: None,
         clock: c,
         logged: String::new(),
@@ -413,6 +712,8 @@ fn main(_args: Args) -> i32 {
 
     let mut dirty = true;
     let mut released = true;
+    let mut menu: Option<OpenMenu> = None;
+    let mut next_id = MENU_IDS;
     let mut buf = [0u8; 4096];
     loop {
         while syscall::reap_any() > 0 {} // what we launched and has exited
@@ -445,12 +746,56 @@ fn main(_args: Args) -> i32 {
             dirty = true;
         }
         while let Ok(Some(msg)) = dec.next_message() {
-            let iface = match msg.object {
+            let o = msg.object;
+            let iface = match o {
                 1 => Interface::Compositor,
                 BUFFER => Interface::Buffer,
                 SURFACE => Interface::Surface,
+                _ if o >= MENU_IDS && (o - MENU_IDS) % 3 == 0 => Interface::Surface,
+                _ if o >= MENU_IDS && (o - MENU_IDS) % 3 == 2 => Interface::Buffer,
                 _ => Interface::Callback,
             };
+            // the menu's own events
+            if let Some(m) = &menu {
+                if o == m.sid {
+                    match Event::decode(iface, &msg) {
+                        Ok(Event::PopupDone { .. }) => {
+                            println!("panel: menu closed");
+                            close_menu(sock, menu.take().unwrap(), false);
+                            p.menu_open = false;
+                            dirty = true;
+                        }
+                        Ok(Event::Motion { x, y, .. }) => {
+                            let at = Panel::menu_item_at(&m.layout, x, y);
+                            if at != p.menu_hover {
+                                p.menu_hover = at;
+                                redraw_menu(sock, &mut p, m);
+                            }
+                        }
+                        Ok(Event::Button { code: BTN_LEFT, pressed: true, .. }) => {
+                            let item = p.menu_hover.map(|i| m.layout.items[i].2);
+                            if let Some(item) = item {
+                                match item {
+                                    Item::App(i) => {
+                                        let cmd = p.apps[i].cmd.clone();
+                                        let pid = launch::spawn(cmd.as_bytes());
+                                        println!("panel: launched {} (pid {})", cmd, pid);
+                                    }
+                                    Item::Theme(name) => {
+                                        println!("panel: theme {} asked", name);
+                                        send(sock, &[Request::SetTheme { surface: SURFACE, name: String::from(name) }]);
+                                    }
+                                }
+                                close_menu(sock, menu.take().unwrap(), true);
+                                p.menu_open = false;
+                                dirty = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+            }
             let Ok(ev) = Event::decode(iface, &msg) else { continue };
             match ev {
                 Event::Release { .. } => released = true,
@@ -468,6 +813,11 @@ fn main(_args: Args) -> i32 {
                 Event::Theme { name, .. } => {
                     p.theme = theme::by_name(&name).unwrap_or(&theme::FLAT);
                     println!("panel: theme {}", p.theme.name);
+                    // the menu's size is the theme's: it closes
+                    if let Some(m) = menu.take() {
+                        close_menu(sock, m, true);
+                        p.menu_open = false;
+                    }
                     dirty = true;
                 }
                 Event::ToplevelFocus { id, .. } => {
@@ -484,18 +834,16 @@ fn main(_args: Args) -> i32 {
                 }
                 Event::Button { code: BTN_LEFT, pressed: true, .. } => {
                     let action = p.hover_x.and_then(|x| p.button_at(x));
+                    // (with the menu open this click never arrives: the compositor closes the menu instead, popup_done)
                     match action {
-                        Some(Action::Menu) => p.menu_open = !p.menu_open,
-                        Some(Action::Launch(i)) => {
-                            let cmd = p.apps[i].cmd.clone();
-                            let pid = launch::spawn(cmd.as_bytes());
-                            println!("panel: launched {} (pid {})", cmd, pid);
-                            p.menu_open = false;
+                        Some(Action::Menu) => {
+                            menu = open_menu(sock, &mut p, &mut next_id);
+                            p.menu_open = menu.is_some();
                         }
                         Some(Action::Activate(id)) => {
                             send(sock, &[Request::Activate { surface: SURFACE, toplevel: id }]);
                         }
-                        None => p.menu_open = false,
+                        None => {}
                     }
                     dirty = true;
                 }

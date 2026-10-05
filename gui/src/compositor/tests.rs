@@ -1713,3 +1713,155 @@ fn compose_paints_the_strip_under_a_transparent_panel() {
     assert_ne!(h.px(10, H - 20), h.px(10, H - 2), "a gradient: the top differs from the bottom");
     assert_eq!(h.px(10, H - 21), BACKGROUND, "nothing above the strip");
 }
+
+// ── popups (the start menu) ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Gives client `c` a popup on its surface 4: surface 6, `w x h` of `color` (ARGB8888 when `argb`), at (`x`, `y`) of the parent's content,
+/// committed. Pool fd 400 + c, pool 7, buffer 8.
+fn popup(h: &mut H_, c: ClientId, (x, y): (i32, i32), (w, hh): (i32, i32), color: u32) {
+    let fd = 400 + c as i32;
+    let size = (w * hh * 4) as usize;
+    h.pool(fd, size);
+    h.draw(fd, 0, w as usize * 4, 0, 0, w as usize, hh as usize, color);
+    h.send(c, &[
+        R::CreateSurface { id: 6 },
+        R::SetPopup { surface: 6, parent: 4, x, y },
+        R::CreatePool { id: 7, fd, size: size as u32 },
+        R::CreateBuffer { pool: 7, id: 8, offset: 0, width: w, height: hh, stride: w * 4, format: FORMAT_XRGB8888 },
+        R::Attach { surface: 6, buffer: 8 },
+        R::Commit { surface: 6 },
+    ]);
+}
+
+fn recommit_popup(h: &mut H_, c: ClientId) {
+    h.send(c, &[R::Attach { surface: 6, buffer: 8 }, R::Commit { surface: 6 }]);
+}
+
+// A: the panel's popup shows above the panel, at its offset (kept on the screen), undecorated, not a window (no toplevel, not in the
+// stack, never focused); it is drawn last but the cursor, in compose and in the draw list alike.
+#[test]
+fn a_popup_shows_above_everything_and_is_not_a_window() {
+    let mut h = gpu_h();
+    let w = h.window(100, 50, 0x00AA_0000);
+    let p = panel(&mut h, 20, 0x0099_9999);
+    h.comp.take_events();
+    popup(&mut h, p, (10, -60), (80, 60), 0x0012_3456);
+    assert_eq!(h.comp.popups(), vec![(p, 6)]);
+    assert_eq!(h.comp.window_content(p, 6), Some(Rect::new(10, H - 20 - 60, 80, 60)));
+    assert_eq!(h.comp.toplevels().len(), 1, "not in the window list");
+    assert!(!h.comp.stack().contains(&(p, 6)));
+    assert_eq!(h.comp.focus(), Some((w, 4)), "the focus stays");
+    assert!(h.events_for(p).iter().all(|e| !matches!(e, Event::Toplevel { .. })));
+    h.comp.damage.add(Rect::new(0, 0, W, H));
+    h.compose();
+    assert_eq!(h.px(15, H - 50), 0x0012_3456);
+    let (_, ops) = h.comp.draw_list();
+    let last_cpu = ops.iter().rposition(|o| matches!(o, DrawOp::Cpu { .. })).unwrap();
+    assert!(matches!(ops[last_cpu], DrawOp::Cpu { client, surface: 6, .. } if client == p), "drawn after everything");
+    assert_eq!(same_picture(&raster(&ops, &h.comp, &BTreeMap::new()), &h.screen), None);
+    // asked past the left edge: kept on the screen
+    let q = h.comp.add_client();
+    h.send(q, &[R::CreateSurface { id: 4 }]);
+    let _ = h.window(10, 10, 0); // (unrelated, just another client in between)
+    let _ = q;
+    let p2 = h.window(60, 40, 0x0000_00FF);
+    popup(&mut h, p2, (-500, 0), (30, 30), 0x00FF_00FF);
+    assert_eq!(h.comp.window_content(p2, 6).unwrap().x, 0);
+}
+
+// A: a click inside the popup is the popup's (no focus change); a click outside closes every popup, tells the client, and goes nowhere;
+// a commit with a buffer shows it again; Escape closes it too and is nobody's key.
+#[test]
+fn a_click_outside_or_escape_closes_the_popup() {
+    let mut h = gpu_h();
+    let w = h.window(100, 50, 0x00AA_0000);
+    let p = panel(&mut h, 20, 0x0099_9999);
+    popup(&mut h, p, (10, -60), (80, 60), 0x0012_3456);
+    h.comp.take_events();
+    let r = h.comp.window_content(p, 6).unwrap();
+    pointer_to(&mut h, r.x + 5, r.y + 5);
+    h.comp.pointer_button(BTN_LEFT, true);
+    h.comp.pointer_button(BTN_LEFT, false);
+    let evs = h.events_for(p);
+    assert!(evs.contains(&Event::Button { surface: 6, code: BTN_LEFT, pressed: true }), "{evs:?}");
+    h.comp.pointer_motion(1, 2);
+    assert!(h.events_for(p).contains(&Event::Motion { surface: 6, x: 6, y: 7 }), "motion over it is the popup's too");
+    assert_eq!(h.comp.focus(), Some((w, 4)));
+    // outside, over the window: closes, and the window gets nothing
+    let f = h.comp.window_content(w, 4).unwrap();
+    pointer_to(&mut h, f.x + 5, f.y + 5);
+    h.comp.take_events();
+    h.comp.pointer_button(BTN_LEFT, true);
+    h.comp.pointer_button(BTN_LEFT, false);
+    let evs = h.comp.take_events();
+    assert_eq!(evs, vec![(p, Event::PopupDone { surface: 6 })], "only popup_done");
+    assert!(h.comp.popups().is_empty());
+    assert!(h.comp.damage().contains(r.x, r.y), "where it was is repainted");
+    h.compose();
+    assert_ne!(h.px(r.x + 5, r.y + 5), 0x0012_3456);
+    // shown again by a commit; Escape closes it and reaches no client
+    recommit_popup(&mut h, p);
+    assert_eq!(h.comp.popups(), vec![(p, 6)]);
+    h.comp.take_events();
+    h.comp.key(1, true);
+    h.comp.key(1, false);
+    let evs = h.comp.take_events();
+    assert_eq!(evs.iter().filter(|(_, e)| matches!(e, Event::Key { pressed: true, .. })).count(), 0, "{evs:?}");
+    assert!(evs.contains(&(p, Event::PopupDone { surface: 6 })));
+    // with no popup, Escape is the focused window's again
+    h.comp.key(1, true);
+    assert!(h.events_for(w).contains(&Event::Key { surface: 4, code: 1, pressed: true }));
+}
+
+// A: the popup goes when its parent does; bad set_popup requests are protocol errors; only the panel may set the theme.
+#[test]
+fn popup_parent_errors_and_set_theme() {
+    let mut h = gpu_h();
+    let p = panel(&mut h, 20, 0x0099_9999);
+    popup(&mut h, p, (0, -40), (50, 40), 0x0012_3456);
+    h.comp.take_events();
+    h.send(p, &[R::DestroySurface { surface: 4 }]);
+    assert!(h.comp.popups().is_empty());
+    assert!(h.events_for(p).contains(&Event::PopupDone { surface: 6 }));
+    // a mapped window cannot become a popup; nor can a surface name a parent it does not have
+    for reqs in [
+        vec![R::SetPopup { surface: 4, parent: 9, x: 0, y: 0 }],
+        vec![R::CreateSurface { id: 9 }, R::SetPopup { surface: 4, parent: 9, x: 0, y: 0 }],
+    ] {
+        let mut h = gpu_h();
+        let c = h.window(40, 30, 0x0012_3456);
+        h.send(c, &reqs);
+        assert!(h.comp.take_events().iter().any(|(_, e)| matches!(e, Event::Error { code, .. } if *code == ErrorCode::Role as u32)), "{reqs:?}");
+    }
+    let mut h = gpu_h();
+    let c = h.window(40, 30, 0x0012_3456);
+    h.send(c, &[R::SetTheme { surface: 4, name: "luna".into() }]);
+    assert_eq!(h.comp.theme().name, "flat", "a window may not");
+    let p = panel(&mut h, 20, 0);
+    h.send(p, &[R::SetTheme { surface: 4, name: "9x".into() }]);
+    assert_eq!(h.comp.theme().name, "9x", "the panel may");
+    h.send(p, &[R::SetTheme { surface: 4, name: "aqua".into() }]);
+    assert_eq!(h.comp.theme().name, "9x", "an unknown name changes nothing");
+}
+
+// A: in a look with a menu style the popup's frame (with its shadow) is a shape right under it, in the draw list and in compose.
+#[test]
+fn a_themed_popup_has_its_frame_under_it() {
+    let mut h = gpu_h();
+    let p = panel(&mut h, 20, 0x0099_9999);
+    popup(&mut h, p, (10, -60), (80, 60), 0x0012_3456);
+    let r = h.comp.window_content(p, 6).unwrap();
+    for t in [&theme::LUNA, &theme::NINES] {
+        h.comp.set_theme(t);
+        let ops = h.comp.draw_list().1;
+        let at = ops.iter().position(|o| matches!(o, DrawOp::Cpu { surface: 6, .. })).unwrap();
+        assert_eq!(ops[at - 1], DrawOp::Shape { rect: r, shape: t.menu.as_ref().unwrap().frame }, "{}", t.name);
+    }
+    h.comp.set_theme(&theme::LUNA);
+    h.compose();
+    let frame = theme::LUNA.menu.as_ref().unwrap().frame;
+    // the shadow below and to the right of the menu, painted by compose
+    let (sx, sy) = (r.right() + 2, r.y + 20);
+    assert!(frame.pixel(r, sx, sy)[3] > 0.1);
+    assert_ne!(h.px(sx, sy), BACKGROUND, "the shadow darkens the desktop");
+}

@@ -1,7 +1,7 @@
 # GPU compositor visual plan (vk_comp): primitives, themes, icons
 
-Agreed 2026-10-05. Steps 1, 2 and 2b done; 1 and 2 seen on the Ryzen (both looks kept, the user
-likes both: a theme toggle in a menu later); step 3 next. Start here without other context.
+Agreed 2026-10-05. Steps 1, 2, 2b (taskbar) and 2c (start menu) done; 1 and 2 seen on the Ryzen
+(both looks kept: the user likes both, and picks in the start menu). Step 3 (glass) next. Start here without other context.
 
 ## Where it stands
 
@@ -34,6 +34,16 @@ likes both: a theme toggle in a menu later); step 3 next. Start here without oth
   `draw_list`; `compose` paints the same shape in software), which is where step 3's blur goes.
   Text drawing writes `0x00RRGGBB`, so the panel puts the alpha back after its labels. Flat stays
   the old opaque look.
+- **Start menu** (step 2c): "Apps" opens a **popup** (`set_popup`, `xdg_popup`-like: above
+  everything, undecorated, never focused; a click outside or Escape hides it with `popup_done`,
+  and that click goes nowhere; it goes with its parent) holding the apps and the **theme selector**
+  (`set_theme`, the panel's alone). Its look is `Theme::menu` (`gui::theme::Menu`): the frame with
+  its shadow is the compositor's shape under the popup (step 3 blurs there), the panel draws the
+  rest: Luna's blue header ("constanos"), white apps column and light-blue "Tema" column, footer;
+  9x's grey menu with the navy side banner (the name drawn bottom to top) and an etched separator;
+  flat, dark and opaque. The panel makes a new popup surface each time it opens (its height, and
+  so its offset above the strip, depends on the theme) and logs `panel: menu <label>@x,y ...` in
+  screen coordinates, which `gui-e2e.sh wm` uses to launch apps (W1, W5, W6) and checks (W7).
 - Decorations (title, close, maximize), the panel (`panel` client) and window management live in
   `gui` (host-tested). PNG loading exists: crate `img` gives premultiplied ARGB, icon theme layout
   `disk-image-root/usr/share/icons/<n>x<n>/<name>.png`, `img::load_icon` resamples once at load.
@@ -91,6 +101,13 @@ Decide by seeing them: build the engine, then switch themes on the real screen.
    the monitor) the start button, window buttons (focused down, 9x sunken), the Apps list and the
    clock area were checked on screendumps; `gui-e2e.sh` and `gui-e2e.sh wm` pass. Not on the
    Ryzen yet.
+2c. **Start menu** — done, see "Where it stands". Proof: `gui` tests (a popup above everything and
+   not a window, kept on screen; a click inside is its own, outside or Escape closes it and goes
+   nowhere, a commit shows it again; its parent's end closes it; bad `set_popup`s are errors; only
+   the panel may `set_theme`; its frame under it in both painters), 12 mutants killed;
+   `gui-e2e.sh wm` W7 (shows above the strip, Escape, a click outside, a theme picked in it, back
+   to flat) and every launch going through it; the three looks checked on QEMU screendumps.
+   Next on it: keyboard navigation, icons per item (step 4), submenus.
 3. **Glass / blur behind** for the taskbar and start menu: copy what is behind, two-pass blur,
    tint. Costlier; measure on the Ryzen (`cr_stats` render_us).
 4. **Icons**: the user generates them with a local image model. Generate at 256 px on a

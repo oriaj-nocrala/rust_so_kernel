@@ -9,7 +9,7 @@
 //! | compositor | create_pool(id, fd, size) 0, create_surface(id) 1, sync(id) 2, create_gpu_buffer(id, fd, size, w, h, stride, format) 3 | error(obj, code, msg) 0, delete_id(id) 1 |
 //! | pool       | create_buffer(id, offset, w, h, stride, format) 0, destroy 1             | — |
 //! | buffer     | destroy 0                                                                | release 0 |
-//! | surface    | attach(buffer) 0, damage(x, y, w, h) 1, frame(id) 2, commit 3, set_title(s) 4, destroy 5, lock_pointer(on) 6, set_resizable(min_w, min_h) 7, set_panel(height) 8, activate(toplevel) 9 | configure(w, h) 0, focus(in) 1, key(code, state) 2, motion(x, y) 3, button(code, state) 4, relative_motion(dx, dy) 5, resize(w, h) 6, close 7, toplevel(id, title) 8, toplevel_focus(id) 9, toplevel_gone(id) 10, theme(name) 11 |
+//! | surface    | attach(buffer) 0, damage(x, y, w, h) 1, frame(id) 2, commit 3, set_title(s) 4, destroy 5, lock_pointer(on) 6, set_resizable(min_w, min_h) 7, set_panel(height) 8, activate(toplevel) 9, set_popup(parent, x, y) 10, set_theme(name) 11 | configure(w, h) 0, focus(in) 1, key(code, state) 2, motion(x, y) 3, button(code, state) 4, relative_motion(dx, dy) 5, resize(w, h) 6, close 7, toplevel(id, title) 8, toplevel_focus(id) 9, toplevel_gone(id) 10, theme(name) 11, popup_done 12 |
 //! | callback   | —                                                                        | done(ms) 0 |
 //!
 //! `create_gpu_buffer` makes a buffer (a `buffer` object: `destroy`, `release`) out of a GPU
@@ -34,7 +34,11 @@
 //! alone gets the window list (`toplevel*`, with the compositor's own ids)
 //! and may `activate` one. It is also told the compositor's look (`theme`: a name of
 //! `gui::theme`, at `set_panel` and whenever it changes) so it can draw the taskbar's buttons to
-//! match; the strip under it is the compositor's. Clients ignore events they do not know, so an
+//! match; the strip under it is the compositor's. The panel alone may `set_theme` (its menu's
+//! theme selector). `set_popup` is `xdg_popup`: the surface (before it is mapped) becomes a popup
+//! at (x, y) of another surface of the same client, shown above everything, undecorated, never
+//! focused; a click outside every popup, or Escape, hides it and sends `popup_done` (that click
+//! goes nowhere), and so does its parent going away. Clients ignore events they do not know, so an
 //! old client never sees a difference.
 
 use alloc::string::String;
@@ -106,6 +110,10 @@ pub enum Request {
     SetPanel { surface: u32, height: i32 },
     /// From the panel: raise and focus the window with that toplevel id.
     Activate { surface: u32, toplevel: u32 },
+    /// The popup role (before the surface is mapped): shown at (`x`, `y`) of `parent`'s content, a surface of the same client.
+    SetPopup { surface: u32, parent: u32, x: i32, y: i32 },
+    /// From the panel: the compositor's look (`gui::theme`'s names).
+    SetTheme { surface: u32, name: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +145,9 @@ pub enum Event {
     ToplevelGone { surface: u32, id: u32 },
     /// To the panel: the compositor's look (`gui::theme`'s names: "flat", "luna", "9x").
     Theme { surface: u32, name: String },
+    /// The popup was dismissed (a click outside it, Escape, its parent gone) and is hidden; it stays a popup and shows again at its
+    /// next commit with a buffer.
+    PopupDone { surface: u32 },
     Done { callback: u32, ms: u32 },
 }
 
@@ -197,6 +208,8 @@ impl Request {
             (Interface::Surface, 7) => Request::SetResizable { surface: obj, min_w: a.int()?, min_h: a.int()? },
             (Interface::Surface, 8) => Request::SetPanel { surface: obj, height: a.int()? },
             (Interface::Surface, 9) => Request::Activate { surface: obj, toplevel: a.uint()? },
+            (Interface::Surface, 10) => Request::SetPopup { surface: obj, parent: a.uint()?, x: a.int()?, y: a.int()? },
+            (Interface::Surface, 11) => Request::SetTheme { surface: obj, name: a.string()? },
             _ => return Err(DecodeError::UnknownOpcode),
         };
         a.finish()?;
@@ -231,6 +244,8 @@ impl Request {
             Request::SetResizable { surface, min_w, min_h } => e.begin(*surface, 7).int(*min_w).int(*min_h),
             Request::SetPanel { surface, height } => e.begin(*surface, 8).int(*height),
             Request::Activate { surface, toplevel } => e.begin(*surface, 9).uint(*toplevel),
+            Request::SetPopup { surface, parent, x, y } => e.begin(*surface, 10).uint(*parent).int(*x).int(*y),
+            Request::SetTheme { surface, name } => e.begin(*surface, 11).string(name),
         }
         .end();
     }
@@ -256,6 +271,7 @@ impl Event {
             (Interface::Surface, 9) => Event::ToplevelFocus { surface: obj, id: a.uint()? },
             (Interface::Surface, 10) => Event::ToplevelGone { surface: obj, id: a.uint()? },
             (Interface::Surface, 11) => Event::Theme { surface: obj, name: a.string()? },
+            (Interface::Surface, 12) => Event::PopupDone { surface: obj },
             (Interface::Callback, 0) => Event::Done { callback: obj, ms: a.uint()? },
             _ => return Err(DecodeError::UnknownOpcode),
         };
@@ -280,6 +296,7 @@ impl Event {
             Event::ToplevelFocus { surface, id } => e.begin(*surface, 9).uint(*id),
             Event::ToplevelGone { surface, id } => e.begin(*surface, 10).uint(*id),
             Event::Theme { surface, name } => e.begin(*surface, 11).string(name),
+            Event::PopupDone { surface } => e.begin(*surface, 12),
             Event::Done { callback, ms } => e.begin(*callback, 0).uint(*ms),
         }
         .end();
@@ -301,7 +318,8 @@ impl Event {
             | Event::Toplevel { surface, .. }
             | Event::ToplevelFocus { surface, .. }
             | Event::ToplevelGone { surface, .. }
-            | Event::Theme { surface, .. } => *surface,
+            | Event::Theme { surface, .. }
+            | Event::PopupDone { surface } => *surface,
             Event::Done { callback, .. } => *callback,
         }
     }
@@ -334,6 +352,8 @@ mod tests {
             (Interface::Surface, Request::SetResizable { surface: 3, min_w: 100, min_h: 50 }),
             (Interface::Surface, Request::SetPanel { surface: 3, height: 32 }),
             (Interface::Surface, Request::Activate { surface: 3, toplevel: 7 }),
+            (Interface::Surface, Request::SetPopup { surface: 3, parent: 4, x: -2, y: -300 }),
+            (Interface::Surface, Request::SetTheme { surface: 3, name: "9x".into() }),
         ]
     }
 
@@ -373,6 +393,7 @@ mod tests {
             (Interface::Surface, Event::ToplevelFocus { surface: 3, id: 0 }),
             (Interface::Surface, Event::ToplevelGone { surface: 3, id: 2 }),
             (Interface::Surface, Event::Theme { surface: 3, name: "luna".into() }),
+            (Interface::Surface, Event::PopupDone { surface: 3 }),
             (Interface::Callback, Event::Done { callback: 8, ms: 1234 }),
         ];
         let mut e = Encoder::new();
