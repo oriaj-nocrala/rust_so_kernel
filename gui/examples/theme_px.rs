@@ -3,7 +3,7 @@
 //!
 //!   theme_px <theme> desktop <screen_w> <screen_h> <x> <y>
 //!   theme_px <theme> bar <focused 0|1> <frame_x> <frame_y> <frame_w> <x> <y>     a title bar where nothing covers it (scale 1)
-//!   theme_px <theme> strip <screen_w> <screen_h> <panel_h> <x> <y>              the taskbar's strip where no button is
+//!   theme_px <theme> strip <screen_w> <screen_h> <panel_h> <x> <y>              the taskbar's strip where no button is (over the desktop)
 
 use gui::compositor::TITLE_H;
 use gui::region::Rect;
@@ -27,7 +27,16 @@ fn main() {
             let r = Rect::new(n(4) - fw, n(5) - fw, n(6) + 2 * fw, fw + TITLE_H + b.radius as i32 + 1);
             at(&b, r, n(7), n(8))
         }
-        "strip" => at(&t.taskbar.bar, Rect::new(0, n(4) - n(5), n(3), n(5)), n(6), n(7)),
+        "strip" => {
+            // the strip may be glass (translucent): over the desktop, as the CPU painter draws it (no blur)
+            let (x, y) = (n(6), n(7));
+            let mut p = [0u32];
+            let one = Rect::new(0, 0, 1, 1);
+            t.background.paint(&mut p, 1, one, Rect::new(-x, -y, n(3), n(4)));
+            let r = Rect::new(0, n(4) - n(5), n(3), n(5));
+            t.taskbar.bar.paint(&mut p, 1, one, Rect::new(r.x - x, r.y - y, r.w, r.h));
+            p[0] & 0x00FF_FFFF
+        }
         w => panic!("what is {w}?"),
     };
     println!("{},{},{}", v >> 16 & 255, v >> 8 & 255, v & 255);
