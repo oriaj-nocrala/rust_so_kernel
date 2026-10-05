@@ -226,6 +226,13 @@ pub fn probe(level: NicLevel, irq_apic: Option<u32>) -> Option<Rtl> {
         serial_println!("rtl8168: the window reads as all ones: the device is not answering");
         return None;
     };
+    // Linux keeps EEE off on the RTL8168h (XID 0x541): gigabit came up and
+    // dropped ~400 ms later, over and over, until the PHY settled at 100 Mb/s.
+    // `nic_eee=on` in kernel.conf advertises it anyway.
+    if id.xid == 0x541 && crate::bootopts::get("nic_eee") != Some("on") {
+        drv.set_eee(false);
+        serial_println!("rtl8168: EEE not advertised, TX LPI off (as Linux on the 8168h; nic_eee=on to advertise it)");
+    }
     serial_println!(
         "rtl8168: TxConfig {:#010x} XID {:#05x} ({:?}) mac {:02x?} link {:?}",
         id.tx_config, id.xid, id.family, id.mac, id.link

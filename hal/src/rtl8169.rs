@@ -79,6 +79,13 @@ pub const MISC: usize = 0xF0;
 pub const MISC_RXDV_GATED_EN: u32 = 1 << 19;
 pub const MISC_1: usize = 0xF2;
 pub const MISC_1_PFM_D3COLD_EN: u8 = 1 << 6;
+/// `EEE_LED`: Linux clears bits 2:0 (the EEE LED frequency) with TX LPI.
+pub const EEE_LED: usize = 0x1B;
+/// The PHY's EEE advertisement (MMD 7.0x3c), at page 0xa5d register 0x10 on
+/// Realtek's internal PHYs: Linux's `rtlgen_write_mmd` maps it there (OCP
+/// 0xa5d0), the PHY does not take MMD access through registers 13/14.
+pub const PHY_EEE_ADV_PAGE: u16 = 0x0a5d;
+pub const PHY_EEE_ADV_REG: u8 = 0x10;
 
 // `ChipCmd` bits.
 pub const CMD_RESET: u8 = 0x10;
@@ -419,6 +426,8 @@ pub struct Rtl8168<R: Regs, D: DmaMem> {
     /// The last frames sent and received, oldest overwritten (index = count % NOTES).
     pub tx_notes: [FrameNote; NOTES],
     pub rx_notes: [FrameNote; NOTES],
+    /// Energy-Efficient Ethernet advertised and TX LPI left alone; see `set_eee`.
+    eee: bool,
     /// Link state as of the last `poll_link` (set by `init_rings`).
     link_was_up: bool,
     /// Link transitions seen by `poll_link`.
@@ -440,6 +449,7 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
             intr_seen: 0,
             tx_notes: [FrameNote { len: 0, head: [0; NOTE_BYTES] }; NOTES],
             rx_notes: [FrameNote { len: 0, head: [0; NOTE_BYTES] }; NOTES],
+            eee: true,
             link_was_up: false,
             link_changes: 0,
         }
@@ -528,7 +538,8 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
     /// without the PHY firmware patch (`rtl8168h-2.fw`) it applies first:
     /// channel-estimation and R-tune parameters, the ADC bias offset and TX
     /// LPF level read from the MAC, and the power-saving features off
-    /// (PFM, 10M PLL off, ALDPS), EEE on. Linux runs it before the link comes
+    /// (PFM, 10M PLL off, ALDPS), the PHY's EEE capability on (Linux then
+    /// advertises none on this chip: `set_eee`). Linux runs it before the link comes
     /// up; without it the board's PHY dropped gigabit link ~13 s after boot
     /// and came back at 100 Mb/s. `false` on an MDIO timeout.
     pub fn phy_config_8168h(&self, mut relax: impl FnMut()) -> bool {
@@ -556,7 +567,8 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
             self.phy_page_modify(0x0a44, 0x11, 1 << 7, 0, r)?; // disable PHY PFM mode
             self.phy_page_modify(0x0a43, 0x10, 1 << 0, 0, r)?; // disable 10M PLL off
             self.phy_page_modify(0x0a43, 0x10, 1 << 2, 0, r)?; // disable ALDPS
-            self.phy_page_modify(0x0a43, 0x11, 0, 1 << 4, r) // EEE
+            // EEE capability on, as Linux; whether it is advertised is `phy_autoneg`'s.
+            self.phy_page_modify(0x0a43, 0x11, 0, 1 << 4, r)
         };
         run().is_some()
     }
@@ -603,9 +615,12 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
         false
     }
 
-    /// Restarts auto-negotiation advertising everything up to 1000BASE-T.
+    /// Restarts auto-negotiation advertising everything up to 1000BASE-T,
+    /// and EEE only when `set_eee` left it on (phylib's `config_aneg` writes
+    /// the EEE advertisement before the restart too).
     pub fn phy_autoneg(&self, mut relax: impl FnMut()) -> bool {
-        self.phy_write(MII_ADVERTISE, ADVERTISE_ALL, &mut relax)
+        (self.eee || self.phy_page_write(PHY_EEE_ADV_PAGE, PHY_EEE_ADV_REG, 0, &mut relax).is_some())
+            && self.phy_write(MII_ADVERTISE, ADVERTISE_ALL, &mut relax)
             && self.phy_write(MII_CTRL1000, ADVERTISE_1000, &mut relax)
             && self.phy_write(MII_BMCR, BMCR_ANENABLE | BMCR_ANRESTART, &mut relax)
     }
@@ -662,6 +677,14 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
         r.w16(INTR_STATUS, 0xFFFF); // clear anything pending
         r.w8(CFG9346, CFG9346_LOCK);
         self.sync_link();
+    }
+
+    /// EEE on or off (call before `init_rings` and `phy_autoneg`). Off: the
+    /// PHY advertises no EEE mode and the MAC's TX LPI is cleared, which is
+    /// what Linux does for the RTL8168h (VER_46, `phy_disable_eee` in
+    /// `r8169_mdio_register`; `rtl_enable_tx_lpi(false)` at link-up).
+    pub fn set_eee(&mut self, on: bool) {
+        self.eee = on;
     }
 
     /// Takes the PHY's current state as the baseline `poll_link` compares to
@@ -721,6 +744,11 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
         r.w8(DLLPR, r.r8(DLLPR) & !(DLLPR_PFM_EN | DLLPR_TX_10M_PS_EN));
         r.w8(MISC_1, r.r8(MISC_1) & !MISC_1_PFM_D3COLD_EN);
         self.eri_modify(0x1B0, 0, 1 << 12);
+        if !self.eee {
+            // `rtl_enable_tx_lpi(tp, false)`: EEE LED frequency and TX LPI off.
+            r.w8(EEE_LED, r.r8(EEE_LED) & !0x07);
+            self.eri_modify(0x1B0, 0, 0x0003);
+        }
     }
 
     fn write_desc(&self, ring: usize, i: usize, addr: u64, opts1: u32) {
@@ -1575,6 +1603,48 @@ mod tests {
         assert_eq!(reg(0x0a42, 0x16) & 2, 2);
         assert_eq!(m.phy[0x1f], 0, "page restored");
         assert!(m.violations.is_empty());
+    }
+
+    #[test]
+    fn eee_off_advertises_nothing_and_clears_tx_lpi_as_linux_8168h() {
+        let dev = Dev::new(0x1000_0000);
+        let mut d = Rtl8168::new(dev.clone(), dev.clone());
+        {
+            // As a reset (or firmware) may leave them: EEE advertised, TX LPI and LED on.
+            let mut m = dev.0.borrow_mut();
+            m.paged.insert((PHY_EEE_ADV_PAGE, PHY_EEE_ADV_REG as usize), 0x0006);
+            m.eri.insert(0x1B0, 0x1003);
+        }
+        d.set_eee(false);
+        d.reset(|| {}).unwrap();
+        dev.0.borrow_mut().regs[EEE_LED] = 0x47;
+        d.init_rings();
+        assert!(d.phy_config_8168h(|| {}));
+        assert!(d.phy_autoneg(|| {}));
+        let m = dev.0.borrow();
+        assert_eq!(m.paged[&(PHY_EEE_ADV_PAGE, PHY_EEE_ADV_REG as usize)], 0, "no EEE mode advertised");
+        assert_eq!(m.paged[&(0x0a43, 0x11)] & (1 << 4), 1 << 4, "PHY EEE capability stays on, as Linux");
+        assert_eq!(m.eri[&0x1B0] & 0x1003, 0, "TX LPI and bit 12 cleared");
+        assert_eq!(m.regs[EEE_LED], 0x40, "LED frequency bits cleared, the rest kept");
+        assert_eq!(m.phy[0x1f], 0, "page restored");
+        assert_eq!(m.phy[MII_BMCR as usize], BMCR_ANENABLE | BMCR_ANRESTART);
+    }
+
+    #[test]
+    fn eee_on_leaves_the_advertisement_and_tx_lpi_alone() {
+        let dev = Dev::new(0x1000_0000);
+        let mut d = Rtl8168::new(dev.clone(), dev.clone());
+        {
+            let mut m = dev.0.borrow_mut();
+            m.paged.insert((PHY_EEE_ADV_PAGE, PHY_EEE_ADV_REG as usize), 0x0006);
+            m.eri.insert(0x1B0, 0x1003);
+        }
+        d.reset(|| {}).unwrap();
+        d.init_rings();
+        assert!(d.phy_autoneg(|| {}));
+        let m = dev.0.borrow();
+        assert_eq!(m.paged[&(PHY_EEE_ADV_PAGE, PHY_EEE_ADV_REG as usize)], 0x0006);
+        assert_eq!(m.eri[&0x1B0], 0x0003, "only bit 12 cleared (rtl_hw_start_8168h_1)");
     }
 
     #[test]
