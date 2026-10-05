@@ -38,6 +38,7 @@ docs/
 │   ├── README.md             ← driver-docs index
 │   ├── architecture.md       ← where we are: the trait/seam design, today
 │   └── roadmap.md            ← where we're going: toward a Linux-class driver model
+├── gui/compositor-visual-plan.md ← vk_comp looks: renderer primitives → themes (Luna 2026 / 9x) → glass → icons → real 3D icons
 ├── userland/roadmap.md       ← agreed order: HTTPS client → dynamic linking → Claude Code (scope) → browser
 ├── busybox-integration.md    ← legacy: BusyBox/ash bring-up log (see note below)
 └── *.png                     ← screenshots referenced by the repo-root README.md
