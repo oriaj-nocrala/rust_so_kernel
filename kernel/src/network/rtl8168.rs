@@ -25,7 +25,7 @@ const VENDOR: u16 = 0x10EC;
 const DEVICE: u16 = 0x8168;
 /// The chip does 64-bit DMA with `PCIDAC` set (`hal::rtl8169::init_rings`).
 const DMA_MASK: u64 = u64::MAX >> 17;
-/// Longest wait for auto-negotiation, in milliseconds.
+/// Longest wait for auto-negotiation at `nic=reset`, in milliseconds (`net` does not wait).
 const LINK_WAIT_MS: u64 = 6_000;
 /// The PHY/MAC-MCU patch Linux applies to the RTL8168h (`FIRMWARE_8168H_2`), under `firmware::ROOT`.
 const FW_8168H_2: &str = "rtl_nic/rtl8168h-2.fw";
@@ -312,9 +312,13 @@ pub fn probe(level: NicLevel, irq_apic: Option<u32>) -> Option<Rtl> {
     serial_println!("rtl8168: restarting auto-negotiation at {} ms", crate::cpu::tsc::uptime_ms());
     let aneg = drv.phy_autoneg(relax);
     serial_println!("rtl8168: MDIO writes {}", if aneg { "completed" } else { "TIMED OUT" });
+    // `reset` waits for the link to say whether auto-negotiation completes;
+    // `net` does not, as Linux: the link comes up asynchronously (the first
+    // one took ~10 s on the board), `link_change` reports it and
+    // `net::LinkWatch` starts DHCP over then.
     let start = crate::cpu::tsc::uptime_ms();
     let mut link = drv.link();
-    while !link.up && crate::cpu::tsc::uptime_ms() - start < LINK_WAIT_MS {
+    while level == NicLevel::Reset && !link.up && crate::cpu::tsc::uptime_ms() - start < LINK_WAIT_MS {
         relax();
         link = drv.link();
     }

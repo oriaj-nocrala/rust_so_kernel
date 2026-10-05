@@ -62,6 +62,12 @@ impl net::Nic for AnyNic {
             AnyNic::Rtl(n) => n.link_change(),
         }
     }
+    fn link_up(&self) -> Option<bool> {
+        match self {
+            AnyNic::Virtio(_) => None,
+            AnyNic::Rtl(n) => Some(n.link_up()),
+        }
+    }
 }
 
 impl AnyNic {
@@ -220,7 +226,8 @@ pub fn init_with(irq_cpu: Option<usize>) {
     let mut stack = Stack::new(net::NicDevice::new(nic), mac, u64::from_le_bytes(seed), now());
     stack.enable_dhcp();
     stack.poll(now());
-    NET.with(|n| *n = Some(Net { stack, socks: Vec::new(), link: net::LinkWatch::new() }));
+    let link = net::LinkWatch::starting(net::Nic::link_up(&mut stack.device().nic));
+    NET.with(|n| *n = Some(Net { stack, socks: Vec::new(), link }));
 }
 
 /// Times the stack was driven (tick, interrupt or a socket call): `/proc/nic`

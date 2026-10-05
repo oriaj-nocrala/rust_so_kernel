@@ -33,6 +33,10 @@ pub trait Nic {
     fn link_change(&mut self) -> Option<bool> {
         None
     }
+    /// The link state now, for a NIC that knows it (`None`: it cannot tell).
+    fn link_up(&self) -> Option<bool> {
+        None
+    }
 }
 
 /// Decides what a link transition means for the DHCP lease. A cable pulled
@@ -42,19 +46,34 @@ pub trait Nic {
 #[derive(Default)]
 pub struct LinkWatch {
     down_at: Option<i64>,
+    /// The NIC started without link (it comes up asynchronously): its first
+    /// up restarts DHCP, whose first DISCOVER went out on a dead link and
+    /// would otherwise wait for smoltcp's 10 s retry.
+    first_up_pending: bool,
 }
 
 impl LinkWatch {
     pub fn new() -> Self {
-        LinkWatch { down_at: None }
+        LinkWatch { down_at: None, first_up_pending: false }
+    }
+
+    /// For a NIC whose link state at start is `up` (`Some(false)`: the first
+    /// up restarts DHCP whatever the timing).
+    pub fn starting(up: Option<bool>) -> Self {
+        LinkWatch { down_at: None, first_up_pending: up == Some(false) }
     }
 
     /// Feeds one transition (`up`) seen at `now_ms`. `true`: the link is back
-    /// after at least `min_down_ms` down, so DHCP should start over.
+    /// after at least `min_down_ms` down, or up for the first time on a NIC
+    /// that started without it, so DHCP should start over.
     pub fn event(&mut self, up: bool, now_ms: i64, min_down_ms: i64) -> bool {
         if !up {
             self.down_at.get_or_insert(now_ms);
             return false;
+        }
+        if core::mem::take(&mut self.first_up_pending) {
+            self.down_at = None;
+            return true;
         }
         match self.down_at.take() {
             Some(t) => now_ms - t >= min_down_ms,
@@ -134,6 +153,23 @@ mod tests {
         assert!(!w.event(false, 6_000, 3_000), "a second down does not move the start");
         assert!(w.event(true, 8_000, 3_000), "3 s down: another network, ask again");
         assert!(!w.event(true, 9_000, 3_000), "an up without a down does nothing");
+    }
+
+    #[test]
+    fn link_watch_first_up_of_a_nic_that_started_down_restarts_dhcp() {
+        use super::LinkWatch;
+        let mut w = LinkWatch::starting(Some(false));
+        assert!(w.event(true, 100, 3_000), "the first up, however soon");
+        assert!(!w.event(false, 200, 3_000));
+        assert!(!w.event(true, 300, 3_000), "later flaps follow the normal rule");
+        let mut w = LinkWatch::starting(Some(false));
+        assert!(!w.event(false, 50, 3_000), "a stale up read at start, then down");
+        assert!(w.event(true, 1_000, 3_000), "still the first real up");
+        let mut up = LinkWatch::starting(Some(true));
+        assert!(!up.event(false, 0, 3_000));
+        assert!(!up.event(true, 100, 3_000), "started up: a short flap keeps the lease");
+        let mut unknown = LinkWatch::starting(None);
+        assert!(!unknown.event(true, 0, 3_000));
     }
 
     use super::*;
