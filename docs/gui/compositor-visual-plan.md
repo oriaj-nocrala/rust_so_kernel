@@ -122,6 +122,16 @@ Decide by seeing them: build the engine, then switch themes on the real screen.
    tests (a transparent window shows neither its frame nor its bar; a shadow falls on the window
    below), the renderer's clip mutant killed, the four `gui-e2e.sh` modes.
    Next on it: keyboard navigation, icons per item (step 4), submenus.
+2e. **Later (agreed, not now): one compositor.** `vk_comp` becomes *the* compositor with two
+   render backends: GPU (`cr_*` over NVK, as now) and software (`gui::Compositor::compose` +
+   `/dev/fb0`, `FBIO_FLUSH` of the damage and the vblank pacing, taken from
+   `userspace/src/bin/compositor.rs`), the software one chosen when `cr_init` finds no GPU (or by
+   an env var). `vk-comp` gets a cargo feature for NVK so a software-only build is a plain musl
+   `cargo build`, which `kernel/build.rs` can put on `disk.img` for QEMU; `gui-e2e.sh` then drives
+   `vk_comp`, and `compositor.rs` is deleted. Expected differences to settle with the e2e: the
+   console keyboard grab, Ctrl+Alt+Backspace, starting the panel. Until then the CPU compositor is
+   a test bench and fallback only: no features of its own (glass is drawn there as its tint,
+   without blur).
 3. **Glass / blur behind** for the taskbar and start menu: copy what is behind, two-pass blur,
    tint. Costlier; measure on the Ryzen (`cr_stats` render_us).
 4. **Icons**: the user generates them with a local image model. Generate at 256 px on a
