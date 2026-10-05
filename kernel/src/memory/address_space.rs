@@ -336,7 +336,9 @@ impl AddressSpace {
                 (phys_offset + dst.start_address().as_u64()).as_mut_ptr::<u8>(),
                 PAGE_2M as usize,
             );
-            match child.create_mapper().map_to(page, dst, vma.page_table_flags(), &mut buddy) {
+            let flags = vma.page_table_flags();
+            let tables = super::page_table_manager::OwnedPageTable::table_flags_for(flags);
+            match child.create_mapper().map_to_with_table_flags(page, dst, flags, tables, &mut buddy) {
                 // The child is in no CPU's CR3 yet: nothing to invalidate.
                 Ok(flush) => flush.ignore(),
                 Err(_) => {

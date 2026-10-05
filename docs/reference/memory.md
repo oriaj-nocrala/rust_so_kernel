@@ -28,6 +28,7 @@ Code: `kernel/src/memory/`, `kernel/src/allocator/`, crate `mm/` (host tests: `c
 - **The address-space lock** (`AddressSpace::vmas`, an `IrqMutex`) covers every VMA lookup and every PTE change: faults, COW, fork's write-protect, `mmap`/`munmap`. A fault that finds its page already mapped (another thread won) counts as success.
   - Lock order: scheduler → address space → `BUDDY`/`SLAB_ALLOCATOR`.
   - Never touch user memory by virtual address while holding it: the fault would take the lock again.
+- **Page-table levels are always `PRESENT | WRITABLE` (+ `USER` for a user page); the leaf alone sets the permissions.** Map with `map_to_with_table_flags(.., OwnedPageTable::table_flags_for(flags), ..)`, never x86_64's plain `map_to`, which copies the leaf's flags into the levels it creates: a read fault that mapped the zero frame (read-only) first in a fresh 2 MiB made its page table read-only, and every later write there faulted with the PTE already writable, which `make_writable_locked` reports as done, so the process looped on the fault forever (test: `zeropage_test`, proven by reverting the fix).
 - **Writing another process's memory:** use `AddressSpace::copy_to_user`/`copy_from_user`/`prepare_user_write`. **Never** `translate_page` + a physmap write: the frame behind the page may be the shared zero frame or a COW frame still shared with a fork sibling (test: `pipe_cow_test`).
 
 ## Page faults

@@ -273,7 +273,7 @@ impl OwnedPageTable {
         let mut mapper = self.create_mapper();
 
         mapper
-            .map_to(page, frame, flags, &mut buddy_alloc)?
+            .map_to_with_table_flags(page, frame, flags, Self::table_flags_for(flags), &mut buddy_alloc)?
             .ignore();
         crate::memory::tlb::invalidate_page(self.pml4_phys(), page.start_address());
 
@@ -289,6 +289,16 @@ impl OwnedPageTable {
     /// handler can later restore WRITABLE on just the leaf entry: the CPU checks R/W on ALL
     /// page table levels, so if any intermediate entry lacks WRITABLE the page stays read-only
     /// even after the leaf is updated.
+    /// The flags for page-table levels created (or extended) while mapping a leaf with `leaf`: always PRESENT | WRITABLE, plus
+    /// USER_ACCESSIBLE for a user page. The leaf alone decides the page's permissions. x86_64's plain `map_to` copies the leaf's
+    /// flags instead, so a read-only first mapping (the shared zero frame of a read fault) made the new table read-only for the whole
+    /// 2 MiB (or 1 GiB) it covers: every later write there faulted with the PTE already writable, `make_writable_locked` called that
+    /// done, and the process looped on the fault forever (a 900x20 title's coverage buffer, read before written, in the CPU
+    /// compositor). Use `map_to_with_table_flags(.., table_flags_for(flags), ..)` for every mapping.
+    pub fn table_flags_for(leaf: PageTableFlags) -> PageTableFlags {
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | (leaf & PageTableFlags::USER_ACCESSIBLE)
+    }
+
     pub unsafe fn map_existing_frame(
         &self,
         page: Page<Size4KiB>,

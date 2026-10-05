@@ -138,7 +138,7 @@ pub(super) unsafe fn map_demand_page(
         let ro_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
         let mut buddy_alloc = BuddyFrameAllocator;
         pt.create_mapper()
-            .map_to(page, zero, ro_flags, &mut buddy_alloc)
+            .map_to_with_table_flags(page, zero, ro_flags, OwnedPageTable::table_flags_for(ro_flags), &mut buddy_alloc)
             .map_err(|_| "zero-page: map_to failed")?
             .ignore();
         crate::memory::tlb::invalidate_page(pt.pml4_phys(), page.start_address());
@@ -158,7 +158,7 @@ pub(super) unsafe fn map_demand_page(
     core::ptr::write_bytes(frame_virt.as_mut_ptr::<u8>(), 0, 4096);
 
     pt.create_mapper()
-        .map_to(page, frame, vma.page_table_flags(), &mut buddy_alloc)
+        .map_to_with_table_flags(page, frame, vma.page_table_flags(), OwnedPageTable::table_flags_for(vma.page_table_flags()), &mut buddy_alloc)
         .map_err(|_| "Demand paging: map_to failed")?
         .ignore();
     crate::memory::tlb::invalidate_page(pt.pml4_phys(), page.start_address());
@@ -202,7 +202,7 @@ unsafe fn map_demand_page_2m(pt: &OwnedPageTable, fault_addr: u64, vma: &Vma) ->
 
     // map_to for Size2MiB sets the HUGE_PAGE bit automatically.
     pt.create_mapper()
-        .map_to(page, frame, vma.page_table_flags(), &mut buddy_alloc)
+        .map_to_with_table_flags(page, frame, vma.page_table_flags(), OwnedPageTable::table_flags_for(vma.page_table_flags()), &mut buddy_alloc)
         .map_err(|_| "map_to 2M failed")?
         .ignore();
     crate::memory::tlb::invalidate_page(pt.pml4_phys(), page.start_address());
