@@ -258,6 +258,10 @@ pub fn probe(level: NicLevel, irq_apic: Option<u32>) -> Option<Rtl> {
         let ok = drv.phy_config_8168h(relax);
         serial_println!("rtl8168: PHY configured as Linux's rtl8168h_2 ({})", if ok { "ok" } else { "MDIO TIMED OUT" });
     }
+    // `genphy_soft_reset`, as Linux right after the PHY configuration
+    // (`rtl8169_init_phy`): the parameters written above take effect with it.
+    let ok = drv.phy_soft_reset(relax);
+    serial_println!("rtl8168: PHY soft reset {}", if ok { "done" } else { "TIMED OUT" });
     // The MAC is configured before the link is brought up, as Linux does
     // (`rtl_hw_start` runs before `phy_start`): programming it afterwards made
     // the PHY drop the link ~350 ms after it came up.

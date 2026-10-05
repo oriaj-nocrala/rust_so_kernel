@@ -163,6 +163,7 @@ pub const MII_CTRL1000: u8 = 9;
 pub const BMCR_RESET: u16 = 0x8000;
 pub const BMCR_ANENABLE: u16 = 0x1000;
 pub const BMCR_ANRESTART: u16 = 0x0200;
+pub const BMCR_ISOLATE: u16 = 0x0400;
 pub const BMSR_LSTATUS: u16 = 0x0004;
 pub const BMSR_ANEGCOMPLETE: u16 = 0x0020;
 /// Advertise 10/100 half/full and 802.3 (`ADVERTISE_ALL | ADVERTISE_CSMA`).
@@ -615,6 +616,27 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
         false
     }
 
+    /// `genphy_soft_reset`, which Linux runs right after the PHY configuration
+    /// (`rtl8169_init_phy`): `BMCR.Reset` with auto-negotiation restart and
+    /// isolate cleared, then wait for the PHY to clear the reset bit.
+    /// `false` on an MDIO timeout or a reset that never completes.
+    pub fn phy_soft_reset(&self, mut relax: impl FnMut()) -> bool {
+        let Some(bmcr) = self.phy_read(MII_BMCR, &mut relax) else {
+            return false;
+        };
+        if !self.phy_write(MII_BMCR, (bmcr & !BMCR_ISOLATE) | BMCR_RESET | BMCR_ANRESTART, &mut relax) {
+            return false;
+        }
+        for _ in 0..20_000u32 {
+            match self.phy_read(MII_BMCR, &mut relax) {
+                Some(v) if v & BMCR_RESET == 0 => return true,
+                Some(_) => relax(),
+                None => return false,
+            }
+        }
+        false
+    }
+
     /// Restarts auto-negotiation advertising everything up to 1000BASE-T,
     /// and EEE only when `set_eee` left it on (phylib's `config_aneg` writes
     /// the EEE advertisement before the restart too).
@@ -974,6 +996,7 @@ mod tests {
         link_status: u8,
         reset_stuck: bool,
         eri: alloc::collections::BTreeMap<u32, u32>,
+        bmcr_resets: u32,
         /// PHY registers behind a non-zero page (register 0x1f).
         paged: alloc::collections::BTreeMap<(u16, usize), u16>,
         ocp: alloc::collections::BTreeMap<u16, u16>,
@@ -999,6 +1022,7 @@ mod tests {
                 link_status: PHYST_LINK | PHYST_FULL_DUP | PHYST_1000,
                 reset_stuck: false,
                 eri: Default::default(),
+                bmcr_resets: 0,
                 paged: Default::default(),
                 ocp: Default::default(),
             })))
@@ -1102,6 +1126,10 @@ mod tests {
                 }
                 if banked {
                     m.paged.insert((page, reg), v as u16);
+                } else if reg == MII_BMCR as usize {
+                    // The reset bit self-clears.
+                    m.bmcr_resets += (v as u16 & BMCR_RESET != 0) as u32;
+                    m.phy[reg] = v as u16 & !BMCR_RESET;
                 } else {
                     m.phy[reg] = v as u16;
                 }
@@ -1628,6 +1656,17 @@ mod tests {
         assert_eq!(m.regs[EEE_LED], 0x40, "LED frequency bits cleared, the rest kept");
         assert_eq!(m.phy[0x1f], 0, "page restored");
         assert_eq!(m.phy[MII_BMCR as usize], BMCR_ANENABLE | BMCR_ANRESTART);
+    }
+
+    #[test]
+    fn phy_soft_reset_as_genphy() {
+        let dev = Dev::new(0x1000_0000);
+        let d = Rtl8168::new(dev.clone(), dev.clone());
+        assert!(d.phy_write(MII_BMCR, BMCR_ANENABLE | BMCR_ISOLATE, || {}));
+        assert!(d.phy_soft_reset(|| {}));
+        let m = dev.0.borrow();
+        assert_eq!(m.bmcr_resets, 1);
+        assert_eq!(m.phy[MII_BMCR as usize], BMCR_ANENABLE | BMCR_ANRESTART, "isolate cleared, restart set");
     }
 
     #[test]
