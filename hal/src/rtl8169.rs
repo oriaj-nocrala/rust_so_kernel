@@ -661,6 +661,12 @@ impl<R: Regs, D: DmaMem> Rtl8168<R, D> {
         r.w16(INTR_MASK, 0); // polled
         r.w16(INTR_STATUS, 0xFFFF); // clear anything pending
         r.w8(CFG9346, CFG9346_LOCK);
+        self.sync_link();
+    }
+
+    /// Takes the PHY's current state as the baseline `poll_link` compares to
+    /// (after the adapter has waited for the link).
+    pub fn sync_link(&mut self) {
         self.link_was_up = self.link().up;
     }
 
