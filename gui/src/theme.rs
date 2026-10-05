@@ -108,30 +108,37 @@ impl Shape {
         };
         let area = Rect::new(rect.x - reach, rect.y - reach, rect.w + 2 * reach, rect.h + 2 * reach);
         let Some(a) = area.intersect(&clip) else { return };
-        if self.radius <= 0.0 && self.border <= 0.0 && reach == 0 {
-            // a plain gradient (the desktop, the taskbar): every pixel inside is fully covered and its colour depends on its row (or
-            // column) alone, so `pixel` is asked once per row (column) — the same numbers, far fewer of them
-            for y in a.y..a.bottom() {
-                let row = &mut px[y as usize * stride..];
-                let mut last = (i32::MIN, [0.0f32; 4]);
-                for x in a.x..a.right() {
+        // Inside the box, farther than the corner radius and the border from its edge, a pixel is fully covered, past the border, and
+        // gets no shadow (it is multiplied by 1 - cover = 0): its colour is the gradient's alone, which depends on its row (or column).
+        // There `pixel` is asked once per row (column) — the same numbers, far fewer of them — or not at all when the fill is
+        // transparent (a frame's ring). Only the border band, the corners and the shadow are computed pixel by pixel.
+        let m = (self.radius.max(0.0) + self.border.max(0.0)) as i32 + 2;
+        let inner = Rect::new(rect.x + m, rect.y + m, rect.w - 2 * m, rect.h - 2 * m);
+        let filled = self.c.iter().any(|c| c >> 24 != 0);
+        for y in a.y..a.bottom() {
+            let row_inside = inner.w > 0 && inner.h > 0 && y >= inner.y && y < inner.bottom();
+            let row = &mut px[y as usize * stride..];
+            let mut last = (i32::MIN, [0.0f32; 4]);
+            let mut x = a.x;
+            while x < a.right() {
+                let c = if row_inside && x >= inner.x && x < inner.right() {
+                    if !filled {
+                        x = inner.right();
+                        continue;
+                    }
                     let key = if self.horizontal { x } else { y };
                     if key != last.0 {
                         last = (key, self.pixel(rect, x, y));
                     }
-                    let d = &mut row[x as usize];
-                    *d = over_f(*d, last.1);
-                }
-            }
-            return;
-        }
-        for y in a.y..a.bottom() {
-            for x in a.x..a.right() {
-                let c = self.pixel(rect, x, y);
+                    last.1
+                } else {
+                    self.pixel(rect, x, y)
+                };
                 if c[3] > 0.0 {
-                    let d = &mut px[y as usize * stride + x as usize];
+                    let d = &mut row[x as usize];
                     *d = over_f(*d, c);
                 }
+                x += 1;
             }
         }
     }
@@ -533,6 +540,30 @@ mod tests {
         assert_eq!(over(0x8012_3456, 0), 0x8012_3456, "transparent leaves");
         assert_eq!(over(0xFFFF_FFFF, 0x8000_0000), 0xFF7F_7F7F, "half black over white: 255 * 127 / 255 = 127");
         assert_eq!(over(0x00C8_6432, 0x8040_2010) & 0x00FF_FFFF, 0x00A4_5229, "0x40 + (200 * 127 + 127) / 255 = 164");
+    }
+
+    // A: the interior shortcut (a colour per row or column, nothing for a transparent fill) gives exactly what `pixel` gives, for a
+    // frame's ring with its shadow, a large horizontal gradient, and a rounded vertical one.
+    #[test]
+    fn paint_is_pixel_for_rings_and_large_gradients() {
+        let shapes = [
+            Shape::solid(0).border(3.0, 0xFF00_55E5).shadow(14.0, 0, 6, 0x7000_0000),
+            Shape::gradient(0xFF0A_246A, 0xFFA6_CAF0, 0, 0, 1.0).horizontal(),
+            Shape::gradient(0xFF4C_92F2, 0xFF1F_63D8, 0xFF19_58CC, 0xFF15_4FC0, 0.4).radius(9.0).border(2.0, 0xFF00_0000),
+        ];
+        let (w, h) = (140usize, 110usize);
+        for (n, s) in shapes.iter().enumerate() {
+            let rect = Rect::new(20, 15, 100, 70);
+            let mut px = vec![0x1020_3040u32; w * h];
+            s.paint(&mut px, w, Rect::new(0, 0, w as i32, h as i32), rect);
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    let c = s.pixel(rect, x, y);
+                    let want = if c[3] > 0.0 { over_f(0x1020_3040, c) } else { 0x1020_3040 };
+                    assert_eq!(px[y as usize * w + x as usize], want, "shape {n} at ({x}, {y})");
+                }
+            }
+        }
     }
 
     // A: Shape::paint is Shape::pixel "over" each pixel of the clip, and nothing outside the clip; the corners of a rounded box stay
