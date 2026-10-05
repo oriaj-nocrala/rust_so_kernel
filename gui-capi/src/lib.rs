@@ -399,8 +399,11 @@ pub unsafe extern "C" fn gui_draw_get(c: *const GuiComp, i: usize, out: *mut Gui
             o.kind = 4;
             (o.x, o.y) = (*x, *y);
         }
-        DrawOp::Shape { rect, shape } => {
+        DrawOp::Shape { rect, shape, clip } => {
             o.kind = 5;
+            if let Some(c) = clip {
+                (o.clip_x, o.clip_y, o.clip_w, o.clip_h) = (c.x, c.y, c.w, c.h);
+            }
             (o.x, o.y, o.w, o.h) = (rect.x, rect.y, rect.w, rect.h);
             (o.shape_radius, o.shape_border, o.shape_split, o.shape_shadow_blur) = (shape.radius, shape.border, shape.split, shape.shadow_blur);
             (o.shape_c, o.shape_border_color, o.shape_shadow_color) = (shape.c, shape.border_color, shape.shadow_color);

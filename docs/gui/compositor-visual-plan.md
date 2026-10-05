@@ -1,7 +1,8 @@
 # GPU compositor visual plan (vk_comp): primitives, themes, icons
 
-Agreed 2026-10-05. Steps 1, 2, 2b (taskbar) and 2c (start menu) done; 1 and 2 seen on the Ryzen
-(both looks kept: the user likes both, and picks in the start menu). Step 3 (glass) next. Start here without other context.
+Agreed 2026-10-05. Steps 1, 2, 2b (taskbar), 2c (start menu) and 2d (no flat look) done and seen
+on the Ryzen up to 2c (both looks kept: the user likes both, and picks in the start menu). Step 3
+(glass) next. Start here without other context.
 
 ## Where it stands
 
@@ -14,34 +15,40 @@ Agreed 2026-10-05. Steps 1, 2, 2b (taskbar) and 2c (start menu) done; 1 and 2 se
   SDF, a two-segment gradient vertical or horizontal, an inner border, a soft or hard drop shadow,
   colours `0xAARRGGBB` straight alpha). Every draw blends ONE / ONE_MINUS_SRC_ALPHA, so opaque
   draws stay exact. No sampling or scaling yet.
-- **Themes** (`gui/src/theme.rs`): `flat` (what the CPU painter `compose` draws, the only look
-  it knows), `luna` ("Luna 2026") and `9x` ("9x moderno"), each a `Theme` of `Shape`s (desktop,
-  window frame with its shadow, title bar focused/unfocused, buttons as shape, bevel or flat,
-  glyph colour and stroke, title text colour and shadow). `draw_list` emits `DrawOp::Shape`
-  (unclipped; the renderer clips) and carries the title's colours in `DrawOp::Title`. **The
+- **Themes** (`gui/src/theme.rs`): `luna` ("Luna 2026", the default) and `9x` ("9x moderno"),
+  each a `Theme` of `Shape`s (desktop, window frame and shadow, title bar focused/unfocused,
+  buttons as shape or bevel, glyph colour and stroke, title text colour and shadow, taskbar,
+  menu). The old flat look is gone (step 2d). `draw_list` emits `DrawOp::Shape` (with an optional
+  `clip`: a title bar's box reaches under the content so only its top corners are round, and the
+  clip keeps it out; the frame is split into its shadow, square and masked under the window, and
+  its ring, square and clipped below the bar, so nothing shows through a translucent window) and
+  carries the title's colours in `DrawOp::Title`. **`compose`, the CPU painter (QEMU, no GPU),
+  rasterises the same list in software** (`Shape::paint`, a plain gradient row by row), so both
+  painters show the same look, and windows' damage is grown by the decorations' reach
+  (`decor_margin`). **The
   geometry is the same in every look** (title bar `TITLE_H` × scale, buttons and hit boxes where
   they were; the frame reaches `frame_w` past the window but is not a hit area), so a switch only
-  changes pixels. **F12** (the compositor's, like F11) cycles flat → luna → 9x; vk-comp starts in
+  changes pixels. **F12** (the compositor's, like F11) cycles luna → 9x; vk-comp starts in
   `COMP_THEME` (default `luna`) and prints `COMP theme <name>` on every change.
-- Titles in vk-comp are premultiplied text, transparent around the glyphs (`titles.rs`: drawn
+- Titles are premultiplied text, transparent around the glyphs (`gui::theme::text_pixels`: drawn
   white on black for the coverage, then coloured, over an optional 1 px × scale shadow), so the
-  bar's gradient shows through.
+  bar's gradient shows through: vk-comp draws them with `CR_PREMUL`, the CPU compositor with
+  `theme::over`.
 - **Taskbar** (step 2b): the panel (`userspace/src/bin/panel.rs`) is told the look (`theme(name)`
-  event, at `set_panel` and on every change) and, in a theme with a `Taskbar`, draws only its
+  event, at `set_panel` and on every change) and draws only its
   buttons (start, windows, clock area: `Button::paint`, shapes through `Shape::paint`, the
   software twin of `comp.frag`) into a premultiplied **`ARGB8888`** buffer, transparent elsewhere.
   The strip under it is the compositor's (`DrawOp::Shape` before the panel's pixels in
   `draw_list`; `compose` paints the same shape in software), which is where step 3's blur goes.
-  Text drawing writes `0x00RRGGBB`, so the panel puts the alpha back after its labels. Flat stays
-  the old opaque look.
+  Text drawing writes `0x00RRGGBB`, so the panel puts the alpha back after its labels.
 - **Start menu** (step 2c): "Apps" opens a **popup** (`set_popup`, `xdg_popup`-like: above
   everything, undecorated, never focused; a click outside or Escape hides it with `popup_done`,
   and that click goes nowhere; it goes with its parent) holding the apps and the **theme selector**
   (`set_theme`, the panel's alone). Its look is `Theme::menu` (`gui::theme::Menu`): the frame with
   its shadow is the compositor's shape under the popup (step 3 blurs there), the panel draws the
   rest: Luna's blue header ("constanos"), white apps column and light-blue "Tema" column, footer;
-  9x's grey menu with the navy side banner (the name drawn bottom to top) and an etched separator;
-  flat, dark and opaque. The panel makes a new popup surface each time it opens (its height, and
+  9x's grey menu with the navy side banner (the name drawn bottom to top) and an etched separator.
+  The panel makes a new popup surface each time it opens (its height, and
   so its offset above the strip, depends on the theme) and logs `panel: menu <label>@x,y ...` in
   screen coordinates, which `gui-e2e.sh wm` uses to launch apps (W1, W5, W6) and checks (W7).
 - Decorations (title, close, maximize), the panel (`panel` client) and window management live in
@@ -97,7 +104,7 @@ Decide by seeing them: build the engine, then switch themes on the real screen.
    Proof: `gui` tests (an ARGB window over others, in compose and the draw list, the oracle
    included; the theme event; the strip as a shape; compose's strip; `Shape::paint` = `pixel` over
    inside the clip; bevels; `over`; `sqrt`), 9 mutants killed; `host_comp.c` frame
-   `5c2-argb-panel-flat` and the strip in `5d-luna`; in QEMU with the CPU compositor (F12 through
+   `5c2-argb-panel` and the strip in `5d-luna`; in QEMU with the CPU compositor (F12 through
    the monitor) the start button, window buttons (focused down, 9x sunken), the Apps list and the
    clock area were checked on screendumps; `gui-e2e.sh` and `gui-e2e.sh wm` pass. Not on the
    Ryzen yet.
@@ -107,6 +114,13 @@ Decide by seeing them: build the engine, then switch themes on the real screen.
    the panel may `set_theme`; its frame under it in both painters), 12 mutants killed;
    `gui-e2e.sh wm` W7 (shows above the strip, Escape, a click outside, a theme picked in it, back
    to flat) and every launch going through it; the three looks checked on QEMU screendumps.
+2d. **No flat look** — done (the user: "cajas negras sin alma"). `compose` became a software
+   rasteriser of the draw list (so QEMU and a GPU-less machine show the themes too); the frame
+   and bar got the split and clip above; `gui-e2e.sh` asks `gui/examples/theme_px` (the same
+   `Shape::paint`) what a point should look like instead of hard-coding flat colours, and finds
+   the cursor by its bitmap (black text on Luna's white menu fooled the looser test). Proof: `gui`
+   tests (a transparent window shows neither its frame nor its bar; a shadow falls on the window
+   below), the renderer's clip mutant killed, the four `gui-e2e.sh` modes.
    Next on it: keyboard navigation, icons per item (step 4), submenus.
 3. **Glass / blur behind** for the taskbar and start menu: copy what is behind, two-pass blur,
    tint. Costlier; measure on the Ryzen (`cr_stats` render_us).

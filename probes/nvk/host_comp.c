@@ -4,8 +4,9 @@
  * in-process: a "GPU" client whose buffer is a memfd it writes pixels into (the harness's stand-in for a client's VRAM buffer), and a
  * pool client (shm) for the CPU path. Each frame is rendered into an offscreen image, read back, and compared pixel for pixel with a
  * rasterisation of the same draw list on the CPU (titles are not drawn by either). Exit 1 on the first difference.
- * Some frames add operations the window manager does not make yet (shapes, premultiplied pixels: docs/gui/compositor-visual-plan.md):
- * those are computed in floats on both sides, so they compare within `tol` per channel, and the reference itself is checked on known pixels.
+ * The window manager draws its look with shapes (gui::theme: the desktop, frames, bars, buttons, the taskbar) and one frame adds shapes and
+ * premultiplied pixels of its own: those are computed in floats on both sides, so every frame compares within `tol` per channel (3: at a
+ * window's rounded corner three blended layers stack, each rounded to 8 bits), and the reference itself is checked on known pixels.
  */
 #define _GNU_SOURCE
 #include <vulkan/vulkan.h>
@@ -100,7 +101,7 @@ static struct client pool_window(int w, int h, uint32_t color) {
 /* Operations drawn after the window manager's (on top of everything), and how far (per channel) the GPU may be from the reference. */
 static const struct cr_op *extra_ops;
 static size_t n_extra;
-static int tol;
+static int tol = 3;
 
 static float clampf(float x, float lo, float hi) { return x < lo ? lo : x > hi ? hi : x; }
 
@@ -169,10 +170,18 @@ static void blend_over(uint32_t *dst, const float src[4]) {
    *dst = out;
 }
 
-/* every pixel of the screen: a renderer that covers too little (the shadow's reach) shows as a difference */
+/* every pixel of the screen (or of its clip): a renderer that covers too little (the shadow's reach) shows as a difference */
 static void reference_shape(const struct cr_op *op, uint32_t *out) {
-   for (int y = 0; y < H; y++)
-      for (int x = 0; x < W; x++) {
+   const struct cr_shape *s = &op->shape;
+   int x0 = 0, y0 = 0, x1 = W, y1 = H;
+   if (s->clip_w > 0) {
+      x0 = s->clip_x > 0 ? s->clip_x : 0;
+      y0 = s->clip_y > 0 ? s->clip_y : 0;
+      x1 = s->clip_x + s->clip_w < W ? s->clip_x + s->clip_w : W;
+      y1 = s->clip_y + s->clip_h < H ? s->clip_y + s->clip_h : H;
+   }
+   for (int y = y0; y < y1; y++)
+      for (int x = x0; x < x1; x++) {
          float c[4];
          shape_pixel(op, x, y, c);
          if (c[3] > 0.0f) blend_over(&out[y * W + x], c);
@@ -184,7 +193,7 @@ static struct cr_op shape_op(const struct gui_draw_op *d) {
    struct cr_op o = { .kind = CR_SHAPE, .x = d->x, .y = d->y, .w = d->w, .h = d->h };
    o.shape = (struct cr_shape){ .radius = d->shape_radius, .border = d->shape_border, .split = d->shape_split, .shadow_blur = d->shape_shadow_blur,
       .border_color = d->shape_border_color, .shadow_color = d->shape_shadow_color, .shadow_dx = d->shape_shadow_dx, .shadow_dy = d->shape_shadow_dy,
-      .horizontal = d->shape_horizontal };
+      .horizontal = d->shape_horizontal, .clip_x = d->clip_x, .clip_y = d->clip_y, .clip_w = d->clip_w, .clip_h = d->clip_h };
    memcpy(o.shape.c, d->shape_c, sizeof(o.shape.c));
    return o;
 }
@@ -567,11 +576,9 @@ int main(int argc, char **argv) {
       CHECK(px[2] < 0.55f && px2[2] > 0.8f && px[3] == 1.0f, "the title bar runs navy to light blue left to right (b %.3f -> %.3f)", px[2], px2[2]);
       extra_ops = deco;
       n_extra = sizeof(deco) / sizeof(deco[0]);
-      tol = 2;
       failures += frame(&v, &comp, dir, "5c-shapes") != 0;
       extra_ops = NULL;
       n_extra = 0;
-      tol = 0;
    }
 
    /* ---- the window manager's own looks (step 2): its shapes go through gui_capi and the renderer like any operation. A panel whose buffer is
@@ -594,12 +601,8 @@ int main(int argc, char **argv) {
       guiw_attach(&o, 4, 3);
       guiw_commit(&o, 4);
       send_out(pc, &o);
-      tol = 0;
-      failures += frame(&v, &comp, dir, "5c2-argb-panel-flat") != 0;
+      failures += frame(&v, &comp, dir, "5c2-argb-panel") != 0;
       CHECK(gui_set_theme(g, "luna") == 0, "the Luna look");
-      /* at a window's rounded corner three layers stack (the desktop's gradient, the shadow, the frame's anti-aliased edge), each rounded to
-       * 8 bits where it is blended: lavapipe lands within 2 of the reference on a handful of those pixels */
-      tol = 3;
       failures += frame(&v, &comp, dir, "5d-luna") != 0;
       int nshapes = 0;
       for (size_t i = 0; i < gui_draw_count(g); i++) if (gui_draw_get(g, i, &d) == 0 && d.kind == GUI_DRAW_SHAPE) nshapes++;
@@ -611,8 +614,8 @@ int main(int argc, char **argv) {
       CHECK(strip == 1, "the taskbar's strip is a shape under the panel (%d)", strip);
       CHECK(gui_set_theme(g, "9x") == 0, "the 9x look");
       failures += frame(&v, &comp, dir, "5e-9x") != 0;
-      CHECK(gui_set_theme(g, "flat") == 0, "back to flat: the frames below compare exactly");
-      tol = 0;
+      CHECK(gui_set_theme(g, "flat") == -1, "there is no flat look any more");
+      CHECK(gui_set_theme(g, "luna") == 0, "back to the default");
    }
 
    /* ---- the pool window grows (a bigger buffer than the one its upload buffer was made for), and the pointer sits on the right/bottom edges */

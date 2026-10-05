@@ -73,7 +73,8 @@ int gui_has_damage(const gui_comp *c);
 #define GUI_DRAW_CPU 2     /* rect shows gui_cpu_content(client, surface) (src_w x src_h) from (sx, sy); `version` changes with the pixels */
 #define GUI_DRAW_TITLE 3   /* a title to paint over its bar: id, focused, area (x, y, w, h), clip (clip_*); the text is gui_title(c, i, ...) */
 #define GUI_DRAW_CURSOR 4  /* the pointer, hotspot at (x, y); the bitmap is gui_cursor_bitmap */
-#define GUI_DRAW_SHAPE 5   /* the box (x, y, w, h), not clipped, drawn as the shape_* fields say (comp_api.h's struct cr_shape; gui::theme::Shape) */
+#define GUI_DRAW_SHAPE 5   /* the box (x, y, w, h) drawn as the shape_* fields say (comp_api.h's struct cr_shape; gui::theme::Shape), only inside
+                            * clip_* when clip_w > 0 */
 struct gui_draw_op {
     uint32_t kind;
     uint32_t color;      /* FILL: 0x00RRGGBB */
@@ -85,7 +86,7 @@ struct gui_draw_op {
     int32_t src_w, src_h;/* CPU: size of the surface's pixels */
     uint32_t id;         /* TITLE: toplevel id, stable while the window is mapped */
     uint32_t focused;    /* TITLE */
-    int32_t clip_x, clip_y, clip_w, clip_h; /* TITLE */
+    int32_t clip_x, clip_y, clip_w, clip_h; /* TITLE; SHAPE (clip_w 0: none) */
     uint32_t title_fg;   /* TITLE: 0x00RRGGBB */
     uint32_t title_shadow; /* TITLE: 0xAARRGGBB, alpha 0 = none */
     float shape_radius, shape_border, shape_split, shape_shadow_blur;   /* SHAPE */
@@ -94,7 +95,7 @@ struct gui_draw_op {
     uint32_t shape_horizontal;
     uint32_t premul;     /* CPU: the pixels are premultiplied ARGB, drawn "over" (else opaque) */
 };
-/* The draw list's look (gui::theme): "flat" (what compose paints), "luna", "9x". 0, or -1 for an unknown name. F12 cycles them too.
+/* The draw list's look (gui::theme): "luna" (the default), "9x". 0, or -1 for an unknown name. F12 cycles them too.
  * The panel is told (a `theme` event); in a look with a taskbar the strip is a SHAPE under the panel's surface. */
 int gui_set_theme(gui_comp *c, const char *name);
 /* Builds the draw list for the next frame (the whole screen, back to front, clipped), takes the damage, and returns the frame's number. */

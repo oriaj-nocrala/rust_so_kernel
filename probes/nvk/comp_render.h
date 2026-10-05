@@ -123,7 +123,13 @@ static void comp_shape_push(const struct cr_op *op, struct comp_push *pc) {
       if (sx1 > x1) x1 = sx1;
       if (sy1 > y1) y1 = sy1;
    }
-   pc->dst[0] = x0; pc->dst[1] = y0; pc->dst[2] = x1 - x0; pc->dst[3] = y1 - y0;
+   if (s->clip_w > 0) {
+      if (x0 < s->clip_x) x0 = s->clip_x;
+      if (y0 < s->clip_y) y0 = s->clip_y;
+      if (x1 > s->clip_x + s->clip_w) x1 = s->clip_x + s->clip_w;
+      if (y1 > s->clip_y + s->clip_h) y1 = s->clip_y + s->clip_h;
+   }
+   pc->dst[0] = x0; pc->dst[1] = y0; pc->dst[2] = x1 - x0; pc->dst[3] = y1 - y0;   /* empty when clipped away: not drawn */
    pc->src[3] = 3;
    pc->misc[3] = s->horizontal ? 1u : 0u;
    pc->box[0] = op->x; pc->box[1] = op->y; pc->box[2] = op->w; pc->box[3] = op->h;

@@ -36,7 +36,7 @@ use alloc::vec::Vec;
 
 use alloc::string::String;
 use draw::Canvas;
-use gui::compositor::{scale_for, ClientId, Compositor, PoolMem, TitleText, TITLE_FOCUSED, TITLE_UNFOCUSED};
+use gui::compositor::{scale_for, ClientId, Compositor, PoolMem, TitleText};
 use gui::region::Rect;
 use gui::wire::Encoder;
 use userspace::args::Args;
@@ -169,7 +169,8 @@ fn open_path(path: &str, flags: i32) -> i32 {
 /// when the title, the focus or the bar's width changes.
 struct TitleImg {
     title: String,
-    focused: bool,
+    fg: u32,
+    shadow: u32,
     w: i32,
     h: i32,
     px: Vec<u32>,
@@ -181,32 +182,36 @@ struct Titles {
     text: Text,
     cache: BTreeMap<u32, TitleImg>,
     size: f32,
+    scale: i32,
 }
 
 impl Titles {
     fn new(scale: i32) -> Titles {
-        Titles { text: Text::load(), cache: BTreeMap::new(), size: 13.0 * scale as f32 }
+        Titles { text: Text::load(), cache: BTreeMap::new(), size: 13.0 * scale as f32, scale }
     }
 
     fn paint(&mut self, t: &TitleText, clip: Rect, dst: &mut [u32], stride: usize) {
         let a = t.area;
-        let stale = self.cache.get(&t.id).is_none_or(|c| c.title != t.title || c.focused != t.focused || (c.w, c.h) != (a.w, a.h));
+        let stale = self.cache.get(&t.id).is_none_or(|c| c.title != t.title || (c.fg, c.shadow) != (t.fg, t.shadow) || (c.w, c.h) != (a.w, a.h));
         if stale {
-            let bg = if t.focused { TITLE_FOCUSED } else { TITLE_UNFOCUSED };
-            let fg = if t.focused { 0x00F0_F0F0 } else { 0x00B0_B0B8 };
-            let mut px = alloc::vec![bg; (a.w.max(0) * a.h.max(0)) as usize];
-            if a.w > 0 && a.h > 0 {
-                let mut cv = Canvas::new(&mut px, a.w as usize, a.h as usize, a.w as usize);
-                let st = Style::new(SANS, self.size).bold().color(fg);
+            // the glyphs' coverage (white on black), then the text in its colour over its shadow, premultiplied: it goes over the bar's gradient
+            let (w, h) = (a.w.max(0) as usize, a.h.max(0) as usize);
+            let mut cov = alloc::vec![0u32; w * h];
+            if w > 0 && h > 0 {
+                let mut cv = Canvas::new(&mut cov, w, h, w);
+                let st = Style::new(SANS, self.size).bold().color(0x00FF_FFFF);
                 let (_, lh) = self.text.measure("Hg", &st, None);
                 self.text.draw(&mut cv, t.title, &st, None, 0, (a.h - lh) / 2);
             }
-            self.cache.insert(t.id, TitleImg { title: String::from(t.title), focused: t.focused, w: a.w, h: a.h, px });
+            let px = gui::theme::text_pixels(&cov, w, h, t.fg, t.shadow, self.scale as usize);
+            self.cache.insert(t.id, TitleImg { title: String::from(t.title), fg: t.fg, shadow: t.shadow, w: a.w, h: a.h, px });
         }
         let img = &self.cache[&t.id];
         for y in clip.y..clip.bottom() {
             let src = &img.px[((y - a.y) * a.w + (clip.x - a.x)) as usize..][..clip.w as usize];
-            dst[y as usize * stride + clip.x as usize..][..clip.w as usize].copy_from_slice(src);
+            for (d, v) in dst[y as usize * stride + clip.x as usize..][..clip.w as usize].iter_mut().zip(src) {
+                *d = gui::theme::over(*d, *v);
+            }
         }
     }
 

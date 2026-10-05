@@ -97,14 +97,11 @@ pub trait PoolMem {
 
 /// Title bar height at scale 1; see [`title_height_for`].
 pub const TITLE_H: i32 = 20;
-pub const BACKGROUND: u32 = 0x0020_3040;
-pub const TITLE_FOCUSED: u32 = 0x0050_78B0;
-pub const TITLE_UNFOCUSED: u32 = 0x0050_5058;
 /// Where a window's content is not covered by its buffer (between a
-/// `resize` and the client's answer).
+/// `resize` and the client's answer), and where the CPU painter has a
+/// GPU buffer to show (it cannot).
 pub const WINDOW_BG: u32 = 0x0018_1818;
-pub const BUTTON_FG: u32 = 0x00E8_E8E8;
-pub const CLOSE_PRESSED: u32 = 0x00C0_3030;
+/// The resize outline.
 pub const OUTLINE: u32 = 0x00E0_E0E0;
 /// Largest surface side accepted.
 pub const MAX_SIDE: i32 = 8192;
@@ -180,8 +177,10 @@ pub enum Zone {
 
 /// What [`Compositor::compose_with`] asks the caller to paint: a window's
 /// title, left-aligned in `area` (screen coordinates, the bar's full
-/// height), over the bar's colour for `focused`. `id` is the window's
-/// toplevel id, stable while it is mapped — a cache key.
+/// height), in `fg` (`0x00RRGGBB`) over what is already there (the bar),
+/// with a shadow one pixel × scale down and right in `shadow`
+/// (`0xAARRGGBB`, alpha 0 = none). `id` is the window's toplevel id,
+/// stable while it is mapped — a cache key.
 /// The closure that paints a title: `(title, clip, dst, stride)`.
 pub type PaintTitle<'a> = dyn FnMut(&TitleText, Rect, &mut [u32], usize) + 'a;
 
@@ -189,6 +188,8 @@ pub struct TitleText<'a> {
     pub id: u32,
     pub title: &'a str,
     pub focused: bool,
+    pub fg: u32,
+    pub shadow: u32,
     pub area: Rect,
 }
 
@@ -287,14 +288,20 @@ pub enum DrawOp {
     /// (`0xAARRGGBB`, alpha 0 = none), left-aligned in `area` and touching only `clip`; transparent around the glyphs. `id` is stable while
     /// the window is mapped (a cache key).
     Title { id: u32, title: String, focused: bool, fg: u32, shadow: u32, area: Rect, clip: Rect },
-    /// The box `rect` drawn as `shape` says (see [`theme`]); not clipped: the shape and its shadow may reach past the screen, the host clips.
-    /// Only themes other than [`theme::FLAT`] make them.
-    Shape { rect: Rect, shape: Shape },
+    /// The box `rect` drawn as `shape` says (see [`theme`]), touching only `clip` if there is one (a title bar's box reaches under the
+    /// content so that only its top corners are round; the clip keeps it out). Not clipped to the screen: the shape and its shadow may
+    /// reach past it, the host clips.
+    Shape { rect: Rect, shape: Shape, clip: Option<Rect> },
     /// The pointer, its hotspot at (`x`, `y`): the bitmap is [`CURSOR`].
     Cursor { x: i32, y: i32 },
 }
 
 /// A fill clipped to the screen.
+/// `r` grown by `m` on every side.
+fn grow(r: Rect, m: i32) -> Rect {
+    Rect::new(r.x - m, r.y - m, r.w + 2 * m, r.h + 2 * m)
+}
+
 fn push_fill(ops: &mut Vec<DrawOp>, scr: Rect, rect: Rect, color: u32) {
     if let Some(rect) = rect.intersect(&scr) {
         ops.push(DrawOp::Fill { rect, color });
@@ -515,7 +522,7 @@ impl<M: PoolMem> Compositor<M> {
             retired: Vec::new(),
             epoch_issued: 0,
             epoch_done: 0,
-            theme: &theme::FLAT,
+            theme: theme::THEMES[0],
         }
     }
 
@@ -577,11 +584,11 @@ impl<M: PoolMem> Compositor<M> {
     pub fn remove_client(&mut self, c: ClientId) {
         let Some(mut client) = self.clients.remove(&c) else { return };
         self.fds_to_close.extend(client.decoder.drain_fds());
-        let th = self.th;
+        let (th, mg) = (self.th, self.decor_margin());
         for (id, obj) in &client.objects {
             if let Object::Surface(s) = obj {
                 if s.mapped {
-                    self.damage.add(s.frame(th));
+                    self.damage.add(grow(s.frame(th), mg));
                 }
                 self.forget_surface((c, *id));
             }
@@ -891,9 +898,10 @@ impl<M: PoolMem> Compositor<M> {
             }
             Request::DestroySurface { surface } => {
                 let key = (c, surface);
+                let mg = self.decor_margin();
                 if let Some(s) = self.surface(key) {
                     if s.mapped {
-                        self.damage.add(s.frame(self.th));
+                        self.damage.add(grow(s.frame(self.th), mg));
                     }
                 }
                 self.forget_surface(key);
@@ -910,6 +918,7 @@ impl<M: PoolMem> Compositor<M> {
         let work = self.work_area();
         let panel = self.panel.filter(|(k, _)| *k == key).map(|(_, h)| h);
         let (sw, sh) = (self.width, self.height);
+        let mg = self.decor_margin();
         // a popup: where its parent's content is
         let popup = self.surface(key).and_then(|s| s.popup).map(|(pk, x, y)| {
             let at = self.surface(pk).map_or(Rect::new(0, 0, 0, 0), |p| p.content(th));
@@ -927,7 +936,7 @@ impl<M: PoolMem> Compositor<M> {
             None => {}
             Some(None) => {
                 if s.mapped {
-                    screen_damage.add(s.frame(th));
+                    screen_damage.add(grow(s.frame(th), mg));
                     s.mapped = false;
                     unmapped = true;
                 }
@@ -967,11 +976,11 @@ impl<M: PoolMem> Compositor<M> {
                     s.resize_pending = None;
                     if (s.fw, s.fh) != (bw, bh) {
                         if s.mapped {
-                            screen_damage.add(s.frame(th)); // the old frame
+                            screen_damage.add(grow(s.frame(th), mg)); // the old frame
                         }
                         s.fw = bw;
                         s.fh = bh;
-                        screen_damage.add(s.frame(th));
+                        screen_damage.add(grow(s.frame(th), mg));
                     }
                 }
                 if !s.mapped {
@@ -1012,7 +1021,7 @@ impl<M: PoolMem> Compositor<M> {
                 on_screen.translate(content.x, content.y);
                 screen_damage.add_region(&on_screen);
                 if newly_mapped {
-                    screen_damage.add(s.frame(th));
+                    screen_damage.add(grow(s.frame(th), mg));
                 }
             }
         }
@@ -1144,6 +1153,13 @@ impl<M: PoolMem> Compositor<M> {
         }
     }
 
+    /// How far a window's decorations (its frame and the frame's shadow) reach past its frame: damaged with it.
+    fn decor_margin(&self) -> i32 {
+        let t = self.theme;
+        let reach = |f: &Shape| f.shadow_blur as i32 + 1 + f.shadow_dx.abs().max(f.shadow_dy.abs());
+        (t.frame_w + reach(&t.frame[0]).max(reach(&t.frame[1]))) * self.scale
+    }
+
     /// What a popup covers on screen, with room for its frame's shadow.
     fn popup_extent(&self, key: Key) -> Rect {
         let m = POPUP_MARGIN * self.scale;
@@ -1186,10 +1202,11 @@ impl<M: PoolMem> Compositor<M> {
         if self.focus == key {
             return;
         }
-        let th = self.th;
+        let (th, mg) = (self.th, self.decor_margin());
         if let Some(old) = self.focus {
             if let Some(s) = self.surface(old) {
-                self.damage.add(s.title_bar(th));
+                // the frame changes colour too (and its shadow)
+                self.damage.add(grow(s.frame(th), mg));
                 self.events.push((old.0, Event::Focus { surface: old.1, focused: false }));
             }
         }
@@ -1197,8 +1214,8 @@ impl<M: PoolMem> Compositor<M> {
         self.locked = None;
         let mut tid = 0;
         if let Some(new) = key {
-            if let Some((bar, wants, t)) = self.surface(new).map(|s| (s.title_bar(th), s.wants_lock, s.tid)) {
-                self.damage.add(bar);
+            if let Some((frame, wants, t)) = self.surface(new).map(|s| (s.frame(th), s.wants_lock, s.tid)) {
+                self.damage.add(grow(frame, mg));
                 self.events.push((new.0, Event::Focus { surface: new.1, focused: true }));
                 if wants {
                     self.locked = Some(new);
@@ -1213,8 +1230,9 @@ impl<M: PoolMem> Compositor<M> {
         if self.stack.last() != Some(&key) {
             self.stack.retain(|k| *k != key);
             self.stack.push(key);
+            let mg = self.decor_margin();
             if let Some(s) = self.surface(key) {
-                self.damage.add(s.frame(self.th));
+                self.damage.add(grow(s.frame(self.th), mg));
             }
         }
     }
@@ -1238,7 +1256,7 @@ impl<M: PoolMem> Compositor<M> {
 
     /// Moves and sizes a window's content box, repainting both places.
     fn set_geometry(&mut self, key: Key, g: Rect) {
-        let th = self.th;
+        let (th, mg) = (self.th, self.decor_margin());
         let s = self.surface_mut(key).unwrap();
         let before = s.frame(th);
         s.x = g.x;
@@ -1246,8 +1264,8 @@ impl<M: PoolMem> Compositor<M> {
         s.fw = g.w;
         s.fh = g.h;
         let after = s.frame(th);
-        self.damage.add(before);
-        self.damage.add(after);
+        self.damage.add(grow(before, mg));
+        self.damage.add(grow(after, mg));
     }
 
     /// Asks the client for a `w x h` content — unless that is exactly
@@ -1287,7 +1305,7 @@ impl<M: PoolMem> Compositor<M> {
     /// Only a window that sent `set_resizable` can, like maximize: it is how a client says it can take any size.
     fn toggle_fullscreen(&mut self, key: Key) {
         let (sw, sh) = (self.width, self.height);
-        let th = self.th;
+        let (th, mg) = (self.th, self.decor_margin());
         let Some(s) = self.surface_mut(key) else { return };
         if s.resizable.is_none() || !s.mapped {
             return;
@@ -1310,8 +1328,8 @@ impl<M: PoolMem> Compositor<M> {
         s.fw = g.w;
         s.fh = g.h;
         let after = s.frame(th);
-        self.damage.add(before);
-        self.damage.add(after);
+        self.damage.add(grow(before, mg));
+        self.damage.add(grow(after, mg));
         self.request_size(key, g.w, g.h);
     }
 
@@ -1656,8 +1674,9 @@ impl<M: PoolMem> Compositor<M> {
         if self.damage.is_empty() || stride < self.width as usize || dst.len() < stride * self.height as usize {
             return Vec::new();
         }
+        let ops = self.ops();
         for r in self.damage.rects().to_vec() {
-            self.paint(r, dst, stride, paint_title);
+            self.raster(&ops, r, dst, stride, paint_title);
         }
         let out = self.damage.coarsened(MAX_FLUSH_RECTS);
         self.damage.clear();
@@ -1668,32 +1687,31 @@ impl<M: PoolMem> Compositor<M> {
 
     /// Everything on screen as drawing operations, back to front, for a host that composes on the GPU: the whole screen every time (a GPU
     /// does not mind), clipped to it. Returns the frame's number, which the host gives back to [`Compositor::gpu_frame_done`] when the GPU is
-    /// done with the frame, and clears the damage. Under [`theme::FLAT`] the pixels are what [`Compositor::compose`] would paint (a test
-    /// rasterises both and compares); other themes draw the same geometry with shapes. Only the title text, the cursor's bitmap and the
-    /// pixels of buffers are left to the host.
+    /// done with the frame, and clears the damage. [`Compositor::compose`] paints the same list in software. Only the title text, the
+    /// cursor's bitmap and the pixels of buffers are left to the host.
     pub fn draw_list(&mut self) -> (u64, Vec<DrawOp>) {
         self.epoch_issued += 1;
+        let ops = self.ops();
+        self.damage.clear();
+        (self.epoch_issued, ops)
+    }
+
+    /// The screen as drawing operations, back to front (what [`Compositor::draw_list`] hands out and `compose` rasterises).
+    fn ops(&self) -> Vec<DrawOp> {
         let scr = self.screen();
         let mut ops = Vec::new();
-        match self.theme.background {
-            Some(bg) => ops.push(DrawOp::Shape { rect: scr, shape: bg.scaled(self.scale) }),
-            None => push_fill(&mut ops, scr, scr, BACKGROUND),
-        }
-        for key in self.stack.clone() {
+        ops.push(DrawOp::Shape { rect: scr, shape: self.theme.background.scaled(self.scale), clip: None });
+        for &key in &self.stack {
             self.ops_surface(key, scr, &mut ops);
         }
         if let Some((k, _)) = self.panel {
             if let Some(s) = self.surface(k).filter(|s| s.mapped) {
-                if let Some(tb) = &self.theme.taskbar {
-                    ops.push(DrawOp::Shape { rect: s.content(self.th), shape: tb.bar.scaled(self.scale) });
-                }
+                ops.push(DrawOp::Shape { rect: s.content(self.th), shape: self.theme.taskbar.bar.scaled(self.scale), clip: None });
                 self.ops_surface(k, scr, &mut ops);
             }
         }
         for &k in &self.popups {
-            if let Some(m) = &self.theme.menu {
-                ops.push(DrawOp::Shape { rect: self.surface(k).unwrap().content(self.th), shape: m.frame.scaled(self.scale) });
-            }
+            ops.push(DrawOp::Shape { rect: self.surface(k).unwrap().content(self.th), shape: self.theme.menu.frame.scaled(self.scale), clip: None });
             self.ops_surface(k, scr, &mut ops);
         }
         if let Some(rs) = &self.resize {
@@ -1704,8 +1722,7 @@ impl<M: PoolMem> Compositor<M> {
         if self.cursor_rect().intersect(&scr).is_some() {
             ops.push(DrawOp::Cursor { x: self.pointer.0, y: self.pointer.1 });
         }
-        self.damage.clear();
-        (self.epoch_issued, ops)
+        ops
     }
 
     /// The pixels of a window that is not a GPU buffer (`w x h`, rows `w` pixels long), for a host to upload when its `version`
@@ -1719,31 +1736,8 @@ impl<M: PoolMem> Compositor<M> {
     fn ops_surface(&self, key: Key, scr: Rect, ops: &mut Vec<DrawOp>) {
         let th = self.th;
         let s = self.surface(key).unwrap();
-        if s.decorated && self.theme.title.is_some() {
+        if s.decorated {
             self.ops_decorations(key, scr, ops);
-        } else if s.decorated {
-            let focused = self.focus == Some(key);
-            let bar_color = if focused { TITLE_FOCUSED } else { TITLE_UNFOCUSED };
-            if let Some(t) = s.title_bar(th).intersect(&scr) {
-                push_fill(ops, scr, t, bar_color);
-                self.ops_title(key, t, ops);
-                let pressed = self.pressed.filter(|(k, _)| *k == key).map(|(_, b)| b);
-                let close = s.close_button(th);
-                if pressed == Some(ButtonKind::Close) {
-                    if let Some(c) = close.intersect(&t) {
-                        push_fill(ops, scr, c, CLOSE_PRESSED);
-                    }
-                }
-                self.ops_glyph_x(close, t, scr, ops);
-                if let Some(m) = s.max_button(th) {
-                    if pressed == Some(ButtonKind::Maximize) {
-                        if let Some(c) = m.intersect(&t) {
-                            push_fill(ops, scr, c, TITLE_UNFOCUSED);
-                        }
-                    }
-                    self.ops_glyph_square(m, t, scr, ops);
-                }
-            }
         }
         let content = s.content(th);
         if let Some(i) = content.intersect(&scr) {
@@ -1793,15 +1787,19 @@ impl<M: PoolMem> Compositor<M> {
         let fw = t.frame_w * sc;
         let outer = s.frame(th);
         let outer = Rect::new(outer.x - fw, outer.y - fw, outer.w + 2 * fw, outer.h + 2 * fw);
-        if let Some(f) = t.frame {
-            ops.push(DrawOp::Shape { rect: outer, shape: f[fi].scaled(sc) });
-        }
-        if let Some(bar) = t.title {
-            let bar = bar[fi].scaled(sc);
-            // the box reaches under the content by the radius, so only the top corners show rounded
-            let r = bar.radius as i32 + 1;
-            ops.push(DrawOp::Shape { rect: Rect::new(outer.x, outer.y, outer.w, fw + th + r), shape: bar });
-        }
+        // the frame in two: its shadow (a square box with no fill, so the shadow is masked under the whole window), and its ring, square,
+        // below the bar (whose rounded top corners are the window's): neither shows through a translucent window
+        let f = t.frame[fi].scaled(sc);
+        let shadow = Shape { c: [0; 4], border: 0.0, radius: 0.0, ..f };
+        let ring = Shape { radius: 0.0, shadow_color: 0, ..f };
+        ops.push(DrawOp::Shape { rect: outer, shape: shadow, clip: None });
+        let below = Rect::new(outer.x, outer.y + fw + th, outer.w, outer.h - fw - th);
+        ops.push(DrawOp::Shape { rect: outer, shape: ring, clip: Some(below) });
+        let bar = t.title[fi].scaled(sc);
+        // the box reaches under the content by the radius, so only the top corners show rounded
+        let r = bar.radius as i32 + 1;
+        let clip = Rect::new(outer.x, outer.y, outer.w, fw + th);
+        ops.push(DrawOp::Shape { rect: Rect::new(outer.x, outer.y, outer.w, fw + th + r), shape: bar, clip: Some(clip) });
         let Some(tb) = s.title_bar(th).intersect(&scr) else { return };
         self.ops_title(key, tb, ops);
         let pressed = self.pressed.filter(|(k, _)| *k == key).map(|(_, b)| b);
@@ -1816,13 +1814,8 @@ impl<M: PoolMem> Compositor<M> {
                 continue;
             }
             match style {
-                Button::Flat { pressed } => {
-                    if down {
-                        push_fill(ops, scr, b, pressed);
-                    }
-                }
                 Button::Shape { normal, pressed } => {
-                    ops.push(DrawOp::Shape { rect: b, shape: if down { pressed } else { normal }.scaled(sc) });
+                    ops.push(DrawOp::Shape { rect: b, shape: if down { pressed } else { normal }.scaled(sc), clip: None });
                 }
                 Button::Bevel { face, light, dark } => {
                     let (tl, br) = if down { (dark, light) } else { (light, dark) };
@@ -1867,181 +1860,76 @@ impl<M: PoolMem> Compositor<M> {
         }
     }
 
-    fn ops_glyph_x(&self, b: Rect, clip: Rect, scr: Rect, ops: &mut Vec<DrawOp>) {
-        let (x0, y0, side) = self.glyph_box(b);
-        let t = self.scale;
-        for i in 0..side {
-            for (px, py) in [(x0 + i, y0 + i), (x0 + side - 1 - i, y0 + i)] {
-                if let Some(p) = Rect::new(px, py, t, t).intersect(&clip).and_then(|p| p.intersect(&b)) {
-                    push_fill(ops, scr, p, BUTTON_FG);
-                }
-            }
-        }
-    }
-
-    fn ops_glyph_square(&self, b: Rect, clip: Rect, scr: Rect, ops: &mut Vec<DrawOp>) {
-        let (x0, y0, side) = self.glyph_box(b);
-        let t = self.scale;
-        for e in [
-            Rect::new(x0, y0, side, t),
-            Rect::new(x0, y0 + side - t, side, t),
-            Rect::new(x0, y0, t, side),
-            Rect::new(x0 + side - t, y0, t, side),
-        ] {
-            if let Some(p) = e.intersect(&clip).and_then(|p| p.intersect(&b)) {
-                push_fill(ops, scr, p, BUTTON_FG);
-            }
-        }
-    }
-
-    fn paint_surface(&self, key: Key, r: Rect, dst: &mut [u32], stride: usize, paint_title: &mut PaintTitle) {
-        let th = self.th;
-        let s = self.surface(key).unwrap();
-        if s.decorated {
-            let focused = self.focus == Some(key);
-            let bar_color = if focused { TITLE_FOCUSED } else { TITLE_UNFOCUSED };
-            if let Some(t) = s.title_bar(th).intersect(&r) {
-                fill(dst, stride, t, bar_color);
-                let pad = 6 * self.scale;
-                let left = s.x + pad;
-                let area = Rect::new(left, s.y, (s.buttons_left(th) - pad - left).max(0), th);
-                if let Some(clip) = area.intersect(&t) {
-                    paint_title(&TitleText { id: s.tid, title: &s.title, focused, area }, clip, dst, stride);
-                }
-                let pressed = self.pressed.filter(|(k, _)| *k == key).map(|(_, b)| b);
-                let close = s.close_button(th);
-                if pressed == Some(ButtonKind::Close) {
-                    if let Some(c) = close.intersect(&t) {
-                        fill(dst, stride, c, CLOSE_PRESSED);
-                    }
-                }
-                self.glyph_x(close, t, dst, stride);
-                if let Some(m) = s.max_button(th) {
-                    if pressed == Some(ButtonKind::Maximize) {
-                        if let Some(c) = m.intersect(&t) {
-                            fill(dst, stride, c, TITLE_UNFOCUSED);
-                        }
-                    }
-                    self.glyph_square(m, t, dst, stride);
-                }
-            }
-        }
-        let content = s.content(th);
-        if let Some(i) = content.intersect(&r) {
-            let shown = Rect::new(content.x, content.y, s.w.min(s.fw), s.h.min(s.fh));
-            // (a GPU buffer has no store to copy from: this painter shows the background for it)
-            let covered = shown.intersect(&i).filter(|_| !s.store.is_empty());
-            // Whatever the buffer does not cover yet.
-            let mut rest = Region::from_rect(i);
-            if let Some(cv) = covered {
-                rest.subtract(cv);
-            }
-            for f in rest.rects() {
-                fill(dst, stride, *f, WINDOW_BG);
-            }
-            if let Some(cv) = covered {
-                for py in cv.y..cv.bottom() {
-                    let sy = (py - content.y) as usize;
-                    let sx = (cv.x - content.x) as usize;
-                    let src = &s.store[sy * s.w as usize + sx..][..cv.w as usize];
-                    let row = &mut dst[py as usize * stride + cv.x as usize..][..cv.w as usize];
-                    if s.premul {
-                        for (d, v) in row.iter_mut().zip(src) {
-                            *d = theme::over(*d, *v) & 0x00FF_FFFF;
-                        }
-                    } else {
-                        row.copy_from_slice(src);
-                    }
-                }
-            }
-        }
-    }
-
     /// The side of a button glyph's box and its top-left, centred in `b`.
     fn glyph_box(&self, b: Rect) -> (i32, i32, i32) {
         let side = (self.th * 2 / 5).max(3);
         (b.x + (b.w - side) / 2, b.y + (b.h - side) / 2, side)
     }
 
-    /// A close button's ×, clipped to `clip`.
-    fn glyph_x(&self, b: Rect, clip: Rect, dst: &mut [u32], stride: usize) {
-        let (x0, y0, side) = self.glyph_box(b);
-        let t = self.scale;
-        for i in 0..side {
-            for (px, py) in [(x0 + i, y0 + i), (x0 + side - 1 - i, y0 + i)] {
-                if let Some(p) = Rect::new(px, py, t, t).intersect(&clip).and_then(|p| p.intersect(&b)) {
-                    fill(dst, stride, p, BUTTON_FG);
-                }
-            }
-        }
-    }
-
-    /// A maximize button's hollow square, clipped to `clip`.
-    fn glyph_square(&self, b: Rect, clip: Rect, dst: &mut [u32], stride: usize) {
-        let (x0, y0, side) = self.glyph_box(b);
-        let t = self.scale;
-        for e in [
-            Rect::new(x0, y0, side, t),
-            Rect::new(x0, y0 + side - t, side, t),
-            Rect::new(x0, y0, t, side),
-            Rect::new(x0 + side - t, y0, t, side),
-        ] {
-            if let Some(p) = e.intersect(&clip).and_then(|p| p.intersect(&b)) {
-                fill(dst, stride, p, BUTTON_FG);
-            }
-        }
-    }
-
-    fn paint(&self, r: Rect, dst: &mut [u32], stride: usize, paint_title: &mut PaintTitle) {
-        fill(dst, stride, r, BACKGROUND);
-        for key in &self.stack {
-            self.paint_surface(*key, r, dst, stride, paint_title);
-        }
-        if let Some((k, _)) = self.panel {
-            if let Some(s) = self.surface(k).filter(|s| s.mapped) {
-                // the strip under a themed panel (whose buffer is transparent around its buttons), as the draw list's shape
-                if let Some(tb) = &self.theme.taskbar {
-                    let strip = s.content(self.th);
-                    if let Some(c) = strip.intersect(&r) {
-                        tb.bar.scaled(self.scale).paint(dst, stride, c, strip);
+    /// Paints `ops` into `dst` (rows `stride` long), touching only `r`: the software twin of a GPU host. A GPU buffer cannot be shown
+    /// here: its place is [`WINDOW_BG`].
+    fn raster(&self, ops: &[DrawOp], r: Rect, dst: &mut [u32], stride: usize, paint_title: &mut PaintTitle) {
+        for op in ops {
+            match op {
+                DrawOp::Fill { rect, color } => {
+                    if let Some(i) = rect.intersect(&r) {
+                        fill(dst, stride, i, *color);
                     }
                 }
-                self.paint_surface(k, r, dst, stride, paint_title);
-            }
-        }
-        for &k in &self.popups {
-            if let Some(m) = &self.theme.menu {
-                let s = self.surface(k).unwrap();
-                let shape = m.frame.scaled(self.scale);
-                let c = s.content(self.th);
-                shape.paint(dst, stride, r, c);
-            }
-            self.paint_surface(k, r, dst, stride, paint_title);
-        }
-        if let Some(rs) = &self.resize {
-            for e in self.outline_edges(rs.outline) {
-                if let Some(i) = e.intersect(&r) {
-                    fill(dst, stride, i, OUTLINE);
+                DrawOp::Shape { rect, shape, clip } => {
+                    if let Some(c) = clip.map_or(Some(r), |c| c.intersect(&r)) {
+                        shape.paint(dst, stride, c, *rect);
+                    }
+                }
+                DrawOp::Gpu { dst: d, .. } => {
+                    if let Some(i) = d.intersect(&r) {
+                        fill(dst, stride, i, WINDOW_BG);
+                    }
+                }
+                DrawOp::Cpu { client, surface, dst: d, sx, sy, w, premul, .. } => {
+                    let (Some(i), Some(px)) = (d.intersect(&r), self.cpu_content(*client, *surface)) else { continue };
+                    for py in i.y..i.bottom() {
+                        let (row_y, row_x) = ((sy + py - d.y) as usize, (sx + i.x - d.x) as usize);
+                        let src = &px[row_y * *w as usize + row_x..][..i.w as usize];
+                        let row = &mut dst[py as usize * stride + i.x as usize..][..i.w as usize];
+                        if *premul {
+                            for (d, v) in row.iter_mut().zip(src) {
+                                *d = theme::over(*d, *v);
+                            }
+                        } else {
+                            row.copy_from_slice(src);
+                        }
+                    }
+                }
+                DrawOp::Title { id, title, focused, fg, shadow, area, clip } => {
+                    if let Some(c) = clip.intersect(&r) {
+                        let t = TitleText { id: *id, title, focused: *focused, fg: *fg, shadow: *shadow, area: *area };
+                        paint_title(&t, c, dst, stride);
+                    }
+                }
+                DrawOp::Cursor { x, y } => {
+                    let Some(i) = Rect::new(*x, *y, CURSOR_W, CURSOR_H).intersect(&r) else { continue };
+                    for py in i.y..i.bottom() {
+                        let row = CURSOR[(py - y) as usize];
+                        for px in i.x..i.right() {
+                            let v = match row[(px - x) as usize] {
+                                b'X' => 0x0000_0000,
+                                b'.' => 0x00FF_FFFF,
+                                _ => continue,
+                            };
+                            dst[py as usize * stride + px as usize] = v;
+                        }
+                    }
                 }
             }
         }
-        if let Some(i) = self.cursor_rect().intersect(&r) {
-            for py in i.y..i.bottom() {
-                let row = CURSOR[(py - self.pointer.1) as usize];
-                for px in i.x..i.right() {
-                    let v = match row[(px - self.pointer.0) as usize] {
-                        b'X' => 0x0000_0000,
-                        b'.' => 0x00FF_FFFF,
-                        _ => continue,
-                    };
-                    dst[py as usize * stride + px as usize] = v;
-                }
+        // the screen is XRGB: what the shapes' and premultiplied windows' blending left in the top byte goes
+        for y in r.y..r.bottom() {
+            for p in &mut dst[y as usize * stride + r.x as usize..][..r.w as usize] {
+                *p &= 0x00FF_FFFF;
             }
         }
     }
-
-    // ── inspection (tests, and the host's own reporting) ─────────────────
-
     pub fn pointer(&self) -> (i32, i32) {
         self.pointer
     }

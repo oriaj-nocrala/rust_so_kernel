@@ -55,14 +55,6 @@ const APPS_FILE: &str = "/mnt/etc/gui/apps";
 const HEIGHT: i32 = 32;
 const BTN_LEFT: u32 = 0x110;
 
-const BG: u32 = 0x0015_1A22;
-const EDGE: u32 = 0x002A_313C;
-const BUTTON: u32 = 0x0024_2B36;
-const HOVER: u32 = 0x0033_3B48;
-const FOCUSED: u32 = 0x003D_5A80;
-const OPEN: u32 = 0x0058_A6FF;
-const TEXT: u32 = 0x00E6_EDF3;
-const DIM: u32 = 0x008B_949E;
 
 struct App {
     name: String,
@@ -106,7 +98,7 @@ enum Item {
 }
 
 /// The themes the menu offers: `gui::theme` name, label.
-const THEME_ITEMS: [(&str, &str); 3] = [("luna", "Luna 2026"), ("9x", "9x moderno"), ("flat", "Flat")];
+const THEME_ITEMS: [(&str, &str); 2] = [("luna", "Luna 2026"), ("9x", "9x moderno")];
 
 /// The menu laid out for the current theme: its size and where everything goes, in its own pixels.
 struct MenuLayout {
@@ -159,7 +151,7 @@ impl Panel {
     }
 
     fn text_w(&mut self, s: &str) -> i32 {
-        let st = self.style(TEXT);
+        let st = self.style(0);
         self.text.measure(s, &st, None).0
     }
 
@@ -212,16 +204,8 @@ impl Panel {
     }
 
     fn draw(&mut self, px: &mut [u32]) {
-        match &self.theme.taskbar {
-            Some(tb) => self.draw_themed(px, tb),
-            None => {
-                self.draw_flat(px);
-                // an ARGB8888 buffer: the flat look is opaque everywhere
-                for p in px.iter_mut() {
-                    *p |= 0xFF00_0000;
-                }
-            }
-        }
+        let tb = &self.theme.taskbar;
+        self.draw_themed(px, tb);
     }
 
     /// The buttons log line, when they change (scripts read it).
@@ -295,33 +279,6 @@ impl Panel {
         }
     }
 
-    fn draw_flat(&mut self, px: &mut [u32]) {
-        let (w, h, k) = (self.w, self.h, self.k);
-        let buttons = self.layout();
-        self.log_buttons(&buttons);
-        let st = self.style(TEXT);
-        let (_, lh) = self.text.measure("Hg", &st, None);
-        let mut cv = Canvas::new(px, w as usize, h as usize, w as usize);
-        cv.fill(BG);
-        cv.hline(0, 0, w, EDGE);
-        let (by, bh) = (4 * k, h - 7 * k);
-        for b in &buttons {
-            let hover = self.hover_x.is_some_and(|x| x >= b.x && x < b.x + b.w);
-            let (bg, fg) = match b.action {
-                Action::Menu if self.menu_open => (OPEN, BG),
-                Action::Activate(id) if id == self.focused => (FOCUSED, TEXT),
-                _ if hover => (HOVER, TEXT),
-                _ => (BUTTON, TEXT),
-            };
-            cv.rect(b.x, by, b.w, bh, bg);
-            let st = self.style(fg);
-            self.text.draw(&mut cv, &b.label, &st, None, b.x + 12 * k, by + (bh - lh) / 2);
-        }
-        let st = self.style(DIM);
-        let cw = self.text.measure(&self.clock, &st, None).0;
-        self.text.draw(&mut cv, &self.clock, &st, None, w - 12 * k - cw, by + (bh - lh) / 2);
-    }
-
     /// The menu's geometry in the current theme.
     fn menu_layout(&mut self) -> MenuLayout {
         let k = self.k;
@@ -329,12 +286,12 @@ impl Panel {
         let pad = 6 * k;
         let napps = self.apps.len() as i32;
         let mut items = Vec::new();
-        let m = self.theme.menu.as_ref();
-        let inset = m.map_or(0, |m| m.inset * k);
+        let m = &self.theme.menu;
+        let inset = m.inset * k;
         let col_w = 190 * k;
-        match m {
+        match m.side_bg {
             // Luna: header, the apps on the left, the themes in a second column, footer
-            Some(m) if m.side_bg.is_some() => {
+            Some(_) => {
                 let side_w = 150 * k;
                 let hh = m.header_h * k;
                 let col_h = (napps * row).max(row + THEME_ITEMS.len() as i32 * row) + 2 * pad;
@@ -363,9 +320,9 @@ impl Panel {
                     side_title: Some((side.x + pad + 8 * k, top + pad)),
                 }
             }
-            // one column (9x with its banner on the left, or flat): the apps, a line, the themes
-            _ => {
-                let bw = m.and_then(|m| m.banner.map(|_| m.banner_w * k)).unwrap_or(0);
+            // one column (9x, with its banner on the left): the apps, a line, the themes
+            None => {
+                let bw = m.banner.map_or(0, |_| m.banner_w * k);
                 let x0 = inset + bw;
                 let sep_h = 9 * k;
                 let col_h = (napps + THEME_ITEMS.len() as i32) * row + sep_h + 2 * pad;
@@ -397,8 +354,7 @@ impl Panel {
         }
     }
 
-    /// The menu into `px` (`l.w x l.h`, premultiplied ARGB): in a theme with a menu style, transparent where the compositor's frame
-    /// shows (the inset); flat: opaque.
+    /// The menu into `px` (`l.w x l.h`, premultiplied ARGB), transparent where the compositor's frame shows (the inset).
     fn draw_menu(&mut self, px: &mut [u32], l: &MenuLayout) {
         let (w, h, k) = (l.w as usize, l.h as usize, self.k);
         let all = Rect::new(0, 0, l.w, l.h);
@@ -408,45 +364,32 @@ impl Panel {
                 px[y as usize * w + r.x as usize..][..r.w as usize].fill(0xFF00_0000 | c);
             }
         };
-        // the backgrounds; (the items' text colour, the hovered item's)
-        let (items_fg, hover_fg) = match &self.theme.menu {
-            Some(m) => {
-                px.fill(0);
-                fill(px, l.left, m.items_bg);
-                if let (Some(r), Some(c)) = (l.side, m.side_bg) {
-                    fill(px, r, c);
-                }
-                if let (Some(r), Some(sh)) = (l.header, m.header) {
-                    sh.scaled(k).paint(px, w, all, r);
-                }
-                if let (Some(r), Some(sh)) = (l.footer, m.footer) {
-                    sh.scaled(k).paint(px, w, all, r);
-                }
-                if let (Some(r), Some(sh)) = (l.banner, m.banner) {
-                    sh.scaled(k).paint(px, w, all, r);
-                }
-                if let Some(r) = l.separator {
-                    fill(px, r, m.separator);
-                    fill(px, Rect::new(r.x, r.y + k, r.w, k), 0x00FF_FFFF); // the etched line's light half
-                }
-                (m.items_fg, m.hover_fg)
-            }
-            None => {
-                px.fill(0xFF00_0000 | BG);
-                if let Some(r) = l.separator {
-                    fill(px, r, EDGE);
-                }
-                (TEXT, TEXT)
-            }
-        };
-        let side_fg = self.theme.menu.as_ref().map_or(TEXT, |m| m.side_fg);
+        // the backgrounds
+        let m = &self.theme.menu;
+        px.fill(0);
+        fill(px, l.left, m.items_bg);
+        if let (Some(r), Some(c)) = (l.side, m.side_bg) {
+            fill(px, r, c);
+        }
+        if let (Some(r), Some(sh)) = (l.header, m.header) {
+            sh.scaled(k).paint(px, w, all, r);
+        }
+        if let (Some(r), Some(sh)) = (l.footer, m.footer) {
+            sh.scaled(k).paint(px, w, all, r);
+        }
+        if let (Some(r), Some(sh)) = (l.banner, m.banner) {
+            sh.scaled(k).paint(px, w, all, r);
+        }
+        if let Some(r) = l.separator {
+            fill(px, r, m.separator);
+            fill(px, Rect::new(r.x, r.y + k, r.w, k), 0x00FF_FFFF); // the etched line's light half
+        }
+        let (items_fg, hover_fg) = (m.items_fg, m.hover_fg);
+        let side_fg = m.side_fg;
         // the item under the pointer, and a dot at the current theme
         for (i, (r, _, item)) in l.items.iter().enumerate() {
             if self.menu_hover == Some(i) {
-                match &self.theme.menu {
-                    Some(m) => m.hover.scaled(k).paint(px, w, all, *r),
-                    None => fill(px, *r, HOVER),
-                }
+                m.hover.scaled(k).paint(px, w, all, *r);
             }
             if let Item::Theme(name) = item {
                 if *name == self.theme.name {
@@ -468,10 +411,10 @@ impl Panel {
             let indent = if matches!(item, Item::Theme(_)) { 18 * k } else { 8 * k };
             self.text.draw(&mut cv, label, &Style::new(SANS, size).color(fg), None, r.x + indent, r.y + (r.h - lh) / 2);
         }
-        if let (Some((x, y)), Some(m)) = (l.side_title, &self.theme.menu) {
+        if let (Some((x, y)), Some(m)) = (l.side_title, Some(m)) {
             self.text.draw(&mut cv, "Tema", &Style::new(SANS, size).color(m.side_fg).bold(), None, x, y + (24 * k - lh) / 2);
         }
-        if let (Some(r), Some(m)) = (l.header, &self.theme.menu) {
+        if let (Some(r), Some(m)) = (l.header, Some(m)) {
             let st = Style::new(SANS, 18.0 * k as f32).color(m.header_fg).bold();
             let (_, hl) = self.text.measure("constanos", &st, None);
             self.text.draw(&mut cv, "constanos", &st, None, r.x + 14 * k, r.y + (r.h - hl) / 2);
@@ -481,7 +424,7 @@ impl Panel {
             *p = (*p & 0x00FF_FFFF) | (a as u32) << 24;
         }
         // 9x: the name down the banner, bottom to top (drawn on its side, then turned)
-        if let (Some(r), Some(m)) = (l.banner, &self.theme.menu) {
+        if let (Some(r), Some(m)) = (l.banner, Some(m)) {
             let st = Style::new(SANS, 15.0 * k as f32).color(0x00FF_FFFF).bold();
             let (tw, tl) = self.text.measure("constanos", &st, None);
             let (cw, ch) = ((tw + 16 * k) as usize, r.w as usize);
@@ -699,7 +642,7 @@ fn main(_args: Args) -> i32 {
         apps: read_apps(),
         windows: Vec::new(),
         focused: 0,
-        theme: &theme::FLAT,
+        theme: theme::THEMES[0],
         menu_open: false,
         screen_h: half_h * 2,
         menu_hover: None,
@@ -811,7 +754,7 @@ fn main(_args: Args) -> i32 {
                     dirty = true;
                 }
                 Event::Theme { name, .. } => {
-                    p.theme = theme::by_name(&name).unwrap_or(&theme::FLAT);
+                    p.theme = theme::by_name(&name).unwrap_or(theme::THEMES[0]);
                     println!("panel: theme {}", p.theme.name);
                     // the menu's size is the theme's: it closes
                     if let Some(m) = menu.take() {

@@ -106,6 +106,26 @@ impl H_ {
         c
     }
 
+    /// The desktop's pixel at (x, y) in the current look (its background shape over anything: it is opaque).
+    fn desktop(&self, x: i32, y: i32) -> u32 {
+        let mut p = [0u32];
+        self.comp.theme().background.paint(&mut p, 1, Rect::new(0, 0, 1, 1), Rect::new(-x, -y, W, H));
+        p[0] & 0x00FF_FFFF
+    }
+
+    /// The title bar's pixel at (x, y) of `c`'s window (surface 4), drawn focused or not: past the bar's border and corners it is
+    /// opaque, so this is what the screen shows there when nothing covers it.
+    fn bar(&self, c: ClientId, focused: bool, x: i32, y: i32) -> u32 {
+        let f = self.comp.window_frame(c, 4).unwrap();
+        let t = self.comp.theme();
+        let b = t.title[if focused { 0 } else { 1 }];
+        let fw = t.frame_w;
+        let r = Rect::new(f.x - fw, f.y - fw, f.w + 2 * fw, fw + TITLE_H + b.radius as i32 + 1);
+        let mut p = [0u32];
+        b.paint(&mut p, 1, Rect::new(0, 0, 1, 1), Rect::new(r.x - x, r.y - y, r.w, r.h));
+        p[0] & 0x00FF_FFFF
+    }
+
     fn events_for(&mut self, c: ClientId) -> Vec<Event> {
         self.comp.take_events().into_iter().filter(|(k, _)| *k == c).map(|(_, e)| e).collect()
     }
@@ -130,11 +150,11 @@ fn a_window_appears_with_its_title_bar_and_the_cursor() {
     let f = h.comp.window_frame(c, 4).unwrap();
     assert_eq!(f, Rect::new(40, 40, 100, 50 + TITLE_H));
     h.compose();
-    assert_eq!(h.px(0, 0), BACKGROUND);
-    assert_eq!(h.px(40, 40), TITLE_FOCUSED);
+    assert_eq!(h.px(0, 0), h.desktop(0, 0));
+    assert_eq!(h.px(50, 45), h.bar(c, true, 50, 45));
     assert_eq!(h.px(40, 40 + TITLE_H), 0x00FF_0000);
     assert_eq!(h.px(139, 40 + TITLE_H + 49), 0x00FF_0000);
-    assert_eq!(h.px(140, 40 + TITLE_H), BACKGROUND);
+    assert_ne!(h.px(140, 40 + TITLE_H), 0x00FF_0000, "the content ends at 139 (the frame is next)");
     let (px, py) = h.comp.pointer();
     assert_eq!(h.px(px, py), 0, "cursor tip is black");
     assert_eq!(h.px(px + 1, py + 2), 0x00FF_FFFF, "cursor body is white");
@@ -182,7 +202,7 @@ fn stacking_click_to_raise_and_focus() {
     assert_eq!(h.comp.focus(), Some((b, 4)));
     assert_eq!(h.px(80, 100), 0x0000_BB00);
     assert_eq!(h.px(45, 70), 0x00AA_0000);
-    assert_eq!(h.px(72, 72), TITLE_FOCUSED);
+    assert_eq!(h.px(82, 77), h.bar(b, true, 82, 77));
     h.comp.take_events();
 
     // Click a's visible content at (45, 70).
@@ -201,8 +221,9 @@ fn stacking_click_to_raise_and_focus() {
     h.compose();
     assert_eq!(h.px(100, 130), 0x00AA_0000, "a now covers the overlap");
     assert_eq!(h.px(72, 72), 0x00AA_0000);
-    assert_eq!(h.px(150, 150), 0x0000_BB00);
-    assert_eq!(h.px(40, 40), TITLE_FOCUSED);
+    assert_eq!(h.px(165, 188), 0x0000_BB00, "b, past a's shadow");
+    assert_ne!(h.px(150, 150), 0x0000_BB00, "a's shadow falls on b");
+    assert_eq!(h.px(50, 45), h.bar(a, true, 50, 45));
 }
 
 #[test]
@@ -223,7 +244,7 @@ fn dragging_the_title_bar_moves_the_window() {
     h.comp.pointer_motion(-5, -5);
     h.comp.take_events();
     h.compose();
-    assert_eq!(h.px(60, 60 + TITLE_H), BACKGROUND, "where it was");
+    assert_eq!(h.px(60, 60 + TITLE_H), h.desktop(60, 60 + TITLE_H), "where it was");
     assert_eq!(h.px(160, 70 + TITLE_H + 5), 0x0012_3456, "where it is");
     assert!(h.padding_untouched());
 
@@ -391,7 +412,7 @@ fn disconnect_removes_windows_and_closes_unclaimed_fds() {
     assert_eq!(h.comp.focus(), Some((a, 4)));
     assert_eq!(h.events_for(a), vec![Event::Focus { surface: 4, focused: true }]);
     h.compose();
-    assert_eq!(h.px(100, 100 + TITLE_H), BACKGROUND);
+    assert_eq!(h.px(115, 130), h.desktop(115, 130), "where b was (past a's shadow)");
     assert_eq!(h.px(45, 45 + TITLE_H), 0x0000_0077);
     // Data for a gone client: its fds are closed, nothing else happens.
     h.send_bytes(b, &[0; 8], &[70]);
@@ -415,7 +436,7 @@ fn null_attach_unmaps_and_destroyed_pool_keeps_buffers_alive() {
     assert!(h.comp.stack().is_empty());
     assert_eq!(h.comp.focus(), None);
     h.compose();
-    assert_eq!(h.px(40, 40 + TITLE_H), BACKGROUND);
+    assert_eq!(h.px(40, 40 + TITLE_H), h.desktop(40, 40 + TITLE_H));
     // Mapping it again places it anew.
     h.send(c, &[R::Attach { surface: 4, buffer: 3 }, R::Commit { surface: 4 }]);
     assert_eq!(h.comp.stack(), &[(c, 4)]);
@@ -436,7 +457,7 @@ fn resize_repaints_the_old_and_new_area() {
     h.compose();
     assert_eq!(h.comp.window_frame(c, 4), Some(Rect::new(40, 40, 20, 20 + TITLE_H)));
     assert_eq!(h.px(45, 45 + TITLE_H), 0x0000_0022);
-    assert_eq!(h.px(100, 100), BACKGROUND, "the old area is gone");
+    assert_eq!(h.px(100, 100), h.desktop(100, 100), "the old area is gone");
 }
 
 #[test]
@@ -670,7 +691,7 @@ fn the_frame_follows_the_client_once_it_answers() {
     assert_eq!(h.comp.window_content(c, 4), Some(Rect::new(40, 60, 136, 88)), "the buffer has the last word");
     h.compose();
     assert_eq!(h.px(175, 147), 0x0000_0022);
-    assert_eq!(h.px(176, 147), BACKGROUND);
+    assert_ne!(h.px(176, 147), 0x0000_0022, "the content ends at 175");
 }
 
 // A: an answer that rounds back to the old size is still an answer.
@@ -764,9 +785,11 @@ fn close_goes_to_the_owner_only() {
     assert_eq!(h.comp.hit(close_a.0, close_a.1), Some(((a, 4), Zone::Close)));
     // Pressed, then released elsewhere: cancelled.
     pointer_to(&mut h, close_a.0, close_a.1);
+    h.compose();
+    let up = h.px(124, 50); // inside the button, left of its glyph
     h.comp.pointer_button(BTN_LEFT, true);
     h.compose();
-    assert_eq!(h.px(close_a.0 - TITLE_H / 2 + 1, 41), CLOSE_PRESSED);
+    assert_ne!(h.px(124, 50), up, "drawn pressed");
     pointer_to(&mut h, 60, 45);
     h.comp.pointer_button(BTN_LEFT, false);
     assert!(!h.comp.take_events().iter().any(|(_, e)| matches!(e, Event::Close { .. })));
@@ -810,7 +833,7 @@ fn the_panel_is_on_top_outside_the_work_area_and_never_focused() {
     h.comp.remove_client(p);
     assert_eq!(h.comp.work_area(), Rect::new(0, 0, W, H));
     h.compose();
-    assert_eq!(h.px(300, H - 1), BACKGROUND);
+    assert_eq!(h.px(300, H - 1), h.desktop(300, H - 1));
     assert_eq!(h.px(230, H - 5), 0x00AA_0000, "the window under it shows again");
 }
 
@@ -881,7 +904,7 @@ fn titles_are_painted_by_the_caller_inside_their_area() {
     });
     assert_eq!(seen, vec![(1, String::from("hola"), true, Rect::new(46, 40, 140 - TITLE_H - 6 - 46, TITLE_H))]);
     assert_eq!(h.px(46, 45), 0x00AB_CDEF);
-    assert_eq!(h.px(45, 45), TITLE_FOCUSED, "padding before the text");
+    assert_eq!(h.px(45, 45), h.bar(c, true, 45, 45), "padding before the text");
     assert_ne!(h.px(140 - TITLE_H / 2, 40 + TITLE_H / 2), 0x00AB_CDEF, "the close button is not text");
     // A title change repaints the bar.
     h.send(c, &[R::SetTitle { surface: 4, title: "adiós".into() }]);
@@ -909,12 +932,16 @@ fn raster(ops: &[DrawOp], comp: &Compositor<Mem>, gpu: &BTreeMap<u64, (i32, Vec<
                 for y in 0..dst.h {
                     for x in 0..dst.w {
                         let (d, v) = ((dst.y + y) as usize * STRIDE + (dst.x + x) as usize, px[((sy + y) * w + sx + x) as usize]);
-                        out[d] = if *premul { theme::over(out[d], v) & 0x00FF_FFFF } else { v };
+                        out[d] = if *premul { theme::over(out[d], v) } else { v };
                     }
                 }
             }
             DrawOp::Title { .. } => {}
-            DrawOp::Shape { .. } => panic!("the flat look makes no shapes"),
+            DrawOp::Shape { rect, shape, clip } => {
+                if let Some(c) = clip.unwrap_or(Rect::new(0, 0, W, H)).intersect(&Rect::new(0, 0, W, H)) {
+                    shape.paint(&mut out, STRIDE, c, *rect)
+                }
+            }
             DrawOp::Cursor { x, y } => {
                 for (cy, row) in CURSOR.iter().enumerate() {
                     for (cx, c) in row.iter().enumerate() {
@@ -931,6 +958,12 @@ fn raster(ops: &[DrawOp], comp: &Compositor<Mem>, gpu: &BTreeMap<u64, (i32, Vec<
                     }
                 }
             }
+        }
+    }
+    // XRGB, as compose leaves it
+    for y in 0..H as usize {
+        for p in &mut out[y * STRIDE..y * STRIDE + W as usize] {
+            *p &= 0x00FF_FFFF;
         }
     }
     out
@@ -979,7 +1012,8 @@ fn the_draw_list_paints_what_compose_paints() {
     let got = raster(&ops, &h.comp, &BTreeMap::new());
     assert_eq!(same_picture(&got, &want), None, "the first differing pixel");
     assert!(ops.iter().any(|o| matches!(o, DrawOp::Title { focused: true, .. })));
-    assert!(ops.iter().any(|o| matches!(o, DrawOp::Fill { color: CLOSE_PRESSED, .. })), "the pressed close button is in the list");
+    let Button::Shape { pressed: close_down, .. } = h.comp.theme().close else { unreachable!() };
+    assert!(ops.iter().any(|o| matches!(o, DrawOp::Shape { shape, .. } if *shape == close_down)), "the pressed close button is in the list");
     assert!(!h.comp.has_damage(), "a draw list takes the damage");
     // and again after the pointer moved and a window was dragged: the whole screen every time, the same as a full recompose
     h.comp.pointer_button(BTN_LEFT, false);
@@ -1059,8 +1093,8 @@ fn a_gpu_window_is_drawn_from_its_buffer_and_not_released_at_commit() {
     let mut gpu = BTreeMap::new();
     gpu.insert(1u64, (64, px.clone()));
     let pic = raster(&ops, &h.comp, &gpu);
-    assert_eq!(pic[(40 + TITLE_H) as usize * STRIDE + 40], px[0]);
-    assert_eq!(pic[(40 + TITLE_H + 31) as usize * STRIDE + 40 + 63], px[31 * 64 + 63]);
+    assert_eq!(pic[(40 + TITLE_H) as usize * STRIDE + 40], px[0] & 0x00FF_FFFF);
+    assert_eq!(pic[(40 + TITLE_H + 31) as usize * STRIDE + 40 + 63], px[31 * 64 + 63] & 0x00FF_FFFF);
 }
 
 #[test]
@@ -1275,7 +1309,7 @@ fn a_window_dragged_past_the_left_and_top_edges_is_drawn_from_the_inside_of_its_
     // the CPU window's pixels are right wherever they landed (the oracle compares them to compose); the GPU window's are the buffer's, shifted
     let f = h.comp.window_content(g, 4).unwrap();
     let (x, y) = (f.x.max(0), f.y.max(0));
-    assert_eq!(pic[y as usize * STRIDE + x as usize], 0x0200_0000 + ((y - f.y) * 100 + (x - f.x)) as u32);
+    assert_eq!(pic[y as usize * STRIDE + x as usize], ((y - f.y) * 100 + (x - f.x)) as u32, "(the top byte is not shown: XRGB)");
 }
 
 #[test]
@@ -1429,8 +1463,13 @@ fn geometry(ops: &[DrawOp]) -> Vec<(u8, Rect, i32, i32)> {
         .collect()
 }
 
+/// A frame shape's two halves as the draw list draws them: its shadow alone (no fill, no border, square) and its ring (square, no shadow).
+fn frame_parts(f: Shape) -> (Shape, Shape) {
+    (Shape { c: [0; 4], border: 0.0, radius: 0.0, ..f }, Shape { radius: 0.0, shadow_color: 0, ..f })
+}
+
 fn shapes(ops: &[DrawOp]) -> Vec<(Rect, Shape)> {
-    ops.iter().filter_map(|o| if let DrawOp::Shape { rect, shape } = o { Some((*rect, *shape)) } else { None }).collect()
+    ops.iter().filter_map(|o| if let DrawOp::Shape { rect, shape, .. } = o { Some((*rect, *shape)) } else { None }).collect()
 }
 
 // A: every look puts the windows' pixels and titles exactly where the flat one does, so switching is only a matter of pixels; and the
@@ -1461,20 +1500,23 @@ fn luna_draws_frame_bar_title_buttons_then_content() {
     h.comp.set_theme(&theme::LUNA);
     let ops = h.comp.draw_list().1;
     let f = h.comp.window_frame(c, 4).unwrap();
-    assert_eq!(ops[0], DrawOp::Shape { rect: Rect::new(0, 0, W, H), shape: theme::LUNA.background.unwrap() }, "the desktop first");
+    assert_eq!(ops[0], DrawOp::Shape { rect: Rect::new(0, 0, W, H), shape: theme::LUNA.background, clip: None }, "the desktop first");
     let sh = shapes(&ops);
     let fw = theme::LUNA.frame_w;
-    let frame = theme::LUNA.frame.unwrap()[0];
-    assert_eq!(sh[1], (Rect::new(f.x - fw, f.y - fw, f.w + 2 * fw, f.h + 2 * fw), frame), "the focused frame, its shadow included");
-    assert!(frame.shadow_color >> 24 != 0);
-    let bar = theme::LUNA.title.unwrap()[0];
-    assert_eq!(sh[2].1, bar);
-    assert_eq!(sh[2].0, Rect::new(f.x - fw, f.y - fw, f.w + 2 * fw, fw + TITLE_H + bar.radius as i32 + 1));
+    let (shadow, ring) = frame_parts(theme::LUNA.frame[0]);
+    let outer = Rect::new(f.x - fw, f.y - fw, f.w + 2 * fw, f.h + 2 * fw);
+    assert_eq!(sh[1], (outer, shadow), "the focused window's shadow");
+    assert!(shadow.shadow_color >> 24 != 0);
+    assert_eq!(sh[2], (outer, ring), "its frame");
+    assert_eq!(ops[2], DrawOp::Shape { rect: outer, shape: ring, clip: Some(Rect::new(outer.x, f.y + TITLE_H, outer.w, outer.h - fw - TITLE_H)) }, "below the bar");
+    let bar = theme::LUNA.title[0];
+    assert_eq!(sh[3].1, bar);
+    assert_eq!(sh[3].0, Rect::new(f.x - fw, f.y - fw, f.w + 2 * fw, fw + TITLE_H + bar.radius as i32 + 1));
     let close = match theme::LUNA.close { Button::Shape { normal, .. } => normal, _ => unreachable!() };
     let max = match theme::LUNA.other { Button::Shape { normal, .. } => normal, _ => unreachable!() };
     let i = theme::LUNA.button_inset;
-    assert_eq!(sh[3], (Rect::new(f.right() - TITLE_H + i, f.y + i, TITLE_H - 2 * i, TITLE_H - 2 * i), close), "the close button, inset");
-    assert_eq!(sh[4], (Rect::new(f.right() - 2 * TITLE_H + i, f.y + i, TITLE_H - 2 * i, TITLE_H - 2 * i), max));
+    assert_eq!(sh[4], (Rect::new(f.right() - TITLE_H + i, f.y + i, TITLE_H - 2 * i, TITLE_H - 2 * i), close), "the close button, inset");
+    assert_eq!(sh[5], (Rect::new(f.right() - 2 * TITLE_H + i, f.y + i, TITLE_H - 2 * i, TITLE_H - 2 * i), max));
     let pos = |pred: &dyn Fn(&DrawOp) -> bool| ops.iter().position(|o| pred(o)).unwrap();
     let title_at = pos(&|o| matches!(o, DrawOp::Title { .. }));
     let content_at = pos(&|o| matches!(o, DrawOp::Cpu { .. }));
@@ -1504,8 +1546,9 @@ fn luna_draws_the_unfocused_window_below_in_its_own_colours() {
     let _b = h.window(100, 80, 0x0000_AA00);
     h.comp.set_theme(&theme::LUNA);
     let ops = h.comp.draw_list().1;
-    let frames: Vec<Shape> = shapes(&ops).iter().map(|(_, s)| *s).filter(|s| theme::LUNA.frame.unwrap().contains(s)).collect();
-    assert_eq!(frames, theme::LUNA.frame.unwrap()[..].iter().rev().copied().collect::<Vec<_>>(), "unfocused below, focused on top");
+    let rings = theme::LUNA.frame.map(|f| frame_parts(f).1);
+    let frames: Vec<Shape> = shapes(&ops).iter().map(|(_, s)| *s).filter(|s| rings.contains(s)).collect();
+    assert_eq!(frames, vec![rings[1], rings[0]], "unfocused below, focused on top");
     let titles: Vec<(bool, u32)> = ops.iter().filter_map(|o| if let DrawOp::Title { focused, fg, .. } = o { Some((*focused, *fg)) } else { None }).collect();
     assert_eq!(titles, vec![(false, theme::LUNA.title_fg[1]), (true, theme::LUNA.title_fg[0])]);
 }
@@ -1532,7 +1575,7 @@ fn nines_buttons_are_bevels_that_swap_when_pressed() {
     assert!(shapes(&h.comp.draw_list().1).iter().any(|(_, s)| s.horizontal), "the title runs left to right");
 }
 
-// A: F12 is the compositor's: it cycles flat -> luna -> 9x -> flat, damages the whole screen, and no client sees it.
+// A: F12 is the compositor's: it cycles luna (the default) -> 9x -> luna, damages the whole screen, and no client sees it.
 #[test]
 fn f12_cycles_the_themes_and_the_client_never_sees_it() {
     let mut h = gpu_h();
@@ -1547,7 +1590,7 @@ fn f12_cycles_the_themes_and_the_client_never_sees_it() {
         let _ = h.comp.draw_list();
         seen.push(h.comp.theme().name);
     }
-    assert_eq!(seen, vec!["luna", "9x", "flat"]);
+    assert_eq!(seen, vec!["9x", "luna", "9x"]);
     assert!(!h.events_for(c).iter().any(|e| matches!(e, Event::Key { .. })), "F12 is not the client's");
     assert_eq!(theme::by_name("luna").map(|t| t.name), Some("luna"));
     assert!(theme::by_name("aqua").is_none());
@@ -1572,7 +1615,7 @@ fn a_fullscreen_window_has_no_shapes() {
 // A: scale 2 (a 1080p screen) doubles a theme's lengths, not its colours.
 #[test]
 fn shapes_scale_with_the_screen() {
-    let s = theme::LUNA.frame.unwrap()[0];
+    let s = theme::LUNA.frame[0];
     let d = s.scaled(2);
     assert_eq!((d.radius, d.border, d.shadow_blur, d.shadow_dy), (2.0 * s.radius, 2.0 * s.border, 2.0 * s.shadow_blur, 2 * s.shadow_dy));
     assert_eq!((d.c, d.split, d.shadow_color), (s.c, s.split, s.shadow_color));
@@ -1591,12 +1634,15 @@ fn a_theme_at_scale_2() {
     let f = h.comp.window_frame(c, 4).unwrap();
     let sh = shapes(&h.comp.draw_list().1);
     let fw = 2 * theme::LUNA.frame_w;
-    assert_eq!(sh[0].1, theme::LUNA.background.unwrap().scaled(2));
-    assert_eq!(sh[1], (Rect::new(f.x - fw, f.y - fw, f.w + 2 * fw, f.h + 2 * fw), theme::LUNA.frame.unwrap()[0].scaled(2)));
-    assert_eq!(sh[1].1.radius, 16.0);
-    assert_eq!(sh[2].1, theme::LUNA.title.unwrap()[0].scaled(2));
+    assert_eq!(sh[0].1, theme::LUNA.background.scaled(2));
+    let (shadow, ring) = frame_parts(theme::LUNA.frame[0].scaled(2));
+    assert_eq!(sh[1], (Rect::new(f.x - fw, f.y - fw, f.w + 2 * fw, f.h + 2 * fw), shadow));
+    assert_eq!((sh[1].1.shadow_blur, sh[2].1.border), (28.0, 6.0));
+    assert_eq!(sh[2].1, ring);
+    assert_eq!(sh[3].1, theme::LUNA.title[0].scaled(2));
+    assert_eq!(sh[3].1.radius, 16.0);
     let (th, i) = (2 * TITLE_H, 2 * theme::LUNA.button_inset);
-    assert_eq!(sh[3].0, Rect::new(f.right() - th + i, f.y + i, th - 2 * i, th - 2 * i));
+    assert_eq!(sh[4].0, Rect::new(f.right() - th + i, f.y + i, th - 2 * i, th - 2 * i));
 }
 
 // ── the taskbar's look and premultiplied windows ──────────────────────────────────────────────────────────────────────────────────────
@@ -1641,11 +1687,12 @@ fn an_argb_window_is_drawn_over_what_is_under_it() {
     // over a's red, and (to its right, past a) over the desktop
     let (x_in, y_in) = (fb.x + 2, fb.y + 2);
     assert!(fa.contains(x_in, y_in));
-    assert_eq!(h.px(x_in, y_in), theme::over(0x00AA_0000, 0x8000_4000) & 0x00FF_FFFF);
-    assert_eq!(h.px(x_in, y_in), 0x0055_4000, "half of a's red under half-alpha green");
-    let x_out = fa.right() + 2;
+    assert_eq!(h.px(x_in, y_in) & 0x00FF_FFFF, theme::over(0x00AA_0000, 0x8000_4000) & 0x00FF_FFFF);
+    assert_eq!(h.px(x_in, y_in) & 0x00FF_FFFF, 0x0055_4000, "half of a's red under half-alpha green");
+    // past a, its frame and its shadow: over the desktop (and not over b's own frame: that is a ring around it)
+    let x_out = fa.right() + 30;
     assert!(x_out < fb.right());
-    assert_eq!(h.px(x_out, y_in), theme::over(BACKGROUND, 0x8000_4000) & 0x00FF_FFFF);
+    assert_eq!(h.px(x_out, y_in) & 0x00FF_FFFF, theme::over(h.desktop(x_out, y_in), 0x8000_4000) & 0x00FF_FFFF);
     let want = h.screen.clone();
     let (_, ops) = h.comp.draw_list();
     assert!(ops.iter().any(|o| matches!(o, DrawOp::Cpu { client, premul: true, .. } if *client == b)));
@@ -1657,7 +1704,7 @@ fn an_argb_window_is_drawn_over_what_is_under_it() {
         R::Commit { surface: 4 },
     ]);
     h.compose();
-    assert_eq!(h.px(x_in, y_in), 0x8000_4000, "XRGB: the pixel as it is");
+    assert_eq!(h.px(x_in, y_in), 0x0000_4000, "XRGB: the pixel as it is, its top byte ignored");
     assert!(h.comp.draw_list().1.iter().any(|o| matches!(o, DrawOp::Cpu { client, premul: false, .. } if *client == b)));
 }
 
@@ -1667,51 +1714,45 @@ fn the_panel_is_told_the_theme() {
     let mut h = gpu_h();
     let w = h.window(100, 50, 0x00AA_0000);
     let p = panel_argb(&mut h, 20, 0);
-    assert!(h.events_for(p).contains(&Event::Theme { surface: 4, name: "flat".into() }));
+    assert!(h.events_for(p).contains(&Event::Theme { surface: 4, name: "luna".into() }));
     h.comp.key(88, true);
     let evs = h.comp.take_events();
-    assert!(evs.contains(&(p, Event::Theme { surface: 4, name: "luna".into() })), "{evs:?}");
+    assert!(evs.contains(&(p, Event::Theme { surface: 4, name: "9x".into() })), "{evs:?}");
     assert!(!evs.iter().any(|(c, e)| *c == w && matches!(e, Event::Theme { .. })), "only the panel");
-    h.comp.set_theme(&theme::NINES);
-    assert_eq!(h.events_for(p), vec![Event::Theme { surface: 4, name: "9x".into() }]);
+    h.comp.set_theme(&theme::LUNA);
+    assert_eq!(h.events_for(p), vec![Event::Theme { surface: 4, name: "luna".into() }]);
 }
 
-// A: in a look with a taskbar, the strip is a shape under the panel's surface, right before its pixels, covering exactly the panel's
-// area; the flat look has none.
+// A: the taskbar's strip is a shape under the panel's surface, right before its pixels, covering exactly the panel's area.
 #[test]
 fn a_themed_taskbar_is_a_shape_under_the_panel() {
     let mut h = gpu_h();
     let _w = h.window(100, 50, 0x00AA_0000);
     let p = panel_argb(&mut h, 20, 0);
     let strip = Rect::new(0, H - 20, W, 20);
-    assert!(shapes(&h.comp.draw_list().1).is_empty(), "flat: no shapes at all");
     for t in [&theme::LUNA, &theme::NINES] {
         h.comp.set_theme(t);
         let ops = h.comp.draw_list().1;
         let at = ops.iter().position(|o| matches!(o, DrawOp::Cpu { client, .. } if *client == p)).unwrap();
-        assert_eq!(ops[at - 1], DrawOp::Shape { rect: strip, shape: t.taskbar.as_ref().unwrap().bar }, "{}", t.name);
+        assert_eq!(ops[at - 1], DrawOp::Shape { rect: strip, shape: t.taskbar.bar, clip: None }, "{}", t.name);
     }
 }
 
-// A: compose (the CPU painter) draws the same strip under a transparent panel, with the shape's own pixels (Shape::paint); under the flat
-// look a transparent panel shows what is under it.
+// A: compose (the CPU painter) draws the same strip under a transparent panel, with the shape's own pixels (Shape::paint).
 #[test]
 fn compose_paints_the_strip_under_a_transparent_panel() {
     let mut h = H_::new();
     let _p = panel_argb(&mut h, 20, 0);
     h.compose();
-    assert_eq!(h.px(10, H - 10), BACKGROUND, "flat: nothing under the panel but the desktop");
-    h.comp.set_theme(&theme::LUNA);
-    h.compose();
     let strip = Rect::new(0, H - 20, W, 20);
-    let bar = theme::LUNA.taskbar.as_ref().unwrap().bar;
+    let bar = theme::LUNA.taskbar.bar;
     for (x, y) in [(10, H - 20), (10, H - 10), (W - 1, H - 1)] {
         let c = bar.pixel(strip, x, y);
         let want = [c[0], c[1], c[2]].map(|v| (v * 255.0 + 0.5) as u32);
         assert_eq!(h.px(x, y) & 0x00FF_FFFF, want[0] << 16 | want[1] << 8 | want[2], "({x}, {y})");
     }
     assert_ne!(h.px(10, H - 20), h.px(10, H - 2), "a gradient: the top differs from the bottom");
-    assert_eq!(h.px(10, H - 21), BACKGROUND, "nothing above the strip");
+    assert_eq!(h.px(10, H - 21), h.desktop(10, H - 21), "nothing above the strip");
 }
 
 // ── popups (the start menu) ───────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -1835,8 +1876,8 @@ fn popup_parent_errors_and_set_theme() {
     }
     let mut h = gpu_h();
     let c = h.window(40, 30, 0x0012_3456);
-    h.send(c, &[R::SetTheme { surface: 4, name: "luna".into() }]);
-    assert_eq!(h.comp.theme().name, "flat", "a window may not");
+    h.send(c, &[R::SetTheme { surface: 4, name: "9x".into() }]);
+    assert_eq!(h.comp.theme().name, "luna", "a window may not");
     let p = panel(&mut h, 20, 0);
     h.send(p, &[R::SetTheme { surface: 4, name: "9x".into() }]);
     assert_eq!(h.comp.theme().name, "9x", "the panel may");
@@ -1855,13 +1896,36 @@ fn a_themed_popup_has_its_frame_under_it() {
         h.comp.set_theme(t);
         let ops = h.comp.draw_list().1;
         let at = ops.iter().position(|o| matches!(o, DrawOp::Cpu { surface: 6, .. })).unwrap();
-        assert_eq!(ops[at - 1], DrawOp::Shape { rect: r, shape: t.menu.as_ref().unwrap().frame }, "{}", t.name);
+        assert_eq!(ops[at - 1], DrawOp::Shape { rect: r, shape: t.menu.frame, clip: None }, "{}", t.name);
     }
     h.comp.set_theme(&theme::LUNA);
     h.compose();
-    let frame = theme::LUNA.menu.as_ref().unwrap().frame;
+    let frame = theme::LUNA.menu.frame;
     // the shadow below and to the right of the menu, painted by compose
     let (sx, sy) = (r.right() + 2, r.y + 20);
     assert!(frame.pixel(r, sx, sy)[3] > 0.1);
-    assert_ne!(h.px(sx, sy), BACKGROUND, "the shadow darkens the desktop");
+    assert_ne!(h.px(sx, sy), h.desktop(sx, sy), "the shadow darkens the desktop");
+}
+
+// A: a fully transparent (ARGB8888) window shows the desktop through its content: neither its frame (a ring around it) nor its title bar
+// (whose box reaches under the content to round only the top corners, kept out by its clip) is under it.
+#[test]
+fn a_transparent_window_shows_neither_its_frame_nor_its_bar_through() {
+    let mut h = H_::new();
+    let c = h.comp.add_client();
+    h.pool(300, 100 * 60 * 4);
+    h.send(c, &[
+        R::CreatePool { id: 2, fd: 300, size: 100 * 60 * 4 },
+        R::CreateBuffer { pool: 2, id: 3, offset: 0, width: 100, height: 60, stride: 100 * 4, format: crate::protocol::FORMAT_ARGB8888 },
+        R::CreateSurface { id: 4 },
+        R::Attach { surface: 4, buffer: 3 },
+        R::Commit { surface: 4 },
+    ]);
+    let r = h.comp.window_content(c, 4).unwrap();
+    h.compose();
+    for (x, y) in [(r.x, r.y), (r.x + 5, r.y + 2), (r.right() - 1, r.y + 4), (r.x + 50, r.y + 30), (r.x, r.bottom() - 1)] {
+        assert_eq!(h.px(x, y), h.desktop(x, y), "({x}, {y})");
+    }
+    assert_ne!(h.px(r.x + 50, r.y - 5), h.desktop(r.x + 50, r.y - 5), "the bar is above it");
+    assert_ne!(h.px(r.x - 1, r.y + 30), h.desktop(r.x - 1, r.y + 30), "the frame is around it");
 }

@@ -2,13 +2,15 @@
 //! decorations and of the desktop, as data. The geometry does not change with the look (the title bar is [`TITLE_H`] × scale tall in every
 //! theme, the buttons are where they always were), so a theme can be switched at any moment and nothing but pixels moves.
 //!
-//! [`FLAT`] is the look of [`Compositor::compose`], the CPU painter, which knows no other: under it the draw list is the same picture
-//! `compose` paints (a test checks it pixel for pixel). The others are made of [`Shape`]s, which only a GPU host draws (`CR_SHAPE` in
-//! `probes/nvk/comp_api.h`). All sizes here are at scale 1; the compositor multiplies them by its scale.
+//! A look is made of [`Shape`]s: a GPU host draws them with `comp.frag` (`CR_SHAPE` in `probes/nvk/comp_api.h`), and
+//! [`Compositor::compose`], the CPU painter, with [`Shape::paint`], the same maths in software. Two looks: [`LUNA`] (the default) and
+//! [`NINES`]. All sizes here are at scale 1; the compositor multiplies them by its scale.
 //!
 //! [`Compositor::draw_list`]: crate::compositor::Compositor::draw_list
 //! [`Compositor::compose`]: crate::compositor::Compositor::compose
 //! [`TITLE_H`]: crate::compositor::TITLE_H
+
+use alloc::vec::Vec;
 
 use crate::region::Rect;
 
@@ -106,6 +108,23 @@ impl Shape {
         };
         let area = Rect::new(rect.x - reach, rect.y - reach, rect.w + 2 * reach, rect.h + 2 * reach);
         let Some(a) = area.intersect(&clip) else { return };
+        if self.radius <= 0.0 && self.border <= 0.0 && reach == 0 {
+            // a plain gradient (the desktop, the taskbar): every pixel inside is fully covered and its colour depends on its row (or
+            // column) alone, so `pixel` is asked once per row (column) — the same numbers, far fewer of them
+            for y in a.y..a.bottom() {
+                let row = &mut px[y as usize * stride..];
+                let mut last = (i32::MIN, [0.0f32; 4]);
+                for x in a.x..a.right() {
+                    let key = if self.horizontal { x } else { y };
+                    if key != last.0 {
+                        last = (key, self.pixel(rect, x, y));
+                    }
+                    let d = &mut row[x as usize];
+                    *d = over_f(*d, last.1);
+                }
+            }
+            return;
+        }
         for y in a.y..a.bottom() {
             for x in a.x..a.right() {
                 let c = self.pixel(rect, x, y);
@@ -213,11 +232,33 @@ pub fn over(dst: u32, src: u32) -> u32 {
     out
 }
 
-/// How a title-bar button is drawn, inside its square (the hit box) less [`Theme::button_inset`].
+/// Text whose coverage is `cov` (drawn white on black, `w x h`) in `fg` (`0x00RRGGBB`), over its shadow (`shadow`, `0xAARRGGBB`, alpha 0 =
+/// none, `off` pixels down and right), as premultiplied ARGB, transparent around the glyphs: how a title goes over a gradient bar (vk-comp
+/// draws it with `CR_PREMUL`, the CPU compositor with [`over`]).
+pub fn text_pixels(cov: &[u32], w: usize, h: usize, fg: u32, shadow: u32, off: usize) -> Vec<u32> {
+    let chan = |c: u32, sh: u32| (c >> sh) & 255;
+    let sa = shadow >> 24;
+    let mut out = alloc::vec![0u32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let t = cov[y * w + x] >> 8 & 255; // green: the coverage
+            let s = if sa > 0 && x >= off && y >= off { (cov[(y - off) * w + x - off] >> 8 & 255) * sa / 255 } else { 0 };
+            // text over shadow, premultiplied: a = t + s (1 - t)
+            let a = t + s * (255 - t) / 255;
+            let mut p = a << 24;
+            for sh in [16, 8, 0] {
+                let c = chan(fg, sh) * t / 255 + chan(shadow, sh) * s / 255 * (255 - t) / 255;
+                p |= c.min(a) << sh;
+            }
+            out[y * w + x] = p;
+        }
+    }
+    out
+}
+
+/// How a title-bar or taskbar button is drawn, inside its box.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Button {
-    /// Only the glyph; pressed, the square is filled (the flat look: [`FLAT`]).
-    Flat { pressed: u32 },
     /// A shape, another one while pressed.
     Shape { normal: Shape, pressed: Shape },
     /// Windows 9x: a face with a light top-left edge and a dark bottom-right one, swapped while pressed. Opaque fills.
@@ -226,7 +267,7 @@ pub enum Button {
 
 impl Button {
     /// The button at `rect`, pressed or not, into the premultiplied pixels `px` (rows `stride` long), touching only `clip`.
-    /// [`Button::Flat`] draws only when pressed. `scale`: the shapes' scale and the bevel's line width.
+    /// `scale`: the shapes' scale and the bevel's line width.
     pub fn paint(&self, down: bool, px: &mut [u32], stride: usize, clip: Rect, rect: Rect, scale: i32) {
         let mut fill = |r: Rect, c: u32| {
             let Some(r) = r.intersect(&clip) else { return };
@@ -237,11 +278,6 @@ impl Button {
             }
         };
         match *self {
-            Button::Flat { pressed } => {
-                if down {
-                    fill(rect, pressed)
-                }
-            }
             Button::Shape { normal, pressed } => (if down { pressed } else { normal }).scaled(scale).paint(px, stride, clip, rect),
             Button::Bevel { face, light, dark } => {
                 let (tl, br) = if down { (dark, light) } else { (light, dark) };
@@ -314,14 +350,17 @@ pub struct Menu {
 #[derive(Debug, PartialEq)]
 pub struct Theme {
     pub name: &'static str,
-    /// The desktop, under everything: `None` is a flat [`crate::compositor::BACKGROUND`].
-    pub background: Option<Shape>,
-    /// A frame drawn under the whole window, `frame_w` wider than it on each side (bottom too); its shadow is the window's. Focused, unfocused.
-    pub frame: Option<[Shape; 2]>,
+    /// The desktop, under everything.
+    pub background: Shape,
+    /// The window's frame: a ring `frame_w` wide around it (a shape whose box is the window grown by `frame_w`, transparent inside, its
+    /// border the ring) and the window's shadow. The draw list splits it: the shadow on its own, square, masked under the whole window;
+    /// the ring square and clipped to below the title bar, whose rounded top corners are the window's. So neither shows through a
+    /// translucent window. Focused, unfocused.
+    pub frame: [Shape; 2],
     pub frame_w: i32,
-    /// The title bar, focused and unfocused. `None`: [`FLAT`]'s fills. Its radius rounds the top corners only (the box reaches under the
-    /// content, which covers the bottom ones).
-    pub title: Option<[Shape; 2]>,
+    /// The title bar, focused and unfocused. Its radius rounds the top corners only (the box reaches under the content, which covers the
+    /// bottom ones).
+    pub title: [Shape; 2],
     /// The title's text, `0x00RRGGBB`, focused and unfocused.
     pub title_fg: [u32; 2],
     /// A shadow under the text, one pixel (× scale) down and right, `0xAARRGGBB`; alpha 0 = none.
@@ -333,44 +372,24 @@ pub struct Theme {
     /// The glyphs' colour (`0x00RRGGBB`) and stroke (× scale).
     pub glyph: u32,
     pub glyph_weight: i32,
-    /// `None`: the panel draws its own flat look, opaque.
-    pub taskbar: Option<Taskbar>,
-    /// `None`: the panel draws a flat menu, opaque.
-    pub menu: Option<Menu>,
+    pub taskbar: Taskbar,
+    pub menu: Menu,
 }
-
-/// The look `compose` paints: flat fills, no shapes.
-pub static FLAT: Theme = Theme {
-    name: "flat",
-    background: None,
-    frame: None,
-    frame_w: 0,
-    title: None,
-    title_fg: [0x00F0_F0F0, 0x00B0_B0B8],
-    title_shadow: 0,
-    close: Button::Flat { pressed: crate::compositor::CLOSE_PRESSED },
-    other: Button::Flat { pressed: crate::compositor::TITLE_UNFOCUSED },
-    button_inset: 0,
-    glyph: crate::compositor::BUTTON_FG,
-    glyph_weight: 1,
-    taskbar: None,
-    menu: None,
-};
 
 /// "Luna 2026": Windows XP's Luna redone with shaders: glossy blue title bars with rounded tops, a blue frame, soft shadows, a red close
 /// button, a sky-and-hill desktop.
 pub static LUNA: Theme = Theme {
     name: "luna",
-    background: Some(Shape::gradient(0xFF2F_6FD0, 0xFF9C_CBF5, 0xFF5F_A835, 0xFF2D_6A19, 0.62)),
-    frame: Some([
-        Shape::solid(0xFF00_55E5).radius(8.0).border(1.0, 0xFF00_2D9A).shadow(14.0, 0, 6, 0x7000_0000),
-        Shape::solid(0xFF7A_96DF).radius(8.0).border(1.0, 0xFF5A_76C0).shadow(10.0, 0, 4, 0x4000_0000),
-    ]),
+    background: Shape::gradient(0xFF2F_6FD0, 0xFF9C_CBF5, 0xFF5F_A835, 0xFF2D_6A19, 0.62),
+    frame: [
+        Shape::solid(0).border(3.0, 0xFF00_55E5).shadow(14.0, 0, 6, 0x7000_0000),
+        Shape::solid(0).border(3.0, 0xFF7A_96DF).shadow(10.0, 0, 4, 0x4000_0000),
+    ],
     frame_w: 3,
-    title: Some([
+    title: [
         Shape::gradient(0xFF5C_A2FF, 0xFF2B_7CF2, 0xFF0A_5BDB, 0xFF0C_52CF, 0.45).radius(8.0).border(1.0, 0xFF00_2D9A),
         Shape::gradient(0xFFAE_C8F6, 0xFF97_B6EE, 0xFF83_A5E4, 0xFF8C_ACE7, 0.45).radius(8.0).border(1.0, 0xFF5A_76C0),
-    ]),
+    ],
     title_fg: [0x00FF_FFFF, 0x00E4_ECFA],
     title_shadow: 0x900A_1E5A,
     close: Button::Shape {
@@ -384,7 +403,7 @@ pub static LUNA: Theme = Theme {
     button_inset: 2,
     glyph: 0x00FF_FFFF,
     glyph_weight: 2,
-    taskbar: Some(Taskbar {
+    taskbar: Taskbar {
         bar: Shape::gradient(0xFF6A_A8F7, 0xFF31_6FDE, 0xFF26_5FD9, 0xFF1B_47B4, 0.14),
         start: Button::Shape {
             normal: Shape::gradient(0xFF79_C96A, 0xFF46_A33A, 0xFF31_8C28, 0xFF3D_9C33, 0.45).radius(10.0).border(1.0, 0xFF1F_6A18),
@@ -404,8 +423,8 @@ pub static LUNA: Theme = Theme {
             pressed: Shape::gradient(0xFF2E_A8F5, 0xFF16_92E9, 0xFF10_86DF, 0xFF13_8CE4, 0.5).radius(4.0).border(1.0, 0xFF0B_4FAE),
         },
         tray_fg: 0x00FF_FFFF,
-    }),
-    menu: Some(Menu {
+    },
+    menu: Menu {
         frame: Shape::solid(0xFF1C_5ED8).radius(8.0).border(1.0, 0xFF0A_3A9A).shadow(12.0, 4, 4, 0x8000_0000),
         inset: 2,
         header: Some(Shape::gradient(0xFF4C_92F2, 0xFF1F_63D8, 0xFF19_58CC, 0xFF15_4FC0, 0.4).radius(6.0)),
@@ -423,23 +442,23 @@ pub static LUNA: Theme = Theme {
         footer: Some(Shape::gradient(0xFF2A_6FE0, 0xFF19_58CC, 0xFF19_58CC, 0xFF14_4AB8, 1.0)),
         footer_h: 30,
         separator: 0x00C5_D4EA,
-    }),
+    },
 };
 
 /// "9x moderno": Windows 98's layout (grey bevelled frame and buttons, a navy-to-blue title running left to right, a teal desktop) with
 /// modern light: soft shadows and a sheen on the desktop.
 pub static NINES: Theme = Theme {
     name: "9x",
-    background: Some(Shape::gradient(0xFF10_9494, 0xFF00_8080, 0xFF00_8080, 0xFF00_6868, 0.5)),
-    frame: Some([
-        Shape::solid(0xFFD4_D0C8).border(1.0, 0xFF40_4040).shadow(10.0, 3, 5, 0x6000_0000),
-        Shape::solid(0xFFD4_D0C8).border(1.0, 0xFF80_8080).shadow(8.0, 2, 3, 0x4000_0000),
-    ]),
+    background: Shape::gradient(0xFF10_9494, 0xFF00_8080, 0xFF00_8080, 0xFF00_6868, 0.5),
+    frame: [
+        Shape::solid(0).border(3.0, 0xFFD4_D0C8).shadow(10.0, 3, 5, 0x6000_0000),
+        Shape::solid(0).border(3.0, 0xFFC0_BCB4).shadow(8.0, 2, 3, 0x4000_0000),
+    ],
     frame_w: 3,
-    title: Some([
+    title: [
         Shape::gradient(0xFF0A_246A, 0xFFA6_CAF0, 0, 0, 1.0).horizontal(),
         Shape::gradient(0xFF80_8080, 0xFFC0_C0C0, 0, 0, 1.0).horizontal(),
-    ]),
+    ],
     title_fg: [0x00FF_FFFF, 0x00D4_D0C8],
     title_shadow: 0,
     close: Button::Bevel { face: 0x00D4_D0C8, light: 0x00FF_FFFF, dark: 0x0040_4040 },
@@ -447,7 +466,7 @@ pub static NINES: Theme = Theme {
     button_inset: 2,
     glyph: 0x0000_0000,
     glyph_weight: 2,
-    taskbar: Some(Taskbar {
+    taskbar: Taskbar {
         // a white line along the top, then the grey face
         bar: Shape::gradient(0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFD4_D0C8, 0xFFC8_C4BC, 0.05),
         start: Button::Bevel { face: 0x00D4_D0C8, light: 0x00FF_FFFF, dark: 0x0040_4040 },
@@ -459,8 +478,8 @@ pub static NINES: Theme = Theme {
         task_fg: 0x0000_0000,
         tray: Button::Bevel { face: 0x00D4_D0C8, light: 0x00FF_FFFF, dark: 0x0080_8080 },
         tray_fg: 0x0000_0000,
-    }),
-    menu: Some(Menu {
+    },
+    menu: Menu {
         // the raised grey frame of a 98 menu, with a modern soft shadow
         frame: Shape::solid(0xFFD4_D0C8).border(1.0, 0xFF40_4040).shadow(8.0, 3, 3, 0x6000_0000),
         inset: 3,
@@ -479,11 +498,11 @@ pub static NINES: Theme = Theme {
         footer: None,
         footer_h: 0,
         separator: 0x0080_8080,
-    }),
+    },
 };
 
-/// Every theme, in the order the theme key cycles through them.
-pub static THEMES: [&Theme; 3] = [&FLAT, &LUNA, &NINES];
+/// Every theme, in the order the theme key cycles through them; the first is the default.
+pub static THEMES: [&Theme; 2] = [&LUNA, &NINES];
 
 /// The theme called `name`, if there is one.
 pub fn by_name(name: &str) -> Option<&'static Theme> {
@@ -563,5 +582,28 @@ mod tests {
         let mut px = vec![0u32; w * h];
         b.paint(false, &mut px, w, Rect::new(0, 0, 5, 5), r, 1);
         assert_eq!(px[5 * w + 6], 0, "clipped");
+    }
+}
+
+#[cfg(test)]
+mod text_tests {
+    extern crate std;
+    use super::*;
+
+    #[test]
+    fn text_over_its_shadow_text_pixels() {
+        // one row: full coverage, nothing, half coverage; the shadow is one pixel right of each
+        let cov = [0x00FF_FFFF, 0, 0x0080_8080, 0];
+        let px = text_pixels(&cov, 4, 1, 0x0020_4080, 0x8000_0000, 0);
+        assert_eq!(px[0], 0xFF20_4080, "full coverage: the colour, opaque");
+        assert_eq!(px[1], 0, "no glyph, no shadow: transparent");
+        assert_eq!(px[2] >> 24, 0x80 + (0x80 * 0x80 / 255) * (255 - 0x80) / 255, "half a glyph over a shadow (offset 0: under itself)");
+        let px = text_pixels(&cov, 4, 1, 0x00FF_FFFF, 0x8000_0000, 1);
+        // offset 1 needs y >= 1 too: on one row there is no shadow
+        assert_eq!(px[1], 0);
+        let cov2 = [0x00FF_FFFF, 0, 0, 0];
+        let px = text_pixels(&cov2, 2, 2, 0x00FF_FFFF, 0x8000_0000, 1);
+        assert_eq!(px[3], 0x8000_0000, "the shadow, down and right of the glyph: black at half alpha");
+        assert!(px.iter().all(|p| [16, 8, 0].iter().all(|s| (p >> s & 255) <= p >> 24)), "premultiplied: no channel above alpha");
     }
 }

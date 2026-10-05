@@ -65,8 +65,8 @@
 #   W6. `fire` (constanos_gfx.h, fixed size) has no maximize button, and
 #       dragging just past its right edge does not change it.
 #   W7. The start menu (a popup): it shows above the strip, Escape and a
-#       click outside close it, and a theme picked in it changes the
-#       taskbar (the strip is the compositor's), then back to flat.
+#       click outside close it, and a theme picked in it (9x) changes the
+#       taskbar (the strip is the compositor's), then back to Luna.
 # Exit status: number of failed checks.
 set -u
 MODE=${1:-demo}
@@ -84,13 +84,16 @@ px() { # px <png> <x> <y>  -> "r,g,b"
 from PIL import Image
 im = Image.open('$1').convert('RGB'); print('%d,%d,%d' % im.getpixel(($2, $3)))"
 }
-cursor() { # cursor <png> -> "x y" of the cursor tip (black with white below-right)
+cursor() { # cursor <png> -> "x y" of the cursor tip: where the top of gui::compositor::CURSOR's bitmap is, pixel for pixel (black text on a
+           # white menu would fool a looser test)
     python3 -c "
 from PIL import Image
-im = Image.open('$1').convert('RGB'); W, H = im.size
-for y in range(H - 2):
-    for x in range(W - 2):
-        if im.getpixel((x, y)) == (0, 0, 0) and im.getpixel((x + 1, y + 2)) == (255, 255, 255):
+im = Image.open('$1').convert('RGB'); W, H = im.size; px = im.load()
+rows = ['X', 'XX', 'X.X', 'X..X', 'X...X', 'X....X', 'X.....X', 'X......X', 'X.......X', 'X........X']
+want = [(dx, dy, (0, 0, 0) if c == 'X' else (255, 255, 255)) for dy, r in enumerate(rows) for dx, c in enumerate(r)]
+for y in range(H - len(rows)):
+    for x in range(W - 10):
+        if px[x, y] == (0, 0, 0) and all(px[x + dx, y + dy] == c for dx, dy, c in want):
             print(x, y); raise SystemExit
 print('none')"
 }
@@ -102,8 +105,14 @@ print('yes' if any(im.getpixel((x, y)) == want for y in range($4, $6) for x in r
 }
 shot() { $Q screendump "$OUT/$1.png" >/dev/null; echo "$OUT/$1.png"; }
 
-BG=32,48,64          # gui::compositor::BACKGROUND
-FOCUSED=80,120,176   # TITLE_FOCUSED
+# What the look (Luna, the default) paints where nothing covers it, from the same code the compositor runs (gui/examples/theme_px.rs):
+# the desktop at a point, a focused / unfocused title bar at a point (its window's frame at fx,fy), the taskbar's strip.
+(cd gui && cargo build -q --example theme_px) || { echo "cannot build theme_px"; exit 99; }
+TP() { gui/target/debug/examples/theme_px luna "$@"; }
+desk() { TP desktop 1280 800 "$1" "$2"; }
+fbar() { TP bar 1 "$1" "$2" 2000 "$3" "$4"; }   # fbar <fx> <fy> <x> <y>
+ubar() { TP bar 0 "$1" "$2" 2000 "$3" "$4"; }
+strip() { TP strip 1280 800 32 "$1" "$2"; }
 
 $Q stop >/dev/null 2>&1
 QEMU_DEBUG_SMP=${QEMU_DEBUG_SMP:-4} $Q start >/dev/null 2>&1 || { echo "start failed"; exit 99; }
@@ -120,7 +129,7 @@ if [ "$MODE" = term ]; then
     X1=$((X0 + 80 * CW)); Y1=$((Y0 + 25 * CH))
     sleep 2
     s=$(shot t1)
-    [ "$(px "$s" 45 45)" = "$FOCUSED" ] && ok "T1 focused term window at (40,40)" || bad "T1 title bar: $(px "$s" 45 45)"
+    [ "$(px "$s" 45 45)" = "$(fbar 40 40 45 45)" ] && ok "T1 focused term window at (40,40)" || bad "T1 title bar: $(px "$s" 45 45)"
 
     $Q send "clear; printf '\\033[41m%80s\\033[0m\\n' ''" && $Q enter; sleep 2
     s=$(shot t2)
@@ -137,7 +146,7 @@ if [ "$MODE" = term ]; then
     $Q send "printf '\\033[42m%10s\\033[0m\\n' ''" && $Q enter; sleep 2
     s=$(shot t3)
     [ "$(has "$s" "$GREEN" $X0 $Y0 $X1 $Y1)" = yes ] && ok "T3 ^C ended sleep; the shell answers" || bad "T3 no green row"
-    [ "$(px "$s" 45 45)" = "$FOCUSED" ] && ok "T3 compositor survived ^C" || bad "T3 window gone: $(px "$s" 45 45)"
+    [ "$(px "$s" 45 45)" = "$(fbar 40 40 45 45)" ] && ok "T3 compositor survived ^C" || bad "T3 window gone: $(px "$s" 45 45)"
     grep -aq "Killed PID [0-9]* (compositor)" "$STATE/serial.log" && bad "T3 compositor killed"
 
     $Q send "vi /tmp/e2e.txt" && $Q enter; sleep 2
@@ -152,7 +161,7 @@ if [ "$MODE" = term ]; then
     $Q wait-for "term: shell gone" 15 >/dev/null && ok "T5 exit: term saw the shell go" || bad "T5 term did not notice"
     sleep 1
     s=$(shot t6)
-    [ "$(px "$s" 45 45)" = "$BG" ] && ok "T5 window gone" || bad "T5 window still there: $(px "$s" 45 45)"
+    [ "$(px "$s" 45 45)" = "$(desk 45 45)" ] && ok "T5 window gone" || bad "T5 window still there: $(px "$s" 45 45)"
 
     $Q key ctrl-alt-backspace; sleep 2
     $Q send "echo console-is-back" && $Q enter
@@ -164,7 +173,7 @@ if [ "$MODE" = term ]; then
 fi
 
 if [ "$MODE" = wm ]; then
-    PANEL=21,26,34; UNFOCUSED=80,80,88; BLACK=0,0,0; WHITE=232,232,232
+    BLACK=0,0,0
     goto() { # goto x y: moves the pointer there, correcting from screendumps
         local tx=$1 ty=$2 i c dx dy
         for i in $(seq 20); do
@@ -210,14 +219,14 @@ for label, x, y in re.findall(r' (.+?)@(\d+),(\d+)', sys.stdin.read().split('pan
     $Q wait-for "panel: buttons" 60 >/dev/null || bad "W1 no panel"
     sleep 1
     s=$(shot w1)
-    [ "$(px "$s" 640 795)" = "$PANEL" ] && [ "$(px "$s" 640 760)" = "$BG" ] \
+    [ "$(px "$s" 640 795)" = "$(strip 640 795)" ] && [ "$(px "$s" 640 760)" = "$(desk 640 760)" ] \
         && ok "W1 panel on the last strip" || bad "W1 panel: $(px "$s" 640 795) above: $(px "$s" 640 760)"
     launch Terminal
     grep -aq "panel: menu.*Terminal@" "$STATE/serial.log" || bad "W1 the start menu did not open"
     $Q wait-for "term: 80x25 cells" 30 >/dev/null || bad "W1 term never started"
     sleep 2
     s=$(shot w1b)
-    [ "$(px "$s" 45 45)" = "$FOCUSED" ] && grep -a "panel: buttons" "$STATE/serial.log" | tail -1 | grep -q " term@" \
+    [ "$(px "$s" 45 45)" = "$(fbar 40 40 45 45)" ] && grep -a "panel: buttons" "$STATE/serial.log" | tail -1 | grep -q " term@" \
         && ok "W1 launcher started term, focused and listed" || bad "W1 term: $(px "$s" 45 45)"
 
     # term: content 720x500 at (40,60); the corner just outside it.
@@ -232,32 +241,32 @@ for label, x, y in re.findall(r' (.+?)@(\d+),(\d+)', sys.stdin.read().split('pan
     console "stty size"
     grep -aq "^20 57" "$STATE/serial.log" && ok "W2 stty size: 20 57" || bad "W2 stty size wrong"
     s=$(shot w2b)
-    [ "$(px "$s" 700 300)" = "$BG" ] && [ "$(px "$s" 500 300)" = "$BLACK" ] \
+    [ "$(px "$s" 700 300)" = "$(desk 700 300)" ] && [ "$(px "$s" 500 300)" = "$BLACK" ] \
         && ok "W2 window smaller on screen" || bad "W2 screen: $(px "$s" 700 300) / $(px "$s" 500 300)"
 
     click 523 50                                  # maximize (frame 40..553)
     sleep 1
     console "stty size"
     s=$(shot w3a)
-    [ "$(px "$s" 5 5)" = "$FOCUSED" ] && [ "$(px "$s" 640 795)" = "$PANEL" ] \
+    [ "$(px "$s" 5 5)" = "$(fbar 0 0 5 5)" ] && [ "$(px "$s" 640 795)" = "$(strip 640 795)" ] \
         && ok "W3 maximized over the work area, panel visible" || bad "W3 max: $(px "$s" 5 5) panel $(px "$s" 640 795)"
     grep -aq "^37 142" "$STATE/serial.log" && ok "W3 stty size: 37 142" || bad "W3 stty size after maximize"
     click 1250 10                                 # restore
     sleep 1.5
     s=$(shot w3b)
-    [ "$(px "$s" 5 5)" = "$BG" ] && [ "$(px "$s" 45 45)" = "$FOCUSED" ] \
+    [ "$(px "$s" 5 5)" = "$(desk 5 5)" ] && [ "$(px "$s" 45 45)" = "$(fbar 40 40 45 45)" ] \
         && ok "W3 restored" || bad "W3 restore: $(px "$s" 5 5) / $(px "$s" 45 45)"
 
     launch "CPU monitor"
     $Q wait-for "panel: buttons.* cpumon@" 30 >/dev/null || bad "W5 cpumon never mapped"
     sleep 4
     s=$(shot w5a)
-    [ "$(px "$s" 45 45)" = "$UNFOCUSED" ] && [ "$(px "$s" 100 150)" != "$BLACK" ] \
+    [ "$(px "$s" 45 45)" = "$(ubar 40 40 45 45)" ] && [ "$(px "$s" 100 150)" != "$BLACK" ] \
         && ok "W5 cpumon on top, term unfocused" || bad "W5 before: $(px "$s" 45 45) / $(px "$s" 100 150)"
     click "$(button term)" $PY_
     sleep 1
     s=$(shot w5b)
-    [ "$(px "$s" 45 45)" = "$FOCUSED" ] && [ "$(px "$s" 100 150)" = "$BLACK" ] \
+    [ "$(px "$s" 45 45)" = "$(fbar 40 40 45 45)" ] && [ "$(px "$s" 100 150)" = "$BLACK" ] \
         && ok "W5 the panel raised and focused term" || bad "W5 after: $(px "$s" 45 45) / $(px "$s" 100 150)"
 
     click 702 82                                  # cpumon's close (frame 72..712)
@@ -267,24 +276,24 @@ for label, x, y in re.findall(r' (.+?)@(\d+),(\d+)', sys.stdin.read().split('pan
         && ok "W4 term closed" || bad "W4 term did not close"
     sleep 1
     s=$(shot w4)
-    [ "$(px "$s" 45 45)" = "$BG" ] && ok "W4 both windows gone" || bad "W4 window left: $(px "$s" 45 45)"
+    [ "$(px "$s" 45 45)" = "$(desk 45 45)" ] && ok "W4 both windows gone" || bad "W4 window left: $(px "$s" 45 45)"
 
     launch Fire
     $Q wait-for "panel: buttons.* fire@" 30 >/dev/null || bad "W6 fire never mapped"
     sleep 3
-    edge() { # right end of the focused title bar on row 110, from x=110
+    edge() { # left end of the (red) close button on fire's title bar, row 110 (fire's frame is at (104,104): the third window placed)
         python3 -c "
 from PIL import Image
-im = Image.open('$1').convert('RGB'); x = 110
-while x < im.size[0] - 1 and im.getpixel((x + 1, 110)) in ((80,120,176), (232,232,232)): x += 1
-print(x)"
+im = Image.open('$1').convert('RGB')
+print(next((x for x in range(150, im.size[0]) if (lambda p: p[0] > 150 and p[1] < 130 and p[2] < 110)(im.getpixel((x, 110)))), -1))"
     }
-    s=$(shot w6a); r=$(edge "$s")
-    [ "$(has "$s" "$WHITE" $((r - 38)) 104 $((r - 20)) 124)" = no ] && ok "W6 fire: no maximize button" \
-        || bad "W6 a maximize button on fire"
-    goto $((r + 3)) 150; press; $Q mouse-move 100 0 >/dev/null; sleep 0.3; release
+    s=$(shot w6a); c=$(edge "$s")
+    # left of the close button is the bar itself, not a maximize button
+    [ "$c" -gt 0 ] && [ "$(px "$s" $((c - 10)) 110)" = "$(fbar 0 104 $((c - 10)) 110)" ] && ok "W6 fire: no maximize button" \
+        || bad "W6 a maximize button on fire (close at $c, $(px "$s" $((c - 10)) 110) left of it)"
+    goto $((c + 18 + 3)) 150; press; $Q mouse-move 100 0 >/dev/null; sleep 0.3; release   # just past the frame's right edge
     s=$(shot w6b)
-    [ "$(edge "$s")" = "$r" ] && ok "W6 fire's size did not change ($r)" || bad "W6 fire resized: $r -> $(edge "$s")"
+    [ "$(edge "$s")" = "$c" ] && ok "W6 fire's size did not change ($c)" || bad "W6 fire resized: $c -> $(edge "$s")"
 
     menu_open() { # opens the start menu, waits for its log line; "x y" of its first item
         local n; n=$(grep -ac "panel: menu " "$STATE/serial.log")
@@ -294,27 +303,28 @@ print(x)"
         menuitem Terminal
     }
     closed() { grep -ac "panel: menu closed" "$STATE/serial.log"; }
+    pre=$(shot w7pre)
     read -r mx my <<< "$(menu_open)"
     s=$(shot w7a)
-    [ "$(px "$s" "$mx" "$my")" != "$BG" ] && [ "$my" -lt 768 ] && ok "W7 the menu shows above the strip" || bad "W7 no menu at $mx,$my: $(px "$s" "$mx" "$my")"
+    [ "$(px "$s" "$mx" "$my")" != "$(px "$pre" "$mx" "$my")" ] && [ "$my" -lt 768 ] && ok "W7 the menu shows above the strip" || bad "W7 no menu at $mx,$my: $(px "$s" "$mx" "$my")"
     c0=$(closed); $Q key esc; sleep 1
     s=$(shot w7b)
-    [ "$(closed)" -gt "$c0" ] && [ "$(px "$s" "$mx" "$my")" = "$BG" ] && ok "W7 Escape closes it" \
+    [ "$(closed)" -gt "$c0" ] && [ "$(px "$s" "$mx" "$my")" = "$(px "$pre" "$mx" "$my")" ] && ok "W7 Escape closes it" \
         || bad "W7 Escape: closed $(closed) (was $c0), $(px "$s" "$mx" "$my") at the item"
     menu_open >/dev/null
     c0=$(closed); click 1000 300; sleep 1
     [ "$(closed)" -gt "$c0" ] && ok "W7 a click outside closes it" || bad "W7 a click outside did not close the menu"
     menu_open >/dev/null
     # shellcheck disable=SC2046
-    click $(menuitem "Luna 2026")
-    $Q wait-for "panel: theme luna$" 10 >/dev/null || bad "W7 the menu did not set the theme"
+    click $(menuitem "9x moderno")
+    $Q wait-for "panel: theme 9x$" 10 >/dev/null || bad "W7 the menu did not set the theme"
     sleep 2
     s=$(shot w7c)
-    [ "$(px "$s" 640 795)" != "$PANEL" ] && ok "W7 Luna's taskbar ($(px "$s" 640 795))" || bad "W7 the strip is still flat"
+    [ "$(px "$s" 640 795)" != "$(strip 640 795)" ] && ok "W7 9x's taskbar ($(px "$s" 640 795))" || bad "W7 the strip did not change"
     menu_open >/dev/null
     # shellcheck disable=SC2046
-    click $(menuitem Flat)
-    $Q wait-for "panel: theme flat$" 10 >/dev/null && ok "W7 back to flat" || bad "W7 could not go back to flat"
+    click $(menuitem "Luna 2026")
+    $Q wait-for "panel: theme luna$" 10 >/dev/null && ok "W7 back to Luna" || bad "W7 could not go back to Luna"
 
     $Q key ctrl-alt-backspace; sleep 2
     $Q send "echo console-is-back" && $Q enter
@@ -334,7 +344,7 @@ if [ "$MODE" = text ]; then
     $Q wait-for "textdemo: ready" 120 >/dev/null || bad "X1 textdemo never got ready"
     sleep 2
     s=$(shot x1)
-    [ "$(px "$s" 45 45)" = "$FOCUSED" ] && ok "X1 focused textdemo window at (40,40)" || bad "X1 title bar: $(px "$s" 45 45)"
+    [ "$(px "$s" 45 45)" = "$(fbar 40 40 45 45)" ] && ok "X1 focused textdemo window at (40,40)" || bad "X1 title bar: $(px "$s" 45 45)"
     grep -aq "textdemo: fonts loaded" "$STATE/serial.log" && ok "X1 TrueType fonts loaded" \
         || bad "X1 $(grep -a 'textdemo: no fonts' "$STATE/serial.log" | tail -1)"
 
@@ -381,7 +391,7 @@ PY
     $Q wait-for "textdemo: bye" 15 >/dev/null && ok "X3 Esc quits" || bad "X3 textdemo did not quit"
     sleep 1
     s=$(shot x3)
-    [ "$(px "$s" 45 45)" = "$BG" ] && ok "X3 window gone" || bad "X3 window still there: $(px "$s" 45 45)"
+    [ "$(px "$s" 45 45)" = "$(desk 45 45)" ] && ok "X3 window gone" || bad "X3 window still there: $(px "$s" 45 45)"
     $Q key ctrl-alt-backspace; sleep 2
     $Q send "echo console-is-back" && $Q enter
     $Q wait-for "^.fb. console-is-back" 10 >/dev/null && ok "X3 console and keyboard back" || bad "X3 typing does not reach ash"
@@ -396,8 +406,8 @@ $Q wait-for "gui_demo: focus in" 30 >/dev/null || bad "gui_demo never got focus"
 sleep 1
 
 s=$(shot one)
-[ "$(px "$s" 45 45)" = "$FOCUSED" ] && ok "1 focused title bar at (40,40)" || bad "1 title bar: $(px "$s" 45 45)"
-c=$(px "$s" 100 150); [ "$c" != "$BG" ] && ok "1 window content at (100,150)" || bad "1 no content at (100,150)"
+[ "$(px "$s" 45 45)" = "$(fbar 40 40 45 45)" ] && ok "1 focused title bar at (40,40)" || bad "1 title bar: $(px "$s" 45 45)"
+c=$(px "$s" 100 150); [ "$c" != "$(desk 100 150)" ] && ok "1 window content at (100,150)" || bad "1 no content at (100,150)"
 [ "$(cursor "$s")" = "640 400" ] && ok "1 cursor at the centre" || bad "1 cursor at $(cursor "$s")"
 
 $Q mouse-move -440 -350; sleep 0.5
@@ -406,8 +416,8 @@ s=$(shot two)
 
 $Q mouse-button 1; $Q mouse-move 150 100; $Q mouse-move 150 100; $Q mouse-button 0; sleep 0.5
 s=$(shot three)
-[ "$(px "$s" 345 245)" = "$FOCUSED" ] && ok "3 title bar dragged to (340,240)" || bad "3 title at (345,245): $(px "$s" 345 245)"
-[ "$(px "$s" 100 150)" = "$BG" ] && ok "3 old place is background" || bad "3 old place: $(px "$s" 100 150)"
+[ "$(px "$s" 345 245)" = "$(fbar 340 240 345 245)" ] && ok "3 title bar dragged to (340,240)" || bad "3 title at (345,245): $(px "$s" 345 245)"
+[ "$(px "$s" 100 150)" = "$(desk 100 150)" ] && ok "3 old place is background" || bad "3 old place: $(px "$s" 100 150)"
 
 $Q mouse-move 0 100; $Q mouse-button 2; $Q mouse-button 0
 $Q send "ab"; sleep 1

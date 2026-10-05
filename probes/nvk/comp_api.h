@@ -32,6 +32,8 @@ struct cr_shape {
    uint32_t shadow_color;   /* alpha 0 = no shadow */
    int32_t shadow_dx, shadow_dy;
    uint32_t horizontal;     /* 1: the gradient runs left to right instead of top to bottom */
+   int32_t clip_x, clip_y, clip_w, clip_h;   /* drawn only inside this rectangle (clip_w <= 0: no clip): a title bar's box reaches
+                                              * under the window's content so only its top corners are round, and the clip keeps it out */
 };
 
 struct cr_op {

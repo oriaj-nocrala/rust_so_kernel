@@ -25,6 +25,10 @@ pub struct CrShape {
     pub shadow_dx: i32,
     pub shadow_dy: i32,
     pub horizontal: u32,
+    pub clip_x: i32,
+    pub clip_y: i32,
+    pub clip_w: i32,
+    pub clip_h: i32,
 }
 
 #[repr(C)]
@@ -50,7 +54,7 @@ pub struct CrOp {
 impl CrOp {
     pub const fn new(kind: u32) -> CrOp {
         CrOp { kind, color: 0, x: 0, y: 0, w: 0, h: 0, sx: 0, sy: 0, key: 0, version: 0, px: std::ptr::null(), npx: 0, src_w: 0, alpha: CR_OPAQUE, shape: CrShape {
-            radius: 0.0, border: 0.0, split: 1.0, shadow_blur: 0.0, c: [0; 4], border_color: 0, shadow_color: 0, shadow_dx: 0, shadow_dy: 0, horizontal: 0,
+            radius: 0.0, border: 0.0, split: 1.0, shadow_blur: 0.0, c: [0; 4], border_color: 0, shadow_color: 0, shadow_dx: 0, shadow_dy: 0, horizontal: 0, clip_x: 0, clip_y: 0, clip_w: 0, clip_h: 0,
         } }
     }
 }

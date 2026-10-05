@@ -10,7 +10,7 @@
 //!                            sent SIGTERM (SIGKILL after 3 s), so a session ends with its compositor
 //!   COMP_NO_PANEL=1          with no program to start, do not start the default panel
 //!   COMP_F11_AT=60,120       test hook: press F11 (fullscreen on the focused window) when that many frames have been composed
-//!   COMP_THEME=<name>        the look to start with: luna (default), 9x or flat (gui::theme); F12 cycles them
+//!   COMP_THEME=<name>        the look to start with: luna (default) or 9x (gui::theme); F12 and the start menu change it
 //!   COMP_EXIT_WHEN_IDLE=1    quit when every client that connected has gone and every program it started has exited (the quit line then
 //!                            says how long it all took)
 //!
@@ -547,7 +547,8 @@ fn run(args: &[String]) -> i32 {
                             ..CrOp::new(CR_CPU)
                         });
                     }
-                    DrawOp::Shape { rect, shape } => {
+                    DrawOp::Shape { rect, shape, clip } => {
+                        let c = clip.unwrap_or(gui::region::Rect::new(0, 0, 0, 0));
                         let shape = CrShape {
                             radius: shape.radius,
                             border: shape.border,
@@ -559,6 +560,10 @@ fn run(args: &[String]) -> i32 {
                             shadow_dx: shape.shadow_dx,
                             shadow_dy: shape.shadow_dy,
                             horizontal: shape.horizontal as u32,
+                            clip_x: c.x,
+                            clip_y: c.y,
+                            clip_w: c.w,
+                            clip_h: c.h,
                         };
                         ops.push(CrOp { x: rect.x, y: rect.y, w: rect.w, h: rect.h, shape, ..CrOp::new(CR_SHAPE) });
                     }
