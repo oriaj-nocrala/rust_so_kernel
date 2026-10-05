@@ -9,9 +9,30 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CR_FILL 0   /* rect (x, y, w, h) in `color` (0x00RRGGBB) */
+#define CR_FILL 0   /* rect (x, y, w, h) in `color` (0x00RRGGBB), opaque */
 #define CR_GPU 1    /* rect shows the GPU buffer `key` (cr_import) from pixel (sx, sy) */
 #define CR_CPU 2    /* rect shows `px` (`src_w` pixels per row, `npx` in all) from (sx, sy); uploaded when `version` differs from the last upload under `key` */
+#define CR_SHAPE 3  /* the box (x, y, w, h) drawn as `shape` says: rounded, a gradient, a border, a shadow (which may reach past the box) */
+
+/* How a GPU or CPU source's pixels cover what is under them (`alpha`). */
+#define CR_OPAQUE 0   /* 0x??RRGGBB, the top byte ignored */
+#define CR_KEYED 1    /* a pixel whose top byte is 0 is transparent, any other is opaque (the cursor) */
+#define CR_PREMUL 2   /* premultiplied 0xAARRGGBB (what crate `img` decodes), composited "over" */
+
+/* A CR_SHAPE. Colours are 0xAARRGGBB with straight (not premultiplied) alpha: 0xFF opaque, 0 invisible. All of it is computed per pixel
+ * (comp.frag), so the edges are anti-aliased and nothing is rasterised ahead. */
+struct cr_shape {
+   float radius;            /* corner radius in pixels (clamped to half the box's shorter side) */
+   float border;            /* border width in pixels, inside the box; 0 = none */
+   float split;             /* the gradient: c0 -> c1 over [0, split], c2 -> c3 over [split, 1] of the box's height (or width); c1 == c2 is
+                             * one 3-stop gradient, split = 1 a plain c0 -> c1, a hard step at `split` is the glossy look */
+   float shadow_blur;       /* the shadow's soft edge, pixels on each side of the outline; 0 = a hard shadow */
+   uint32_t c[4];
+   uint32_t border_color;
+   uint32_t shadow_color;   /* alpha 0 = no shadow */
+   int32_t shadow_dx, shadow_dy;
+   uint32_t horizontal;     /* 1: the gradient runs left to right instead of top to bottom */
+};
 
 struct cr_op {
    uint32_t kind;
@@ -23,7 +44,8 @@ struct cr_op {
    const uint32_t *px;      /* CPU: valid during the call */
    uint64_t npx;
    int32_t src_w;
-   uint32_t keyed;          /* CPU: a pixel whose top byte is 0 is transparent (the cursor) */
+   uint32_t alpha;          /* GPU, CPU: CR_OPAQUE, CR_KEYED or CR_PREMUL */
+   struct cr_shape shape;   /* SHAPE */
 };
 
 

@@ -3,7 +3,9 @@
  * vk_comp.c (constanos: NVK linked in, the screen) and the host harness (-DCOMP_HOST: the system's Vulkan, an offscreen image, PPM dumps).
  *
  * It draws a list of `cr_op` (comp_api.h), back to front, with one graphics pipeline: a rectangle per operation, whose fragment shader
- * shows a solid colour or reads the pixel of a client's buffer as a storage buffer, one for one (comp.vert, comp.frag). The buffers:
+ * shows a solid colour, reads the pixel of a client's buffer as a storage buffer, one for one, or computes a shape (rounded box, gradient,
+ * border, shadow) from its signed distance (comp.vert, comp.frag). Every draw blends "over" (premultiplied); an opaque one replaces what is
+ * under it exactly. The buffers:
  *   - GPU buffers (CR_GPU): the client's memory, imported where it is (constanos: the opaque-fd import of a /dev/nvgpu BO; host
  *     harness: a descriptor of a memfd, mapped and copied into a buffer of its own before every frame, standing in for shared memory);
  *   - pool windows (CR_CPU): the library's copy of their pixels: written to a host-visible staging buffer and copied into a device-local one
@@ -93,11 +95,42 @@ struct comp {
    int cpu_in_host;            /* COMP_CPU_HOST=1: CPU sources stay in one host-visible buffer */
 };
 
+/* comp.vert / comp.frag's push constants: 112 bytes (Vulkan guarantees 128) */
 struct comp_push {
    int32_t dst[4];
    int32_t src[4];
    uint32_t misc[4];
+   int32_t box[4];
+   float geom[4];
+   uint32_t grad[4];
+   uint32_t extra[4];
 };
+
+/* comp.frag's mode for a buffer drawn with `alpha` (CR_OPAQUE, CR_KEYED, CR_PREMUL) */
+static int32_t comp_source_mode(uint32_t alpha) {
+   return alpha == CR_KEYED ? 2 : alpha == CR_PREMUL ? 4 : 1;
+}
+
+/* A CR_SHAPE's push constants: the draw covers the box and, with a shadow, the shadow's reach (its offset and blur). */
+static void comp_shape_push(const struct cr_op *op, struct comp_push *pc) {
+   const struct cr_shape *s = &op->shape;
+   int x0 = op->x, y0 = op->y, x1 = op->x + op->w, y1 = op->y + op->h;
+   if (s->shadow_color >> 24) {
+      int reach = (int)(s->shadow_blur + 1.0f);   /* past the blur's edge the shadow is 0 */
+      int sx0 = x0 + s->shadow_dx - reach, sy0 = y0 + s->shadow_dy - reach, sx1 = x1 + s->shadow_dx + reach, sy1 = y1 + s->shadow_dy + reach;
+      if (sx0 < x0) x0 = sx0;
+      if (sy0 < y0) y0 = sy0;
+      if (sx1 > x1) x1 = sx1;
+      if (sy1 > y1) y1 = sy1;
+   }
+   pc->dst[0] = x0; pc->dst[1] = y0; pc->dst[2] = x1 - x0; pc->dst[3] = y1 - y0;
+   pc->src[3] = 3;
+   pc->misc[3] = s->horizontal ? 1u : 0u;
+   pc->box[0] = op->x; pc->box[1] = op->y; pc->box[2] = op->w; pc->box[3] = op->h;
+   pc->geom[0] = s->radius; pc->geom[1] = s->border; pc->geom[2] = s->split; pc->geom[3] = s->shadow_blur;
+   memcpy(pc->grad, s->c, sizeof(pc->grad));
+   pc->extra[0] = s->border_color; pc->extra[1] = s->shadow_color; pc->extra[2] = (uint32_t)s->shadow_dx; pc->extra[3] = (uint32_t)s->shadow_dy;
+}
 
 static int comp_type(const struct comp *c, uint32_t allowed, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid) {
    for (uint32_t i = 0; i < c->mp.memoryTypeCount; i++)
@@ -184,7 +217,10 @@ static int comp_init(struct comp *c, VkDevice device, PFN_vkGetDeviceProcAddr gd
    VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE,
                                                  .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
    VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
-   VkPipelineColorBlendAttachmentState cba = { .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT };
+   /* "over", premultiplied: an opaque draw (alpha 1) writes its colour exactly */
+   VkPipelineColorBlendAttachmentState cba = { .blendEnable = VK_TRUE, .srcColorBlendFactor = VK_BLEND_FACTOR_ONE, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+      .colorBlendOp = VK_BLEND_OP_ADD, .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .alphaBlendOp = VK_BLEND_OP_ADD,
+      .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT };
    VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &cba };
    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
    VkPipelineDynamicStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn };
@@ -411,7 +447,7 @@ static int comp_frame(struct comp *c, const struct cr_op *ops, size_t n, uint64_
       .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
    c->vkCmdPipelineBarrier(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &to_color);
    VkRenderingAttachmentInfo ca = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view, .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-      .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .storeOp = VK_ATTACHMENT_STORE_OP_STORE };   /* the first operation fills the whole screen */
+      .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .storeOp = VK_ATTACHMENT_STORE_OP_STORE };   /* the first operation fills the whole screen, opaque */
    VkRenderingInfo ri = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { w, h } }, .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &ca };
    c->vkCmdBeginRendering(c->cb, &ri);
    VkViewport vp = { 0, 0, (float)w, (float)h, 0, 1 };
@@ -423,7 +459,7 @@ static int comp_frame(struct comp *c, const struct cr_op *ops, size_t n, uint64_
    uint32_t draws = 0;
    for (size_t i = 0; i < n; i++) {
       const struct cr_op *op = &ops[i];
-      struct comp_push pc = { { op->x, op->y, op->w, op->h }, { 0, 0, 0, 0 }, { 0, w, h, 0 } };
+      struct comp_push pc = { .dst = { op->x, op->y, op->w, op->h }, .misc = { 0, w, h, 0 } };
       struct comp_src *src = &c->dummy;
       switch (op->kind) {
       case CR_FILL:
@@ -433,7 +469,7 @@ static int comp_frame(struct comp *c, const struct cr_op *ops, size_t n, uint64_
          struct comp_src *s = comp_find(c->gpu, COMP_MAX_GPU, op->key);
          if (!s) continue;   /* its import failed: nothing to show */
          src = s;
-         pc.src[0] = op->sx; pc.src[1] = op->sy; pc.src[2] = (int32_t)s->stride_px; pc.src[3] = 1;
+         pc.src[0] = op->sx; pc.src[1] = op->sy; pc.src[2] = (int32_t)s->stride_px; pc.src[3] = comp_source_mode(op->alpha);
          break;
       }
       case CR_CPU: {
@@ -442,9 +478,13 @@ static int comp_frame(struct comp *c, const struct cr_op *ops, size_t n, uint64_
          if (!s) continue;
          s->used_frame = c->frames;
          src = s;
-         pc.src[0] = op->sx; pc.src[1] = op->sy; pc.src[2] = op->src_w; pc.src[3] = op->keyed ? 2 : 1;
+         pc.src[0] = op->sx; pc.src[1] = op->sy; pc.src[2] = op->src_w; pc.src[3] = comp_source_mode(op->alpha);
          break;
       }
+      case CR_SHAPE:
+         if (op->w <= 0 || op->h <= 0) continue;
+         comp_shape_push(op, &pc);
+         break;
       default:
          continue;
       }

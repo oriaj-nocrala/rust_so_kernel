@@ -545,7 +545,7 @@ fn run(args: &[String]) -> i32 {
                             px: cursor.as_ptr(),
                             npx: cursor.len() as u64,
                             src_w: CURSOR_W,
-                            keyed: 1,
+                            alpha: CR_KEYED,
                             x: *x,
                             y: *y,
                             w: CURSOR_W,

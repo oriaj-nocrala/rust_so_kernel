@@ -4,10 +4,13 @@
  * in-process: a "GPU" client whose buffer is a memfd it writes pixels into (the harness's stand-in for a client's VRAM buffer), and a
  * pool client (shm) for the CPU path. Each frame is rendered into an offscreen image, read back, and compared pixel for pixel with a
  * rasterisation of the same draw list on the CPU (titles are not drawn by either). Exit 1 on the first difference.
+ * Some frames add operations the window manager does not make yet (shapes, premultiplied pixels: docs/gui/compositor-visual-plan.md):
+ * those are computed in floats on both sides, so they compare within `tol` per channel, and the reference itself is checked on known pixels.
  */
 #define _GNU_SOURCE
 #include <vulkan/vulkan.h>
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -92,6 +95,100 @@ static struct client pool_window(int w, int h, uint32_t color) {
    guiw_commit(&o, 4);
    send_out(c.id, &o);
    return c;
+}
+
+/* Operations drawn after the window manager's (on top of everything), and how far (per channel) the GPU may be from the reference. */
+static const struct cr_op *extra_ops;
+static size_t n_extra;
+static int tol;
+
+static float clampf(float x, float lo, float hi) { return x < lo ? lo : x > hi ? hi : x; }
+
+/* 0xAARRGGBB straight -> premultiplied, as comp.frag's unpack_straight */
+static void unpack_straight(uint32_t v, float o[4]) {
+   float a = (float)(v >> 24) / 255.0f;
+   o[0] = (float)((v >> 16) & 255) / 255.0f * a;
+   o[1] = (float)((v >> 8) & 255) / 255.0f * a;
+   o[2] = (float)(v & 255) / 255.0f * a;
+   o[3] = a;
+}
+
+static float sd_round_box(float px, float py, float bx, float by, float r) {
+   float qx = fabsf(px) - bx + r, qy = fabsf(py) - by + r;
+   float mx = fmaxf(qx, 0.0f), my = fmaxf(qy, 0.0f);
+   return sqrtf(mx * mx + my * my) + fminf(fmaxf(qx, qy), 0.0f) - r;
+}
+
+static float smoothstepf(float e0, float e1, float x) {
+   float t = clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+   return t * t * (3.0f - 2.0f * t);
+}
+
+static void mixv(const float a[4], const float b[4], float t, float o[4]) {
+   for (int i = 0; i < 4; i++) o[i] = a[i] * (1.0f - t) + b[i] * t;
+}
+
+/* A CR_SHAPE's premultiplied colour at the pixel (x, y), as comp.frag's shape() */
+static void shape_pixel(const struct cr_op *op, int x, int y, float o[4]) {
+   const struct cr_shape *s = &op->shape;
+   float px = (float)x + 0.5f, py = (float)y + 0.5f;
+   float bx = (float)op->w * 0.5f, by = (float)op->h * 0.5f;
+   float cx = (float)op->x + bx, cy = (float)op->y + by;
+   float r = fminf(s->radius, fminf(bx, by));
+   float d = sd_round_box(px - cx, py - cy, bx, by, r);
+   float cover = clampf(0.5f - d, 0.0f, 1.0f);
+   float t = s->horizontal ? (px - (float)op->x) / (float)op->w : (py - (float)op->y) / (float)op->h;
+   t = clampf(t, 0.0f, 1.0f);
+   float c[4][4], fill[4];
+   for (int i = 0; i < 4; i++) unpack_straight(s->c[i], c[i]);
+   if (t < s->split) mixv(c[0], c[1], t / s->split, fill);
+   else mixv(c[2], c[3], s->split < 1.0f ? (t - s->split) / (1.0f - s->split) : 1.0f, fill);
+   if (s->border > 0.0f) {
+      float bc[4];
+      unpack_straight(s->border_color, bc);
+      mixv(bc, fill, clampf(0.5f - (d + s->border), 0.0f, 1.0f), fill);
+   }
+   for (int i = 0; i < 4; i++) o[i] = fill[i] * cover;
+   float sc[4];
+   unpack_straight(s->shadow_color, sc);
+   if (sc[3] > 0.0f) {
+      float ds = sd_round_box(px - cx - (float)s->shadow_dx, py - cy - (float)s->shadow_dy, bx, by, r);
+      float k = s->shadow_blur > 0.0f ? 1.0f - smoothstepf(-s->shadow_blur, s->shadow_blur, ds) : clampf(0.5f - ds, 0.0f, 1.0f);
+      for (int i = 0; i < 4; i++) o[i] += sc[i] * (k * (1.0f - cover));
+   }
+}
+
+/* `src` (premultiplied, 0..1) over the pixel at `dst`, rounded as a UNORM attachment stores it */
+static void blend_over(uint32_t *dst, const float src[4]) {
+   uint32_t out = 0;
+   for (int i = 0; i < 3; i++) {
+      int sh = 16 - 8 * i;
+      float d = (float)((*dst >> sh) & 255) / 255.0f;
+      out |= (uint32_t)lrintf(clampf(src[i] + d * (1.0f - src[3]), 0.0f, 1.0f) * 255.0f) << sh;
+   }
+   *dst = out;
+}
+
+static void reference_extra(uint32_t *out) {
+   for (size_t i = 0; i < n_extra; i++) {
+      const struct cr_op *op = &extra_ops[i];
+      if (op->kind == CR_SHAPE) {
+         /* every pixel of the screen: a renderer that covers too little (the shadow's reach) shows as a difference */
+         for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) {
+               float c[4];
+               shape_pixel(op, x, y, c);
+               if (c[3] > 0.0f) blend_over(&out[y * W + x], c);
+            }
+      } else if (op->kind == CR_CPU && op->alpha == CR_PREMUL) {
+         for (int y = 0; y < op->h; y++)
+            for (int x = 0; x < op->w; x++) {
+               uint32_t v = op->px[(op->sy + y) * op->src_w + op->sx + x];
+               float c[4] = { (float)((v >> 16) & 255) / 255.0f, (float)((v >> 8) & 255) / 255.0f, (float)(v & 255) / 255.0f, (float)(v >> 24) / 255.0f };
+               blend_over(&out[(op->y + y) * W + op->x + x], c);
+            }
+      }
+   }
 }
 
 /* The draw list last built, rasterised on the CPU. */
@@ -182,7 +279,7 @@ static int frame(struct vkctx *v, struct comp *c, const char *dir, const char *n
          cursor_px[y * GUI_CURSOR_W + x] = ch == 'X' ? 0xff000000u : ch == '.' ? 0xffffffffu : 0u;
       }
    size_t nops = gui_draw_count(g);
-   struct cr_op *ops = calloc(nops + 1, sizeof(*ops));
+   struct cr_op *ops = calloc(nops + n_extra + 1, sizeof(*ops));
    size_t no = 0;
    for (size_t i = 0; i < nops; i++) {
       struct gui_draw_op d;
@@ -200,13 +297,14 @@ static int frame(struct vkctx *v, struct comp *c, const char *dir, const char *n
          break;
       }
       case GUI_DRAW_CURSOR:
-         *o = (struct cr_op){ .kind = CR_CPU, .key = 1ull << 63, .version = 1, .px = cursor_px, .npx = GUI_CURSOR_W * GUI_CURSOR_H, .src_w = GUI_CURSOR_W, .keyed = 1,
+         *o = (struct cr_op){ .kind = CR_CPU, .key = 1ull << 63, .version = 1, .px = cursor_px, .npx = GUI_CURSOR_W * GUI_CURSOR_H, .src_w = GUI_CURSOR_W, .alpha = CR_KEYED,
                               .x = d.x, .y = d.y, .w = GUI_CURSOR_W, .h = GUI_CURSOR_H };
          no++;
          break;
       default: break;
       }
    }
+   for (size_t i = 0; i < n_extra; i++) ops[no++] = extra_ops[i];
    int r = comp_frame(c, ops, no, epoch, v->image, v->view, W, H, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
    free(ops);
    if (r != 0) { printf("FAIL comp_frame -> %d\n", r); failures++; return -1; }
@@ -232,15 +330,22 @@ static int frame(struct vkctx *v, struct comp *c, const char *dir, const char *n
    static uint32_t want[W * H];
    for (int i = 0; i < W * H; i++) want[i] = 0xdeadbeefu;
    reference(c, want);
-   int bad = 0, bx = -1, by = -1;
+   reference_extra(want);
+   int bad = 0, bx = -1, by = -1, worst = 0;
    for (int y = 0; y < H; y++) {
       for (int x = 0; x < W; x++) {
-         uint32_t got = v->rb_map[y * W + x] & 0x00ffffffu, w = want[y * W + x] & 0x00ffffffu;
-         if (got != w && !bad++) { bx = x; by = y; }
+         uint32_t got = v->rb_map[y * W + x], w = want[y * W + x];
+         int diff = 0;
+         for (int sh = 0; sh < 24; sh += 8) {
+            int d = abs((int)((got >> sh) & 255) - (int)((w >> sh) & 255));
+            if (d > diff) diff = d;
+         }
+         if (diff > worst) worst = diff;
+         if (diff > tol && !bad++) { bx = x; by = y; }
       }
    }
    dump_ppm(dir, name, v->rb_map);
-   printf("frame %s: %u draws, %u uploads, %d pixels differ", name, c->draws, c->uploads, bad);
+   printf("frame %s: %u draws, %u uploads, %d pixels differ (by up to %d, %d allowed)", name, c->draws, c->uploads, bad, worst, tol);
    if (bad) printf(" (first at %d,%d: got %06x want %06x)", bx, by, v->rb_map[by * W + bx] & 0xffffff, want[by * W + bx] & 0xffffff);
    printf("\n");
    return bad;
@@ -366,8 +471,77 @@ int main(int argc, char **argv) {
       gui_set_time(g, 230);
       uint64_t before = comp.upload_bytes;
       failures += frame(&v, &comp, dir, "5b-three-rows") != 0;
-      CHECK(comp.upload_bytes - before == (comp.cpu_in_host ? 160u * 90 * 4 : 3u * 160 * 4),
+      /* a source is staged (only the changed rows copied into VRAM) when the device has memory that is device-local and not host-visible;
+       * lavapipe has none, so there every version is written whole into a host-visible buffer */
+      struct comp_src *ps = comp_find(comp.cpu, COMP_MAX_CPU, ((uint64_t)b.id << 32) | 4);
+      CHECK(ps != NULL, "the pool window has a CPU source");
+      CHECK(comp.upload_bytes - before == (!ps || !ps->staged ? 160u * 90 * 4 : 3u * 160 * 4),
             "only the three changed rows were copied (%llu bytes)", (unsigned long long)(comp.upload_bytes - before));
+   }
+
+   /* ---- decorations the window manager does not make yet (step 1 of docs/gui/compositor-visual-plan.md): shapes and premultiplied pixels on top */
+   {
+      /* a "Luna" window frame: glossy gradient (a hard step at 45%), a border, a soft shadow below and to the right */
+      struct cr_shape luna = { .radius = 10, .border = 2, .split = 0.45f, .shadow_blur = 12, .c = { 0xff3a80f3u, 0xff2a5fd8u, 0xff0b47c8u, 0xff2766e0u },
+                               .border_color = 0xff0a246au, .shadow_color = 0x99000000u, .shadow_dx = 5, .shadow_dy = 8 };
+      /* translucent glass, partly off the left edge, a horizontal gradient */
+      struct cr_shape glass = { .radius = 16, .split = 1, .c = { 0x8840a0ffu, 0x55ffffffu, 0, 0 }, .horizontal = 1 };
+      /* a ring: a transparent fill, a thick border, a radius past half the box (clamped), a hard shadow up and to the left */
+      struct cr_shape ring = { .radius = 40, .border = 4, .split = 1, .c = { 0, 0, 0, 0 }, .border_color = 0xffffd700u, .shadow_color = 0x80ff0000u, .shadow_dx = -3, .shadow_dy = 3 };
+      /* a "9x" title bar: square, navy to light blue left to right */
+      struct cr_shape title = { .split = 1, .c = { 0xff000080u, 0xff1084d0u, 0, 0 }, .horizontal = 1 };
+      /* off the bottom-right corner, its shadow too; a 3-stop gradient (c1 == c2) */
+      struct cr_shape corner = { .radius = 6, .border = 1, .split = 0.5f, .shadow_blur = 6, .c = { 0xffff0000u, 0xff00ff00u, 0xff00ff00u, 0xff0000ffu },
+                                 .border_color = 0xff000000u, .shadow_color = 0xff000000u, .shadow_dx = 4, .shadow_dy = 4 };
+      /* an icon: premultiplied ARGB, a disc whose alpha falls off to the edge (what `img` decodes) */
+      static uint32_t icon[48 * 48];
+      for (int y = 0; y < 48; y++)
+         for (int x = 0; x < 48; x++) {
+            float dx = (float)x - 23.5f, dy = (float)y - 23.5f, dd = sqrtf(dx * dx + dy * dy);
+            uint32_t a = dd >= 24 ? 0 : (uint32_t)(255.0f * (1.0f - dd / 24.0f));
+            uint32_t r = (uint32_t)(x * 5) * a / 255, gg = (uint32_t)(y * 5) * a / 255, bl = 200 * a / 255;
+            icon[y * 48 + x] = a << 24 | r << 16 | gg << 8 | bl;
+         }
+      struct cr_op deco[] = {
+         { .kind = CR_SHAPE, .x = 330, .y = 70, .w = 220, .h = 150, .shape = luna },
+         { .kind = CR_SHAPE, .x = -20, .y = 300, .w = 400, .h = 48, .shape = glass },
+         { .kind = CR_SHAPE, .x = 580, .y = 20, .w = 50, .h = 50, .shape = ring },
+         { .kind = CR_SHAPE, .x = 60, .y = 20, .w = 240, .h = 18, .shape = title },
+         { .kind = CR_SHAPE, .x = 600, .y = 320, .w = 80, .h = 80, .shape = corner },
+         { .kind = CR_CPU, .key = 1ull << 62, .version = 1, .px = icon, .npx = 48 * 48, .src_w = 48, .alpha = CR_PREMUL, .x = 100, .y = 200, .w = 48, .h = 48 },
+         { .kind = CR_CPU, .key = 1ull << 62, .version = 1, .px = icon, .npx = 48 * 48, .src_w = 48, .alpha = CR_PREMUL, .x = 0, .y = 150, .w = 38, .h = 48, .sx = 10 },
+      };
+      /* the reference itself, on pixels whose answer is known, so a mistake shared by comp.frag and shape_pixel cannot pass */
+      float px[4];
+      shape_pixel(&deco[0], 330, 70, px);
+      CHECK(px[3] < 0.05f, "the rounded corner is cut off (alpha %.3f)", px[3]);
+      shape_pixel(&deco[0], 440, 71, px);
+      CHECK(fabsf(px[2] - 0x6a / 255.0f) < 0.01f && px[3] > 0.99f, "the top border is the border colour (b %.3f a %.3f)", px[2], px[3]);
+      shape_pixel(&deco[0], 440, 74, px);
+      CHECK(fabsf(px[0] - 0x3a / 255.0f) < 0.03f && fabsf(px[2] - 0xf3 / 255.0f) < 0.03f, "just under the border the gradient starts at c0 (r %.3f b %.3f)", px[0], px[2]);
+      shape_pixel(&deco[0], 440, 135, px);   /* the split is at y 70 + 0.45 * 150 = 137.5 */
+      float after[4];
+      shape_pixel(&deco[0], 440, 140, after);
+      CHECK(fabsf(px[0] - 0x2a / 255.0f) < 0.03f && fabsf(after[0] - 0x0b / 255.0f) < 0.03f, "a hard step at the split: c1 just above, c2 just below (r %.3f -> %.3f)", px[0], after[0]);
+      shape_pixel(&deco[0], 440, 224, px);
+      CHECK(px[3] > 0.3f && px[3] < 0.55f && px[0] == 0.0f, "under the box: the soft, black shadow (a %.3f)", px[3]);
+      shape_pixel(&deco[0], 600, 300, px);
+      CHECK(px[3] == 0.0f, "far from it nothing (a %.3f)", px[3]);
+      shape_pixel(&deco[2], 605, 45, px);
+      CHECK(px[3] == 0.0f, "the ring's middle is transparent and its shadow is not seen through it (a %.3f)", px[3]);
+      shape_pixel(&deco[2], 605, 21, px);
+      CHECK(px[3] > 0.99f && fabsf(px[1] - 0xd7 / 255.0f) < 0.01f, "the ring's border (g %.3f)", px[1]);
+      shape_pixel(&deco[3], 61, 25, px);
+      float px2[4];
+      shape_pixel(&deco[3], 298, 25, px2);
+      CHECK(px[2] < 0.55f && px2[2] > 0.8f && px[3] == 1.0f, "the title bar runs navy to light blue left to right (b %.3f -> %.3f)", px[2], px2[2]);
+      extra_ops = deco;
+      n_extra = sizeof(deco) / sizeof(deco[0]);
+      tol = 2;
+      failures += frame(&v, &comp, dir, "5c-shapes") != 0;
+      extra_ops = NULL;
+      n_extra = 0;
+      tol = 0;
    }
 
    /* ---- the pool window grows (a bigger buffer than the one its upload buffer was made for), and the pointer sits on the right/bottom edges */
