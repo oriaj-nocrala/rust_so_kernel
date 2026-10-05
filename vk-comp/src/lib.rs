@@ -10,6 +10,7 @@
 //!                            sent SIGTERM (SIGKILL after 3 s), so a session ends with its compositor
 //!   COMP_NO_PANEL=1          with no program to start, do not start the default panel
 //!   COMP_F11_AT=60,120       test hook: press F11 (fullscreen on the focused window) when that many frames have been composed
+//!   COMP_THEME=<name>        the look to start with: luna (default), 9x or flat (gui::theme); F12 cycles them
 //!   COMP_EXIT_WHEN_IDLE=1    quit when every client that connected has gone and every program it started has exited (the quit line then
 //!                            says how long it all took)
 //!
@@ -332,6 +333,12 @@ fn run(args: &[String]) -> i32 {
     }
     let mut comp: Compositor<Mapping> = Compositor::new(w as i32, h as i32);
     comp.enable_gpu_buffers();
+    let theme_name = env("COMP_THEME").unwrap_or_else(|| "luna".into());
+    comp.set_theme(gui::theme::by_name(&theme_name).unwrap_or_else(|| {
+        println!("COMP no theme {:?}: luna", theme_name);
+        &gui::theme::LUNA
+    }));
+    let mut theme_shown = "";
     let mut titles = Titles::new(scale_for(h as i32));
     if titles.missing_fonts() > 0 {
         println!("COMP {} font files missing, titles in the bitmap font", titles.missing_fonts());
@@ -517,9 +524,9 @@ fn run(args: &[String]) -> i32 {
                             });
                         }
                     }
-                    DrawOp::Title { id, title, focused, area, clip } => {
+                    DrawOp::Title { id, title, fg, shadow, area, clip, .. } => {
                         live_titles.push(*id);
-                        let img = titles.image(*id, title, *focused, area.w, area.h);
+                        let img = titles.image(*id, title, *fg, *shadow, area.w, area.h);
                         if img.px.is_empty() {
                             continue;
                         }
@@ -535,8 +542,24 @@ fn run(args: &[String]) -> i32 {
                             h: clip.h,
                             sx: clip.x - area.x,
                             sy: clip.y - area.y,
+                            alpha: CR_PREMUL,
                             ..CrOp::new(CR_CPU)
                         });
+                    }
+                    DrawOp::Shape { rect, shape } => {
+                        let shape = CrShape {
+                            radius: shape.radius,
+                            border: shape.border,
+                            split: shape.split,
+                            shadow_blur: shape.shadow_blur,
+                            c: shape.c,
+                            border_color: shape.border_color,
+                            shadow_color: shape.shadow_color,
+                            shadow_dx: shape.shadow_dx,
+                            shadow_dy: shape.shadow_dy,
+                            horizontal: shape.horizontal as u32,
+                        };
+                        ops.push(CrOp { x: rect.x, y: rect.y, w: rect.w, h: rect.h, shape, ..CrOp::new(CR_SHAPE) });
                     }
                     DrawOp::Cursor { x, y } => {
                         ops.push(CrOp {
@@ -556,6 +579,10 @@ fn run(args: &[String]) -> i32 {
                 }
             }
             titles.retain(|id| live_titles.contains(&id));
+            if comp.theme().name != theme_shown {
+                theme_shown = comp.theme().name;
+                println!("COMP theme {}", theme_shown);
+            }
             let t_built = Instant::now();
             if unsafe { cr_frame(ops.as_ptr(), ops.len(), epoch) } != 0 {
                 println!("COMP FAIL frame {}", frames);
@@ -662,7 +689,8 @@ fn run(args: &[String]) -> i32 {
 }
 
 /// C's `main`: Rust's own startup does not run, so the arguments are `argc` and `argv`.
-#[no_mangle]
+// not under `cargo test`, whose harness has its own `main` (the tests need no renderer: `cargo test` runs the pure parts)
+#[cfg_attr(not(test), no_mangle)]
 pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
     let args: Vec<String> = (0..argc.max(0) as usize).map(|i| unsafe { CStr::from_ptr(*argv.add(i)) }.to_string_lossy().into_owned()).collect();
     run(&args)

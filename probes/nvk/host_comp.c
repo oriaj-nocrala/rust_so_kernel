@@ -169,17 +169,31 @@ static void blend_over(uint32_t *dst, const float src[4]) {
    *dst = out;
 }
 
+/* every pixel of the screen: a renderer that covers too little (the shadow's reach) shows as a difference */
+static void reference_shape(const struct cr_op *op, uint32_t *out) {
+   for (int y = 0; y < H; y++)
+      for (int x = 0; x < W; x++) {
+         float c[4];
+         shape_pixel(op, x, y, c);
+         if (c[3] > 0.0f) blend_over(&out[y * W + x], c);
+      }
+}
+
+/* A GUI_DRAW_SHAPE as the renderer's operation (what vk-comp/src/lib.rs does with a DrawOp::Shape) */
+static struct cr_op shape_op(const struct gui_draw_op *d) {
+   struct cr_op o = { .kind = CR_SHAPE, .x = d->x, .y = d->y, .w = d->w, .h = d->h };
+   o.shape = (struct cr_shape){ .radius = d->shape_radius, .border = d->shape_border, .split = d->shape_split, .shadow_blur = d->shape_shadow_blur,
+      .border_color = d->shape_border_color, .shadow_color = d->shape_shadow_color, .shadow_dx = d->shape_shadow_dx, .shadow_dy = d->shape_shadow_dy,
+      .horizontal = d->shape_horizontal };
+   memcpy(o.shape.c, d->shape_c, sizeof(o.shape.c));
+   return o;
+}
+
 static void reference_extra(uint32_t *out) {
    for (size_t i = 0; i < n_extra; i++) {
       const struct cr_op *op = &extra_ops[i];
       if (op->kind == CR_SHAPE) {
-         /* every pixel of the screen: a renderer that covers too little (the shadow's reach) shows as a difference */
-         for (int y = 0; y < H; y++)
-            for (int x = 0; x < W; x++) {
-               float c[4];
-               shape_pixel(op, x, y, c);
-               if (c[3] > 0.0f) blend_over(&out[y * W + x], c);
-            }
+         reference_shape(op, out);
       } else if (op->kind == CR_CPU && op->alpha == CR_PREMUL) {
          for (int y = 0; y < op->h; y++)
             for (int x = 0; x < op->w; x++) {
@@ -211,6 +225,11 @@ static void reference(struct comp *c, uint32_t *out) {
          size_t len;
          const uint32_t *px = gui_cpu_content(g, op.client, op.surface, &len);
          for (int y = 0; y < op.h; y++) for (int x = 0; x < op.w; x++) out[(op.y + y) * W + op.x + x] = px[(op.sy + y) * op.src_w + op.sx + x];
+         break;
+      }
+      case GUI_DRAW_SHAPE: {
+         struct cr_op so = shape_op(&op);
+         reference_shape(&so, out);
          break;
       }
       case GUI_DRAW_CURSOR:
@@ -286,6 +305,7 @@ static int frame(struct vkctx *v, struct comp *c, const char *dir, const char *n
       gui_draw_get(g, i, &d);
       struct cr_op *o = &ops[no];
       switch (d.kind) {
+      case GUI_DRAW_SHAPE: *o = shape_op(&d); no++; break;
       case GUI_DRAW_FILL: *o = (struct cr_op){ .kind = CR_FILL, .color = d.color, .x = d.x, .y = d.y, .w = d.w, .h = d.h }; no++; break;
       case GUI_DRAW_GPU: *o = (struct cr_op){ .kind = CR_GPU, .key = d.handle, .x = d.x, .y = d.y, .w = d.w, .h = d.h, .sx = d.sx, .sy = d.sy }; no++; break;
       case GUI_DRAW_CPU: {
@@ -541,6 +561,24 @@ int main(int argc, char **argv) {
       failures += frame(&v, &comp, dir, "5c-shapes") != 0;
       extra_ops = NULL;
       n_extra = 0;
+      tol = 0;
+   }
+
+   /* ---- the window manager's own looks (step 2): its shapes go through gui_capi and the renderer like any operation */
+   {
+      struct gui_draw_op d;
+      CHECK(gui_set_theme(g, "luna") == 0, "the Luna look");
+      /* at a window's rounded corner three layers stack (the desktop's gradient, the shadow, the frame's anti-aliased edge), each rounded to
+       * 8 bits where it is blended: lavapipe lands within 2 of the reference on a handful of those pixels */
+      tol = 3;
+      failures += frame(&v, &comp, dir, "5d-luna") != 0;
+      int nshapes = 0;
+      for (size_t i = 0; i < gui_draw_count(g); i++) if (gui_draw_get(g, i, &d) == 0 && d.kind == GUI_DRAW_SHAPE) nshapes++;
+      /* the desktop, then per window a frame, a bar and its buttons (the pool window: close only; the GPU one: close only) */
+      CHECK(nshapes >= 1 + 2 * 3, "Luna drew the desktop and both windows' frames, bars and buttons (%d shapes)", nshapes);
+      CHECK(gui_set_theme(g, "9x") == 0, "the 9x look");
+      failures += frame(&v, &comp, dir, "5e-9x") != 0;
+      CHECK(gui_set_theme(g, "flat") == 0, "back to flat: the frames below compare exactly");
       tol = 0;
    }
 

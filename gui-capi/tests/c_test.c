@@ -92,7 +92,7 @@ int main(void) {
    struct gui_draw_op op;
    CHECK(find_op(c, GUI_DRAW_GPU, &op) && op.handle == first && op.w == 64 && op.h == 32 && op.sx == 0 && op.sy == 0);
    CHECK(find_op(c, GUI_DRAW_FILL, &op));                  // the background, first of the list
-   CHECK(find_op(c, GUI_DRAW_TITLE, &op) && op.focused == 1 && op.w > 0);
+   CHECK(find_op(c, GUI_DRAW_TITLE, &op) && op.focused == 1 && op.w > 0 && op.title_fg == 0x00F0F0F0u && op.title_shadow == 0);
    size_t ti = 0;
    for (size_t i = 0; i < gui_draw_count(c); i++) { struct gui_draw_op t; gui_draw_get(c, i, &t); if (t.kind == GUI_DRAW_TITLE) ti = i; }
    guiw_set_title(&o, 2, "ventana");
@@ -193,6 +193,18 @@ int main(void) {
    CHECK(has_event(ev, n, 4, GUIW_EV_KEY) && ev[n - 1].a0 == 30 && ev[n - 1].a1 == 1);
    gui_pointer_motion(c, 5, 5);
    CHECK(!gui_quit_requested(c));
+
+   // ---- looks: a theme of shapes puts the desktop's gradient first and the window's frame after it; an unknown name changes nothing
+   CHECK(gui_set_theme(c, "aqua") == -1);
+   CHECK(gui_set_theme(c, "luna") == 0);
+   gui_draw_list(c);
+   struct gui_draw_op sh;
+   CHECK(gui_draw_get(c, 0, &sh) == 0 && sh.kind == GUI_DRAW_SHAPE && sh.x == 0 && sh.y == 0 && sh.w == 320 && sh.h == 240 && sh.shape_split > 0.5f);
+   CHECK(gui_draw_get(c, 1, &sh) == 0 && sh.kind == GUI_DRAW_SHAPE && sh.shape_radius == 8.0f && (sh.shape_shadow_color >> 24) != 0 && sh.shape_shadow_dy == 6);
+   CHECK(find_op(c, GUI_DRAW_TITLE, &op) && op.title_fg == 0x00FFFFFFu && (op.title_shadow >> 24) != 0);
+   CHECK(gui_set_theme(c, "flat") == 0);
+   gui_draw_list(c);
+   CHECK(gui_draw_get(c, 0, &sh) == 0 && sh.kind == GUI_DRAW_FILL);
    gui_free(c);
    printf("gui_capi: DONE\n");
    return 0;

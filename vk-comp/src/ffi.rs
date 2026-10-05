@@ -5,12 +5,10 @@ use std::ffi::c_int;
 pub const CR_FILL: u32 = 0;
 pub const CR_GPU: u32 = 1;
 pub const CR_CPU: u32 = 2;
-#[allow(dead_code)] // the window manager emits shapes from step 2 of docs/gui/compositor-visual-plan.md
 pub const CR_SHAPE: u32 = 3;
 
 pub const CR_OPAQUE: u32 = 0;
 pub const CR_KEYED: u32 = 1;
-#[allow(dead_code)] // icons, step 4
 pub const CR_PREMUL: u32 = 2;
 
 /// `struct cr_shape`: colours `0xAARRGGBB`, straight alpha.

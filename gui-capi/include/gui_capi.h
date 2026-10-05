@@ -73,6 +73,7 @@ int gui_has_damage(const gui_comp *c);
 #define GUI_DRAW_CPU 2     /* rect shows gui_cpu_content(client, surface) (src_w x src_h) from (sx, sy); `version` changes with the pixels */
 #define GUI_DRAW_TITLE 3   /* a title to paint over its bar: id, focused, area (x, y, w, h), clip (clip_*); the text is gui_title(c, i, ...) */
 #define GUI_DRAW_CURSOR 4  /* the pointer, hotspot at (x, y); the bitmap is gui_cursor_bitmap */
+#define GUI_DRAW_SHAPE 5   /* the box (x, y, w, h), not clipped, drawn as the shape_* fields say (comp_api.h's struct cr_shape; gui::theme::Shape) */
 struct gui_draw_op {
     uint32_t kind;
     uint32_t color;      /* FILL: 0x00RRGGBB */
@@ -85,7 +86,15 @@ struct gui_draw_op {
     uint32_t id;         /* TITLE: toplevel id, stable while the window is mapped */
     uint32_t focused;    /* TITLE */
     int32_t clip_x, clip_y, clip_w, clip_h; /* TITLE */
+    uint32_t title_fg;   /* TITLE: 0x00RRGGBB */
+    uint32_t title_shadow; /* TITLE: 0xAARRGGBB, alpha 0 = none */
+    float shape_radius, shape_border, shape_split, shape_shadow_blur;   /* SHAPE */
+    uint32_t shape_c[4], shape_border_color, shape_shadow_color;
+    int32_t shape_shadow_dx, shape_shadow_dy;
+    uint32_t shape_horizontal;
 };
+/* The draw list's look (gui::theme): "flat" (what compose paints), "luna", "9x". 0, or -1 for an unknown name. F12 cycles them too. */
+int gui_set_theme(gui_comp *c, const char *name);
 /* Builds the draw list for the next frame (the whole screen, back to front, clipped), takes the damage, and returns the frame's number. */
 uint64_t gui_draw_list(gui_comp *c);
 size_t gui_draw_count(const gui_comp *c);

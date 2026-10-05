@@ -913,6 +913,7 @@ fn raster(ops: &[DrawOp], comp: &Compositor<Mem>, gpu: &BTreeMap<u64, (i32, Vec<
                 }
             }
             DrawOp::Title { .. } => {}
+            DrawOp::Shape { .. } => panic!("the flat look makes no shapes"),
             DrawOp::Cursor { x, y } => {
                 for (cy, row) in CURSOR.iter().enumerate() {
                     for (cx, c) in row.iter().enumerate() {
@@ -1411,4 +1412,188 @@ fn leaving_fullscreen_restores_maximized_and_a_fullscreen_window_has_no_grip() {
     assert_eq!(h.comp.window_frame(c, 4), Some(Rect::new(0, 0, W, H)));
     assert_eq!(h.comp.hit(5, 5), Some(((c, 4), Zone::Title)), "its bar is back");
     assert_eq!(resizes(&h.events_for(c)).last(), Some(&(W, H - TITLE_H)), "its client is asked for the maximized size again");
+}
+
+// ── themes (step 2 of docs/gui/compositor-visual-plan.md) ─────────────────────────────────────────────────────────────────────────────
+
+/// Where the pixels of windows go, and the titles' boxes: what a look must not move.
+fn geometry(ops: &[DrawOp]) -> Vec<(u8, Rect, i32, i32)> {
+    ops.iter()
+        .filter_map(|o| match o {
+            DrawOp::Gpu { dst, sx, sy, .. } => Some((0, *dst, *sx, *sy)),
+            DrawOp::Cpu { dst, sx, sy, .. } => Some((1, *dst, *sx, *sy)),
+            DrawOp::Title { area, clip, .. } => Some((2, *area, clip.x, clip.w)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn shapes(ops: &[DrawOp]) -> Vec<(Rect, Shape)> {
+    ops.iter().filter_map(|o| if let DrawOp::Shape { rect, shape } = o { Some((*rect, *shape)) } else { None }).collect()
+}
+
+// A: every look puts the windows' pixels and titles exactly where the flat one does, so switching is only a matter of pixels; and the
+// hit boxes stay too (a click on the close button's square closes in every look).
+#[test]
+fn a_theme_moves_no_window() {
+    let mut h = gpu_h();
+    let a = h.window(120, 60, 0x00AA_0000);
+    let b = h.window(100, 80, 0x0000_AA00);
+    h.send(b, &[R::SetResizable { surface: 4, min_w: 50, min_h: 30 }]);
+    let _ = a;
+    let flat = geometry(&h.comp.draw_list().1);
+    assert!(flat.len() >= 4);
+    for t in theme::THEMES {
+        h.comp.set_theme(t);
+        assert_eq!(geometry(&h.comp.draw_list().1), flat, "theme {}", t.name);
+        assert_eq!(h.comp.title_height(), TITLE_H, "theme {}", t.name);
+    }
+}
+
+// A: Luna draws a window as frame (with its shadow), then the bar, then the title text, then the buttons, then the content, all above the
+// desktop's gradient; the frame reaches past the window by frame_w, the bar's box reaches under the content so only its top corners round.
+#[test]
+fn luna_draws_frame_bar_title_buttons_then_content() {
+    let mut h = gpu_h();
+    let c = h.window(120, 60, 0x00AA_0000);
+    h.send(c, &[R::SetResizable { surface: 4, min_w: 50, min_h: 30 }]);
+    h.comp.set_theme(&theme::LUNA);
+    let ops = h.comp.draw_list().1;
+    let f = h.comp.window_frame(c, 4).unwrap();
+    assert_eq!(ops[0], DrawOp::Shape { rect: Rect::new(0, 0, W, H), shape: theme::LUNA.background.unwrap() }, "the desktop first");
+    let sh = shapes(&ops);
+    let fw = theme::LUNA.frame_w;
+    let frame = theme::LUNA.frame.unwrap()[0];
+    assert_eq!(sh[1], (Rect::new(f.x - fw, f.y - fw, f.w + 2 * fw, f.h + 2 * fw), frame), "the focused frame, its shadow included");
+    assert!(frame.shadow_color >> 24 != 0);
+    let bar = theme::LUNA.title.unwrap()[0];
+    assert_eq!(sh[2].1, bar);
+    assert_eq!(sh[2].0, Rect::new(f.x - fw, f.y - fw, f.w + 2 * fw, fw + TITLE_H + bar.radius as i32 + 1));
+    let close = match theme::LUNA.close { Button::Shape { normal, .. } => normal, _ => unreachable!() };
+    let max = match theme::LUNA.other { Button::Shape { normal, .. } => normal, _ => unreachable!() };
+    let i = theme::LUNA.button_inset;
+    assert_eq!(sh[3], (Rect::new(f.right() - TITLE_H + i, f.y + i, TITLE_H - 2 * i, TITLE_H - 2 * i), close), "the close button, inset");
+    assert_eq!(sh[4], (Rect::new(f.right() - 2 * TITLE_H + i, f.y + i, TITLE_H - 2 * i, TITLE_H - 2 * i), max));
+    let pos = |pred: &dyn Fn(&DrawOp) -> bool| ops.iter().position(|o| pred(o)).unwrap();
+    let title_at = pos(&|o| matches!(o, DrawOp::Title { .. }));
+    let content_at = pos(&|o| matches!(o, DrawOp::Cpu { .. }));
+    let bar_at = pos(&|o| matches!(o, DrawOp::Shape { shape, .. } if *shape == bar));
+    let close_at = pos(&|o| matches!(o, DrawOp::Shape { shape, .. } if *shape == close));
+    assert!(bar_at < title_at && title_at < close_at && close_at < content_at, "{bar_at} {title_at} {close_at} {content_at}");
+    match &ops[title_at] {
+        DrawOp::Title { fg, shadow, focused: true, .. } => assert_eq!((*fg, *shadow), (theme::LUNA.title_fg[0], theme::LUNA.title_shadow)),
+        o => panic!("{o:?}"),
+    }
+    assert!(ops.iter().any(|o| matches!(o, DrawOp::Fill { color, .. } if *color == theme::LUNA.glyph)), "the glyphs are in the theme's colour");
+    // pressing the close button shows the pressed shape; the button still closes on release over it (the hit box is the flat one's)
+    h.comp.pointer_motion(f.right() - TITLE_H / 2 - h.comp.pointer().0, f.y + TITLE_H / 2 - h.comp.pointer().1);
+    h.comp.pointer_button(BTN_LEFT, true);
+    let pressed = match theme::LUNA.close { Button::Shape { pressed, .. } => pressed, _ => unreachable!() };
+    assert!(shapes(&h.comp.draw_list().1).iter().any(|(_, s)| *s == pressed));
+    h.comp.take_events();
+    h.comp.pointer_button(BTN_LEFT, false);
+    assert!(h.events_for(c).iter().any(|e| matches!(e, Event::Close { .. })), "the close button closes in Luna too");
+}
+
+// A: a second window: the one below is drawn unfocused (the other frame, bar and title colour), and entirely before the one on top.
+#[test]
+fn luna_draws_the_unfocused_window_below_in_its_own_colours() {
+    let mut h = gpu_h();
+    let _a = h.window(120, 60, 0x00AA_0000);
+    let _b = h.window(100, 80, 0x0000_AA00);
+    h.comp.set_theme(&theme::LUNA);
+    let ops = h.comp.draw_list().1;
+    let frames: Vec<Shape> = shapes(&ops).iter().map(|(_, s)| *s).filter(|s| theme::LUNA.frame.unwrap().contains(s)).collect();
+    assert_eq!(frames, theme::LUNA.frame.unwrap()[..].iter().rev().copied().collect::<Vec<_>>(), "unfocused below, focused on top");
+    let titles: Vec<(bool, u32)> = ops.iter().filter_map(|o| if let DrawOp::Title { focused, fg, .. } = o { Some((*focused, *fg)) } else { None }).collect();
+    assert_eq!(titles, vec![(false, theme::LUNA.title_fg[1]), (true, theme::LUNA.title_fg[0])]);
+}
+
+// A: 9x's buttons are bevels, opaque fills: light top-left and dark bottom-right, swapped while pressed.
+#[test]
+fn nines_buttons_are_bevels_that_swap_when_pressed() {
+    let mut h = gpu_h();
+    let c = h.window(120, 60, 0x00AA_0000);
+    h.comp.set_theme(&theme::NINES);
+    let Button::Bevel { face, light, dark } = theme::NINES.close else { unreachable!() };
+    let f = h.comp.window_frame(c, 4).unwrap();
+    let i = theme::NINES.button_inset;
+    let b = Rect::new(f.right() - TITLE_H + i, f.y + i, TITLE_H - 2 * i, TITLE_H - 2 * i);
+    let bevel = |ops: &[DrawOp]| -> Vec<(Rect, u32)> {
+        ops.iter().filter_map(|o| if let DrawOp::Fill { rect, color } = o { Some((*rect, *color)) } else { None }).filter(|(r, _)| r.x >= b.x && r.right() <= b.right() && r.y >= b.y && r.bottom() <= b.bottom() && r.w > 4).take(3).collect()
+    };
+    let up = bevel(&h.comp.draw_list().1);
+    assert_eq!(up, vec![(b, dark), (Rect::new(b.x, b.y, b.w - 1, b.h - 1), light), (Rect::new(b.x + 1, b.y + 1, b.w - 2, b.h - 2), face)]);
+    h.comp.pointer_motion(b.x + 2 - h.comp.pointer().0, b.y + 2 - h.comp.pointer().1);
+    h.comp.pointer_button(BTN_LEFT, true);
+    let down = bevel(&h.comp.draw_list().1);
+    assert_eq!((down[0].1, down[1].1, down[2].1), (light, dark, face));
+    assert!(shapes(&h.comp.draw_list().1).iter().any(|(_, s)| s.horizontal), "the title runs left to right");
+}
+
+// A: F12 is the compositor's: it cycles flat -> luna -> 9x -> flat, damages the whole screen, and no client sees it.
+#[test]
+fn f12_cycles_the_themes_and_the_client_never_sees_it() {
+    let mut h = gpu_h();
+    let c = h.window(100, 50, 0x0012_3456);
+    let _ = h.comp.draw_list();
+    h.comp.take_events();
+    let mut seen = vec![];
+    for _ in 0..3 {
+        h.comp.key(88, true);
+        h.comp.key(88, false);
+        assert!(h.comp.damage().contains(0, 0) && h.comp.damage().contains(W - 1, H - 1), "the whole screen is damaged");
+        let _ = h.comp.draw_list();
+        seen.push(h.comp.theme().name);
+    }
+    assert_eq!(seen, vec!["luna", "9x", "flat"]);
+    assert!(!h.events_for(c).iter().any(|e| matches!(e, Event::Key { .. })), "F12 is not the client's");
+    assert_eq!(theme::by_name("luna").map(|t| t.name), Some("luna"));
+    assert!(theme::by_name("aqua").is_none());
+}
+
+// A: a fullscreen window has no decorations in any look: only the desktop's shape (under it) and its pixels.
+#[test]
+fn a_fullscreen_window_has_no_shapes() {
+    let mut h = gpu_h();
+    let c = h.window(100, 50, 0x0012_3456);
+    h.send(c, &[R::SetResizable { surface: 4, min_w: 1, min_h: 1 }]);
+    h.comp.key(87, true);
+    assert!(h.comp.is_fullscreen(c, 4));
+    for t in [&theme::LUNA, &theme::NINES] {
+        h.comp.set_theme(t);
+        let ops = h.comp.draw_list().1;
+        assert_eq!(shapes(&ops).len(), 1, "{}: only the background", t.name);
+        assert!(!ops.iter().any(|o| matches!(o, DrawOp::Title { .. })));
+    }
+}
+
+// A: scale 2 (a 1080p screen) doubles a theme's lengths, not its colours.
+#[test]
+fn shapes_scale_with_the_screen() {
+    let s = theme::LUNA.frame.unwrap()[0];
+    let d = s.scaled(2);
+    assert_eq!((d.radius, d.border, d.shadow_blur, d.shadow_dy), (2.0 * s.radius, 2.0 * s.border, 2.0 * s.shadow_blur, 2 * s.shadow_dy));
+    assert_eq!((d.c, d.split, d.shadow_color), (s.c, s.split, s.shadow_color));
+}
+
+// A: on a 1080p screen (scale 2) every length of the look doubles where the draw list uses it: the frame's reach and shape, the bar, the
+// buttons' inset, the desktop's shape.
+#[test]
+fn a_theme_at_scale_2() {
+    let mut h = gpu_h();
+    h.comp = Compositor::new(640, 1080);
+    h.comp.enable_gpu_buffers();
+    let c = h.window(120, 60, 0x00AA_0000);
+    h.comp.set_theme(&theme::LUNA);
+    assert_eq!(h.comp.title_height(), 2 * TITLE_H);
+    let f = h.comp.window_frame(c, 4).unwrap();
+    let sh = shapes(&h.comp.draw_list().1);
+    let fw = 2 * theme::LUNA.frame_w;
+    assert_eq!(sh[0].1, theme::LUNA.background.unwrap().scaled(2));
+    assert_eq!(sh[1], (Rect::new(f.x - fw, f.y - fw, f.w + 2 * fw, f.h + 2 * fw), theme::LUNA.frame.unwrap()[0].scaled(2)));
+    assert_eq!(sh[1].1.radius, 16.0);
+    assert_eq!(sh[2].1, theme::LUNA.title.unwrap()[0].scaled(2));
+    let (th, i) = (2 * TITLE_H, 2 * theme::LUNA.button_inset);
+    assert_eq!(sh[3].0, Rect::new(f.right() - th + i, f.y + i, th - 2 * i, th - 2 * i));
 }

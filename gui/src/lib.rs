@@ -16,6 +16,8 @@
 //!   names, as typed requests and events over `wire`.
 //! - [`compositor`]: clients, their objects, surfaces with pending and
 //!   current state, stacking, focus, the pointer, and `compose`.
+//! - [`theme`]: the looks a GPU host's draw list can take (shapes: gradients,
+//!   rounded corners, shadows).
 
 #![no_std]
 
@@ -24,4 +26,5 @@ extern crate alloc;
 pub mod compositor;
 pub mod protocol;
 pub mod region;
+pub mod theme;
 pub mod wire;

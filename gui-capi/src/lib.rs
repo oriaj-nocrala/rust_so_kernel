@@ -173,6 +173,18 @@ pub struct GuiDrawOp {
     clip_y: i32,
     clip_w: i32,
     clip_h: i32,
+    title_fg: u32,
+    title_shadow: u32,
+    shape_radius: f32,
+    shape_border: f32,
+    shape_split: f32,
+    shape_shadow_blur: f32,
+    shape_c: [u32; 4],
+    shape_border_color: u32,
+    shape_shadow_color: u32,
+    shape_shadow_dx: i32,
+    shape_shadow_dy: i32,
+    shape_horizontal: u32,
 }
 
 unsafe fn get<'a>(c: *mut GuiComp) -> &'a mut GuiComp {
@@ -326,6 +338,18 @@ pub unsafe extern "C" fn gui_has_damage(c: *const GuiComp) -> c_int {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn gui_set_theme(c: *mut GuiComp, name: *const c_char) -> c_int {
+    let Ok(name) = core::ffi::CStr::from_ptr(name).to_str() else { return -1 };
+    match gui::theme::by_name(name) {
+        Some(t) => {
+            get(c).comp.set_theme(t);
+            0
+        }
+        None => -1,
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn gui_draw_list(c: *mut GuiComp) -> u64 {
     let g = get(c);
     let (epoch, ops) = g.comp.draw_list();
@@ -361,8 +385,9 @@ pub unsafe extern "C" fn gui_draw_get(c: *const GuiComp, i: usize, out: *mut Gui
             (o.x, o.y, o.w, o.h) = (dst.x, dst.y, dst.w, dst.h);
             (o.sx, o.sy, o.src_w, o.src_h) = (*sx, *sy, *w, *h);
         }
-        DrawOp::Title { id, focused, area, clip, .. } => {
+        DrawOp::Title { id, focused, fg, shadow, area, clip, .. } => {
             o.kind = 3;
+            (o.title_fg, o.title_shadow) = (*fg, *shadow);
             o.id = *id;
             o.focused = *focused as u32;
             (o.x, o.y, o.w, o.h) = (area.x, area.y, area.w, area.h);
@@ -371,6 +396,13 @@ pub unsafe extern "C" fn gui_draw_get(c: *const GuiComp, i: usize, out: *mut Gui
         DrawOp::Cursor { x, y } => {
             o.kind = 4;
             (o.x, o.y) = (*x, *y);
+        }
+        DrawOp::Shape { rect, shape } => {
+            o.kind = 5;
+            (o.x, o.y, o.w, o.h) = (rect.x, rect.y, rect.w, rect.h);
+            (o.shape_radius, o.shape_border, o.shape_split, o.shape_shadow_blur) = (shape.radius, shape.border, shape.split, shape.shadow_blur);
+            (o.shape_c, o.shape_border_color, o.shape_shadow_color) = (shape.c, shape.border_color, shape.shadow_color);
+            (o.shape_shadow_dx, o.shape_shadow_dy, o.shape_horizontal) = (shape.shadow_dx, shape.shadow_dy, shape.horizontal as u32);
         }
     }
     *out = o;

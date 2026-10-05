@@ -83,6 +83,7 @@ use alloc::vec::Vec;
 
 use crate::protocol::{DecodeError, ErrorCode, Event, Interface, Request, FORMAT_XRGB8888, MAX_TITLE};
 use crate::region::{Rect, Region};
+use crate::theme::{self, Button, Shape, Theme};
 use crate::wire::{Decoder, WireError};
 
 pub type ClientId = u32;
@@ -116,6 +117,7 @@ pub const DOUBLE_CLICK_MS: u32 = 400;
 pub const BTN_LEFT: u32 = 0x110;
 const KEY_BACKSPACE: u32 = 14;
 const KEY_F11: u32 = 87;
+const KEY_F12: u32 = 88;
 const KEY_LEFTCTRL: u32 = 29;
 const KEY_RIGHTCTRL: u32 = 97;
 const KEY_LEFTALT: u32 = 56;
@@ -256,8 +258,9 @@ struct Retired {
     after: u64,
 }
 
-/// One thing to draw, from [`Compositor::draw_list`]. Rectangles are in screen pixels and already clipped to the screen.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One thing to draw, from [`Compositor::draw_list`]. Rectangles are in screen pixels and already clipped to the screen, except a
+/// [`DrawOp::Shape`]'s.
+#[derive(Clone, Debug, PartialEq)]
 pub enum DrawOp {
     /// A solid `0x00RRGGBB` rectangle.
     Fill { rect: Rect, color: u32 },
@@ -266,9 +269,13 @@ pub enum DrawOp {
     /// `dst` shows the pixels [`Compositor::cpu_content`] returns for (`client`, `surface`): `w x h`, from (`sx`, `sy`). `version` changes
     /// whenever the pixels do.
     Cpu { client: ClientId, surface: u32, version: u64, dst: Rect, sx: i32, sy: i32, w: i32, h: i32 },
-    /// A window's title, to paint over its bar (colour for `focused`), left-aligned in `area` and touching only `clip`; `id` is stable while
+    /// A window's title, to paint over its bar in `fg` (`0x00RRGGBB`) with a shadow one pixel × scale down and right in `shadow`
+    /// (`0xAARRGGBB`, alpha 0 = none), left-aligned in `area` and touching only `clip`; transparent around the glyphs. `id` is stable while
     /// the window is mapped (a cache key).
-    Title { id: u32, title: String, focused: bool, area: Rect, clip: Rect },
+    Title { id: u32, title: String, focused: bool, fg: u32, shadow: u32, area: Rect, clip: Rect },
+    /// The box `rect` drawn as `shape` says (see [`theme`]); not clipped: the shape and its shadow may reach past the screen, the host clips.
+    /// Only themes other than [`theme::FLAT`] make them.
+    Shape { rect: Rect, shape: Shape },
     /// The pointer, its hotspot at (`x`, `y`): the bitmap is [`CURSOR`].
     Cursor { x: i32, y: i32 },
 }
@@ -443,6 +450,8 @@ pub struct Compositor<M> {
     /// The last frame handed out by `draw_list`, and the last the host said is done.
     epoch_issued: u64,
     epoch_done: u64,
+    /// The draw list's look ([`theme`]); `compose` always paints [`theme::FLAT`].
+    theme: &'static Theme,
 }
 
 impl<M: PoolMem> Compositor<M> {
@@ -485,6 +494,7 @@ impl<M: PoolMem> Compositor<M> {
             retired: Vec::new(),
             epoch_issued: 0,
             epoch_done: 0,
+            theme: &theme::FLAT,
         }
     }
 
@@ -501,6 +511,16 @@ impl<M: PoolMem> Compositor<M> {
     /// The title bar's height on this screen.
     pub fn title_height(&self) -> i32 {
         self.th
+    }
+
+    /// The draw list's look from now on (the whole screen is damaged). F12 cycles through [`theme::THEMES`].
+    pub fn set_theme(&mut self, t: &'static Theme) {
+        self.theme = t;
+        self.damage.add(self.screen());
+    }
+
+    pub fn theme(&self) -> &'static Theme {
+        self.theme
     }
 
     fn border(&self) -> i32 {
@@ -1431,6 +1451,14 @@ impl<M: PoolMem> Compositor<M> {
             self.quit = true;
             return;
         }
+        if code == KEY_F12 {
+            // the compositor's own key too: the next look
+            if pressed {
+                let i = theme::THEMES.iter().position(|t| core::ptr::eq(*t, self.theme)).map_or(0, |i| (i + 1) % theme::THEMES.len());
+                self.set_theme(theme::THEMES[i]);
+            }
+            return;
+        }
         if code == KEY_F11 {
             // the compositor's own key: not the client's, press or release
             if pressed {
@@ -1503,13 +1531,17 @@ impl<M: PoolMem> Compositor<M> {
 
     /// Everything on screen as drawing operations, back to front, for a host that composes on the GPU: the whole screen every time (a GPU
     /// does not mind), clipped to it. Returns the frame's number, which the host gives back to [`Compositor::gpu_frame_done`] when the GPU is
-    /// done with the frame, and clears the damage. The pixels are what [`Compositor::compose`] would paint (a test rasterises both and
-    /// compares); only the title text, the cursor's bitmap and the pixels of buffers are left to the host.
+    /// done with the frame, and clears the damage. Under [`theme::FLAT`] the pixels are what [`Compositor::compose`] would paint (a test
+    /// rasterises both and compares); other themes draw the same geometry with shapes. Only the title text, the cursor's bitmap and the
+    /// pixels of buffers are left to the host.
     pub fn draw_list(&mut self) -> (u64, Vec<DrawOp>) {
         self.epoch_issued += 1;
         let scr = self.screen();
         let mut ops = Vec::new();
-        push_fill(&mut ops, scr, scr, BACKGROUND);
+        match self.theme.background {
+            Some(bg) => ops.push(DrawOp::Shape { rect: scr, shape: bg.scaled(self.scale) }),
+            None => push_fill(&mut ops, scr, scr, BACKGROUND),
+        }
         for key in self.stack.clone() {
             self.ops_surface(key, scr, &mut ops);
         }
@@ -1541,17 +1573,14 @@ impl<M: PoolMem> Compositor<M> {
     fn ops_surface(&self, key: Key, scr: Rect, ops: &mut Vec<DrawOp>) {
         let th = self.th;
         let s = self.surface(key).unwrap();
-        if s.decorated {
+        if s.decorated && self.theme.title.is_some() {
+            self.ops_decorations(key, scr, ops);
+        } else if s.decorated {
             let focused = self.focus == Some(key);
             let bar_color = if focused { TITLE_FOCUSED } else { TITLE_UNFOCUSED };
             if let Some(t) = s.title_bar(th).intersect(&scr) {
                 push_fill(ops, scr, t, bar_color);
-                let pad = 6 * self.scale;
-                let left = s.x + pad;
-                let area = Rect::new(left, s.y, (s.buttons_left(th) - pad - left).max(0), th);
-                if let Some(clip) = area.intersect(&t) {
-                    ops.push(DrawOp::Title { id: s.tid, title: s.title.clone(), focused, area, clip });
-                }
+                self.ops_title(key, t, ops);
                 let pressed = self.pressed.filter(|(k, _)| *k == key).map(|(_, b)| b);
                 let close = s.close_button(th);
                 if pressed == Some(ButtonKind::Close) {
@@ -1588,6 +1617,106 @@ impl<M: PoolMem> Compositor<M> {
                 } else if !s.store.is_empty() {
                     ops.push(DrawOp::Cpu { client: key.0, surface: key.1, version: s.version, dst: cv, sx, sy, w: s.w, h: s.h });
                 }
+            }
+        }
+    }
+
+    /// The title's text over the bar (`bar`: the part on screen).
+    fn ops_title(&self, key: Key, bar: Rect, ops: &mut Vec<DrawOp>) {
+        let th = self.th;
+        let s = self.surface(key).unwrap();
+        let focused = self.focus == Some(key);
+        let pad = 6 * self.scale;
+        let left = s.x + pad;
+        let area = Rect::new(left, s.y, (s.buttons_left(th) - pad - left).max(0), th);
+        if let Some(clip) = area.intersect(&bar) {
+            let t = self.theme;
+            let fg = t.title_fg[if focused { 0 } else { 1 }];
+            ops.push(DrawOp::Title { id: s.tid, title: s.title.clone(), focused, fg, shadow: t.title_shadow, area, clip });
+        }
+    }
+
+    /// A decorated window's frame, title bar and buttons in a theme made of shapes. The geometry is the flat look's (the bar is `th` tall,
+    /// the buttons are `th` squares at its right end); the frame reaches `frame_w` past the window on every side.
+    fn ops_decorations(&self, key: Key, scr: Rect, ops: &mut Vec<DrawOp>) {
+        let (th, sc) = (self.th, self.scale);
+        let t = self.theme;
+        let s = self.surface(key).unwrap();
+        let focused = self.focus == Some(key);
+        let fi = if focused { 0 } else { 1 };
+        let fw = t.frame_w * sc;
+        let outer = s.frame(th);
+        let outer = Rect::new(outer.x - fw, outer.y - fw, outer.w + 2 * fw, outer.h + 2 * fw);
+        if let Some(f) = t.frame {
+            ops.push(DrawOp::Shape { rect: outer, shape: f[fi].scaled(sc) });
+        }
+        if let Some(bar) = t.title {
+            let bar = bar[fi].scaled(sc);
+            // the box reaches under the content by the radius, so only the top corners show rounded
+            let r = bar.radius as i32 + 1;
+            ops.push(DrawOp::Shape { rect: Rect::new(outer.x, outer.y, outer.w, fw + th + r), shape: bar });
+        }
+        let Some(tb) = s.title_bar(th).intersect(&scr) else { return };
+        self.ops_title(key, tb, ops);
+        let pressed = self.pressed.filter(|(k, _)| *k == key).map(|(_, b)| b);
+        let mut buttons = alloc::vec![(s.close_button(th), t.close, pressed == Some(ButtonKind::Close), true)];
+        if let Some(m) = s.max_button(th) {
+            buttons.push((m, t.other, pressed == Some(ButtonKind::Maximize), false));
+        }
+        for (hit, style, down, close) in buttons {
+            let i = t.button_inset * sc;
+            let b = Rect::new(hit.x + i, hit.y + i, hit.w - 2 * i, hit.h - 2 * i);
+            if b.w <= 0 || b.h <= 0 {
+                continue;
+            }
+            match style {
+                Button::Flat { pressed } => {
+                    if down {
+                        push_fill(ops, scr, b, pressed);
+                    }
+                }
+                Button::Shape { normal, pressed } => {
+                    ops.push(DrawOp::Shape { rect: b, shape: if down { pressed } else { normal }.scaled(sc) });
+                }
+                Button::Bevel { face, light, dark } => {
+                    let (tl, br) = if down { (dark, light) } else { (light, dark) };
+                    push_fill(ops, scr, b, br);
+                    push_fill(ops, scr, Rect::new(b.x, b.y, b.w - sc, b.h - sc), tl);
+                    push_fill(ops, scr, Rect::new(b.x + sc, b.y + sc, b.w - 2 * sc, b.h - 2 * sc), face);
+                }
+            }
+            let w = t.glyph_weight * sc;
+            if close {
+                self.ops_glyph_x_w(b, w, t.glyph, scr, ops);
+            } else {
+                self.ops_glyph_square_w(b, w, t.glyph, scr, ops);
+            }
+        }
+    }
+
+    /// A × of stroke `w` in `color` inside `b`.
+    fn ops_glyph_x_w(&self, b: Rect, w: i32, color: u32, scr: Rect, ops: &mut Vec<DrawOp>) {
+        let (x0, y0, side) = self.glyph_box(b);
+        for i in 0..(side - w + 1).max(1) {
+            for (px, py) in [(x0 + i, y0 + i), (x0 + side - w - i, y0 + i)] {
+                if let Some(p) = Rect::new(px, py, w, w).intersect(&b) {
+                    push_fill(ops, scr, p, color);
+                }
+            }
+        }
+    }
+
+    /// A maximize square of stroke `w` (twice that on top, as Windows draws it) in `color` inside `b`.
+    fn ops_glyph_square_w(&self, b: Rect, w: i32, color: u32, scr: Rect, ops: &mut Vec<DrawOp>) {
+        let (x0, y0, side) = self.glyph_box(b);
+        for e in [
+            Rect::new(x0, y0, side, 2 * w),
+            Rect::new(x0, y0 + side - w, side, w),
+            Rect::new(x0, y0, w, side),
+            Rect::new(x0 + side - w, y0, w, side),
+        ] {
+            if let Some(p) = e.intersect(&b) {
+                push_fill(ops, scr, p, color);
             }
         }
     }
