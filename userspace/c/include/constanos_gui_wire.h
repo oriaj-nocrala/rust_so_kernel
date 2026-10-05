@@ -23,6 +23,7 @@
 
 #define GUIW_COMPOSITOR 1u
 #define GUIW_FORMAT_XRGB8888 1u
+#define GUIW_FORMAT_ARGB8888 0u   /* premultiplied; pool buffers only */
 #define GUIW_MAX_MESSAGE 4096u
 
 // Event opcodes, by interface.
@@ -37,6 +38,7 @@
 #define GUIW_EV_RELATIVE_MOTION 5  // surface: (dx, dy), dy positive down
 #define GUIW_EV_RESIZE 6           // surface: (w, h)
 #define GUIW_EV_CLOSE 7            // surface: ()
+#define GUIW_EV_THEME 11           // surface (the panel): (name)
 #define GUIW_EV_DONE 0             // callback: (ms)
 
 // ── Encoding ─────────────────────────────────────────────────────────────
@@ -135,6 +137,10 @@ static void guiw_set_resizable(struct guiw_out *o, uint32_t surface, int32_t min
 }
 static void guiw_lock_pointer(struct guiw_out *o, uint32_t surface, int on) {
     guiw_begin(o, surface, 6); guiw_put(o, on ? 1u : 0u); guiw_end(o);
+}
+// The panel role: a strip `height` pixels tall along the bottom (before the surface is mapped). It gets the window list and the theme.
+static void guiw_set_panel(struct guiw_out *o, uint32_t surface, int32_t height) {
+    guiw_begin(o, surface, 8); guiw_put(o, (uint32_t)height); guiw_end(o);
 }
 
 // ── Decoding ─────────────────────────────────────────────────────────────

@@ -224,7 +224,16 @@ static void reference(struct comp *c, uint32_t *out) {
       case GUI_DRAW_CPU: {
          size_t len;
          const uint32_t *px = gui_cpu_content(g, op.client, op.surface, &len);
-         for (int y = 0; y < op.h; y++) for (int x = 0; x < op.w; x++) out[(op.y + y) * W + op.x + x] = px[(op.sy + y) * op.src_w + op.sx + x];
+         for (int y = 0; y < op.h; y++)
+            for (int x = 0; x < op.w; x++) {
+               uint32_t v = px[(op.sy + y) * op.src_w + op.sx + x];
+               if (op.premul) {
+                  float c[4] = { (float)((v >> 16) & 255) / 255.0f, (float)((v >> 8) & 255) / 255.0f, (float)(v & 255) / 255.0f, (float)(v >> 24) / 255.0f };
+                  blend_over(&out[(op.y + y) * W + op.x + x], c);
+               } else {
+                  out[(op.y + y) * W + op.x + x] = v;
+               }
+            }
          break;
       }
       case GUI_DRAW_SHAPE: {
@@ -312,6 +321,7 @@ static int frame(struct vkctx *v, struct comp *c, const char *dir, const char *n
          size_t len = 0;
          const uint32_t *px = gui_cpu_content(g, d.client, d.surface, &len);
          *o = (struct cr_op){ .kind = CR_CPU, .key = ((uint64_t)d.client << 32) | d.surface, .version = d.version, .px = px, .npx = len, .src_w = d.src_w,
+                              .alpha = d.premul ? CR_PREMUL : CR_OPAQUE,
                               .x = d.x, .y = d.y, .w = d.w, .h = d.h, .sx = d.sx, .sy = d.sy };
          no++;
          break;
@@ -564,9 +574,28 @@ int main(int argc, char **argv) {
       tol = 0;
    }
 
-   /* ---- the window manager's own looks (step 2): its shapes go through gui_capi and the renderer like any operation */
+   /* ---- the window manager's own looks (step 2): its shapes go through gui_capi and the renderer like any operation. A panel whose buffer is
+    * premultiplied ARGB8888, transparent but for its "buttons" (one opaque, one at half alpha): the themed taskbar strip shows around them */
    {
       struct gui_draw_op d;
+      const int ph = 24;
+      uint32_t pc = gui_add_client(g);
+      int pfd = memfd_create("panel", 0);
+      ftruncate(pfd, W * ph * 4);
+      uint32_t *ppx = mmap(NULL, (size_t)W * ph * 4, PROT_READ | PROT_WRITE, MAP_SHARED, pfd, 0);
+      for (int y = 0; y < ph; y++)
+         for (int x = 0; x < W; x++)
+            ppx[y * W + x] = (y >= 3 && y < ph - 3 && x >= 4 && x < 80) ? 0xff2a7a22u : (y >= 3 && y < ph - 3 && x >= 90 && x < 200) ? 0x80102040u : 0;
+      memset(&o, 0, sizeof(o));
+      guiw_create_surface(&o, 4);
+      guiw_set_panel(&o, 4, ph);
+      guiw_create_pool(&o, 2, dup(pfd), (uint32_t)(W * ph * 4));
+      guiw_create_buffer(&o, 2, 3, 0, W, ph, W * 4, GUIW_FORMAT_ARGB8888);
+      guiw_attach(&o, 4, 3);
+      guiw_commit(&o, 4);
+      send_out(pc, &o);
+      tol = 0;
+      failures += frame(&v, &comp, dir, "5c2-argb-panel-flat") != 0;
       CHECK(gui_set_theme(g, "luna") == 0, "the Luna look");
       /* at a window's rounded corner three layers stack (the desktop's gradient, the shadow, the frame's anti-aliased edge), each rounded to
        * 8 bits where it is blended: lavapipe lands within 2 of the reference on a handful of those pixels */
@@ -575,7 +604,11 @@ int main(int argc, char **argv) {
       int nshapes = 0;
       for (size_t i = 0; i < gui_draw_count(g); i++) if (gui_draw_get(g, i, &d) == 0 && d.kind == GUI_DRAW_SHAPE) nshapes++;
       /* the desktop, then per window a frame, a bar and its buttons (the pool window: close only; the GPU one: close only) */
-      CHECK(nshapes >= 1 + 2 * 3, "Luna drew the desktop and both windows' frames, bars and buttons (%d shapes)", nshapes);
+      CHECK(nshapes >= 1 + 2 * 3 + 1, "Luna drew the desktop, both windows' frames, bars and buttons, and the taskbar (%d shapes)", nshapes);
+      int strip = 0;
+      for (size_t i = 0; i < gui_draw_count(g); i++)
+         if (gui_draw_get(g, i, &d) == 0 && d.kind == GUI_DRAW_SHAPE && d.x == 0 && d.y == H - ph && d.w == W && d.h == ph) strip++;
+      CHECK(strip == 1, "the taskbar's strip is a shape under the panel (%d)", strip);
       CHECK(gui_set_theme(g, "9x") == 0, "the 9x look");
       failures += frame(&v, &comp, dir, "5e-9x") != 0;
       CHECK(gui_set_theme(g, "flat") == 0, "back to flat: the frames below compare exactly");

@@ -81,7 +81,7 @@ use core::cell::RefCell;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::protocol::{DecodeError, ErrorCode, Event, Interface, Request, FORMAT_XRGB8888, MAX_TITLE};
+use crate::protocol::{DecodeError, ErrorCode, Event, Interface, Request, FORMAT_ARGB8888, FORMAT_XRGB8888, MAX_TITLE};
 use crate::region::{Rect, Region};
 use crate::theme::{self, Button, Shape, Theme};
 use crate::wire::{Decoder, WireError};
@@ -201,11 +201,22 @@ struct BufRef<M> {
     w: i32,
     h: i32,
     stride: usize,
+    /// `ARGB8888`: premultiplied alpha, shown "over".
+    premul: bool,
 }
 
 impl<M> Clone for BufRef<M> {
     fn clone(&self) -> Self {
-        BufRef { id: self.id, serial: self.serial, mem: self.mem.clone(), offset: self.offset, w: self.w, h: self.h, stride: self.stride }
+        BufRef {
+            id: self.id,
+            serial: self.serial,
+            mem: self.mem.clone(),
+            offset: self.offset,
+            w: self.w,
+            h: self.h,
+            stride: self.stride,
+            premul: self.premul,
+        }
     }
 }
 
@@ -267,8 +278,8 @@ pub enum DrawOp {
     /// `dst` shows the GPU buffer `handle` (see [`GpuOp::Import`]) starting at pixel (`sx`, `sy`) of it, one pixel to one.
     Gpu { handle: u64, dst: Rect, sx: i32, sy: i32 },
     /// `dst` shows the pixels [`Compositor::cpu_content`] returns for (`client`, `surface`): `w x h`, from (`sx`, `sy`). `version` changes
-    /// whenever the pixels do.
-    Cpu { client: ClientId, surface: u32, version: u64, dst: Rect, sx: i32, sy: i32, w: i32, h: i32 },
+    /// whenever the pixels do. `premul`: they are premultiplied `0xAARRGGBB`, drawn "over" ([`theme::over`]); else opaque.
+    Cpu { client: ClientId, surface: u32, version: u64, dst: Rect, sx: i32, sy: i32, w: i32, h: i32, premul: bool },
     /// A window's title, to paint over its bar in `fg` (`0x00RRGGBB`) with a shadow one pixel × scale down and right in `shadow`
     /// (`0xAARRGGBB`, alpha 0 = none), left-aligned in `area` and touching only `clip`; transparent around the glyphs. `id` is stable while
     /// the window is mapped (a cache key).
@@ -321,6 +332,8 @@ struct Surface<M> {
     fullscreen: Option<(Rect, Option<Rect>)>,
     /// Has a title bar (every window but the panel).
     decorated: bool,
+    /// The content is premultiplied `ARGB8888` (the last pool buffer committed was), shown "over" what is under it.
+    premul: bool,
     /// Toplevel id while mapped as a window, 0 otherwise.
     tid: u32,
     /// Top-left of the window's frame (title bar included).
@@ -517,6 +530,7 @@ impl<M: PoolMem> Compositor<M> {
     pub fn set_theme(&mut self, t: &'static Theme) {
         self.theme = t;
         self.damage.add(self.screen());
+        self.tell_panel(|p| Event::Theme { surface: p, name: String::from(t.name) });
     }
 
     pub fn theme(&self) -> &'static Theme {
@@ -681,6 +695,7 @@ impl<M: PoolMem> Compositor<M> {
                     maximized: None,
                     fullscreen: None,
                     decorated: true,
+                    premul: false,
                     tid: 0,
                     x: 0,
                     y: 0,
@@ -728,8 +743,8 @@ impl<M: PoolMem> Compositor<M> {
             Request::CreateBuffer { pool, id, offset, width, height, stride, format } => {
                 let Some(Object::Pool { mem, size }) = self.clients[&c].objects.get(&pool) else { unreachable!() };
                 let (mem, size) = (mem.clone(), *size);
-                if format != FORMAT_XRGB8888 {
-                    return self.fail(c, pool, ErrorCode::InvalidFormat, "only XRGB8888");
+                if format != FORMAT_XRGB8888 && format != FORMAT_ARGB8888 {
+                    return self.fail(c, pool, ErrorCode::InvalidFormat, "only XRGB8888 or ARGB8888");
                 }
                 let fits = width > 0
                     && height > 0
@@ -742,7 +757,16 @@ impl<M: PoolMem> Compositor<M> {
                     return self.fail(c, pool, ErrorCode::InvalidBuffer, "buffer outside its pool");
                 }
                 self.buffers_created += 1;
-                let b = BufRef { id, serial: self.buffers_created, mem, offset: offset as usize, w: width, h: height, stride: stride as usize };
+                let b = BufRef {
+                    id,
+                    serial: self.buffers_created,
+                    mem,
+                    offset: offset as usize,
+                    w: width,
+                    h: height,
+                    stride: stride as usize,
+                    premul: format == FORMAT_ARGB8888,
+                };
                 self.new_object(c, id, Object::Buffer(b));
             }
             Request::DestroyPool { pool } | Request::DestroyBuffer { buffer: pool } => self.destroy_object(c, pool),
@@ -823,6 +847,7 @@ impl<M: PoolMem> Compositor<M> {
                 }
                 let fid = self.focus.and_then(|k| self.surface(k)).map_or(0, |s| s.tid);
                 self.events.push((c, Event::ToplevelFocus { surface, id: fid }));
+                self.events.push((c, Event::Theme { surface, name: String::from(self.theme.name) }));
             }
             Request::Activate { surface, toplevel } => {
                 if self.panel.is_some_and(|(k, _)| k == (c, surface)) {
@@ -884,15 +909,17 @@ impl<M: PoolMem> Compositor<M> {
                     dmg = full.clone();
                 }
                 match &att {
-                    Attached::Cpu(_) => {
-                        if s.store.len() != (bw * bh) as usize {
+                    Attached::Cpu(b) => {
+                        if s.store.len() != (bw * bh) as usize || s.premul != b.premul {
                             s.store = alloc::vec![0; (bw * bh) as usize];
+                            s.premul = b.premul;
                             dmg = full.clone();
                         }
                     }
                     // the host reads the whole buffer every frame
                     Attached::Gpu(_) => {
                         s.store = Vec::new();
+                        s.premul = false;
                         dmg = full.clone();
                     }
                 }
@@ -1546,7 +1573,10 @@ impl<M: PoolMem> Compositor<M> {
             self.ops_surface(key, scr, &mut ops);
         }
         if let Some((k, _)) = self.panel {
-            if self.surface(k).is_some_and(|s| s.mapped) {
+            if let Some(s) = self.surface(k).filter(|s| s.mapped) {
+                if let Some(tb) = &self.theme.taskbar {
+                    ops.push(DrawOp::Shape { rect: s.content(self.th), shape: tb.bar.scaled(self.scale) });
+                }
                 self.ops_surface(k, scr, &mut ops);
             }
         }
@@ -1615,7 +1645,7 @@ impl<M: PoolMem> Compositor<M> {
                 if let Some(g) = &s.gpu {
                     ops.push(DrawOp::Gpu { handle: g.buf.handle, dst: cv, sx, sy });
                 } else if !s.store.is_empty() {
-                    ops.push(DrawOp::Cpu { client: key.0, surface: key.1, version: s.version, dst: cv, sx, sy, w: s.w, h: s.h });
+                    ops.push(DrawOp::Cpu { client: key.0, surface: key.1, version: s.version, dst: cv, sx, sy, w: s.w, h: s.h, premul: s.premul });
                 }
             }
         }
@@ -1798,7 +1828,14 @@ impl<M: PoolMem> Compositor<M> {
                     let sy = (py - content.y) as usize;
                     let sx = (cv.x - content.x) as usize;
                     let src = &s.store[sy * s.w as usize + sx..][..cv.w as usize];
-                    dst[py as usize * stride + cv.x as usize..][..cv.w as usize].copy_from_slice(src);
+                    let row = &mut dst[py as usize * stride + cv.x as usize..][..cv.w as usize];
+                    if s.premul {
+                        for (d, v) in row.iter_mut().zip(src) {
+                            *d = theme::over(*d, *v) & 0x00FF_FFFF;
+                        }
+                    } else {
+                        row.copy_from_slice(src);
+                    }
                 }
             }
         }
@@ -1845,7 +1882,14 @@ impl<M: PoolMem> Compositor<M> {
             self.paint_surface(*key, r, dst, stride, paint_title);
         }
         if let Some((k, _)) = self.panel {
-            if self.surface(k).is_some_and(|s| s.mapped) {
+            if let Some(s) = self.surface(k).filter(|s| s.mapped) {
+                // the strip under a themed panel (whose buffer is transparent around its buttons), as the draw list's shape
+                if let Some(tb) = &self.theme.taskbar {
+                    let strip = s.content(self.th);
+                    if let Some(c) = strip.intersect(&r) {
+                        tb.bar.scaled(self.scale).paint(dst, stride, c, strip);
+                    }
+                }
                 self.paint_surface(k, r, dst, stride, paint_title);
             }
         }

@@ -506,7 +506,7 @@ fn run(args: &[String]) -> i32 {
                     DrawOp::Gpu { handle, dst, sx, sy } => {
                         ops.push(CrOp { key: *handle, x: dst.x, y: dst.y, w: dst.w, h: dst.h, sx: *sx, sy: *sy, ..CrOp::new(CR_GPU) });
                     }
-                    DrawOp::Cpu { client, surface, version, dst, sx, sy, w: sw, .. } => {
+                    DrawOp::Cpu { client, surface, version, dst, sx, sy, w: sw, premul, .. } => {
                         if let Some(px) = comp.cpu_content(*client, *surface) {
                             ops.push(CrOp {
                                 key: ((*client as u64) << 32) | *surface as u64,
@@ -520,6 +520,7 @@ fn run(args: &[String]) -> i32 {
                                 h: dst.h,
                                 sx: *sx,
                                 sy: *sy,
+                                alpha: if *premul { CR_PREMUL } else { CR_OPAQUE },
                                 ..CrOp::new(CR_CPU)
                             });
                         }

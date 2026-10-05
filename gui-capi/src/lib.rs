@@ -185,6 +185,7 @@ pub struct GuiDrawOp {
     shape_shadow_dx: i32,
     shape_shadow_dy: i32,
     shape_horizontal: u32,
+    premul: u32,
 }
 
 unsafe fn get<'a>(c: *mut GuiComp) -> &'a mut GuiComp {
@@ -379,8 +380,9 @@ pub unsafe extern "C" fn gui_draw_get(c: *const GuiComp, i: usize, out: *mut Gui
             (o.x, o.y, o.w, o.h) = (dst.x, dst.y, dst.w, dst.h);
             (o.sx, o.sy) = (*sx, *sy);
         }
-        DrawOp::Cpu { client, surface, version, dst, sx, sy, w, h } => {
+        DrawOp::Cpu { client, surface, version, dst, sx, sy, w, h, premul } => {
             o.kind = 2;
+            o.premul = *premul as u32;
             (o.client, o.surface, o.version) = (*client, *surface, *version);
             (o.x, o.y, o.w, o.h) = (dst.x, dst.y, dst.w, dst.h);
             (o.sx, o.sy, o.src_w, o.src_h) = (*sx, *sy, *w, *h);

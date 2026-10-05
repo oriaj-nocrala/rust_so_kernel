@@ -1,6 +1,7 @@
 # GPU compositor visual plan (vk_comp): primitives, themes, icons
 
-Agreed 2026-10-05. Steps 1 and 2 done (host-proven, not yet on the Ryzen); step 3 next. Start here without other context.
+Agreed 2026-10-05. Steps 1, 2 and 2b done; 1 and 2 seen on the Ryzen (both looks kept, the user
+likes both: a theme toggle in a menu later); step 3 next. Start here without other context.
 
 ## Where it stands
 
@@ -25,7 +26,14 @@ Agreed 2026-10-05. Steps 1 and 2 done (host-proven, not yet on the Ryzen); step 
 - Titles in vk-comp are premultiplied text, transparent around the glyphs (`titles.rs`: drawn
   white on black for the coverage, then coloured, over an optional 1 px × scale shadow), so the
   bar's gradient shows through.
-- The panel is a client (`userspace/src/bin/panel.rs`) and draws itself: no theme reaches it yet.
+- **Taskbar** (step 2b): the panel (`userspace/src/bin/panel.rs`) is told the look (`theme(name)`
+  event, at `set_panel` and on every change) and, in a theme with a `Taskbar`, draws only its
+  buttons (start, windows, clock area: `Button::paint`, shapes through `Shape::paint`, the
+  software twin of `comp.frag`) into a premultiplied **`ARGB8888`** buffer, transparent elsewhere.
+  The strip under it is the compositor's (`DrawOp::Shape` before the panel's pixels in
+  `draw_list`; `compose` paints the same shape in software), which is where step 3's blur goes.
+  Text drawing writes `0x00RRGGBB`, so the panel puts the alpha back after its labels. Flat stays
+  the old opaque look.
 - Decorations (title, close, maximize), the panel (`panel` client) and window management live in
   `gui` (host-tested). PNG loading exists: crate `img` gives premultiplied ARGB, icon theme layout
   `disk-image-root/usr/share/icons/<n>x<n>/<name>.png`, `img::load_icon` resamples once at load.
@@ -72,10 +80,17 @@ Decide by seeing them: build the engine, then switch themes on the real screen.
    no decorations, scale 2) with 12 mutants of `ops_decorations`/F12 killed; `gui-capi`'s C test
    reads a `GUI_DRAW_SHAPE`; `host_comp.c` frames `5d-luna`/`5e-9x` run the real window manager
    through the renderer (within 3 per channel: three blended layers at a rounded corner);
-   vk-comp's `cargo test` covers the title premultiplication. Left: look at both on the Ryzen,
-   tune colours by eye, then the user picks. Not done: a premultiplied flag on `DrawOp::Cpu`
-   (comes with icons, step 4); theming the panel (it is a client: needs the theme over the
-   protocol, or the panel drawn by the compositor).
+   vk-comp's `cargo test` covers the title premultiplication. Seen on the Ryzen: both looks work
+   (render 1.3-1.6 ms per frame with blending on). Colours still open to tuning by eye.
+2b. **Taskbar** — done, see "Where it stands". Pool buffers may be premultiplied `ARGB8888`
+   (`DrawOp::Cpu { premul }` → `CR_PREMUL`; `compose` blends with `theme::over`, exact `/255`).
+   Proof: `gui` tests (an ARGB window over others, in compose and the draw list, the oracle
+   included; the theme event; the strip as a shape; compose's strip; `Shape::paint` = `pixel` over
+   inside the clip; bevels; `over`; `sqrt`), 9 mutants killed; `host_comp.c` frame
+   `5c2-argb-panel-flat` and the strip in `5d-luna`; in QEMU with the CPU compositor (F12 through
+   the monitor) the start button, window buttons (focused down, 9x sunken), the Apps list and the
+   clock area were checked on screendumps; `gui-e2e.sh` and `gui-e2e.sh wm` pass. Not on the
+   Ryzen yet.
 3. **Glass / blur behind** for the taskbar and start menu: copy what is behind, two-pass blur,
    tint. Costlier; measure on the Ryzen (`cr_stats` render_us).
 4. **Icons**: the user generates them with a local image model. Generate at 256 px on a

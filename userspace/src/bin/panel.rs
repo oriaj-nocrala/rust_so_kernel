@@ -18,6 +18,12 @@
 //!   click raises and focuses it (`activate`).
 //! - **A clock**, `HH:MM` UTC (as `/etc/localtime`), redrawn each minute.
 //!
+//! **Looks**: the compositor says its theme (`theme` event, `gui::theme`). The flat one is drawn as
+//! always, opaque; in a theme with a `Taskbar` the strip is the compositor's (a shape under this
+//! surface) and the panel draws only its buttons, with the theme's own shapes and bevels
+//! (`Shape::paint`, the GPU's maths in software), into a premultiplied `ARGB8888` buffer that is
+//! transparent everywhere else.
+//!
 //! Started by `compositor` without arguments. If it dies the compositor
 //! goes on without it; it exits when the compositor goes.
 
@@ -28,7 +34,9 @@ use alloc::vec::Vec;
 
 use draw::Canvas;
 use gui::compositor::scale_for;
-use gui::protocol::{Event, Interface, Request, FORMAT_XRGB8888};
+use gui::protocol::{Event, Interface, Request, FORMAT_ARGB8888};
+use gui::region::Rect;
+use gui::theme::{self, Button as ThemeButton, Taskbar, Theme};
 use gui::wire::{Decoder, Encoder};
 use userspace::args::Args;
 use userspace::syscall::{self, AF_UNIX, MAP_SHARED, PROT_READ, PROT_WRITE, SOCK_STREAM};
@@ -106,6 +114,7 @@ struct Panel {
     /// `(toplevel id, title)`, in the order they appeared.
     windows: Vec<(u32, String)>,
     focused: u32,
+    theme: &'static Theme,
     menu_open: bool,
     hover_x: Option<i32>,
     clock: String,
@@ -176,16 +185,93 @@ impl Panel {
     }
 
     fn draw(&mut self, px: &mut [u32]) {
-        let (w, h, k) = (self.w, self.h, self.k);
-        let buttons = self.layout();
+        match &self.theme.taskbar {
+            Some(tb) => self.draw_themed(px, tb),
+            None => {
+                self.draw_flat(px);
+                // an ARGB8888 buffer: the flat look is opaque everywhere
+                for p in px.iter_mut() {
+                    *p |= 0xFF00_0000;
+                }
+            }
+        }
+    }
+
+    /// The buttons log line, when they change (scripts read it).
+    fn log_buttons(&mut self, buttons: &[Button]) {
         let mut desc = String::new();
-        for b in &buttons {
+        for b in buttons {
             desc.push_str(&alloc::format!(" {}@{}+{}", b.label, b.x, b.w));
         }
         if desc != self.logged {
             println!("panel: buttons{}", desc);
             self.logged = desc;
         }
+    }
+
+    /// A theme's buttons over a transparent buffer (the strip under it is the compositor's).
+    fn draw_themed(&mut self, px: &mut [u32], tb: &Taskbar) {
+        let (w, h, k) = (self.w, self.h, self.k);
+        let buttons = self.layout();
+        self.log_buttons(&buttons);
+        px.fill(0);
+        let all = Rect::new(0, 0, w, h);
+        let (by, bh) = (4 * k, h - 7 * k);
+        let st = self.style(tb.task_fg);
+        let (_, lh) = self.text.measure("Hg", &st, None);
+        // the shapes first, then the text over them (text drawing writes 0x00RRGGBB: the alpha is put back after)
+        let mut labels: Vec<(i32, i32, String, u32, u32, bool)> = Vec::new();
+        for b in &buttons {
+            let hover = self.hover_x.is_some_and(|x| x >= b.x && x < b.x + b.w);
+            match b.action {
+                Action::Menu => {
+                    let bleed = tb.start_bleed * k;
+                    let r = if bleed > 0 { Rect::new(b.x - bleed, 0, b.w + bleed, h) } else { Rect::new(b.x, by, b.w, bh) };
+                    tb.start.paint(self.menu_open, px, w as usize, all, r, k);
+                    labels.push((b.x + 12 * k, r.y + (r.h - lh) / 2, b.label.clone(), tb.start_fg, tb.start_shadow, true));
+                }
+                _ => {
+                    let down = matches!(b.action, Action::Activate(id) if id == self.focused);
+                    let r = Rect::new(b.x, by, b.w, bh);
+                    tb.task.paint(down, px, w as usize, all, r, k);
+                    if hover && !down && tb.hover.c[0] >> 24 != 0 {
+                        tb.hover.scaled(k).paint(px, w as usize, all, r);
+                    }
+                    let push = if down && matches!(tb.task, ThemeButton::Bevel { .. }) { k } else { 0 };
+                    labels.push((b.x + 12 * k + push, by + (bh - lh) / 2 + push, b.label.clone(), tb.task_fg, 0, false));
+                }
+            }
+        }
+        let st = self.style(tb.tray_fg);
+        let cw = self.text.measure(&self.clock, &st, None).0;
+        let pad = 12 * k;
+        let tray = match tb.tray {
+            // a shape reaches past the right edge (its right corners hidden) and fills the strip's height
+            ThemeButton::Shape { .. } => Rect::new(w - cw - 2 * pad, 0, cw + 2 * pad + 8 * k, h),
+            _ => Rect::new(w - cw - 2 * pad, by, cw + 2 * pad - 4 * k, bh),
+        };
+        tb.tray.paint(true, px, w as usize, all, tray, k);
+        labels.push((tray.x + pad, tray.y + (tray.h - lh) / 2, self.clock.clone(), tb.tray_fg, 0, false));
+
+        let alpha: Vec<u8> = px.iter().map(|p| (p >> 24) as u8).collect();
+        let mut cv = Canvas::new(px, w as usize, h as usize, w as usize);
+        for (x, y, text, fg, shadow, bold) in labels {
+            let size = 13.0 * k as f32;
+            let style = |c: u32| if bold { Style::new(SANS, size).color(c).bold() } else { Style::new(SANS, size).color(c) };
+            if shadow >> 24 != 0 {
+                self.text.draw(&mut cv, &text, &style(shadow & 0x00FF_FFFF), None, x + k, y + k);
+            }
+            self.text.draw(&mut cv, &text, &style(fg), None, x, y);
+        }
+        for (p, a) in px.iter_mut().zip(alpha) {
+            *p = (*p & 0x00FF_FFFF) | (a as u32) << 24;
+        }
+    }
+
+    fn draw_flat(&mut self, px: &mut [u32]) {
+        let (w, h, k) = (self.w, self.h, self.k);
+        let buttons = self.layout();
+        self.log_buttons(&buttons);
         let st = self.style(TEXT);
         let (_, lh) = self.text.measure("Hg", &st, None);
         let mut cv = Canvas::new(px, w as usize, h as usize, w as usize);
@@ -299,7 +385,7 @@ fn main(_args: Args) -> i32 {
     let px = unsafe { core::slice::from_raw_parts_mut(base as *mut u32, (w * h) as usize) };
     let ok = send(sock, &[
         Request::CreatePool { id: POOL, fd: mfd, size: size as u32 },
-        Request::CreateBuffer { pool: POOL, id: BUFFER, offset: 0, width: w, height: h, stride: w * 4, format: FORMAT_XRGB8888 },
+        Request::CreateBuffer { pool: POOL, id: BUFFER, offset: 0, width: w, height: h, stride: w * 4, format: FORMAT_ARGB8888 },
         Request::SetTitle { surface: SURFACE, title: "panel".into() },
     ]);
     syscall::close(mfd);
@@ -316,6 +402,7 @@ fn main(_args: Args) -> i32 {
         apps: read_apps(),
         windows: Vec::new(),
         focused: 0,
+        theme: &theme::FLAT,
         menu_open: false,
         hover_x: None,
         clock: c,
@@ -376,6 +463,11 @@ fn main(_args: Args) -> i32 {
                 }
                 Event::ToplevelGone { id, .. } => {
                     p.windows.retain(|(i, _)| *i != id);
+                    dirty = true;
+                }
+                Event::Theme { name, .. } => {
+                    p.theme = theme::by_name(&name).unwrap_or(&theme::FLAT);
+                    println!("panel: theme {}", p.theme.name);
                     dirty = true;
                 }
                 Event::ToplevelFocus { id, .. } => {

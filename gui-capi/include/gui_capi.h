@@ -92,8 +92,10 @@ struct gui_draw_op {
     uint32_t shape_c[4], shape_border_color, shape_shadow_color;
     int32_t shape_shadow_dx, shape_shadow_dy;
     uint32_t shape_horizontal;
+    uint32_t premul;     /* CPU: the pixels are premultiplied ARGB, drawn "over" (else opaque) */
 };
-/* The draw list's look (gui::theme): "flat" (what compose paints), "luna", "9x". 0, or -1 for an unknown name. F12 cycles them too. */
+/* The draw list's look (gui::theme): "flat" (what compose paints), "luna", "9x". 0, or -1 for an unknown name. F12 cycles them too.
+ * The panel is told (a `theme` event); in a look with a taskbar the strip is a SHAPE under the panel's surface. */
 int gui_set_theme(gui_comp *c, const char *name);
 /* Builds the draw list for the next frame (the whole screen, back to front, clipped), takes the damage, and returns the frame's number. */
 uint64_t gui_draw_list(gui_comp *c);

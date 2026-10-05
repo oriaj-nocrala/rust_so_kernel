@@ -335,11 +335,11 @@ fn protocol_errors_disconnect() {
         assert_eq!(err, Some(code as u32), "{reqs:?}");
         assert!(!h.comp.has_client(c));
     }
-    // Wrong format.
+    // Wrong format (neither XRGB8888 = 1 nor ARGB8888 = 0).
     let mut h = H_::new();
     let c = h.comp.add_client();
     h.pool(7, 400);
-    h.send(c, &[R::CreatePool { id: 2, fd: 7, size: 400 }, R::CreateBuffer { pool: 2, id: 3, offset: 0, width: 1, height: 1, stride: 4, format: 0 }]);
+    h.send(c, &[R::CreatePool { id: 2, fd: 7, size: 400 }, R::CreateBuffer { pool: 2, id: 3, offset: 0, width: 1, height: 1, stride: 4, format: 7 }]);
     assert!(h.comp.take_events().iter().any(|(_, e)| matches!(e, Event::Error { code, .. } if *code == ErrorCode::InvalidFormat as u32)));
     // Garbage bytes.
     let mut h = H_::new();
@@ -904,11 +904,12 @@ fn raster(ops: &[DrawOp], comp: &Compositor<Mem>, gpu: &BTreeMap<u64, (i32, Vec<
                     }
                 }
             }
-            DrawOp::Cpu { client, surface, dst, sx, sy, w, .. } => {
+            DrawOp::Cpu { client, surface, dst, sx, sy, w, premul, .. } => {
                 let px = comp.cpu_content(*client, *surface).unwrap();
                 for y in 0..dst.h {
                     for x in 0..dst.w {
-                        out[(dst.y + y) as usize * STRIDE + (dst.x + x) as usize] = px[((sy + y) * w + sx + x) as usize];
+                        let (d, v) = ((dst.y + y) as usize * STRIDE + (dst.x + x) as usize, px[((sy + y) * w + sx + x) as usize]);
+                        out[d] = if *premul { theme::over(out[d], v) & 0x00FF_FFFF } else { v };
                     }
                 }
             }
@@ -1596,4 +1597,119 @@ fn a_theme_at_scale_2() {
     assert_eq!(sh[2].1, theme::LUNA.title.unwrap()[0].scaled(2));
     let (th, i) = (2 * TITLE_H, 2 * theme::LUNA.button_inset);
     assert_eq!(sh[3].0, Rect::new(f.right() - th + i, f.y + i, th - 2 * i, th - 2 * i));
+}
+
+// ── the taskbar's look and premultiplied windows ──────────────────────────────────────────────────────────────────────────────────────
+
+/// A client whose surface 4 takes the panel role, `ph` pixels tall, with a `W x ph` premultiplied `ARGB8888` buffer of `color`.
+fn panel_argb(h: &mut H_, ph: i32, color: u32) -> ClientId {
+    let c = h.comp.add_client();
+    let fd = 100 + c as i32;
+    let size = (W * ph * 4) as usize;
+    h.pool(fd, size);
+    h.draw(fd, 0, W as usize * 4, 0, 0, W as usize, ph as usize, color);
+    h.send(c, &[R::CreateSurface { id: 4 }, R::SetPanel { surface: 4, height: ph }]);
+    h.send(c, &[
+        R::CreatePool { id: 2, fd, size: size as u32 },
+        R::CreateBuffer { pool: 2, id: 3, offset: 0, width: W, height: ph, stride: W * 4, format: crate::protocol::FORMAT_ARGB8888 },
+        R::Attach { surface: 4, buffer: 3 },
+        R::Damage { surface: 4, x: 0, y: 0, w: W, h: ph },
+        R::Commit { surface: 4 },
+    ]);
+    c
+}
+
+// A: a window whose buffer is ARGB8888 is drawn "over" what is under it, by compose (exact /255 rounding) and in the draw list (premul,
+// the same picture as compose: the oracle), and goes back to opaque when an XRGB8888 buffer replaces it.
+#[test]
+fn an_argb_window_is_drawn_over_what_is_under_it() {
+    let mut h = gpu_h();
+    let _a = h.window(120, 60, 0x00AA_0000);
+    let b = h.comp.add_client();
+    h.pool(300, 160 * 40 * 4);
+    h.draw(300, 0, 160 * 4, 0, 0, 160, 40, 0x8000_4000); // green at half alpha, premultiplied
+    h.send(b, &[
+        R::CreatePool { id: 2, fd: 300, size: 160 * 40 * 4 },
+        R::CreateBuffer { pool: 2, id: 3, offset: 0, width: 160, height: 40, stride: 160 * 4, format: crate::protocol::FORMAT_ARGB8888 },
+        R::CreateSurface { id: 4 },
+        R::Attach { surface: 4, buffer: 3 },
+        R::Commit { surface: 4 },
+    ]);
+    let fb = h.comp.window_content(b, 4).unwrap();
+    let fa = h.comp.window_content(_a, 4).unwrap();
+    h.compose();
+    // over a's red, and (to its right, past a) over the desktop
+    let (x_in, y_in) = (fb.x + 2, fb.y + 2);
+    assert!(fa.contains(x_in, y_in));
+    assert_eq!(h.px(x_in, y_in), theme::over(0x00AA_0000, 0x8000_4000) & 0x00FF_FFFF);
+    assert_eq!(h.px(x_in, y_in), 0x0055_4000, "half of a's red under half-alpha green");
+    let x_out = fa.right() + 2;
+    assert!(x_out < fb.right());
+    assert_eq!(h.px(x_out, y_in), theme::over(BACKGROUND, 0x8000_4000) & 0x00FF_FFFF);
+    let want = h.screen.clone();
+    let (_, ops) = h.comp.draw_list();
+    assert!(ops.iter().any(|o| matches!(o, DrawOp::Cpu { client, premul: true, .. } if *client == b)));
+    assert_eq!(same_picture(&raster(&ops, &h.comp, &BTreeMap::new()), &want), None, "the draw list is compose's picture");
+    // an XRGB buffer of the same size: opaque again (the top byte ignored)
+    h.send(b, &[
+        R::CreateBuffer { pool: 2, id: 5, offset: 0, width: 160, height: 40, stride: 160 * 4, format: FORMAT_XRGB8888 },
+        R::Attach { surface: 4, buffer: 5 },
+        R::Commit { surface: 4 },
+    ]);
+    h.compose();
+    assert_eq!(h.px(x_in, y_in), 0x8000_4000, "XRGB: the pixel as it is");
+    assert!(h.comp.draw_list().1.iter().any(|o| matches!(o, DrawOp::Cpu { client, premul: false, .. } if *client == b)));
+}
+
+// A: the panel is told the look when it takes the role and whenever it changes (F12 included); no other client is.
+#[test]
+fn the_panel_is_told_the_theme() {
+    let mut h = gpu_h();
+    let w = h.window(100, 50, 0x00AA_0000);
+    let p = panel_argb(&mut h, 20, 0);
+    assert!(h.events_for(p).contains(&Event::Theme { surface: 4, name: "flat".into() }));
+    h.comp.key(88, true);
+    let evs = h.comp.take_events();
+    assert!(evs.contains(&(p, Event::Theme { surface: 4, name: "luna".into() })), "{evs:?}");
+    assert!(!evs.iter().any(|(c, e)| *c == w && matches!(e, Event::Theme { .. })), "only the panel");
+    h.comp.set_theme(&theme::NINES);
+    assert_eq!(h.events_for(p), vec![Event::Theme { surface: 4, name: "9x".into() }]);
+}
+
+// A: in a look with a taskbar, the strip is a shape under the panel's surface, right before its pixels, covering exactly the panel's
+// area; the flat look has none.
+#[test]
+fn a_themed_taskbar_is_a_shape_under_the_panel() {
+    let mut h = gpu_h();
+    let _w = h.window(100, 50, 0x00AA_0000);
+    let p = panel_argb(&mut h, 20, 0);
+    let strip = Rect::new(0, H - 20, W, 20);
+    assert!(shapes(&h.comp.draw_list().1).is_empty(), "flat: no shapes at all");
+    for t in [&theme::LUNA, &theme::NINES] {
+        h.comp.set_theme(t);
+        let ops = h.comp.draw_list().1;
+        let at = ops.iter().position(|o| matches!(o, DrawOp::Cpu { client, .. } if *client == p)).unwrap();
+        assert_eq!(ops[at - 1], DrawOp::Shape { rect: strip, shape: t.taskbar.as_ref().unwrap().bar }, "{}", t.name);
+    }
+}
+
+// A: compose (the CPU painter) draws the same strip under a transparent panel, with the shape's own pixels (Shape::paint); under the flat
+// look a transparent panel shows what is under it.
+#[test]
+fn compose_paints_the_strip_under_a_transparent_panel() {
+    let mut h = H_::new();
+    let _p = panel_argb(&mut h, 20, 0);
+    h.compose();
+    assert_eq!(h.px(10, H - 10), BACKGROUND, "flat: nothing under the panel but the desktop");
+    h.comp.set_theme(&theme::LUNA);
+    h.compose();
+    let strip = Rect::new(0, H - 20, W, 20);
+    let bar = theme::LUNA.taskbar.as_ref().unwrap().bar;
+    for (x, y) in [(10, H - 20), (10, H - 10), (W - 1, H - 1)] {
+        let c = bar.pixel(strip, x, y);
+        let want = [c[0], c[1], c[2]].map(|v| (v * 255.0 + 0.5) as u32);
+        assert_eq!(h.px(x, y) & 0x00FF_FFFF, want[0] << 16 | want[1] << 8 | want[2], "({x}, {y})");
+    }
+    assert_ne!(h.px(10, H - 20), h.px(10, H - 2), "a gradient: the top differs from the bottom");
+    assert_eq!(h.px(10, H - 21), BACKGROUND, "nothing above the strip");
 }
