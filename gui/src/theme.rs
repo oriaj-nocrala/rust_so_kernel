@@ -32,6 +32,9 @@ pub struct Shape {
     pub shadow_dy: i32,
     /// The gradient runs left to right.
     pub horizontal: bool,
+    /// Glass: > 0 puts the fill over what is behind the shape blurred by this radius (a GPU host does it: `cr_shape.backdrop_blur`; the
+    /// CPU painter draws the fill over what is behind as it is). 0: no blur.
+    pub backdrop_blur: f32,
 }
 
 impl Shape {
@@ -52,7 +55,14 @@ impl Shape {
             shadow_dx: 0,
             shadow_dy: 0,
             horizontal: false,
+            backdrop_blur: 0.0,
         }
+    }
+
+    /// Glass: the (translucent) fill goes over what is behind, blurred by `radius`.
+    pub const fn glass(mut self, radius: f32) -> Shape {
+        self.backdrop_blur = radius;
+        self
     }
 
     pub const fn radius(mut self, r: f32) -> Shape {
@@ -88,6 +98,7 @@ impl Shape {
             shadow_blur: self.shadow_blur * f,
             shadow_dx: self.shadow_dx * s,
             shadow_dy: self.shadow_dy * s,
+            backdrop_blur: self.backdrop_blur * f,
             ..*self
         }
     }
@@ -352,10 +363,10 @@ pub struct Menu {
     pub banner: Option<Shape>,
     pub banner_w: i32,
     pub banner_fg: u32,
-    /// The apps' column.
+    /// The apps' column, `0xAARRGGBB` (straight alpha: a translucent column shows the glass under it).
     pub items_bg: u32,
     pub items_fg: u32,
-    /// Luna: a second column (the theme selector) in another colour; `None`: one column, the themes under the apps.
+    /// Luna: a second column (the theme selector) in another colour (`0xAARRGGBB`); `None`: one column, the themes under the apps.
     pub side_bg: Option<u32>,
     pub side_fg: u32,
     /// Under the item the pointer is on, and that item's text.
@@ -425,7 +436,8 @@ pub static LUNA: Theme = Theme {
     glyph: 0x00FF_FFFF,
     glyph_weight: 2,
     taskbar: Taskbar {
-        bar: Shape::gradient(0xFF6A_A8F7, 0xFF31_6FDE, 0xFF26_5FD9, 0xFF1B_47B4, 0.14),
+        // glass: a translucent blue over what is behind, blurred
+        bar: Shape::gradient(0xC86A_A8F7, 0xC031_6FDE, 0xC026_5FD9, 0xD01B_47B4, 0.14).glass(10.0),
         start: Button::Shape {
             normal: Shape::gradient(0xFF79_C96A, 0xFF46_A33A, 0xFF31_8C28, 0xFF3D_9C33, 0.45).radius(10.0).border(1.0, 0xFF1F_6A18),
             pressed: Shape::gradient(0xFF2F_7E26, 0xFF2A_7422, 0xFF25_6A1E, 0xFF2A_7422, 0.45).radius(10.0).border(1.0, 0xFF1A_5A14),
@@ -446,21 +458,21 @@ pub static LUNA: Theme = Theme {
         tray_fg: 0x00FF_FFFF,
     },
     menu: Menu {
-        frame: Shape::solid(0xFF1C_5ED8).radius(8.0).border(1.0, 0xFF0A_3A9A).shadow(12.0, 4, 4, 0x8000_0000),
+        frame: Shape::solid(0xA81C_5ED8).radius(8.0).border(1.0, 0xFF0A_3A9A).shadow(12.0, 4, 4, 0x8000_0000).glass(14.0),
         inset: 2,
-        header: Some(Shape::gradient(0xFF4C_92F2, 0xFF1F_63D8, 0xFF19_58CC, 0xFF15_4FC0, 0.4).radius(6.0)),
+        header: Some(Shape::gradient(0xD84C_92F2, 0xD01F_63D8, 0xD019_58CC, 0xD815_4FC0, 0.4).radius(6.0)),
         header_h: 46,
         header_fg: 0x00FF_FFFF,
         banner: None,
         banner_w: 0,
         banner_fg: 0,
-        items_bg: 0x00FF_FFFF,
+        items_bg: 0xC0FF_FFFF,
         items_fg: 0x0000_0000,
-        side_bg: Some(0x00D3_E5FA),
+        side_bg: Some(0xA8D3_E5FA),
         side_fg: 0x0000_1E5A,
         hover: Shape::solid(0xFF31_6AC5).radius(2.0),
         hover_fg: 0x00FF_FFFF,
-        footer: Some(Shape::gradient(0xFF2A_6FE0, 0xFF19_58CC, 0xFF19_58CC, 0xFF14_4AB8, 1.0)),
+        footer: Some(Shape::gradient(0xD02A_6FE0, 0xD019_58CC, 0xD019_58CC, 0xD814_4AB8, 1.0)),
         footer_h: 30,
         separator: 0x00C5_D4EA,
     },
@@ -510,7 +522,7 @@ pub static NINES: Theme = Theme {
         banner: Some(Shape::gradient(0xFF10_84D0, 0xFF0A_246A, 0xFF0A_246A, 0xFF00_0080, 1.0)),
         banner_w: 24,
         banner_fg: 0x00D4_D0C8,
-        items_bg: 0x00D4_D0C8,
+        items_bg: 0xFFD4_D0C8,
         items_fg: 0x0000_0000,
         side_bg: None,
         side_fg: 0x0000_0000,

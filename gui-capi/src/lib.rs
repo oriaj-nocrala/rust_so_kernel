@@ -186,6 +186,7 @@ pub struct GuiDrawOp {
     shape_shadow_dy: i32,
     shape_horizontal: u32,
     premul: u32,
+    shape_backdrop_blur: f32,
 }
 
 unsafe fn get<'a>(c: *mut GuiComp) -> &'a mut GuiComp {
@@ -408,6 +409,7 @@ pub unsafe extern "C" fn gui_draw_get(c: *const GuiComp, i: usize, out: *mut Gui
             (o.shape_radius, o.shape_border, o.shape_split, o.shape_shadow_blur) = (shape.radius, shape.border, shape.split, shape.shadow_blur);
             (o.shape_c, o.shape_border_color, o.shape_shadow_color) = (shape.c, shape.border_color, shape.shadow_color);
             (o.shape_shadow_dx, o.shape_shadow_dy, o.shape_horizontal) = (shape.shadow_dx, shape.shadow_dy, shape.horizontal as u32);
+            o.shape_backdrop_blur = shape.backdrop_blur;
         }
     }
     *out = o;

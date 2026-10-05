@@ -39,6 +39,7 @@
 #define GUIW_EV_RESIZE 6           // surface: (w, h)
 #define GUIW_EV_CLOSE 7            // surface: ()
 #define GUIW_EV_THEME 11           // surface (the panel): (name)
+#define GUIW_EV_POPUP_DONE 12      // surface (a popup): ()
 #define GUIW_EV_DONE 0             // callback: (ms)
 
 // ── Encoding ─────────────────────────────────────────────────────────────
@@ -141,6 +142,11 @@ static void guiw_lock_pointer(struct guiw_out *o, uint32_t surface, int on) {
 // The panel role: a strip `height` pixels tall along the bottom (before the surface is mapped). It gets the window list and the theme.
 static void guiw_set_panel(struct guiw_out *o, uint32_t surface, int32_t height) {
     guiw_begin(o, surface, 8); guiw_put(o, (uint32_t)height); guiw_end(o);
+}
+// The popup role (before the surface is mapped): shown at (x, y) of `parent`'s content, above everything, never focused; a click outside
+// or Escape hides it (GUIW_EV_POPUP_DONE).
+static void guiw_set_popup(struct guiw_out *o, uint32_t surface, uint32_t parent, int32_t x, int32_t y) {
+    guiw_begin(o, surface, 10); guiw_put(o, parent); guiw_put(o, (uint32_t)x); guiw_put(o, (uint32_t)y); guiw_end(o);
 }
 
 // ── Decoding ─────────────────────────────────────────────────────────────

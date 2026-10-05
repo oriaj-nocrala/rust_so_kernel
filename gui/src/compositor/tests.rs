@@ -1619,6 +1619,9 @@ fn shapes_scale_with_the_screen() {
     let d = s.scaled(2);
     assert_eq!((d.radius, d.border, d.shadow_blur, d.shadow_dy), (2.0 * s.radius, 2.0 * s.border, 2.0 * s.shadow_blur, 2 * s.shadow_dy));
     assert_eq!((d.c, d.split, d.shadow_color), (s.c, s.split, s.shadow_color));
+    let g = theme::LUNA.taskbar.bar.scaled(2);
+    assert_eq!(g.backdrop_blur, 2.0 * theme::LUNA.taskbar.bar.backdrop_blur, "the glass's blur too");
+    assert!(theme::LUNA.menu.frame.backdrop_blur > 0.0 && theme::NINES.taskbar.bar.backdrop_blur == 0.0, "Luna is glass, 9x is not");
 }
 
 // A: on a 1080p screen (scale 2) every length of the look doubles where the draw list uses it: the frame's reach and shape, the bar, the
@@ -1747,10 +1750,12 @@ fn compose_paints_the_strip_under_a_transparent_panel() {
     let strip = Rect::new(0, H - 20, W, 20);
     let bar = theme::LUNA.taskbar.bar;
     for (x, y) in [(10, H - 20), (10, H - 10), (W - 1, H - 1)] {
-        let c = bar.pixel(strip, x, y);
-        let want = [c[0], c[1], c[2]].map(|v| (v * 255.0 + 0.5) as u32);
-        assert_eq!(h.px(x, y) & 0x00FF_FFFF, want[0] << 16 | want[1] << 8 | want[2], "({x}, {y})");
+        // the strip is translucent (glass): over the desktop, as it is (the CPU painter does not blur)
+        let mut p = [h.desktop(x, y)];
+        bar.paint(&mut p, 1, Rect::new(0, 0, 1, 1), Rect::new(strip.x - x, strip.y - y, strip.w, strip.h));
+        assert_eq!(h.px(x, y), p[0] & 0x00FF_FFFF, "({x}, {y})");
     }
+    assert!(bar.c[0] >> 24 < 0xFF && bar.backdrop_blur > 0.0, "Luna's taskbar is glass");
     assert_ne!(h.px(10, H - 20), h.px(10, H - 2), "a gradient: the top differs from the bottom");
     assert_eq!(h.px(10, H - 21), h.desktop(10, H - 21), "nothing above the strip");
 }

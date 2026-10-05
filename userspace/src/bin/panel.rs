@@ -364,12 +364,20 @@ impl Panel {
                 px[y as usize * w + r.x as usize..][..r.w as usize].fill(0xFF00_0000 | c);
             }
         };
-        // the backgrounds
+        // the backgrounds: the columns may be translucent (Luna's glass shows through), stored premultiplied
         let m = &self.theme.menu;
         px.fill(0);
-        fill(px, l.left, m.items_bg);
+        let column = |px: &mut [u32], r: Rect, c: u32| {
+            let a = c >> 24;
+            let p = a << 24 | ((c >> 16 & 255) * a / 255) << 16 | ((c >> 8 & 255) * a / 255) << 8 | (c & 255) * a / 255;
+            let Some(r) = r.intersect(&all) else { return };
+            for y in r.y..r.bottom() {
+                px[y as usize * w + r.x as usize..][..r.w as usize].fill(p);
+            }
+        };
+        column(px, l.left, m.items_bg);
         if let (Some(r), Some(c)) = (l.side, m.side_bg) {
-            fill(px, r, c);
+            column(px, r, c);
         }
         if let (Some(r), Some(sh)) = (l.header, m.header) {
             sh.scaled(k).paint(px, w, all, r);

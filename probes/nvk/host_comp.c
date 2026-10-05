@@ -263,7 +263,7 @@ static struct cr_op shape_op(const struct gui_draw_op *d) {
    struct cr_op o = { .kind = CR_SHAPE, .x = d->x, .y = d->y, .w = d->w, .h = d->h };
    o.shape = (struct cr_shape){ .radius = d->shape_radius, .border = d->shape_border, .split = d->shape_split, .shadow_blur = d->shape_shadow_blur,
       .border_color = d->shape_border_color, .shadow_color = d->shape_shadow_color, .shadow_dx = d->shape_shadow_dx, .shadow_dy = d->shape_shadow_dy,
-      .horizontal = d->shape_horizontal, .clip_x = d->clip_x, .clip_y = d->clip_y, .clip_w = d->clip_w, .clip_h = d->clip_h };
+      .horizontal = d->shape_horizontal, .backdrop_blur = d->shape_backdrop_blur, .clip_x = d->clip_x, .clip_y = d->clip_y, .clip_w = d->clip_w, .clip_h = d->clip_h };
    memcpy(o.shape.c, d->shape_c, sizeof(o.shape.c));
    return o;
 }
@@ -689,6 +689,35 @@ int main(int argc, char **argv) {
       for (size_t i = 0; i < gui_draw_count(g); i++)
          if (gui_draw_get(g, i, &d) == 0 && d.kind == GUI_DRAW_SHAPE && d.x == 0 && d.y == H - ph && d.w == W && d.h == ph) strip++;
       CHECK(strip == 1, "the taskbar's strip is a shape under the panel (%d)", strip);
+      CHECK(comp.glass_count == 1, "Luna's taskbar is glass: one blurred backdrop (%u)", comp.glass_count);
+
+      /* glass doing its job: the GPU window dragged down behind the taskbar, and a popup of the panel (a menu: a translucent white
+       * column with dark rows, as the panel draws it) over the windows */
+      gui_pointer_motion(g, 2 * W, 2 * H);
+      gui_pointer_motion(g, -(W - 60), -(H - 76));            /* back to the GPU window's title bar */
+      gui_pointer_button(g, 0x110, 1);
+      gui_pointer_motion(g, 200, 220);
+      gui_pointer_button(g, 0x110, 0);
+      const int mw = 180, mh = 150;
+      int mfd = memfd_create("menu", 0);
+      ftruncate(mfd, mw * mh * 4);
+      uint32_t *mpx = mmap(NULL, (size_t)mw * mh * 4, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+      for (int y = 0; y < mh; y++)
+         for (int x = 0; x < mw; x++)
+            mpx[y * mw + x] = (x < 2 || y < 2 || x >= mw - 2 || y >= mh - 2) ? 0 : ((y / 12) % 2 && x > 10 && x < 90 && y % 12 > 4 && y % 12 < 8) ? 0xff202020u : 0xc0c0c0c0u;
+      memset(&o, 0, sizeof(o));
+      guiw_create_surface(&o, 9);
+      guiw_set_popup(&o, 9, 4, 0, -mh);
+      guiw_create_pool(&o, 10, dup(mfd), (uint32_t)(mw * mh * 4));
+      guiw_create_buffer(&o, 10, 11, 0, mw, mh, mw * 4, GUIW_FORMAT_ARGB8888);
+      guiw_attach(&o, 9, 11);
+      guiw_commit(&o, 9);
+      send_out(pc, &o);
+      failures += frame(&v, &comp, dir, "5f-glass") != 0;
+      CHECK(comp.glass_count == 2, "the taskbar and the menu: two blurred backdrops (%u)", comp.glass_count);
+      gui_key(g, 1, 1);   /* Escape: the popup goes */
+      gui_key(g, 1, 0);
+
       CHECK(gui_set_theme(g, "9x") == 0, "the 9x look");
       failures += frame(&v, &comp, dir, "5e-9x") != 0;
       CHECK(gui_set_theme(g, "flat") == -1, "there is no flat look any more");

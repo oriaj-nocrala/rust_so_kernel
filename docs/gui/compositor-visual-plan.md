@@ -1,8 +1,8 @@
 # GPU compositor visual plan (vk_comp): primitives, themes, icons
 
-Agreed 2026-10-05. Steps 1, 2, 2b (taskbar), 2c (start menu) and 2d (no flat look) done and seen
-on the Ryzen up to 2c (both looks kept: the user likes both, and picks in the start menu). Step 3
-(glass) next. Start here without other context.
+Agreed 2026-10-05. Steps 1, 2, 2b (taskbar), 2c (start menu), 2d (no flat look) and 3 (glass) done,
+seen on the Ryzen up to 2c (both looks kept: the user likes both, and picks in the start menu).
+Step 4 (icons) next. Start here without other context.
 
 ## Where it stands
 
@@ -132,8 +132,19 @@ Decide by seeing them: build the engine, then switch themes on the real screen.
    console keyboard grab, Ctrl+Alt+Backspace, starting the panel. Until then the CPU compositor is
    a test bench and fallback only: no features of its own (glass is drawn there as its tint,
    without blur).
-3. **Glass / blur behind** for the taskbar and start menu: copy what is behind, two-pass blur,
-   tint. Costlier; measure on the Ryzen (`cr_stats` render_us).
+3. **Glass / blur behind** — done on the host, not yet on the Ryzen. `cr_shape.backdrop_blur` (and
+   `gui::theme::Shape::glass`): at such a shape the renderer pauses the frame, copies the region
+   behind it (its box in its clip, grown by the radius) out of the target into a buffer, blurs it
+   with `blur.comp` in two Gaussian passes (sigma radius / 2) and draws the fill over that copy
+   (`comp.frag` mode 3, `misc.w` bit 1). Up to 4 per frame; the swapchain images need
+   `TRANSFER_SRC` (else glass is unblurred, and vk-comp says so); `cr_stats.glass` counts them.
+   Luna's taskbar strip (blue, ~78%, radius 10) and menu frame (radius 14) are glass, its menu
+   columns translucent (white 75%, light blue 66%) and its header/footer slightly so; 9x stays
+   opaque. The CPU painter draws the tint over what is behind as it is (no blur). Proof:
+   `host_comp.c` (its own blur reference; `5c-shapes` checks a glass smooths what is behind it,
+   `5d-luna` one backdrop, `5f-glass` a window dragged behind the taskbar and a menu-like popup:
+   two), 22 renderer mutants killed (6 of the glass). Left: measure `render` on the Ryzen with the
+   menu open (two blurs of ~1280 x 60 and ~350 x 400 per frame).
 4. **Icons**: the user generates them with a local image model. Generate at 256 px on a
    transparent (or flat, keyed-out) background, one shared prompt (light from the top left, 3/4
    view, same palette) so the set is coherent; store in the theme layout (16/32/48/256).
