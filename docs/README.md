@@ -34,6 +34,7 @@ docs/
 ├── gpu/gpu-plan.md           ← NVIDIA RTX 3050 plan: EDID, vblank, GSP boot, modeset via RM, copy engine
 ├── gpu/g5-*.md               ← graphics stack on NVK (plan, layer-4 handoff, and `g5-layer4-session-report-2026-10-01.md`: bugs, dead ends, mistakes, recipes)
 ├── gpu/hw-cursor-plan.md     ← design (not started): the display engine's cursor channel instead of a quad in the compositor's frame
+├── blog/                     ← write-ups for outside readers (`gsp-to-vulkan.md`: the GPU driver, GSP-RM to Vulkan)
 ├── drivers/                  ← the device-driver subsystem (current focus)
 │   ├── README.md             ← driver-docs index
 │   ├── architecture.md       ← where we are: the trait/seam design, today
