@@ -40,7 +40,9 @@ docs/
 │   ├── architecture.md       ← where we are: the trait/seam design, today
 │   └── roadmap.md            ← where we're going: toward a Linux-class driver model
 ├── gui/compositor-visual-plan.md ← vk_comp looks: renderer primitives → themes (Luna 2026 / 9x) → glass → icons → real 3D icons
-├── userland/roadmap.md       ← agreed order: HTTPS client → dynamic linking → Claude Code (scope) → browser
+├── ai/                       ← handoffs, not started: `llm-as-ui-plan.md` (agent interface layer), `threejs-runtime-plan.md` (unmodified three.js on wgpu/NVK), `capabilities-plan.md` (Capsicum-style, first security model)
+├── userland/roadmap.md       ← agreed order: HTTPS client → dynamic linking → Claude Code (scope) → browser; musl-only (mlibc retired)
+├── userland/init-plan.md     ← handoff, not started: minimal Rust PID 1 + BusyBox runit (needs mkfifo, flock)
 ├── busybox-integration.md    ← legacy: BusyBox/ash bring-up log (see note below)
 └── *.png                     ← screenshots referenced by the repo-root README.md
 ```

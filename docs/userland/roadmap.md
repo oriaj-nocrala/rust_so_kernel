@@ -1,4 +1,4 @@
-# Userland roadmap: HTTPS, dynamic linking, Claude Code, a browser
+# Userland roadmap: HTTPS, dynamic linking, Claude Code, a browser, one libc
 
 Agreed order (2026-10-05), shortest and most enabling first. Each step is useful on its own
 and unblocks the next. GPU work is out of this list (it depends on the Ryzen).
@@ -40,3 +40,36 @@ the list against `docs/reference/syscalls.md`. Decide after seeing the gap.
 2. `links -g`: graphics mode drawing on the framebuffer, no toolkit.
 3. NetSurf (framebuffer frontend) for something closer to a real browser.
 Chromium/Firefox: out of reach for a long time.
+
+## 5. One libc: musl only, mlibc retired gradually (not started)
+
+Why (2026-10-07):
+- The kernel speaks Linux's ABI (G1 closed: `linux-abi` skill), so unmodified musl binaries run.
+  mlibc was the right choice for a kernel with its own ABI; it no longer is.
+- Two libcs today: mlibc (+ the `constanos-sysdeps` port) for the 67 C programs in
+  `userspace/c/`, BusyBox, ncurses, DOOM, Quake; static musl for Rust std programs and
+  Mesa/NVK (`docs/gpu/phase7-3d-decision.md`, G3). Step 2 (dynamic linking) uses musl's `ld.so`.
+- mlibc's ABI headers differing from Linux caused many bugs (`docs/reference/userspace.md`), and
+  some still differ. **termios is the live one**: the kernel uses the port's own layout
+  (`kernel/src/tty.rs`, `docs/reference/syscalls.md`), so a musl program's `tcgetattr` gets
+  the wrong struct today.
+- BusyBox is built without `__linux__` (`docs/reference/userspace.md`); with musl it gets its
+  normal Linux code paths.
+
+Order (each step leaves everything working):
+1. **Kernel to Linux's layout where it still follows mlibc** (termios/winsize first), switching
+   the mlibc port's matching `abi-bits` to `mlibc/abis/linux/` in the same change, so both libcs
+   agree while they coexist. Audit the rest of the port's headers against `mlibc/abis/linux/`.
+2. **A musl sysroot for C** (clang `--target=x86_64-linux-musl`, static), next to `sysroot/`.
+   Move the raw-syscall C tests first (`scripts/run-abi-suite.sh` must stay green on both).
+3. **BusyBox on musl** with a standard config (`__linux__` defined). Expect missing syscalls and
+   `/proc` files: that is useful G1-style work, not a reason to stop.
+4. ncurses, DOOM, Quake, cmatrix, the GUI C headers (`gui-capi`, `constanos_gui*.h`).
+5. Remove mlibc: the submodule, `mlibc-port/`, `scripts/setup-mlibc.sh`, `sysroot/`, and the
+   kernel code that exists only for it (grep `mlibc` in `kernel/src`: e.g. the `TCGETS`-with-null
+   `isatty` path in `syscall/fs.rs`). Update the `userspace-programs` skill and docs.
+
+6. **Then the Rust no_std programs** in `userspace/src/bin` (target `x86_64-constanos.json`, raw
+   syscalls, no libc) move to Rust std on musl too (decided 2026-10-07), so one toolchain and one
+   ABI cover all of userspace.
+The upstream mlibc PR (managarm/mlibc#1925) is unaffected.
