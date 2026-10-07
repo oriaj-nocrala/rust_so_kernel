@@ -13,7 +13,8 @@ What the machine needs:
 
 - **UEFI** (no legacy BIOS boot) and **Secure Boot off** (the loader is not signed).
 - An x86-64 CPU and 2 GiB of RAM or more.
-- The disk where the kernel can read it: a **USB stick** (xHCI), or in a VM the **secondary IDE channel**.
+- The disk where the kernel can read it: a **USB stick** (xHCI; in a VM, a disk on a USB controller),
+  or the **secondary IDE channel** (works, but crashes under load for now).
   There is no SATA/AHCI or NVMe driver: a VM's default SATA disk boots the kernel but leaves `/mnt`
   empty, and the screen says so in red.
 
@@ -32,22 +33,24 @@ virtio-net (DHCP), and writes the kernel log to `constanos-serial.log` next to t
 
 ## VirtualBox (7.x)
 
-Run from the directory holding `constanos.vmdk` (Windows: `"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"`
-in PowerShell, same arguments):
+Tested on VirtualBox 7.2. Run from the directory holding `constanos.vmdk` (Windows:
+`"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"` in PowerShell, same arguments):
 
 ```bash
 VBoxManage createvm --name constanos --ostype Other_64 --register
 VBoxManage modifyvm constanos --firmware efi --memory 4096 --cpus 4 --ioapic on \
   --graphicscontroller vmsvga --mouse ps2 --keyboard ps2 \
   --audio-controller ac97 --audio-enabled on --audio-out on \
-  --nic1 none --usb-xhci off \
+  --nic1 none --usb-xhci on \
   --uart1 0x3F8 4 --uart-mode1 file "$PWD/constanos-serial.log"
-VBoxManage storagectl constanos --name IDE --add ide --controller PIIX4
-VBoxManage storageattach constanos --storagectl IDE --port 1 --device 0 --type hdd --medium "$PWD/constanos.vmdk"
+VBoxManage storagectl constanos --name USB --add usb --controller USB
+VBoxManage storageattach constanos --storagectl USB --port 0 --device 0 --type hdd --medium "$PWD/constanos.vmdk"
 VBoxManage startvm constanos
 ```
 
-- **Port 1, device 0 = secondary master.** That is where the kernel looks for its disk.
+- **The disk goes on a USB controller** (with xHCI on): the kernel sees it as a USB stick, the way
+  the real machine boots. An IDE disk (secondary master) also mounts, but the IDE path still crashes
+  under load (a TLB shootdown panic within seconds of many programs starting at once), so use USB.
 - **PS/2 mouse**, not the USB tablet: the kernel reads relative motion only.
 - **AC97** gives DOOM and Quake sound. There is no network in VirtualBox (no e1000 driver).
 
@@ -74,7 +77,9 @@ ethernet0.present = "FALSE"
 sound.present = "FALSE"
 ```
 
-`ide1:0` is the secondary master. No sound (VMware has no AC97) and no network.
+`ide1:0` is the secondary master. No sound (VMware has no AC97) and no network. **Not tested, and
+fragile:** VMware cannot present a disk as a USB stick, so this uses the IDE path, which crashes under
+load in VirtualBox (see above). Prefer VirtualBox or QEMU until that is fixed.
 
 ## A real machine (USB stick)
 
