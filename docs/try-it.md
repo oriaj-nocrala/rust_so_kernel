@@ -14,7 +14,7 @@ What the machine needs:
 - **UEFI** (no legacy BIOS boot) and **Secure Boot off** (the loader is not signed).
 - An x86-64 CPU and 2 GiB of RAM or more.
 - The disk where the kernel can read it: a **USB stick** (xHCI; in a VM, a disk on a USB controller),
-  or the **secondary IDE channel** (works, but crashes under load for now).
+  or the **secondary IDE channel**.
   There is no SATA/AHCI or NVMe driver: a VM's default SATA disk boots the kernel but leaves `/mnt`
   empty, and the screen says so in red.
 
@@ -49,8 +49,8 @@ VBoxManage startvm constanos
 ```
 
 - **The disk goes on a USB controller** (with xHCI on): the kernel sees it as a USB stick, the way
-  the real machine boots. An IDE disk (secondary master) also mounts, but the IDE path still crashes
-  under load (a TLB shootdown panic within seconds of many programs starting at once), so use USB.
+  the real machine boots. An IDE disk on the secondary master works too (tested in VirtualBox the
+  same way, and the only choice in VMware), but USB is the path the real machine uses.
 - **PS/2 mouse**, not the USB tablet: the kernel reads relative motion only.
 - **AC97** gives DOOM and Quake sound. There is no network in VirtualBox (no e1000 driver).
 
@@ -77,9 +77,9 @@ ethernet0.present = "FALSE"
 sound.present = "FALSE"
 ```
 
-`ide1:0` is the secondary master. No sound (VMware has no AC97) and no network. **Not tested, and
-fragile:** VMware cannot present a disk as a USB stick, so this uses the IDE path, which crashes under
-load in VirtualBox (see above). Prefer VirtualBox or QEMU until that is fixed.
+`ide1:0` is the secondary master. No sound (VMware has no AC97) and no network. **Not tested in VMware
+itself:** VMware cannot present a disk as a USB stick, so this uses the IDE path, which passes the same
+load in VirtualBox.
 
 ## A real machine (USB stick)
 

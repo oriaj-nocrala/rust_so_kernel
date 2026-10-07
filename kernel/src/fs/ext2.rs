@@ -311,6 +311,25 @@ pub fn is_read_only() -> bool {
 /// (not panics) on any problem — a missing or unreadable disk shouldn't
 /// take down boot, just leave `/mnt` unmounted.
 pub fn init() -> Result<(), &'static str> {
+    // The block cache's lock (`hal::blockcache`) is reached with IF=0 from
+    // `sys_read` (fd-table lock): held with interrupts off, so its holder is
+    // never preempted, and spun for answering TLB shootdowns.
+    hal::blockcache::set_lock_hooks(hal::blockcache::LockHooks {
+        irq_save: || {
+            let were_on = x86_64::instructions::interrupts::are_enabled();
+            x86_64::instructions::interrupts::disable();
+            were_on
+        },
+        irq_restore: |were_on| {
+            if were_on {
+                x86_64::instructions::interrupts::enable();
+            }
+        },
+        relax: || {
+            crate::memory::tlb::service_pending();
+            core::hint::spin_loop();
+        },
+    });
     // The boot pendrive first: on the target machine it is the only disk
     // there is (no IDE), and in QEMU it is only present when asked for
     // (`QEMU_USB_STORAGE`), so the ATA path below still serves every

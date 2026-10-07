@@ -49,9 +49,21 @@ fn wait_400ns() {
     }
 }
 
+/// One step of a busy-wait on the drive. The driver runs with IF=0 when
+/// `sys_read` reaches it (fd-table lock), and in a VM every port access is a
+/// VM exit: a whole PIO transfer is long enough that a TLB-shootdown sender
+/// on another CPU must not be left waiting for this one (CLAUDE.md: every
+/// busy-wait with IF=0 calls `service_pending`).
+fn relax() {
+    if !x86_64::instructions::interrupts::are_enabled() {
+        crate::memory::tlb::service_pending();
+    }
+}
+
 fn wait_not_busy() -> Result<(), &'static str> {
     let mut status: Port<u8> = Port::new(COMMAND_STATUS);
     for _ in 0..1_000_000u32 {
+        relax();
         let s = unsafe { status.read() };
         if s & STATUS_BSY == 0 {
             if s & STATUS_ERR != 0 {
@@ -66,6 +78,7 @@ fn wait_not_busy() -> Result<(), &'static str> {
 fn wait_drq() -> Result<(), &'static str> {
     let mut status: Port<u8> = Port::new(COMMAND_STATUS);
     for _ in 0..1_000_000u32 {
+        relax();
         let s = unsafe { status.read() };
         if s & STATUS_ERR != 0 {
             return Err("ata: ERR set while waiting for DRQ");
@@ -85,6 +98,13 @@ fn wait_drq() -> Result<(), &'static str> {
 /// documented here since it's a sharp edge in the ATA spec itself, not
 /// something this driver adds.
 pub fn read_sectors(lba: u32, count: u8, buf: &mut [u8]) -> Result<(), &'static str> {
+    // `ATA_LOCK` is held with interrupts off: a holder preempted in a
+    // transfer left every CPU spinning for it with IF=0 (readers come from
+    // `sys_read` under the fd-table lock), so nothing ever ran it again.
+    x86_64::instructions::interrupts::without_interrupts(|| read_sectors_irqs_off(lba, count, buf))
+}
+
+fn read_sectors_irqs_off(lba: u32, count: u8, buf: &mut [u8]) -> Result<(), &'static str> {
     let n = if count == 0 { 256 } else { count as usize };
     assert!(buf.len() >= n * SECTOR_SIZE, "ata::read_sectors: buf too small");
     assert!(lba & 0xF000_0000 == 0, "ata::read_sectors: LBA28 overflow");
@@ -136,6 +156,13 @@ pub fn read_sectors(lba: u32, count: u8, buf: &mut [u8]) -> Result<(), &'static 
 /// this returns — matters once `fs::ext2` starts persisting bitmaps and
 /// inodes here, unlike the read-only path this driver started as.
 pub fn write_sectors(lba: u32, count: u8, buf: &[u8]) -> Result<(), &'static str> {
+    // `ATA_LOCK` is held with interrupts off: a holder preempted in a
+    // transfer left every CPU spinning for it with IF=0 (readers come from
+    // `sys_read` under the fd-table lock), so nothing ever ran it again.
+    x86_64::instructions::interrupts::without_interrupts(|| write_sectors_irqs_off(lba, count, buf))
+}
+
+fn write_sectors_irqs_off(lba: u32, count: u8, buf: &[u8]) -> Result<(), &'static str> {
     let n = if count == 0 { 256 } else { count as usize };
     assert!(buf.len() >= n * SECTOR_SIZE, "ata::write_sectors: buf too small");
     assert!(lba & 0xF000_0000 == 0, "ata::write_sectors: LBA28 overflow");
@@ -191,7 +218,9 @@ pub fn write_sectors(lba: u32, count: u8, buf: &[u8]) -> Result<(), &'static str
 /// Used by `fs::ext2::init` to fail fast with a clear message instead of
 /// spinning through `wait_not_busy`'s full timeout when no disk is attached.
 pub fn present() -> bool {
-    let _guard = ATA_LOCK.lock();
-    let mut status: Port<u8> = Port::new(COMMAND_STATUS);
-    unsafe { status.read() != 0xFF }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _guard = ATA_LOCK.lock();
+        let mut status: Port<u8> = Port::new(COMMAND_STATUS);
+        unsafe { status.read() != 0xFF }
+    })
 }

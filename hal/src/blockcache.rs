@@ -25,10 +25,25 @@
 //
 // Coherence is by construction, not by convention: the wrapped device is
 // owned here, so every write passes through `write_sectors`, which writes
-// the device first and then updates whichever chunks are cached. The lock
-// is held across the device request so that a read racing a write cannot
-// insert data the write has already superseded (ext2's read paths do not
-// take its own mutation lock).
+// the device first and then updates whichever chunks are cached.
+//
+// The lock is NOT held across a device request. It is a spin lock that
+// callers reach with interrupts off (the kernel's `sys_read` holds the
+// fd-table lock), and a device request can take long: on the ATA disk of a
+// VM every port access is a VM exit, and holding the lock across a 64 KiB
+// PIO read left the other CPUs spinning with IF=0 for over a second, deaf
+// to TLB shootdowns (VirtualBox, 2026-10-07: a panic within seconds of a
+// burst of `exec`s). Instead a miss notes the write generation, drops the
+// lock, reads, and caches what it read only if no write finished in the
+// meantime (ext2's read paths do not take its own mutation lock, so a read
+// can race a write; the reader still gets the device's answer, which is
+// one of the two orders). Writes must be serialized by the caller (ext2
+// holds its mutation lock across them): two overlapping writes could
+// otherwise update the cache in the opposite order to the device.
+//
+// The lock itself is taken through [`set_lock_hooks`]: the kernel disables
+// interrupts while it is held (so its holder is never preempted) and
+// answers TLB shootdowns while spinning for it.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -58,6 +73,31 @@ pub const MAX_CACHE_CHUNKS: usize = 128 * 1024;
 pub fn default_cache_chunks(ram_bytes: u64) -> usize {
     let chunks = ram_bytes / 8 / CHUNK_BYTES as u64;
     chunks.clamp(MIN_CACHE_CHUNKS as u64, MAX_CACHE_CHUNKS as u64) as usize
+}
+
+/// How the cache's lock meets the kernel's interrupt and SMP rules: `irq_save` disables interrupts and returns whether they
+/// were on, `irq_restore` puts that back, `relax` runs on every failed attempt to take the lock (the kernel answers TLB
+/// shootdowns there; it must not take a lock). Without [`set_lock_hooks`] (host tests) all three do nothing.
+#[derive(Clone, Copy)]
+pub struct LockHooks {
+    pub irq_save: fn() -> bool,
+    pub irq_restore: fn(bool),
+    pub relax: fn(),
+}
+
+static LOCK_HOOKS: spin::Once<LockHooks> = spin::Once::new();
+
+/// Installs the hooks for every cache, once, before the first mount.
+pub fn set_lock_hooks(hooks: LockHooks) {
+    LOCK_HOOKS.call_once(|| hooks);
+}
+
+fn hooks() -> LockHooks {
+    LOCK_HOOKS.get().copied().unwrap_or(LockHooks {
+        irq_save: || false,
+        irq_restore: |_| {},
+        relax: core::hint::spin_loop,
+    })
 }
 
 /// Counters, read with [`CachedDevice::stats`].
@@ -99,6 +139,9 @@ struct State {
     scratch: Vec<u8>,
     /// Chunks the cache may hold: [`CachedDevice::set_max_chunks`] moves it.
     max_chunks: usize,
+    /// Bumped by every write once it has reached the device: a miss caches
+    /// what it read only if this did not move while it was reading.
+    write_gen: u64,
 }
 
 impl State {
@@ -141,6 +184,7 @@ impl CachedDevice {
                 hand: 0,
                 scratch: Vec::new(),
                 max_chunks: max_chunks.max(1),
+                write_gen: 0,
             }),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -162,26 +206,62 @@ impl CachedDevice {
 
     /// Chunks cached right now.
     pub fn cached_chunks(&self) -> usize {
-        self.state.lock().slots.len()
+        self.locked(|st| st.slots.len())
     }
 
     /// The most chunks the cache may hold.
     pub fn max_chunks(&self) -> usize {
-        self.state.lock().max_chunks
+        self.locked(|st| st.max_chunks)
     }
 
     /// Changes the ceiling. Growing is free (storage is allocated as the cache fills); shrinking drops the newest slots at once
     /// and gives their storage back. What stays is still valid: slots are independent, and the CLOCK hand wraps on its own.
     pub fn set_max_chunks(&self, max_chunks: usize) {
-        let mut st = self.state.lock();
-        st.max_chunks = max_chunks.max(1);
-        while st.slots.len() > st.max_chunks {
-            let last = st.slots.len() - 1;
-            Self::remove_slot(&mut st, last);
-        }
-        let segments = st.slots.len().div_ceil(SEGMENT_CHUNKS);
-        st.segments.truncate(segments);
-        st.segments.shrink_to_fit();
+        self.locked(|st| {
+            st.max_chunks = max_chunks.max(1);
+            while st.slots.len() > st.max_chunks {
+                let last = st.slots.len() - 1;
+                Self::remove_slot(st, last);
+            }
+            let segments = st.slots.len().div_ceil(SEGMENT_CHUNKS);
+            st.segments.truncate(segments);
+            st.segments.shrink_to_fit();
+        })
+    }
+
+    /// Whether nobody holds the lock right now.
+    #[cfg(test)]
+    fn lock_is_free(&self) -> bool {
+        self.state.try_lock().is_some()
+    }
+
+    /// Every slot is indexed, under its own chunk, exactly once.
+    #[cfg(test)]
+    fn assert_consistent(&self) {
+        self.locked(|st| {
+            assert_eq!(st.index.len(), st.slots.len(), "a slot is not indexed (one chunk cached twice?)");
+            for (i, slot) in st.slots.iter().enumerate() {
+                assert_eq!(st.index.get(&slot.chunk), Some(&i), "slot {} (chunk {}) is not the indexed one", i, slot.chunk);
+            }
+        })
+    }
+
+    /// Runs `f` under the lock, taken through the [`LockHooks`]. Never
+    /// around a device request.
+    fn locked<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
+        let h = hooks();
+        let were_on = (h.irq_save)();
+        let r = {
+            let mut st = loop {
+                if let Some(g) = self.state.try_lock() {
+                    break g;
+                }
+                (h.relax)();
+            };
+            f(&mut st)
+        };
+        (h.irq_restore)(were_on);
+        r
     }
 
     fn chunks_in_capacity(&self) -> u32 {
@@ -195,49 +275,36 @@ impl CachedDevice {
         self.inner.read_sectors(lba, sectors as u8, buf)
     }
 
-    /// Makes sure `chunk` is cached, reading it plus read-ahead on a miss,
-    /// and returns its slot.
-    fn fill(&self, st: &mut State, chunk: u32) -> Result<usize, &'static str> {
-        if let Some(&i) = st.index.get(&chunk) {
-            st.slots[i].referenced = true;
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(i);
-        }
-
-        // Read-ahead: following chunks, stopping at the first cached one
-        // (never re-read what we have) or the end of the capacity. Never
-        // prefetch more than a quarter of the cache, or a read-ahead would
-        // evict the very chunks being used.
+    /// How many chunks a miss at `chunk` reads: it plus the following ones,
+    /// stopping at the first cached one (never re-read what we have) or the
+    /// end of the capacity. Never more than a quarter of the cache, or a
+    /// read-ahead would evict the very chunks being used.
+    fn readahead_run(&self, st: &State, chunk: u32) -> u32 {
         let limit = self.chunks_in_capacity();
         let max_run = READAHEAD_CHUNKS.min((st.max_chunks / 4).max(1) as u32);
         let mut run = 1u32;
-        while run < max_run
-            && chunk + run < limit
-            && !st.index.contains_key(&(chunk + run))
-        {
+        while run < max_run && chunk + run < limit && !st.index.contains_key(&(chunk + run)) {
             run += 1;
         }
-        if st.scratch.is_empty() {
-            st.scratch = vec![0u8; READAHEAD_CHUNKS as usize * CHUNK_BYTES];
-        }
-        let mut scratch = core::mem::take(&mut st.scratch);
-        let read = self.device_read(chunk * CHUNK_SECTORS, run * CHUNK_SECTORS, &mut scratch[..run as usize * CHUNK_BYTES]);
-        if let Err(e) = read {
-            st.scratch = scratch;
-            return Err(e);
-        }
-        self.misses.fetch_add(1, Ordering::Relaxed);
+        run
+    }
 
-        // Read-ahead chunks first, unreferenced (an unused prefetch is the
-        // first thing CLOCK takes back); the requested chunk last, so no
-        // eviction in this call can pick it.
-        let mut first = 0;
+    /// Caches the `run` chunks a miss at `chunk` read into `data`:
+    /// read-ahead chunks first, unreferenced (an unused prefetch is the
+    /// first thing CLOCK takes back), the requested chunk last, so no
+    /// eviction in this call can pick it. A chunk some other miss cached
+    /// while this one was reading is left as it is: two slots for one chunk
+    /// would leave one of them unindexed, and a write would update only the
+    /// other.
+    fn insert_run(&self, st: &mut State, chunk: u32, run: u32, data: &[u8]) {
         for k in (1..run).chain(core::iter::once(0)) {
-            let bytes = &scratch[k as usize * CHUNK_BYTES..(k as usize + 1) * CHUNK_BYTES];
-            first = self.store(st, chunk + k, k == 0, bytes);
+            let c = chunk + k;
+            if st.index.contains_key(&c) {
+                continue;
+            }
+            let bytes = &data[k as usize * CHUNK_BYTES..(k as usize + 1) * CHUNK_BYTES];
+            self.store(st, c, k == 0, bytes);
         }
-        st.scratch = scratch;
-        Ok(first)
     }
 
     /// Puts `bytes` in a free slot, or the one CLOCK evicts.
@@ -310,20 +377,55 @@ impl BlockDevice for CachedDevice {
         let cached_end = self.chunks_in_capacity() as u64 * CHUNK_SECTORS as u64;
         if end > cached_end {
             self.passthrough.fetch_add(1, Ordering::Relaxed);
-            let _st = self.state.lock(); // order against concurrent writes
             return self.inner.read_sectors(lba, count, buf);
         }
 
-        let mut st = self.state.lock();
         let mut sector = lba;
         while (sector as u64) < end {
             let chunk = sector / CHUNK_SECTORS;
             let off = (sector % CHUNK_SECTORS) as usize;
             let take = ((CHUNK_SECTORS as usize - off) as u64).min(end - sector as u64) as usize;
-            let i = self.fill(&mut st, chunk)?;
             let dst = (sector - lba) as usize * SECTOR_SIZE;
-            buf[dst..dst + take * SECTOR_SIZE]
-                .copy_from_slice(&st.data(i)[off * SECTOR_SIZE..(off + take) * SECTOR_SIZE]);
+            let range = off * SECTOR_SIZE..(off + take) * SECTOR_SIZE;
+
+            // A hit is served under the lock; a miss leaves with the plan.
+            let miss = self.locked(|st| match st.index.get(&chunk) {
+                Some(&i) => {
+                    st.slots[i].referenced = true;
+                    buf[dst..dst + take * SECTOR_SIZE].copy_from_slice(&st.data(i)[range.clone()]);
+                    None
+                }
+                None => Some((self.readahead_run(st, chunk), st.write_gen, core::mem::take(&mut st.scratch))),
+            });
+            let Some((run, gen, mut scratch)) = miss else {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                sector += take as u32;
+                continue;
+            };
+
+            // The device request, unlocked. Another miss running at the same
+            // time found the scratch buffer taken and reads into its own.
+            if scratch.is_empty() {
+                scratch = vec![0u8; READAHEAD_CHUNKS as usize * CHUNK_BYTES];
+            }
+            let read = self.device_read(chunk * CHUNK_SECTORS, run * CHUNK_SECTORS, &mut scratch[..run as usize * CHUNK_BYTES]);
+            if read.is_ok() {
+                buf[dst..dst + take * SECTOR_SIZE].copy_from_slice(&scratch[range]);
+                self.misses.fetch_add(1, Ordering::Relaxed);
+            }
+            let spare = self.locked(|st| {
+                if read.is_ok() && st.write_gen == gen {
+                    self.insert_run(st, chunk, run, &scratch);
+                }
+                if st.scratch.is_empty() {
+                    st.scratch = scratch;
+                    None
+                } else {
+                    Some(scratch)
+                }
+            });
+            drop(spare); // freed outside the lock
+            read?;
             sector += take as u32;
         }
         Ok(())
@@ -334,27 +436,29 @@ impl BlockDevice for CachedDevice {
         if buf.len() < n as usize * SECTOR_SIZE {
             return Err("blockcache: buffer too small");
         }
-        let mut st = self.state.lock();
         let result = self.inner.write_sectors(lba, count, buf);
-        let end = lba as u64 + n as u64;
-        let mut sector = lba;
-        while (sector as u64) < end {
-            let chunk = sector / CHUNK_SECTORS;
-            let off = (sector % CHUNK_SECTORS) as usize;
-            let take = ((CHUNK_SECTORS as usize - off) as u64).min(end - sector as u64) as usize;
-            if let Some(&i) = st.index.get(&chunk) {
-                if result.is_ok() {
-                    let src = (sector - lba) as usize * SECTOR_SIZE;
-                    st.data_mut(i)[off * SECTOR_SIZE..(off + take) * SECTOR_SIZE]
-                        .copy_from_slice(&buf[src..src + take * SECTOR_SIZE]);
-                } else {
-                    // What reached the device is unknown: forget the chunk
-                    // so the next read asks the device.
-                    Self::remove_slot(&mut st, i);
+        self.locked(|st| {
+            st.write_gen += 1;
+            let end = lba as u64 + n as u64;
+            let mut sector = lba;
+            while (sector as u64) < end {
+                let chunk = sector / CHUNK_SECTORS;
+                let off = (sector % CHUNK_SECTORS) as usize;
+                let take = ((CHUNK_SECTORS as usize - off) as u64).min(end - sector as u64) as usize;
+                if let Some(&i) = st.index.get(&chunk) {
+                    if result.is_ok() {
+                        let src = (sector - lba) as usize * SECTOR_SIZE;
+                        st.data_mut(i)[off * SECTOR_SIZE..(off + take) * SECTOR_SIZE]
+                            .copy_from_slice(&buf[src..src + take * SECTOR_SIZE]);
+                    } else {
+                        // What reached the device is unknown: forget the chunk
+                        // so the next read asks the device.
+                        Self::remove_slot(st, i);
+                    }
                 }
+                sector += take as u32;
             }
-            sector += take as u32;
-        }
+        });
         result
     }
 }
@@ -367,10 +471,15 @@ mod tests {
 
     /// Shares one `MemDisk` between the cache and the test, and counts
     /// the requests the cache actually makes.
+    /// Runs once, inside the next device read, after the disk was read:
+    /// what another CPU does while a miss is waiting for the device.
+    type Hook = Arc<spin::Mutex<Option<Box<dyn FnMut() + Send>>>>;
+
     struct Probe {
         disk: Arc<MemDisk>,
         reads: Arc<AtomicU64>,
         fail_writes: bool,
+        hook: Hook,
     }
 
     impl BlockDevice for Probe {
@@ -379,7 +488,12 @@ mod tests {
         }
         fn read_sectors(&self, lba: u32, count: u8, buf: &mut [u8]) -> Result<(), &'static str> {
             self.reads.fetch_add(1, Ordering::Relaxed);
-            self.disk.read_sectors(lba, count, buf)
+            let r = self.disk.read_sectors(lba, count, buf);
+            let hook = self.hook.lock().take();
+            if let Some(mut f) = hook {
+                f();
+            }
+            r
         }
         fn write_sectors(&self, lba: u32, count: u8, buf: &[u8]) -> Result<(), &'static str> {
             if self.fail_writes {
@@ -401,8 +515,23 @@ mod tests {
 
     fn cache(disk: &Arc<MemDisk>, capacity: u32, max_chunks: usize, fail_writes: bool) -> (CachedDevice, Arc<AtomicU64>) {
         let reads = Arc::new(AtomicU64::new(0));
-        let probe = Probe { disk: disk.clone(), reads: reads.clone(), fail_writes };
+        let probe = Probe { disk: disk.clone(), reads: reads.clone(), fail_writes, hook: Hook::default() };
         (CachedDevice::new(Box::new(probe), capacity, max_chunks), reads)
+    }
+
+    /// A cache whose next device read runs `f(cache)` in the middle.
+    fn hooked_cache(disk: &Arc<MemDisk>, f: impl FnOnce(&CachedDevice) + Send + 'static) -> Arc<CachedDevice> {
+        let hook = Hook::default();
+        let probe = Probe { disk: disk.clone(), reads: Arc::new(AtomicU64::new(0)), fail_writes: false, hook: hook.clone() };
+        let c = Arc::new(CachedDevice::new(Box::new(probe), DISK_SECTORS as u32, 64));
+        let weak = Arc::downgrade(&c);
+        let mut f = Some(f);
+        *hook.lock() = Some(Box::new(move || {
+            if let (Some(f), Some(c)) = (f.take(), weak.upgrade()) {
+                f(&c);
+            }
+        }));
+        c
     }
 
     fn read(dev: &dyn BlockDevice, lba: u32, count: u8) -> Vec<u8> {
@@ -595,5 +724,53 @@ mod tests {
         read(&c, 0, 255);
         read(&c, 255, 255);
         assert!(c.cached_chunks() > 20);
+    }
+
+    #[test]
+    fn the_device_is_read_without_the_lock() {
+        // Held across the request, the lock kept other CPUs spinning with
+        // IF=0 through a whole ATA PIO transfer, deaf to TLB shootdowns.
+        let disk = patterned_disk();
+        let free = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let seen = free.clone();
+        let c = hooked_cache(&disk, move |c| seen.store(c.lock_is_free(), Ordering::Relaxed));
+        assert_eq!(read(&*c, 0, 1), read(&*disk, 0, 1));
+        assert!(free.load(Ordering::Relaxed), "the lock was held during the device read");
+    }
+
+    #[test]
+    fn a_read_racing_a_write_does_not_cache_what_the_write_replaced() {
+        // The miss reads the old sectors, then a write lands before it
+        // caches them: they must not be cached, or every later read
+        // returns the old data.
+        let disk = patterned_disk();
+        let new = vec![0xCDu8; 8 * SECTOR_SIZE];
+        let written = new.clone();
+        let c = hooked_cache(&disk, move |c| c.write_sectors(0, 8, &written).unwrap());
+        let racing = read(&*c, 0, 8);
+        assert!(racing == new || racing == read(&*patterned_disk(), 0, 8), "the racing read is one of the two orders");
+        assert_eq!(read(&*disk, 0, 8), new);
+        assert_eq!(read(&*c, 0, 8), new, "the cache kept the sectors the write replaced");
+        c.assert_consistent();
+    }
+
+    #[test]
+    fn a_chunk_cached_during_a_miss_is_not_cached_twice() {
+        // Another miss caches chunk 5 while this one is reading chunks
+        // 0..16. A second slot for chunk 5 would be unindexed, a write
+        // would update only one of them, and evicting the stray one would
+        // unindex the other.
+        let disk = patterned_disk();
+        let c = hooked_cache(&disk, |c| {
+            read(c, 5 * 8, 8);
+        });
+        read(&*c, 0, 1);
+        c.assert_consistent();
+        let data = vec![0x77u8; 8 * SECTOR_SIZE];
+        c.write_sectors(5 * 8, 8, &data).unwrap();
+        for k in 0..32u32 {
+            assert_eq!(read(&*c, k * 8, 8), read(&*disk, k * 8, 8), "chunk {}", k);
+        }
+        c.assert_consistent();
     }
 }

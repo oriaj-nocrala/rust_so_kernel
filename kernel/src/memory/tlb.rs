@@ -43,8 +43,10 @@
 // `BUDDY`, see `unmap_page_and_free_2m_with_buddy`), every kernel
 // `crate::sync::Mutex` spin (its relax strategy — the scheduler's lock
 // among them, since stage 6), and the USB transfer waits, which poll the
-// controller with IF=0 for up to seconds. **A new IF=0 busy-wait must do
-// the same**; `spin::Mutex` itself must not be used in the kernel.
+// controller with IF=0 for up to seconds, the ATA PIO waits, and every
+// `invalidate` (long page-table walks run with IF=0 and call it per page).
+// **A new IF=0 busy-wait or long IF=0 loop must do the same**; `spin::Mutex`
+// itself must not be used in the kernel.
 //
 // The ordering that makes "who has it loaded" safe to read without a lock:
 // a CPU publishes `LOADED[cpu]` *before* writing CR3, and the sender reads
@@ -163,6 +165,13 @@ pub fn this_cpu_ready(cpu: usize) {
 
 fn invalidate(scope: Scope, addr: VirtAddr) {
     x86_64::instructions::interrupts::without_interrupts(|| {
+        // Page-table walks call this once per page with IF=0 for their whole
+        // length (`AddressSpace::fork` marks every page COW under the VMA
+        // `IrqMutex`), and when only this CPU has the table loaded they never
+        // reach `shoot` and its spin. A big fork in QEMU took over a second
+        // that way, deaf to another CPU's shootdown (gdb on a paused panic,
+        // `scripts/tlb-stress.sh`, 2026-10-07): answer here as well.
+        service_pending();
         let (cr3, _) = Cr3::read();
         if htlb::holds(scope, cr3.start_address().as_u64()) {
             tlb::flush(addr);

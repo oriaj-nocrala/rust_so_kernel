@@ -85,7 +85,7 @@ Breaking one of these has cost days of debugging each time. The *why* is kept sh
   - Why: the timer ISR can allocate and can take the scheduler lock. A plain lock held with IF=1 deadlocks one CPU against itself.
 - **`SCHEDULER` (a `sync::Mutex`) is only taken with IF=0.** Use `SchedGuard::lock()`/`with_scheduler`/`with_current_process`, which `cli` first and `sti` after releasing. The `sti` is unconditional, so from code that already runs with IF=0 (ISRs, `sys_exit`) call `scheduler::local_scheduler()` directly.
 - Kernel locks are `crate::sync::Mutex`, **never `spin::Mutex`**: its spin loop answers TLB shootdowns.
-- Any other busy-wait with IF=0 calls `memory::tlb::service_pending`.
+- Any other busy-wait with IF=0 calls `memory::tlb::service_pending`, and so does any long IF=0 loop (`tlb::invalidate` does it per page, which covers page-table walks). A lock a holder may be preempted in must not be spun for with IF=0 by everyone else: take it with interrupts off (`ATA_LOCK`, the block cache's lock).
 - **IF=0 is not mutual exclusion** on SMP; shared state needs a real lock.
 - No new `static mut` or global `UnsafeCell` for shared state. Per-CPU state is indexed by `cpu::cpu_id()`.
 - Lock order: scheduler → address space → `BUDDY`/`SLAB_ALLOCATOR`.
