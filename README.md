@@ -193,6 +193,13 @@ plans elsewhere in `docs/` are still in Spanish.
 
 ## ▶️ Running it
 
+**Without building anything:** download the image from the
+[releases](https://github.com/oriaj-nocrala/rust_so_kernel/releases) and follow
+[docs/try-it.md](docs/try-it.md): QEMU, VirtualBox, VMware or a USB stick, and how to
+send the kernel log with a bug report.
+
+### Building it
+
 Requirements: Rust **nightly** (pinned in `rust-toolchain.toml`),
 `qemu-system-x86_64`, OVMF, `clang`/`llvm`/`lld`, `meson`, `ninja`, `make`,
 `e2fsprogs`, and `curl`/`unzip` to download Freedoom and the Quake shareware.

@@ -332,6 +332,10 @@ pub fn init() -> Result<(), &'static str> {
     if !device.present() {
         return Err("no disk on the secondary IDE channel");
     }
+    let device: Box<dyn BlockDevice> = match crate::block::ata_data_partition() {
+        Some(part) => Box::new(part),
+        None => device,
+    };
     mount_and_repair(device)?;
     // `block::ata` drives the secondary channel through its legacy ports
     // (0x170/0x376), so it never finds its controller on the bus. Claim the

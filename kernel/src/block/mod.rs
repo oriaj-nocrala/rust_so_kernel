@@ -18,7 +18,7 @@ pub mod ata;
 pub mod logpart;
 pub mod usb;
 
-pub use hal::block::{BlockDevice, SECTOR_SIZE};
+pub use hal::block::{BlockDevice, Partition, SECTOR_SIZE};
 
 // `MemDisk` (the `Vec<u8>`-backed test double) is only ever constructed from
 // `kernel/src/hw_tests.rs`, which is itself `#[cfg(test)]`-only — gating
@@ -49,4 +49,20 @@ impl BlockDevice for AtaBlockDevice {
     fn write_sectors(&self, lba: u32, count: u8, buf: &[u8]) -> Result<(), &'static str> {
         ata::write_sectors(lba, count, buf)
     }
+}
+
+/// The `constanos-data` partition of the ATA disk, when that disk is a whole
+/// GPT image (the release image attached to a VM's IDE controller) rather
+/// than a bare ext2 filesystem (QEMU's `disk.img`, whose LBA 1 holds no GPT
+/// signature). Only the primary GPT is read: the driver issues no IDENTIFY,
+/// so it does not know where the backup copy sits.
+pub fn ata_data_partition() -> Option<Partition> {
+    let table = hal::gpt::read_gpt(&AtaBlockDevice, 0).ok()?;
+    let part = hal::gpt::select(&table, usb::DATA_PARTITION_NAME).ok()?;
+    crate::serial_println!(
+        "ata: GPT disk: using partition {} at LBA {} ({} sectors)",
+        part.index, part.first_lba, part.sectors()
+    );
+    // `select` already refused anything past 32-bit LBAs.
+    Partition::new(alloc::boxed::Box::new(AtaBlockDevice), part.first_lba as u32, part.sectors() as u32, false)
 }

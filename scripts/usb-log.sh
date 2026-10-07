@@ -14,7 +14,7 @@
 #   scripts/usb-log.sh list [TARGET]                      one line per boot kept on the stick
 #   scripts/usb-log.sh init [TARGET]                      write the format marker (once)
 #   scripts/usb-log.sh mkpart DISK [SIZE]                 append the partition to DISK (default 64MiB)
-#   scripts/usb-log.sh mkimage OUT.img                    QEMU test stick: boot + data (disk.img) + log
+#   scripts/usb-log.sh mkimage OUT.img [DATA.img]         QEMU test stick: boot + data (default disk.img) + log
 #
 # TARGET is the log partition: by default /dev/disk/by-partlabel/constanos-log
 # (found by label, never by device node — see sync-usb-data.sh for why), or
@@ -216,8 +216,8 @@ cmd_mkpart() {
 # stick's three-partition shape, with this tree's disk.img as the data
 # partition and a formatted log partition.
 cmd_mkimage() {
-    local out="${1:?usage: $0 mkimage OUT.img}"
-    local data="$REPO_ROOT/disk.img"
+    local out="${1:?usage: $0 mkimage OUT.img [DATA.img]}"
+    local data="${2:-$REPO_ROOT/disk.img}"
     [[ -f "$data" ]] || die "$data missing — run a build first"
     local data_sectors=$(( $(stat -c %s "$data") / 512 ))
     local log_sectors=$(( 64 * 2048 ))
@@ -235,7 +235,7 @@ start=$log_start, size=$log_sectors, type=$TYPE_LINUX_RESERVED, name=$PARTLABEL
 EOF
     dd if="$data" of="$out" bs=1M seek=$(( data_start * 512 )) oflag=seek_bytes conv=notrunc,sparse status=none
     cmd_init --image "$out" >/dev/null
-    echo "$out: boot + constanos-data (disk.img) + $PARTLABEL (formatted)"
+    echo "$out: boot + constanos-data ($(basename "$data")) + $PARTLABEL (formatted)"
 }
 
 case "${1:-}" in

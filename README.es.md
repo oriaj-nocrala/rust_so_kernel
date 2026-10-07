@@ -186,6 +186,13 @@ build.rs src/      host: arma la imagen UEFI y disk.img, lanza QEMU
 
 ## ▶️ Cómo correrlo
 
+**Sin compilar nada:** descarga la imagen desde los
+[releases](https://github.com/oriaj-nocrala/rust_so_kernel/releases) y sigue
+[docs/try-it.md](docs/try-it.md) (en inglés): QEMU, VirtualBox, VMware o un pendrive, y
+cómo enviar el log del kernel junto a un reporte.
+
+### Compilarlo
+
 Requisitos: Rust **nightly** (fijado en `rust-toolchain.toml`), `qemu-system-x86_64`,
 OVMF, `clang`/`llvm`/`lld`, `meson`, `ninja`, `make`, `e2fsprogs`, y `curl`/`unzip`
 para bajar Freedoom y el shareware de Quake.

@@ -48,7 +48,15 @@ pub fn init() {
             vfs::mount("/mnt", Arc::new(ext2::Ext2FsHandle));
             crate::serial_println!("ext2: mounted /mnt");
         }
-        Err(e) => crate::serial_println!("ext2: not mounted ({})", e),
+        // Most programs (the desktop, DOOM, Quake) live on /mnt: say on screen
+        // how to attach the disk, for a VM set up with its default SATA/NVMe.
+        Err(e) => {
+            crate::serial_println!("ext2: not mounted ({})", e);
+            crate::kalert!(
+                "no /mnt ({}): attach the disk as a USB stick or to the secondary IDE channel (no SATA/NVMe driver)",
+                e
+            );
+        }
     }
     // /proc — synthetic, read-only (meminfo today)
     vfs::mount("/proc", Arc::new(procfs::ProcFs));

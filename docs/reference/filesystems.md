@@ -9,7 +9,7 @@ Code: `kernel/src/fs/`, crates `vfs/` and `ext2/` (host tests: `cd vfs && cargo 
 | `/` | initramfs | The embedded programs in `/bin`, plus `/etc` (`ETC_FILES`: `localtime` (UTC TZif), `passwd`, `group`, `hosts`, `services`, plus a `resolv.conf` rendered from the DHCP lease on every open). mlibc's `localtime()` **panics** without `/etc/localtime` |
 | `/dev` | devfs | Flat, except the hardcoded `/dev/input/` and `/dev/pts/` |
 | `/tmp` | ramfs (`vfs::ramfs::RamFs`) | Writable. The only FS with symlink creation *and* socket nodes. `busybox --install -s /tmp/bin` puts the applet symlinks here at boot |
-| `/mnt` | ext2 | From the USB stick (read-write, `sync(2)` flushes the stick's cache), else ATA `disk.img` (read-write). Best effort: may be absent |
+| `/mnt` | ext2 | From the USB stick (read-write, `sync(2)` flushes the stick's cache), else the ATA disk on the secondary IDE channel (read-write): its `constanos-data` GPT partition when it is a whole GPT disk (the release image in a VM, `block::ata_data_partition`, primary GPT only), else a bare ext2 from LBA 0 (`disk.img`). Best effort: may be absent, and then a `kalert!` says how to attach the disk |
 | `/proc` | procfs | Synthetic, regenerated on every open |
 
 - `ls /` lists the other mounts via `fs::vfs::direct_children`; the mount table redirects traversal into them.
