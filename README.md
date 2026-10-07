@@ -1,248 +1,256 @@
-# 🦀 constanos — un sistema operativo x86-64 en Rust
+# 🦀 constanos — an x86-64 operating system in Rust
 
-Un kernel escrito desde cero en Rust (`no_std`, UEFI, SMP) con ABI de syscalls
-numerada como Linux, [mlibc](https://github.com/managarm/mlibc) como libc,
-BusyBox como userland, un escritorio con compositor propio y un driver para una
-NVIDIA RTX 3050 (GA106) que llega hasta Vulkan con el NVK de Mesa. Corre en QEMU
-y en una máquina física (AM4 / Ryzen 9 5900X), donde no hay puerto serie y todo
-—teclado, mouse, disco— entra por USB.
+*English · [Español](README.es.md)*
 
-![El escritorio de constanos con el tema Luna: una terminal y cpumon con cuatro CPUs en ventanas, barra de tareas con el botón Apps](docs/screenshots/compositor-luna.png)
+> **Status: experimental.** A personal project, developed by one person with a lot
+> of help from Claude Code. Everything listed below runs today, in QEMU and on one
+> real machine; the gaps are listed under [What's missing](#-whats-missing).
 
-*El escritorio con el tema **Luna 2026**: `term` (BusyBox `ash`) y `cpumon` en
-ventanas, barra de tareas con los botones de las ventanas abiertas y el reloj.
-Captura real de QEMU con 4 CPUs.*
+A kernel written from scratch in Rust (`no_std`, UEFI, SMP) with a Linux-numbered
+syscall ABI, [mlibc](https://github.com/managarm/mlibc) as its libc, BusyBox as its
+userland, a desktop with its own compositor, and a driver for an NVIDIA RTX 3050
+(GA106) that goes all the way up to Vulkan through Mesa's NVK. It runs in QEMU and
+on a physical machine (AM4 / Ryzen 9 5900X) that has no serial port, where
+everything — keyboard, mouse, disk — comes in over USB.
 
-<table>
-<tr>
-<td><img src="docs/screenshots/compositor-luna-menu.png" alt="Menú de inicio del tema Luna, con las aplicaciones y el selector de tema"></td>
-<td><img src="docs/screenshots/compositor-9x-menu.png" alt="El mismo escritorio con el tema 9x moderno y su menú de inicio con la franja vertical"></td>
-</tr>
-<tr>
-<td><em>Menú de inicio (Luna): las aplicaciones de <code>/mnt/etc/gui/apps</code> y el selector de tema.</em></td>
-<td><em>El mismo escritorio en <strong>9x moderno</strong>, cambiado desde el menú (o con F12).</em></td>
-</tr>
-</table>
+![The constanos desktop with the Luna theme: a terminal and cpumon with four CPUs in windows, taskbar with the Apps button](docs/screenshots/compositor-luna.png)
 
-![Frame del renderizador GPU: barra de tareas y menú de vidrio con el fondo desenfocado detrás, ventanas translúcidas](docs/screenshots/vk-comp-glass.png)
-
-*Vidrio en el compositor por GPU (`vk_comp`): la barra y el menú copian lo que
-tienen detrás, lo desenfocan con un blur gaussiano en compute shader y se dibujan
-encima. Es un frame del arnés `probes/nvk/host-comp.sh`, que corre el renderizador
-real sobre lavapipe y lo compara píxel a píxel con la rasterización por CPU.*
+*The desktop with the **Luna 2026** theme: `term` (BusyBox `ash`) and `cpumon` in
+windows, a taskbar with buttons for the open windows and the clock. A real QEMU
+screenshot with 4 CPUs.*
 
 <table>
 <tr>
-<td><img src="docs/doom-screenshot.png" alt="DOOM corriendo en constanos"></td>
-<td><img src="docs/quake-screenshot.png" alt="Quake corriendo en constanos"></td>
-<td><img src="docs/cmatrix-screenshot.png" alt="cmatrix en la consola del framebuffer"></td>
+<td><img src="docs/screenshots/compositor-luna-menu.png" alt="Luna theme start menu, with the applications and the theme picker"></td>
+<td><img src="docs/screenshots/compositor-9x-menu.png" alt="The same desktop with the modern 9x theme and its start menu with the vertical strip"></td>
 </tr>
 <tr>
-<td><em>DOOM, con mouse y sonido.</em></td>
-<td><em>Quake, partida real con QuakeC.</em></td>
-<td><em><code>cmatrix</code> sobre un port propio de ncurses.</em></td>
+<td><em>Start menu (Luna): the applications from <code>/mnt/etc/gui/apps</code> and the theme picker.</em></td>
+<td><em>The same desktop in <strong>modern 9x</strong>, switched from the menu (or with F12).</em></td>
 </tr>
 </table>
 
-## 🚀 Qué tiene
+![A frame from the GPU renderer: glass taskbar and menu with the blurred background behind them, translucent windows](docs/screenshots/vk-comp-glass.png)
 
-### Núcleo
+*Glass in the GPU compositor (`vk_comp`): the taskbar and the menu copy what is
+behind them, blur it with a Gaussian blur in a compute shader and draw on top. This
+frame comes from the `probes/nvk/host-comp.sh` harness, which runs the real renderer
+on lavapipe and compares it pixel by pixel with the CPU rasterizer.*
 
-- **Boot UEFI** (crate `bootloader`), framebuffer GOP, log del kernel en serie, en
-  `/proc/dmesg` y —en la máquina real— en una partición del pendrive.
-- **SMP**: hasta 32 CPUs (APs por trampolín, LAPIC timer one-shot, I/O APIC, MSI/MSI-X),
-  un scheduler preemptivo de prioridades multinivel compartido por todas las CPUs (los
-  procesos migran entre ellas), TLB shootdown entre CPUs. Las reglas de
-  locks e interrupciones que lo hacen andar están en `CLAUDE.md`.
-- **Memoria**: buddy allocator como único asignador de frames, slab para el heap,
-  tablas de páginas por proceso, VMAs, demand paging, copy-on-write, pila que crece
-  sola, memoria compartida (`memfd_create`, `MAP_SHARED`), DMA para los drivers.
-- **Procesos y threads**: `fork` con COW, `execve` de ELF64 estáticos (incluido
-  static-pie), `clone` con threads reales, futex, señales POSIX con `sigaltstack` y
-  `ucontext`, job control, `wait4`, `pidfd_open`, credenciales, tiempo de CPU.
-- **IPC**: pipes, sockets AF_UNIX (stream, dgram, seqpacket, `SCM_RIGHTS`), ptys,
+<table>
+<tr>
+<td><img src="docs/doom-screenshot.png" alt="DOOM running on constanos"></td>
+<td><img src="docs/quake-screenshot.png" alt="Quake running on constanos"></td>
+<td><img src="docs/cmatrix-screenshot.png" alt="cmatrix on the framebuffer console"></td>
+</tr>
+<tr>
+<td><em>DOOM, with mouse and sound.</em></td>
+<td><em>Quake, a real game with QuakeC.</em></td>
+<td><em><code>cmatrix</code> on a port of ncurses.</em></td>
+</tr>
+</table>
+
+## 🚀 What it has
+
+### Kernel
+
+- **UEFI boot** (the `bootloader` crate), GOP framebuffer, kernel log on serial, in
+  `/proc/dmesg` and — on the real machine — in a partition of the USB stick.
+- **SMP**: up to 32 CPUs (APs via a trampoline, one-shot LAPIC timer, I/O APIC,
+  MSI/MSI-X), a preemptive multilevel priority scheduler shared by all CPUs
+  (processes migrate between them), cross-CPU TLB shootdown. The lock and interrupt
+  rules that make it work are in `CLAUDE.md`.
+- **Memory**: the buddy allocator as the only frame allocator, slab for the heap,
+  per-process page tables, VMAs, demand paging, copy-on-write, a stack that grows on
+  demand, shared memory (`memfd_create`, `MAP_SHARED`), DMA for drivers.
+- **Processes and threads**: `fork` with COW, `execve` of static ELF64 binaries
+  (static-pie included), `clone` with real threads, futex, POSIX signals with
+  `sigaltstack` and `ucontext`, job control, `wait4`, `pidfd_open`, credentials, CPU
+  time accounting.
+- **IPC**: pipes, AF_UNIX sockets (stream, dgram, seqpacket, `SCM_RIGHTS`), ptys,
   `poll`/`epoll`/`eventfd`.
-- **Sistemas de archivos**: VFS con montajes, ramfs en `/tmp`, devfs, procfs (`ps` y
-  `top` de BusyBox lo leen), y **ext2 de lectura y escritura** en `/mnt` (ATA o el
-  pendrive USB), con caché de bloques y reparación al montar.
+- **File systems**: a VFS with mounts, ramfs on `/tmp`, devfs, procfs (BusyBox's `ps`
+  and `top` read it), and **read-write ext2** on `/mnt` (ATA or the USB stick), with
+  a block cache and repair at mount time.
 
-### Compatibilidad con Linux
+### Linux compatibility
 
-- Los números de syscall y los headers `abi-bits` de mlibc son los de Linux: lo que
-  compila contra Linux suele correr sin cambios.
-- **C**: mlibc portado (`mlibc-port/`), con un par de bugs de upstream parchados.
-  BusyBox 1.36.1 sin modificar: `ash` es la shell, con ~60 applets (`vi`, `less`,
+- The syscall numbers and mlibc's `abi-bits` headers are Linux's, so what compiles
+  against Linux usually runs unchanged.
+- **C**: a port of mlibc (`mlibc-port/`), with a few upstream bugs patched (one fix
+  sent upstream: [managarm/mlibc#1925](https://github.com/managarm/mlibc/pull/1925)).
+  Unmodified BusyBox 1.36.1: `ash` is the shell, with ~60 applets (`vi`, `less`,
   `grep`, `awk`, `tar`, `ps`, `top`, `wget`, `nc`, `ping`, `httpd`...).
-- **Rust std sobre musl**: programas `x86_64-unknown-linux-musl` normales corren tal
-  cual, **tokio** incluido (multi-thread, timers, sockets, `tokio::fs`, procesos);
-  probado con cargas de 10.000 tareas (`scripts/run-tokio-probe.sh`).
+- **Rust std on musl**: ordinary `x86_64-unknown-linux-musl` programs run as they
+  are, **tokio** included (multi-threaded runtime, timers, sockets, `tokio::fs`,
+  processes); tested with loads of 10,000 tasks (`scripts/run-tokio-probe.sh`).
 
-### Red
+### Networking
 
-- **virtio-net** (QEMU) y **Realtek RTL8168** (la placa de la Ryzen, gigabit
-  verificado), con interrupciones MSI-X.
-- Pila [smoltcp](https://github.com/smoltcp-rs/smoltcp): DHCP, sockets AF_INET **TCP**
-  (cliente y servidor), **UDP** y **ICMP crudo**; `wget`, `nc` y `ping` de BusyBox
-  funcionan.
+- **virtio-net** (QEMU) and **Realtek RTL8168** (the Ryzen's board, gigabit
+  verified), with MSI-X interrupts.
+- The [smoltcp](https://github.com/smoltcp-rs/smoltcp) stack: DHCP, AF_INET **TCP**
+  (client and server), **UDP** and **raw ICMP** sockets; BusyBox's `wget`, `nc` and
+  `ping` work.
 
-### Escritorio
+### Desktop
 
-- **Protocolo estilo Wayland** propio (crate `gui`): buffers compartidos o de GPU,
-  `commit`, callbacks de frame, popups, roles de panel. El gestor de ventanas
-  (mover, redimensionar, maximizar, F11 pantalla completa, foco) es lógica pura con
-  ~90 tests en el host.
-- **Dos compositores con la misma lista de dibujo**:
-  - `compositor`: pinta por CPU en `/dev/fb0` — anda en cualquier lado (QEMU incluido);
-  - `vk_comp`: compone por GPU con Vulkan sobre NVK en la RTX 3050 — SDF de cajas
-    redondeadas, degradados, bordes, sombras, transparencia premultiplicada y vidrio con
-    blur. El mismo frame se rasteriza por CPU y se compara píxel a píxel en los tests.
-- **Temas** (`gui::theme`): **Luna 2026** y **9x moderno**; se eligen desde el menú de
-  inicio o con F12, en vivo.
-- **Programas**: `panel` (barra de tareas y menú de inicio), `term` (emulador de
-  terminal con su propio parser VT, crate `vt`), `cpumon` (gráficos por CPU, memoria,
-  procesos), `textdemo` (texto TrueType con antialiasing, crate `text`), `imgview`
-  (PNG), `snake`, `fire`, DOOM y Quake en ventana.
-- `scripts/gui-e2e.sh` maneja el escritorio en QEMU con teclado y mouse y revisa los
-  screenshots píxel a píxel.
+- **Its own Wayland-style protocol** (the `gui` crate): shared or GPU buffers,
+  `commit`, frame callbacks, popups, panel roles. The window manager (move, resize,
+  maximize, F11 fullscreen, focus) is pure logic with ~90 host tests.
+- **Two compositors with the same display list**:
+  - `compositor`: paints on the CPU into `/dev/fb0` — works anywhere (QEMU included);
+  - `vk_comp`: composites on the GPU with Vulkan on NVK on the RTX 3050 — rounded-box
+    SDFs, gradients, borders, shadows, premultiplied transparency and blurred glass.
+    The same frame is rasterized on the CPU and compared pixel by pixel in the tests.
+- **Themes** (`gui::theme`): **Luna 2026** and **modern 9x**, switched live from the
+  start menu or with F12.
+- **Programs**: `panel` (taskbar and start menu), `term` (a terminal emulator with
+  its own VT parser, the `vt` crate), `cpumon` (per-CPU graphs, memory, processes),
+  `textdemo` (antialiased TrueType text, the `text` crate), `imgview` (PNG), `snake`,
+  `fire`, and DOOM and Quake in windows.
+- `scripts/gui-e2e.sh` drives the desktop in QEMU with keyboard and mouse and checks
+  the screenshots pixel by pixel.
 
 ### GPU: NVIDIA RTX 3050 (GA106)
 
-Detrás de la opción de arranque `gpu=` (apagada por defecto), en escalones que se
-prueban de a uno en la máquina real (`docs/reference/gpu.md`, plan en
-`docs/gpu/gpu-plan.md`):
+Behind the `gpu=` boot option (off by default), in steps that are tested one at a
+time on the real machine (`docs/reference/gpu.md`, plan in `docs/gpu/gpu-plan.md`):
 
-- VBIOS, DCB, EDID por AUX/I2C, modos, link DisplayPort y HDMI, scanout propio;
-- arranque de **GSP-RM** (el firmware de NVIDIA que maneja la GPU desde adentro),
-  tablas de páginas de la GPU, canales GPFIFO, copy engine y compute;
-- **`/dev/nvgpu`**: la interfaz para un driver NVK de Mesa portado (`mesa-port/`).
-  Vulkan funciona: compute, 3D, swapchain sobre la pantalla, buffers y timelines
-  compartidos entre procesos. `snake3d` (Vulkan, 60 fps) y `vk_comp` corren encima.
+- VBIOS, DCB, EDID over AUX/I2C, modes, DisplayPort and HDMI link training, its own
+  scanout;
+- booting **GSP-RM** (the NVIDIA firmware that runs the GPU from the inside), GPU page
+  tables, GPFIFO channels, the copy engine and compute;
+- **`/dev/nvgpu`**: the interface for a port of Mesa's NVK driver (`mesa-port/`).
+  Vulkan works: compute, 3D, a swapchain on the display, buffers and timelines shared
+  between processes. `snake3d` (Vulkan, 60 fps) and `vk_comp` run on it.
 
-### Hardware real
+### Real hardware
 
-La Ryzen no tiene puerto serie, ni PS/2, ni IDE. Por eso existen:
+The Ryzen has no serial port, no PS/2 and no IDE. That is why there are:
 
-- un driver **xHCI** propio: teclado, mouse y almacenamiento masivo USB (el ext2 de
-  `/mnt` vive en una partición del pendrive de arranque);
-- una **partición de log** en el pendrive (el ring del kernel se copia cada 5 s y en un
-  pánico; `scripts/usb-log.sh read` lo lee desde Linux);
-- **corridas desatendidas** (`scripts/metal-run.sh`): un trabajo en el pendrive, un
-  watchdog, el resultado en el log;
-- una consola de framebuffer con shadow buffer y write-combining (`seq 1 400`: de
-  875 s a 0,75 s en metal; `docs/fb/console-perf.md`);
-- sensores de la CPU (frecuencia, temperatura, energía) que muestra `cpumon`.
+- its own **xHCI** driver: USB keyboard, mouse and mass storage (the ext2 for `/mnt`
+  lives in a partition of the boot stick);
+- a **log partition** on the stick (the kernel ring is copied every 5 s and on a
+  panic; `scripts/usb-log.sh read` reads it from Linux);
+- **unattended runs** (`scripts/metal-run.sh`): a job on the stick, a watchdog, the
+  verdict in the log;
+- a framebuffer console with a shadow buffer and write-combining (`seq 1 400`: from
+  875 s down to 0.75 s on metal; `docs/fb/console-perf.md`);
+- CPU sensors (frequency, temperature, energy) shown by `cpumon`.
 
-### Juegos
+### Games
 
-- **DOOM** ([doomgeneric](https://github.com/ozkl/doomgeneric) + `doom-port/`): IWAD
-  Freedoom desde `/mnt`, mouse-look y efectos de sonido por un driver AC97 propio.
+- **DOOM** ([doomgeneric](https://github.com/ozkl/doomgeneric) + `doom-port/`): the
+  Freedoom IWAD from `/mnt`, mouse-look and sound effects through its own AC97 driver.
 - **Quake** ([quakegeneric](https://github.com/erysdren/quakegeneric) +
-  `quake-port/`): el shareware `pak0.pak`, partida nueva con QuakeC y sonido.
+  `quake-port/`): the shareware `pak0.pak`, a new game with QuakeC and sound.
 
 ## 🧪 Tests
 
-El kernel no puede correr `cargo test`, así que toda la lógica que se deja escribir
-sobre tipos simples vive en crates aparte con tests en el host (`hal`, `mm`, `vfs`,
-`ext2`, `sched`, `usock`, `tty`, `net`, `nvgpu`, `gui`, `vt`, `text`, ...). Lo demás se
-prueba en QEMU:
+The kernel can't run `cargo test`, so all the logic that can be written against plain
+types lives in separate crates with host tests (`hal`, `mm`, `vfs`, `ext2`, `sched`,
+`usock`, `tty`, `net`, `nvgpu`, `gui`, `vt`, `text`, ...). The rest is tested in QEMU:
 
-| Qué | Cómo |
-|-----|------|
-| Crates puros | `cd <crate> && cargo test` |
-| Kernel en QEMU | `scripts/run-kernel-tests.sh` |
-| ABI de Linux (tests en C crudos) | `scripts/run-abi-suite.sh` |
+| What | How |
+|------|-----|
+| Pure crates | `cd <crate> && cargo test` |
+| Kernel in QEMU | `scripts/run-kernel-tests.sh` |
+| Linux ABI (raw C tests) | `scripts/run-abi-suite.sh` |
 | Rust std / tokio | `scripts/run-std-probe.sh`, `scripts/run-tokio-probe.sh` |
-| Escritorio | `scripts/gui-e2e.sh [term\|wm\|text]` |
-| Renderizador GPU (lavapipe) | `probes/nvk/host-comp.sh` |
-| Red | `scripts/net-e2e.sh` |
+| Desktop | `scripts/gui-e2e.sh [term\|wm\|text]` |
+| GPU renderer (lavapipe) | `probes/nvk/host-comp.sh` |
+| Networking | `scripts/net-e2e.sh` |
 
-Un test se da por bueno cuando falla al sabotear el código que prueba; varios
-subsistemas tienen scripts de mutación (`scripts/gpu-mutate*.py`, `nvgpu/mutations/`).
+A test counts only once it fails when the code it covers is sabotaged; several
+subsystems have mutation scripts (`scripts/gpu-mutate*.py`, `nvgpu/mutations/`).
 
-## 🏗️ Estructura
+## 🏗️ Layout
 
 ```
-kernel/            el kernel (no_std): init, memoria, procesos, syscalls, fs, drivers,
-                   usb, red, gpu, cpu/smp, interrupciones, tiempo
-hal/ mm/ sched/    lógica pura con tests en el host: hardware (xHCI, virtio, APIC,
-vfs/ ext2/ usock/  ACPI, GPT...), memoria, scheduler, VFS, ext2, AF_UNIX, ptys,
-tty/ net/ diag/    red, diagnósticos de locks
-nvgpu/             driver de la GA106 (lógica pura) + uapi de /dev/nvgpu
-gui/ gui-capi/     protocolo, gestor de ventanas y temas; su API en C
-draw/ text/ img/   primitivas de dibujo, texto TrueType, PNG
-vt/                parser de terminal
-vk-comp/           el compositor por GPU (Rust std sobre musl)
-probes/            programas de prueba: NVK/Vulkan, renderizador del compositor, std, tokio
-userspace/         programas en Rust (shell, compositor, panel, term, cpumon...) y en C
-mlibc-port/ mesa-port/ doom-port/ quake-port/   ports propios
-mlibc/ busybox/ doomgeneric/ quakegeneric/      submódulos de upstream
-disk-image-root/   contenido de /mnt (disk.img)
-docs/              referencia por subsistema (docs/reference/) y planes
-scripts/           QEMU, tests, despliegue al pendrive, corridas en metal
-build.rs src/      host: arma la imagen UEFI y disk.img, lanza QEMU
+kernel/            the kernel (no_std): init, memory, processes, syscalls, fs, drivers,
+                   usb, networking, gpu, cpu/smp, interrupts, time
+hal/ mm/ sched/    pure logic with host tests: hardware (xHCI, virtio, APIC, ACPI,
+vfs/ ext2/ usock/  GPT...), memory, scheduler, VFS, ext2, AF_UNIX, ptys,
+tty/ net/ diag/    networking, lock diagnostics
+nvgpu/             the GA106 driver (pure logic) + the /dev/nvgpu uapi
+gui/ gui-capi/     protocol, window manager and themes; its C API
+draw/ text/ img/   drawing primitives, TrueType text, PNG
+vt/                terminal parser
+vk-comp/           the GPU compositor (Rust std on musl)
+probes/            test programs: NVK/Vulkan, compositor renderer, std, tokio
+userspace/         programs in Rust (shell, compositor, panel, term, cpumon...) and C
+mlibc-port/ mesa-port/ doom-port/ quake-port/   the ports
+mlibc/ busybox/ doomgeneric/ quakegeneric/      upstream submodules
+disk-image-root/   contents of /mnt (disk.img)
+docs/              per-subsystem reference (docs/reference/) and plans
+scripts/           QEMU, tests, deploying to the stick, metal runs
+build.rs src/      host side: builds the UEFI image and disk.img, launches QEMU
 ```
 
-## ▶️ Cómo correrlo
+The per-subsystem reference (`docs/reference/`) is in English; many of the design
+plans elsewhere in `docs/` are still in Spanish.
 
-Requisitos: Rust **nightly** (fijado en `rust-toolchain.toml`), `qemu-system-x86_64`,
-OVMF, `clang`/`llvm`/`lld`, `meson`, `ninja`, `make`, `e2fsprogs`, y `curl`/`unzip`
-para bajar Freedoom y el shareware de Quake.
+## ▶️ Running it
 
-En Arch:
+Requirements: Rust **nightly** (pinned in `rust-toolchain.toml`),
+`qemu-system-x86_64`, OVMF, `clang`/`llvm`/`lld`, `meson`, `ninja`, `make`,
+`e2fsprogs`, and `curl`/`unzip` to download Freedoom and the Quake shareware.
+
+On Arch:
 ```bash
 sudo pacman -S qemu-system-x86 qemu-img qemu-ui-gtk edk2-ovmf clang llvm meson ninja lld e2fsprogs
 ```
 
 ```bash
-cargo run       # compila todo (mlibc, BusyBox, programas, kernel) y arranca en QEMU
-cargo build     # solo la imagen UEFI y disk.img
+cargo run       # builds everything (mlibc, BusyBox, programs, kernel) and boots in QEMU
+cargo build     # just the UEFI image and disk.img
 ```
 
-Desde la shell, `compositor` abre el escritorio (Ctrl+Alt+Retroceso lo cierra), y
-`doom`, `quake`, `cmatrix`, `cpumon`... corren desde ahí o en ventana.
-`scripts/qemu-debug.sh` arranca QEMU sin ventana para depurar (teclado, mouse,
+From the shell, `compositor` opens the desktop (Ctrl+Alt+Backspace closes it), and
+`doom`, `quake`, `cmatrix`, `cpumon`... run from there or in a window.
+`scripts/qemu-debug.sh` boots QEMU headless for debugging (keyboard, mouse,
 screenshots, gdb).
 
-### En la máquina real
+### On the real machine
 
-El pendrive lleva tres particiones GPT: `boot` (FAT, el kernel), `constanos-data`
-(ext2, `/mnt`) y `constanos-log` (el log).
+The USB stick has three GPT partitions: `boot` (FAT, the kernel), `constanos-data`
+(ext2, `/mnt`) and `constanos-log` (the log).
 
 ```bash
 scripts/deploy-usb-boot.sh   # kernel → boot
 scripts/sync-usb-data.sh     # disk-image-root/ → constanos-data
-scripts/usb-log.sh read      # después de usarla: el log de ese arranque
+scripts/usb-log.sh read      # afterwards: the log of that boot
 ```
 
-Nunca hacer `dd` de la imagen entera al pendrive: reemplaza la tabla GPT y se lleva
-las otras dos particiones. Las opciones de arranque (`gpu=`, `nic=`) van en
-`/mnt/etc/kernel.conf`.
+Never `dd` the whole image onto the stick: it replaces the GPT and takes the other
+two partitions with it. Boot options (`gpu=`, `nic=`) go in `/mnt/etc/kernel.conf`.
 
-## 🎯 Qué falta
+## 🎯 What's missing
 
-- **Enlazado dinámico**: el loader rechaza `PT_INTERP`; faltan `mmap` de archivos y
-  `mmap` con direcciones como sugerencia. Es lo siguiente después de un cliente HTTPS
+- **Dynamic linking**: the loader rejects `PT_INTERP`; file-backed `mmap` and `mmap`
+  address hints are missing. It comes next after an HTTPS client
   (`docs/userland/roadmap.md`).
-- **Aislamiento entre procesos en la GPU**: todas las sesiones de `/dev/nvgpu`
-  comparten tablas de páginas.
-- **Un solo compositor**: `vk_comp` con un backend por software en vez de dos
-  programas (`docs/gui/compositor-visual-plan.md`, paso 2e); íconos.
-- Red: IPv6, loopback, TLS.
+- **Isolation between processes on the GPU**: all `/dev/nvgpu` sessions share page
+  tables.
+- **A single compositor**: `vk_comp` with a software backend instead of two programs
+  (`docs/gui/compositor-visual-plan.md`, step 2e); icons.
+- Networking: IPv6, loopback, TLS.
 
-## 📜 Licencia
+## 📜 License
 
-El código de este repositorio es software libre bajo la licencia que elijas entre
-[MIT](LICENSE-MIT) y [Apache 2.0](LICENSE-APACHE) (`MIT OR Apache-2.0`, como el
-ecosistema de Rust). Salvo que digas lo contrario, cualquier contribución que envíes
-queda bajo esas mismas dos licencias.
+The code in this repository is free software, licensed under your choice of
+[MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE) (`MIT OR Apache-2.0`, like the
+Rust ecosystem). Unless you say otherwise, any contribution you submit is licensed
+the same way.
 
-Los submódulos y archivos de terceros conservan su propia licencia: mlibc (MIT),
-BusyBox (GPLv2), doomgeneric y quakegeneric (GPLv2), ncurses (MIT-X11), cmatrix
-(GPLv3), Mesa (MIT) y Freedoom (`disk-image-root/freedoom-COPYING.txt`). Los
-binarios que enlazan código GPL (BusyBox, DOOM, Quake, cmatrix) se distribuyen bajo
-la GPL correspondiente.
+Submodules and third-party files keep their own licenses: mlibc (MIT), BusyBox
+(GPLv2), doomgeneric and quakegeneric (GPLv2), ncurses (MIT-X11), cmatrix (GPLv3),
+Mesa (MIT) and Freedoom (`disk-image-root/freedoom-COPYING.txt`). Binaries that link
+GPL code (BusyBox, DOOM, Quake, cmatrix) are distributed under the corresponding
+GPL.
 
 ---
 
-*Proyecto personal para aprender a hacer un sistema operativo en Rust, con bastante
-ayuda de Claude Code en el camino.*
+*A personal project to learn how to build an operating system in Rust, with plenty
+of help from Claude Code along the way.*
