@@ -1,6 +1,7 @@
 [package]
 name = "kernel"  # Este nombre debe coincidir con el usado en CARGO_BIN_FILE_KERNEL_kernel
 version = "0.1.0"
+license = "MIT OR Apache-2.0"
 edition = "2021"
 
 # NOTE: there used to be a `[package.metadata.bootimage]` block here (same

@@ -3,7 +3,7 @@
 Un kernel escrito desde cero en Rust (`no_std`, UEFI, SMP) con ABI de syscalls
 numerada como Linux, [mlibc](https://github.com/managarm/mlibc) como libc,
 BusyBox como userland, un escritorio con compositor propio y un driver para una
-NVIDIA RTX 3060 (GA106) que llega hasta Vulkan con el NVK de Mesa. Corre en QEMU
+NVIDIA RTX 3050 (GA106) que llega hasta Vulkan con el NVK de Mesa. Corre en QEMU
 y en una máquina física (AM4 / Ryzen 9 5900X), donde no hay puerto serie y todo
 —teclado, mouse, disco— entra por USB.
 
@@ -93,7 +93,7 @@ real sobre lavapipe y lo compara píxel a píxel con la rasterización por CPU.*
   ~90 tests en el host.
 - **Dos compositores con la misma lista de dibujo**:
   - `compositor`: pinta por CPU en `/dev/fb0` — anda en cualquier lado (QEMU incluido);
-  - `vk_comp`: compone por GPU con Vulkan sobre NVK en la RTX 3060 — SDF de cajas
+  - `vk_comp`: compone por GPU con Vulkan sobre NVK en la RTX 3050 — SDF de cajas
     redondeadas, degradados, bordes, sombras, transparencia premultiplicada y vidrio con
     blur. El mismo frame se rasteriza por CPU y se compara píxel a píxel en los tests.
 - **Temas** (`gui::theme`): **Luna 2026** y **9x moderno**; se eligen desde el menú de
@@ -105,7 +105,7 @@ real sobre lavapipe y lo compara píxel a píxel con la rasterización por CPU.*
 - `scripts/gui-e2e.sh` maneja el escritorio en QEMU con teclado y mouse y revisa los
   screenshots píxel a píxel.
 
-### GPU: NVIDIA RTX 3060 (GA106)
+### GPU: NVIDIA RTX 3050 (GA106)
 
 Detrás de la opción de arranque `gpu=` (apagada por defecto), en escalones que se
 prueban de a uno en la máquina real (`docs/reference/gpu.md`, plan en
@@ -228,6 +228,19 @@ las otras dos particiones. Las opciones de arranque (`gpu=`, `nic=`) van en
 - **Un solo compositor**: `vk_comp` con un backend por software en vez de dos
   programas (`docs/gui/compositor-visual-plan.md`, paso 2e); íconos.
 - Red: IPv6, loopback, TLS.
+
+## 📜 Licencia
+
+El código de este repositorio es software libre bajo la licencia que elijas entre
+[MIT](LICENSE-MIT) y [Apache 2.0](LICENSE-APACHE) (`MIT OR Apache-2.0`, como el
+ecosistema de Rust). Salvo que digas lo contrario, cualquier contribución que envíes
+queda bajo esas mismas dos licencias.
+
+Los submódulos y archivos de terceros conservan su propia licencia: mlibc (MIT),
+BusyBox (GPLv2), doomgeneric y quakegeneric (GPLv2), ncurses (MIT-X11), cmatrix
+(GPLv3), Mesa (MIT) y Freedoom (`disk-image-root/freedoom-COPYING.txt`). Los
+binarios que enlazan código GPL (BusyBox, DOOM, Quake, cmatrix) se distribuyen bajo
+la GPL correspondiente.
 
 ---
 

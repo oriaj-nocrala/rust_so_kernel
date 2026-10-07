@@ -1,6 +1,7 @@
 [package]
 name = "draw"
 version = "0.1.0"
+license = "MIT OR Apache-2.0"
 edition = "2021"
 
 # Software 2D drawing into a plain `&mut [u32]` of 0x00RRGGBB pixels:

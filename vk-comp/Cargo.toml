@@ -1,6 +1,7 @@
 [package]
 name = "vk-comp"
 version = "0.1.0"
+license = "MIT OR Apache-2.0"
 edition = "2021"
 
 # The GPU compositor's machine (G5 layer 4): sockets, input, window titles and the window manager (`gui`), in Rust with std on

@@ -1,6 +1,7 @@
 [package]
 name = "nvgpu"
 version = "0.1.0"
+license = "MIT OR Apache-2.0"
 edition = "2021"
 
 # The pure half of the NVIDIA GA106 driver (`docs/gpu/gpu-plan.md`,

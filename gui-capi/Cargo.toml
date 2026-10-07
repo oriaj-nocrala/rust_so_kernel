@@ -1,6 +1,7 @@
 [package]
 name = "gui-capi"
 version = "0.1.0"
+license = "MIT OR Apache-2.0"
 edition = "2021"
 
 # The window manager of `gui` behind a C ABI, for a compositor written in C that composes on the GPU (G5 layer 4, slice 3:
