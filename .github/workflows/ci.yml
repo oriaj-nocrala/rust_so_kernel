@@ -1,0 +1,126 @@
+# CI: the host tests of every extracted crate, then a clean build of the whole system,
+# the kernel's QEMU tests, and the release image boot-tested in QEMU (as a USB stick
+# and as an IDE disk). The image is kept as an artifact.
+#
+# Not here: the Vulkan programs (vk_comp, snake3d), which need the Mesa build in
+# mesa-port/ (machine-specific for now), and the ABI suite (scripts/run-abi-suite.sh),
+# which has an open stall (docs/reference/processes-and-scheduling.md, "Process death").
+# To try a change to this file first: the same steps in an ubuntu:24.04 container,
+# starting with scripts/ci-deps.sh.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-tests:
+    name: Host tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            */target
+          key: host-${{ hashFiles('rust-toolchain.toml', '*/Cargo.lock') }}
+          restore-keys: host-
+
+      - name: Fonts for the text crate's tests
+        run: bash scripts/fetch-fonts.sh
+
+      - name: cargo test, crate by crate
+        run: |
+          failed=""
+          for crate in diag draw ext2 gui gui-capi hal img mm net nvgpu sched text tty usock vfs vt; do
+            echo "::group::$crate"
+            (cd "$crate" && cargo test) || failed="$failed $crate"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::host tests failed in:$failed"
+            exit 1
+          fi
+
+  build-and-boot:
+    name: Build, QEMU tests, release image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Packages
+        run: bash scripts/ci-deps.sh
+
+      - name: KVM for QEMU
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # Only what cargo itself keeps coherent, plus downloads pinned by their scripts.
+      # The C builds (mlibc, BusyBox, ncurses, DOOM, Quake) run from scratch every time:
+      # kernel/build.rs rebuilds some of them only when their output is missing.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            kernel/target
+            userspace/target
+          key: build-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'kernel/Cargo.lock', 'userspace/Cargo.lock') }}
+          restore-keys: build-
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            disk-image-root/freedoom1.wad
+            disk-image-root/freedoom-COPYING.txt
+            disk-image-root/id1
+            disk-image-root/usr/share/fonts
+          key: assets-${{ hashFiles('scripts/fetch-freedoom.sh', 'scripts/fetch-quake-shareware.sh', 'scripts/fetch-fonts.sh') }}
+
+      - name: cargo build
+        run: cargo build
+
+      - name: Kernel tests in QEMU
+        run: scripts/run-kernel-tests.sh
+
+      - name: Release image (boot-tested as USB and IDE)
+        run: scripts/make-release-image.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: constanos-image
+          path: |
+            target/release-image/constanos.img.zst
+            target/release-image/SHA256SUMS
+          retention-days: 14
+          compression-level: 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: boot-test-logs
+          path: target/release-image/boot-test-*.log
+          if-no-files-found: ignore

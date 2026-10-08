@@ -2,6 +2,8 @@
 
 *English · [Español](README.es.md)*
 
+[![CI](https://github.com/oriaj-nocrala/rust_so_kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/oriaj-nocrala/rust_so_kernel/actions/workflows/ci.yml)
+
 > **Status: experimental.** A personal project, developed by one person with a lot
 > of help from Claude Code. Everything listed below runs today, in QEMU and on one
 > real machine; the gaps are listed under [What's missing](#-whats-missing).

@@ -2,6 +2,8 @@
 
 *[English](README.md) · Español*
 
+[![CI](https://github.com/oriaj-nocrala/rust_so_kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/oriaj-nocrala/rust_so_kernel/actions/workflows/ci.yml)
+
 Un kernel escrito desde cero en Rust (`no_std`, UEFI, SMP) con ABI de syscalls
 numerada como Linux, [mlibc](https://github.com/managarm/mlibc) como libc,
 BusyBox como userland, un escritorio con compositor propio y un driver para una
