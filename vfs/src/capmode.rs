@@ -53,8 +53,8 @@ pub fn rule(nr: u64) -> Option<Rule> {
         43 | 45 | 47 | 48 | 50 | 51 | 52 | 54 | 55 | 288 => Allow,
         // Processes: create (they inherit the mode), wait for own children, exit.
         56 | 57 | 58 | 60 | 61 | 231 => Allow,
-        // Process attributes of oneself; futexes; epoll; the cwd only through a held dirfd.
-        81 | 112 | 157 | 158 | 202 | 232 | 233 | 281 => Allow,
+        // Process attributes of oneself; futexes; epoll; the creation mask (umask); the cwd only through a held dirfd.
+        81 | 95 | 112 | 157 | 158 | 202 | 232 | 233 | 281 => Allow,
         // Flushing caches; a signal through a pidfd (CAP_PDKILL).
         162 | 424 => Allow,
         // This kernel's own: uptime, meminfo, rights, the mode itself.

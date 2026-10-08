@@ -269,6 +269,7 @@ pub enum SyscallNumber {
     Access = 21,
     Chmod = 90,
     Fchmod = 91,
+    Umask = 95,
     Dup = 32,
     Dup2 = 33,
     Fcntl = 72,
@@ -423,6 +424,7 @@ impl SyscallNumber {
             21 => Some(Self::Access),
             90 => Some(Self::Chmod),
             91 => Some(Self::Fchmod),
+            95 => Some(Self::Umask),
             32 => Some(Self::Dup),
             33 => Some(Self::Dup2),
             72 => Some(Self::Fcntl),
@@ -558,6 +560,7 @@ pub mod errno {
     pub const EIO: i64 = -5;
     pub const ENXIO: i64 = -6;
     pub const E2BIG: i64 = -7;
+    pub const ENOEXEC: i64 = -8;
     pub const EBADF: i64 = -9;
     pub const ENOMEM: i64 = -12;
     pub const EACCES: i64 = -13;
@@ -958,6 +961,7 @@ pub fn syscall_handler(
         SyscallNumber::Access => fs::sys_access(arg1 as usize, arg2 as i32),
         SyscallNumber::Chmod => fs::sys_chmod(arg1 as usize, arg2 as u32),
         SyscallNumber::Fchmod => fs::sys_fchmod(arg1 as i32, arg2 as u32),
+        SyscallNumber::Umask => creds::sys_umask(arg1 as u32),
         SyscallNumber::Dup => fs::sys_dup(arg1 as i32),
         SyscallNumber::Dup2 => fs::sys_dup2(arg1 as i32, arg2 as i32),
         SyscallNumber::Fcntl => fs::sys_fcntl(arg1 as i32, arg2 as i32, arg3),

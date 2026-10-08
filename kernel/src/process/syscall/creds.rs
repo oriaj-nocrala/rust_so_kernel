@@ -32,6 +32,17 @@ pub(super) fn sys_setregid(r: u32, e: u32) -> SyscallResult { commit(snapshot().
 pub(super) fn sys_setresuid(r: u32, e: u32, s: u32) -> SyscallResult { commit(snapshot().setresuid(r, e, s)) }
 pub(super) fn sys_setresgid(r: u32, e: u32, s: u32) -> SyscallResult { commit(snapshot().setresgid(r, e, s)) }
 
+/// umask(95): sets the mask to `mask & 0777` and returns the previous one; never fails.
+pub(super) fn sys_umask(mask: u32) -> SyscallResult {
+    let mut old = 0;
+    with_current_process(|p| {
+        old = p.creds.umask;
+        p.creds.umask = mask & 0o777;
+        0
+    });
+    old as SyscallResult
+}
+
 /// setfsuid/setfsgid return the previous value whether or not the change was allowed.
 pub(super) fn sys_setfsuid(uid: u32) -> SyscallResult {
     let old = snapshot();

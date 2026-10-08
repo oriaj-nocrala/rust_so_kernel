@@ -248,8 +248,12 @@ impl MountTable {
 
     /// Create a new directory at `path`.
     pub fn mkdir(&self, path: &str) -> Result<(), Errno> {
-        // the root always exists (Linux says EEXIST; `mkdir -p` relies on it)
+        // A name that exists is EEXIST before anything else, as on Linux: the root, and a mount point whose parent is read-only
+        // (`/tmp` over a read-only `/`), which would otherwise say EROFS. `mkdir -p` relies on it.
         if path.trim_end_matches('/').is_empty() && path.starts_with('/') {
+            return Err(Errno::EEXIST);
+        }
+        if !path.is_empty() && self.resolve_no_follow(path).is_ok() {
             return Err(Errno::EEXIST);
         }
         let (dir_path, leaf) = split_parent(path)?;
@@ -939,6 +943,22 @@ mod tests {
         assert_eq!(table.mkdir("/"), Err(Errno::EEXIST));
         assert_eq!(table.mkdir("//"), Err(Errno::EEXIST));
         assert_eq!(table.mkdir(""), Err(Errno::EINVAL), "an empty path is not the root");
+    }
+
+    #[test]
+    fn mkdir_of_a_name_that_exists_is_eexist() {
+        let table = MountTable::new();
+        let root = TestDir::new();
+        mount_root_with(&table, root.clone());
+        let tmp = TestDir::new();
+        table.mount("/tmp", TestFs::new(tmp.clone()));
+        // the mount point is not a child of the root: asking the root to make it would succeed (or say EROFS on a real one)
+        assert_eq!(table.mkdir("/tmp"), Err(Errno::EEXIST));
+        assert_eq!(table.mkdir("/tmp/"), Err(Errno::EEXIST));
+        assert!(root.children.lock().get("tmp").is_none(), "the root got a 'tmp' it should not have");
+        table.mkdir("/tmp/a").expect("mkdir /tmp/a");
+        assert_eq!(table.mkdir("/tmp/a"), Err(Errno::EEXIST));
+        assert_eq!(tmp.children.lock().len(), 1);
     }
 
     #[test]

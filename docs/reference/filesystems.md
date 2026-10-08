@@ -6,7 +6,7 @@ Code: `kernel/src/fs/`, crates `vfs/` and `ext2/` (host tests: `cd vfs && cargo 
 
 | Path | FS | Notes |
 |------|----|-------|
-| `/` | initramfs | The embedded programs in `/bin`, plus `/etc` (`ETC_FILES`: `localtime` (UTC TZif), `passwd`, `group`, `hosts`, `services`, plus a `resolv.conf` rendered from the DHCP lease on every open). mlibc's `localtime()` **panics** without `/etc/localtime` |
+| `/` | initramfs | The embedded programs in `/bin` (with `sh`: BusyBox again, for `#!/bin/sh`), plus `/etc` (`ETC_FILES`: `localtime` (UTC TZif), `passwd`, `group`, `hosts`, `services`, plus a `resolv.conf` rendered from the DHCP lease on every open). mlibc's `localtime()` **panics** without `/etc/localtime` |
 | `/dev` | devfs | Flat, except the hardcoded `/dev/input/` and `/dev/pts/` |
 | `/tmp` | ramfs (`vfs::ramfs::RamFs`) | Writable. The only FS with symlink creation *and* socket nodes. `busybox --install -s /tmp/bin` puts the applet symlinks here at boot |
 | `/mnt` | ext2 | From the USB stick (read-write, `sync(2)` flushes the stick's cache), else the ATA disk on the secondary IDE channel (read-write): its `constanos-data` GPT partition when it is a whole GPT disk (the release image in a VM, `block::ata_data_partition`, primary GPT only), else a bare ext2 from LBA 0 (`disk.img`). Best effort: may be absent, and then a `kalert!` says how to attach the disk |
@@ -52,6 +52,8 @@ Code: `kernel/src/fs/`, crates `vfs/` and `ext2/` (host tests: `cd vfs && cargo 
 
 - `ext2::Ext2Core` does every on-disk detail: layout, allocation, direct through triple-indirect blocks, directories, fast (<60 B) and slow symlinks, repair passes. It speaks inode numbers and `Ext2Error`, never VFS types.
 - The adapter provides the VFS impls, `Ext2Error → Errno`, the `EXT2` global plus `EXT2_LOCK`, and wall-clock time.
+- `lookup` (every path component) is `Ext2Core::find_dir_entry`: a scan of the directory's bytes that allocates nothing and stops at the match. `read_dir_entries` (a `String` per entry) is for listings only: as a lookup it cost ~3.5 ms per `stat` in a 2000-file folder.
+- `MountTable::mkdir` of a name that exists is `EEXIST` before anything else (a mount point over a read-only parent, such as `/tmp` or `/mnt` over `/`, would otherwise say `EROFS` and break `mkdir -p`).
 - **`EXT2_LOCK` serializes every mutation.** Read paths (`lookup`/`readdir`) don't take it, because mutations call them while holding it and the lock isn't reentrant.
 - **Read-only switch**: `READ_ONLY` / `write_lock()` turn every mutation and write-open into `EROFS`, but nothing sets it today (the USB mount used to).
 - `rmdir` ends the removed directory's inode with `links_count = 0`, like `unlink`; with 2 left, e2fsck reports a phantom directory (`hw_tests` checks it).

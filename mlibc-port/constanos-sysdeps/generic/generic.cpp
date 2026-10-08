@@ -106,6 +106,7 @@ constexpr long SYS_getresgid = 120;
 constexpr long SYS_linkat = 265;
 constexpr long SYS_chmod = 90;
 constexpr long SYS_fchmod = 91;
+constexpr long SYS_umask = 95;
 constexpr long SYS_socket = 41;
 constexpr long SYS_connect = 42;
 constexpr long SYS_accept = 43;
@@ -128,6 +129,7 @@ constexpr long SYS_dup = 32;
 constexpr long SYS_dup2 = 33;
 constexpr long SYS_fcntl = 72;
 constexpr long SYS_pipe = 22;
+constexpr long SYS_pipe2 = 293;
 constexpr long SYS_munmap = 11;
 constexpr long SYS_ioctl = 16;
 constexpr long SYS_nanosleep = 35;
@@ -582,10 +584,9 @@ int sys_unlinkat(int fd, const char *path, int flags) {
 // This kernel's pipe(22) takes only `int pipefd[2]` — no pipe2() flags
 // (O_NONBLOCK/O_CLOEXEC aren't supported). Anything other than 0 in `flags`
 // would silently be ignored by the kernel, so reject it here instead.
+// pipe2(293) takes O_CLOEXEC and O_NONBLOCK (Linux's values, abi-bits/fcntl.h); anything else is the kernel's EINVAL.
 int sys_pipe(int *fds, int flags) {
-	if (flags != 0)
-		return EINVAL;
-	long ret = raw_syscall(SYS_pipe, (long)fds);
+	long ret = flags ? raw_syscall(SYS_pipe2, (long)fds, flags) : raw_syscall(SYS_pipe, (long)fds);
 	return ret < 0 ? (int)-ret : 0;
 }
 
@@ -1067,6 +1068,12 @@ int sys_chmod(const char *path, mode_t mode) {
 int sys_fchmod(int fd, mode_t mode) {
 	long ret = raw_syscall(SYS_fchmod, fd, mode);
 	return ret < 0 ? (int)-ret : 0;
+}
+
+// umask(95) never fails: it returns the previous mask.
+int sys_umask(mode_t mode, mode_t *old) {
+	*old = (mode_t)raw_syscall(SYS_umask, mode);
+	return 0;
 }
 
 // fchmodat(AT_FDCWD, path, ...) is just chmod(path, ...) in disguise — same

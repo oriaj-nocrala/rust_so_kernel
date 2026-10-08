@@ -576,6 +576,11 @@ impl Ext2Fs {
             .collect())
     }
 
+    /// The inode number called `name` in `raw` (never "." or ".."), scanning without allocating and stopping at the match.
+    fn find_dir_entry(&self, raw: &RawInode, name: &str) -> Result<Option<u32>, Errno> {
+        Ok(self.core.find_dir_entry(raw, name).map_err(ExtErr)?.map(|e| e.ino))
+    }
+
     /// Insert a new `(name -> ino)` directory entry into `dir_raw`'s data.
     fn add_dir_entry(&self, dir_ino: u32, dir_raw: &mut RawInode, name: &str, ino: u32, kind: FileType) -> Result<(), Errno> {
         self.core.add_dir_entry(dir_ino, dir_raw, name, ino, vfs_file_type_to_ext2(kind)).map_err(|e| Errno::from(ExtErr(e)))
@@ -814,9 +819,8 @@ impl Inode for Ext2Inode {
         if !self.raw.is_dir() {
             return Err(Errno::ENOTDIR);
         }
-        let entries = fs().read_dir_entries(&self.raw)?;
-        let e = entries.into_iter().find(|e| e.name == name).ok_or(Errno::ENOENT)?;
-        Ok(Arc::new(Ext2Inode::new(e.ino)?) as Arc<dyn Inode>)
+        let ino = fs().find_dir_entry(&self.raw, name)?.ok_or(Errno::ENOENT)?;
+        Ok(Arc::new(Ext2Inode::new(ino)?) as Arc<dyn Inode>)
     }
 
     fn readdir(&self, offset: u64) -> Result<Option<DirEntry>, Errno> {

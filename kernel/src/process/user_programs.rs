@@ -74,7 +74,7 @@ pub enum ProgramSource {
 /// includes `/mnt/bin` — no special-casing needed here, they just aren't
 /// registered in this table at all, and so don't show up in initramfs's
 /// `/bin` (`ls /bin`) either, only in `/mnt/bin`.
-static PROGRAMS: [(&str, ProgramSource); 18] = [
+static PROGRAMS: [(&str, ProgramSource); 19] = [
     ("uname",     ProgramSource::Elf(include_bytes!("../../embedded/uname.elf"))),
     ("shell",     ProgramSource::Elf(include_bytes!("../../embedded/shell.elf"))),
     ("snake",     ProgramSource::Elf(include_bytes!("../../embedded/snake.elf"))),
@@ -98,8 +98,13 @@ static PROGRAMS: [(&str, ProgramSource); 18] = [
     // smoke test. See the busybox-readiness memory / session notes for
     // the exact cross-compile recipe and every sysroot header gap it took
     // to get this far.
-    ("busybox",   ProgramSource::Elf(include_bytes!("../../embedded/busybox.elf"))),
+    ("busybox",   ProgramSource::Elf(BUSYBOX)),
+    // `/bin/sh`: what `#!/bin/sh` scripts and `system()` expect. The same bytes; BusyBox picks the applet from argv[0]'s
+    // name, so this is ash. (The other applets get real symlinks in /tmp/bin at boot.)
+    ("sh",        ProgramSource::Elf(BUSYBOX)),
 ];
+
+static BUSYBOX: &[u8] = include_bytes!("../../embedded/busybox.elf");
 
 /// Print available programs to serial.
 pub fn print_available() {

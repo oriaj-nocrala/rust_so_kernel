@@ -14,7 +14,7 @@ pub const KEEP: u32 = u32::MAX;
 /// `NGROUPS_MAX`.
 pub const NGROUPS_MAX: usize = 65536;
 
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Creds {
     pub ruid: u32,
     pub euid: u32,
@@ -25,6 +25,16 @@ pub struct Creds {
     pub sgid: u32,
     pub fsgid: u32,
     pub groups: Vec<u32>,
+    /// The file-creation mask (`umask`). Linux keeps it in `fs_struct`; it lives here because it travels like the ids (fork copies
+    /// it, exec keeps it, a new thread gets a copy). Bookkeeping only for now: `open`/`mkdir` do not keep a mode, so it masks nothing.
+    pub umask: u32,
+}
+
+impl Default for Creds {
+    /// Root, with Linux's boot mask 022.
+    fn default() -> Creds {
+        Creds { ruid: 0, euid: 0, suid: 0, fsuid: 0, rgid: 0, egid: 0, sgid: 0, fsgid: 0, groups: Vec::new(), umask: 0o022 }
+    }
 }
 
 /// `EPERM`: the caller may not make this change.

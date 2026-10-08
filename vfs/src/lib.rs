@@ -122,6 +122,7 @@ extern crate alloc;
 
 pub mod clock;
 pub mod dirent;
+pub mod exec;
 pub mod file;
 pub mod inode;
 pub mod lock;

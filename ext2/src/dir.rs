@@ -83,6 +83,36 @@ impl Ext2Core {
         Ok(entries)
     }
 
+    /// The entry called `name` in `raw`'s data, or `None`: what a path walk needs per component. Unlike [`Self::read_dir_entries`]
+    /// it allocates no names and stops at the match, so a lookup in a folder of thousands of files costs a scan of the bytes up
+    /// to it, not a `String` per entry (`stat` of each visible row in Files was ~3.5 ms in a 2000-file folder).
+    pub fn find_dir_entry(&self, raw: &RawInode, name: &str) -> Result<Option<DirEntry>, Ext2Error> {
+        if name.is_empty() || name == "." || name == ".." {
+            return Ok(None);
+        }
+        let bs = self.sb.block_size;
+        let num_blocks = (raw.size() + bs as u64 - 1) / bs as u64;
+        let mut buf = alloc::vec![0u8; bs as usize];
+        for block_index in 0..num_blocks as u32 {
+            let Some(block_num) = self.block_for_index(raw, block_index)? else { continue };
+            self.read_block(block_num, &mut buf)?;
+            let mut off = 0usize;
+            while off + 8 <= buf.len() {
+                let rec_len = u16::from_le_bytes(buf[off + 4..off + 6].try_into().unwrap()) as usize;
+                if rec_len < 8 {
+                    break; // corrupt: same stop as read_dir_entries
+                }
+                if let Some(entry) = ParsedDirent::parse(&buf, off) {
+                    if entry.ino != 0 && entry.name == name.as_bytes() {
+                        return Ok(Some(DirEntry { ino: entry.ino, file_type: entry.file_type, name: name.to_string() }));
+                    }
+                }
+                off += rec_len;
+            }
+        }
+        Ok(None)
+    }
+
     /// Insert a new `(name -> ino)` directory entry into `dir_raw`'s data,
     /// splitting an existing entry's slack space (real ext2's own
     /// approach) if one is big enough, or reusing a deleted (`inode == 0`)
@@ -292,6 +322,30 @@ mod tests {
         assert_eq!(entries[0].ino, 5);
         assert_eq!(entries[0].file_type, 1);
         assert_eq!(entries[0].name, "foo");
+    }
+
+    #[test]
+    fn find_dir_entry_agrees_with_read_dir_entries() {
+        let core = mount(minimal_image());
+        let mut dir_raw = new_dir_raw();
+        core.add_dir_entry(ROOT_INO, &mut dir_raw, ".", ROOT_INO, 2).expect("add .");
+        core.add_dir_entry(ROOT_INO, &mut dir_raw, "..", ROOT_INO, 2).expect("add ..");
+        // enough names to fill several blocks, so a match past the first block is found too
+        for i in 0..200u32 {
+            core.add_dir_entry(ROOT_INO, &mut dir_raw, &alloc::format!("file-{}.txt", i), 10 + i, 1).expect("add");
+        }
+        assert!(dir_raw.size() > 3 * 1024, "the directory spans {} bytes", dir_raw.size());
+        for e in core.read_dir_entries(&dir_raw).expect("read") {
+            assert_eq!(core.find_dir_entry(&dir_raw, &e.name).expect("find"), Some(e.clone()), "{}", e.name);
+        }
+        assert_eq!(core.find_dir_entry(&dir_raw, "file-199.txt").expect("find").map(|e| e.ino), Some(209));
+        // a prefix, a longer name, the synthetic entries and an empty name are not there
+        for missing in ["file-1", "file-1.txt.bak", "file-200.txt", ".", "..", ""] {
+            assert_eq!(core.find_dir_entry(&dir_raw, missing).expect("find"), None, "{:?}", missing);
+        }
+        // a removed entry is gone
+        core.remove_dir_entry(&dir_raw, "file-7.txt").expect("remove");
+        assert_eq!(core.find_dir_entry(&dir_raw, "file-7.txt").expect("find"), None);
     }
 
     #[test]

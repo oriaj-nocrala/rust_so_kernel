@@ -929,6 +929,46 @@ fn exec_from(from: ExecFrom, argv_ptr: usize, envp_ptr: usize) -> SyscallResult 
     // applets are symlinks to one binary: `/tmp/bin/cat` must show as
     // `cat`, not `busybox`. (`/proc/<pid>/exe` is the resolved path.)
     let comm = alloc::string::String::from(&name[name.rfind('/').map_or(0, |i| i + 1)..]);
+    let (mut resolved_path, mut elf_owned) = if let Some(image) = fd_image {
+        (alloc::string::String::from(name), image)
+    } else {
+        match read_exec_path(name) {
+            Ok(r) => r,
+            Err(e) => return e,
+        }
+    };
+    // `#!` scripts (Linux's binfmt_script, rules in `vfs::exec`): the interpreter runs with the script's path as an argument.
+    // `comm` stays the script's name and `/proc/<pid>/exe` becomes the interpreter, as on Linux.
+    let mut argv = argv;
+    let mut depth = 0;
+    loop {
+        match vfs::exec::classify(&elf_owned) {
+            vfs::exec::Image::Elf => break,
+            vfs::exec::Image::Unknown => {
+                serial_println!("sys_exec: '{}' is neither an ELF file nor a #! script: ENOEXEC", resolved_path);
+                return errno::ENOEXEC;
+            }
+            vfs::exec::Image::Script { interpreter, arg } => {
+                depth += 1;
+                if depth > vfs::exec::MAX_SCRIPT_DEPTH {
+                    return errno::ELOOP;
+                }
+                // the interpreter is opened by path, which capability mode refuses
+                if crate::process::scheduler::in_capmode() {
+                    return super::record_denial(
+                        format_args!("execve: interpreter '{}' of {}: ECAPMODE (capability mode)", interpreter, resolved_path),
+                        errno::ECAPMODE,
+                    );
+                }
+                argv = vfs::exec::script_argv(&interpreter, arg.as_deref(), &resolved_path, &argv);
+                serial_println!("sys_exec: '{}' is a script for '{}'", resolved_path, interpreter);
+                (resolved_path, elf_owned) = match read_exec_path(&interpreter) {
+                    Ok(r) => r,
+                    Err(e) => return e,
+                };
+            }
+        }
+    }
     // `/proc/<pid>/cmdline`: every argument followed by its NUL, as Linux
     // lays out the argument area. A call without argv (the legacy
     // `exec(name)`) gets the name as its only argument.
@@ -943,39 +983,6 @@ fn exec_from(from: ExecFrom, argv_ptr: usize, envp_ptr: usize) -> SyscallResult 
             c.push(0);
         }
         c.into()
-    };
-    let (resolved_path, elf_owned) = if let Some(image) = fd_image {
-        (alloc::string::String::from(name), image)
-    } else {
-    let resolved_path = match resolve_exec_path(name) {
-        Ok(p) => p,
-        Err(e) => {
-            serial_println!("sys_exec: '{}' not found", name);
-            return e;
-        }
-    };
-    serial_println!("sys_exec: resolved '{}' -> '{}'", name, resolved_path);
-
-    let elf_owned = {
-        let mut handle = match crate::fs::vfs::open(&resolved_path, crate::fs::types::OpenFlags::RDONLY) {
-            Ok(h) => h,
-            Err(e) => {
-                serial_println!("sys_exec: '{}' not found", name);
-                return e.as_i64();
-            }
-        };
-        let mut buf = alloc::vec::Vec::new();
-        let mut chunk = [0u8; 8192];
-        loop {
-            match handle.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                Err(_) => return errno::EIO,
-            }
-        }
-        buf
-    };
-    (resolved_path, elf_owned)
     };
 
     // Load ELF without any lock — may take time and allocates frames.
@@ -1201,6 +1208,26 @@ fn exec_from(from: ExecFrom, argv_ptr: usize, envp_ptr: usize) -> SyscallResult 
 /// the *canonical path string* is what needs to survive to become the new
 /// `Process::exe_name` — an `Inode` alone doesn't carry the path that
 /// reached it.
+/// The program file at `name` (symlinks followed): its resolved path and whole contents.
+fn read_exec_path(name: &str) -> Result<(alloc::string::String, alloc::vec::Vec<u8>), i64> {
+    let resolved_path = resolve_exec_path(name).inspect_err(|_| serial_println!("sys_exec: '{}' not found", name))?;
+    serial_println!("sys_exec: resolved '{}' -> '{}'", name, resolved_path);
+    let mut handle = crate::fs::vfs::open(&resolved_path, crate::fs::types::OpenFlags::RDONLY).map_err(|e| {
+        serial_println!("sys_exec: '{}' not found", name);
+        e.as_i64()
+    })?;
+    let mut buf = alloc::vec::Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match handle.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => return Err(errno::EIO),
+        }
+    }
+    Ok((resolved_path, buf))
+}
+
 fn resolve_exec_path(name: &str) -> Result<alloc::string::String, i64> {
     let mut path = resolve_path(name);
     for _ in 0..8 {
