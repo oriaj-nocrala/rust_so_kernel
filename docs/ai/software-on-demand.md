@@ -35,8 +35,9 @@ They assume every app has a developer, a store and a signature. A generated app 
 `/mnt/apps/<name>/`: `manifest` (name, icon, entry, requested capabilities, provenance:
 request text, model, date, parent entry if forked), the entry (`main.js` for the three.js
 runtime, or a static binary), assets, `tests/` (semantic-tree scripts the agent ran). Launcher
-line and icon derive from the manifest. Native apps are **static**: no name resolution at
-install time (no slopsquatting), and they keep running for decades (P3.4).
+line and icon derive from the manifest. Native apps are **static except the platform**
+(musl, the Vulkan driver), whose libraries are content-addressed and pinned per generation
+(`docs/userland/roadmap.md` step 2): an app keeps running for decades (P3.4).
 
 ## Drivers on demand: a ladder by reach
 
@@ -67,7 +68,12 @@ ACL 2026, Linux drivers → QEMU models, 44/50; Termite, OSDI 2014, formal synth
 - **Threat, measured:** 19.7% of LLM code samples import a package that doesn't exist; 43% of
   those names recur on every run, so attackers register them (slopsquatting, USENIX Security
   2025); real malicious packages have reached tens of thousands of downloads.
-- **Mitigations:** static apps (no install-time resolution); capabilities (a malicious entry
+- **Slopsquatting happens at build time** (a hallucinated package fetched from a registry),
+  so static vs dynamic linking does not change it: the malicious code ends up in the binary
+  either way.
+- **Mitigations:** the agent builds only against an allowlisted, locally mirrored dependency
+  set with a lockfile (a name not in the mirror fails the build instead of being fetched);
+  capabilities (a malicious entry
   only does what was granted); the manifest shown before install ("asks for microphone and
   files you give it; **no network**"); tests that run locally before first launch;
   provenance chain of forks.

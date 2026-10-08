@@ -63,6 +63,9 @@ Linux-numbered (437), useful alone, the core of capability mode.
 
 ## Stage 2. NX for user pages + `PROT_EXEC` (1)
 
+Also a prerequisite of dynamic linking (`docs/userland/roadmap.md` step 2), so W^X holds
+from the first dynamically linked binary.
+
 - Facts: `EFER.NXE` is already on (bootloader on the BSP, AP trampoline sets it,
   `kernel/src/cpu/init.rs` verifies it); kernel PTEs use bit 63. User mappings just never set it:
   `kernel/src/memory/elf_loader.rs` (~line 513, comment says NX is "not confirmed": stale),
@@ -76,6 +79,9 @@ Linux-numbered (437), useful alone, the core of capability mode.
 - **Gate:** the ABI suite, BusyBox, DOOM/Quake, `term`, the compositor and (if available on the
   host) a std/tokio probe (`scripts/run-std-probe.sh`) still run; a new C test jumps into a
   non-`PROT_EXEC` page and gets `SIGSEGV`, then `mprotect(PROT_EXEC)` makes it run; sabotage.
+- **Say why (P1.1):** the page fault's error code has the instruction-fetch bit; a process killed
+  for executing non-executable memory is announced as such ("executed non-executable memory at
+  0x..."), not as a plain segmentation fault, in the kill notice (`kalert!`) and the log.
 
 ## Stage 3. Rights on fds + `cap_rights_limit` (1.5)
 
@@ -105,6 +111,10 @@ Linux-numbered (437), useful alone, the core of capability mode.
 - **Test:** one C program enters cap mode and tries each escape (`/etc/...`, `/dev/...`, `..`
   from its dirfd, `kill` of another pid, connecting to a socket path); every attempt fails with
   `ECAPMODE`/`ENOTCAPABLE`; sabotage each check.
+- **Say why (P1.1):** Capsicum's errors are opaque to the program. Record every denial (syscall,
+  path or target, the capability or right that was missing) in a per-process ring readable from
+  **outside** the process (`/proc/<pid>/...` or the kernel log), because foreign programs will
+  only print "Not permitted". The C test also checks that each denial left its record.
 
 ## Stage 5. `cap-exec`, the launcher (0.5)
 

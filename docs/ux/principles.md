@@ -23,6 +23,15 @@ Related: [`backbones.md`](backbones.md) (the infrastructure these need),
   same risk exists here between coding-agent sessions; P5 is the rule against it.
 - Each child is a **rule a test can check**, like the kernel invariants in `CLAUDE.md`.
 
+## When principles pull apart
+
+- **P1 (explain) vs P9 (attention):** everything is explained and available on demand; normal
+  state goes to the periphery; only what needs a user action interrupts. A verified backup is
+  a green tint at the edge; a failed one is a notification that can't be dismissed until seen.
+  Never implement P1 by adding popups.
+- **P3.4 (pinned versions last) vs P1/P8 (a known flaw must be visible):** an app may stay pinned
+  to old platform libraries, but the system says so when that version has a known problem.
+
 ---
 
 ## P1. The system explains itself — evidence 15
@@ -84,7 +93,7 @@ network, an account or a vendor, and none of it expires with a company's support
 | P3.1 Works offline, no account | Install, first boot, search and every base feature work with no network and no account. |
 | P3.2 Local first | Personal data (files, memories, the learner model) lives on the machine; anything sent out is explicit and visible (P1.3). |
 | P3.3 Old hardware is a target | If an x86-64 UEFI machine works, constanos runs on it; no TPM or CPU-generation gates. |
-| P3.4 Formats never die | A decoder the system ever shipped is never removed; static apps keep running unchanged. |
+| P3.4 Formats never die | A decoder the system ever shipped is never removed; an app keeps running unchanged: apps are static except the platform libraries, which are content-addressed and pinned per generation (policy: `docs/userland/roadmap.md` step 2). |
 | P3.5 Data survives its owner and its machine | Recovery and inheritance (threshold-shared keys) and whole-system migration need no cloud. |
 
 Evidence: Bing results in local search (fixed only in a 26H2 test build); the Windows 11 Calendar

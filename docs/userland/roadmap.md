@@ -13,22 +13,82 @@ and unblocks the next. GPU work is out of this list (it depends on the Ryzen).
   the RTC time is right (certificate validity).
 - Test in QEMU (user network) first, then on the Ryzen (RTL8168, gigabit verified).
 
-## 2. Dynamic linking (1 session of planning, 1-2 to implement)
+## 2. Dynamic linking (reviewed 2026-10-08: 3-5 sessions, after NX)
 
-Use musl's `ld.so`; the kernel side is small but three things are missing:
-1. **`PT_INTERP`**: the loader refuses it today (`docs/reference/memory.md`). Load the
-   interpreter (ET_DYN) at a base, pass `AT_BASE`/`AT_PHDR`/`AT_PHNUM`/`AT_ENTRY`, enter it.
-2. **File-backed `mmap(MAP_PRIVATE)`**: only anonymous and memfd mappings exist. A first
-   version may copy the file into private pages at map time (no page cache).
-3. **`mmap` address hints**: a nonzero `addr` is treated as `MAP_FIXED` today; Linux treats
-   it as a hint unless `MAP_FIXED`/`MAP_FIXED_NOREPLACE`. `ld.so` relies on that.
+Linking policy (`docs/ux/principles.md` P3.4, P6): **static, except the platform.**
 
-Gate for most non-static Linux binaries (and for step 3).
+| Layer | Linking | Why |
+|---|---|---|
+| Platform: musl, the Vulkan driver (NVK), later a UI library with a C interface | **dynamic**, immutable, content-addressed, part of a system generation (B4) | used by many processes at once (the exception Torvalds grants: libc and core GUI libraries); one fix reaches every app; pinned by hash, so no DLL hell and old generations keep their libs |
+| Native apps, including generated ones | **static** except the platform | one-off libraries gain nothing shared (DeVault: over half of a distro's libraries serve < 0.1% of executables) |
+| three.js apps | n/a | scripts on one runtime |
+| Plugins (audio, effects, formats) | **out of process** | Bitwig sandboxes plugins; Apple loads AUv3 out of process by default; P6. `dlopen` only for trusted platform pieces (the Vulkan ICD) |
+| Foreign Linux binaries | dynamic through musl's `ld.so` | compatibility |
 
-Scope: dynamic linking is for **running foreign Linux binaries**. constanos-native and generated
-apps stay **static** (`docs/ai/software-on-demand.md`): nothing is resolved by name at install
-or load time (no room for slopsquatting), and an app keeps running unchanged for decades
-(P3.4, P6 in `docs/ux/principles.md`).
+Measured today: six Vulkan programs in `disk-image-root/bin` are ~16 MB each (`vk_comp` 19 MB),
+almost all of it the same statically linked NVK: ~95 MB on disk, and each running copy loads its
+own code; an NVK fix means rebuilding every Vulkan app. Rust has no stable ABI between crates,
+so a shared Rust library (e.g. the text engine) needs a C (`cdylib`) facade or a service.
+
+### What the kernel lacks (checked in the code 2026-10-08)
+
+1. **`PT_INTERP`**: `elf_loader.rs` refuses it. Load the interpreter (ET_DYN) at its own base,
+   not `PIE_BASE`, and enter it. **auxv lacks `AT_BASE`** (it has `AT_PHDR/PHENT/PHNUM/ENTRY/
+   PAGESZ/RANDOM`): add it (and `AT_HWCAP`, `AT_SECURE`=0 cheaply).
+2. **File-backed `mmap`**: `sys_mmap` returns `EINVAL` for `MAP_PRIVATE` with an fd, and
+   `MAP_SHARED` works only on memfd/shm objects. `ld.so` maps each segment from the file with
+   an offset, `MAP_PRIVATE`.
+3. **Address hints and `MAP_FIXED`**: a nonzero `addr` is treated as fixed and fails on overlap
+   (`address_space.rs`, "MAP_FIXED conflict"). Linux: without `MAP_FIXED` it is a hint (pick
+   elsewhere); with `MAP_FIXED` it **replaces** what is there (`ld.so` reserves the whole span,
+   then maps each segment over it with `MAP_FIXED`); `MAP_FIXED_NOREPLACE` fails with `EEXIST`.
+4. **`PROT_EXEC` and RELRO**: `ld.so` maps code with `PROT_EXEC` and `mprotect`s RELRO
+   read-only. **Do NX first** (`docs/ux/handoff-capabilities-to-files.md` stage 2) so W^X holds
+   from the first dynamic binary instead of working by accident.
+5. **A page cache for shared code**: there is none. Today `exec` copies every segment into fresh
+   frames, so two runs of the same program share nothing, and a "copy the file into private
+   pages at map time" `mmap` would give dynamic linking all its costs and none of the memory
+   benefit. Scoped design: share pages **only for immutable files** (the platform's
+   content-addressed store, see "Layout"): no coherence with writes to solve, COW on a private
+   write. Mutable files keep the copy-at-map path. `exec` of a store binary can use the same
+   cache, which also shares the text of two instances of one static program.
+
+### Layout
+
+- A store per generation: `/system/<hash>-<name>-<version>/lib/...` (immutable; the hash
+  pins, the name and version keep it readable, as Nix does). Native dynamic binaries carry
+  `PT_INTERP` and `DT_RUNPATH` into the store path they were built and tested against (as Nix
+  does), so an app is pinned to exact library versions and a new generation can't break it.
+- `/lib/ld-musl-x86_64.so.1` (the path foreign musl binaries expect) is a symlink into the
+  current generation's store.
+
+### Observability (P1, `docs/ux/principles.md`)
+
+- **Missing interpreter or library:** Linux returns `ENOENT` from `exec` when the *interpreter*
+  is missing ("No such file" for a file that exists), and `ld.so` reports a missing library on
+  stderr, lost when the panel launched the app. Here the `exec` failure carries its cause
+  (the missing interpreter or library, backbone B2), and the launcher keeps each app's stderr
+  and exit status and shows them when a launch fails.
+- **What an app is linked against** is visible in the inspector (a `ldd` with names and
+  versions from the store paths).
+- **Shared pages are attributed** proportionally and by library name (B2), never as "other".
+- **Pinned to a flawed version:** when a platform library version has a known problem, apps
+  still pinned to it say so and offer to try the current generation; staying pinned is a
+  visible choice.
+
+### Steps
+
+1. NX + `PROT_EXEC` (handoff stage 2). 2. `mmap`: hints, `MAP_FIXED` replace,
+`MAP_FIXED_NOREPLACE`, file-backed `MAP_PRIVATE` by copy. 3. `PT_INTERP` + `AT_BASE`: a C
+program dynamically linked against musl runs; `dlopen` of a test `.so` works. 4. Immutable store
++ page cache for it; measure: two processes mapping the same library share frames (a
+`/proc/kdebug` counter), sabotage the sharing and see the counter drop. 5. Platform libs:
+musl's `libc.so`, then Mesa/NVK as a shared ICD (the mesa-port builds static today; decide
+between the Khronos loader and linking `libvulkan_nouveau.so` directly), then rebuild the
+Vulkan apps against it and measure disk and RAM again.
+
+Tests: raw C tests per syscall change (`linux-abi` skill), proven by sabotage; an unmodified
+dynamically linked Alpine binary (e.g. its `busybox`) as the compatibility gate.
 
 ## 3. Claude Code (scope first, then decide)
 

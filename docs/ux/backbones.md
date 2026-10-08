@@ -35,6 +35,13 @@ hangs from one of these six. Build a backbone once, in the layer that owns the i
   layer. Per-CPU vs global work stated per the timer-tick rule.
 - **First step:** `EBUSY` on unmount/eject naming the holder (who-has-it-open walk over fd
   tables, IF-safe per the lock order).
+- **Visible from outside the process:** foreign Linux programs will never read the extended
+  channel and print a bare "Permission denied". So the kernel also keeps each process's recent
+  failures with their causes (syscall, path, missing capability, holder) where the inspector,
+  `/proc` and `agentd` can read them. The cause must not depend on the app cooperating.
+- **Shared memory has owners too:** pages shared through the page cache (platform libraries)
+  are attributed proportionally (like Linux's PSS) and listed by name ("NVK: 15 MB shared by
+  vk_comp, snake3d"), never as an anonymous "shared"/"other" bucket.
 - **Unknowns:** cost of per-socket accounting on the hot path; where the "why" lives so threads
   don't clobber each other's.
 
@@ -50,12 +57,16 @@ hangs from one of these six. Build a backbone once, in the layer that owns the i
 ## B4. System generations
 
 - **What:** a system version = kernel + `/bin` + system apps as one unit; boot the new one once,
-  mark it good after `watchdog::settle`, else the firmware falls back. The metal loop already
+  mark it good after `watchdog::settle`, else the firmware falls back, **and the next boot says
+  why** ("the update to generation 13 never reached a healthy state: watchdog at X; you are back
+  on 12"), with the log at hand (P1.2). The metal loop already
   does this: `BootNext` one-shot boot + TCO watchdog (`docs/reference/metal.md`,
   `docs/metal/autonomous-loop-plan.md`).
 - **First step:** write down the generation layout on the ESP and the "good" marker; reuse the
   metal-loop code paths rather than writing new ones (P5).
-- **Open:** where user-pinned UI versions live (P2.6); how apps (directories, static) join a
+- **Platform libraries** (musl, NVK) live in an immutable store per generation, addressed by
+  hash; native apps pin the store path they were tested against (`docs/userland/roadmap.md` step 2).
+- **Open:** where user-pinned UI versions live (P2.6); how apps (directories, static except the platform) join a
   generation.
 
 ## B5. Semantic UI tree

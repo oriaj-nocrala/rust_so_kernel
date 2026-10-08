@@ -79,7 +79,7 @@ then show (30, P2.7). The journal itself (1) is backbone B1, the semantic tree (
 | U1 | Run in draft: execute an installer/script in a VFS overlay, review the diff, commit or discard | P4.1, P6 | B1 | 14 | L |
 | U2 | Backups verified by real sample restores; status = "last verified restore" | P8.1 | B1 | 58 | M |
 | U3 | Atomic system generations with automatic fallback (from the metal loop) | P4.3 | B4 | 61 | M |
-| U4 | Apps as self-contained static directories; one updater for system and apps | P5.4, P3.4 | B4 | 60, 62 | M |
+| U4 | Apps as self-contained directories, static except the pinned platform libraries; one updater for system and apps | P5.4, P3.4 | B4 | 60, 62 | M |
 | U5 | Pinned UI version; a new one is tried in a window a few times before adoption | P2.6 | B4 | 77 | M |
 | U6 | Inheritance and migration: threshold-shared disk key among trusted people; whole-system transfer | P3.5 | B4 | 78 | L |
 | U7 | Daemon does the work, UI only watches (`filesd`): copies survive a UI crash and resume after reboot | P6.5, P4.4 | B1 | 18 | M |

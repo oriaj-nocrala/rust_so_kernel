@@ -89,6 +89,11 @@ model-written apps run unmodified).
 
 ## Caveats
 
+- **Everything the agent does is visible (P1, P2, P4).** When `agentd` installs, deletes or
+  changes something, the system is acting. Every tool call goes to an activity log the user
+  can see, with the request that caused it, what it touched and how to undo it. The log is
+  written by `agentd`'s host side of each tool, not by the model, so it can't be skipped.
+
 - **Memories of a student** (possibly a minor) sent to an API: privacy/consent matters for
   anything beyond a demo. Use a fictional user in demos.
 - **Trademarks:** a public repo of generated apps with a famous superhero invites trouble; use
