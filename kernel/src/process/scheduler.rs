@@ -1412,6 +1412,10 @@ impl Scheduler {
             // same pid twice; PID 1 never looked again, so `busybox
             // --install`'s zombie lived for the whole uptime.
             self.reap_zombie(dead_pid);
+            // That bypasses `sys_waitpid`'s `dead_files::settle`: the child's
+            // files may still be closing on another CPU. The parent waits for
+            // them at its next syscall, the first thing that could see them.
+            super::dead_files::settle_before_next_syscall(pid);
             self.wake(pid);
         }
         // Last: a parent whose `waitpid` this death just completed must get

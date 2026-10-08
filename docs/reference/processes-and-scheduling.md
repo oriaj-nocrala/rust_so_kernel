@@ -84,7 +84,8 @@ Code: `kernel/src/process/` (`scheduler.rs`, `timer_preempt.rs`, `trapframe.rs`,
 ## Process death
 
 - `kill_current` (every death path) moves the fd table to `process::dead_files`, which is drained with no lock held at every syscall entry and in the idle loop. Never drop files under `SCHEDULER`: a socket's `Drop` takes it again.
-- `sys_waitpid` starts with `dead_files::settle()`: drain, then wait for a drain another CPU has started (`IN_FLIGHT`), so a child handed back by `wait4` has its files closed, as in Linux (a parent could otherwise find an exclusive device its dead child held, `/dev/nvgpu` or `/dev/fb0`, still busy). The count goes up and down with interrupts off: the idle loop drains with IF=1 and is pinned to its CPU, so a tick in between would leave the count raised for ever.
+- `sys_waitpid` starts with `dead_files::settle()`: drain, then wait for a drain another CPU has started (`IN_FLIGHT`), so a child handed back by `wait4` has its files closed, as in Linux (a parent could otherwise find an exclusive device its dead child held, `/dev/nvgpu` or `/dev/fb0`, still busy).
+  - A `waitpid` that was **blocked** is completed by the waker (`notify_child_death` sets `rax`, reaps, wakes): it never runs `sys_waitpid` again, so it skips that `settle`. The waker calls `dead_files::settle_before_next_syscall(parent)`, and the parent's next syscall entry (`drain_for`) waits for `FILES_IN_FLIGHT` (files only, not the address spaces after them). Without it `nvgpu_sw_test` saw the session busy after `waitpid` in 3 of 4 full suite runs under KVM (an idle CPU had taken the queue and was still closing). The count goes up and down with interrupts off: the idle loop drains with IF=1 and is pinned to its CPU, so a tick in between would leave the count raised for ever.
 - Children are reparented to PID 1 (`reparent_children`).
 - A zombie whose blocked parent is woken for it is reaped right there (`reap_zombie`).
 - Test: `lifecycle_test`.

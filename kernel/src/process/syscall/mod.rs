@@ -905,7 +905,9 @@ pub fn syscall_handler(
 
     // Close what processes killed by a signal or a fault left open: this
     // is process context with no lock held (see `process::dead_files`).
-    crate::process::dead_files::drain();
+    // A process just handed a reaped child also waits here for that
+    // child's files to finish closing (`settle_before_next_syscall`).
+    crate::process::dead_files::drain_for(crate::process::scheduler::current_pid_fast());
 
     let syscall = match SyscallNumber::from_u64(syscall_num) {
         Some(s) => s,

@@ -46,6 +46,13 @@ static DEAD_PIDS: IrqMutex<Vec<usize>, KernelIrq> = IrqMutex::new(Vec::new());
 static PENDING: AtomicBool = AtomicBool::new(false);
 /// Drains that have taken the queue and are still closing what they took.
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// The same, until their files are closed (the address spaces after them can take seconds; nobody waits for those).
+static FILES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// Processes that were handed a reaped child by `Scheduler::notify_child_death` (their `waitpid` completed without running
+/// again, so without its `settle`): each waits for the files in flight at the entry of its next syscall ([`drain_for`]).
+static SETTLE_PIDS: IrqMutex<Vec<usize>, KernelIrq> = IrqMutex::new(Vec::new());
+/// `SETTLE_PIDS` is not empty: lets [`drain_for`] skip its lock on every syscall.
+static SETTLE_ANY: AtomicBool = AtomicBool::new(false);
 
 /// Queues a dead process's table. Callable under `SCHEDULER` and from the
 /// timer ISR: it only takes `DEAD` (an `IrqMutex`, after `SCHEDULER` in
@@ -93,15 +100,19 @@ pub fn drain() {
     x86_64::instructions::interrupts::without_interrupts(|| {
         // Announced before the queue is taken, so anyone who then finds `PENDING` clear can tell a drain is still closing files.
         IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        FILES_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
         if PENDING.swap(false, Ordering::SeqCst) {
             let tables = DEAD.with(core::mem::take);
             drop(tables);
+            FILES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
             let spaces = DEAD_SPACES.with(core::mem::take);
             drop(spaces);
             for pid in DEAD_PIDS.with(core::mem::take) {
                 crate::process::pidfd::mark_exited(pid);
                 crate::process::syscall::poll_wakeup_for_pidfd(pid);
             }
+        } else {
+            FILES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
         }
         IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
     });
@@ -119,3 +130,47 @@ pub fn settle() {
         core::hint::spin_loop();
     }
 }
+
+/// `pid` was just handed a dead child by a `waitpid` completed from the waker (`Scheduler::notify_child_death`), which runs under
+/// `SCHEDULER` and cannot wait for anything. The child's files are queued here by then (`kill_current` queues them before the
+/// zombie exists), but another CPU may have taken the queue and still be closing them: `pid`'s next syscall waits for that
+/// ([`drain_for`]), so the parent cannot observe the child's files open (a `/dev/nvgpu` session still busy) after `waitpid`.
+/// Callable under `SCHEDULER`, like [`defer`].
+pub fn settle_before_next_syscall(pid: usize) {
+    SETTLE_PIDS.with(|v| {
+        // A process that is killed before its next syscall leaves its pid here; drop the stale ones rather than grow.
+        if v.len() >= 64 {
+            v.clear();
+        }
+        if !v.contains(&pid) {
+            v.push(pid);
+        }
+    });
+    SETTLE_ANY.store(true, Ordering::Release);
+}
+
+/// [`drain`] at the entry of a syscall of process `pid`, plus the wait [`settle_before_next_syscall`] asked for. No lock held.
+pub fn drain_for(pid: usize) {
+    drain();
+    if !SETTLE_ANY.load(Ordering::Acquire) {
+        return;
+    }
+    let mine = SETTLE_PIDS.with(|v| match v.iter().position(|&p| p == pid) {
+        Some(i) => {
+            v.swap_remove(i);
+            if v.is_empty() {
+                SETTLE_ANY.store(false, Ordering::Release);
+            }
+            true
+        }
+        None => false,
+    });
+    if mine {
+        while FILES_IN_FLIGHT.load(Ordering::SeqCst) != 0 {
+            // A drainer may be waiting for a TLB shootdown this CPU has not answered.
+            crate::memory::tlb::service_pending();
+            core::hint::spin_loop();
+        }
+    }
+}
+
