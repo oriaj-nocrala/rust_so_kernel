@@ -129,13 +129,13 @@ pub(super) fn socket(ty: i32, protocol: i32) -> SyscallResult {
     };
     let handle = InetSocketHandle::new(id);
     handle.set_nonblocking(ty & SOCK_NONBLOCK != 0);
-    install(handle, ty & SOCK_CLOEXEC != 0)
+    install(handle, ty & SOCK_CLOEXEC != 0, vfs::rights::CAP_ALL)
 }
 
-/// Puts a socket behind a new descriptor of the current process.
-fn install(handle: InetSocketHandle, cloexec: bool) -> SyscallResult {
+/// Puts a socket behind a new descriptor of the current process, with capability `rights`.
+fn install(handle: InetSocketHandle, cloexec: bool, rights: vfs::rights::Rights) -> SyscallResult {
     let files = super::ipc::current_files();
-    let allocated = files.lock().allocate(Box::new(handle));
+    let allocated = files.lock().allocate_with_rights(Box::new(handle), rights);
     match allocated {
         Ok(fd) => {
             if cloexec {
@@ -215,7 +215,8 @@ pub(super) fn accept(id: usize, fd: i32, addr_ptr: u64, len_ptr: u64, flags: i32
             return e;
         }
     }
-    install(handle, flags & SOCK_CLOEXEC != 0)
+    // An accepted socket has the listening socket's rights (Capsicum).
+    install(handle, flags & SOCK_CLOEXEC != 0, super::ipc::fd_rights(fd))
 }
 
 pub(super) fn sendto(

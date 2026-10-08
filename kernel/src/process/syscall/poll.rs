@@ -33,6 +33,8 @@ enum PollSource {
     /// fd 0 while it is still the console: readable when the keyboard buffer has a key. Once fd 0 is redirected to a file
     /// it is `Other` like any file (always ready), the same gate `sys_read` uses (`stdin_is_console`).
     Console,
+    /// An fd without `CAP_EVENT` (`vfs::rights`): never ready, reported `POLLNVAL` (FreeBSD's answer for `poll`).
+    NoEvent,
 }
 
 /// A process's fd → `PollSource` mapping, snapshotted at the moment it blocks.
@@ -80,7 +82,9 @@ fn snapshot_sockets() -> SocketMap {
     let mut map = alloc::vec![PollSource::Other; len];
     for (fd, slot) in map.iter_mut().enumerate() {
         if let Ok(h) = guard.get(fd) {
-            *slot = if let Some(id) = h.socket_id() {
+            *slot = if guard.check_rights(fd, vfs::rights::CAP_EVENT).is_err() {
+                PollSource::NoEvent
+            } else if let Some(id) = h.socket_id() {
                 PollSource::Socket(id)
             } else if let Some(src) = h.event_source() {
                 PollSource::Input { queue: src.queue as u32, buffered: src.buffered, seen: src.seen }
@@ -339,6 +343,7 @@ fn fd_check_ready(socks: &SocketMap, fd: i32, events: i16) -> i16 {
     let fd_usize = fd as usize;
     // The snapshot runs to the highest open fd: past it, nothing is open.
     let Some(&source) = socks.get(fd_usize) else { return POLLNVAL };
+    if matches!(source, PollSource::NoEvent) { return POLLNVAL; }
 
     if let PollSource::Input { queue, buffered, seen } = source {
         let ready = buffered || crate::drivers::evdev::queue_ready(queue as usize, seen);

@@ -69,13 +69,18 @@ use usock::{PollMask, SockError, SocketId, SocketTable, UnixAddr, Wakes};
 use crate::allocator::KernelIrq;
 use crate::process::file::{FileError, FileHandle, FileResult};
 
-/// Every AF_UNIX socket in the system.
-///
-/// `Box<dyn FileHandle>` is the `SCM_RIGHTS` payload: a descriptor in flight
-/// is an owned handle sitting in a queue, exactly like one sitting in a
-/// `FileDescriptorTable`, and is installed into the receiver's table
-/// verbatim when it arrives.
-pub static SOCKETS: IrqMutex<SocketTable<Box<dyn FileHandle>>, KernelIrq> =
+/// A descriptor in flight (`SCM_RIGHTS`): an owned handle sitting in a queue,
+/// exactly like one sitting in a `FileDescriptorTable`, with the capability
+/// rights it had in the sender's table, which the receiver's new fd keeps
+/// (`vfs::rights`: passing an fd never widens it).
+pub struct PassedFd {
+    pub handle: Box<dyn FileHandle>,
+    pub rights: vfs::rights::Rights,
+}
+
+/// Every AF_UNIX socket in the system. `PassedFd` is the `SCM_RIGHTS`
+/// payload, installed into the receiver's table when it arrives.
+pub static SOCKETS: IrqMutex<SocketTable<PassedFd>, KernelIrq> =
     IrqMutex::new(SocketTable::new());
 
 /// Processes parked on a socket, waiting for it to become ready.

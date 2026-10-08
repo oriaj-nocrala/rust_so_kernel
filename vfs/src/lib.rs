@@ -128,5 +128,6 @@ pub mod lock;
 pub mod mount;
 pub mod path;
 pub mod resolve;
+pub mod rights;
 pub mod ramfs;
 pub mod types;

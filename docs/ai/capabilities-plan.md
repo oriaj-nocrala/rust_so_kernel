@@ -82,8 +82,9 @@ resource-and-effect capabilities for coding agents") but not read.
 
 1. **Done.** `openat2` with `RESOLVE_BENEATH` (+ `RESOLVE_NO_SYMLINKS`), raw C test proven by sabotage
    (`linux-abi` skill).
-2. NX / `PROT_EXEC`.
-3. Rights masks on fds + `cap_rights_limit`, host-testable where the logic allows (`vfs`).
+2. **Done.** NX / `PROT_EXEC` (`nx_test`).
+3. **Done.** Rights masks on fds + `cap_rights_limit` (405) / `cap_rights_get` (406); pure rules in `vfs::rights`, the
+   per-syscall table in `syscall::fd_rights_needed` (`cap_rights_test`).
 4. `cap_enter` + `ECAPMODE` on every global-namespace syscall: audit the syscall table
    (`kernel/src/process/syscall/`) and list each one as allowed / denied / fd-relative.
 5. Launcher integration (`agentd`, compositor, `filesd`'s preview providers).

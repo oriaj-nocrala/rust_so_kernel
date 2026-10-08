@@ -39,12 +39,16 @@ pub struct FileDescriptorTable {
     /// The absolute path an fd was opened by (`open`/`openat`), which the `*at` calls resolve a relative path against when it is
     /// their `dirfd`. `None` for fds that were not opened by path (pipes, sockets, stdio) and for a slot's fresh handle.
     paths: alloc::vec::Vec<Option<alloc::string::String>>,
+    /// Capability rights per slot (`vfs::rights`): what may be done through the descriptor. A property of the descriptor
+    /// like `cloexec`, but `dup`, `fork` and `exec` keep it (Capsicum); a fresh handle starts with `CAP_ALL`. Only
+    /// `limit_rights` changes it, and only downwards. Always as long as `files`.
+    rights: alloc::vec::Vec<vfs::rights::Rights>,
 }
 
 impl FileDescriptorTable {
     /// Create an empty table.
     pub const fn new() -> Self {
-        Self { files: alloc::vec::Vec::new(), cloexec: alloc::vec::Vec::new(), paths: alloc::vec::Vec::new() }
+        Self { files: alloc::vec::Vec::new(), cloexec: alloc::vec::Vec::new(), paths: alloc::vec::Vec::new(), rights: alloc::vec::Vec::new() }
     }
 
     /// Make `fd` a valid slot index (growing the table with free slots). `false` if it is past `MAX_FILES`.
@@ -56,15 +60,48 @@ impl FileDescriptorTable {
             self.files.resize_with(fd + 1, || None);
             self.cloexec.resize(fd + 1, false);
             self.paths.resize(fd + 1, None);
+            self.rights.resize(fd + 1, vfs::rights::CAP_ALL);
         }
         true
     }
 
-    /// Put `handle` at `fd` (free or not; the caller has dealt with whatever was there), with a clear close-on-exec flag.
+    /// Put `handle` at `fd` (free or not; the caller has dealt with whatever was there), with a clear close-on-exec flag and
+    /// every right.
     fn put(&mut self, fd: usize, handle: Box<dyn FileHandle>, cloexec: bool) {
         self.files[fd] = Some(handle);
         self.cloexec[fd] = cloexec;
         self.paths[fd] = None;
+        self.rights[fd] = vfs::rights::CAP_ALL;
+    }
+
+    /// The capability rights of an open descriptor.
+    pub fn rights(&self, fd: usize) -> FileResult<vfs::rights::Rights> {
+        self.get(fd)?;
+        Ok(self.rights[fd])
+    }
+
+    /// `Ok` if open descriptor `fd` holds every right in `need`; `Err(None)` if it is not open, `Err(Some(name))` with the
+    /// first missing right otherwise.
+    pub fn check_rights(&self, fd: usize, need: vfs::rights::Rights) -> Result<(), Option<&'static str>> {
+        let have = self.rights(fd).map_err(|_| None)?;
+        match vfs::rights::first_missing(have, need) {
+            None => Ok(()),
+            Some(name) => Err(Some(name)),
+        }
+    }
+
+    /// `cap_rights_limit`: narrow `fd`'s rights to `want` (`vfs::rights::limit`: never widens).
+    pub fn limit_rights(&mut self, fd: usize, want: vfs::rights::Rights) -> Result<(), vfs::types::Errno> {
+        let have = self.rights(fd).map_err(|_| vfs::types::Errno::EBADF)?;
+        self.rights[fd] = vfs::rights::limit(have, want)?;
+        Ok(())
+    }
+
+    /// `allocate`, with the new descriptor's rights (a file opened through a dirfd, an accepted socket, an `SCM_RIGHTS` fd).
+    pub fn allocate_with_rights(&mut self, handle: Box<dyn FileHandle>, rights: vfs::rights::Rights) -> FileResult<usize> {
+        let fd = self.allocate(handle)?;
+        self.rights[fd] = rights & vfs::rights::CAP_ALL;
+        Ok(fd)
     }
 
     /// Record the absolute path `fd` was opened by (see `paths`).
@@ -163,8 +200,10 @@ impl FileDescriptorTable {
             if self.files.get(i).map_or(true, |slot| slot.is_none()) {
                 self.ensure(i);
                 let path = self.paths.get(fd).cloned().flatten();
+                let rights = self.rights[fd];
                 self.put(i, cloned, cloexec);
                 self.paths[i] = path;
+                self.rights[i] = rights;
                 return Ok(i);
             }
         }
@@ -198,8 +237,10 @@ impl FileDescriptorTable {
             let _ = old.close();
         }
         let path = self.paths.get(oldfd).cloned().flatten();
+        let rights = self.rights[oldfd];
         self.put(newfd, cloned, cloexec);
         self.paths[newfd] = path;
+        self.rights[newfd] = rights;
         Ok(newfd)
     }
 
@@ -224,6 +265,7 @@ impl FileDescriptorTable {
             if self.cloexec[i] {
                 self.cloexec[i] = false;
                 self.paths[i] = None;
+                self.rights[i] = vfs::rights::CAP_ALL;
                 if let Some(h) = self.files[i].take() {
                     out.push(h);
                 }
@@ -243,6 +285,7 @@ impl FileDescriptorTable {
 
         self.cloexec[fd] = false;
         self.paths[fd] = None;
+        self.rights[fd] = vfs::rights::CAP_ALL;
         if let Some(mut handle) = self.files[fd].take() {
             handle.close()?;
         }
@@ -299,6 +342,7 @@ impl Clone for FileDescriptorTable {
         }
         new_table.cloexec = self.cloexec.clone();
         new_table.paths = self.paths.clone();
+        new_table.rights = self.rights.clone();
 
         new_table
     }

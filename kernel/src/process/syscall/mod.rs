@@ -381,6 +381,8 @@ pub enum SyscallNumber {
     MemInfoKb = 402,
     KdebugCtl = 403,
     Statvfs = 404,
+    CapRightsLimit = 405,
+    CapRightsGet = 406,
 }
 
 impl SyscallNumber {
@@ -527,6 +529,8 @@ impl SyscallNumber {
             402 => Some(Self::MemInfoKb),
             403 => Some(Self::KdebugCtl),
             404 => Some(Self::Statvfs),
+            405 => Some(Self::CapRightsLimit),
+            406 => Some(Self::CapRightsGet),
             _ => None,
         }
     }
@@ -553,6 +557,8 @@ pub mod errno {
     pub const EBUSY: i64 = -16;
     pub const EEXIST: i64 = -17;
     pub const ENOTDIR: i64 = -20;
+    /// Not Linux: `vfs::rights::ENOTCAPABLE` (134), a descriptor lacks a capability right.
+    pub const ENOTCAPABLE: i64 = -134;
     pub const EINVAL: i64 = -22;
     pub const EROFS: i64 = -30;
     pub const ENOTTY: i64 = -25;
@@ -701,6 +707,79 @@ fn note_unknown_syscall(nr: u64) {
     }
 }
 
+/// The capability rights (`vfs::rights`) each syscall needs on the descriptors in fixed argument positions: up to two
+/// `(fd, rights)` pairs, `(_, 0)` for none. The audit table of what every fd-taking call may do; `docs/reference/syscalls.md`
+/// lists it. Calls whose fd is a dirfd are not here (only a relative path uses it: `fs::user_path_at`), nor `poll`'s array.
+fn fd_rights_needed(syscall: SyscallNumber, a: [u64; 6]) -> [(i64, vfs::rights::Rights); 2] {
+    use vfs::rights::*;
+    use SyscallNumber as S;
+    const MAP_ANONYMOUS: u64 = 0x20;
+    let fd = a[0] as i32 as i64;
+    let one = |need| [(fd, need), (0, 0)];
+    match syscall {
+        S::Read | S::Recvfrom | S::Recvmsg | S::GetDents64 => one(CAP_READ),
+        S::Write | S::Writev | S::Sendmsg => one(CAP_WRITE),
+        // A destination address is a connect.
+        S::Sendto => one(CAP_WRITE | if a[4] != 0 { CAP_CONNECT } else { 0 }),
+        S::Fstat => one(CAP_FSTAT),
+        S::Lseek => one(CAP_SEEK),
+        S::Ftruncate => one(CAP_FTRUNCATE),
+        S::Fchmod => one(CAP_FCHMOD),
+        S::Ioctl => one(CAP_IOCTL),
+        S::Fcntl => one(fcntl_needs(a[1] as i32)),
+        S::Fchdir => one(CAP_FCHDIR),
+        S::Connect => one(CAP_CONNECT),
+        S::Accept | S::Accept4 => one(CAP_ACCEPT),
+        S::Shutdown => one(CAP_SHUTDOWN),
+        S::Bind => one(CAP_BIND),
+        S::Listen => one(CAP_LISTEN),
+        S::Getsockname => one(CAP_GETSOCKNAME),
+        S::Getpeername => one(CAP_GETPEERNAME),
+        S::Setsockopt => one(CAP_SETSOCKOPT),
+        S::Getsockopt => one(CAP_GETSOCKOPT),
+        S::EpollWait | S::EpollPwait => one(CAP_EVENT),
+        // The epoll fd and the fd being added, changed or removed.
+        S::EpollCtl => [(fd, CAP_EVENT), (a[2] as i32 as i64, CAP_EVENT)],
+        S::PidfdSendSignal => one(CAP_PDKILL),
+        S::Mmap if a[3] & MAP_ANONYMOUS == 0 => [(a[4] as i32 as i64, mmap_needs(a[2] as u32, a[3] as u32)), (0, 0)],
+        _ => [(0, 0), (0, 0)],
+    }
+}
+
+/// `Ok` if `fd` holds `need` or is not open (the call reports `EBADF` itself); `ENOTCAPABLE` otherwise, after
+/// `note_denied`.
+///
+/// Leaves IF as it found it: the dispatcher runs this before every call's body, and syscalls enter with IF=0
+/// (`IA32_FMASK`), which some bodies rely on (`epoll_ctl`'s `epoll_of_fd`). `with_fd_table`'s guard `sti`s
+/// unconditionally, which broke exactly that.
+pub(super) fn require_rights(syscall: SyscallNumber, fd: i64, need: vfs::rights::Rights) -> Result<(), i64> {
+    if fd < 0 {
+        return Ok(());
+    }
+    let files = x86_64::instructions::interrupts::without_interrupts(|| {
+        super::scheduler::local_scheduler().running_ref().map(|p| p.files.clone())
+    });
+    let Some(files) = files else { return Ok(()) };
+    let verdict = files.lock().check_rights(fd as usize, need);
+    match verdict {
+        Err(Some(right)) => Err(note_denied(format_args!("{:?}", syscall), fd, right)),
+        _ => Ok(()),
+    }
+}
+
+/// Say why a call was refused for a missing right (P1.1: a program only prints "unknown error 134"): one log line with the
+/// pid, the call, the fd and the right. Returns `ENOTCAPABLE`. No lock held; IF is left as it was.
+pub(super) fn note_denied(what: core::fmt::Arguments, fd: i64, right: &str) -> i64 {
+    crate::serial_println!(
+        "capability: PID {} {} on fd {} refused: no {}",
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            super::scheduler::local_scheduler().running_ref().map_or(0, |p| p.pid.0)
+        }),
+        what, fd, right
+    );
+    errno::ENOTCAPABLE
+}
+
 pub fn syscall_handler(
     syscall_num: u64,
     arg1: u64,
@@ -729,6 +808,17 @@ pub fn syscall_handler(
             return errno::ENOSYS;
         }
     };
+
+    // Capability rights of the descriptors this call names in fixed argument positions (`fd_rights_needed`). An fd that is
+    // not open is left to the call itself (EBADF). The `*at` dirfds are checked where the path is known to be relative
+    // (`fs::user_path_at`), `poll`/`epoll_ctl` per entry.
+    for (fd, need) in fd_rights_needed(syscall, [arg1, arg2, arg3, arg4, arg5, arg6]) {
+        if need != 0 {
+            if let Err(e) = require_rights(syscall, fd, need) {
+                return e;
+            }
+        }
+    }
 
     match syscall {
         SyscallNumber::Read => fs::sys_read(arg1 as i32, arg2 as usize, arg3 as usize),
@@ -868,6 +958,8 @@ pub fn syscall_handler(
         SyscallNumber::MemInfoKb => misc::sys_meminfo_kb(),
         SyscallNumber::KdebugCtl => misc::sys_kdebug_ctl(arg1, arg2, arg3),
         SyscallNumber::Statvfs => fs::sys_statvfs(arg1 as usize, arg2 as usize),
+        SyscallNumber::CapRightsLimit => fs::sys_cap_rights_limit(arg1 as i32, arg2),
+        SyscallNumber::CapRightsGet => fs::sys_cap_rights_get(arg1 as i32, arg2),
         SyscallNumber::Utimensat => fs::sys_utimensat(arg1 as i64, arg2, arg3, arg4),
         SyscallNumber::Sync => misc::sys_sync(),
         SyscallNumber::Reboot => misc::sys_reboot(arg1 as u32, arg2 as u32, arg3 as u32),

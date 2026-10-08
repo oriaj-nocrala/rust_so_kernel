@@ -19,7 +19,7 @@
 
 ## AF_UNIX sockets (`usock/`, `ipc/unix.rs`, `process/syscall/ipc.rs`)
 
-- `usock::SocketTable<F>`: stream and datagram sockets, the bind registry (paths and the abstract namespace), backlog, half-close, `SO_*`, `SCM_RIGHTS`, `sockaddr_un` parsing. The kernel uses `F = Box<dyn FileHandle>`; host tests use integers.
+- `usock::SocketTable<F>`: stream and datagram sockets, the bind registry (paths and the abstract namespace), backlog, half-close, `SO_*`, `SCM_RIGHTS`, `sockaddr_un` parsing. The kernel uses `F = ipc::unix::PassedFd` (the handle and its capability rights, which the receiver's fd keeps); host tests use integers.
 - `syscall/ipc.rs` is the user-memory boundary: sockaddrs, iovecs, cmsgs, and the EAGAIN-vs-park decision.
 - **fd → socket**: `FileHandle::socket_id()` (a `dyn FileHandle` can't be downcast in `no_std`). `poll`/`epoll` snapshot that mapping (`SocketMap`), because a waker can't reach another process's fd table.
 - **`bind()` to a path has two halves**: an `S_IFSOCK` node in the filesystem (ramfs only, `Inode::mksocket`) *plus* a registry entry, which is what `connect()` resolves. This gives Linux's errors:

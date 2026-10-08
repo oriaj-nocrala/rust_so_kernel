@@ -13,7 +13,16 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 
 - `sigset_t` arrives in Linux layout (bit N-1 = signal N) and is shifted to the kernel's bit-N masks by `signal::mask_from_user`.
 - termios/winsize use this port's own layout (`tty` crate), not Linux's.
-- Custom numbers above the Linux range: 400 `uptime_ms`, 401 `uptime_sec`, 402 `meminfo_kb`, 403 `kdebug_ctl`, 404 `statvfs`.
+- Custom numbers above the Linux range: 400 `uptime_ms`, 401 `uptime_sec`, 402 `meminfo_kb`, 403 `kdebug_ctl`, 404 `statvfs`, 405 `cap_rights_limit`, 406 `cap_rights_get` (Linux has no Capsicum calls; C header `userspace/c/include/constanos_capsicum.h`).
+- Errors outside Linux's range (which ends at 133): 134 `ENOTCAPABLE` (a descriptor lacks a capability right), 135 `ECAPMODE` (reserved for capability mode). libc's `strerror` does not know them; the kernel log names every refusal (`capability: PID n <call> on fd N refused: no CAP_X`).
+
+## Capability rights on descriptors (`vfs::rights`)
+
+- Every fd-table slot has a rights mask (Capsicum's names, this kernel's own bit layout in one `u64`). A fresh descriptor has `CAP_ALL`. `cap_rights_limit` only narrows (`ENOTCAPABLE` if asked to widen, `EINVAL` for an unknown bit). `dup`/`dup2`/`dup3`/`F_DUPFD`, `fork`, `exec` and `SCM_RIGHTS` keep the mask; a file opened through a dirfd with a relative path, and an accepted socket, get the parent descriptor's mask.
+- Which call needs which right on a descriptor in a fixed argument position: `syscall::fd_rights_needed` (`kernel/src/process/syscall/mod.rs`), checked before the call runs. read/recvfrom/recvmsg/getdents64 `CAP_READ`; write/writev/sendmsg `CAP_WRITE` (sendto with an address also `CAP_CONNECT`); fstat `CAP_FSTAT`; lseek `CAP_SEEK`; ftruncate `CAP_FTRUNCATE`; fchmod `CAP_FCHMOD`; ioctl `CAP_IOCTL`; fcntl `F_GETFL`/`F_SETFL` `CAP_FCNTL` (the descriptor's own flags and `F_DUPFD` need nothing); fchdir `CAP_FCHDIR`; connect, accept, bind, listen, shutdown, get/setsockopt, getsockname, getpeername their own `CAP_*`; epoll_wait and epoll_ctl (both fds) `CAP_EVENT`; pidfd_send_signal `CAP_PDKILL`; mmap of an fd `CAP_MMAP` (+`CAP_READ` for `PROT_READ`, +`CAP_WRITE` for a shared writable map).
+- A dirfd used with a relative path (`fs::user_path_at`) needs `CAP_LOOKUP` plus: openat/openat2 `CAP_READ`/`CAP_WRITE` by access mode, `CAP_CREATE` for `O_CREAT`, `CAP_FTRUNCATE` for `O_TRUNC`; fstatat/statx/faccessat `CAP_FSTAT`; mkdirat `CAP_MKDIRAT`; unlinkat `CAP_UNLINKAT`; symlinkat `CAP_SYMLINKAT`; linkat `CAP_LINKAT_SOURCE`/`_TARGET`; renameat `CAP_RENAMEAT_SOURCE`/`_TARGET`; fchmodat `CAP_FCHMOD`; utimensat `CAP_FUTIMES`; readlinkat nothing more. `AT_EMPTY_PATH` and `futimens` check the fd itself. An absolute path or `AT_FDCWD` uses no descriptor and needs nothing (capability mode will close that).
+- `poll` reports `POLLNVAL` for an fd without `CAP_EVENT` (FreeBSD's answer).
+- The check and the call take the fd-table lock separately: a sibling thread's `dup2` in between swaps the descriptor, which only gives it what it already holds. Test: `cap_rights_test`.
 
 ## Table
 

@@ -208,7 +208,7 @@ pub(super) fn sys_socket(domain: i32, ty: i32, protocol: i32) -> SyscallResult {
         Err(e) => return unix::errno_of(e),
     };
 
-    match install_fd(id, nonblock) {
+    match install_fd(id, nonblock, vfs::rights::CAP_ALL) {
         Ok(fd) => {
             if ty & SOCK_CLOEXEC != 0 {
                 super::fs::set_cloexec_current(fd as usize);
@@ -236,7 +236,7 @@ pub(super) fn sys_socketpair(domain: i32, ty: i32, protocol: i32, sv: u64) -> Sy
         Err(e) => return unix::errno_of(e),
     };
 
-    let fd_a = match install_fd(a, nonblock) {
+    let fd_a = match install_fd(a, nonblock, vfs::rights::CAP_ALL) {
         Ok(fd) => fd,
         Err(e) => {
             // Neither socket ever reached an fd table, so nothing else will
@@ -246,7 +246,7 @@ pub(super) fn sys_socketpair(domain: i32, ty: i32, protocol: i32, sv: u64) -> Sy
             return e;
         }
     };
-    let fd_b = match install_fd(b, nonblock) {
+    let fd_b = match install_fd(b, nonblock, vfs::rights::CAP_ALL) {
         Ok(fd) => fd,
         Err(e) => {
             close_fd(fd_a);
@@ -427,7 +427,8 @@ pub(super) fn sys_accept4(fd: i32, addr_ptr: u64, len_ptr: u64, flags: i32) -> S
         return e;
     }
 
-    match install_fd(child, flags & SOCK_NONBLOCK != 0) {
+    // An accepted socket has the listening socket's rights (Capsicum).
+    match install_fd(child, flags & SOCK_NONBLOCK != 0, fd_rights(fd)) {
         Ok(new_fd) => {
             if flags & SOCK_CLOEXEC != 0 {
                 super::fs::set_cloexec_current(new_fd as usize);
@@ -786,7 +787,7 @@ pub(super) fn sys_getsockopt(
 struct RecvResult {
     n: usize,
     full_len: usize,
-    fds: Vec<Box<dyn FileHandle>>,
+    fds: Vec<unix::PassedFd>,
     from: Option<UnixAddr>,
 }
 
@@ -798,7 +799,7 @@ struct RecvResult {
 fn send_common(
     fd: i32,
     data: &[u8],
-    mut fds: Vec<Box<dyn FileHandle>>,
+    mut fds: Vec<unix::PassedFd>,
     dest: Option<&UnixAddr>,
     flags: u32,
 ) -> Result<SyscallResult, SocketId> {
@@ -971,15 +972,15 @@ const MAX_SCM_FDS: usize = 8;
 
 /// Take the descriptors named by a `SCM_RIGHTS` control message out of the
 /// sender's fd table — as *duplicates*, so the sender keeps its own fds
-/// open, exactly like Linux.
-fn collect_scm_rights(msg: &UserMsghdr) -> Result<Vec<Box<dyn FileHandle>>, i64> {
+/// open, exactly like Linux — each with its capability rights.
+fn collect_scm_rights(msg: &UserMsghdr) -> Result<Vec<unix::PassedFd>, i64> {
     let clen = msg.msg_controllen as usize;
     if msg.msg_control == 0 || clen < CMSG_HDR_LEN {
         return Ok(Vec::new());
     }
     validate_user_buffer(msg.msg_control, clen)?;
 
-    let mut out: Vec<Box<dyn FileHandle>> = Vec::new();
+    let mut out: Vec<unix::PassedFd> = Vec::new();
     let mut off = 0usize;
     while off + CMSG_HDR_LEN <= clen {
         let hdr = unsafe {
@@ -1000,13 +1001,13 @@ fn collect_scm_rights(msg: &UserMsghdr) -> Result<Vec<Box<dyn FileHandle>>, i64>
                 let fd = unsafe { *((base as *const i32).add(i)) };
                 let dup = {
                     let guard = files.lock();
-                    match guard.get(fd as usize) {
-                        Ok(h) => h.dup(),
-                        Err(_) => return Err(errno::EBADF),
+                    match (guard.get(fd as usize), guard.rights(fd as usize)) {
+                        (Ok(h), Ok(rights)) => h.dup().map(|handle| unix::PassedFd { handle, rights }),
+                        _ => return Err(errno::EBADF),
                     }
                 };
                 match dup {
-                    Some(h) => out.push(h),
+                    Some(p) => out.push(p),
                     // A handle that cannot be duplicated cannot be passed;
                     // saying so beats sending half the set.
                     None => return Err(errno::EINVAL),
@@ -1024,7 +1025,7 @@ fn collect_scm_rights(msg: &UserMsghdr) -> Result<Vec<Box<dyn FileHandle>>, i64>
 /// Returns true if the control buffer was too small to describe them all
 /// (`MSG_CTRUNC`), in which case the descriptors that didn't fit are closed
 /// rather than leaked into a process that can never name them.
-fn install_scm_rights(msg: &UserMsghdr, fds: Vec<Box<dyn FileHandle>>) -> Result<bool, i64> {
+fn install_scm_rights(msg: &UserMsghdr, fds: Vec<unix::PassedFd>) -> Result<bool, i64> {
     let clen = msg.msg_controllen as usize;
     if msg.msg_control == 0 || clen < CMSG_HDR_LEN + 4 {
         return Ok(true); // nowhere to report them: everything is truncated
@@ -1037,8 +1038,8 @@ fn install_scm_rights(msg: &UserMsghdr, fds: Vec<Box<dyn FileHandle>>) -> Result
 
     let files = current_files();
     let mut numbers: Vec<i32> = Vec::with_capacity(take);
-    for handle in fds.into_iter().take(take) {
-        let allocated = files.lock().allocate(handle);
+    for passed in fds.into_iter().take(take) {
+        let allocated = files.lock().allocate_with_rights(passed.handle, passed.rights);
         match allocated {
             Ok(fd) => numbers.push(fd as i32),
             // Out of descriptors: the rest are dropped (closed), which is
@@ -1076,11 +1077,11 @@ pub(super) fn current_files() -> alloc::sync::Arc<crate::sync::Mutex<crate::proc
 }
 
 /// Put a socket behind a new fd, applying `O_NONBLOCK` if asked.
-fn install_fd(id: SocketId, nonblock: bool) -> Result<i32, i64> {
+fn install_fd(id: SocketId, nonblock: bool, rights: vfs::rights::Rights) -> Result<i32, i64> {
     let handle = crate::ipc::unix::UnixSocketHandle::new(id);
     handle.set_nonblocking(nonblock);
     let files = current_files();
-    let allocated = files.lock().allocate(Box::new(handle));
+    let allocated = files.lock().allocate_with_rights(Box::new(handle), rights);
     match allocated {
         Ok(fd) => Ok(fd as i32),
         Err(_) => Err(EMFILE), // the dropped handle already released the socket
@@ -1096,6 +1097,11 @@ fn release_orphan(id: SocketId) {
     });
     drop(fds);
     unix::dispatch_wakes(&wakes);
+}
+
+/// The capability rights of the calling process's `fd` (none if it is not open).
+pub(super) fn fd_rights(fd: i32) -> vfs::rights::Rights {
+    current_files().lock().rights(fd as usize).unwrap_or(0)
 }
 
 fn close_fd(fd: i32) {
