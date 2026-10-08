@@ -3,8 +3,8 @@
 # and as an IDE disk). The image is kept as an artifact.
 #
 # Not here: the Vulkan programs (vk_comp, snake3d), which need the Mesa build in
-# mesa-port/ (machine-specific for now), and the ABI suite (scripts/run-abi-suite.sh),
-# which has an open stall (docs/reference/processes-and-scheduling.md, "Process death").
+# mesa-port/ (machine-specific for now). The ABI suite runs, but does not fail the
+# build: see the step's comment.
 # To try a change to this file first: the same steps in an ubuntu:24.04 container,
 # starting with scripts/ci-deps.sh.
 
@@ -107,6 +107,35 @@ jobs:
         env:
           QEMU_ACCEL: tcg
           BOOT_TIMEOUT: 300
+
+      # The ABI suite, NON-BLOCKING, only to catch an open bug in the act: a forked
+      # child that never runs, every CPU idle (docs/reference/processes-and-scheduling.md,
+      # "Process death"; not reproduced since 2026-10-07). The kernel prints
+      # `=== STRANDED READY` when it happens; this step turns that into a warning and
+      # keeps the serial log. ONCE THAT BUG IS FOUND AND FIXED, make this step blocking
+      # (drop continue-on-error and the STRANDED check) and remove
+      # `Scheduler::watch_stranded_ready` from the kernel if it is no longer wanted.
+      - name: ABI suite (non-blocking, watching for STRANDED READY)
+        continue-on-error: true
+        env:
+          TEST_TIMEOUT: 180
+          STALL: 120
+        run: |
+          rc=0
+          scripts/run-abi-suite.sh --no-build || rc=$?
+          cp /tmp/qemu-debug-rust_so_kernel/serial.log target/abi-suite-serial.log || true
+          if grep -aq "STRANDED READY" target/abi-suite-serial.log; then
+            echo "::warning::STRANDED READY reported: the forked-child stall happened; see the abi-suite-serial artifact"
+            grep -a -A20 "STRANDED READY" target/abi-suite-serial.log
+          fi
+          exit $rc
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: abi-suite-serial
+          path: target/abi-suite-serial.log
+          if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v4
         with:

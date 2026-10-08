@@ -18,7 +18,7 @@ description: Playbook for verifying a change to rust_so_kernel: which test suite
 | real Rust std / tokio programs | `scripts/run-std-probe.sh` (`probes/std/g1_std.rs`: hard links, statx, `Command` with uid/gid), `scripts/run-tokio-probe.sh` (`probes/tokio`); both need `rustc` run from inside the repo (pinned nightly with the musl std) |
 | the compositor or GUI programs | `scripts/gui-e2e.sh [term\|wm\|text]` |
 | anything the Ryzen does differently | the `metal-run` skill |
-| a clean clone still builds, boots and packs | CI (`.github/workflows/ci.yml`, on push to master and PRs): every host crate's `cargo test`, `cargo build`, `run-kernel-tests.sh`, `make-release-image.sh` (artifact `constanos-image`). Not the ABI suite (open stall) nor the Vulkan programs (Mesa is built by hand). Try a change to it in `ubuntu:24.04` with `scripts/ci-deps.sh` first |
+| a clean clone still builds, boots and packs | CI (`.github/workflows/ci.yml`, on push to master and PRs): every host crate's `cargo test`, `cargo build`, `run-kernel-tests.sh`, `make-release-image.sh` (artifact `constanos-image`). The ABI suite runs non-blocking, only to catch the forked-child stall (`STRANDED READY`); make it blocking once that is fixed. Not the Vulkan programs (Mesa is built by hand). Try a change to it in `ubuntu:24.04` with `scripts/ci-deps.sh` first |
 
 - `text` needs `scripts/fetch-fonts.sh` once.
 - `ext2` has a known intermittent temp-file flake (`docs/fs/ext2-test-flake.md`).
