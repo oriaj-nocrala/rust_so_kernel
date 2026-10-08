@@ -122,7 +122,9 @@ jobs:
           STALL: 120
         run: |
           rc=0
-          scripts/run-abi-suite.sh --no-build || rc=$?
+          # --keep-going: a timing check failing on the slow runner (timer_test's 1 ms
+          # sleeps under TCG) must not end the run before the tests that fork.
+          scripts/run-abi-suite.sh --no-build --keep-going || rc=$?
           cp /tmp/qemu-debug-rust_so_kernel/serial.log target/abi-suite-serial.log || true
           if grep -aq "STRANDED READY" target/abi-suite-serial.log; then
             echo "::warning::STRANDED READY reported: the forked-child stall happened; see the abi-suite-serial artifact"

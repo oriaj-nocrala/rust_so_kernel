@@ -41,7 +41,12 @@ while :; do
     if [ "$size" != "$last_size" ]; then last_size=$size; last_change=$SECONDS; fi
     now_cur=$(grep -o "SUITE_START [a-z0-9_]*" "$log" | tail -1 | cut -d' ' -f2)
     if [ "$now_cur" != "$cur" ]; then cur=$now_cur; cur_start=$SECONDS; fi
-    if [ "$keep_going" = 0 ] && grep -qE "^\[fb\].*FAIL" "$log"; then verdict="first FAIL in ${cur:-?}"; sleep 3; break; fi
+    if [ "$keep_going" = 0 ] && grep -qE "^\[fb\].*FAIL" "$log"; then
+        # The test that printed it (the last SUITE_START before the first FAIL line), not the one running now: this loop
+        # polls every 2 s, and a quick test after the failing one had already started.
+        failed=$(awk '/SUITE_START/ {t=$NF} /^\[fb\].*FAIL/ {print t; exit}' "$log")
+        verdict="first FAIL in ${failed:-?}"; sleep 3; break
+    fi
     if grep -qE "KERNEL PANIC|panicked at|DOUBLE FAULT" "$log"; then verdict="kernel panic during ${cur:-?}"; break; fi
     if [ -n "$cur" ] && [ $((SECONDS - cur_start)) -gt "$test_timeout" ]; then verdict="${cur} ran longer than ${test_timeout}s"; break; fi
     if [ $((SECONDS - last_change)) -gt "$stall" ]; then verdict="no output for ${stall}s during ${cur:-boot}"; break; fi
