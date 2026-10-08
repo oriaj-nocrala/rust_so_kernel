@@ -23,7 +23,7 @@ scripts/qemu-debug.sh wait-for "About to start first process" [TIMEOUT]
 scripts/qemu-debug.sh send "ls /mnt/bin" && scripts/qemu-debug.sh enter
 scripts/qemu-debug.sh key ctrl-c                # raw QEMU key names
 scripts/qemu-debug.sh mouse-move 10 -5          # also: mouse-button 1|2|4|0
-scripts/qemu-debug.sh log 50                    # serial.log; also rawlog, dlog (-d int trace)
+scripts/qemu-debug.sh log 50                    # serial.log; also rawlog, dlog (-d int trace, TCG only)
 scripts/qemu-debug.sh screendump out.png        # then Read the PNG
 scripts/qemu-debug.sh stop
 ```
@@ -67,6 +67,7 @@ Iterating on metal costs a physical reboot per try. Make QEMU look like the Ryze
 ## Tracing and counters (`kernel/src/debug.rs`, crate `diag`)
 
 - **Tracepoints**: `crate::ktrace!(crate::debug::MM, "fmt", args)`. Subsystems: `MM`, `SCHED`, `FS`, `PROC`. All off by default; an off tracepoint costs one relaxed load. Toggle live from the shell: `kdebug mm on|off` (syscall 403). Add tracepoints permanently.
+- **serial.log is kept quiet on purpose** (it is read every session): per-process chatter is tracepoints, not `serial_println!`. Fork, exec (`sys_exec: loading`, the `ELF:` segment lines), page-table creation, scheduler queueing and plain exits are under `kdebug proc on` / `kdebug sched on` / `kdebug mm on`; the 24-word raw user stack dump at a segfault is under `mm`. What stays: deaths by a signal or fault (`💀 Killed PID`), the one-line fault report and the symbolizable `user backtrace:`. A new routine per-process message goes in a tracepoint too.
 - **Counters**: atomics shown in `/proc/kdebug` (`forks_total`, `switches_total`, `cow_faults_*`, `early_wakes`, `waits_interrupted`, USB, cache, TLB, sched, irq, cpu_init, smp, …). New counter: add it to `kernel::debug` and to the report.
 - **Always-on lock diagnostics** in `/proc/kdebug` and the panic snapshot:
   - `LockDiag` (`SCHEDULER_LOCK`): acquires, releases, last acquirer's `file:line`;
@@ -88,4 +89,4 @@ Iterating on metal costs a physical reboot per try. Make QEMU look like the Ryze
 - A job that "never finishes" may be slow, not stuck: take the snapshot twice and compare a loop variable (an advancing LBA was progress). Do not call a TIMEOUT a hang.
 - **Inject input into a headless run** through the monitor socket directly: `mouse_move 20 10`, `sendkey a`, `mouse_button 1`/`mouse_button 0` (the `qemu-debug.sh mouse-move/key` subcommands answered "Not running" with a custom `QEMU_DEBUG_STATE_DIR`). Wait for a line the *job* prints at its start, not one the program prints at its end.
 - Parallel runs: one `QEMU_DEBUG_STATE_DIR` each (short path) and a copy of `disk.img` (`scripts/tlb-stress.sh`). **Never `pkill -f` a pattern that appears in your own command line** (it kills the shell running it).
-- **A `TLB shootdown ... never acknowledged` panic in QEMU/TCG is a known pre-existing flake** (`docs/reference/cpu.md`): run `scripts/tlb-stress.sh` on the unchanged tree before blaming a change.
+- **A `TLB shootdown ... never acknowledged` panic is a real bug, not an emulator flake**: some long IF=0 section does not call `tlb::service_pending` (`docs/reference/cpu.md`, fixed once in e0fd174). Find the section (gdb on the paused guest) instead of re-running until it passes; `scripts/tlb-stress.sh` reproduces the class.

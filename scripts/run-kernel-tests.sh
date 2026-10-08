@@ -53,8 +53,24 @@ echo "Building kernel test binary (cargo build --target x86_64-unknown-none --te
 BUILD_JSON="$(mktemp)"
 trap 'rm -f "$BUILD_JSON"' EXIT
 
-(cd "$REPO_ROOT/kernel" && cargo build --target x86_64-unknown-none --tests --message-format=json) \
-    > "$BUILD_JSON"
+# The build's stderr (a `cargo:warning` per userspace program) only when it fails: it is read every run.
+BUILD_ERR="$(mktemp)"
+trap 'rm -f "$BUILD_JSON" "$BUILD_ERR"' EXIT
+if ! (cd "$REPO_ROOT/kernel" && cargo build --target x86_64-unknown-none --tests --message-format=json) \
+    > "$BUILD_JSON" 2> "$BUILD_ERR"; then
+    grep -E "^error|error:|panicked" -A8 "$BUILD_ERR" | head -60 >&2
+    python3 -c "
+import json
+for line in open('$BUILD_JSON'):
+    try:
+        m = json.loads(line)
+    except ValueError:
+        continue
+    if m.get('reason') == 'compiler-message' and m['message'].get('level') == 'error':
+        print(m['message'].get('rendered', ''))
+" | head -80 >&2
+    exit 1
+fi
 
 # The test binary's filename is content-hashed (`kernel-<hash>`), not
 # stable across rebuilds — pull the real path out of cargo's own build

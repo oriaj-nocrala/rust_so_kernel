@@ -18,7 +18,7 @@ while [ $# -gt 0 ]; do
         *) break ;;
     esac
 done
-if [ "$build" = 1 ]; then cargo build 2>&1 | grep -E "^error|panicked" -A8 | head -20; fi
+if [ "$build" = 1 ]; then cargo build 2>&1 | grep -E "^error|panicked|error:" -A8 | head -20; fi
 free=$(dumpe2fs -h disk.img 2>/dev/null | awk '/^Free blocks/ {print $3}')
 [ "${free:-100000}" -lt 2000 ] && echo "warning: disk.img has only $free free blocks; test binaries may be copied truncated" >&2
 $Q stop >/dev/null 2>&1

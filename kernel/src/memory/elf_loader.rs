@@ -105,8 +105,7 @@ pub unsafe fn load_elf(
 
     let elf = Elf64::parse(elf_bytes)?;
 
-    crate::serial_println!(
-        "ELF: entry={:#x}, {} program headers",
+    crate::ktrace!(crate::debug::PROC, "ELF: entry={:#x}, {} program headers",
         elf.entry_point(),
         elf.ph_count(),
     );
@@ -122,8 +121,7 @@ pub unsafe fn load_elf(
     let mut address_space = AddressSpace::new_user()
         .map_err(|_| "ELF loader: failed to create address space")?;
 
-    crate::serial_println!(
-        "ELF: address space created, PML4 at {:#x}",
+    crate::ktrace!(crate::debug::PROC, "ELF: address space created, PML4 at {:#x}",
         address_space.root_frame().start_address().as_u64(),
     );
 
@@ -150,8 +148,7 @@ pub unsafe fn load_elf(
         shm: None,
     }).map_err(|_| "ELF loader: failed to register stack VMA")?;
 
-    crate::serial_println!(
-        "ELF: stack VMA {:#x}..{:#x} ({} pages, demand-paged, grows to {} max)",
+    crate::ktrace!(crate::debug::PROC, "ELF: stack VMA {:#x}..{:#x} ({} pages, demand-paged, grows to {} max)",
         stack_base,
         stack_base + (STACK_PAGES as u64 * 4096),
         STACK_PAGES,
@@ -206,8 +203,7 @@ pub unsafe fn load_elf(
         phdr_vaddr, elf.ph_count(), entry,
     )?;
 
-    crate::serial_println!(
-        "ELF: initial stack at {:#x} (argc={}, envc={}, phdr_vaddr={:#x}, ph_count={})",
+    crate::ktrace!(crate::debug::PROC, "ELF: initial stack at {:#x} (argc={}, envc={}, phdr_vaddr={:#x}, ph_count={})",
         rsp_va, argv.len(), envp.len(), phdr_vaddr, elf.ph_count(),
     );
 
@@ -399,8 +395,7 @@ unsafe fn load_segment(
 
     let flags = elf_flags_to_page_flags(ph.p_flags);
 
-    crate::serial_println!(
-        "ELF: LOAD {:#x}..{:#x} ({} pages) filesz={:#x} memsz={:#x} flags={:#x}",
+    crate::ktrace!(crate::debug::PROC, "ELF: LOAD {:#x}..{:#x} ({} pages) filesz={:#x} memsz={:#x} flags={:#x}",
         aligned_start,
         aligned_end,
         num_pages,

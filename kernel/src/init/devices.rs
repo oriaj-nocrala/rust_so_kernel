@@ -540,7 +540,10 @@ extern "C" fn page_fault_rust(tf: &mut TrapFrame, error_code: u64) {
                     crate::process::scheduler::current_pid_fast(), fault_addr,
                     tf.rip, error_code
                 );
-                dump_user_stack(tf.rsp);
+                // The raw words around rsp: `kdebug mm on`. A fatal fault prints a symbolizable `user backtrace:` anyway.
+                if crate::debug::is_enabled(crate::debug::MM.bit) {
+                    dump_user_stack(tf.rsp);
+                }
                 user_fault(tf, crate::process::signal::SIGSEGV, SEGV_MAPERR, fault_addr, "SEGFAULT (no VMA for address)");
                 return;
             }
@@ -678,7 +681,7 @@ fn kill_current_user_process(reason: &str, sig: u32) -> ! {
         // see `process::syscall::cancel_all_waiters`'s doc comment.
         crate::process::syscall::cancel_all_waiters(dead_pid);
 
-        serial_println!("  → Switching to next process (full TrapFrame restore)");
+        crate::ktrace!(crate::debug::PROC, "  → Switching to next process (full TrapFrame restore)");
         ptr
         // Lock is dropped here before we jump
     };

@@ -169,8 +169,7 @@ impl OwnedPageTable {
 
             if is_user_pml4_entry(i) {
                 skipped += 1;
-                crate::serial_println!(
-                    "  PML4[{}]: SKIPPED (user address range, flags={:#x})",
+                crate::ktrace!(crate::debug::MM, "  PML4[{}]: SKIPPED (user address range, flags={:#x})",
                     i,
                     kernel_pml4[i].flags().bits()
                 );
@@ -181,12 +180,10 @@ impl OwnedPageTable {
             copied += 1;
         }
 
-        crate::serial_println!(
-            "  Creating new page table: PML4 at {:#x}",
+        crate::ktrace!(crate::debug::MM, "  Creating new page table: PML4 at {:#x}",
             new_frame.start_address().as_u64()
         );
-        crate::serial_println!(
-            "  Copied {} kernel entries, skipped {} user-range entries",
+        crate::ktrace!(crate::debug::MM, "  Copied {} kernel entries, skipped {} user-range entries",
             copied, skipped
         );
 

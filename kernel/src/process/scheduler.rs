@@ -517,8 +517,7 @@ impl Scheduler {
         // used to run *before* the push (reading `process.effective_priority`
         // directly); it now runs after, with the same values, since the push
         // itself has no observable output of its own.
-        crate::serial_println!(
-            "Scheduler: Added PID {} (base pri {}, effective {}) to queue[{}]",
+        crate::ktrace!(crate::debug::SCHED, "Scheduler: Added PID {} (base pri {}, effective {}) to queue[{}]",
             pid, base, base, pri
         );
         self.kick_idle(false);
@@ -865,16 +864,16 @@ impl Scheduler {
             if !proc.is_thread {
                 super::dead_files::defer_exit(proc.pid.0);
             }
-            crate::serial_println!(
-                "💀 Killed PID {} ({}): {}",
-                proc.pid.0,
-                core::str::from_utf8(&proc.name)
-                    .unwrap_or("<?>")
-                    .trim_end_matches('\0'),
-                reason,
-            );
+            // A plain exit is routine (one per process): traced. A death by
+            // a signal or a fault is always logged.
+            let name = core::str::from_utf8(&proc.name).unwrap_or("<?>").trim_end_matches('\0');
+            if reason.starts_with("exit(") {
+                crate::ktrace!(crate::debug::PROC, "PID {} ({}) {}", proc.pid.0, name, reason);
+            } else {
+                crate::serial_println!("💀 Killed PID {} ({}): {}", proc.pid.0, name, reason);
+            }
             if proc.is_thread {
-                crate::serial_println!("  → thread, reaped immediately (no waitpid() will ever collect it)");
+                crate::ktrace!(crate::debug::PROC, "  → thread, reaped immediately (no waitpid() will ever collect it)");
                 self.fold_into_leader(&proc);
                 // Defer the kernel stack's phys_free — see pending_stack_frees'
                 // doc comment for why it can't happen right here.

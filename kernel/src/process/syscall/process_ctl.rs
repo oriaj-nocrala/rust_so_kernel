@@ -402,7 +402,7 @@ pub(super) fn sys_exit(status: i32) -> SyscallResult {
         };
         let dead_pid = scheduler.current_pid().map(|p| p.0).unwrap_or(0);
         let ptr = scheduler.kill_and_switch_tf(&reason);
-        serial_println!("  → Process exited, switching immediately (full TrapFrame restore)");
+        crate::ktrace!(crate::debug::PROC, "  → Process exited, switching immediately (full TrapFrame restore)");
         (dead_pid, parent_to_notify, ptr, old_files)
     };
 
@@ -922,7 +922,7 @@ fn exec_from(from: ExecFrom, argv_ptr: usize, envp_ptr: usize) -> SyscallResult 
         Err(e) => return e,
     };
 
-    serial_println!("sys_exec: loading '{}' (argc={}, envc={})", name, argv.len(), envp.len());
+    crate::ktrace!(crate::debug::PROC, "sys_exec: loading '{}' (argc={}, envc={})", name, argv.len(), envp.len());
 
     // `comm` is the basename of the path as the caller named it, before
     // symlinks are followed — Linux's `kbasename(bprm->filename)`. BusyBox
@@ -1213,7 +1213,7 @@ fn exec_from(from: ExecFrom, argv_ptr: usize, envp_ptr: usize) -> SyscallResult 
 /// The program file at `name` (symlinks followed): its resolved path and whole contents.
 fn read_exec_path(name: &str) -> Result<(alloc::string::String, alloc::vec::Vec<u8>), i64> {
     let resolved_path = resolve_exec_path(name).inspect_err(|_| serial_println!("sys_exec: '{}' not found", name))?;
-    serial_println!("sys_exec: resolved '{}' -> '{}'", name, resolved_path);
+    crate::ktrace!(crate::debug::PROC, "sys_exec: resolved '{}' -> '{}'", name, resolved_path);
     let mut handle = crate::fs::vfs::open(&resolved_path, crate::fs::types::OpenFlags::RDONLY).map_err(|e| {
         serial_println!("sys_exec: '{}' not found", name);
         e.as_i64()

@@ -599,8 +599,7 @@ impl Process {
         exe_name: alloc::string::String,
         fpu_state: Box<fpu::FpuState>,
     ) -> Self {
-        crate::serial_println!(
-            "Creating FORKED process PID {} (parent PID {})",
+        crate::ktrace!(crate::debug::PROC, "Creating FORKED process PID {} (parent PID {})",
             pid.0, parent_pid.0,
         );
         crate::debug::inc_forks();

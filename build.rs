@@ -327,11 +327,9 @@ fn sync_disk_bin_dir(disk_path: &std::path::Path) {
         );
     }
 
-    println!(
-        "cargo:warning=synced {} userspace program(s) into disk.img:/bin ({})",
-        entries.len(),
-        entries.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>().join(", "),
-    );
+    // A count, not the list: this line is in every build's output (read by people and agents); `debugfs -R "ls /bin" disk.img`
+    // lists them.
+    println!("cargo:warning=synced {} userspace program(s) into disk.img:/bin", entries.len());
 }
 /// Fetch the Noto fonts (`scripts/fetch-fonts.sh`, ~1.6 MB) into
 /// `disk-image-root/usr/share/fonts/` if they are not there, for

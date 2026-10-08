@@ -190,13 +190,13 @@ fn main() {
             );
             let _ = child.kill();
             let _ = child.wait();
-            print_serial_log(&serial_log);
+            print_serial_log(&serial_log, false);
             std::process::exit(1);
         }
         std::thread::sleep(Duration::from_millis(100));
     };
 
-    print_serial_log(&serial_log);
+    print_serial_log(&serial_log, status.code() == Some(QEMU_EXIT_SUCCESS));
 
     match status.code() {
         Some(QEMU_EXIT_SUCCESS) => {
@@ -218,13 +218,30 @@ fn main() {
     }
 }
 
-fn print_serial_log(path: &Path) {
+/// After a pass, one line (how many cases passed, and where the log is); after anything else, the last
+/// `TAIL` lines of it, where the failing case and its panic are. `QEMU_TEST_VERBOSE=1` prints all of it.
+/// Kept short because it is read every run, by people and agents.
+fn print_serial_log(path: &Path, passed: bool) {
+    const TAIL: usize = 60;
     let mut buf = String::new();
-    if std::fs::File::open(path).and_then(|mut f| f.read_to_string(&mut buf)).is_ok() {
-        eprintln!("--- guest serial output ---");
-        eprintln!("{}", buf);
-        eprintln!("--- end guest serial output ---");
+    if std::fs::File::open(path).and_then(|mut f| f.read_to_string(&mut buf)).is_err() {
+        return;
     }
+    if std::env::var_os("QEMU_TEST_VERBOSE").is_some() {
+        eprintln!("--- guest serial output ---\n{}\n--- end guest serial output ---", buf);
+        return;
+    }
+    if passed {
+        eprintln!("qemu-test-runner: {} cases ok (serial log: {})", buf.matches("[ok]").count(), path.display());
+        return;
+    }
+    let lines: Vec<&str> = buf.lines().collect();
+    let from = lines.len().saturating_sub(TAIL);
+    eprintln!("--- guest serial output, last {} of {} lines (all of it: {}) ---", lines.len() - from, lines.len(), path.display());
+    for l in &lines[from..] {
+        eprintln!("{}", l);
+    }
+    eprintln!("--- end guest serial output ---");
 }
 
 /// Looks for OVMF_CODE/OVMF_VARS in the usual distro install locations —
