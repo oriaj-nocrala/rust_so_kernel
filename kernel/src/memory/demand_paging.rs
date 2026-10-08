@@ -135,7 +135,8 @@ pub(super) unsafe fn map_demand_page(
     // ── Zero-page trick: read faults map the shared zero frame ────────
     if !is_write {
         let zero = crate::memory::cow::zero_frame();
-        let ro_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        // The VMA's flags minus WRITABLE: keeps NO_EXECUTE.
+        let ro_flags = vma.page_table_flags() & !PageTableFlags::WRITABLE;
         let mut buddy_alloc = BuddyFrameAllocator;
         pt.create_mapper()
             .map_to_with_table_flags(page, zero, ro_flags, OwnedPageTable::table_flags_for(ro_flags), &mut buddy_alloc)

@@ -335,7 +335,8 @@ fn load_raw_process(
 
     let stack_flags = x86_64::structures::paging::PageTableFlags::PRESENT
                     | x86_64::structures::paging::PageTableFlags::WRITABLE
-                    | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE;
+                    | x86_64::structures::paging::PageTableFlags::USER_ACCESSIBLE
+                    | x86_64::structures::paging::PageTableFlags::NO_EXECUTE;
 
     address_space.add_vma(Vma {
         start: user_stack_base,

@@ -13,8 +13,8 @@ static long mprot(void *a, size_t n, int prot) {
     __asm__ volatile("syscall" : "=a"(r) : "a"(10L), "D"(a), "S"(n), "d"((long)prot) : "rcx", "r11", "memory");
     return r;
 }
-// `perms` starts with `want` (2 chars: r and w); the x bit is not compared, the kernel maps anonymous memory executable (no NX).
-static int has(const char *perms, const char *want) { return strncmp(perms, want, 2) == 0 && perms[3] == 'p'; }
+// `perms` starts with `want` (2 chars: r and w), then '-' (anonymous memory without PROT_EXEC is NX) and 'p'.
+static int has(const char *perms, const char *want) { return strncmp(perms, want, 2) == 0 && perms[2] == '-' && perms[3] == 'p'; }
 #define CHECK(cond, ...) do { if (cond) printf("  ok   %s\n", #cond); else { failures++; printf("  FAIL %s: ", #cond); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 static char maps[16384];
@@ -69,7 +69,7 @@ int main(void) {
     CHECK(after == with + 2, "the split added %d lines, wanted 2", after - with);
     mprot(m, 4096, PROT_READ | PROT_EXEC);
     load();
-    CHECK(has(perms_at(at, &end), "r-"), "PROT_READ|PROT_EXEC reads '%s' (write must be off)", perms_at(at, &end));
+    CHECK(strcmp(perms_at(at, &end), "r-xp") == 0, "PROT_READ|PROT_EXEC reads '%s'", perms_at(at, &end));
     munmap(m, 3 * 4096);
     CHECK(load() <= base + 1 && strcmp(perms_at(at, NULL), "") == 0, "munmap left its lines behind");
 

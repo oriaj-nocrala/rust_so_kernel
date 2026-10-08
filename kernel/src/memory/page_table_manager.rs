@@ -18,7 +18,8 @@
 // 3. All frame allocations use the Buddy allocator (not BootInfoFrameAllocator)
 //    to avoid double-allocation with the heap.
 //
-// 4. NX (No-Execute) bit: Do NOT set unless EFER.NXE is confirmed enabled.
+// 4. NX (No-Execute) bit: EFER.NXE is on on every CPU (`cpu::init_this_cpu` verifies
+//    it). User pages are NX unless their segment is PF_X or their mapping PROT_EXEC.
 
 use x86_64::{
     PhysAddr, VirtAddr,

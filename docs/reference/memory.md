@@ -23,6 +23,7 @@ Code: `kernel/src/memory/`, `kernel/src/allocator/`, crate `mm/` (host tests: `c
   - `GrowableStack`: starts at 64 KiB and grows down on a fault in the guard gap, up to 8 MiB (`VmaList::grow_stack`, called from the fault path).
   - `Huge2M`: any anonymous `mmap` of 2 MiB or more. Whole 2 MiB pages; touching one byte makes all 512 resident. There is no huge zero page.
   - `Shared`: see Shared memory below.
+- **NX:** user pages are `NO_EXECUTE` unless their ELF segment is `PF_X` or their mapping has `PROT_EXEC` (`prot_to_flags`, `elf_flags_to_page_flags`); the stack is NX; the signal trampoline page (`TRAMPOLINE_VA`) stays executable. `EFER.NXE` is verified on every CPU (`cpu/init.rs`). Every PTE takes its flags from the VMA (fork, COW, demand paging, the zero-frame mapping minus `WRITABLE`), so NX survives them all. An instruction fetch from an NX page kills with `EXECUTED NON-EXECUTABLE MEMORY at <addr>` (`SIGSEGV`/`SEGV_ACCERR`, rip = si_addr). Test: `nx_test`.
 - **Protection:** a VMA's `flags` are its PTE flags. `PROT_NONE` = `PRESENT` without `USER_ACCESSIBLE`; `map_demand_page` refuses such a VMA (not even the zero frame), so touching one kills the process. `mmap` of `PROT_NONE` is never `Huge2M` (a reservation that `mprotect` will cut).
 - **`mprotect`/`munmap` cut VMAs** (`VmaList::split_at`, `remove_range`, `merge_adjacent`; only `Anonymous` neighbours are rejoined). `mprotect` leaves a read-only PTE read-only even when the VMA becomes writable: the first write goes through the COW path, which is what makes a zero-frame or shared page private. Lowering clears `WRITABLE`/`USER` in every present PTE at once. `fork` derives the child's PTEs from the VMA flags, so a test that forks first cannot see whether `mprotect` updated the parent's PTEs (`mprotect_test` maps and lowers inside the child for that).
 - **The address-space lock** (`AddressSpace::vmas`, an `IrqMutex`) covers every VMA lookup and every PTE change: faults, COW, fork's write-protect, `mmap`/`munmap`. A fault that finds its page already mapped (another thread won) counts as success.
@@ -34,7 +35,7 @@ Code: `kernel/src/memory/`, `kernel/src/allocator/`, crate `mm/` (host tests: `c
 ## Page faults
 
 - `init/devices.rs` reads CR2 and calls `handle_not_present_fault`/`handle_cow_fault` on the *running process's* address space, under its lock. Pages are mapped into that table, not into whatever CR3 holds.
-- A fault in kernel mode panics. A fault in user mode outside every VMA kills the process.
+- A fault in kernel mode panics. A fault in user mode outside every VMA kills the process. An instruction fetch from a present NX page (error code `P|I`) is named as such in the log and the kill notice.
 
 ## COW refcounts (`memory/cow.rs`)
 
@@ -55,6 +56,7 @@ Code: `kernel/src/memory/`, `kernel/src/allocator/`, crate `mm/` (host tests: `c
 
 ## ELF loader (`memory/elf_loader.rs`)
 
+- Segments without `PF_X` are NX. A page shared by two segments with different permissions keeps the first one's (and a serial warning says so); none of our binaries has one (checked: 84 ELFs).
 - Static ELF64 only; reads only the ELF header and the PT_LOAD program headers (and looks for PT_INTERP, which is refused), so stripped binaries load the same.
 - `ET_DYN` (static-pie, Rust's default for musl) loads at the fixed base `PIE_BASE` (4 GiB): segments, entry and `AT_PHDR` get the bias, and **the kernel applies no relocations** (musl's rcrt1 does). No ASLR. Test: `pie_test` (freestanding, `DISK_PIE_PROGRAMS` in `kernel/build.rs`); a real `x86_64-unknown-linux-musl` std binary runs too (`rustc` inside the repo dir picks the pinned nightly).
 - auxv: `AT_PHDR/PHENT/PHNUM/ENTRY/PAGESZ/RANDOM`. `AT_RANDOM` points at 16 fresh bytes in the stack page.

@@ -111,6 +111,7 @@ const PF_PRESENT:  u64 = 1 << 0;   // 1 = protection violation, 0 = not present
 const PF_WRITE:    u64 = 1 << 1;   // 1 = write fault
 const PF_USER:     u64 = 1 << 2;   // 1 = user mode
 const PF_RESERVED: u64 = 1 << 3;   // 1 = reserved PTE bit set
+const PF_INSTR:    u64 = 1 << 4;   // 1 = instruction fetch
 
 // ============================================================================
 // INTERRUPT HANDLERS
@@ -322,6 +323,31 @@ fn user_fault(tf: &mut TrapFrame, sig: u32, si_code: i32, addr: u64, reason: &st
     }
 }
 
+/// A fixed-size string on the stack, for a kill reason built from numbers: unlike a `String` it has no `Drop`, so it may be
+/// live when a `-> !` function is called. Text past `N` bytes is cut.
+struct StackStr<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StackStr<N> {
+    fn new() -> Self {
+        Self { buf: [0; N], len: 0 }
+    }
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl<const N: usize> core::fmt::Write for StackStr<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let n = s.len().min(N - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
 // siginfo `si_code`s of a fault.
 const SEGV_MAPERR: i32 = 1;
 const SEGV_ACCERR: i32 = 2;
@@ -427,6 +453,20 @@ extern "C" fn page_fault_rust(tf: &mut TrapFrame, error_code: u64) {
         }
         kill_current_user_process("COW FAULT FAILED", crate::process::signal::SIGSEGV);
         // unreachable
+    }
+
+    // An instruction fetch from a present page: the page is NX (no PF_X segment, no PROT_EXEC). Say so (P1.1), with the
+    // address, rather than a plain segmentation fault. The reason lives in a stack buffer: nothing with a `Drop` may be live
+    // when `user_fault` diverges.
+    if is_user && error_code & (PF_PRESENT | PF_INSTR) == (PF_PRESENT | PF_INSTR) && error_code & PF_RESERVED == 0 {
+        let mut why = StackStr::<64>::new();
+        let _ = core::fmt::write(&mut why, format_args!("EXECUTED NON-EXECUTABLE MEMORY at {:#x}", fault_addr));
+        serial_println!(
+            "⚠️  PID {} executed non-executable memory at {:#x} (error {:#b})",
+            crate::process::scheduler::current_pid_fast(), fault_addr, error_code
+        );
+        user_fault(tf, crate::process::signal::SIGSEGV, SEGV_ACCERR, fault_addr, why.as_str());
+        return;
     }
 
     // Step 1: Is this fault potentially demand-pageable?

@@ -139,7 +139,8 @@ pub unsafe fn load_elf(
 
     let stack_flags = PageTableFlags::PRESENT
         | PageTableFlags::WRITABLE
-        | PageTableFlags::USER_ACCESSIBLE;
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
 
     address_space.add_vma(Vma {
         start: stack_base,
@@ -429,7 +430,19 @@ unsafe fn load_segment(
         // instead of trying to map it again (which would fail with
         // PageAlreadyMapped).
         let (frame, is_new_page) = match address_space.translate_page(page) {
-            Some(existing) => (existing, false),
+            Some(existing) => {
+                // The page keeps the first segment's permissions (and its VMA wins in fork and
+                // demand paging), so a code page shared with a non-executable segment would be NX.
+                // None of our binaries has one (each segment starts on its own page); say so if
+                // one ever does, since the symptom is an "executed non-executable memory" kill.
+                if address_space.find_vma(page_vaddr).is_some_and(|v| v.flags != flags.bits()) {
+                    crate::serial_println!(
+                        "ELF: page {:#x} shared by two segments with different permissions; keeps the first one's",
+                        page_vaddr,
+                    );
+                }
+                (existing, false)
+            }
             None => {
                 let f = address_space
                     .map_user_page(page, flags)
@@ -510,7 +523,7 @@ unsafe fn load_segment(
 ///
 /// All user pages need PRESENT + USER_ACCESSIBLE.
 /// PF_W → WRITABLE.
-/// PF_X → we do NOT set NO_EXECUTE (NX bit is not confirmed enabled in EFER).
+/// No PF_X → NO_EXECUTE (`EFER.NXE` is on on every CPU, `cpu::init_this_cpu` verifies it).
 /// PF_R → implied by PRESENT.
 fn elf_flags_to_page_flags(elf_flags: u32) -> PageTableFlags {
     let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
@@ -518,11 +531,9 @@ fn elf_flags_to_page_flags(elf_flags: u32) -> PageTableFlags {
     if elf_flags & PF_W != 0 {
         flags |= PageTableFlags::WRITABLE;
     }
-
-    // NOTE: We intentionally do NOT set NO_EXECUTE for non-executable
-    // segments because EFER.NXE may not be enabled.  When NX support
-    // is confirmed, add:
-    //   if elf_flags & PF_X == 0 { flags |= PageTableFlags::NO_EXECUTE; }
+    if elf_flags & PF_X == 0 {
+        flags |= PageTableFlags::NO_EXECUTE;
+    }
 
     flags
 }

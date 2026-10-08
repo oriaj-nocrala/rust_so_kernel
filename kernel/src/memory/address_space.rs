@@ -593,7 +593,7 @@ impl AddressSpace {
     /// If `addr == 0`: kernel picks the address via the bump pointer.
     /// If `addr != 0`: used as MAP_FIXED — must be page-aligned and non-overlapping.
     ///
-    /// `prot` bits: PROT_READ=1, PROT_WRITE=2 (PROT_EXEC ignored — NX not enabled).
+    /// `prot` bits: PROT_READ=1, PROT_WRITE=2, PROT_EXEC=4 (without it the pages are NX).
     /// `PROT_NONE` (no bits) maps pages the user cannot touch at all.
     /// `length` is rounded up to the next page boundary.
     ///
@@ -740,17 +740,22 @@ impl AddressSpace {
 
     /// Page-table flags of a mapping with the given `PROT_*` bits. Any of
     /// read/write/exec makes the page user-accessible (x86 has no write-only
-    /// or exec-only page, and NX is off); none makes it `PROT_NONE`: present
-    /// but supervisor-only, so a user access faults and the fault handler
-    /// (which refuses to demand-map such a VMA) kills the process.
+    /// or exec-only page); none makes it `PROT_NONE`: present but
+    /// supervisor-only, so a user access faults and the fault handler (which
+    /// refuses to demand-map such a VMA) kills the process. Without
+    /// `PROT_EXEC` the page is `NO_EXECUTE`.
     fn prot_to_flags(prot: u32) -> PageTableFlags {
         const PROT_WRITE: u32 = 2;
+        const PROT_EXEC: u32 = 4;
         let mut flags = PageTableFlags::PRESENT;
         if prot & 7 != 0 {
             flags |= PageTableFlags::USER_ACCESSIBLE;
         }
         if prot & PROT_WRITE != 0 {
             flags |= PageTableFlags::WRITABLE;
+        }
+        if prot & PROT_EXEC == 0 {
+            flags |= PageTableFlags::NO_EXECUTE;
         }
         flags
     }

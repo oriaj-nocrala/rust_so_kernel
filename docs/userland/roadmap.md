@@ -43,8 +43,8 @@ so a shared Rust library (e.g. the text engine) needs a C (`cdylib`) facade or a
    elsewhere); with `MAP_FIXED` it **replaces** what is there (`ld.so` reserves the whole span,
    then maps each segment over it with `MAP_FIXED`); `MAP_FIXED_NOREPLACE` fails with `EEXIST`.
 4. **`PROT_EXEC` and RELRO**: `ld.so` maps code with `PROT_EXEC` and `mprotect`s RELRO
-   read-only. **Do NX first** (`docs/ux/handoff-capabilities-to-files.md` stage 2) so W^X holds
-   from the first dynamic binary instead of working by accident.
+   read-only. NX is done (handoff stage 2): `PROT_EXEC` is honoured, so W^X holds from the
+   first dynamic binary.
 5. **A page cache for shared code**: there is none. Today `exec` copies every segment into fresh
    frames, so two runs of the same program share nothing, and a "copy the file into private
    pages at map time" `mmap` would give dynamic linking all its costs and none of the memory
@@ -78,7 +78,7 @@ so a shared Rust library (e.g. the text engine) needs a C (`cdylib`) facade or a
 
 ### Steps
 
-1. NX + `PROT_EXEC` (handoff stage 2). 2. `mmap`: hints, `MAP_FIXED` replace,
+1. ~~NX + `PROT_EXEC`~~ (done, handoff stage 2). 2. `mmap`: hints, `MAP_FIXED` replace,
 `MAP_FIXED_NOREPLACE`, file-backed `MAP_PRIVATE` by copy. 3. `PT_INTERP` + `AT_BASE`: a C
 program dynamically linked against musl runs; `dlopen` of a test `.so` works. 4. Immutable store
 + page cache for it; measure: two processes mapping the same library share frames (a
@@ -92,8 +92,8 @@ dynamically linked Alpine binary (e.g. its `busybox`) as the compatibility gate.
 
 ## 3. Claude Code (scope first, then decide)
 
-A Bun-compiled binary: needs dynamic linking, JIT (W+X memory: `PROT_EXEC` is ignored and NX is
-off today, so it may work by accident), threads, `epoll`, many more syscalls, TLS to the API,
+A Bun-compiled binary: needs dynamic linking, JIT (W+X memory: needs `PROT_EXEC` asked for explicitly,
+now that NX is on), threads, `epoll`, many more syscalls, TLS to the API,
 and a terminal that handles its TUI. First, cheap step: on the Linux host,
 `strace -f -c -o claude-syscalls.txt claude --version` (and a short interactive run), then diff
 the list against `docs/reference/syscalls.md`. Decide after seeing the gap.
