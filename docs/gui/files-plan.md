@@ -1,6 +1,6 @@
 # Files: the first app built on the UX principles
 
-Status: direction (2026-10-08), not started. The file manager is where the principles were
+Status: direction (2026-10-08), not started. Executable path: [`../ux/handoff-capabilities-to-files.md`](../ux/handoff-capabilities-to-files.md). The file manager is where the principles were
 first worked out, and the first app that exercises the backbones. Principles:
 [`../ux/principles.md`](../ux/principles.md); ideas F1-F16, K1, U7 in [`../ux/ideas.md`](../ux/ideas.md).
 

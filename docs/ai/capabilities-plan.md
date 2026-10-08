@@ -5,6 +5,8 @@ of [`../ux/backbones.md`](../ux/backbones.md), ahead of the other `docs/ai/` pla
 Principles served: P6 (nothing escapes its box), P2.7 (ask once, then show), P3
 ([`../ux/principles.md`](../ux/principles.md)).
 
+Executable path (steps 1-5 + `cap-exec`, then the file manager): [`../ux/handoff-capabilities-to-files.md`](../ux/handoff-capabilities-to-files.md).
+
 ## Verdict: the cornerstone
 
 - **Today the kernel has no security model at all.** Credentials are bookkeeping only: files

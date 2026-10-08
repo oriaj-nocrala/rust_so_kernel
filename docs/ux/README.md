@@ -7,6 +7,9 @@ user will see the effects of).
   evidence; the root document.
 - [`backbones.md`](backbones.md): the 6 pieces of infrastructure most ideas hang from.
 - [`ideas.md`](ideas.md): the deduplicated idea inventory, each tied to a principle and backbone.
+- [`handoff-capabilities-to-files.md`](handoff-capabilities-to-files.md): **the next work**, staged for
+  a fresh agent: capabilities (openat2, NX, rights, cap mode, `cap-exec`) → std GUI client →
+  widget crate with the semantic tree → Files v1.
 - [`audit-2026-10.md`](audit-2026-10.md): existing plans checked against the principles; open
   decisions are marked "user decision".
 
