@@ -62,6 +62,7 @@ const EV_KEY: u16 = 1;
 const EV_REL: u16 = 2;
 const REL_X: u16 = 0;
 const REL_Y: u16 = 1;
+const REL_WHEEL: u16 = 8;
 
 // epoll data tags; clients are TAG_CLIENT + id.
 const TAG_LISTEN: u64 = 1;
@@ -373,7 +374,7 @@ fn main(args: Args) -> i32 {
     let mut last_frame: i64 = -FRAME_MS;
     let mut frames: u64 = 0;
     let mut compose_ms_total: i64 = 0;
-    let (mut mdx, mut mdy) = (0i32, 0i32);
+    let (mut mdx, mut mdy, mut wheel) = (0i32, 0i32, 0i32);
     let mut buf = alloc::vec![0u8; 4096];
     let mut evs = [EpollEvent::default(); 16];
     // Vblank pacing: what the last compose left in the RAM copy for the
@@ -456,13 +457,17 @@ fn main(args: Args) -> i32 {
                     (EV_REL, REL_X) => mdx += value,
                     // PS/2's convention: positive is up. The screen's is down.
                     (EV_REL, REL_Y) => mdy -= value,
+                    (EV_REL, REL_WHEEL) => wheel += value,
                     (EV_KEY, _) => comp.pointer_button(code as u32, value != 0),
                     (EV_SYN, _) => {
                         if mdx != 0 || mdy != 0 {
                             comp.pointer_motion(mdx, mdy);
                         }
+                        // after the motion of the same report: to what is under the pointer now
+                        comp.pointer_axis(wheel);
                         mdx = 0;
                         mdy = 0;
+                        wheel = 0;
                     }
                     _ => {}
                 }),

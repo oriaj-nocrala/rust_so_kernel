@@ -59,6 +59,7 @@ const EV_KEY: u16 = 1;
 const EV_REL: u16 = 2;
 const REL_X: u16 = 0;
 const REL_Y: u16 = 1;
+const REL_WHEEL: u16 = 8;
 
 struct Clients {
     streams: BTreeMap<ClientId, UnixStream>,
@@ -380,7 +381,7 @@ fn run(args: &[String]) -> i32 {
     let mut clients = Clients { streams: BTreeMap::new(), seen: 0 };
     let t_start = Instant::now();
     let mut last_stat = Instant::now();
-    let (mut mdx, mut mdy) = (0i32, 0i32);
+    let (mut mdx, mut mdy, mut wheel) = (0i32, 0i32, 0i32);
     let mut frames = 0u64;
     // what the input devices delivered (is the mouse alive?): key events, pointer motions, button events
     let (mut n_keys, mut n_moves, mut n_buttons) = (0u64, 0u64, 0u64);
@@ -457,6 +458,7 @@ fn run(args: &[String]) -> i32 {
                         sum_dy += value as i64;
                         mdy -= value // PS/2: positive is up; the screen's is down
                     }
+                    (EV_REL, REL_WHEEL) => wheel += value,
                     (EV_KEY, _) => {
                         n_buttons += 1;
                         comp.pointer_button(code as u32, value != 0)
@@ -466,8 +468,11 @@ fn run(args: &[String]) -> i32 {
                             n_moves += 1;
                             comp.pointer_motion(mdx, mdy);
                         }
+                        // after the motion of the same report: to what is under the pointer now
+                        comp.pointer_axis(wheel);
                         mdx = 0;
                         mdy = 0;
+                        wheel = 0;
                     }
                     _ => {}
                   })

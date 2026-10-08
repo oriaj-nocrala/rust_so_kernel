@@ -23,11 +23,12 @@ use super::evdev::{InputEvent, EV_SYN, EV_KEY, EV_REL, SYN_REPORT, RECORD_SIZE, 
 
 const REL_X: u16 = 0x00;
 const REL_Y: u16 = 0x01;
+const REL_WHEEL: u16 = 0x08;
 const BTN_LEFT: u16 = 0x110;
 const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
 
-const PENDING_CAPACITY: usize = 8; // dx, dy, 3 buttons, sync — comfortably fits
+const PENDING_CAPACITY: usize = 8; // dx, dy, wheel, 3 buttons, sync — fits
 
 pub struct MouseEventDevice {
     pending: [InputEvent; PENDING_CAPACITY],
@@ -58,6 +59,10 @@ impl MouseEventDevice {
         }
         if ev.dy != 0 {
             self.pending[n] = InputEvent::now(EV_REL, REL_Y, ev.dy as i32);
+            n += 1;
+        }
+        if ev.wheel != 0 {
+            self.pending[n] = InputEvent::now(EV_REL, REL_WHEEL, ev.wheel as i32);
             n += 1;
         }
         let changed = ev.buttons ^ self.last_buttons;

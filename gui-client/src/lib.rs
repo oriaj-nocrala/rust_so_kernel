@@ -36,6 +36,8 @@ pub enum Event {
     Button { code: u32, pressed: bool },
     /// Pointer motion while locked ([`Window::lock_pointer`]); `dy` positive is down.
     RelativeMotion { dx: i32, dy: i32 },
+    /// The wheel over the window: notches, positive away from the user (scroll up), evdev's `REL_WHEEL` sign.
+    Wheel { steps: i32 },
     Focus(bool),
     /// The user resized the window (only after [`Window::set_resizable`]): call [`Window::resize`] with this size (or another) and present.
     Resize { width: usize, height: usize },
@@ -209,6 +211,7 @@ impl Window {
             Wire::Motion { x, y, .. } => Event::Motion { x, y },
             Wire::Button { code, pressed, .. } => Event::Button { code, pressed },
             Wire::RelativeMotion { dx, dy, .. } => Event::RelativeMotion { dx, dy },
+            Wire::Axis { steps, .. } => Event::Wheel { steps },
             Wire::Focus { focused, .. } => Event::Focus(focused),
             Wire::Resize { width, height, .. } => Event::Resize { width: width.max(1) as usize, height: height.max(1) as usize },
             Wire::Close { .. } => Event::Close,

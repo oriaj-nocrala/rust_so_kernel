@@ -2012,3 +2012,36 @@ fn semantic_nodes_are_checked() {
     assert!(h.events_for(a).iter().any(|e| matches!(e, Event::Error { code: 2, .. })));
     assert!(!h.comp.has_client(a));
 }
+
+#[test]
+fn the_wheel_goes_to_the_content_under_the_pointer() {
+    let mut h = H_::new();
+    let a = h.window(100, 100, 0x00AA_0000); // at (40, 40)
+    let b = h.window(100, 100, 0x0000_BB00); // at (72, 72), on top and focused
+    h.compose();
+    let axis = |h: &mut H_, steps| {
+        h.comp.take_events();
+        h.comp.pointer_axis(steps);
+        h.comp.take_events()
+    };
+    // a's visible content, behind b: a gets it, nothing is raised or focused
+    pointer_to(&mut h, 45, 70);
+    assert_eq!(axis(&mut h, -2), vec![(a, Event::Axis { surface: 4, steps: -2 })]);
+    assert_eq!(h.comp.stack(), &[(a, 4), (b, 4)]);
+    assert_eq!(h.comp.focus(), Some((b, 4)));
+    // b's content
+    pointer_to(&mut h, 120, 150);
+    assert_eq!(axis(&mut h, 1), vec![(b, Event::Axis { surface: 4, steps: 1 })]);
+    // a title bar, the desktop, zero notches: nothing
+    pointer_to(&mut h, 100, 77);
+    assert_eq!(axis(&mut h, 1), vec![]);
+    pointer_to(&mut h, 300, 230);
+    assert_eq!(axis(&mut h, 1), vec![]);
+    pointer_to(&mut h, 120, 150);
+    assert_eq!(axis(&mut h, 0), vec![]);
+    // locked: to the locked window wherever the pointer is (here over its title bar)
+    pointer_to(&mut h, 100, 77);
+    h.send(b, &[R::LockPointer { surface: 4, on: true }]);
+    assert_eq!(h.comp.pointer_locked(), Some((b, 4)));
+    assert_eq!(axis(&mut h, 3), vec![(b, Event::Axis { surface: 4, steps: 3 })]);
+}

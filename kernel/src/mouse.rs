@@ -56,9 +56,14 @@ impl Driver for MouseDriver {
     fn init(&mut self) -> Result<(), DriverError> {
         let io = X86PortIo;
         match hal::mouse::enable_aux(&io) {
-            Ok(()) => {
+            Ok(aux) => {
+                // before IRQ12: the first packet already has the wheel's byte
+                DECODER.with(|d| d.set_wheel(aux.wheel));
                 crate::interrupts::enable_isa_irq(12);
-                crate::serial_println!("mouse: PS/2 auxiliary device enabled (IRQ12)");
+                crate::serial_println!(
+                    "mouse: PS/2 auxiliary device enabled (IRQ12){}",
+                    if aux.wheel { ", IntelliMouse wheel" } else { ", no wheel" }
+                );
                 Ok(())
             }
             Err(hal::mouse::MouseInitError::AuxEnableTimeout) => {

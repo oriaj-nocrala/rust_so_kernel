@@ -40,6 +40,7 @@
 #define GUIW_EV_CLOSE 7            // surface: ()
 #define GUIW_EV_THEME 11           // surface (the panel): (name)
 #define GUIW_EV_POPUP_DONE 12      // surface (a popup): ()
+#define GUIW_EV_AXIS 13            // surface: (steps) wheel notches, positive away from the user (evdev REL_WHEEL)
 #define GUIW_EV_DONE 0             // callback: (ms)
 
 // ── Encoding ─────────────────────────────────────────────────────────────

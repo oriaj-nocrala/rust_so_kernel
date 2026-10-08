@@ -69,6 +69,7 @@ fn input(e: Event) -> Option<Input> {
         Event::Motion { x, y } => Input::Motion { x, y },
         Event::Button { code, pressed } => Input::Button { code, pressed },
         Event::Focus(f) => Input::Focus(f),
+        Event::Wheel { steps } => Input::Wheel { dy: -steps },
         _ => return None,
     })
 }

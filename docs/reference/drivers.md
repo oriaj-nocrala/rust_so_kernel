@@ -15,12 +15,12 @@ A device is a `FileHandle` (`read`/`write`/`ioctl`/`stat`/`dup`/…). Device sta
 | `/dev/fb0` | exclusive graphics mode (`graphics.md`) |
 | `/dev/kbd` | non-blocking keyboard, chars + ANSI sequences |
 | `/dev/input/event0` | keyboard, Linux evdev (`struct input_event`, `KEY_*` derived from Set-1, then `SYN_REPORT`). The ring fills from boot, so games drain it at startup |
-| `/dev/input/event1` | mouse (PS/2 and USB merged): `REL_X`/`REL_Y` (PS/2 sign: up positive), `BTN_*` |
+| `/dev/input/event1` | mouse (PS/2 and USB merged): `REL_X`/`REL_Y` (PS/2 sign: up positive), `REL_WHEEL` (evdev's sign: up/away positive), `BTN_*` |
 | `/dev/dsp` | write-only PCM, fixed 48 kHz stereo s16le, AC97 |
 | `/dev/ptmx`, `/dev/pts/N`, `/dev/tty` | ptys (`ipc.md`) |
 
 - Keyboard input: the PS/2 ISR and the USB poll both feed `keyboard::process_scancode` (Set-1). The decoder `keyboard::DECODER` is an `IrqMutex`.
-- PS/2 mouse (`mouse.rs`): 3-byte packets. A partial packet is dropped after 500 ms of silence (`mouse_resyncs` in `/proc/kdebug`). Test: `qemu-debug.sh mouse-move` + `cat /dev/input/event1 | wc -c`.
+- PS/2 mouse (`mouse.rs`): 3-byte packets, or 4 with the wheel: `hal::mouse::enable_aux` knocks (sample rates 200, 100, 80, then "get ID") and an IntelliMouse answers ID 3 (the boot log says `IntelliMouse wheel`); the 4th byte is a signed count, negated into `REL_WHEEL` as Linux's psmouse does. A mouse that ignores or refuses the knock stays 3-byte. QEMU's PS/2 mouse is an IntelliMouse (`qemu-debug.sh mouse-move 0 0 1` is a notch up). A partial packet is dropped after 500 ms of silence (`mouse_resyncs` in `/proc/kdebug`). Test: `qemu-debug.sh mouse-move` + `cat /dev/input/event1 | wc -c`.
 - `poll` readiness for input devices: `FileHandle::event_source`.
 
 ## PCI (`kernel/src/pci.rs`, `hal::pci`)

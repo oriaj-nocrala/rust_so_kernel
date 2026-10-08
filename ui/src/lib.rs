@@ -163,7 +163,8 @@ pub enum Input {
     Motion { x: i32, y: i32 },
     /// A Linux `BTN_*`.
     Button { code: u32, pressed: bool },
-    /// Wheel notches, positive towards the user (scrolls down).
+    /// Wheel notches, positive towards the user (scrolls down): the opposite of evdev's `REL_WHEEL` and of
+    /// `gui_client::Event::Wheel`, so `Input::Wheel { dy: -steps }`.
     Wheel { dy: i32 },
     /// The window got or lost the keyboard.
     Focus(bool),

@@ -55,6 +55,7 @@ fn run() -> std::io::Result<()> {
                 pressed = p;
             }
             Event::RelativeMotion { dx, dy } => println!("hello-window: relative {} {}", dx, dy),
+            Event::Wheel { steps } => println!("hello-window: wheel {}", steps),
             Event::Focus(f) => println!("hello-window: focus {}", if f { "in" } else { "out" }),
             Event::Resize { width, height } => {
                 win.resize(width, height)?;

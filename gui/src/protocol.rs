@@ -9,7 +9,7 @@
 //! | compositor | create_pool(id, fd, size) 0, create_surface(id) 1, sync(id) 2, create_gpu_buffer(id, fd, size, w, h, stride, format) 3, get_semantics(id) 4 | error(obj, code, msg) 0, delete_id(id) 1 |
 //! | pool       | create_buffer(id, offset, w, h, stride, format) 0, destroy 1             | — |
 //! | buffer     | destroy 0                                                                | release 0 |
-//! | surface    | attach(buffer) 0, damage(x, y, w, h) 1, frame(id) 2, commit 3, set_title(s) 4, destroy 5, lock_pointer(on) 6, set_resizable(min_w, min_h) 7, set_panel(height) 8, activate(toplevel) 9, set_popup(parent, x, y) 10, set_theme(name) 11, semantics_node(node) 12 | configure(w, h) 0, focus(in) 1, key(code, state) 2, motion(x, y) 3, button(code, state) 4, relative_motion(dx, dy) 5, resize(w, h) 6, close 7, toplevel(id, title) 8, toplevel_focus(id) 9, toplevel_gone(id) 10, theme(name) 11, popup_done 12 |
+//! | surface    | attach(buffer) 0, damage(x, y, w, h) 1, frame(id) 2, commit 3, set_title(s) 4, destroy 5, lock_pointer(on) 6, set_resizable(min_w, min_h) 7, set_panel(height) 8, activate(toplevel) 9, set_popup(parent, x, y) 10, set_theme(name) 11, semantics_node(node) 12 | configure(w, h) 0, focus(in) 1, key(code, state) 2, motion(x, y) 3, button(code, state) 4, relative_motion(dx, dy) 5, resize(w, h) 6, close 7, toplevel(id, title) 8, toplevel_focus(id) 9, toplevel_gone(id) 10, theme(name) 11, popup_done 12, axis(steps) 13 |
 //! | callback   | —                                                                        | done(ms) 0, semantics_window(toplevel, title, x, y, w, h, focused) 1, semantics_node(node) 2 |
 //!
 //! `create_gpu_buffer` makes a buffer (a `buffer` object: `destroy`, `release`) out of a GPU
@@ -160,6 +160,9 @@ pub enum Event {
     /// The popup was dismissed (a click outside it, Escape, its parent gone) and is hidden; it stays a popup and shows again at its
     /// next commit with a buffer.
     PopupDone { surface: u32 },
+    /// The wheel under the pointer (Wayland's `wl_pointer.axis_discrete`): notches, positive away from the user (scroll up),
+    /// evdev's `REL_WHEEL` sign. To the surface under the pointer (or the one it is locked to), without raising or focusing it.
+    Axis { surface: u32, steps: i32 },
     Done { callback: u32, ms: u32 },
     /// Answering `get_semantics`: a window; its nodes follow. `x, y, w, h`: its content on the screen.
     SemanticsWindow { callback: u32, toplevel: u32, title: String, x: i32, y: i32, w: i32, h: i32, focused: bool },
@@ -310,6 +313,7 @@ impl Event {
             (Interface::Surface, 10) => Event::ToplevelGone { surface: obj, id: a.uint()? },
             (Interface::Surface, 11) => Event::Theme { surface: obj, name: a.string()? },
             (Interface::Surface, 12) => Event::PopupDone { surface: obj },
+            (Interface::Surface, 13) => Event::Axis { surface: obj, steps: a.int()? },
             (Interface::Callback, 0) => Event::Done { callback: obj, ms: a.uint()? },
             (Interface::Callback, 1) => Event::SemanticsWindow {
                 callback: obj,
@@ -346,6 +350,7 @@ impl Event {
             Event::ToplevelGone { surface, id } => e.begin(*surface, 10).uint(*id),
             Event::Theme { surface, name } => e.begin(*surface, 11).string(name),
             Event::PopupDone { surface } => e.begin(*surface, 12),
+            Event::Axis { surface, steps } => e.begin(*surface, 13).int(*steps),
             Event::Done { callback, ms } => e.begin(*callback, 0).uint(*ms),
             Event::SemanticsWindow { callback, toplevel, title, x, y, w, h, focused } => {
                 e.begin(*callback, 1).uint(*toplevel).string(title).int(*x).int(*y).int(*w).int(*h).uint(*focused as u32)
@@ -376,7 +381,8 @@ impl Event {
             | Event::ToplevelFocus { surface, .. }
             | Event::ToplevelGone { surface, .. }
             | Event::Theme { surface, .. }
-            | Event::PopupDone { surface } => *surface,
+            | Event::PopupDone { surface }
+            | Event::Axis { surface, .. } => *surface,
             Event::Done { callback, .. } | Event::SemanticsWindow { callback, .. } | Event::SemanticsNode { callback, .. } => *callback,
         }
     }
@@ -464,6 +470,7 @@ mod tests {
             (Interface::Surface, Event::ToplevelGone { surface: 3, id: 2 }),
             (Interface::Surface, Event::Theme { surface: 3, name: "luna".into() }),
             (Interface::Surface, Event::PopupDone { surface: 3 }),
+            (Interface::Surface, Event::Axis { surface: 3, steps: -2 }),
             (Interface::Callback, Event::Done { callback: 8, ms: 1234 }),
             (
                 Interface::Callback,

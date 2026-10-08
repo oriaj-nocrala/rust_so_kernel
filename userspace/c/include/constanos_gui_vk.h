@@ -31,6 +31,7 @@
 #define GVK_FOCUS 4     // value 1 gained, 0 lost
 #define GVK_CLOSE 5     // the user asked for the window to close
 #define GVK_CONFIGURE 6 // value = w, code unused, y = h (the compositor's suggestion; the program picks its own size)
+#define GVK_WHEEL 8     // value = wheel notches, positive away from the user (scroll up); x/y unused
 #define GVK_RESIZE 7    // value = w, y = h: the size the compositor gives the window (maximize, a resize drag, F11 fullscreen); a program that sent
                         // gvk_set_resizable makes its swapchain this size, and the next buffer it sends is the window's new size
 
@@ -129,6 +130,7 @@ static void gvk_dispatch(struct gvk_window *w) {
                 break;
             case GUIW_EV_RESIZE: e.type = GVK_RESIZE; e.value = (int)a; e.y = (int)b; gvk_push(w, e); break;
             case GUIW_EV_CLOSE: e.type = GVK_CLOSE; gvk_push(w, e); break;
+            case GUIW_EV_AXIS: e.type = GVK_WHEEL; e.value = (int)a; gvk_push(w, e); break;
             }
         } else if (m.object == w->frame_cb && m.opcode == GUIW_EV_DONE && na == 1) {
             w->frame_cb = 0;   // the compositor showed the frame the last commit asked about

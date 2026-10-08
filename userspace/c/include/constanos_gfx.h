@@ -50,10 +50,11 @@
 #define GFX_EV_REL 2
 #define GFX_REL_X 0
 #define GFX_REL_Y 1
+#define GFX_REL_WHEEL 8 // notches, positive away from the user, in a window and on the console alike
 
 struct gfx_event {
     uint16_t type;  // GFX_EV_KEY / GFX_EV_REL (evdev's EV_KEY / EV_REL)
-    uint16_t code;  // KEY_* / BTN_* / REL_X / REL_Y
+    uint16_t code;  // KEY_* / BTN_* / REL_X / REL_Y / REL_WHEEL
     int32_t value;  // 1 press, 0 release / the motion
 };
 
@@ -178,6 +179,8 @@ static void gfx_dispatch(int *cw, int *ch) {
                 if (b) gfx_push(GFX_EV_REL, GFX_REL_Y, -(int32_t)b); // PS/2: up positive
                 break;
             }
+        } else if (m.object == GFX_SURFACE && m.opcode == GUIW_EV_AXIS && na >= 1) {
+            gfx_push(GFX_EV_REL, GFX_REL_WHEEL, (int32_t)guiw_arg(&m, 0));
         } else if (m.object == GFX_SURFACE && m.opcode == GUIW_EV_FOCUS && na >= 1 && guiw_arg(&m, 0) == 0) {
             // The releases of keys held now will go to another window.
             for (uint32_t code = 0; code < 512; code++)

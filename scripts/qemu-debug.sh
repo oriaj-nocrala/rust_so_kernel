@@ -16,7 +16,7 @@
 #   scripts/qemu-debug.sh key ret                  # raw qemu keynames, one per arg
 #   scripts/qemu-debug.sh key ctrl-c
 #   scripts/qemu-debug.sh enter                    # shortcut for: key ret
-#   scripts/qemu-debug.sh mouse-move dx dy          # relative PS/2 motion (HMP mouse_move)
+#   scripts/qemu-debug.sh mouse-move dx dy [dz]     # relative PS/2 motion (HMP mouse_move); dz: one wheel notch, > 0 up
 #   scripts/qemu-debug.sh mouse-button val          # HMP bitmask: 1=left, 2=right, 4=middle, 0=release
 #   scripts/qemu-debug.sh screendump [out.png]      # defaults to STATE_DIR/screen.png
 #   scripts/qemu-debug.sh log [N]                   # tail -n N serial.log (default 100)
@@ -443,7 +443,8 @@ cmd_mouse_move() {
     is_running || { echo "Not running." >&2; exit 1; }
     # QEMU HMP mouse_move dx dy [dz] — relative deltas by default (no
     # absolute pointing device, e.g. usb-tablet, is attached in cmd_start).
-    mon "mouse_move $1 $2"
+    # dz: the wheel, one notch per call whatever its size (QEMU's HMP): > 0 up (away from the user, REL_WHEEL +1), < 0 down.
+    mon "mouse_move $1 $2 ${3:-0}"
 }
 
 cmd_mouse_button() {
@@ -565,7 +566,7 @@ case "${1:-}" in
     send) cmd_send "$2" ;;
     key) shift; cmd_key "$@" ;;
     enter) cmd_key ret ;;
-    mouse-move) cmd_mouse_move "${2:-0}" "${3:-0}" ;;
+    mouse-move) cmd_mouse_move "${2:-0}" "${3:-0}" "${4:-0}" ;;
     mouse-button) cmd_mouse_button "${2:-0}" ;;
     screendump) cmd_screendump "${2:-}" ;;
     log) cmd_log "${2:-}" ;;

@@ -13,7 +13,8 @@
 #   2. Moving the mouse lands the cursor exactly where it was sent (1:1).
 #   3. Dragging the title bar by (+300,+200) moves the window there, and
 #      where it was is background again.
-#   4. A right click and two keys in the window reach gui_demo (its stdout).
+#   4. A right click, two keys and the wheel (a notch each way) in the
+#      window reach gui_demo (its stdout).
 #   5. The keys did not reach ash (the keyboard was grabbed).
 #   6. Ctrl+Alt+Backspace quits; gui_demo sees EOF; the console comes back
 #      and typing works.
@@ -91,7 +92,7 @@
 #       only the shown rows; "d" finds "date 00003"; the status label says
 #       so; the selected row is the theme's selection colour on screen.
 #   U4. A click on the button (its bounds from the tree) is a click; a
-#       double click on a row opens it.
+#       double click on a row opens it; the wheel scrolls the list.
 #   U5. Esc ends ui-demo with exit(0); the console comes back.
 #
 #   scripts/gui-e2e.sh files    # Files v1 (stage 8)
@@ -510,6 +511,14 @@ if [ "$MODE" = ui ]; then
     mv "$cx" "$cy"; $Q mouse-button 1 >/dev/null; $Q mouse-button 0 >/dev/null; $Q mouse-button 1 >/dev/null; $Q mouse-button 0 >/dev/null
     $Q wait-for "ui-demo: action Activated { list: 12, row: 6 }" 10 >/dev/null && ok "U4 a double click opens the row" || bad "U4 no Activated (row 6)"
 
+    # the wheel over the list: three notches down, one up = 6 rows (three a notch) from the top; a wrong sign gives 3 (clamped at the top)
+    first() { grep -m1 'ListBoxOption.*/10000)' "$1" | grep -o '([0-9]*/10000)' | grep -o '^([0-9]*' | tr -d '('; }
+    tree > "$OUT/t4"; p0=$(first "$OUT/t4")
+    read -r lx ly _ <<< "$(scr "$OUT/t4" 'ListBox#12 "Items"')"
+    mv "$lx" "$ly"; for dz in -1 -1 -1 1; do $Q mouse-move 0 0 $dz >/dev/null; sleep 0.3; done; sleep 1
+    tree > "$OUT/t5"; p1=$(first "$OUT/t5")
+    [ -n "$p0" ] && [ "$p1" = $((p0 + 6)) ] && ok "U4 the wheel scrolls the list (first row $p0 -> $p1)" || bad "U4 wheel: first row $p0 -> $p1"
+
     $Q key esc
     $Q wait-for "ui-demo: bye" 15 >/dev/null && ok "U5 Esc ends it" || bad "U5 ui-demo did not quit"
     sleep 1
@@ -716,6 +725,9 @@ $Q send "ab"; sleep 1
 log=$(grep -a "gui_demo:" "$STATE/serial.log")
 grep -q "button 0x111 down" <<<"$log" && ok "4 right click reached the window" || bad "4 no button event"
 grep -q "key 30 down" <<<"$log" && grep -q "key 48 up" <<<"$log" && ok "4 keys a,b reached the window" || bad "4 no key events"
+$Q mouse-move 0 0 1; sleep 0.3; $Q mouse-move 0 0 -1; sleep 1   # the wheel: a notch up, a notch down
+log=$(grep -a "gui_demo:" "$STATE/serial.log")
+grep -q "gui_demo: wheel 1$" <<<"$log" && grep -q "gui_demo: wheel -1$" <<<"$log" && ok "4 the wheel reached the window (+1 up, -1 down)" || bad "4 wheel: $(grep 'wheel' <<<"$log" | tr '\n' ' ')"
 
 $Q key ctrl-alt-backspace
 $Q wait-for "gui_demo: compositor gone" 15 >/dev/null && ok "6 quit; gui_demo saw EOF" || bad "6 gui_demo not told"

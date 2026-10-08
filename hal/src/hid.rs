@@ -238,8 +238,8 @@ pub fn usage_to_set1(usage: u8) -> Option<Set1Code> {
 /// Decodes one HID boot-protocol mouse report (HID 1.11 Appendix B.2):
 /// byte 0 buttons (bit 0 left, 1 right, 2 middle; the rest are
 /// device-specific), byte 1 X and byte 2 Y displacement as signed 8-bit
-/// counts. Anything after byte 2 (a wheel, extra buttons) is outside the
-/// boot protocol and ignored. `None` for a report too short to hold the
+/// counts. Byte 3, when the report has one, is the wheel (outside the boot
+/// protocol, but what wheel mice send there; Linux's `usbmouse` reads it too). `None` for a report too short to hold the
 /// three bytes — a device may send a zero-length report as a NAK stand-in.
 ///
 /// Unlike the keyboard, no state is needed: a mouse report is already
@@ -262,6 +262,9 @@ pub fn decode_boot_mouse(report: &[u8]) -> Option<crate::mouse::MouseEvent> {
         dx: report[1] as i8 as i16,
         dy: -(report[2] as i8 as i16),
         buttons: report[0] & 0x07,
+        // Byte 3 is the wheel on the mice that send one (HID's sign is REL_WHEEL's: positive away from the user); Linux's
+        // boot-protocol driver (usbmouse.c) reads it the same way.
+        wheel: report.get(3).map_or(0, |&b| b as i8),
     })
 }
 
@@ -463,7 +466,7 @@ mod tests {
     fn boot_mouse_report_decodes_signed_motion_and_buttons() {
         // Left+middle held, 5 right, 3 down (HID) = 3 up negated -> -3.
         let ev = decode_boot_mouse(&[0b101, 5, 3]).unwrap();
-        assert_eq!(ev, crate::mouse::MouseEvent { dx: 5, dy: -3, buttons: 0b101 });
+        assert_eq!(ev, crate::mouse::MouseEvent { dx: 5, dy: -3, buttons: 0b101, wheel: 0 });
         // Extremes: 0x80 = -128 on both axes; Y -128 (up) becomes +128.
         let ev = decode_boot_mouse(&[0, 0x80, 0x80]).unwrap();
         assert_eq!((ev.dx, ev.dy), (-128, 128));
@@ -472,10 +475,13 @@ mod tests {
     }
 
     #[test]
-    fn boot_mouse_ignores_extra_buttons_and_trailing_bytes() {
-        // Buttons 4/5 (bits 3-4) and a wheel byte are not boot protocol.
+    fn boot_mouse_reads_the_wheel_and_ignores_extra_buttons() {
+        // Buttons 4/5 (bits 3-4) are dropped; byte 3 is the wheel, HID's sign (+1 = away from the user = REL_WHEEL +1).
         let ev = decode_boot_mouse(&[0b11010, 1, 0xFF, 0x01, 0, 0, 0, 0]).unwrap();
-        assert_eq!(ev, crate::mouse::MouseEvent { dx: 1, dy: 1, buttons: 0b010 });
+        assert_eq!(ev, crate::mouse::MouseEvent { dx: 1, dy: 1, buttons: 0b010, wheel: 1 });
+        assert_eq!(decode_boot_mouse(&[0, 0, 0, 0xFE]).unwrap().wheel, -2);
+        // a 3-byte report has none
+        assert_eq!(decode_boot_mouse(&[0, 0, 0]).unwrap().wheel, 0);
     }
 
     #[test]

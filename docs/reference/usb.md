@@ -6,7 +6,7 @@ Why it exists: the Ryzen target has no PS/2 and no IDE. Keyboard, mouse and `/mn
 
 ## Design
 
-- **Input reuses the PS/2 pipeline.** USB key presses are translated to Set-1 scancodes (`hal::hid::usage_to_set1`) and fed to `keyboard::process_scancode`, so every keyboard consumer works unchanged and both keyboards merge into one stream. Boot-mouse reports go into the PS/2 mouse queue (`mouse::push_usb_event`) with **HID Y negated** (PS/2 convention: up is positive).
+- **Input reuses the PS/2 pipeline.** USB key presses are translated to Set-1 scancodes (`hal::hid::usage_to_set1`) and fed to `keyboard::process_scancode`, so every keyboard consumer works unchanged and both keyboards merge into one stream. Boot-mouse reports go into the PS/2 mouse queue (`mouse::push_usb_event`) with **HID Y negated** (PS/2 convention: up is positive). Byte 3, when the report has one, is the wheel (HID's sign is `REL_WHEEL`'s), as Linux's boot-protocol `usbmouse` reads it; the endpoint's full max packet is requested, so it arrives.
 - **Polled, not interrupt-driven.** `usb::poll()` runs on CPU 0's tick, before the scheduler lock, with `try_lock` (skips if busy). It *returns* scancodes instead of dispatching them, so the driver lock is released before `process_scancode` (which can take the scheduler lock for SIGINT). Reason: the IDT is filled before PCI enumeration.
 - **MMIO** (`memory::mmio::map`): 4 KiB pages mapped uncached (PWT|PCD) in an unused higher-half PML4 slot, so every address space inherits them. DMA buffers use the normal cacheable physmap (x86 DMA is coherent). BARs may sit above 4 GiB.
 - PCI discovery by class over all buses: `pci::for_each_by_class`, 64-bit BARs.

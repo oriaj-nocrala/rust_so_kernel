@@ -12,7 +12,7 @@
 //!
 //! Either way events are `EV_KEY` with Linux `KEY_*`/`BTN_*` codes (value 1
 //! press, 0 release, 2 autorepeat on the console) and `EV_REL` with
-//! `REL_X`/`REL_Y` in PS/2's sign convention (Y positive up).
+//! `REL_X`/`REL_Y` in PS/2's sign convention (Y positive up), and `REL_WHEEL`.
 
 use alloc::collections::VecDeque;
 
@@ -25,6 +25,8 @@ pub const EV_KEY: u16 = 1;
 pub const EV_REL: u16 = 2;
 pub const REL_X: u16 = 0;
 pub const REL_Y: u16 = 1;
+/// Wheel notches, positive away from the user (evdev's sign), in a window and on the console alike.
+pub const REL_WHEEL: u16 = 8;
 
 /// Lock the pointer to the window and report its motion (games).
 pub const MOUSE: u32 = 1;
@@ -416,6 +418,7 @@ impl Window {
                         }
                     }
                 }
+                Event::Axis { steps, .. } => self.push(EV_REL, REL_WHEEL, steps),
                 Event::Resize { width, height, .. } => {
                     self.want = Some((width.max(1) as usize, height.max(1) as usize));
                     self.push(EV_GFX, GFX_RESIZE, 0);

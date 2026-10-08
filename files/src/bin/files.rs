@@ -584,6 +584,8 @@ fn run() -> std::io::Result<()> {
             Event::Motion { x, y } => Input::Motion { x, y },
             Event::Button { code, pressed } => Input::Button { code, pressed },
             Event::Focus(f) => Input::Focus(f),
+            // the wheel's notches up are the list's rows up
+            Event::Wheel { steps } => Input::Wheel { dy: -steps },
             Event::RelativeMotion { .. } => continue,
         };
         let now = t0.elapsed().as_millis() as u32;

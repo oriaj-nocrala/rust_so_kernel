@@ -1541,6 +1541,25 @@ impl<M: PoolMem> Compositor<M> {
         }
     }
 
+    /// Wheel notches (`REL_WHEEL`'s sign: positive away from the user): an `axis` event to the surface the pointer is locked to,
+    /// else to the content under the pointer — a window, the panel or a popup — which is neither raised nor focused (scrolling
+    /// a window behind another is ordinary). Nothing during a drag or a resize, or over a title bar or the desktop.
+    pub fn pointer_axis(&mut self, steps: i32) {
+        if steps == 0 || self.drag.is_some() || self.resize.is_some() {
+            return;
+        }
+        let target = match self.locked {
+            Some(k) => Some(k),
+            None => {
+                let (x, y) = self.pointer;
+                self.hit(x, y).filter(|(_, z)| *z == Zone::Content).map(|(k, _)| k)
+            }
+        };
+        if let Some(k) = target {
+            self.events.push((k.0, Event::Axis { surface: k.1, steps }));
+        }
+    }
+
     pub fn pointer_button(&mut self, code: u32, pressed: bool) {
         let (x, y) = self.pointer;
         if !pressed {

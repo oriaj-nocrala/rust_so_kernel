@@ -103,6 +103,7 @@ fn opens_presents_and_reads_events() {
             Wire::Button { surface: SURFACE, code: 0x110, pressed: true },
             Wire::Toplevel { surface: SURFACE, id: 1, title: "not for us".into() },
             Wire::RelativeMotion { surface: SURFACE, dx: -3, dy: 4 },
+            Wire::Axis { surface: SURFACE, steps: -2 },
             Wire::Close { surface: SURFACE },
         ]);
         // Not released yet: the client's next frame() must wait for this.
@@ -133,6 +134,7 @@ fn opens_presents_and_reads_events() {
             Event::Motion { x: 7, y: 9 },
             Event::Button { code: 0x110, pressed: true },
             Event::RelativeMotion { dx: -3, dy: 4 },
+            Event::Wheel { steps: -2 },
             Event::Close,
         ]
     );

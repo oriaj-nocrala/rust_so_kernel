@@ -31,6 +31,8 @@ pub struct MouseEvent {
     pub dx: i16,
     pub dy: i16,
     pub buttons: u8, // bit0=left, bit1=right, bit2=middle
+    /// Wheel notches, evdev's `REL_WHEEL` sign: positive is away from the user (scroll up). 0 without a wheel.
+    pub wheel: i8,
 }
 
 /// In-progress 3-byte packet assembly state, extracted verbatim from the
@@ -40,8 +42,10 @@ pub struct MouseEvent {
 /// function).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PacketDecoder {
-    bytes: [u8; 3],
+    bytes: [u8; 4],
     index: usize,
+    /// 3, or 4 for an IntelliMouse (the wheel's byte last) — [`PacketDecoder::set_wheel`].
+    len: usize,
     /// When the previous byte arrived (`push_byte_at`'s clock).
     last_ms: u64,
     /// Partial packets discarded by the idle-gap rule.
@@ -64,7 +68,13 @@ pub const RESYNC_GAP_MS: u64 = 500;
 
 impl PacketDecoder {
     pub const fn new() -> Self {
-        PacketDecoder { bytes: [0; 3], index: 0, last_ms: 0, resyncs: 0 }
+        PacketDecoder { bytes: [0; 4], index: 0, len: 3, last_ms: 0, resyncs: 0 }
+    }
+
+    /// 4-byte packets with the wheel in the last byte, once [`enable_aux`] found an IntelliMouse.
+    pub fn set_wheel(&mut self, on: bool) {
+        self.len = if on { 4 } else { 3 };
+        self.index = 0;
     }
 
     /// How many partial packets the idle-gap rule has discarded.
@@ -101,13 +111,15 @@ impl PacketDecoder {
 
         self.bytes[self.index] = byte;
 
-        if self.index < 2 {
+        if self.index < self.len - 1 {
             self.index += 1;
             return None;
         }
         self.index = 0;
 
         let (b0, b1, b2) = (self.bytes[0], self.bytes[1], self.bytes[2]);
+        // IntelliMouse: a signed count, positive towards the user; Linux's psmouse negates it into REL_WHEEL.
+        let wheel = if self.len == 4 { (self.bytes[3] as i8).saturating_neg() } else { 0 };
 
         // Overflow bits set → that axis's delta is meaningless; drop the
         // whole packet rather than feed a caller a huge, bogus jump.
@@ -124,6 +136,7 @@ impl PacketDecoder {
             dx: dx as i16,
             dy: dy as i16,
             buttons: b0 & 0x07,
+            wheel,
         })
     }
 }
@@ -153,6 +166,27 @@ pub enum MouseInitError {
     /// The "enable reporting" mouse command (`0xF4`) was sent but never
     /// ACKed (`0xFA`) within `TIMEOUT_POLLS`.
     ReportingNotAcked,
+}
+
+/// What [`enable_aux`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Aux {
+    /// An IntelliMouse: 4-byte packets with a wheel ([`PacketDecoder::set_wheel`]).
+    pub wheel: bool,
+}
+
+/// `0xF3 rate` ("set sample rate"), both bytes ACKed.
+fn set_rate<IO: PortIo>(io: &IO, rate: u8) -> bool {
+    mouse_write(io, 0xF3) && read_data(io) == Some(0xFA) && mouse_write(io, rate) && read_data(io) == Some(0xFA)
+}
+
+/// The IntelliMouse knock: sample rates 200, 100, 80, then "get device ID" (`0xF2`) answers 3 if the mouse switched to
+/// 4-byte packets with a wheel (0 for a plain PS/2 mouse, which ignores the knock). The rate goes back to 100 either way.
+fn knock_wheel<IO: PortIo>(io: &IO) -> bool {
+    let knocked = set_rate(io, 200) && set_rate(io, 100) && set_rate(io, 80);
+    let id = if knocked && mouse_write(io, 0xF2) && read_data(io) == Some(0xFA) { read_data(io) } else { None };
+    let _ = set_rate(io, 100);
+    id == Some(3)
 }
 
 fn wait_write<IO: PortIo>(io: &IO, max: u32) -> bool {
@@ -210,7 +244,7 @@ fn mouse_write<IO: PortIo>(io: &IO, data: u8) -> bool {
 ///
 /// Pure over the seam — no logging, no globals; the kernel adapter logs
 /// `Ok`/`Err` and drives `pic::enable_irq`.
-pub fn enable_aux<IO: PortIo>(io: &IO) -> Result<(), MouseInitError> {
+pub fn enable_aux<IO: PortIo>(io: &IO) -> Result<Aux, MouseInitError> {
     if !write_command(io, 0xA8) {
         return Err(MouseInitError::AuxEnableTimeout);
     }
@@ -232,6 +266,9 @@ pub fn enable_aux<IO: PortIo>(io: &IO) -> Result<(), MouseInitError> {
     }
     let _ = read_data(io); // ACK optional — proceed regardless, as the original did.
 
+    // Best effort: a mouse that does not answer it is a plain 3-byte one.
+    let wheel = knock_wheel(io);
+
     if !mouse_write(io, 0xF4) {
         return Err(MouseInitError::AuxEnableTimeout);
     }
@@ -239,7 +276,7 @@ pub fn enable_aux<IO: PortIo>(io: &IO) -> Result<(), MouseInitError> {
         return Err(MouseInitError::ReportingNotAcked);
     }
 
-    Ok(())
+    Ok(Aux { wheel })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -269,7 +306,7 @@ mod tests {
         assert_eq!(d.push_byte(0b0000_1011), None);
         assert_eq!(d.push_byte(10), None); // dx = 10
         let ev = d.push_byte(20).expect("third byte completes the packet");
-        assert_eq!(ev, MouseEvent { dx: 10, dy: 20, buttons: 0b011 });
+        assert_eq!(ev, MouseEvent { dx: 10, dy: 20, buttons: 0b011, wheel: 0 });
         // Decoder resets for the next packet.
         assert_eq!(d.index, 0);
     }
@@ -334,7 +371,7 @@ mod tests {
         let mut good = 0;
         for _ in 0..10 {
             for &b in &[0x28, 0x0A, 0xFB] {
-                if d.push_byte_at(b, t) == Some(MouseEvent { dx: 10, dy: -5, buttons: 0 }) {
+                if d.push_byte_at(b, t) == Some(MouseEvent { dx: 10, dy: -5, buttons: 0, wheel: 0 }) {
                     good += 1;
                 }
                 t += 1;
@@ -356,7 +393,7 @@ mod tests {
         let t = 6 + RESYNC_GAP_MS + 1;
         assert_eq!(d.push_byte_at(0x28, t), None);
         assert_eq!(d.push_byte_at(0x0A, t + 1), None);
-        assert_eq!(d.push_byte_at(0xFB, t + 2), Some(MouseEvent { dx: 10, dy: -5, buttons: 0 }));
+        assert_eq!(d.push_byte_at(0xFB, t + 2), Some(MouseEvent { dx: 10, dy: -5, buttons: 0, wheel: 0 }));
         assert_eq!(d.resyncs(), 1);
     }
 
@@ -368,7 +405,7 @@ mod tests {
         let t = RESYNC_GAP_MS + 1;
         d.push_byte_at(0x28, t);
         d.push_byte_at(0x0A, t + 1);
-        assert_eq!(d.push_byte_at(0xFB, t + 2), Some(MouseEvent { dx: 10, dy: -5, buttons: 0 }));
+        assert_eq!(d.push_byte_at(0xFB, t + 2), Some(MouseEvent { dx: 10, dy: -5, buttons: 0, wheel: 0 }));
     }
 
     #[test]
@@ -379,7 +416,7 @@ mod tests {
         d.push_byte_at(0x0A, 1000 + RESYNC_GAP_MS);
         assert_eq!(
             d.push_byte_at(0xFB, 1000 + 2 * RESYNC_GAP_MS),
-            Some(MouseEvent { dx: 10, dy: -5, buttons: 0 })
+            Some(MouseEvent { dx: 10, dy: -5, buttons: 0, wheel: 0 })
         );
         assert_eq!(d.resyncs(), 0);
     }
@@ -393,67 +430,96 @@ mod tests {
         for &b in &[0x28, 0x0A] {
             d.push_byte_at(b, 10_000);
         }
-        assert_eq!(d.push_byte_at(0xFB, 10_000), Some(MouseEvent { dx: 10, dy: -5, buttons: 0 }));
+        assert_eq!(d.push_byte_at(0xFB, 10_000), Some(MouseEvent { dx: 10, dy: -5, buttons: 0, wheel: 0 }));
         assert_eq!(d.resyncs(), 0);
     }
 
     // ── 8042 enable sequence ─────────────────────────────────────────────
 
-    #[test]
-    fn enable_aux_full_success_sequence() {
+    /// The DATA_PORT answers after the config byte for: 0xF6's ACK, the knock (three set-rates, two ACKs each), 0xF2's ACK and
+    /// `id`, the rate back to 100 (two ACKs), 0xF4's ACK.
+    fn answers(f6: u8, id: u8, f4: u8) -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec![f6];
+        v.extend([0xFA; 6]);
+        v.extend([0xFA, id]);
+        v.extend([0xFA, 0xFA, f4]);
+        v
+    }
+
+    fn scripted(reads: &[u8]) -> ScriptedIo {
         let io = ScriptedIo::new();
-        // Config byte read after "read controller configuration" (0x20).
-        io.queue_read(DATA_PORT, 0b0010_0000); // aux clock bit set (disabled)
-        // "set defaults" (0xF6) ACK, then "enable reporting" (0xF4) ACK.
-        io.queue_reads(DATA_PORT, &[0xFA, 0xFA]);
-        // STATUS_CMD_PORT reads: input-empty (bit1=0) for every wait_write,
-        // output-full (bit0=1) for every wait_read. ScriptedIo returns 0
-        // (sticky default) for un-queued reads, which already satisfies
-        // wait_write (bit1=0 means "not full" -> ready). wait_read needs
-        // bit0=1, so queue that explicitly, sticky across all reads.
+        io.queue_read(DATA_PORT, 0b0010_0000); // config: aux clock bit set (disabled)
+        io.queue_reads(DATA_PORT, &reads.iter().map(|&b| b as u32).collect::<alloc::vec::Vec<u32>>());
+        // STATUS_CMD_PORT: 0 (input empty) satisfies every wait_write; wait_read needs bit 0, sticky.
         io.queue_read(STATUS_CMD_PORT, STATUS_OUTPUT_FULL as u32);
+        io
+    }
 
-        assert_eq!(enable_aux(&io), Ok(()));
+    #[test]
+    fn enable_aux_full_success_sequence_finds_the_wheel() {
+        let io = scripted(&answers(0xFA, 3, 0xFA));
+        assert_eq!(enable_aux(&io), Ok(Aux { wheel: true }));
+        let to_mouse = |b: u8| [(STATUS_CMD_PORT, 0xD4u32), (DATA_PORT, b as u32)];
+        let mut want = alloc::vec![
+            (STATUS_CMD_PORT, 0xA8u32), // enable aux device
+            (STATUS_CMD_PORT, 0x20),    // read config
+            (STATUS_CMD_PORT, 0x60),    // write config back
+            (DATA_PORT, 0b0000_0010),   // IRQ12 bit set, aux-clock bit cleared (enabled)
+        ];
+        // defaults, the knock 200/100/80, get ID, the rate back to 100, enable reporting
+        for b in [0xF6, 0xF3, 200, 0xF3, 100, 0xF3, 80, 0xF2, 0xF3, 100, 0xF4] {
+            want.extend(to_mouse(b));
+        }
+        assert_eq!(io.writes(), want);
+    }
 
-        let writes = io.writes();
-        assert_eq!(
-            writes,
-            alloc::vec![
-                (STATUS_CMD_PORT, 0xA8u32),        // enable aux device
-                (STATUS_CMD_PORT, 0x20),           // read config
-                (STATUS_CMD_PORT, 0x60),           // write config back
-                (DATA_PORT, 0b0000_0010),          // config: IRQ12 bit set, aux-clock bit cleared (enabled)
-                (STATUS_CMD_PORT, 0xD4),           // "next byte is for the mouse" (0xF6)
-                (DATA_PORT, 0xF6),
-                (STATUS_CMD_PORT, 0xD4),           // "next byte is for the mouse" (0xF4)
-                (DATA_PORT, 0xF4),
-            ]
-        );
+    #[test]
+    fn a_plain_mouse_answers_id_0_and_stays_3_bytes() {
+        assert_eq!(enable_aux(&scripted(&answers(0xFA, 0, 0xFA))), Ok(Aux { wheel: false }));
+    }
+
+    #[test]
+    fn a_mouse_that_refuses_the_knock_still_works() {
+        // 0xFE (resend) to the first set-rate: the knock stops there; the rate back to 100 and reporting are ACKed.
+        let io = scripted(&[0xFA, 0xFE, 0xFA, 0xFA, 0xFA]);
+        assert_eq!(enable_aux(&io), Ok(Aux { wheel: false }));
     }
 
     #[test]
     fn enable_aux_defaults_not_acked_continues_anyway() {
-        let io = ScriptedIo::new();
-        io.queue_read(DATA_PORT, 0); // config byte
-        // First DATA_PORT read after 0xF6 (set defaults) is NOT 0xFA -> the
-        // original logs "continuing anyway" but does not fail. The next
-        // read (after 0xF4) IS 0xFA -> overall success.
-        io.queue_reads(DATA_PORT, &[0x00, 0xFA]);
-        io.queue_read(STATUS_CMD_PORT, STATUS_OUTPUT_FULL as u32);
-
-        assert_eq!(enable_aux(&io), Ok(()));
+        // 0xF6's ACK missing: the original logged "continuing anyway"; so do we.
+        assert_eq!(enable_aux(&scripted(&answers(0x00, 3, 0xFA))), Ok(Aux { wheel: true }));
     }
 
     #[test]
     fn enable_aux_reporting_never_acked_fails() {
-        let io = ScriptedIo::new();
-        io.queue_read(DATA_PORT, 0); // config byte
-        // "set defaults" ACK, then "enable reporting" never ACKed (0x00
-        // sticks for every subsequent read).
-        io.queue_reads(DATA_PORT, &[0xFA, 0x00]);
-        io.queue_read(STATUS_CMD_PORT, STATUS_OUTPUT_FULL as u32);
+        assert_eq!(enable_aux(&scripted(&answers(0xFA, 3, 0x00))), Err(MouseInitError::ReportingNotAcked));
+    }
 
-        assert_eq!(enable_aux(&io), Err(MouseInitError::ReportingNotAcked));
+    #[test]
+    fn four_byte_packets_carry_the_wheel() {
+        let mut d = PacketDecoder::new();
+        d.set_wheel(true);
+        // left button, dx 3, dy 0, z = -1 (towards... away from the user: scroll up) -> REL_WHEEL +1
+        for b in [0x09, 3, 0] {
+            assert_eq!(d.push_byte(b), None);
+        }
+        assert_eq!(d.push_byte(0xFF), Some(MouseEvent { dx: 3, dy: 0, buttons: 1, wheel: 1 }));
+        for b in [0x08, 0, 0] {
+            assert_eq!(d.push_byte(b), None);
+        }
+        assert_eq!(d.push_byte(2), Some(MouseEvent { dx: 0, dy: 0, buttons: 0, wheel: -2 }));
+        // -128 does not overflow
+        for b in [0x08, 0, 0] {
+            d.push_byte(b);
+        }
+        assert_eq!(d.push_byte(0x80).unwrap().wheel, 127);
+        // back to 3 bytes: the next byte starts a new packet
+        d.set_wheel(false);
+        for b in [0x08, 1] {
+            assert_eq!(d.push_byte(b), None);
+        }
+        assert_eq!(d.push_byte(1), Some(MouseEvent { dx: 1, dy: 1, buttons: 0, wheel: 0 }));
     }
 
     #[test]
