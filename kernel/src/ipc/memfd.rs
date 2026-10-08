@@ -82,6 +82,15 @@ impl FileHandle for MemfdHandle {
         Ok(new)
     }
 
+    // No position involved: the shared offset of dups is never moved, not even for the call.
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> FileResult<usize> {
+        Ok(self.obj.read_at(offset, buf))
+    }
+
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> FileResult<usize> {
+        self.obj.write_at(offset, buf).map_err(file_error)
+    }
+
     fn shm_object(&self) -> Option<Arc<dyn Any + Send + Sync>> {
         Some(self.obj.clone())
     }

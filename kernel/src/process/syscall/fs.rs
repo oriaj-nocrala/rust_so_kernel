@@ -1512,6 +1512,43 @@ pub(super) fn sys_lseek(fd: i32, offset: i64, whence: i32) -> SyscallResult {
     })
 }
 
+// ── pread64(17), pwrite64(18) ─────────────────────────────────────────────
+
+/// pread64(17) / pwrite64(18): `count` bytes at `offset` of `fd`, its position unchanged (`FileHandle::read_at`/`write_at`).
+/// `ESPIPE` on a pipe, socket or device (no position), `EINVAL` for a negative offset. They never block: the handles with a
+/// position (files, memfd) do not.
+pub(super) fn sys_pread64(fd: i32, buf: usize, count: usize, offset: i64) -> SyscallResult {
+    pio(fd, buf, count, offset, false)
+}
+
+pub(super) fn sys_pwrite64(fd: i32, buf: usize, count: usize, offset: i64) -> SyscallResult {
+    pio(fd, buf, count, offset, true)
+}
+
+fn pio(fd: i32, buf: usize, count: usize, offset: i64, write: bool) -> SyscallResult {
+    use crate::process::file::FileError as E;
+    if fd < 0 || fd as usize >= crate::process::file::MAX_FILES { return errno::EBADF; }
+    if offset < 0 { return errno::EINVAL; }
+    if count == 0 { return 0; }
+    if let Err(e) = validate_user_buffer(buf as u64, count) { return e; }
+    with_files(|files| {
+        let Ok(file) = files.get_mut(fd as usize) else { return errno::EBADF };
+        let r = if write {
+            file.write_at(offset as u64, unsafe { core::slice::from_raw_parts(buf as *const u8, count) })
+        } else {
+            file.read_at(offset as u64, unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, count) })
+        };
+        match r {
+            Ok(n) => n as i64,
+            Err(E::NotSupported) => errno::ESPIPE,
+            Err(E::NoSpace) => errno::ENOSPC,
+            Err(E::BadFileDescriptor) => errno::EBADF,
+            Err(E::IOError) => errno::EIO,
+            Err(_) => errno::EINVAL,
+        }
+    })
+}
+
 // ── brk(12) ────────────────────────────────────────────────────────────────
 
 /// brk(12): int brk(void *addr)

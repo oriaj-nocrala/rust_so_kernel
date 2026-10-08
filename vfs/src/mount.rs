@@ -248,6 +248,10 @@ impl MountTable {
 
     /// Create a new directory at `path`.
     pub fn mkdir(&self, path: &str) -> Result<(), Errno> {
+        // the root always exists (Linux says EEXIST; `mkdir -p` relies on it)
+        if path.trim_end_matches('/').is_empty() && path.starts_with('/') {
+            return Err(Errno::EEXIST);
+        }
         let (dir_path, leaf) = split_parent(path)?;
         self.resolve(dir_path)?.mkdir(leaf)?;
         Ok(())
@@ -926,6 +930,15 @@ mod tests {
         table.mkdir("/sub").expect("mkdir");
         let child = root.children.lock().get("sub").cloned().expect("sub exists");
         assert_eq!(child.file_type(), FileType::Directory);
+    }
+
+    #[test]
+    fn mkdir_of_the_root_is_eexist() {
+        let table = MountTable::new();
+        mount_root_with(&table, TestDir::new());
+        assert_eq!(table.mkdir("/"), Err(Errno::EEXIST));
+        assert_eq!(table.mkdir("//"), Err(Errno::EEXIST));
+        assert_eq!(table.mkdir(""), Err(Errno::EINVAL), "an empty path is not the root");
     }
 
     #[test]

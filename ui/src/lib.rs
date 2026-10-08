@@ -119,9 +119,9 @@ pub enum Widget<'a> {
     Column(Vec<(Size, Widget<'a>)>),
     /// Children left to right.
     Row(Vec<(Size, Widget<'a>)>),
-    /// Two children side by side with a handle between them the user drags; `at` is the first one's starting width and `min` the
-    /// least either may get (logical pixels).
-    Split { id: Id, first: Box<Widget<'a>>, second: Box<Widget<'a>>, at: i32, min: i32 },
+    /// Two children side by side (`vertical`: one above the other) with a handle between them the user drags; `at` is the first
+    /// one's starting width (height) and `min` the least either may get (logical pixels).
+    Split { id: Id, first: Box<Widget<'a>>, second: Box<Widget<'a>>, at: i32, min: i32, vertical: bool },
     /// Its child at the height it asks for, scrolled by the wheel.
     Scroll { id: Id, child: Box<Widget<'a>> },
     /// A named group (an inspector, a toolbar): a node in the semantic tree, nothing on the screen.
@@ -141,7 +141,11 @@ impl<'a> Widget<'a> {
         Widget::Field { id, label, placeholder }
     }
     pub fn split(id: Id, first: Widget<'a>, second: Widget<'a>, at: i32, min: i32) -> Self {
-        Widget::Split { id, first: Box::new(first), second: Box::new(second), at, min }
+        Widget::Split { id, first: Box::new(first), second: Box::new(second), at, min, vertical: false }
+    }
+    /// [`Widget::split`] one above the other.
+    pub fn vsplit(id: Id, first: Widget<'a>, second: Widget<'a>, at: i32, min: i32) -> Self {
+        Widget::Split { id, first: Box::new(first), second: Box::new(second), at, min, vertical: true }
     }
     pub fn scroll(id: Id, child: Widget<'a>) -> Self {
         Widget::Scroll { id, child: Box::new(child) }
@@ -233,7 +237,7 @@ enum Kind {
     Field,
     List { len: usize, row_h: i32, head_h: i32, first_cell: bool },
     /// The handle; the split's whole box is `rect`.
-    Split { handle: Rect, min: i32 },
+    Split { handle: Rect, min: i32, vertical: bool },
     Scroll { content_h: i32 },
     Other,
 }
@@ -353,9 +357,10 @@ impl State {
                 self.pointer = (x, y);
                 if let Some((id, off)) = self.drag {
                     if let Some(p) = placed.iter().find(|p| p.id == id) {
-                        if let Kind::Split { handle, min } = p.kind {
-                            let max = (p.rect.w - handle.w - min).max(min);
-                            self.splits.insert(id, (x - off - p.rect.x).clamp(min, max));
+                        if let Kind::Split { handle, min, vertical } = p.kind {
+                            let (len, hw, at) = if vertical { (p.rect.h, handle.h, y - p.rect.y) } else { (p.rect.w, handle.w, x - p.rect.x) };
+                            let max = (len - hw - min).max(min);
+                            self.splits.insert(id, (at - off).clamp(min, max));
                         }
                     }
                 }
@@ -402,9 +407,9 @@ impl State {
         // the topmost (last placed) widget under the pointer that takes clicks
         let Some(p) = placed.iter().rev().find(|p| hit(p, pt) && !matches!(p.kind, Kind::Other | Kind::Scroll { .. })) else { return };
         match p.kind {
-            Kind::Split { handle, .. } => {
+            Kind::Split { handle, vertical, .. } => {
                 if handle.contains(pt.0, pt.1) {
-                    self.drag = Some((p.id, pt.0 - handle.x));
+                    self.drag = Some((p.id, if vertical { pt.1 - handle.y } else { pt.0 - handle.x }));
                 }
             }
             Kind::Button => {
@@ -734,9 +739,13 @@ impl<'s, 'm, 'a> Cx<'s, 'm, 'a> {
                 let (cw, ch) = self.pref(c);
                 (aw + if let Size::Fixed(n) = sz { self.px(*n) } else { cw }, ah.max(ch))
             }),
-            Widget::Split { first, second, .. } => {
+            Widget::Split { first, second, vertical, .. } => {
                 let (a, b) = (self.pref(first), self.pref(second));
-                (a.0 + b.0 + self.px(5), a.1.max(b.1))
+                if *vertical {
+                    (a.0.max(b.0), a.1 + b.1 + self.px(5))
+                } else {
+                    (a.0 + b.0 + self.px(5), a.1.max(b.1))
+                }
             }
             Widget::Scroll { child, .. } | Widget::Pane { child, .. } => self.pref(child),
             Widget::Space => (0, 0),
@@ -869,20 +878,25 @@ impl<'s, 'm, 'a> Cx<'s, 'm, 'a> {
                     x += w;
                 }
             }
-            Widget::Split { id, first, second, at, min } => {
+            Widget::Split { id, first, second, at, min, vertical } => {
                 let hw = self.px(5);
                 let min = self.px(*min);
-                let max = (r.w - hw - min).max(min);
+                let len = if *vertical { r.h } else { r.w };
+                let max = (len - hw - min).max(min);
                 let a = self.st.splits.get(id).copied().unwrap_or(self.px(*at)).clamp(min, max);
-                let handle = Rect::new(r.x + a, r.y, hw, r.h);
-                self.placed.push(Placed { id: *id, rect: r, clip, kind: Kind::Split { handle, min } });
-                self.walk(first, Rect::new(r.x, r.y, a, r.h), clip, parent);
+                let (handle, one, two) = if *vertical {
+                    (Rect::new(r.x, r.y + a, r.w, hw), Rect::new(r.x, r.y, r.w, a), Rect::new(r.x, r.y + a + hw, r.w, r.h - a - hw))
+                } else {
+                    (Rect::new(r.x + a, r.y, hw, r.h), Rect::new(r.x, r.y, a, r.h), Rect::new(r.x + a + hw, r.y, r.w - a - hw, r.h))
+                };
+                self.placed.push(Placed { id: *id, rect: r, clip, kind: Kind::Split { handle, min, vertical: *vertical } });
+                self.walk(first, one, clip, parent);
                 self.set_clip(intersect(handle, clip));
                 self.fill(handle, st_w.splitter);
                 if let Some(n) = self.node(*id, parent, Role::Splitter, handle) {
                     n.value = alloc::format!("{}", a);
                 }
-                self.walk(second, Rect::new(r.x + a + hw, r.y, r.w - a - hw, r.h), clip, parent);
+                self.walk(second, two, clip, parent);
             }
             Widget::Scroll { id, child } => {
                 let ch = self.pref(child).1.max(r.h);

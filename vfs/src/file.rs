@@ -278,6 +278,26 @@ pub trait FileHandle: Send {
         Err(FileError::NotSupported)
     }
 
+    /// `pread`: up to `buf.len()` bytes from `offset`, the position left where it was. The default seeks there, reads and seeks back
+    /// (the caller holds the fd-table lock, so threads sharing the table never see the moved position; another process holding a dup
+    /// of the same open file could, during the call): enough for any handle with `seek`. `NotSupported` (`ESPIPE`) without one.
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> FileResult<usize> {
+        let at = self.seek(0, 1)?;
+        self.seek(offset as i64, 0)?;
+        let r = self.read(buf);
+        self.seek(at, 0)?;
+        r
+    }
+
+    /// `pwrite`: `read_at`'s twin.
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> FileResult<usize> {
+        let at = self.seek(0, 1)?;
+        self.seek(offset as i64, 0)?;
+        let r = self.write(buf);
+        self.seek(at, 0)?;
+        r
+    }
+
     /// The kernel event queue that feeds this handle, for `poll(2)`.
     ///
     /// `poll` cannot ask a handle whether it is readable at wakeup time:
@@ -323,6 +343,64 @@ pub trait FileHandle: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A seekable file in memory: what the default `read_at`/`write_at` need.
+    struct Mem {
+        data: alloc::vec::Vec<u8>,
+        pos: usize,
+    }
+
+    impl FileHandle for Mem {
+        fn read(&mut self, buf: &mut [u8]) -> FileResult<usize> {
+            let n = buf.len().min(self.data.len().saturating_sub(self.pos));
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+        fn write(&mut self, buf: &[u8]) -> FileResult<usize> {
+            if self.data.len() < self.pos + buf.len() {
+                self.data.resize(self.pos + buf.len(), 0);
+            }
+            self.data[self.pos..self.pos + buf.len()].copy_from_slice(buf);
+            self.pos += buf.len();
+            Ok(buf.len())
+        }
+        fn seek(&mut self, offset: i64, whence: i32) -> FileResult<i64> {
+            let new = compute_seek(self.pos as i64, self.data.len() as i64, offset, whence)?;
+            self.pos = new as usize;
+            Ok(new)
+        }
+    }
+
+    /// No position: a pipe or a device.
+    struct Stream;
+
+    impl FileHandle for Stream {
+        fn read(&mut self, _: &mut [u8]) -> FileResult<usize> {
+            Ok(0)
+        }
+        fn write(&mut self, b: &[u8]) -> FileResult<usize> {
+            Ok(b.len())
+        }
+    }
+
+    #[test]
+    fn read_at_and_write_at_leave_the_position() {
+        let mut f = Mem { data: b"hello world".to_vec(), pos: 3 };
+        let mut buf = [0u8; 5];
+        assert_eq!(f.read_at(6, &mut buf), Ok(5));
+        assert_eq!(&buf, b"world");
+        assert_eq!(f.pos, 3);
+        assert_eq!(f.write_at(0, b"J"), Ok(1));
+        assert_eq!(f.write_at(11, b"!"), Ok(1), "past the end grows the file");
+        assert_eq!(&f.data, b"Jello world!");
+        assert_eq!(f.pos, 3);
+        // a plain read still goes on from the position
+        assert_eq!(f.read(&mut buf[..2]), Ok(2));
+        assert_eq!(&buf[..2], b"lo");
+        assert_eq!(Stream.read_at(0, &mut buf), Err(FileError::NotSupported));
+        assert_eq!(Stream.write_at(0, b"x"), Err(FileError::NotSupported));
+    }
 
     // ── compute_seek ─────────────────────────────────────────────────────
 

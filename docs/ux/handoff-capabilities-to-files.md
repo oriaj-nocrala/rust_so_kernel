@@ -1,6 +1,6 @@
 # Handoff: from capabilities to the file manager (v1)
 
-Status: **stages 1-7 done** (openat2, NX, rights on fds, capability mode, `cap-exec` + `execveat`, the std GUI client `gui-client` + `STD_PROGRAMS`, the `ui` widgets + the semantic tree with AccessKit's schema mirrored in `gui::semantic`; 2026-10-08); next: stage 8 (Files v1; the wheel is not in the protocol yet). Written 2026-10-08. For a fresh agent session: everything needed is
+Status: **all stages done** (2026-10-08): openat2, NX, rights on fds, capability mode, `cap-exec` + `execveat`, the std GUI client `gui-client` + `STD_PROGRAMS`, the `ui` widgets + the semantic tree (AccessKit's schema mirrored in `gui::semantic`), Files v1 with sandboxed previews (and `pread64`/`pwrite64`, which the provider needed). Left over: wheel events (the input drivers read none), `umask` (no syscall, no mlibc sysdep: BusyBox `mkdir -p` complains). Written 2026-10-08. For a fresh agent session: everything needed is
 here or linked. Work stage by stage; each stage ends in a commit and leaves everything that
 worked still working. Estimates are guesses in sessions (one long working session each).
 

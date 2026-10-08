@@ -93,6 +93,25 @@
 #   U4. A click on the button (its bounds from the tree) is a click; a
 #       double click on a row opens it.
 #   U5. Esc ends ui-demo with exit(0); the console comes back.
+#
+#   scripts/gui-e2e.sh files    # Files v1 (stage 8)
+#
+# `files` mode runs `compositor term`, moves term below where Files will
+# be, makes /tmp/f (a PNG and two text files) and /tmp/g (two PNGs) and
+# starts `files` from term (its log on the console):
+#   F1. The list shows the folder's entries by name (the tree), the first
+#       row's text preview reaches the inspector (its lines in the tree).
+#   F2. Down: the PNG's preview (an Image node, its pixels on screen);
+#       the list did not move (the layout is the folder's, P2.3).
+#   F3. Backspace goes up with the folder selected, Enter goes back in;
+#       the path bar takes /tmp/g, a folder of pictures: layout bottom
+#       (the inspector under the list); Space toggles the full preview.
+#   F4. Enter on a PNG opens it with imgview (/mnt/etc/gui/open).
+#   F5. A provider killed mid-preview (FILES_PREVIEW_TEST=sleep) is
+#       reported (SIGKILL) and the app still answers keys; a provider
+#       that hangs is stopped at the timeout and said so.
+#   F6. A provider that tries to open another file is refused ECAPMODE
+#       (errno 135) and /proc/capdenials says so; its preview still works.
 # Exit status: number of failed checks.
 set -u
 MODE=${1:-demo}
@@ -130,6 +149,45 @@ im = Image.open('$1').convert('RGB'); want = tuple(int(v) for v in '$2'.split(',
 print('yes' if any(im.getpixel((x, y)) == want for y in range($4, $6) for x in range($3, $5)) else 'no')"
 }
 shot() { $Q screendump "$OUT/$1.png" >/dev/null; echo "$OUT/$1.png"; }
+
+# Pointer and semantic-tree helpers (modes ui, files). The pointer starts at the centre and moves 1:1.
+PX=640; PY=400
+mv() { $Q mouse-move $(($1 - PX)) $(($2 - PY)) >/dev/null; PX=$1; PY=$2; sleep 0.3; }
+clk() { mv "$1" "$2"; $Q mouse-button 1 >/dev/null; $Q mouse-button 0 >/dev/null; sleep 0.5; }
+TERMBAR=; APPBAR=; APPWIN=          # "x y" of term's and the app's title bars, the app window's title
+n=0
+in_term() { # in_term <command>: clicks term's title bar and types the command there
+    # shellcheck disable=SC2086
+    clk $TERMBAR; $Q send "$1" && $Q enter
+}
+tree() { # tree: runs gui-tree in term, prints its lines (each prefixed "T<n> " on the serial log), gives the app the keyboard back
+    n=$((n + 1))
+    # to a file first: the compositor's "client gone" when gui-tree exits would interleave with lines piped to the console
+    in_term "gui-tree > /tmp/t$n; sed 's/^/T$n /' /tmp/t$n > /dev/console; echo T$n-DONE > /dev/console"
+    $Q wait-for "T$n-DONE" 45 >/dev/null || echo "  (gui-tree $n did not finish)" >&2
+    sleep 1                         # the log file may lag the match
+    grep -a "T$n " "$STATE/serial.log" | sed "s/.*T$n //" > "$OUT/tree.last"
+    cat "$OUT/tree.last"
+    # the app's title bar, where gui-tree says its newest window is (windows cascade, so it moves from launch to launch)
+    local at; at=$(grep "^window [0-9]* \"$APPWIN\" at " "$OUT/tree.last" | tail -1 | grep -o ' at [0-9]*,[0-9]*' | tr -d ' at' | tr ',' ' ')
+    if [ -n "$at" ]; then set -- $at; clk $(($1 + 150)) $(($2 - 10)); else clk $APPBAR; fi
+}
+app_focus() { tree >/dev/null; }    # gives the app the keyboard wherever its window is
+node() { grep -m1 -- "$1"; }        # node <pattern> < tree
+scr() { # scr <tree file> <node pattern> -> "cx cy right-20" of that node on the screen ($APPWIN's content origin + its @x,y wxh)
+    python3 - "$1" "$2" "$APPWIN" <<'PY'
+import re, sys
+lines = open(sys.argv[1]).read().splitlines()
+win = next(l for l in lines if l.startswith('window ') and '"%s"' % sys.argv[3] in l)
+wx, wy = map(int, re.search(r' at (-?\d+),(-?\d+) ', win).groups())
+l = next(l for l in lines if re.search(sys.argv[2], l))
+x, y, w, h = map(int, re.search(r'@(-?\d+),(-?\d+) (\d+)x(\d+)', l).groups())
+print(wx + x + w // 2, wy + y + h // 2, wx + x + w - 20)
+PY
+}
+box() { # box <tree file> <node pattern> -> "x y w h" as the tree has it
+    grep -m1 -- "$2" "$1" | grep -o '@[-0-9]*,[-0-9]* [0-9]*x[0-9]*' | tr '@,x' '   '
+}
 
 # What the look (Luna, the default) paints where nothing covers it, from the same code the compositor runs (gui/examples/theme_px.rs):
 # the desktop at a point, a focused / unfocused title bar at a point (its window's frame at fx,fy), the taskbar's strip.
@@ -409,32 +467,7 @@ if [ "$MODE" = std ]; then
 fi
 
 if [ "$MODE" = ui ]; then
-    PX=640; PY=400                      # the pointer starts at the centre; moves are 1:1
-    mv() { $Q mouse-move $(($1 - PX)) $(($2 - PY)) >/dev/null; PX=$1; PY=$2; sleep 0.3; }
-    clk() { mv "$1" "$2"; $Q mouse-button 1 >/dev/null; $Q mouse-button 0 >/dev/null; sleep 0.5; }
-    n=0
-    tree() { # tree: runs gui-tree in term, prints its lines (each prefixed "T<n> " on the serial log)
-        n=$((n + 1))
-        clk 700 468                     # term's title bar (moved below ui-demo's window)
-        # to a file first: the compositor's "client gone" when gui-tree exits would interleave with lines piped to the console
-        $Q send "gui-tree > /tmp/t$n; sed 's/^/T$n /' /tmp/t$n > /dev/console; echo T$n-DONE > /dev/console" && $Q enter
-        $Q wait-for "T$n-DONE" 20 >/dev/null || echo "  (gui-tree $n did not finish)" >&2
-        grep -a "T$n " "$STATE/serial.log" | sed "s/.*T$n //"
-        clk 300 80                      # ui-demo's title bar: the keyboard back to it
-    }
-    node() { grep -m1 -- "$1"; }        # node <pattern> < tree
-    # screen box of a node line: the window's content origin + its @x,y wxh
-    scr() { # scr <tree file> <node pattern> -> "x y" of its centre on the screen
-        python3 - "$1" "$2" <<'PY'
-import re, sys
-lines = open(sys.argv[1]).read().splitlines()
-win = next(l for l in lines if l.startswith('window ') and '"ui-demo"' in l)
-wx, wy = map(int, re.search(r' at (-?\d+),(-?\d+) ', win).groups())
-l = next(l for l in lines if re.search(sys.argv[2], l))
-x, y, w, h = map(int, re.search(r'@(-?\d+),(-?\d+) (\d+)x(\d+)', l).groups())
-print(wx + x + w // 2, wy + y + h // 2, wx + x + w - 20)
-PY
-    }
+    TERMBAR="700 468"; APPBAR="300 80"; APPWIN=ui-demo
     $Q send "compositor /mnt/bin/ui-demo term" && $Q enter
     $Q wait-for "ui-demo: ready" 60 >/dev/null || bad "U1 ui-demo never got ready"
     $Q wait-for "term: 80x25" 30 >/dev/null || bad "U1 term never started"
@@ -487,6 +520,112 @@ PY
     grep -aq "KERNEL PANIC" "$STATE/serial.log" && bad "kernel panic in the log"
     $Q stop >/dev/null 2>&1
     echo "gui-e2e ui: $([ $fails = 0 ] && echo PASS || echo "FAIL ($fails)")"
+    exit $fails
+fi
+
+if [ "$MODE" = files ]; then
+    TERMBAR="400 708"; APPBAR="300 80"; APPWIN=Files
+    log() { grep -a "files: " "$STATE/serial.log"; }
+    ready_pid() { log | grep -a "files: ready" | tail -1 | grep -o "pid [0-9]*" | grep -o "[0-9]*"; }
+    # what happened after an action: `mark` before it (k and in_term do), `waitm` polls only the lines since
+    M=1
+    mark() { M=$(($(wc -l < "$STATE/serial.log") + 1)); }
+    waitm() { local i; for i in $(seq $(($2 * 2))); do tail -n +"$M" "$STATE/serial.log" | grep -aqE "$1" && return 0; sleep 0.5; done; return 1; }
+    k() { mark; $Q key "$@"; }
+    in_term() { mark; clk $TERMBAR; $Q send "$1" && $Q enter; }
+    $Q send "compositor term" && $Q enter
+    $Q wait-for "term: 80x25" 30 >/dev/null || bad "F1 term never started"
+    sleep 2
+    # term (40,40) down out of where the Files windows (cascading from 72,72, 780x490 each) will be: its title bar at y 708
+    mv 700 48; $Q mouse-button 1 >/dev/null; mv 700 400; mv 700 700; $Q mouse-button 0 >/dev/null; sleep 1
+    in_term "mkdir /tmp/f /tmp/g; cp /mnt/usr/share/icons/128x128/sample.png /tmp/f/pic.png; printf 'hola\\nmundo\\n' > /tmp/f/notes.txt; echo x > /tmp/f/zz.txt; cp /tmp/f/pic.png /tmp/g/a.png; cp /tmp/f/pic.png /tmp/g/b.png"
+    sleep 1
+    in_term "files /tmp/f > /dev/console 2>&1 &"
+    waitm "files: preview notes.txt: text, 2 lines" 90 || bad "F1 no text preview of notes.txt: $(log | tail -3)"
+    log | grep -q "files: at /tmp/f (3 items, layout right)" && ok "F1 /tmp/f: 3 items, preview on the right" || bad "F1 $(log | grep 'files: at' | tail -1)"
+    fpid=$(ready_pid)
+    clk $APPBAR
+    tree > "$OUT/t1"
+    for f in notes.txt pic.png zz.txt; do
+        grep -q "ListBoxOption#[0-9]* \"$f\"" "$OUT/t1" || bad "F1 no row $f in the tree"
+    done
+    grep -q 'ListBoxOption#[0-9]* "notes.txt" = "11 B; Text; ' "$OUT/t1" && ok "F1 the rows, with size, type and date" || bad "F1 rows: $(grep ListBoxOption "$OUT/t1" | head -3)"
+    grep -q 'Label#[0-9]* "hola"' "$OUT/t1" && grep -q 'Label#[0-9]* "mundo"' "$OUT/t1" && ok "F1 the text preview is in the inspector" || bad "F1 no text lines"
+    lb1=$(box "$OUT/t1" 'ListBox#8 "Files"')
+
+    k down
+    waitm "files: preview pic.png: image 128x128" 30 && ok "F2 Down: pic.png previewed by files-preview" || bad "F2 no image preview: $(log | tail -2)"
+    sleep 1
+    s=$(shot f2)
+    tree > "$OUT/t2"
+    read -r ix iy _ <<< "$(scr "$OUT/t2" 'Image#[0-9]* "preview"')"
+    [ -n "$ix" ] && [ "$(px "$s" "$ix" "$iy")" != "236,233,216" ] && ok "F2 the picture is on screen ($(px "$s" "$ix" "$iy") at $ix,$iy)" || bad "F2 picture: $(px "$s" "${ix:-0}" "${iy:-0}") at ${ix:-?},${iy:-?}"
+    [ "$(box "$OUT/t2" 'ListBox#8 "Files"')" = "$lb1" ] && ok "F2 the list did not move ($lb1)" || bad "F2 list moved: $lb1 -> $(box "$OUT/t2" 'ListBox#8')"
+
+    k backspace
+    waitm "files: at /tmp ." 15 && ok "F3 Backspace: up to /tmp" || bad "F3 Backspace"
+    sleep 1; k ret
+    waitm "files: at /tmp/f .3 items" 15 && [ "$(log | grep -c 'files: at /tmp/f (')" -ge 2 ] \
+        && ok "F3 Enter on the selected folder (f) goes back in" || bad "F3 Enter did not reopen /tmp/f"
+    k tab; k tab; sleep 0.5    # Up, then the path bar
+    k backspace; $Q send "g"; k ret
+    waitm "files: at /tmp/g .2 items, layout bottom." 15 && ok "F3 the path bar: /tmp/g, pictures: layout bottom" || bad "F3 $(log | grep 'files: at' | tail -1)"
+    waitm "files: preview a.png: image" 30 || bad "F3 no preview of a.png"
+    sleep 1
+    tree > "$OUT/t3"
+    read -r _ ly _ lh <<< "$(box "$OUT/t3" 'ListBox#8 "Files"')"
+    read -r _ py _ _ <<< "$(box "$OUT/t3" 'Pane#10 "Inspector"')"
+    [ -n "$py" ] && [ "$py" -ge $((ly + lh)) ] && ok "F3 the inspector is under the list" || bad "F3 list y=$ly h=$lh, inspector y=$py"
+    k spc
+    waitm "files: quick look on" 10 && ok "F3 Space: the full preview" || bad "F3 Space did nothing"
+    k spc
+    waitm "files: quick look off" 10 || bad "F3 Space again did not close it"
+
+    k ret
+    waitm "files: opened /tmp/g/a.png with imgview" 15 && ok "F4 Enter opens a PNG with imgview" || bad "F4 $(log | tail -1)"
+    waitm "imgview: /tmp/g/a.png -> 128x128" 30 && ok "F4 imgview loaded it" || bad "F4 imgview did not load it"
+    ipid=$(log | grep -o "with imgview (pid [0-9]*)" | tail -1 | grep -o "[0-9]*")
+    sleep 1
+    in_term "kill $ipid $fpid"
+    waitm "Killed PID $fpid .files" 15 || bad "F4 files (pid '$fpid') did not end on SIGTERM"
+
+    # F5: a provider that hangs (the test hook) is killed by hand, then one is stopped by the timeout
+    in_term "FILES_PREVIEW_TEST=sleep:60000 FILES_PREVIEW_TIMEOUT_MS=60000 files /tmp/f > /dev/console 2>&1 &"
+    waitm "files: preview notes.txt: files-preview started .pid" 90 || bad "F5 no provider started"
+    sleep 2
+    ppid=$(log | grep -o "notes.txt: files-preview started (pid [0-9]*)" | tail -1 | grep -o "[0-9]*")
+    fpid=$(ready_pid)
+    in_term "kill -9 $ppid"
+    waitm "files: preview notes.txt: failed: files-preview was killed by signal 9 .SIGKILL." 15 \
+        && ok "F5 a killed provider is reported (SIGKILL)" || bad "F5 $(log | tail -2)"
+    app_focus; k down
+    waitm "files: preview pic.png: files-preview started" 15 && ok "F5 the app still answers keys" || bad "F5 no answer to Down"
+    in_term "kill $fpid"
+    waitm "Killed PID $fpid .files" 15 || bad "files (pid '$fpid') did not end on SIGTERM"
+    in_term "FILES_PREVIEW_TEST=sleep:60000 FILES_PREVIEW_TIMEOUT_MS=3000 files /tmp/f > /dev/console 2>&1 &"
+    waitm "files: preview notes.txt: failed: files-preview did not answer in 3000 ms; it was stopped" 90 \
+        && ok "F5 a hung provider is stopped at the timeout" || bad "F5 no timeout: $(log | tail -2)"
+    fpid=$(ready_pid)
+    in_term "kill $fpid"
+    waitm "Killed PID $fpid .files" 15 || bad "files (pid '$fpid') did not end on SIGTERM"
+
+    # F6: the provider cannot open anything but its file
+    in_term "FILES_PREVIEW_TEST=escape files /tmp/f > /dev/console 2>&1 &"
+    waitm "files: preview notes.txt: text, 2 lines" 90 || bad "F6 no preview with the escape test"
+    log | grep -q "files: files-preview said: files-preview: escape test: open /mnt/etc/gui/apps: .*(os error 135)" \
+        && ok "F6 the provider's open of another file: ECAPMODE (135)" || bad "F6 $(log | grep 'escape test' | tail -1)"
+    in_term "sed 's/^/CAPD /' /proc/capdenials | grep gui/apps > /dev/console"
+    waitm "^CAPD [0-9]+ .*/mnt/etc/gui/apps" 10 && ok "F6 /proc/capdenials records it: $(tail -n +"$M" "$STATE/serial.log" | grep -a '^CAPD' | tail -1 | cut -c1-100)" \
+        || bad "F6 not in /proc/capdenials"
+    fpid=$(ready_pid)
+    in_term "kill $fpid"
+    waitm "Killed PID $fpid .files" 15 || bad "files (pid '$fpid') did not end on SIGTERM"
+    $Q key ctrl-alt-backspace; sleep 2
+    $Q send "echo console-is-back" && $Q enter
+    $Q wait-for "^.fb. console-is-back" 10 >/dev/null && ok "console and keyboard back" || bad "typing does not reach ash"
+    grep -aq "KERNEL PANIC" "$STATE/serial.log" && bad "kernel panic in the log"
+    $Q stop >/dev/null 2>&1
+    echo "gui-e2e files: $([ $fails = 0 ] && echo PASS || echo "FAIL ($fails)")"
     exit $fails
 fi
 

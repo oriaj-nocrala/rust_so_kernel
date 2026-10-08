@@ -253,6 +253,8 @@ pub enum SyscallNumber {
     Pause = 34,
     Poll = 7,
     Lseek = 8,
+    Pread64 = 17,
+    Pwrite64 = 18,
     Mmap = 9,
     Ftruncate = 77,
     MemfdCreate = 319,
@@ -405,6 +407,8 @@ impl SyscallNumber {
             34 => Some(Self::Pause),
             7  => Some(Self::Poll),
             8  => Some(Self::Lseek),
+            17 => Some(Self::Pread64),
+            18 => Some(Self::Pwrite64),
             9  => Some(Self::Mmap),
             77 => Some(Self::Ftruncate),
             319 => Some(Self::MemfdCreate),
@@ -731,6 +735,9 @@ fn fd_rights_needed(syscall: SyscallNumber, a: [u64; 6]) -> [(i64, vfs::rights::
         S::Sendto => one(CAP_WRITE | if a[4] != 0 { CAP_CONNECT } else { 0 }),
         S::Fstat => one(CAP_FSTAT),
         S::Lseek => one(CAP_SEEK),
+        // Capsicum's CAP_PREAD / CAP_PWRITE.
+        S::Pread64 => one(CAP_READ | CAP_SEEK),
+        S::Pwrite64 => one(CAP_WRITE | CAP_SEEK),
         S::Ftruncate => one(CAP_FTRUNCATE),
         S::Fchmod => one(CAP_FCHMOD),
         S::Ioctl => one(CAP_IOCTL),
@@ -803,7 +810,23 @@ fn capmode_gate(nr: u64, syscall: SyscallNumber, a: [u64; 6]) -> Result<(), i64>
     let refuse = |what: core::fmt::Arguments| Err(record_denial(format_args!("{:?}: {}: ECAPMODE (capability mode)", syscall, what), errno::ECAPMODE));
     match vfs::capmode::rule(nr) {
         Some(Rule::Allow) | Some(Rule::PathAt) => Ok(()),
-        Some(Rule::Deny) => refuse(format_args!("a global namespace")),
+        Some(Rule::Deny) => {
+            // The path, when the call names one (P1.1: the record says what was refused). `symlink`'s new name is its second
+            // argument; every other path call here takes it first.
+            let arg = match nr {
+                2 | 4 | 6 | 21 | 59 | 80 | 82 | 83 | 84 | 86 | 87 | 89 | 90 | 404 => Some(0),
+                88 => Some(1),
+                _ => None,
+            };
+            match arg.filter(|&i| validate_user_buffer(a[i], 1).is_ok()) {
+                Some(i) => {
+                    let raw = read_user_str(a[i] as usize);
+                    let from = if raw.starts_with('/') { "/" } else { "the cwd" };
+                    refuse(format_args!("path '{}' from {}", raw, from))
+                }
+                None => refuse(format_args!("a global namespace")),
+            }
+        }
         None => refuse(format_args!("not classified for capability mode")),
         Some(Rule::OwnPid { arg, zero_ok }) => {
             let target = a[arg] as i64;
@@ -919,6 +942,8 @@ pub fn syscall_handler(
         SyscallNumber::Pause => signal::sys_pause(),
         SyscallNumber::Poll => poll::sys_poll(arg1, arg2 as u32, arg3 as i32),
         SyscallNumber::Lseek => fs::sys_lseek(arg1 as i32, arg2 as i64, arg3 as i32),
+        SyscallNumber::Pread64 => fs::sys_pread64(arg1 as i32, arg2 as usize, arg3 as usize, arg4 as i64),
+        SyscallNumber::Pwrite64 => fs::sys_pwrite64(arg1 as i32, arg2 as usize, arg3 as usize, arg4 as i64),
         SyscallNumber::Mmap => fs::sys_mmap(arg1, arg2, arg3 as u32, arg4 as u32, arg5 as i32, arg6),
         SyscallNumber::Ftruncate => fs::sys_ftruncate(arg1 as i32, arg2 as i64),
         SyscallNumber::MemfdCreate => fs::sys_memfd_create(arg1, arg2 as u32),

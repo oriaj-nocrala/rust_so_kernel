@@ -40,7 +40,7 @@ pub fn rule(nr: u64) -> Option<Rule> {
     use Rule::*;
     Some(match nr {
         // I/O and descriptors: governed by the descriptor's rights.
-        0 | 1 | 3 | 5 | 7 | 8 | 16 | 20 | 32 | 33 | 72 | 77 | 91 | 217 | 292 => Allow,
+        0 | 1 | 3 | 5 | 7 | 8 | 16 | 17 | 18 | 20 | 32 | 33 | 72 | 77 | 91 | 217 | 292 => Allow,
         // Memory.
         9 | 10 | 11 | 12 => Allow,
         // Signals on oneself, sleeping, time.

@@ -441,3 +441,33 @@ fn splits_drag_and_scroll_areas_scroll() {
     assert_eq!(node(&f.nodes, 139).bounds.y + 16, 300, "the last line at the bottom");
     assert!(node(&f.nodes, 30).actions & action::SCROLL_DOWN == 0);
 }
+
+#[test]
+fn a_vertical_split_stacks_and_drags_up_and_down() {
+    let rows = |i: usize| Row { key: i as u64, cells: vec![format!("r{i}")] };
+    let t = Widget::vsplit(
+        SPLIT,
+        Widget::List(List { id: SIDE, name: "Top", len: 50, columns: &[], style: ListStyle::Table, row: &rows }),
+        Widget::label(LABEL, "bottom"),
+        100,
+        40,
+    );
+    let mut st = State::new(&LUNA, 1);
+    let f = st.render("v", &t, SIZE, &mut Mono);
+    assert_eq!(node(&f.nodes, SPLIT).bounds, Rect::new(0, 100, 400, 5));
+    assert_eq!(node(&f.nodes, SIDE).bounds, Rect::new(0, 0, 400, 100));
+    assert_eq!(node(&f.nodes, LABEL).bounds.y, 105);
+    drop(f);
+    for i in [Input::Motion { x: 200, y: 102 }, Input::Button { code: BTN_LEFT, pressed: true }, Input::Motion { x: 10, y: 152 }, Input::Button { code: BTN_LEFT, pressed: false }] {
+        st.handle(&t, SIZE, i, 0, &mut Mono);
+    }
+    let f = st.render("v", &t, SIZE, &mut Mono);
+    assert_eq!(node(&f.nodes, SPLIT).bounds.y, 150, "followed the pointer down, not across");
+    assert_eq!(node(&f.nodes, LABEL).bounds.y, 155);
+    drop(f);
+    for i in [Input::Motion { x: 200, y: 152 }, Input::Button { code: BTN_LEFT, pressed: true }, Input::Motion { x: 200, y: 299 }, Input::Button { code: BTN_LEFT, pressed: false }] {
+        st.handle(&t, SIZE, i, 0, &mut Mono);
+    }
+    let f = st.render("v", &t, SIZE, &mut Mono);
+    assert_eq!(node(&f.nodes, SPLIT).bounds.y, 300 - 5 - 40, "the bottom keeps its minimum");
+}

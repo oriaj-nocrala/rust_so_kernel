@@ -111,6 +111,7 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "cap_rights_test",
     "capmode_test",
     "cap_exec_test",
+    "pio_test",
     "cap-exec",
     "fdlock_test",
     "latency_bench",
@@ -170,6 +171,9 @@ const STD_PROGRAMS: &[(&str, &str)] = &[
     ("gui-client", "gui-tree"),
     // The `ui` widgets (stage 7).
     ("ui-demo", "ui-demo"),
+    // Files v1 (stage 8) and its preview provider, started through cap-exec.
+    ("files", "files"),
+    ("files", "files-preview"),
 ];
 
 /// Not built here at all — see the busybox.elf handling below, which

@@ -1,0 +1,27 @@
+[package]
+name = "files"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+edition = "2021"
+
+# Files v1 (stage 8 of docs/ux/handoff-capabilities-to-files.md, docs/gui/files-plan.md): the file manager (`files`) and its preview
+# provider (`files-preview`, started through `cap-exec` with only the file and an output memfd). The library is what both share and what
+# can be tested without a screen: entries and their types, the per-folder preview layout, the preview format (built by the provider,
+# checked by the app: the provider is untrusted), the provider's decoding, the open-with table — `cd files && cargo test`. Rust std on
+# musl, built by kernel/build.rs (`STD_PROGRAMS`). Its own workspace, like `gui`.
+[workspace]
+
+[dependencies]
+gui = { path = "../gui" }
+gui-client = { path = "../gui-client" }
+ui = { path = "../ui", features = ["render"] }
+img = { path = "../img" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+strip = true
+
+[dev-dependencies]
+# Encodes test images, a second implementation to check against (as in `img`).
+png = "0.18"

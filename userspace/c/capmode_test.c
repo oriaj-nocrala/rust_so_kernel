@@ -207,6 +207,8 @@ int main(void) {
     if (fd >= 0) sc(SYS_close, fd, 0, 0);
     log[n] = 0;
     CHECK(count_lines_with(log, child, "path '/tmp/cmout' from /") >= 1, "open(/tmp/cmout) is named");
+    CHECK(count_lines_with(log, child, "Open: path '/tmp/cmout' from /") >= 1, "open(2) itself names its path (musl's open)");
+    CHECK(count_lines_with(log, child, "Stat: path '/etc' from /") >= 1, "stat(2) names its path");
     CHECK(count_lines_with(log, child, "path 'f' from the cwd") >= 1, "openat(AT_FDCWD, f) is named");
     CHECK(count_lines_with(log, child, "'../cmout' leaves directory fd") >= 1, "the .. escape is named");
     CHECK(count_lines_with(log, child, "'abs' leaves directory fd") >= 2, "the symlink escape is named (open and fstatat)");
