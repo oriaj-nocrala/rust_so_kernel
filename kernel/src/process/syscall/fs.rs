@@ -836,7 +836,7 @@ pub(super) fn sys_fchdir(fd: i32) -> SyscallResult {
 /// dirfd (`MountTable::resolve_at`, `RESOLVE_BENEATH`; `follow`: whether the call follows a final symlink) and the call uses
 /// the canonical path that walk found, so neither `..` nor a symlink can leave the directory (`ENOTCAPABLE`). Every refusal
 /// is recorded (`syscall::record_denial`).
-fn user_path_at(dirfd: i64, ptr: usize, empty_err: i64, need: Rights, what: &str, follow: bool) -> Result<alloc::string::String, i64> {
+pub(super) fn user_path_at(dirfd: i64, ptr: usize, empty_err: i64, need: Rights, what: &str, follow: bool) -> Result<alloc::string::String, i64> {
     user_path_at_rights(dirfd, ptr, empty_err, need, what, follow).map(|(path, _)| path)
 }
 
@@ -871,7 +871,7 @@ fn user_path_at_rights(dirfd: i64, ptr: usize, empty_err: i64, need: Rights, wha
 }
 
 /// `Ok` if open descriptor `fd` holds `need` (or is not open: the caller says `EBADF`), else `ENOTCAPABLE`, logged for `what`.
-fn require_fd(fd: i64, need: Rights, what: &str) -> Result<(), i64> {
+pub(super) fn require_fd(fd: i64, need: Rights, what: &str) -> Result<(), i64> {
     if fd < 0 {
         return Ok(());
     }

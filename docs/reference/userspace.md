@@ -15,6 +15,14 @@ How to add a program or change mlibc/BusyBox: the `userspace-programs` skill. Th
 - `/proc/self/exe`, relative paths and `$PATH` candidates all go through this one path.
 - Process `name` = basename as passed (before symlinks); `exe_name` = the resolved path; `cmdline` = argv. So BusyBox applets re-executed through `/proc/self/exe` show as `exe`, as on Linux.
 - `ProgramSource::RawCode` (inline asm tests in `process/user_test_fileio.rs`) is a fallback used when no ELF exists.
+- `execveat(fd, "", AT_EMPTY_PATH)` reads the image through an open fd instead (`ExecFrom::Fd`); everything after loading is shared with `execve`.
+
+## Sandboxed programs: `cap-exec` (`userspace/c/cap-exec.c`, `/mnt/bin/cap-exec`)
+
+- **The one way** to start a service, preview provider or generated app with limited authority (P5; don't add another launcher): `cap-exec [--dir PATH[:RIGHTS]]... [--fd N[:RIGHTS]]... [--stdio-all] -- PROG [ARG]...`.
+- It opens each `--dir`, keeps each `--fd`, closes every other descriptor from 3 up, limits rights (`ro`, `rx`, `rw`, or names joined by `+`; stdio narrowed to read for 0 and write for 1-2, plus seek/fstat/ioctl/event), opens PROG (path, or found in `PATH`), enters capability mode, and runs it with `execveat(AT_EMPTY_PATH)`.
+- The program finds its descriptors in `CAPEXEC_FDS` (`3=/tmp/x 7=fd`, by number) and must use `openat(fd, relative)`: anything else is refused. Programs that open absolute paths (BusyBox `cat /x`) fail inside it, with a cause in `/proc/capdenials`, not in their own message ("Unknown error code").
+- C header for the calls and rights: `userspace/c/include/constanos_capsicum.h`. Test: `cap_exec_test`.
 
 ## Rust programs (`userspace/`, own Cargo workspace)
 
@@ -28,7 +36,7 @@ How to add a program or change mlibc/BusyBox: the `userspace-programs` skill. Th
 ## C programs (`userspace/c/`)
 
 - Compiled with clang against `sysroot/` (mlibc, built by `scripts/setup-mlibc.sh`). Linked static: `crt1.o` + `libc.a`, with `-nostdlib`.
-- Headers of our own in `userspace/c/include/`: `constanos_gfx.h`, `constanos_gui_wire.h`.
+- Headers of our own in `userspace/c/include/`: `constanos_gfx.h`, `constanos_gui_wire.h`, `constanos_capsicum.h`.
 - **Without `crtbegin.o`, `__cxa_finalize` is never called**, so `generic.cpp` has a `[[gnu::destructor]]` that calls it. It is what flushes stdio at `exit()` when stdout is a file or a pipe.
 
 ## BusyBox (`busybox/` submodule, `busybox-config/minimal.config`)

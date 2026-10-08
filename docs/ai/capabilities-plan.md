@@ -87,7 +87,8 @@ resource-and-effect capabilities for coding agents") but not read.
    per-syscall table in `syscall::fd_rights_needed` (`cap_rights_test`).
 4. **Done.** `cap_enter` + `ECAPMODE` on every global-namespace syscall: the audit is `vfs::capmode::rule` (table in
    `docs/reference/syscalls.md`), unclassified numbers denied; refusals in `/proc/capdenials` (`capmode_test`).
-5. Launcher integration (`agentd`, compositor, `filesd`'s preview providers).
+5. Launcher integration (`agentd`, compositor, `filesd`'s preview providers). **The launcher exists**: `cap-exec`
+   (`docs/reference/userspace.md`), started through `execveat(AT_EMPTY_PATH)` (`CAP_FEXECVE`); the integrations are not done.
 6. IOMMU: per-device DMA domains, before the first userland driver that does DMA
    (`docs/drivers/roadmap.md` phase 4).
 

@@ -39,7 +39,8 @@ typedef uint64_t cap_rights_t;
 #define CAP_GETSOCKOPT      (1ull << 28)
 #define CAP_SETSOCKOPT      (1ull << 29)
 #define CAP_PDKILL          (1ull << 30)
-#define CAP_ALL             ((1ull << 31) - 1)
+#define CAP_FEXECVE         (1ull << 31)
+#define CAP_ALL             ((1ull << 32) - 1)
 
 // Errors (outside Linux's range, which ends at 133).
 #define ENOTCAPABLE 134

@@ -53,18 +53,20 @@ pub const CAP_GETSOCKOPT: Rights = 1 << 28;
 pub const CAP_SETSOCKOPT: Rights = 1 << 29;
 /// `pidfd_send_signal`.
 pub const CAP_PDKILL: Rights = 1 << 30;
+/// `execveat(fd, "", AT_EMPTY_PATH)` (`fexecve`): run the file; through a dirfd, run a file beneath it.
+pub const CAP_FEXECVE: Rights = 1 << 31;
 
 /// Every right: what a freshly opened descriptor has.
-pub const CAP_ALL: Rights = (1 << 31) - 1;
+pub const CAP_ALL: Rights = (1 << 32) - 1;
 
 /// The names, for the denial message and `/proc` (P1.1: say which right was missing).
-const NAMES: [&str; 31] = [
+const NAMES: [&str; 32] = [
     "CAP_READ", "CAP_WRITE", "CAP_SEEK", "CAP_MMAP", "CAP_FSTAT", "CAP_FTRUNCATE", "CAP_FCHMOD",
     "CAP_FUTIMES", "CAP_IOCTL", "CAP_FCNTL", "CAP_EVENT", "CAP_LOOKUP", "CAP_FCHDIR", "CAP_CREATE",
     "CAP_MKDIRAT", "CAP_SYMLINKAT", "CAP_UNLINKAT", "CAP_RENAMEAT_SOURCE", "CAP_RENAMEAT_TARGET",
     "CAP_LINKAT_SOURCE", "CAP_LINKAT_TARGET", "CAP_ACCEPT", "CAP_CONNECT", "CAP_BIND", "CAP_LISTEN",
     "CAP_SHUTDOWN", "CAP_GETPEERNAME", "CAP_GETSOCKNAME", "CAP_GETSOCKOPT", "CAP_SETSOCKOPT",
-    "CAP_PDKILL",
+    "CAP_PDKILL", "CAP_FEXECVE",
 ];
 
 /// Linux has no such error; this kernel's number, outside Linux's range (which ends at 133).
@@ -174,7 +176,7 @@ mod tests {
         assert_eq!(first_missing(0, CAP_PDKILL | CAP_ACCEPT), Some("CAP_ACCEPT"));
         assert_eq!(first_missing(0, CAP_PDKILL), Some("CAP_PDKILL"));
         // Every bit in CAP_ALL has a name.
-        for bit in 0..31 {
+        for bit in 0..32 {
             assert!(first_missing(0, 1 << bit).is_some(), "bit {bit}");
         }
     }

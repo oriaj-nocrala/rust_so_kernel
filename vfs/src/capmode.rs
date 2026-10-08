@@ -61,14 +61,15 @@ pub fn rule(nr: u64) -> Option<Rule> {
         400 | 401 | 402 | 405 | 406 | 407 | 408 => Allow,
         // Paths from `/` or the cwd.
         2 | 4 | 6 | 21 | 79 | 80 | 82 | 83 | 84 | 86 | 87 | 88 | 89 | 90 | 404 => Deny,
-        // exec by path (a program to run must be given as a descriptor; none is supported yet).
+        // exec by path; a program is run from a descriptor instead (`execveat`, below).
         59 => Deny,
         // Addresses: connect and bind by name.
         42 | 49 => Deny,
         // Ids, reboot, the kernel's debug switches, a pidfd by pid.
         105 | 106 | 113 | 114 | 116 | 117 | 119 | 122 | 123 | 169 | 403 | 434 => Deny,
         // The `*at` family.
-        257 | 258 | 262 | 263 | 264 | 265 | 266 | 267 | 268 | 269 | 280 | 316 | 332 | 437 | 439 | 452 => PathAt,
+        // `execveat` too: `AT_EMPTY_PATH` runs the descriptor itself (`fexecve`), a relative path a file beneath it.
+        257 | 258 | 262 | 263 | 264 | 265 | 266 | 267 | 268 | 269 | 280 | 316 | 322 | 332 | 437 | 439 | 452 => PathAt,
         // Another process.
         62 | 200 | 234 => OwnPid { arg: 0, zero_ok: false },
         109 | 121 | 124 | 204 => OwnPid { arg: 0, zero_ok: true },
@@ -135,7 +136,7 @@ mod tests {
 
     #[test]
     fn the_at_family_is_path_at() {
-        for nr in [257, 258, 262, 263, 264, 265, 266, 267, 268, 269, 280, 316, 332, 437, 439, 452] {
+        for nr in [257, 258, 262, 263, 264, 265, 266, 267, 268, 269, 280, 316, 322, 332, 437, 439, 452] {
             assert_eq!(rule(nr), Some(Rule::PathAt), "nr {nr}");
         }
     }

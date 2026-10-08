@@ -822,6 +822,92 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
         Ok(s) => s,
         Err(_) => return errno::EINVAL,
     };
+    exec_from(ExecFrom::Path(name), argv_ptr, envp_ptr)
+}
+
+/// Where `exec_from` gets the program.
+enum ExecFrom<'a> {
+    /// A path as the caller named it (`execve`), resolved against the cwd.
+    Path(&'a str),
+    /// An open descriptor (`execveat(fd, "", AT_EMPTY_PATH)`, Linux's `fexecve`): the file it refers to, read through it.
+    Fd(i32),
+}
+
+/// execveat(322): `(dirfd, path, argv, envp, flags)`. With `AT_EMPTY_PATH` and an empty `path`, runs the file `dirfd` refers
+/// to (`fexecve`): the one way to start a program in capability mode, where every path from `/` is refused. The fd needs
+/// `CAP_FEXECVE`. Otherwise `path` is resolved like any `*at` path (`fs::user_path_at`: beneath `dirfd` in capability mode,
+/// `CAP_LOOKUP | CAP_FEXECVE` on it). `AT_SYMLINK_NOFOLLOW` refuses a final symlink (`ELOOP`).
+pub(super) fn sys_execveat(dirfd: i64, path_ptr: usize, argv_ptr: usize, envp_ptr: usize, flags: u64) -> SyscallResult {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return errno::EINVAL;
+    }
+    if let Err(e) = validate_user_buffer(path_ptr as u64, 1) {
+        return e;
+    }
+    if super::read_user_str(path_ptr).is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return errno::ENOENT;
+        }
+        if dirfd < 0 {
+            return errno::EBADF;
+        }
+        if let Err(e) = super::fs::require_fd(dirfd, vfs::rights::CAP_FEXECVE, "execveat") {
+            return e;
+        }
+        return exec_from(ExecFrom::Fd(dirfd as i32), argv_ptr, envp_ptr);
+    }
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let path = match super::fs::user_path_at(dirfd, path_ptr, errno::ENOENT, vfs::rights::CAP_FEXECVE, "execveat", follow) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if !follow && crate::fs::vfs::resolve_no_follow(&path).is_ok_and(|i| i.file_type() == crate::fs::types::FileType::Symlink) {
+        return errno::ELOOP;
+    }
+    exec_from(ExecFrom::Path(&path), argv_ptr, envp_ptr)
+}
+
+/// The whole program behind open descriptor `fd`, read from byte 0 without moving the descriptor's offset (a `dup` shares
+/// it, so it is saved and put back). The path it was opened by names it in `/proc/<pid>/exe` (`fd:<n>` if none).
+fn read_exec_fd(fd: i32) -> Result<(alloc::string::String, alloc::vec::Vec<u8>), i64> {
+    let (handle, path) = super::with_fd_table(|t| match t.get(fd as usize) {
+        Ok(h) => Ok((h.dup(), t.path(fd as usize).map(alloc::string::String::from))),
+        Err(_) => Err(errno::EBADF),
+    })
+    .unwrap_or(Err(errno::ESRCH))?;
+    let mut handle = handle.ok_or(errno::EACCES)?;
+    let saved = handle.seek(0, 1).map_err(|_| errno::EACCES)?; // SEEK_CUR: not a seekable file, not a program
+    handle.seek(0, 0).map_err(|_| errno::EACCES)?;
+    let mut buf = alloc::vec::Vec::new();
+    let mut chunk = [0u8; 8192];
+    let result = loop {
+        match handle.read(&mut chunk) {
+            Ok(0) => break Ok(()),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => break Err(errno::EIO),
+        }
+    };
+    let _ = handle.seek(saved, 0);
+    result?;
+    Ok((path.unwrap_or_else(|| alloc::format!("fd:{}", fd)), buf))
+}
+
+fn exec_from(from: ExecFrom, argv_ptr: usize, envp_ptr: usize) -> SyscallResult {
+    // For an fd, the program is read now (before argv/envp) so the name below is the file's path.
+    let (fd_name, fd_image) = match from {
+        ExecFrom::Fd(fd) => match read_exec_fd(fd) {
+            Ok((n, b)) => (Some(n), Some(b)),
+            Err(e) => return e,
+        },
+        ExecFrom::Path(_) => (None, None),
+    };
+    let name: &str = match (&from, &fd_name) {
+        (ExecFrom::Path(n), _) => n,
+        (ExecFrom::Fd(_), Some(n)) => n.as_str(),
+        _ => "",
+    };
 
     // Both must be read out of the caller's memory now — load_elf below
     // swaps in a fresh address space, after which argv_ptr/envp_ptr (and
@@ -858,6 +944,9 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
         }
         c.into()
     };
+    let (resolved_path, elf_owned) = if let Some(image) = fd_image {
+        (alloc::string::String::from(name), image)
+    } else {
     let resolved_path = match resolve_exec_path(name) {
         Ok(p) => p,
         Err(e) => {
@@ -885,6 +974,8 @@ pub(super) fn sys_exec(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> Sys
             }
         }
         buf
+    };
+    (resolved_path, elf_owned)
     };
 
     // Load ELF without any lock — may take time and allocates frames.
