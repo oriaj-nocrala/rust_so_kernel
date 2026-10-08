@@ -398,6 +398,14 @@ static MAX_SAME_AS: AtomicU64 = AtomicU64::new(0);
 /// Picks that skipped a Ready process because another CPU was still on
 /// its kernel stack.
 static LEAVING_SKIPS: AtomicU64 = AtomicU64::new(0);
+/// CPU 0 ticks in a row with Ready work and every CPU in its idle process
+/// (`watch_stranded_ready`), and how many times that lasted long enough to
+/// be reported.
+static STRANDED_TICKS: AtomicU64 = AtomicU64::new(0);
+static STRANDED_EPISODES: AtomicU64 = AtomicU64::new(0);
+/// 2 s at 100 Hz: an idle CPU takes Ready work at its next tick, so this is
+/// never a matter of waiting.
+const STRANDED_REPORT_TICKS: u64 = 200;
 
 /// The vector of the reschedule IPI: "you are idle and there is work".
 pub const RESCHED_VECTOR: u8 = 0xF2;
@@ -1646,6 +1654,10 @@ impl Scheduler {
             }
         }
 
+        if me == 0 {
+            self.watch_stranded_ready();
+        }
+
         let idle = self.running[me].as_ref().map_or(true, |p| p.pid.0 == 0);
         let kind = sched::cputime::classify(user_mode, idle);
         match kind {
@@ -1661,6 +1673,47 @@ impl Scheduler {
             p.times.charge(kind);
         }
         self.core.consume_quantum_on(me)
+    }
+
+    /// CPU 0's tick: Ready work while every CPU runs its idle process should
+    /// last one tick at most. Seen as a stall of the ABI suite (2026-10-07: a
+    /// forked child added to queue[5], then nothing, every CPU idle): after
+    /// `STRANDED_REPORT_TICKS` this prints, once per episode, why no CPU takes
+    /// each Ready process. Lock-free serial: this is the timer ISR.
+    fn watch_stranded_ready(&self) {
+        let stranded = self.iter_running().next().is_none() && self.core.iter_ready_desc().next().is_some();
+        if !stranded {
+            STRANDED_TICKS.store(0, Ordering::Relaxed);
+            return;
+        }
+        let n = STRANDED_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n != STRANDED_REPORT_TICKS {
+            return;
+        }
+        STRANDED_EPISODES.fetch_add(1, Ordering::Relaxed);
+        crate::serial_println_raw!("\n=== STRANDED READY: {} ticks with Ready work and every CPU idle ===", n);
+        for c in (0..MAX_CPUS).filter(|&c| is_scheduling(c)) {
+            crate::serial_println_raw!(
+                "  cpu{}: leaving={:#x} ap_busy={}",
+                c,
+                LEAVING[c].load(Ordering::Acquire),
+                crate::smp::ap_busy(c)
+            );
+        }
+        for p in self.core.iter_ready_desc().take(16) {
+            let eligible_on = (0..MAX_CPUS)
+                .filter(|&c| is_scheduling(c) && eligible(c, p))
+                .fold(0u32, |m, c| m | 1 << c);
+            crate::serial_println_raw!(
+                "  ready pid {} ({:?}, prio {}, last_cpu {}): kstack_top {:#x}, eligible on cpus {:#x}",
+                p.pid.0,
+                p.state,
+                p.effective_priority,
+                p.last_cpu,
+                p.kernel_stack.as_u64(),
+                eligible_on
+            );
+        }
     }
 
     /// This CPU is idle: is there anything Ready it may take? Not while its
@@ -1930,12 +1983,13 @@ pub fn render() -> alloc::string::String {
     let invariants = x86_64::instructions::interrupts::without_interrupts(|| local_scheduler().check_invariants());
     let _ = writeln!(
         out,
-        "sched: nosmp={} max_concurrent={} max_threads_parallel={} resched_ipis={} leaving_skips={} space_frees_under_lock={} invariants={}",
+        "sched: nosmp={} max_concurrent={} max_threads_parallel={} resched_ipis={} leaving_skips={} stranded_ready={} space_frees_under_lock={} invariants={}",
         crate::smp::nosmp(),
         MAX_CONCURRENT.load(Ordering::Relaxed),
         MAX_SAME_AS.load(Ordering::Relaxed),
         RESCHED_IPIS.load(Ordering::Relaxed),
         LEAVING_SKIPS.load(Ordering::Relaxed),
+        STRANDED_EPISODES.load(Ordering::Relaxed),
         crate::debug::space_freed_under_sched(),
         match invariants { Ok(()) => alloc::string::String::from("ok"), Err(v) => alloc::format!("{:?}", v) },
     );
