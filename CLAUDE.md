@@ -29,6 +29,7 @@ cd kernel && cargo build --target x86_64-unknown-none  # the kernel crate alone
 | `linux-abi` | Making Linux/musl/Rust-std binaries run: running a std program on the kernel, testing a syscall with a raw C test proven by sabotage, the traps (opt-level-0 stack copies, IF=0, fork masking PTE bugs), what is still missing |
 | `gpu-g5` | Many GPU clients, sharing buffers/timelines between processes, the GPU lock discipline, Mesa import/export, `vk_share`, `gpu-multi.sh`, and where the WSI (layer 3) starts |
 | `kernel-drivers` | Writing or porting a driver (`hal` seams, `/dev` entries, driver tests) |
+| `release` | Publishing a downloadable image (GitHub release): built locally so it carries the Vulkan programs and firmware, checked in QEMU and VirtualBox; the first one waits for a reviewer's reply |
 
 ## Code map
 
