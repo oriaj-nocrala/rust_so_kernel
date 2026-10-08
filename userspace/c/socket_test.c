@@ -206,8 +206,11 @@ static void test_abstract(void) {
 
 static void test_errors(void) {
     printf("errors:\n");
-    check(socket(AF_INET, SOCK_STREAM, 0) < 0 && errno == EAFNOSUPPORT,
-          "socket(AF_INET) is EAFNOSUPPORT (there is no network stack)");
+    // A family the kernel does not have at all. (This used to be AF_INET,
+    // from before the network stack; AF_INET is EAFNOSUPPORT now only on a
+    // machine without a NIC, which the suite does not run on.)
+    check(socket(AF_INET6, SOCK_STREAM, 0) < 0 && errno == EAFNOSUPPORT,
+          "socket(AF_INET6) is EAFNOSUPPORT (no IPv6)");
 
     int s = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un a;

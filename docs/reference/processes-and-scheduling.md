@@ -88,6 +88,7 @@ Code: `kernel/src/process/` (`scheduler.rs`, `timer_preempt.rs`, `trapframe.rs`,
 - Children are reparented to PID 1 (`reparent_children`).
 - A zombie whose blocked parent is woken for it is reaped right there (`reap_zombie`).
 - Test: `lifecycle_test`.
+- **Open: `exitgroup_test` stalls inside the full ABI suite** (about one run in two of `scripts/run-abi-suite.sh`, after 7 tests; 4 of 4 clean run alone; the same on the tree before e0fd174). Seen 2026-10-07 with gdb (`KEEP_ALIVE=1`, monitor `gdbserver`): all four CPUs idle or polling the network, nothing runnable, so a wait that is never woken, most likely the parent's `wait4` for a process ended by `exit_group` from a thread. Not yet looked at: the process table at that moment (which PIDs are Blocked/Zombie, on what).
 
 ## CPU time (`sched::cputime`, `sched::loadavg`)
 
