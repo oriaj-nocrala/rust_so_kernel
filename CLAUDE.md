@@ -56,6 +56,7 @@ cd kernel && cargo build --target x86_64-unknown-none  # the kernel crate alone
 - They exist because **`kernel` can't run `cargo test`**: logic that can be written against plain types moves into a crate and gets host tests.
 - The pattern for those crates: **nothing blocks, and effects come back as data** (wakeups, signals, events). The kernel adapter owns the globals and does the blocking.
 - Design docs and plans (the *why* and *what next*): `docs/` (index `docs/README.md`), especially `docs/smp/smp-plan.md`, `docs/gui/gui-plan.md` and `docs/drivers/`.
+- **Anything user-facing (or whose effects a user sees) follows `docs/ux/principles.md`**: a new design doc names the principles it serves and checks for conflicts with existing plans (`docs/ux/audit-2026-10.md` shows how). Before adding a mechanism, look for the one that already exists (P5).
 
 ## Boot sequence (`kernel/src/init/mod.rs`, `init::boot`)
 

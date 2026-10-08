@@ -39,8 +39,10 @@ docs/
 │   ├── README.md             ← driver-docs index
 │   ├── architecture.md       ← where we are: the trait/seam design, today
 │   └── roadmap.md            ← where we're going: toward a Linux-class driver model
+├── gui/files-plan.md          ← the file manager, first app on the UX principles (not started)
 ├── gui/compositor-visual-plan.md ← vk_comp looks: renderer primitives → themes (Luna 2026 / 9x) → glass → icons → real 3D icons
-├── ai/                       ← handoffs, not started: `llm-as-ui-plan.md` (agent interface layer), `threejs-runtime-plan.md` (unmodified three.js on wgpu/NVK), `capabilities-plan.md` (Capsicum-style, first security model)
+├── ux/                       ← UX principles (read first for anything user-facing), backbones, idea inventory, design audit
+├── ai/                       ← direction: `software-on-demand.md` (north star), `education.md`; handoffs, not started: `llm-as-ui-plan.md` (agent interface layer), `threejs-runtime-plan.md` (unmodified three.js on wgpu/NVK), `capabilities-plan.md` (Capsicum-style, first security model)
 ├── userland/roadmap.md       ← agreed order: HTTPS client → dynamic linking → Claude Code (scope) → browser; musl-only (mlibc retired)
 ├── userland/init-plan.md     ← handoff, not started: minimal Rust PID 1 + BusyBox runit (needs mkfifo, flock)
 ├── busybox-integration.md    ← legacy: BusyBox/ash bring-up log (see note below)
