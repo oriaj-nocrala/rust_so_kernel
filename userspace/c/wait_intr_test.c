@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include "testutil.h"
 
 static int fails;
 static volatile sig_atomic_t handled;
@@ -40,17 +41,6 @@ static pid_t main_pid;
 static void check(int ok, const char *what) {
     printf("%s: %s\n", what, ok ? "PASS" : "FAIL");
     if (!ok) fails++;
-}
-
-static long now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
-}
-
-static void nap_ms(long ms) {
-    struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
-    nanosleep(&ts, NULL);
 }
 
 static void on_usr1(int sig) { (void)sig; handled++; }
@@ -87,13 +77,13 @@ struct ctx {
     int p[2];          // pipe
     int s[2];          // socketpair
     volatile int word; // futex word
-    pid_t child;       // for WAITPID: a child that exits by itself
+    pid_t child;       // for WAITPID: a child that exits once p[1] gets a byte (or closes)
 };
 
 static void setup(enum kind k, struct ctx *c) {
     memset(c, 0, sizeof *c);
     c->p[0] = c->p[1] = c->s[0] = c->s[1] = -1;
-    if (k == PIPE_READ || k == PIPE_WRITE) pipe(c->p);
+    if (k == PIPE_READ || k == PIPE_WRITE || k == WAITPID) pipe(c->p);
     if (k == PIPE_WRITE) {
         static char fill[4096];
         write(c->p[1], fill, sizeof fill); // full: the next write blocks
@@ -102,7 +92,8 @@ static void setup(enum kind k, struct ctx *c) {
     if (k == SOCK_READ || k == POLL) socketpair(AF_UNIX, SOCK_STREAM, 0, c->s);
     if (k == WAITPID) {
         c->child = fork();
-        if (c->child == 0) { nap_ms(400); _exit(7); }
+        // Exits when its parent completes the wait, or dies (EOF): never by a timer.
+        if (c->child == 0) { char b; close(c->p[1]); read(c->p[0], &b, 1); _exit(7); }
     }
 }
 
@@ -151,7 +142,8 @@ static void complete(enum kind k, struct ctx *c) {
     case PIPE_WRITE: read(c->p[0], tmp, sizeof tmp); break;
     case FUTEX: c->word = 1; raw_futex(&c->word, 1 /* WAKE */, 1); break;
     case SOCK_READ: write(c->s[1], "\x2a", 1); break;
-    default: break; // WAITPID: the child exits by itself
+    case WAITPID: write(c->p[1], "x", 1); break;
+    default: break;
     }
 }
 static const long kind_result[] = { 0, 42, 1, 0, 7, 1, 42 };
@@ -167,28 +159,34 @@ static void case_a(enum kind k) {
         do_wait(k, &c);
         _exit(0);
     }
-    nap_ms(150);
-    long t0 = now_ms();
+    int blocked = tu_wait_blocked(pid, 2000);
+    long t0 = tu_now_ms();
     kill(pid, SIGKILL);
     int st = 0;
     waitpid(pid, &st, 0);
-    long waited = now_ms() - t0;
+    long waited = tu_now_ms() - t0;
     char what[64];
     snprintf(what, sizeof what, "A %s: SIGKILL ends it (%ldms)", kind_name[k], waited);
-    check(WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL && waited < 500, what);
+    check(blocked && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL && waited < 500, what);
 }
 
 // ── B and C: a handler, with and without SA_RESTART ─────────────────────
 // A helper thread (so futex has someone in its address space) sends
-// SIGUSR1 at 100 ms and completes the wait at 250 ms.
+// SIGUSR1 once the main thread is blocked, waits for the handler to have
+// run, then completes the wait once the main thread is blocked again (in the
+// restarted call, or in pthread_join after an EINTR, where completing is
+// harmless). Waiting for the handler first means a kernel that held the
+// signal back until the call returned fails (the wait is never completed,
+// so the helper gives up after 2 s and the result is wrong).
 
-struct helper { pid_t target; enum kind k; struct ctx *c; };
+struct helper { pid_t target; enum kind k; struct ctx *c; int blocked; };
 
 static void *helper_main(void *arg) {
     struct helper *h = arg;
-    nap_ms(100);
+    h->blocked = tu_wait_blocked(h->target, 2000);
     kill(h->target, SIGUSR1);
-    nap_ms(150);
+    for (long end = tu_now_ms() + 2000; !handled && tu_now_ms() < end;) tu_nap_ms(1);
+    tu_wait_blocked(h->target, 2000);
     complete(h->k, h->c);
     return NULL;
 }
@@ -198,17 +196,17 @@ static void case_bc(enum kind k, int restart) {
     setup(k, &c);
     install(SIGUSR1, on_usr1, restart ? SA_RESTART : 0);
     handled = 0;
-    struct helper h = { getpid(), k, &c };
+    struct helper h = { getpid(), k, &c, 0 };
     pthread_t t;
     pthread_create(&t, NULL, helper_main, &h);
-    long t0 = now_ms();
+    long t0 = tu_now_ms();
     long r = do_wait(k, &c);
-    long waited = now_ms() - t0;
+    long waited = tu_now_ms() - t0;
     pthread_join(t, NULL);
     int expect_restart = restart && kind_restarts[k];
-    int ok = handled == 1;
-    if (expect_restart) ok &= r == kind_result[k] && waited >= 200;
-    else ok &= r == -EINTR && waited < 240;
+    int ok = h.blocked && handled == 1;
+    if (expect_restart) ok &= r == kind_result[k];
+    else ok &= r == -EINTR;
     char what[96];
     snprintf(what, sizeof what, "%s %s: %s (r=%ld, %ldms)", restart ? "C" : "B", kind_name[k],
              expect_restart ? "restarted, completed" : "EINTR", r, waited);
@@ -219,8 +217,10 @@ static void case_bc(enum kind k, int restart) {
 
 // ── D: what an interruption leaves behind does nothing ─────────────────
 
-static void *usr1_at(void *arg) {
-    nap_ms((long)(intptr_t)arg);
+// Sends SIGUSR1 to the main thread once it is blocked.
+static void *usr1_when_blocked(void *arg) {
+    (void)arg;
+    tu_wait_blocked(main_pid, 2000);
     kill(main_pid, SIGUSR1);
     return NULL;
 }
@@ -234,21 +234,22 @@ static void case_d(void) {
         int p[2];
         pipe(p);
         pthread_t t;
-        pthread_create(&t, NULL, usr1_at, (void *)(intptr_t)80);
+        pthread_create(&t, NULL, usr1_when_blocked, NULL);
         char b = 0;
         long r = read(p[0], &b, 1);
         int e = errno;
         pthread_join(t, NULL);
+        // The write lands while the parent sleeps (it waits for that).
         pid_t w = fork();
-        if (w == 0) { nap_ms(100); write(p[1], "Z", 1); _exit(0); }
-        long t0 = now_ms();
-        nap_ms(300);
-        long slept = now_ms() - t0;
+        if (w == 0) { tu_wait_blocked(main_pid, 2000); write(p[1], "Z", 1); _exit(0); }
+        long t0 = tu_now_ms();
+        tu_nap_ms(100);
+        long slept = tu_now_ms() - t0;
         waitpid(w, NULL, 0);
         long r2 = read(p[0], &b, 1);
         char what[96];
         snprintf(what, sizeof what, "D1 interrupted pipe reader: bytes stay, sleep %ldms", slept);
-        check(r == -1 && e == EINTR && slept >= 290 && r2 == 1 && b == 'Z', what);
+        check(r == -1 && e == EINTR && slept >= 95 && r2 == 1 && b == 'Z', what);
         close(p[0]);
         close(p[1]);
     }
@@ -259,21 +260,22 @@ static void case_d(void) {
         int p[2];
         pipe(p);
         pthread_t t;
-        pthread_create(&t, NULL, usr1_at, (void *)(intptr_t)50);
-        struct timespec ts = { 0, 200 * 1000000L };
+        pthread_create(&t, NULL, usr1_when_blocked, NULL);
+        // Interrupted at once; its timer stays due about 100 ms from now.
+        struct timespec ts = { 0, 100 * 1000000L };
         long r = nanosleep(&ts, NULL);
         int e = errno;
         pthread_join(t, NULL);
         pid_t w = fork();
-        if (w == 0) { nap_ms(400); write(p[1], "Q", 1); _exit(0); }
-        long t0 = now_ms();
+        if (w == 0) { tu_nap_ms(200); write(p[1], "Q", 1); _exit(0); }
+        long t0 = tu_now_ms();
         char b = 0;
         long r2 = read(p[0], &b, 1);
-        long waited = now_ms() - t0;
+        long waited = tu_now_ms() - t0;
         waitpid(w, NULL, 0);
         char what[96];
         snprintf(what, sizeof what, "D2 interrupted sleep: its timer leaves the next read alone (%ldms)", waited);
-        check(r == -1 && e == EINTR && r2 == 1 && b == 'Q' && waited >= 350, what);
+        check(r == -1 && e == EINTR && r2 == 1 && b == 'Q' && waited >= 180, what);
         close(p[0]);
         close(p[1]);
     }
@@ -284,20 +286,20 @@ static void case_d(void) {
         int s[2];
         socketpair(AF_UNIX, SOCK_STREAM, 0, s);
         pthread_t t;
-        pthread_create(&t, NULL, usr1_at, (void *)(intptr_t)50);
+        pthread_create(&t, NULL, usr1_when_blocked, NULL);
         struct pollfd pf = { s[0], POLLIN, 0 };
         long r = poll(&pf, 1, -1);
         int e = errno;
         pthread_join(t, NULL);
         pid_t w = fork();
-        if (w == 0) { nap_ms(100); write(s[1], "S", 1); _exit(0); }
-        long t0 = now_ms();
-        nap_ms(300);
-        long slept = now_ms() - t0;
+        if (w == 0) { tu_wait_blocked(main_pid, 2000); write(s[1], "S", 1); _exit(0); }
+        long t0 = tu_now_ms();
+        tu_nap_ms(100);
+        long slept = tu_now_ms() - t0;
         waitpid(w, NULL, 0);
         char what[96];
         snprintf(what, sizeof what, "D3 interrupted poll: socket event leaves the next sleep alone (%ldms)", slept);
-        check(r == -1 && e == EINTR && slept >= 290, what);
+        check(r == -1 && e == EINTR && slept >= 95, what);
         close(s[0]);
         close(s[1]);
     }
@@ -310,21 +312,21 @@ static void case_e(void) {
     // E1: a sleeping child stops at once and, continued, sleeps on.
     pid_t pid = fork();
     if (pid == 0) {
-        struct timespec ts = { 0, 600 * 1000000L };
+        struct timespec ts = { 0, 200 * 1000000L };
         _exit(nanosleep(&ts, NULL) == 0 ? 0 : 1);
     }
-    nap_ms(100);
-    long t0 = now_ms();
+    int blocked = tu_wait_blocked(pid, 2000);
+    long t0 = tu_now_ms();
     kill(pid, SIGSTOP);
     int st = 0;
     int w = waitpid(pid, &st, WUNTRACED);
-    long to_stop = now_ms() - t0;
+    long to_stop = tu_now_ms() - t0;
     int stopped = w == pid && WIFSTOPPED(st);
     kill(pid, SIGCONT);
     waitpid(pid, &st, 0);
     char what[96];
     snprintf(what, sizeof what, "E1 SIGSTOP stops a sleeper at once (%ldms), SIGCONT resumes", to_stop);
-    check(stopped && to_stop < 300 && WIFEXITED(st) && WEXITSTATUS(st) == 0, what);
+    check(blocked && stopped && to_stop < 150 && WIFEXITED(st) && WEXITSTATUS(st) == 0, what);
 
     // E2: a pipe reader stopped and continued still gets its byte.
     int p[2];
@@ -335,15 +337,16 @@ static void case_e(void) {
         long r = read(p[0], &b, 1);
         _exit(r == 1 && b == 'C' ? 0 : 1);
     }
-    nap_ms(100);
+    blocked = tu_wait_blocked(pid, 2000);
     kill(pid, SIGSTOP);
     w = waitpid(pid, &st, WUNTRACED);
     stopped = w == pid && WIFSTOPPED(st);
     kill(pid, SIGCONT);
-    nap_ms(50);
+    // The byte goes to the reader once it is back in its read.
+    blocked &= tu_wait_blocked(pid, 2000);
     write(p[1], "C", 1);
     waitpid(pid, &st, 0);
-    check(stopped && WIFEXITED(st) && WEXITSTATUS(st) == 0, "E2 stopped pipe reader continues and reads");
+    check(blocked && stopped && WIFEXITED(st) && WEXITSTATUS(st) == 0, "E2 stopped pipe reader continues and reads");
     close(p[0]);
     close(p[1]);
 }
@@ -370,9 +373,11 @@ static void case_f(void) {
         pipe(p);
         pid_t w = fork();
         if (w == 0) {
-            nap_ms(100);
+            tu_wait_blocked(getppid(), 2000);
             kill(getppid(), SIGUSR2);
-            nap_ms(100);
+            // Let the handler run and the read restart before the byte.
+            tu_nap_ms(20);
+            tu_wait_blocked(getppid(), 2000);
             write(p[1], "R", 1);
             _exit(0);
         }

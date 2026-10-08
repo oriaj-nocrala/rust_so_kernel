@@ -12,6 +12,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <sys/wait.h>
+#include "testutil.h"
 
 #define printf(...) ((printf)(__VA_ARGS__), fflush(stdout))
 static int failures;
@@ -29,13 +30,14 @@ static int pidfd_open(pid_t pid, unsigned flags) { return (int)sc(434, pid, flag
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 static void ms(int n) { struct timespec ts = {n / 1000, (n % 1000) * 1000000L}; nanosleep(&ts, NULL); }
 
-// A process that ends 150 ms from now in the given way.
+// A process that ends in the given way once its parent is blocked (in the
+// epoll_wait that should see the end, or waiting for the zombie).
 enum { EXIT7, SEGV, SPIN };
 static pid_t child(int how) {
     pid_t c = fork();
     if (c == 0) {
         if (how == SPIN) for (;;) ms(50);
-        ms(150);
+        tu_wait_blocked(getppid(), 2000);
         if (how == SEGV) *(volatile int *)0x10 = 1;
         _exit(7);
     }
@@ -54,7 +56,14 @@ static int wait_readable(int pidfd, double *took) {
     return n;
 }
 
-static void *thread_fn(void *arg) { *(int *)arg = (int)sc(186, 0, 0, 0, 0); ms(300); return NULL; }
+// Publishes its tid and lives until main has tried it.
+static volatile int thread_tid, thread_done;
+static void *thread_fn(void *arg) {
+    (void)arg;
+    thread_tid = (int)sc(186, 0, 0, 0, 0);
+    while (!thread_done) ms(1);
+    return NULL;
+}
 
 int main(void) {
     double took;
@@ -68,7 +77,7 @@ int main(void) {
     struct pollfd p = { .fd = pfd, .events = POLLIN };
     CHECK(poll(&p, 1, 0) == 0, "readable while the child still runs");
     int n = wait_readable(pfd, &took);
-    CHECK(n == 1 && took >= 0.1 && took < 1.5, "epoll_wait: n=%d after %.3f s, wanted 1 after about 0.15", n, took);
+    CHECK(n == 1 && took < 1.5, "epoll_wait: n=%d after %.3f s, wanted 1 (the child exits once epoll_wait sleeps)", n, took);
     CHECK(poll(&p, 1, 0) == 1 && (p.revents & POLLIN), "poll() after the exit: revents %x", p.revents);
     CHECK(waitpid(c, &st, 0) == c && WIFEXITED(st) && WEXITSTATUS(st) == 7, "waitpid status 0x%x", st);
     CHECK(poll(&p, 1, 0) == 1, "still readable after the child was reaped");
@@ -98,11 +107,12 @@ int main(void) {
     CHECK(pidfd_open(0, 0) == -22 && pidfd_open(-5, 0) == -22, "pid 0 / negative");
     CHECK(pidfd_open(getpid(), 0x1) == -22, "an unknown flag");
     CHECK(pidfd_open(999999, 0) == -3, "a pid that does not exist gave %d, wanted -ESRCH", pidfd_open(999999, 0));
-    int tid = 0;
     pthread_t t;
-    pthread_create(&t, NULL, thread_fn, &tid);
-    ms(50);
+    pthread_create(&t, NULL, thread_fn, NULL);
+    for (double end = now() + 2; !thread_tid && now() < end;) ms(1);
+    int tid = thread_tid;
     CHECK(tid > 0 && pidfd_open(tid, 0) == -22, "a thread's tid gave %d, wanted -EINVAL (only leaders)", pidfd_open(tid, 0));
+    thread_done = 1;
     pthread_join(t, NULL);
     int self = pidfd_open(getpid(), 0);
     CHECK(self >= 0 && (poll(&(struct pollfd){ .fd = self, .events = POLLIN }, 1, 0) == 0), "a pidfd of the caller is not readable");
@@ -110,7 +120,7 @@ int main(void) {
 
     printf("an already exited (zombie) child is readable at once; dup shares the state; NONBLOCK\n");
     c = child(EXIT7);
-    ms(400);
+    tu_wait_state(c, 'Z', 2000);
     pfd = pidfd_open(c, 0x800);
     p.fd = pfd;
     CHECK(pfd >= 0 && poll(&p, 1, 0) == 1, "a zombie's pidfd is not readable at once");

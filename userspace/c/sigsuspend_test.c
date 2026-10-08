@@ -22,6 +22,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include "testutil.h"
 
 static volatile sig_atomic_t got_chld, got_usr1;
 
@@ -54,20 +55,24 @@ static int case_sigchld(void) {
     got_chld = 0;
 
     pid_t pid = fork();
-    if (pid == 0) { nap_ms(300); _exit(7); }
+    // Exits once the parent is asleep in sigsuspend.
+    if (pid == 0) { tu_wait_blocked(getppid(), 2000); _exit(7); }
 
     sigemptyset(&empty);
     long t0 = now_ms();
     int r = sigsuspend(&empty);
     int e = errno;
+    // The handler has run by the time the call returns; a sigsuspend that
+    // returned without sleeping would get here first.
+    int handled_at_return = got_chld;
     long waited = now_ms() - t0;
     sigprocmask(SIG_SETMASK, NULL, &after);
     int status = 0;
     waitpid(pid, &status, 0);
     sigprocmask(SIG_SETMASK, &old, NULL);
 
-    int ok = r == -1 && e == EINTR && got_chld == 1 && sigismember(&after, SIGCHLD)
-        && waited >= 200 && WIFEXITED(status) && WEXITSTATUS(status) == 7;
+    int ok = r == -1 && e == EINTR && handled_at_return == 1 && got_chld == 1 && sigismember(&after, SIGCHLD)
+        && WIFEXITED(status) && WEXITSTATUS(status) == 7;
     printf("A sigchld: r=%d errno=%d handler=%d mask_restored=%d waited=%ldms -> %s\n",
            r, e, (int)got_chld, sigismember(&after, SIGCHLD), waited, ok ? "PASS" : "FAIL");
     return !ok;
@@ -105,10 +110,11 @@ static int case_kill_from_child(int ignored_first) {
     pid_t parent = getpid();
     pid_t pid = fork();
     if (pid == 0) {
-        nap_ms(200);
+        tu_wait_blocked(parent, 2000);
         if (ignored_first) {
+            // Long enough for a wrong wakeup to end the sigsuspend first.
             kill(parent, SIGUSR2);
-            nap_ms(300);
+            nap_ms(50);
         }
         kill(parent, SIGUSR1);
         _exit(0);
@@ -118,12 +124,13 @@ static int case_kill_from_child(int ignored_first) {
     long t0 = now_ms();
     int r = sigsuspend(&empty);
     int e = errno;
+    int handled_at_return = got_usr1;
     long waited = now_ms() - t0;
     waitpid(pid, NULL, 0);
     sigprocmask(SIG_SETMASK, &old, NULL);
 
-    long min_wait = ignored_first ? 400 : 100;
-    int ok = r == -1 && e == EINTR && got_usr1 == 1 && waited >= min_wait;
+    long min_wait = ignored_first ? 45 : 0;
+    int ok = r == -1 && e == EINTR && handled_at_return == 1 && waited >= min_wait;
     printf("%s: r=%d errno=%d handler=%d waited=%ldms -> %s\n",
            ignored_first ? "D ignored doesn't wake" : "C kill from child",
            r, e, (int)got_usr1, waited, ok ? "PASS" : "FAIL");
@@ -134,16 +141,17 @@ static int case_pause(void) {
     got_usr1 = 0;
     pid_t pid = fork();
     if (pid == 0) {
-        nap_ms(100);
+        tu_wait_blocked(getppid(), 2000);
         kill(getppid(), SIGUSR1);
         _exit(0);
     }
     long t0 = now_ms();
     int r = pause();
     int e = errno;
+    int handled_at_return = got_usr1;
     long waited = now_ms() - t0;
     waitpid(pid, NULL, 0);
-    int ok = r == -1 && e == EINTR && got_usr1 == 1 && waited >= 50;
+    int ok = r == -1 && e == EINTR && handled_at_return == 1;
     printf("E pause: r=%d errno=%d handler=%d waited=%ldms -> %s\n",
            r, e, (int)got_usr1, waited, ok ? "PASS" : "FAIL");
     return !ok;
@@ -154,13 +162,13 @@ static int case_pause_sigkill(void) {
     if (pid == 0) {
         for (;;) pause();
     }
-    nap_ms(100);
+    int blocked = tu_wait_blocked(pid, 2000);
     long t0 = now_ms();
     kill(pid, SIGKILL);
     int st = 0;
     int w = waitpid(pid, &st, 0);
     long waited = now_ms() - t0;
-    int ok = w == pid && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL && waited < 1000;
+    int ok = blocked && w == pid && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL && waited < 1000;
     printf("F SIGKILL ends pause: waited=%ldms -> %s\n", waited, ok ? "PASS" : "FAIL");
     return !ok;
 }

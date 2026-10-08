@@ -8,9 +8,9 @@
 //      the cpuN lines of /proc/stat and the processors of /proc/cpuinfo
 //      all agree;
 //   B. /proc/stat's aggregate line is the column sum of its cpuN lines;
-//   C. spinning ~300 ms of CPU shows up in times(), getrusage(SELF),
+//   C. spinning ~150 ms of CPU shows up in times(), getrusage(SELF),
 //      clock(), CLOCK_PROCESS_CPUTIME_ID and /proc/self/stat, as user time;
-//   D. sleeping 300 ms does not;
+//   D. sleeping 100 ms does not;
 //   E. a child's time reaches cutime only once it is waited for, and a
 //      grandchild's reaches it through the child;
 //   F. a thread's time counts for the process (CLOCK_PROCESS_CPUTIME_ID,
@@ -168,7 +168,7 @@ static void case_spin(void) {
     clock_t c0 = clock();
     long long s0 = self_stat(14);
 
-    spin_ms(300);
+    spin_ms(150);
 
     times(&t1);
     getrusage(RUSAGE_SELF, &r1);
@@ -179,21 +179,21 @@ static void case_spin(void) {
     long long ru = (r1.ru_utime.tv_sec - r0.ru_utime.tv_sec) * 1000000LL + (r1.ru_utime.tv_usec - r0.ru_utime.tv_usec);
     printf("    times: +%ld user +%ld sys ticks; rusage +%lld us; cputime +%lld ms; clock +%ld us; stat +%lld\n",
            du, ds, ru, (p1 - p0) / 1000000, (long)(c1 - c0), s1 - s0);
-    check("CLOCK_PROCESS_CPUTIME_ID advanced >= 300 ms", p1 - p0 >= 300000000LL);
-    check("clock() advanced >= 300000 us", c1 - c0 >= 300000);
+    check("CLOCK_PROCESS_CPUTIME_ID advanced >= 150 ms", p1 - p0 >= 150000000LL);
+    check("clock() advanced >= 150000 us", c1 - c0 >= 150000);
     // Ticks are samples: allow a few to have landed elsewhere.
-    check("times() user >= 25 ticks", du >= 25);
+    check("times() user >= 12 ticks", du >= 12);
     check("user dominates system", du > ds);
-    check("getrusage(SELF) user >= 250 ms", ru >= 250000);
+    check("getrusage(SELF) user >= 120 ms", ru >= 120000);
     check("/proc/self/stat utime moved like times()", s1 - s0 >= du - 2 && s1 - s0 <= du + 2);
 }
 
 static void case_sleep(void) {
-    printf("D. 300 ms of sleep is not CPU time\n");
+    printf("D. 100 ms of sleep is not CPU time\n");
     struct tms t0, t1;
     long long p0 = ns_of(CLOCK_PROCESS_CPUTIME_ID);
     times(&t0);
-    nap_ms(300);
+    nap_ms(100);
     times(&t1);
     long long p1 = ns_of(CLOCK_PROCESS_CPUTIME_ID);
     printf("    cputime +%lld us, user +%ld sys +%ld ticks\n", (p1 - p0) / 1000,
@@ -212,8 +212,8 @@ static void case_children(void) {
     if (pid == 0) {
         close(fd[0]);
         pid_t g = fork();
-        if (g == 0) { spin_ms(200); _exit(0); }
-        spin_ms(200);
+        if (g == 0) { spin_ms(100); _exit(0); }
+        spin_ms(100);
         waitpid(g, NULL, 0);
         write(fd[1], "x", 1);
         _exit(0);
@@ -236,13 +236,13 @@ static void case_children(void) {
     // 40 ticks of user time if every sample lands in user mode; 30 still
     // tells the grandchild's 20 apart from the child's alone, and leaves
     // room for the ticks an emulator delivers late, inside a syscall.
-    check("child + grandchild after waitpid (>= 30 ticks)", after >= 30);
-    check("getrusage(CHILDREN) >= 300 ms", rc.ru_utime.tv_sec * 1000000L + rc.ru_utime.tv_usec >= 300000);
+    check("child + grandchild after waitpid (>= 15 ticks)", after >= 15);
+    check("getrusage(CHILDREN) >= 150 ms", rc.ru_utime.tv_sec * 1000000L + rc.ru_utime.tv_usec >= 150000);
 }
 
 static void *thread_spin(void *arg) {
     (void)arg;
-    spin_ms(200);
+    spin_ms(100);
     return NULL;
 }
 
@@ -258,9 +258,9 @@ static void case_thread(void) {
     times(&t1);
     printf("    process +%lld ms, main thread +%lld ms, times user +%ld ticks\n",
            (p1 - p0) / 1000000, (m1 - m0) / 1000000, (long)(t1.tms_utime - t0.tms_utime));
-    check("process CPU clock includes the thread (>= 200 ms)", p1 - p0 >= 200000000LL);
-    check("main thread's CPU clock does not (< 50 ms)", m1 - m0 < 50000000LL);
-    check("times() keeps the exited thread's time (>= 15 ticks)", t1.tms_utime - t0.tms_utime >= 15);
+    check("process CPU clock includes the thread (>= 100 ms)", p1 - p0 >= 100000000LL);
+    check("main thread's CPU clock does not (< 30 ms)", m1 - m0 < 30000000LL);
+    check("times() keeps the exited thread's time (>= 8 ticks)", t1.tms_utime - t0.tms_utime >= 8);
 }
 
 static void case_smp(void) {
@@ -276,7 +276,7 @@ static void case_smp(void) {
     pid_t pids[4];
     for (int i = 0; i < kids; i++) {
         pids[i] = fork();
-        if (pids[i] == 0) { spin_ms(500); _exit(0); }
+        if (pids[i] == 0) { spin_ms(250); _exit(0); }
     }
     for (int i = 0; i < kids; i++) waitpid(pids[i], NULL, 0);
     read_stat(&a1, c1);
@@ -284,15 +284,15 @@ static void case_smp(void) {
     for (int i = 0; i < lines; i++) {
         unsigned long long du = c1[i].f[0] - c0[i].f[0];
         printf("    cpu%d +%llu user\n", c1[i].id, du);
-        if (du >= 20) busy++;
+        if (du >= 10) busy++;
     }
-    check("at least two CPUs gained >= 20 user ticks", busy >= 2);
-    // Half of the ~50 ticks each child should get. The ticks are samples,
+    check("at least two CPUs gained >= 10 user ticks", busy >= 2);
+    // Half of the ~25 ticks each child should get. The ticks are samples,
     // and an emulator that cannot run every vCPU when due drops timer
     // ticks while the TSC (and so the child's measured CPU time) runs on:
     // QEMU with 24 vCPUs gave 31-39 per child, the Ryzen 48-50. How much
     // is case C's business; this case is about *where*.
-    check("aggregate user grew by >= kids*25 ticks", a1.f[0] - a0.f[0] >= (unsigned long long)kids * 25);
+    check("aggregate user grew by >= kids*12 ticks", a1.f[0] - a0.f[0] >= (unsigned long long)kids * 12);
 }
 
 static void case_clocks(void) {

@@ -32,6 +32,13 @@ fn main() {
         }
     }
 
+    // KVM when the host has it (same rule as scripts/qemu-debug.sh);
+    // QEMU_ACCEL=tcg forces the emulator.
+    let kvm = std::fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok();
+    if kvm && std::env::var("QEMU_ACCEL").as_deref() != Ok("tcg") {
+        cmd.arg("-enable-kvm");
+    }
+
     // Add some useful QEMU options
     cmd.arg("-m").arg("512M");  // 512MB RAM
     cmd.arg("-serial").arg("stdio");  // Serial output to terminal

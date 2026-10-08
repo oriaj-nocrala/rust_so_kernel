@@ -23,20 +23,21 @@ enum { WAIT_MS = 0, EXEC_SLEEP = 1, KILLED = 2 };
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 static void ms(int n) { struct timespec ts = {n / 1000, (n % 1000) * 1000000L}; nanosleep(&ts, NULL); }
 
-// clone(flags | SIGCHLD); the child does `how` and never returns. Returns the parent's view: pid, and how long clone took.
-static long spawn(long flags, int how, double *took) {
+// clone(flags | SIGCHLD); the child does `how` (after `n` ms) and never returns. Returns the parent's view: pid, and how
+// long clone took. The durations are the observable here (the parent waits for the child), so they are short, not gone.
+static long spawn(long flags, int how, int n, double *took) {
     double t0 = now();
     long pid = sc(56, flags | SIGCHLD, 0, 0, 0);
     if (pid == 0) {
-        if (how == WAIT_MS) { ms(300); _exit(5); }
+        if (how == WAIT_MS) { ms(n); _exit(5); }
         if (how == EXEC_SLEEP) {
-            ms(100);
+            ms(n);
             char *argv[] = {"busybox", "sleep", "1", NULL};
             char *envp[] = {NULL};
             execve("/bin/busybox", argv, envp);
             _exit(99);
         }
-        if (how == KILLED) { ms(200); kill(getpid(), SIGKILL); for (;;) ; }
+        if (how == KILLED) { ms(n); kill(getpid(), SIGKILL); for (;;) ; }
     }
     *took = now() - t0;
     return pid;
@@ -47,25 +48,27 @@ int main(void) {
     int st;
 
     printf("CLONE_VFORK: the parent waits for the child's exit\n");
-    long pid = spawn(CLONE_VM | CLONE_VFORK, WAIT_MS, &took);
+    long pid = spawn(CLONE_VM | CLONE_VFORK, WAIT_MS, 60, &took);
     CHECK(pid > 0, "clone returned %ld", pid);
-    CHECK(took >= 0.28 && took < 0.9, "clone took %.3f s, wanted about 0.3 (the child's lifetime)", took);
+    CHECK(took >= 0.055 && took < 0.5, "clone took %.3f s, wanted about 0.06 (the child's lifetime)", took);
     CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 5, "waitpid: the child's status 0x%x", st);
 
     printf("CLONE_VFORK: the parent is released by exec, not by exit\n");
-    pid = spawn(CLONE_VM | CLONE_VFORK, EXEC_SLEEP, &took);
+    pid = spawn(CLONE_VM | CLONE_VFORK, EXEC_SLEEP, 40, &took);
     CHECK(pid > 0, "clone returned %ld", pid);
-    CHECK(took >= 0.08 && took < 0.7, "clone took %.3f s, wanted about 0.1 (exec) and well under the exec'd sleep of 1 s", took);
-    CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0, "the exec'd child's status 0x%x", st);
+    CHECK(took >= 0.035 && took < 0.7, "clone took %.3f s, wanted about 0.04 (exec) and well under the exec'd sleep of 1 s", took);
+    // Still running the exec'd sleep: the parent was released by the exec. Killed rather than waited for.
+    kill(pid, SIGKILL);
+    CHECK(waitpid(pid, &st, 0) == pid && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL, "the exec'd child, killed during its sleep: status 0x%x", st);
 
     printf("CLONE_VFORK: the parent is released when the child is killed\n");
-    pid = spawn(CLONE_VM | CLONE_VFORK, KILLED, &took);
-    CHECK(pid > 0 && took >= 0.18 && took < 0.9, "clone took %.3f s (pid %ld), wanted about 0.2", took, pid);
+    pid = spawn(CLONE_VM | CLONE_VFORK, KILLED, 40, &took);
+    CHECK(pid > 0 && took >= 0.035 && took < 0.5, "clone took %.3f s (pid %ld), wanted about 0.04", took, pid);
     CHECK(waitpid(pid, &st, 0) == pid && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL, "status 0x%x", st);
 
     printf("without CLONE_VFORK the parent does not wait\n");
-    pid = spawn(0, WAIT_MS, &took);
-    CHECK(pid > 0 && took < 0.15, "clone took %.3f s (pid %ld), wanted about 0", took, pid);
+    pid = spawn(0, WAIT_MS, 150, &took);
+    CHECK(pid > 0 && took < 0.1, "clone took %.3f s (pid %ld), wanted about 0", took, pid);
     st = -1;
     CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 5, "a waitpid that blocks got status 0x%x, wanted exit(5)", st);
 

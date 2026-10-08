@@ -59,6 +59,9 @@
 #   QEMU_DEBUG_SMP=N         N CPUs (-smp N; default 1). The kernel starts
 #                            every AP and parks it (stage 4 of the SMP plan);
 #                            boot-matrix.sh inherits it from the environment
+#   QEMU_ACCEL=tcg           use the TCG emulator even when /dev/kvm is
+#                            usable (KVM is the default); `-d int` traces
+#                            in debug.log only exist under TCG
 #   QEMU_DEBUG_EXTRA_ARGS    extra raw qemu args, word-split
 #
 #   scripts/qemu-debug.sh gdb ["cmd" "cmd" ...]      # batch gdb against a running instance
@@ -265,6 +268,12 @@ cmd_start() {
         -display none
         -d int,guest_errors -D "$DEBUG_LOG"
     )
+    # KVM when the host has it (same rule as make-release-image.sh):
+    # QEMU_ACCEL=tcg forces the emulator, for the rare case that needs it
+    # (`-d int` traces, a CPU feature KVM's host lacks, timing-shape bugs).
+    if [ -w /dev/kvm ] && [ "${QEMU_ACCEL:-}" != tcg ]; then
+        qemu_args+=(-enable-kvm)
+    fi
     if [ -z "${QEMU_DEBUG_NO_AC97:-}" ]; then
         qemu_args+=(-audiodev "$audiodev" -device "AC97,audiodev=snd0")
     fi

@@ -93,7 +93,8 @@ int main(void) {
     long t0, m0, t1, m1;
     CHECK(ticks_now(&t0, &m0) == 0, "cannot read timer_ticks from /proc/kdebug");
     double s = now();
-    while (now() - s < 1.0) { struct timespec ts = {0, 300000}; nanosleep(&ts, NULL); }   // ~3000 early interrupts
+    // Half a second: ~50 ticks, so one tick either way is 2% against a 15% margin.
+    while (now() - s < 0.5) { struct timespec ts = {0, 300000}; nanosleep(&ts, NULL); }   // ~1500 early interrupts
     CHECK(ticks_now(&t1, &m1) == 0, "timer_ticks (second read)");
     double per_s = (double)(t1 - t0) * 1000.0 / (double)(m1 - m0);
     CHECK(per_s > 85 && per_s < 115, "%.1f ticks per second while sleeping 300 us at a time (wanted about 100)", per_s);

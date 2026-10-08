@@ -135,7 +135,13 @@ fn main() {
 
     let serial_log = out_dir.join("serial.log");
 
-    let mut child = Command::new("qemu-system-x86_64")
+    let mut qemu = Command::new("qemu-system-x86_64");
+    // KVM when the host has it (same rule as scripts/qemu-debug.sh);
+    // QEMU_ACCEL=tcg forces the emulator.
+    if kvm_usable() && std::env::var("QEMU_ACCEL").as_deref() != Ok("tcg") {
+        qemu.arg("-enable-kvm");
+    }
+    let mut child = qemu
         .arg("-drive")
         .arg(format!("if=pflash,format=raw,readonly=on,file={}", ovmf_code.display()))
         .arg("-drive")
@@ -242,4 +248,9 @@ fn find_system_ovmf() -> Option<(PathBuf, PathBuf)> {
         .iter()
         .map(|(code, vars)| (PathBuf::from(code), PathBuf::from(vars)))
         .find(|(code, vars)| code.exists() && vars.exists())
+}
+
+/// `/dev/kvm` exists and this user may open it read-write.
+fn kvm_usable() -> bool {
+    std::fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok()
 }

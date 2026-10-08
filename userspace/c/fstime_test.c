@@ -23,6 +23,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include "testutil.h"
 
 static int fails;
 
@@ -36,11 +37,6 @@ static struct stat st_of(const char *p) {
     memset(&st, 0, sizeof st);
     if (lstat(p, &st) != 0) printf("    lstat(%s): errno %d\n", p, errno);
     return st;
-}
-
-static void nap_s(int s) {
-    struct timespec ts = { s, 0 };
-    nanosleep(&ts, NULL);
 }
 
 static void write_file(const char *p, const char *s) {
@@ -63,14 +59,14 @@ static void case_ramfs(void) {
     check("atime == mtime == ctime at birth",
           born.st_atime == born.st_mtime && born.st_ctime == born.st_mtime);
 
-    nap_s(2);
+    tu_wait_second_after(born.st_mtime);
     write_file("/tmp/fst_a", "y");
     struct stat w = st_of("/tmp/fst_a");
     check("write moved mtime", w.st_mtime > born.st_mtime);
     check("write moved ctime with it", w.st_ctime == w.st_mtime);
     check("write left atime", w.st_atime == born.st_atime);
 
-    nap_s(2);
+    tu_wait_second_after(w.st_ctime);
     chmod("/tmp/fst_a", 0600);
     struct stat c = st_of("/tmp/fst_a");
     check("chmod moved ctime only", c.st_ctime > w.st_ctime && c.st_mtime == w.st_mtime);
@@ -128,10 +124,11 @@ static void case_ext2(void) {
         printf("  /mnt is not writable (errno %d): skipped\n", errno);
         return;
     }
-    // The write comes 1.1 s after the create, so it lands in another second: the real-hardware flake (a slow stick
-    // crossed a second boundary between the two) made deterministic.
-    struct timespec nap = { 1, 100000000 };
-    nanosleep(&nap, NULL);
+    // The write lands in a later second than the create: the real-hardware flake (a slow stick crossed a second
+    // boundary between the two) made deterministic.
+    struct stat born;
+    fstat(fd, &born);
+    tu_wait_second_after(born.st_mtime);
     write(fd, "e", 1);
     close(fd);
     struct stat s = st_of("/mnt/fst_e");

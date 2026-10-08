@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
+#include "testutil.h"
 
 static void nap_ms(long ms) {
     struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
@@ -62,7 +63,7 @@ static int spawn_orphan(long grandchild_ms) {
             _exit(0);
         }
         write(p[1], &g, sizeof g);
-        if (!grandchild_ms) nap_ms(200); // let the grandchild die first: a zombie when orphaned
+        if (!grandchild_ms) tu_wait_state(g, 'Z', 2000); // the grandchild dies first: a zombie when orphaned
         _exit(0);
     }
     close(p[1]);
@@ -75,16 +76,16 @@ static int spawn_orphan(long grandchild_ms) {
 
 static int case_zombie_orphan(void) {
     int g = spawn_orphan(0);
-    nap_ms(300);
+    for (long end = tu_now_ms() + 2000; proc_exists(g) && tu_now_ms() < end;) nap_ms(2);
     int gone = !proc_exists(g);
     printf("A zombie orphan: grandchild %d reaped=%d -> %s\n", g, gone, gone ? "PASS" : "FAIL");
     return !gone;
 }
 
 static int case_live_orphan(void) {
-    int g = spawn_orphan(600);
+    int g = spawn_orphan(100);
     int ppid = proc_ppid(g);
-    nap_ms(900);
+    for (long end = tu_now_ms() + 2000; proc_exists(g) && tu_now_ms() < end;) nap_ms(2);
     int gone = !proc_exists(g);
     int ok = ppid == 1 && gone;
     printf("B live orphan: grandchild %d ppid=%d reaped_after_exit=%d -> %s\n",
@@ -135,7 +136,7 @@ static int case_killed_with_files(void) {
     }
     close(sv[1]);
     close(pp[1]);
-    nap_ms(100);
+    tu_wait_blocked(pid, 2000);
     kill(pid, SIGKILL);
     // EOF with the zombie still unreaped. Never block here: without the fix
     // EOF only comes at the reap, and a blocking read would hang the test

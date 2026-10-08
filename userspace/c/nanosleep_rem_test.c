@@ -7,6 +7,7 @@
 #include <signal.h>
 #include <time.h>
 #include <sys/wait.h>
+#include "testutil.h"
 
 static int failures;
 #define printf(...) ((printf)(__VA_ARGS__), fflush(stdout))
@@ -22,12 +23,13 @@ enum { NANOSLEEP = 35, CLOCK_NANOSLEEP = 230, EINTR_ = 4 };
 
 static void handler(int sig) { (void)sig; }
 
-// A child that signals the parent after 100 ms, then waits to be reaped.
+// A child that signals the parent 20 ms into its sleep (so `rem` is measurably
+// less than what was asked), then waits to be reaped.
 static pid_t poke_soon(void) {
     pid_t c = fork();
     if (c == 0) {
-        struct timespec ts = {0, 100000000};
-        nanosleep(&ts, NULL);
+        tu_wait_blocked(getppid(), 2000);
+        tu_nap_ms(20);
         kill(getppid(), SIGUSR1);
         _exit(0);
     }
@@ -40,7 +42,7 @@ static long ns_of(struct timespec t) { return t.tv_sec * 1000000000L + t.tv_nsec
 static void expect_left(const char *what, long r, struct timespec rem, long asked_ns) {
     long left = ns_of(rem);
     CHECK(r == -EINTR_, "%s returned %ld, wanted -EINTR", what, r);
-    CHECK(left > asked_ns / 2 && left < asked_ns - 50000000L, "%s: rem is %ld ns of %ld asked (slept about 100 ms)", what, left, asked_ns);
+    CHECK(left > asked_ns / 2 && left < asked_ns - 15000000L, "%s: rem is %ld ns of %ld asked (slept about 20 ms)", what, left, asked_ns);
 }
 
 int main(void) {
@@ -95,30 +97,30 @@ int main(void) {
     rem = (struct timespec){SENTINEL, SENTINEL};
     int lr = nanosleep(&req, &rem);
     CHECK(lr == -1, "nanosleep() returned %d", lr);
-    CHECK(ns_of(rem) > 1000000000L && ns_of(rem) < 1950000000L, "mlibc rem %ld ns", ns_of(rem));
+    CHECK(ns_of(rem) > 1000000000L && ns_of(rem) < 1985000000L, "mlibc rem %ld ns", ns_of(rem));
     waitpid(c, NULL, 0);
     c = poke_soon();
     unsigned left = sleep(3);
-    CHECK(left == 2 || left == 3, "sleep(3) interrupted after 100 ms returned %u", left);
+    CHECK(left == 2 || left == 3, "sleep(3) interrupted after 20 ms returned %u", left);
     waitpid(c, NULL, 0);
 
     printf("a sleep stopped and continued sleeps only what it had left\n");
     for (int variant = 0; variant < 2; variant++) {
         pid_t stopper = fork();
         if (stopper == 0) {
-            struct timespec a = {0, 100000000}, b = {0, 300000000};
             pid_t parent = getppid();
-            nanosleep(&a, NULL); kill(parent, SIGSTOP);
-            nanosleep(&b, NULL); kill(parent, SIGCONT);
+            tu_wait_blocked(parent, 2000);
+            tu_nap_ms(50); kill(parent, SIGSTOP);
+            tu_nap_ms(150); kill(parent, SIGCONT);
             _exit(0);
         }
-        struct timespec one = {1, 0}, s0, s1;
+        struct timespec one = {0, 400000000}, s0, s1;
         clock_gettime(CLOCK_MONOTONIC, &s0);
         long sr = variant == 0 ? sc(NANOSLEEP, (long)&one, 0, 0, 0) : sc(CLOCK_NANOSLEEP, CLOCK_MONOTONIC, 0, (long)&one, 0);
         clock_gettime(CLOCK_MONOTONIC, &s1);
         long el = ns_of(s1) - ns_of(s0);
         CHECK(sr == 0, "%s returned %ld", variant == 0 ? "nanosleep" : "clock_nanosleep", sr);
-        CHECK(el >= 990000000L && el < 1250000000L, "%s took %ld ms; a restart from scratch would take about 1400",
+        CHECK(el >= 390000000L && el < 520000000L, "%s took %ld ms; a restart from scratch would take about 600",
               variant == 0 ? "nanosleep" : "clock_nanosleep", el / 1000000L);
         waitpid(stopper, NULL, 0);
     }

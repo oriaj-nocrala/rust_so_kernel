@@ -23,6 +23,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include "testutil.h"
 
 #define NPROC 4
 #define PIPE_CAP 4096
@@ -37,6 +38,11 @@ static void check(int ok, const char *what) {
 static void nap_ms(long ms) {
     struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
     nanosleep(&ts, NULL);
+}
+
+// Every child blocked in its pipe call (what a fixed 200 ms nap stood in for).
+static void wait_all_blocked(const pid_t *pids) {
+    for (int i = 0; i < NPROC; i++) tu_wait_blocked(pids[i], 2000);
 }
 
 // Reap `n` children within `ms`; each one's exit code lands in `codes`
@@ -59,15 +65,16 @@ static int reap_all(int n, int *codes, long ms) {
 static void case_a(void) {
     int p[2];
     pipe(p);
+    pid_t pids[NPROC];
     for (int i = 0; i < NPROC; i++) {
-        if (fork() == 0) {
+        if ((pids[i] = fork()) == 0) {
             close(p[1]);
             char c;
             _exit(read(p[0], &c, 1) == 0 ? 0 : 1);
         }
     }
     close(p[0]);
-    nap_ms(200); // let them all block
+    wait_all_blocked(pids);
     close(p[1]);
     int codes[NPROC], n = reap_all(NPROC, codes, 3000), ok = n == NPROC;
     for (int i = 0; i < n; i++) ok &= codes[i] == 0;
@@ -78,15 +85,16 @@ static void case_a(void) {
 static void case_b(void) {
     int p[2];
     pipe(p);
+    pid_t pids[NPROC];
     for (int i = 0; i < NPROC; i++) {
-        if (fork() == 0) {
+        if ((pids[i] = fork()) == 0) {
             close(p[1]);
             unsigned char c;
             _exit(read(p[0], &c, 1) == 1 ? c : 0);
         }
     }
     close(p[0]);
-    nap_ms(200);
+    wait_all_blocked(pids);
     write(p[1], "abcd", NPROC);
     int codes[NPROC], n = reap_all(NPROC, codes, 3000);
     int seen[NPROC] = {0}, ok = n == NPROC;
@@ -106,8 +114,9 @@ static void case_c(void) {
     char fill[PIPE_CAP];
     memset(fill, '.', sizeof fill);
     write(p[1], fill, sizeof fill); // full: every child write blocks
+    pid_t pids[NPROC];
     for (int i = 0; i < NPROC; i++) {
-        if (fork() == 0) {
+        if ((pids[i] = fork()) == 0) {
             close(p[0]);
             char buf[PER_WRITER];
             memset(buf, 'A' + i, sizeof buf);
@@ -121,7 +130,7 @@ static void case_c(void) {
         }
     }
     close(p[1]);
-    nap_ms(200);
+    wait_all_blocked(pids);
     long count[NPROC + 1] = {0}; // [NPROC] counts the '.' fill
     char buf[512];
     ssize_t r;
@@ -149,8 +158,9 @@ static void case_d(void) {
     char fill[PIPE_CAP];
     memset(fill, '.', sizeof fill);
     write(p[1], fill, sizeof fill);
+    pid_t pids[NPROC];
     for (int i = 0; i < NPROC; i++) {
-        if (fork() == 0) {
+        if ((pids[i] = fork()) == 0) {
             signal(SIGPIPE, SIG_IGN);
             close(p[0]);
             char c = 'x';
@@ -158,7 +168,7 @@ static void case_d(void) {
         }
     }
     close(p[1]);
-    nap_ms(200);
+    wait_all_blocked(pids);
     close(p[0]);
     int codes[NPROC], n = reap_all(NPROC, codes, 3000), ok = n == NPROC;
     for (int i = 0; i < n; i++) ok &= codes[i] == 0;

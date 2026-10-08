@@ -25,17 +25,16 @@ $Q stop >/dev/null 2>&1
 debugfs -w -R "rm /abi-suite.sh" disk.img >/dev/null 2>&1
 debugfs -w -R "write disk-image-root/abi-suite.sh /abi-suite.sh" disk.img >/dev/null 2>&1
 QEMU_DEBUG_SMP="${QEMU_DEBUG_SMP:-4}" $Q start --no-build >/dev/null 2>&1
-$Q wait-for '# ' 90 >/dev/null || { echo "no shell prompt" >&2; $Q stop >/dev/null 2>&1; exit 1; }
-sleep 6
-$Q send "sh /mnt/abi-suite.sh $*"
+$Q wait-for '# ' 90 >/dev/null 2>&1 || { echo "no shell prompt" >&2; $Q stop >/dev/null 2>&1; exit 1; }
 sleep 1
+QEMU_KEY_DELAY="${QEMU_KEY_DELAY:-0.05}" $Q send "sh /mnt/abi-suite.sh $*"
 $Q enter
 
 test_timeout="${TEST_TIMEOUT:-90}"; stall="${STALL:-60}"
 verdict=""
 last_size=0; last_change=$SECONDS; cur=""; cur_start=$SECONDS
 while :; do
-    sleep 2
+    sleep 0.5
     grep -q "SUITE_DONE" "$log" 2>/dev/null && break
     size=$(stat -c %s "$log" 2>/dev/null || echo 0)
     if [ "$size" != "$last_size" ]; then last_size=$size; last_change=$SECONDS; fi
