@@ -160,6 +160,14 @@ const DISK_C_PROGRAMS: &[&str] = &[
 /// and relocate themselves. They exist to exercise the kernel's PIE loading; built to `disk-image-root/bin/`.
 const DISK_PIE_PROGRAMS: &[&str] = &["pie_test"];
 
+/// Rust programs written with std, built for `x86_64-unknown-linux-musl` (static, the Linux ABI) and copied to `disk-image-root/bin/<bin>`:
+/// (crate directory at the repo root, binary). Each crate is its own workspace (host tests with `cargo test` there) and is watched here and
+/// in the root build.rs. How to add one: the `userspace-programs` skill.
+const STD_PROGRAMS: &[(&str, &str)] = &[
+    // A window under the compositor from std (stage 6 of docs/ux/handoff-capabilities-to-files.md).
+    ("gui-client", "hello-window"),
+];
+
 /// Not built here at all — see the busybox.elf handling below, which
 /// shells out to scripts/build-busybox.sh (a `make`-based external build,
 /// nothing like the Rust/C recipes above) only when the output is missing.
@@ -302,6 +310,11 @@ fn main() {
         println!("cargo:rerun-if-changed={}", workspace_root.join(krate).join("Cargo.toml").display());
         watch_dir_recursive(&workspace_root.join(krate).join("src"));
     }
+    // The std programs' crates (STD_PROGRAMS).
+    for (krate, _) in STD_PROGRAMS {
+        println!("cargo:rerun-if-changed={}", workspace_root.join(krate).join("Cargo.toml").display());
+        watch_dir_recursive(&workspace_root.join(krate).join("src"));
+    }
 
     // ── Build the mlibc sysroot if missing ──────────────────────────────────
     //
@@ -440,6 +453,28 @@ fn main() {
         assert!(status.success(), "static-pie build failed for {}", stem);
         strip_elf(strip, &dst);
         println!("cargo:warning=userspace(c, static-pie, disk): {}.c -> disk-image-root/bin/{}", stem, stem);
+    }
+
+    // ── Build Rust std programs ───────────────────────────────────────────
+    // rustc's own musl target (std, static), not the constanos target above: these are ordinary Linux programs. Run from inside the repo so
+    // the pinned nightly (which has the musl std) is the one used.
+    for (krate, bin) in STD_PROGRAMS {
+        let dir = workspace_root.join(krate);
+        let status = Command::new(&cargo)
+            .current_dir(&dir)
+            .args(["build", "--release", "--target", "x86_64-unknown-linux-musl", "--bin", bin])
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_BUILD_TARGET")
+            .env_remove("CARGO_TARGET_DIR")
+            .status()
+            .expect("Failed to spawn cargo for a std program");
+        assert!(status.success(), "std program build failed: {}/{}", krate, bin);
+        let src = dir.join("target/x86_64-unknown-linux-musl/release").join(bin);
+        let dst = disk_bin_dir.join(bin);
+        std::fs::copy(&src, &dst).unwrap_or_else(|e| panic!("Failed to copy {} -> {}: {}", src.display(), dst.display(), e));
+        strip_elf(strip, &dst);
+        println!("cargo:warning=userspace(rust std, disk): {}/{} -> disk-image-root/bin/{}", krate, bin, bin);
     }
 
     // ── Build BusyBox if missing ────────────────────────────────────────────

@@ -6,6 +6,7 @@ How to add a program or change mlibc/BusyBox: the `userspace-programs` skill. Th
 
 - **Embedded** (in the kernel ELF, `/bin` in initramfs, `PROGRAMS` in `kernel/src/process/user_programs.rs`, `include_bytes!` from `kernel/embedded/`): only what is needed to reach a shell and debug it. That is `shell` (PID 1), `busybox`, `kdebug`, `reboot`, and the small Rust programs in `RUST_PROGRAMS` (smoke tests, `sse_test`, `userlib_test`, `term`).
 - **Disk-resident** (`disk-image-root/bin/` → `/mnt/bin` on `disk.img` or the stick): everything else, including `doom`, `quake`, the compositor, `panel`, `cpumon`, `textdemo`, and the C test programs (`*_test`).
+- **Rust std programs** (`STD_PROGRAMS` in `kernel/build.rs`: a crate at the repo root and a binary) are plain static `x86_64-unknown-linux-musl` executables, disk-resident like the rest. The first: `gui-client`'s `hello-window`.
 - `PATH=/tmp/bin:/bin:/mnt/bin`: BusyBox applet symlinks first, then embedded programs, then the disk.
 - Every ELF (not the kernel) is stripped by `kernel/build.rs`. The loader only reads PT_LOAD, and the kernel's own symbols are needed for gdb.
 

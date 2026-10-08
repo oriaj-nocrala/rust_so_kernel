@@ -596,6 +596,11 @@ fn build_kernel() -> PathBuf {
     // `text` (proportional fonts, docs/gui/text-plan.md), behind
     // `userspace::text`, likewise.
     watch_dir_recursive(&manifest_dir.join("text/src"));
+    // The std programs' crates (kernel/build.rs's STD_PROGRAMS).
+    for krate in ["gui-client"] {
+        watch_dir_recursive(&manifest_dir.join(krate).join("src"));
+        println!("cargo:rerun-if-changed={}", manifest_dir.join(krate).join("Cargo.toml").display());
+    }
     // Crates the kernel links by path. Without these a root `cargo build`
     // after an edit there skips the nested kernel build and exits 0 with a
     // stale kernel (a metal run once booted the pre-fix driver this way).

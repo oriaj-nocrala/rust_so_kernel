@@ -67,6 +67,16 @@
 #   W7. The start menu (a popup): it shows above the strip, Escape and a
 #       click outside close it, and a theme picked in it (9x) changes the
 #       taskbar (the strip is the compositor's), then back to Luna.
+#   scripts/gui-e2e.sh std      # a Rust std client (gui-client crate)
+#
+# `std` mode runs `compositor /mnt/bin/hello-window` (Rust std on musl, the
+# window through `gui_client`), which prints every event it gets:
+#   S1. A focused 320x200 window at (40,40) showing hello-window's
+#       gradient, pixel exact.
+#   S2. Pointer motion arrives in window coordinates, 1:1, and the square
+#       is drawn under the pointer.
+#   S3. A left click and two keys reach it.
+#   S4. Esc ends it with exit(0) and the window goes; the console comes back.
 # Exit status: number of failed checks.
 set -u
 MODE=${1:-demo}
@@ -345,6 +355,40 @@ print(next((x for x in range(150, im.size[0]) if (lambda p: p[0] > 150 and p[1] 
     grep -aq "KERNEL PANIC" "$STATE/serial.log" && bad "kernel panic in the log"
     $Q stop >/dev/null 2>&1
     echo "gui-e2e wm: $([ $fails = 0 ] && echo PASS || echo "FAIL ($fails)")"
+    exit $fails
+fi
+
+if [ "$MODE" = std ]; then
+    $Q send "compositor /mnt/bin/hello-window" && $Q enter
+    $Q wait-for "hello-window: ready 320x200" 60 >/dev/null || bad "S1 hello-window never got ready"
+    sleep 2
+    s=$(shot s1)
+    [ "$(px "$s" 45 45)" = "$(fbar 40 40 45 45)" ] && ok "S1 focused window at (40,40)" || bad "S1 title bar: $(px "$s" 45 45)"
+    # content (10,10): red 10*255/320, green 0x40, blue 10*255/200
+    [ "$(px "$s" 50 70)" = "7,64,12" ] && ok "S1 its gradient at content (10,10)" || bad "S1 content (10,10): $(px "$s" 50 70)"
+    $Q mouse-move -440 -250; sleep 1         # the cursor starts at the centre (640,400): now (200,150), content (160,90)
+    $Q wait-for "hello-window: motion 160 90" 10 >/dev/null && ok "S2 motion at content (160,90)" \
+        || bad "S2 last motion: $(grep -a 'hello-window: motion' "$STATE/serial.log" | tail -1)"
+    sleep 1
+    s=$(shot s2)
+    [ "$(px "$s" 195 145)" = "255,255,255" ] && ok "S2 the square under the pointer" || bad "S2 at (195,145): $(px "$s" 195 145)"
+    $Q mouse-button 1; sleep 0.5; $Q mouse-button 0
+    $Q send "ab"; sleep 1
+    log=$(grep -a "hello-window:" "$STATE/serial.log")
+    grep -q "button 0x110 down" <<<"$log" && grep -q "button 0x110 up" <<<"$log" && ok "S3 left click reached it" || bad "S3 no button events"
+    grep -q "key 30 down" <<<"$log" && grep -q "key 48 up" <<<"$log" && ok "S3 keys a,b reached it" || bad "S3 no key events"
+    $Q key esc
+    $Q wait-for "hello-window: bye" 15 >/dev/null && ok "S4 Esc ends it" || bad "S4 hello-window did not quit"
+    sleep 1
+    grep -aq "Killed PID [0-9]* (hello-window): exit(0)" "$STATE/serial.log" || bad "S4 exit: $(grep -a 'Killed PID [0-9]* (hello' "$STATE/serial.log" | tail -1)"
+    s=$(shot s4)
+    [ "$(px "$s" 45 45)" = "$(desk 45 45)" ] && ok "S4 window gone" || bad "S4 window still there: $(px "$s" 45 45)"
+    $Q key ctrl-alt-backspace; sleep 2
+    $Q send "echo console-is-back" && $Q enter
+    $Q wait-for "^.fb. console-is-back" 10 >/dev/null && ok "S4 console and keyboard back" || bad "S4 typing does not reach ash"
+    grep -aq "KERNEL PANIC" "$STATE/serial.log" && bad "kernel panic in the log"
+    $Q stop >/dev/null 2>&1
+    echo "gui-e2e std: $([ $fails = 0 ] && echo PASS || echo "FAIL ($fails)")"
     exit $fails
 fi
 

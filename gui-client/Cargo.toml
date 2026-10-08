@@ -1,0 +1,20 @@
+[package]
+name = "gui-client"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+edition = "2021"
+
+# A window under the compositor for programs written with Rust std (stage 6 of docs/ux/handoff-capabilities-to-files.md): connects to
+# `$GUI_DISPLAY`, a memfd pool passed with SCM_RIGHTS, typed input events. The std twin of `userspace::gfx` (no_std, raw syscalls); both speak
+# `gui::protocol` through `gui::wire`, so there is one encoder. Built for `x86_64-unknown-linux-musl` by kernel/build.rs (`STD_PROGRAMS`) and
+# tested on the host against a fake compositor (`cargo test`). Its own workspace, like `gui`: the parent's `panic = "abort"` would break the
+# test harness.
+[workspace]
+
+[dependencies]
+gui = { path = "../gui" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+strip = true

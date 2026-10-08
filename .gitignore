@@ -13,6 +13,7 @@
 /vfs/target/
 /diag/target/
 /gui-capi/target/
+/gui-client/target/
 /vk-comp/target/
 /sched/target/
 /usock/target/

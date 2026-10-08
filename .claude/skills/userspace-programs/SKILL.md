@@ -15,11 +15,13 @@ How it is wired (embedded vs disk, exec, BusyBox, mlibc's quirks): `docs/referen
 |------|-------------------------|----------|
 | Rust (`userspace/src/bin/<name>.rs`) | add to `DISK_RUST_PROGRAMS` in `kernel/build.rs` | add to `RUST_PROGRAMS` **and** to `PROGRAMS` in `kernel/src/process/user_programs.rs`: `("name", ProgramSource::Elf(include_bytes!("../../embedded/name.elf")))` |
 | C (`userspace/c/<name>.c`) | add to `DISK_C_PROGRAMS` | add to `C_PROGRAMS` + `PROGRAMS` |
+| Rust with std (a crate at the repo root) | add `("<crate dir>", "<bin>")` to `STD_PROGRAMS` in `kernel/build.rs`, and the crate dir to the `gui-client` watch loop in the root `build.rs` | — |
 | external build (like doom/quake) | a build script + a `*_NAME` block in `kernel/build.rs` writing `disk-image-root/bin/<name>` | — |
 
 - Disk-resident programs land in `disk-image-root/bin/`. The root `build.rs` syncs them into `disk.img`'s `/bin` on every build (`sync_disk_bin_dir`, `debugfs rm`+`write`, with sizes verified afterwards), and they run as `/mnt/bin/<name>` through `$PATH`. On the Ryzen, `scripts/sync-usb-data.sh` copies them to the stick.
 - Other data for `/mnt` (fonts, terminfo, `etc/gui/apps`, WADs) goes under `disk-image-root/`, synced the same way.
 - **Rust**: `userspace::entry!(main)` with `fn main(args: Args) -> i32`, never a bare `_start`. Anything that links `userspace::text` (+1.2 MB) must be disk-resident.
+- **Rust with std**: an ordinary `x86_64-unknown-linux-musl` program (static-pie; the kernel speaks Linux's ABI, `linux-abi` skill). Its crate is its own workspace (`[workspace]` table, `panic = "abort"` + `strip = true` in its release profile; add `/<crate>/target/` to `.gitignore`), so `cd <crate> && cargo test` runs its host tests. `kernel/build.rs` runs `cargo build --release --target x86_64-unknown-linux-musl --bin <bin>` in it (from inside the repo: only the pinned nightly has the musl std). Calls std lacks (`sendmsg` with fds, `poll`, `memfd_create`, `mmap`) are `extern "C"` declarations, no `libc` crate (`gui-client/src/sys.rs`). A window: the `gui-client` crate (`docs/reference/graphics.md`). Example: `gui-client`'s `hello-window`.
 - **C**: clang against `sysroot/` (built by `scripts/setup-mlibc.sh` if missing), statically linked. Name test programs `<thing>_test`.
 - Build, then run it in QEMU (`qemu-debug` skill) and check the output in serial.log.
 
