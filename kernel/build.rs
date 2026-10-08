@@ -142,6 +142,7 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "fstime_test",
     "fbbench",
     "fire",
+    "acuario",
     "fork_exec_test",
     "pipe_cow_test",
     "sigsuspend_test",
