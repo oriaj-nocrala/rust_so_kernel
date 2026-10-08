@@ -5,7 +5,9 @@
 //! of the compositor with `busybox ash` on a pty behind it.
 //!
 //! `term [cols rows]` (default 80x25, shrunk to fit the screen), usually
-//! started as `compositor term`. It opens `/dev/ptmx`; the child makes a
+//! started as `compositor term`. `term -e PROG [ARG]...` runs PROG (found
+//! through `PATH` by ash) instead of the shell and keeps the window once it
+//! ends, saying how, until a key: what Files does with a console program. It opens `/dev/ptmx`; the child makes a
 //! session of its own, opens the slave (which so becomes its controlling
 //! terminal), puts it on 0/1/2 and execs ash. The parent waits on the
 //! compositor's socket and the master under one `epoll`:
@@ -33,6 +35,9 @@ extern crate alloc;
 
 use gui::protocol::{Event, Interface, Request, FORMAT_XRGB8888};
 use gui::wire::{Decoder, Encoder};
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
 use userspace::args::Args;
 use userspace::syscall::{self, AF_UNIX, MAP_SHARED, PROT_READ, PROT_WRITE, SOCK_STREAM};
 use userspace::{entry, println};
@@ -215,8 +220,8 @@ fn open_pty(ws: &Winsize) -> Option<(i32, [u8; 16])> {
     Some((m, path))
 }
 
-/// The child: session leader on the slave, then ash. Never returns.
-fn run_shell(master: i32, slave_path: &[u8]) -> ! {
+/// The child: session leader on the slave, then ash (running `cmd`, NUL-terminated words, when there is one). Never returns.
+fn run_shell(master: i32, slave_path: &[u8], cmd: &[&[u8]]) -> ! {
     syscall::close(master);
     syscall::setsid();
     // Opening the slave without O_NOCTTY as a session leader with no
@@ -234,14 +239,28 @@ fn run_shell(master: i32, slave_path: &[u8]) -> ! {
     for fd in 3..16 {
         syscall::close(fd);
     }
-    let argv: [&[u8]; 2] = [b"busybox\0", b"ash\0"];
-    syscall::exec_argv(b"/bin/busybox\0", &argv, &ENVP);
+    if cmd.is_empty() {
+        let argv: [&[u8]; 2] = [b"busybox\0", b"ash\0"];
+        syscall::exec_argv(b"/bin/busybox\0", &argv, &ENVP);
+    } else {
+        // ash finds the program in PATH and gives way to it; "$0" is the program, "$@" its arguments
+        let mut argv: Vec<&[u8]> = alloc::vec![b"busybox\0", b"ash\0", b"-c\0", b"exec \"$0\" \"$@\"\0"];
+        argv.extend_from_slice(cmd);
+        syscall::exec_argv(b"/bin/busybox\0", &argv, &ENVP);
+    }
     syscall::exit(127);
 }
 
 fn main(args: Args) -> i32 {
-    let want_cols = parse(args.get(1), 80);
-    let want_rows = parse(args.get(2), 25);
+    // `-e PROG [ARG]...`: the command's words, NUL-terminated
+    let cmd: Vec<&[u8]> = if args.get(1) == Some(b"-e") { (2..args.len()).filter_map(|i| args.get_cstr(i)).collect() } else { Vec::new() };
+    if args.get(1) == Some(b"-e") && cmd.is_empty() {
+        println!("term: -e needs a program");
+        return 2;
+    }
+    let (want_cols, want_rows) = if cmd.is_empty() { (parse(args.get(1), 80), parse(args.get(2), 25)) } else { (80, 25) };
+    let prog = cmd.first().map(|c| &c[..c.len() - 1]);
+    let title: String = prog.map_or("term".into(), |p| String::from_utf8_lossy(p).into_owned());
 
     let Some(sock) = connect() else {
         println!("term: no compositor at /tmp/gui-0");
@@ -281,7 +300,7 @@ fn main(args: Args) -> i32 {
     let pid = syscall::fork();
     if pid == 0 {
         let end = slave_path.iter().position(|&b| b == 0).unwrap_or(slave_path.len());
-        run_shell(master, &slave_path[..=end]);
+        run_shell(master, &slave_path[..=end], &cmd);
     }
     if pid < 0 {
         println!("term: fork failed ({})", pid);
@@ -300,7 +319,7 @@ fn main(args: Args) -> i32 {
     let ok = send(sock, &[
         cp,
         cbuf,
-        Request::SetTitle { surface: SURFACE, title: "term".into() },
+        Request::SetTitle { surface: SURFACE, title },
         Request::SetResizable { surface: SURFACE, min_w: (MIN_COLS * cw) as i32, min_h: (MIN_ROWS * ch) as i32 },
         Request::Attach { surface: SURFACE, buffer: BUFFER },
         Request::Damage { surface: SURFACE, x: 0, y: 0, w: wi, h: hi },
@@ -312,6 +331,8 @@ fn main(args: Args) -> i32 {
         return 1;
     }
     println!("term: {}x{} cells of {}x{} on /dev/pts, ash is pid {}", cols, rows, cw, ch, pid);
+    // `-e`: the program has ended and the window waits for a key
+    let mut ended = false;
 
     let ep = syscall::epoll_create() as i32;
     syscall::epoll_ctl(ep, syscall::EPOLL_CTL_ADD, sock, syscall::EPOLLIN, 0);
@@ -345,6 +366,17 @@ fn main(args: Args) -> i32 {
                 loop {
                     let r = syscall::read(master, &mut buf);
                     if r == EAGAIN {
+                        break;
+                    }
+                    if r <= 0 && !cmd.is_empty() {
+                        // the program's own words stay on screen, with how it ended under them (P1.1)
+                        let (_, st) = syscall::waitpid_status(pid);
+                        let how = if st & 0x7f == 0 { format!("exit {}", (st >> 8) & 0xff) } else { format!("killed by signal {}", st & 0x7f) };
+                        let name = String::from_utf8_lossy(prog.unwrap_or(b"?"));
+                        println!("term: {} ended ({}), waiting for a key", name, how);
+                        term.feed(format!("\r\n\x1b[7m {} ended ({}); press a key to close \x1b[0m", name, how).as_bytes());
+                        syscall::epoll_ctl(ep, syscall::EPOLL_CTL_DEL, master, 0, 1);
+                        ended = true;
                         break;
                     }
                     if r <= 0 {
@@ -382,6 +414,10 @@ fn main(args: Args) -> i32 {
                 match ev {
                     Event::Release { .. } => released = true,
                     Event::Done { callback, .. } if callback == cb => frame_due = true,
+                    Event::Key { pressed: true, .. } if ended => {
+                        println!("term: closed by a key, bye");
+                        return 0;
+                    }
                     Event::Key { code, pressed, .. } => {
                         let bytes = kbd.key(code, pressed, term.grid.app_cursor());
                         if !bytes.is_empty() {

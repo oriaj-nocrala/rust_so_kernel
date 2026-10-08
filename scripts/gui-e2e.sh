@@ -113,6 +113,8 @@
 #       that hangs is stopped at the timeout and said so.
 #   F6. A provider that tries to open another file is refused ECAPMODE
 #       (errno 135) and /proc/capdenials says so; its preview still works.
+#   F7. Enter on an executable script runs it in `term -e`, which says
+#       how it ended (exit 3) and closes on a key.
 # Exit status: number of failed checks.
 set -u
 MODE=${1:-demo}
@@ -153,7 +155,16 @@ shot() { $Q screendump "$OUT/$1.png" >/dev/null; echo "$OUT/$1.png"; }
 
 # Pointer and semantic-tree helpers (modes ui, files). The pointer starts at the centre and moves 1:1.
 PX=640; PY=400
-mv() { $Q mouse-move $(($1 - PX)) $(($2 - PY)) >/dev/null; PX=$1; PY=$2; sleep 0.3; }
+# mv: in steps of at most 127 per axis, one PS/2 packet each. QEMU queues a longer move as several packets and hands them out as the
+# guest reads them, so under TCG a click right after one long move could land before the last packets, where the pointer was then.
+mv() {
+    local dx=$(($1 - PX)) dy=$(($2 - PY)) sx sy
+    while [ $dx != 0 ] || [ $dy != 0 ]; do
+        sx=$((dx > 127 ? 127 : dx < -127 ? -127 : dx)); sy=$((dy > 127 ? 127 : dy < -127 ? -127 : dy))
+        $Q mouse-move $sx $sy >/dev/null; dx=$((dx - sx)); dy=$((dy - sy)); sleep 0.1
+    done
+    PX=$1; PY=$2; sleep 0.3
+}
 clk() { mv "$1" "$2"; $Q mouse-button 1 >/dev/null; $Q mouse-button 0 >/dev/null; sleep 0.5; }
 TERMBAR=; APPBAR=; APPWIN=          # "x y" of term's and the app's title bars, the app window's title
 n=0
@@ -629,6 +640,20 @@ if [ "$MODE" = files ]; then
     fpid=$(ready_pid)
     in_term "kill $fpid"
     waitm "Killed PID $fpid .files" 15 || bad "files (pid '$fpid') did not end on SIGTERM"
+
+    # F7: Enter on a script runs it in `term -e`, which shows how it ended and closes on a key (the '#!' typed as octal escapes)
+    in_term "mkdir /tmp/h; printf '\\043\\041/bin/sh\\necho hola\\nexit 3\\n' > /tmp/h/hi.sh; chmod +x /tmp/h/hi.sh"
+    sleep 1
+    in_term "files /tmp/h > /dev/console 2>&1 &"
+    waitm "files: preview hi.sh: " 90 || bad "F7 no preview of hi.sh: $(log | tail -2)"
+    # a new window has the keyboard; no gui-tree here: this fifth cascaded window covers term's title bar
+    k ret
+    waitm "files: ran /tmp/h/hi.sh .runs in term" 15 && ok "F7 Enter on a script runs it in term" || bad "F7 $(log | tail -1)"
+    waitm "term: /tmp/h/hi.sh ended .exit 3., waiting for a key" 30 && ok "F7 term -e says how it ended (exit 3) and waits" \
+        || bad "F7 $(grep -a 'term: ' "$STATE/serial.log" | tail -2)"
+    k x
+    waitm "term: closed by a key, bye" 15 && ok "F7 a key closes it" || bad "F7 the window did not close on a key"
+    # this Files ends with the compositor, below
     $Q key ctrl-alt-backspace; sleep 2
     $Q send "echo console-is-back" && $Q enter
     $Q wait-for "^.fb. console-is-back" 10 >/dev/null && ok "console and keyboard back" || bad "typing does not reach ash"

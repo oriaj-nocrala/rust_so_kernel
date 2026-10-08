@@ -3,14 +3,20 @@
 //!
 //!     files [PATH]        (under the compositor: from its command line, the launcher, or term)
 //!
-//! - Keys: arrows/Page/Home/End and typing move the selection (the `ui` list), Enter opens (a folder here, a file with its app from
-//!   `/mnt/etc/gui/open`), Backspace goes up, Space shows the preview over the whole window (Space or Esc again to go back), Tab moves
+//! - Keys: arrows/Page/Home/End and typing move the selection (the `ui` list), Enter opens (a folder here, a program by running it, a
+//!   file with its app from `/mnt/etc/gui/open`), Backspace goes up, Space shows the preview over the whole window (Space or Esc again to go back), Tab moves
 //!   between the path bar, the places and the list. Mouse: click, double click, drag the splits.
 //! - Previews come from `files-preview`, started through `cap-exec` with only the file (read) and an output memfd (write): a decoder
 //!   that crashes or hangs costs that process, and the inspector says what happened (P1.1, P6.4). Where the preview goes (right of the
 //!   list, or under it for a folder of pictures) is decided per folder, never per selection (P2.3).
+//! - A program (`files::program`: an `x` bit and an ELF header or `#!`) runs like the panel's launcher when its name is a command of
+//!   the launcher (`/mnt/etc/gui/apps`) or of the open-with table: those have windows. Any other runs in `term -e`, which keeps the
+//!   window after it ends with how it ended, so a console program's output is not lost (P1.1).
 //! - Sizes, dates and permissions are read only for the rows shown.
 //! - Every step is logged on stdout (`files: ...`); `scripts/gui-e2e.sh files` reads it and the semantic tree.
+//! - `files --bench DIR...` drives itself (per folder: open it, wait for the preview, Down 50 times, PageDown 10 times, wait again),
+//!   times every step and prints one summary (`files: bench ...`), then exits: the measurement behind `docs/gui/files-handoff.md` step 1,
+//!   the same in QEMU and in a metal job.
 
 use std::cell::RefCell;
 use std::fs::File;
@@ -19,10 +25,12 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use files::entry::{self, Entry, Kind, Layout};
 use files::open_with;
+use files::program::{self, Program};
 use files::preview::{self, Body};
 use gui_client::{Event, Window};
 use ui::render::{Painter, FONT_FILES};
@@ -30,6 +38,7 @@ use ui::{Action, Column, Font, Input, List, ListStyle, Row, Size, State, Widget}
 
 const FONT_DIR: &str = "/mnt/usr/share/fonts";
 const OPEN_TABLE: &str = "/mnt/etc/gui/open";
+const APPS: &str = "/mnt/etc/gui/apps";
 const PLACES: [&str; 5] = ["/", "/mnt", "/tmp", "/proc", "/dev"];
 /// The box previews are fitted in.
 const PREVIEW_W: usize = 360;
@@ -57,6 +66,8 @@ const LINES: u32 = 1000;
 const KEY_ESC: u32 = 1;
 const KEY_BACKSPACE: u32 = 14;
 const KEY_SPACE: u32 = 57;
+const KEY_DOWN: u32 = 108;
+const KEY_PAGEDOWN: u32 = 109;
 
 const COLS: [Column; 4] = [
     Column { title: "Name", width: Size::Fill, right: false },
@@ -80,10 +91,14 @@ struct Folder {
     layout: Layout,
 }
 
+/// `stat` calls made, for `--bench`.
+static STATS: AtomicU32 = AtomicU32::new(0);
+
 impl Folder {
     fn meta(&self, i: usize) -> Option<Meta> {
         let mut m = self.meta.borrow_mut();
         *m[i].get_or_insert_with(|| {
+            STATS.fetch_add(1, Ordering::Relaxed);
             std::fs::symlink_metadata(entry::join(&self.path, &self.entries[i].name))
                 .ok()
                 .map(|md| Meta { size: md.len(), mtime: md.mtime(), mode: md.mode() })
@@ -124,6 +139,8 @@ struct Job {
     name: String,
     out: File,
     started: Instant,
+    /// How long `spawn` (fork + exec of `cap-exec`) took in this process.
+    spawn: Duration,
 }
 
 struct App {
@@ -139,6 +156,21 @@ struct App {
     timeout: Duration,
     /// Apps started with "open", reaped as they end.
     apps: Vec<Child>,
+    /// Programs that open a window: the commands of the launcher and of the open-with table, by file name.
+    windowed: Vec<String>,
+    /// How long the last folder change's `read_dir` + sort took.
+    read_dir: Duration,
+    /// Finished previews, for `--bench`.
+    previews: Vec<PreviewTime>,
+}
+
+struct PreviewTime {
+    name: String,
+    spawn: Duration,
+    /// From the spawn to the exit being seen (the bench polls every 2 ms).
+    ran: Duration,
+    /// Reading stderr and the memfd, checking and blending the answer.
+    decode: Duration,
 }
 
 extern "C" {
@@ -181,7 +213,10 @@ fn signal_name(s: i32) -> &'static str {
 impl App {
     fn navigate(&mut self, st: &mut State, path: &str, select: Option<&str>) {
         let path = if path.len() > 1 { path.trim_end_matches('/') } else { path };
-        match read_folder(path) {
+        let t = Instant::now();
+        let r = read_folder(path);
+        self.read_dir = t.elapsed();
+        match r {
             Ok(f) => {
                 self.folder = f;
                 let row = select.and_then(|n| entry::position(&self.folder.entries, n)).or(if self.folder.entries.is_empty() { None } else { Some(0) });
@@ -268,9 +303,11 @@ impl App {
                 Ok(())
             });
         }
+        let t = Instant::now();
         let child = cmd.spawn().map_err(|e| format!("cannot start cap-exec: {}", e))?;
+        let spawn = t.elapsed();
         drop((a, b));
-        Ok(Job { child, name: name.into(), out, started: Instant::now() })
+        Ok(Job { child, name: name.into(), out, started: t, spawn })
     }
 
     /// Checks the running provider: done, failed, or too slow. True when the inspector changed.
@@ -295,6 +332,8 @@ impl App {
             }
         };
         let mut j = self.job.take().unwrap();
+        let ran = j.started.elapsed();
+        let t_decode = Instant::now();
         let mut err = String::new();
         if let Some(mut e) = j.child.stderr.take() {
             let _ = e.read_to_string(&mut err);
@@ -322,6 +361,7 @@ impl App {
                 }
             }
         };
+        self.previews.push(PreviewTime { name: j.name.clone(), spawn: j.spawn, ran, decode: t_decode.elapsed() });
         match &self.shown {
             Shown::Ready { name, body: Shot::Image { w, h, .. }, .. } => println!("files: preview {}: image {}x{}", name, w, h),
             Shown::Ready { name, body: Shot::Text(l), .. } => println!("files: preview {}: text, {} lines", name, l.len()),
@@ -338,6 +378,10 @@ impl App {
         let is_dir = e.kind == Kind::Dir || (e.kind == Kind::Link && std::fs::metadata(&path).is_ok_and(|m| m.is_dir()));
         if is_dir {
             self.navigate(st, &path, None);
+            return;
+        }
+        if let Some(p) = self.program(&path) {
+            self.run(&path, &e.name, p);
             return;
         }
         let Some(cmd) = open_with::command(&self.open, &e.name).map(String::from) else {
@@ -361,6 +405,38 @@ impl App {
             }
             Err(err) => {
                 self.status = format!("cannot start {} for {}: {}", prog.display(), e.name, err);
+                println!("files: {}", self.status);
+            }
+        }
+    }
+
+    /// Whether `path` is a program: its mode and first bytes.
+    fn program(&self, path: &str) -> Option<Program> {
+        let mode = std::fs::metadata(path).ok()?.mode();
+        let mut head = [0u8; program::HEAD];
+        let n = File::open(path).ok()?.read(&mut head).ok()?;
+        program::detect(mode, &head[..n])
+    }
+
+    /// Runs the program at `path`: straight when it has a window, else in `term -e`.
+    fn run(&mut self, path: &str, name: &str, p: Program) {
+        let windowed = p == Program::Elf && self.windowed.iter().any(|w| w == name);
+        let mut cmd = if windowed {
+            Command::new(path)
+        } else {
+            let mut c = Command::new("term");
+            c.args(["-e", path]);
+            c
+        };
+        let how = if windowed { "runs in its own window" } else { "runs in term" };
+        match cmd.stdin(Stdio::null()).spawn() {
+            Ok(c) => {
+                println!("files: ran {} ({}, pid {})", path, how, c.id());
+                self.apps.push(c);
+                self.status = format!("{} {}", name, how);
+            }
+            Err(err) => {
+                self.status = format!("cannot run {}: {}", name, err);
                 println!("files: {}", self.status);
             }
         }
@@ -503,8 +579,134 @@ fn tree<'a>(app: &'a App, t: &'a Texts, row: &'a dyn Fn(usize) -> Row, place: &'
     ])
 }
 
+/// One step of `--bench`.
+enum Step {
+    Go(String),
+    Key(u32),
+    /// Until the selection's preview has come back.
+    Settle,
+}
+
+#[derive(Clone, Copy, Default)]
+struct FrameTime {
+    handle: Duration,
+    render: Duration,
+    /// `Window::frame`: waiting for the compositor to release the buffer.
+    wait: Duration,
+    paint: Duration,
+    sem: Duration,
+    present: Duration,
+    stats: u32,
+}
+
+impl FrameTime {
+    fn total(&self) -> Duration {
+        self.handle + self.render + self.wait + self.paint + self.sem + self.present
+    }
+}
+
+struct BenchDir {
+    path: String,
+    items: usize,
+    read_dir: Duration,
+    first: Option<FrameTime>,
+    keys: Vec<FrameTime>,
+    /// Index of its first preview in `App::previews`.
+    previews: usize,
+}
+
+struct Bench {
+    steps: std::collections::VecDeque<Step>,
+    dirs: Vec<BenchDir>,
+    /// The next frame is the first after a folder change.
+    nav: bool,
+    /// The last key's `State::handle` time, charged to the next frame.
+    handle: Duration,
+    started: Instant,
+}
+
+impl Bench {
+    fn new(dirs: &[String]) -> Bench {
+        let mut steps = std::collections::VecDeque::new();
+        for d in dirs {
+            steps.push_back(Step::Go(d.clone()));
+            steps.push_back(Step::Settle);
+            steps.extend((0..50).map(|_| Step::Key(KEY_DOWN)));
+            steps.push_back(Step::Settle);
+            steps.extend((0..10).map(|_| Step::Key(KEY_PAGEDOWN)));
+            steps.push_back(Step::Settle);
+        }
+        Bench { steps, dirs: Vec::new(), nav: false, handle: Duration::ZERO, started: Instant::now() }
+    }
+
+    fn frame(&mut self, f: FrameTime) {
+        let Some(d) = self.dirs.last_mut() else { return };
+        if std::mem::take(&mut self.nav) {
+            d.first = Some(f);
+        } else {
+            d.keys.push(f);
+        }
+    }
+
+    fn summary(&self, app: &App) {
+        let ms = |d: Duration| format!("{:.1}", d.as_secs_f64() * 1000.0);
+        let parts = |f: &FrameTime| {
+            format!(
+                "handle {} render {} wait {} paint {} sem {} present {}",
+                ms(f.handle),
+                ms(f.render),
+                ms(f.wait),
+                ms(f.paint),
+                ms(f.sem),
+                ms(f.present)
+            )
+        };
+        for (i, d) in self.dirs.iter().enumerate() {
+            let first = d.first.map_or("none".into(), |f| format!("{} ms ({}), {} stats", ms(f.total()), parts(&f), f.stats));
+            println!("files: bench {}: {} items, read_dir {} ms, first frame {}", d.path, d.items, ms(d.read_dir), first);
+            if !d.keys.is_empty() {
+                let mut t: Vec<Duration> = d.keys.iter().map(FrameTime::total).collect();
+                t.sort();
+                let q = |p: usize| t[(t.len() - 1) * p / 100];
+                let med = |g: fn(&FrameTime) -> Duration| {
+                    let mut v: Vec<Duration> = d.keys.iter().map(g).collect();
+                    v.sort();
+                    v[v.len() / 2]
+                };
+                let m = FrameTime {
+                    handle: med(|f| f.handle),
+                    render: med(|f| f.render),
+                    wait: med(|f| f.wait),
+                    paint: med(|f| f.paint),
+                    sem: med(|f| f.sem),
+                    present: med(|f| f.present),
+                    stats: 0,
+                };
+                let stats: u32 = d.keys.iter().map(|f| f.stats).sum();
+                println!(
+                    "files: bench {}: {} frames, median {} p95 {} max {} ms; medians {}; {} stats",
+                    d.path,
+                    t.len(),
+                    ms(q(50)),
+                    ms(q(95)),
+                    ms(q(100)),
+                    parts(&m),
+                    stats
+                );
+            }
+            let end = self.dirs.get(i + 1).map_or(app.previews.len(), |n| n.previews);
+            for pv in &app.previews[d.previews..end] {
+                println!("files: bench {}: preview {}: spawn {} exit seen {} decode {} ms", d.path, pv.name, ms(pv.spawn), ms(pv.ran), ms(pv.decode));
+            }
+        }
+        println!("files: bench done in {} ms", ms(self.started.elapsed()));
+    }
+}
+
 fn run() -> std::io::Result<()> {
-    let start = std::env::args().nth(1).unwrap_or_else(|| "/".into());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut bench = (args.first().map(String::as_str) == Some("--bench")).then(|| Bench::new(&args[1..]));
+    let start = if bench.is_some() { "/".into() } else { args.first().cloned().unwrap_or_else(|| "/".into()) };
     let mut fonts = Vec::new();
     for f in FONT_FILES {
         let path = format!("{}/{}", FONT_DIR, f);
@@ -514,6 +716,8 @@ fn run() -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
     let dir = exe.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| "/mnt/bin".into());
     let open = std::fs::read_to_string(OPEN_TABLE).map(|t| open_with::parse(&t)).unwrap_or_default();
+    let apps = std::fs::read_to_string(APPS).unwrap_or_default();
+    let windowed = program::windowed(apps.lines().filter_map(|l| l.split_once('\t')).map(|(_, c)| c).chain(open.iter().map(|(_, c)| c.as_str())));
     let timeout = Duration::from_millis(std::env::var("FILES_PREVIEW_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(TIMEOUT_MS));
     let mut win = Window::open("Files", Some((780, 470)))?;
     win.set_resizable(360, 240)?;
@@ -530,6 +734,9 @@ fn run() -> std::io::Result<()> {
         open,
         timeout,
         apps: Vec::new(),
+        windowed,
+        read_dir: Duration::ZERO,
+        previews: Vec::new(),
     };
     let mut st = State::new(theme, 1);
     app.navigate(&mut st, &start, None);
@@ -544,16 +751,32 @@ fn run() -> std::io::Result<()> {
     loop {
         let (w, h) = win.size();
         if dirty {
-            let t = texts(&app, &st);
+            let mut f = FrameTime { handle: bench.as_mut().map_or(Duration::ZERO, |b| std::mem::take(&mut b.handle)), ..FrameTime::default() };
+            let t = Instant::now();
+            let tx = texts(&app, &st);
             let folder = &app.folder;
             let row = |i| folder.row(i);
             let place = |i: usize| Row { key: i as u64, cells: vec![PLACES[i].into()] };
-            let tr = tree(&app, &t, &row, &place);
+            let tr = tree(&app, &tx, &row, &place);
             let title = format!("Files: {}", app.folder.path);
             let frame = st.render(&title, &tr, (w as i32, h as i32), &mut p);
-            p.paint(&frame.paint, win.frame()?, w, h);
+            f.render = t.elapsed();
+            let t = Instant::now();
+            let px = win.frame()?;
+            f.wait = t.elapsed();
+            let t = Instant::now();
+            p.paint(&frame.paint, px, w, h);
+            f.paint = t.elapsed();
+            let t = Instant::now();
             win.set_semantics(&frame.nodes)?;
+            f.sem = t.elapsed();
+            let t = Instant::now();
             win.present()?;
+            f.present = t.elapsed();
+            f.stats = STATS.swap(0, Ordering::Relaxed);
+            if let Some(b) = bench.as_mut() {
+                b.frame(f);
+            }
             dirty = false;
         }
         if first {
@@ -562,7 +785,13 @@ fn run() -> std::io::Result<()> {
         }
         // previews and apps run while we wait for input
         let busy = app.job.is_some() || app.pending.is_some();
-        let ev = win.next_event(Some(if busy { Duration::from_millis(40) } else { Duration::from_millis(1000) }))?;
+        let wait = match (&bench, busy) {
+            (Some(_), true) => Duration::from_millis(2),
+            (Some(_), false) => Duration::ZERO,
+            (None, true) => Duration::from_millis(40),
+            (None, false) => Duration::from_millis(1000),
+        };
+        let ev = win.next_event(Some(wait))?;
         app.apps.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
         if let Some((row, at)) = app.pending {
             if at.elapsed() >= SETTLE {
@@ -572,6 +801,53 @@ fn run() -> std::io::Result<()> {
             }
         }
         dirty |= app.poll_job(face);
+        let now = t0.elapsed().as_millis() as u32;
+        if let Some(b) = bench.as_mut() {
+            let idle = app.pending.is_none() && app.job.is_none();
+            match b.steps.front() {
+                None => {
+                    b.summary(&app);
+                    break;
+                }
+                Some(Step::Settle) if !idle => {}
+                Some(Step::Settle) => {
+                    b.steps.pop_front();
+                }
+                Some(Step::Go(path)) => {
+                    let path = path.clone();
+                    b.steps.pop_front();
+                    app.navigate(&mut st, &path, None);
+                    st.set_focus(Some(LIST));
+                    b.dirs.push(BenchDir {
+                        path,
+                        items: app.folder.entries.len(),
+                        read_dir: app.read_dir,
+                        first: None,
+                        keys: Vec::new(),
+                        previews: app.previews.len(),
+                    });
+                    b.nav = true;
+                    dirty = true;
+                }
+                Some(&Step::Key(code)) => {
+                    b.steps.pop_front();
+                    let t = Instant::now();
+                    let actions = {
+                        let tx = texts(&app, &st);
+                        let folder = &app.folder;
+                        let row = |i| folder.row(i);
+                        let place = |i: usize| Row { key: i as u64, cells: vec![PLACES[i].into()] };
+                        let tr = tree(&app, &tx, &row, &place);
+                        st.handle(&tr, (w as i32, h as i32), Input::Key { code, pressed: true }, now, &mut p)
+                    };
+                    for a in actions {
+                        app.act(&mut st, a);
+                    }
+                    b.handle = t.elapsed();
+                    dirty = true;
+                }
+            }
+        }
         let Some(ev) = ev else { continue };
         dirty = true;
         let input = match ev {
@@ -588,7 +864,6 @@ fn run() -> std::io::Result<()> {
             Event::Wheel { steps } => Input::Wheel { dy: -steps },
             Event::RelativeMotion { .. } => continue,
         };
-        let now = t0.elapsed().as_millis() as u32;
         let actions = {
             let t = texts(&app, &st);
             let folder = &app.folder;

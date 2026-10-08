@@ -2045,3 +2045,15 @@ fn the_wheel_goes_to_the_content_under_the_pointer() {
     assert_eq!(h.comp.pointer_locked(), Some((b, 4)));
     assert_eq!(axis(&mut h, 3), vec![(b, Event::Axis { surface: 4, steps: 3 })]);
 }
+
+#[test]
+fn a_click_on_one_title_bar_then_another_moves_the_focus() {
+    let mut h = H_::new();
+    let a = h.window(100, 100, 0x00AA_0000); // at (40, 40)
+    let b = h.window(100, 100, 0x0000_BB00); // at (72, 72), on top
+    h.compose();
+    click(&mut h, 150, 75); // b's title bar: a press and a release with no motion between
+    assert_eq!(h.comp.focus(), Some((b, 4)));
+    click(&mut h, 45, 45); // a's title bar, where b does not cover it
+    assert_eq!(h.comp.focus(), Some((a, 4)), "the second title-bar click was ignored");
+}

@@ -184,3 +184,35 @@ fn decode_refuses_a_lying_provider() {
     // capacity holds the largest answer
     assert!(preview::capacity(512, 512) >= preview::HEADER + preview::MAX_META + 512 * 512 * 4);
 }
+
+#[test]
+fn programs_are_executable_elf_files_or_scripts() {
+    use files::program::{detect, Program};
+    let elf = b"\x7fELF\x02\x01\x01\0";
+    assert_eq!(detect(0o100_755, elf), Some(Program::Elf));
+    // one x bit is enough
+    assert_eq!(detect(0o100_744, elf), Some(Program::Elf));
+    assert_eq!(detect(0o100_755, b"#!/bin/sh\necho hi\n"), Some(Program::Script { interpreter: "/bin/sh".into() }));
+    assert_eq!(detect(0o100_755, b"#! /usr/bin/env python3 -u\n"), Some(Program::Script { interpreter: "/usr/bin/env".into() }));
+    assert_eq!(detect(0o100_755, b"#!/bin/sh"), Some(Program::Script { interpreter: "/bin/sh".into() }));
+    // not executable
+    assert_eq!(detect(0o100_644, elf), None);
+    assert_eq!(detect(0o100_644, b"#!/bin/sh\n"), None);
+    // executable but neither: Linux's execve says ENOEXEC
+    assert_eq!(detect(0o100_755, b"echo hi\n"), None);
+    assert_eq!(detect(0o100_755, b""), None);
+    assert_eq!(detect(0o100_755, b"#!\n"), None);
+    assert_eq!(detect(0o100_755, b"#!\xff\xfe\n"), None);
+    // a directory's x bit is search permission, a device is not a program
+    assert_eq!(detect(0o040_755, elf), None);
+    assert_eq!(detect(0o020_755, elf), None);
+    assert_eq!(detect(0o120_777, elf), None);
+}
+
+#[test]
+fn windowed_programs_come_from_the_launcher_and_open_with_commands() {
+    let apps = "Terminal\tterm\nFiles\tfiles /mnt\nDOOM\t/mnt/bin/doom -iwad x.wad\n";
+    let open = open_with::parse("png\timgview\n");
+    let cmds = apps.lines().filter_map(|l| l.split_once('\t')).map(|(_, c)| c).chain(open.iter().map(|(_, c)| c.as_str()));
+    assert_eq!(files::program::windowed(cmds), ["doom", "files", "imgview", "term"]);
+}

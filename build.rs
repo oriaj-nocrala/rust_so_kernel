@@ -48,6 +48,7 @@ fn main() {
     // GPU firmware (`kernel/src/firmware.rs`, GPU plan decision D3).
     ensure_firmware();
     sync_disk_tree(&disk_image, "lib/firmware");
+    warn_stale_nvk_programs();
 
     // pass the disk image paths as env variables to the `main.rs`
     println!("cargo:rustc-env=UEFI_PATH={}", uefi_path.display());
@@ -542,6 +543,77 @@ fn sync_disk_tree(disk_path: &std::path::Path, rel: &str) {
 /// that combination panics inside cargo itself ("no entry found for key" in
 /// unit_dependencies.rs) on every nightly tested — a known upstream
 /// limitation, not something fixable from this repo's config.
+/// The NVK programs are built outside `cargo build` (`probes/nvk/build.py`, then `strip -o disk-image-root/bin/<name>`, see the
+/// `gpu-g5` skill), so nothing rebuilds them when their sources change. A stale `vk_comp` on the stick once refused every client
+/// using a newer request (`no such request`). Warn when a staged binary is older than any of its inputs.
+fn warn_stale_nvk_programs() {
+    let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    const COMMON: &[&str] = &["nvgpu/uapi/nvgpu.h", "mesa-port/overlay", "probes/nvk/stubs.c"];
+    const PROGRAMS: &[(&str, &[&str])] = &[
+        (
+            "vk_comp",
+            &[
+                "vk-comp/src",
+                "vk-comp/Cargo.toml",
+                "gui/src",
+                "draw/src",
+                "text/src",
+                "probes/nvk/comp_vk.c",
+                "probes/nvk/comp_api.h",
+                "probes/nvk/comp_render.h",
+                "probes/nvk/comp_spv.h",
+                "probes/nvk/blur_spv.h",
+                "gui-capi/include",
+            ],
+        ),
+        ("vk_window", &["probes/nvk/vk_window.c"]),
+        ("snake3d", &["probes/nvk/vk_snake.c", "probes/nvk/snake3d_font.h", "probes/nvk/snake3d_spv.h"]),
+        ("vk_draw", &["probes/nvk/vk_draw.c", "probes/nvk/draw_spv.h"]),
+        ("vk_probe", &["probes/nvk/vk_probe.c", "probes/nvk/probe_spv.h"]),
+        ("vk_share", &["probes/nvk/vk_share.c"]),
+    ];
+    // the newest input under `p` (a file or a directory), and which one
+    fn newest(p: &std::path::Path, best: &mut Option<(std::time::SystemTime, PathBuf)>) {
+        if p.is_dir() {
+            let Ok(entries) = std::fs::read_dir(p) else { return };
+            for e in entries.flatten() {
+                // tests do not reach the binary
+                if !["target", ".git", "tests", "tests.rs"].iter().any(|n| e.file_name() == *n) {
+                    newest(&e.path(), best);
+                }
+            }
+        } else if let Ok(t) = std::fs::metadata(p).and_then(|m| m.modified()) {
+            if best.as_ref().is_none_or(|(b, _)| t > *b) {
+                *best = Some((t, p.to_path_buf()));
+            }
+        }
+    }
+    for (name, inputs) in PROGRAMS {
+        let bin = root.join("disk-image-root/bin").join(name);
+        let Ok(built) = std::fs::metadata(&bin).and_then(|m| m.modified()) else { continue };
+        println!("cargo:rerun-if-changed={}", bin.display());
+        let mut best = None;
+        for i in inputs.iter().chain(COMMON) {
+            let p = root.join(i);
+            if p.is_dir() {
+                watch_dir_recursive(&p);
+            } else {
+                println!("cargo:rerun-if-changed={}", p.display());
+            }
+            newest(&p, &mut best);
+        }
+        if let Some((t, newer)) = best.filter(|(t, _)| *t > built) {
+            let ago = t.duration_since(built).map_or(0, |d| d.as_secs() / 60);
+            println!(
+                "cargo:warning=disk-image-root/bin/{} is older than {} (by {} min): rebuild it (probes/nvk/build.py, then strip, gpu-g5 skill) or the stick gets a stale one",
+                name,
+                newer.strip_prefix(&root).unwrap_or(&newer).display(),
+                ago
+            );
+        }
+    }
+}
+
 /// Emit `cargo:rerun-if-changed` for every file under `dir`, recursively.
 ///
 /// Same helper (and same lesson) as kernel/build.rs: a directory-level
