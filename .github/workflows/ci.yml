@@ -77,6 +77,10 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          # The trigger is asynchronous: wait for it, and set the mode directly in case the rule did not apply.
+          sudo udevadm settle || true
+          [ -e /dev/kvm ] && sudo chmod 666 /dev/kvm
+          ls -l /dev/kvm || true
           if [ -w /dev/kvm ]; then echo "KVM: usable"; else echo "::warning::/dev/kvm not writable: QEMU runs under TCG"; fi
 
       # Installs what rust-toolchain.toml names, its targets included (the musl std for STD_PROGRAMS); a no-op when present.

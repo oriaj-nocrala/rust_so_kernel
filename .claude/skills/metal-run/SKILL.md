@@ -14,7 +14,7 @@ The machine boots constanos from a USB stick and also runs Linux, which is where
 GPT partitions: `boot` (FAT, 34816 sectors), `constanos-data` (ext2, becomes `/mnt`), `constanos-log` (raw, the kernel log).
 
 - **Never `dd` the UEFI image onto the whole device**: that replaces the GPT and destroys `constanos-data` and `constanos-log`. Also never `dd` the image's own FAT into `boot`: it is too small for the kernel and truncates it.
-- **Kernel**: `scripts/deploy-usb-boot.sh`. It builds a fresh FAT16 with `bootx64.efi` and the kernel through `strip --strip-debug`, boot-tests it in QEMU from a `usb-storage` stick, then writes it and reads it back.
+- **Kernel**: `scripts/deploy-usb-boot.sh`. It builds a fresh FAT16 with `bootx64.efi` and the kernel through `strip --strip-all` (DWARF and symbols out, ~10 MB; gdb uses the unstripped ELF on the host), boot-tests it in QEMU from a `usb-storage` stick, then writes it and reads it back.
   - `--image-only`: build and test without writing.
   - `--no-test`: needed for a kernel built with `CONSTANOS_TEST_HANG_BEFORE_FS=1`, which fails the boot test on purpose.
 - **Data** (`/mnt`: programs, WADs, fonts): `scripts/sync-usb-data.sh`.

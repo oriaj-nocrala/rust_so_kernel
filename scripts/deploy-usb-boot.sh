@@ -12,11 +12,15 @@
 # partition's size holding the same two files:
 #
 #   efi/boot/bootx64.efi   copied from the UEFI image
-#   kernel-x86_64          kernel/target/.../kernel through `strip --strip-debug`
+#   kernel-x86_64          kernel/target/.../kernel through `strip --strip-all`
 #
-# Stripping only drops DWARF: the PT_LOAD segments are byte-identical, and
-# nothing on the target machine reads debug info (gdb runs against the
-# unstripped ELF on the host). ~18 MB -> ~6 MB.
+# Stripping drops DWARF and the symbol table: the PT_LOAD segments are
+# byte-identical and the dynamic sections the bootloader relocates the PIE
+# kernel with (.dynsym, .rela.dyn, .dynamic) stay; nothing on the target
+# reads the symbols (gdb and the panic addresses are resolved against the
+# unstripped ELF on the host). --strip-debug alone stopped being enough on
+# 2026-10-08: .strtab (Rust's mangled names) was 6.3 MB and the kernel
+# 17.8 MB against the 17 MiB partition. ~54 MB -> ~10.4 MB.
 #
 # Before writing, the image is boot-tested in QEMU as a `usb-storage`
 # stick next to the real stick's shape (`scripts/usb-log.sh mkimage`),
@@ -74,7 +78,7 @@ if [[ $IMAGE_ONLY -eq 0 ]]; then
 fi
 
 # ── Build the FAT ────────────────────────────────────────────────────────
-strip --strip-debug -o "$WORK/kernel" "$KERNEL_ELF"
+strip --strip-all -o "$WORK/kernel" "$KERNEL_ELF"
 mcopy -i "$UEFI_IMG@@$((34 * 512))" ::/efi/boot/bootx64.efi "$WORK/bootx64.efi"
 rm -f "$OUT"
 truncate -s $((SECTORS * 512)) "$OUT"
