@@ -108,8 +108,12 @@ dd if="$BOOT_FAT" of="$IMG" bs=512 seek=34 conv=notrunc status=none
 BUILD_OUT="$(ls -t target/debug/build/so2-*/output 2>/dev/null | head -1 || true)"
 OVMF_CODE="$(grep -oP 'OVMF_CODE=\K.*' "$BUILD_OUT")"
 OVMF_VARS="$(grep -oP 'OVMF_VARS=\K.*' "$BUILD_OUT")"
+# KVM when there is one, unless QEMU_ACCEL=tcg: under nested virtualization (a CI
+# runner) every ATA PIO port access is a costly VM exit, and mounting /mnt from
+# the IDE disk took over 100 s with KVM, where TCG pays nothing extra for port I/O.
 ACCEL=(-cpu max)
-[[ -w /dev/kvm ]] && ACCEL=(-enable-kvm -cpu host)
+[[ -w /dev/kvm && "${QEMU_ACCEL:-}" != tcg ]] && ACCEL=(-enable-kvm -cpu host)
+BOOT_TIMEOUT="${BOOT_TIMEOUT:-120}"
 
 # boot_test NAME DISK-ARGS...: boots the image with -snapshot (nothing is
 # written to it) and waits for /mnt and the first process.
@@ -118,14 +122,14 @@ boot_test() {
     local log="$OUT_DIR/boot-test-$name.log"
     rm -f "$log"
     cp "$OVMF_VARS" "$WORK/vars-$name.fd"
-    timeout 120 qemu-system-x86_64 \
+    timeout "$BOOT_TIMEOUT" qemu-system-x86_64 \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
         -drive "if=pflash,format=raw,file=$WORK/vars-$name.fd" \
         "$@" -snapshot \
         -m 2G -smp 2 "${ACCEL[@]}" -serial "file:$log" -display none -monitor none \
         >/dev/null 2>&1 &
     local qpid=$! ok=0
-    for _ in $(seq 1 120); do
+    for _ in $(seq 1 "$BOOT_TIMEOUT"); do
         if grep -aq "About to start first process" "$log" 2>/dev/null; then ok=1; break; fi
         if grep -aq "KERNEL PANIC" "$log" 2>/dev/null; then break; fi
         kill -0 "$qpid" 2>/dev/null || break

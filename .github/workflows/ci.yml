@@ -68,12 +68,6 @@ jobs:
       - name: Packages
         run: bash scripts/ci-deps.sh
 
-      - name: KVM for QEMU
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-
       - name: Rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
 
@@ -106,8 +100,13 @@ jobs:
       - name: Kernel tests in QEMU
         run: scripts/run-kernel-tests.sh
 
+      # TCG, not KVM: the runner is itself a VM, and under nested KVM every ATA PIO
+      # port access is a VM exit; mounting /mnt from the IDE disk took over 100 s.
       - name: Release image (boot-tested as USB and IDE)
         run: scripts/make-release-image.sh
+        env:
+          QEMU_ACCEL: tcg
+          BOOT_TIMEOUT: 300
 
       - uses: actions/upload-artifact@v4
         with:
