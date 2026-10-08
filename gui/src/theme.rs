@@ -378,6 +378,36 @@ pub struct Menu {
     pub separator: u32,
 }
 
+/// What a program's own widgets (the `ui` crate: buttons, fields, lists) look like in this theme, so an app matches the frame around it.
+/// Colours are `0x00RRGGBB`; buttons and column headers are drawn like the title bar's ([`Button::paint`]). Lengths at scale 1.
+#[derive(Debug, PartialEq)]
+pub struct Widgets {
+    /// The window's background and its text.
+    pub face: u32,
+    pub fg: u32,
+    /// Secondary text: placeholders, a list's other columns.
+    pub dim_fg: u32,
+    /// Inside a text field or a list, and their 1-pixel border.
+    pub field: u32,
+    pub field_border: u32,
+    /// A selected row in the focused list, and in a list without focus.
+    pub selection: u32,
+    pub selection_fg: u32,
+    pub selection_idle: u32,
+    pub selection_idle_fg: u32,
+    /// The ring around the focused widget.
+    pub focus: u32,
+    pub button: Button,
+    pub button_fg: u32,
+    pub header: Button,
+    pub header_fg: u32,
+    /// A list in the sidebar style (places).
+    pub sidebar: u32,
+    pub sidebar_fg: u32,
+    /// A split's handle and a list's scroll thumb.
+    pub splitter: u32,
+}
+
 /// One look. See the module's documentation.
 #[derive(Debug, PartialEq)]
 pub struct Theme {
@@ -406,6 +436,7 @@ pub struct Theme {
     pub glyph_weight: i32,
     pub taskbar: Taskbar,
     pub menu: Menu,
+    pub widgets: Widgets,
 }
 
 /// "Luna 2026": Windows XP's Luna redone with shaders: glossy blue title bars with rounded tops, a blue frame, soft shadows, a red close
@@ -476,6 +507,32 @@ pub static LUNA: Theme = Theme {
         footer_h: 30,
         separator: 0x00C5_D4EA,
     },
+    // XP's: the beige face, the blue-grey field border, the menu's selection blue, the start menu's side column for the sidebar.
+    widgets: Widgets {
+        face: 0x00EC_E9D8,
+        fg: 0x0000_0000,
+        dim_fg: 0x0080_8080,
+        field: 0x00FF_FFFF,
+        field_border: 0x007F_9DB9,
+        selection: 0x0031_6AC5,
+        selection_fg: 0x00FF_FFFF,
+        selection_idle: 0x00D4_D0C8,
+        selection_idle_fg: 0x0000_0000,
+        focus: 0x0031_6AC5,
+        button: Button::Shape {
+            normal: Shape::gradient(0xFFFF_FFFF, 0xFFF4_F3EE, 0xFFEC_EBE6, 0xFFD6_D0C5, 0.6).radius(3.0).border(1.0, 0xFF00_3C74),
+            pressed: Shape::gradient(0xFFD1_CCC1, 0xFFE3_E2DA, 0xFFE3_E2DA, 0xFFEF_EEEA, 0.4).radius(3.0).border(1.0, 0xFF00_3C74),
+        },
+        button_fg: 0x0000_0000,
+        header: Button::Shape {
+            normal: Shape::gradient(0xFFFF_FFFF, 0xFFF6_F5EE, 0xFFEB_EADB, 0xFFE2_E1D3, 0.5).border(1.0, 0xFFD6_D2C2),
+            pressed: Shape::solid(0xFFDE_DFD8).border(1.0, 0xFFA5_A597),
+        },
+        header_fg: 0x0000_0000,
+        sidebar: 0x00D3_E5FA,
+        sidebar_fg: 0x0000_1E5A,
+        splitter: 0x00AC_A899,
+    },
 };
 
 /// "9x moderno": Windows 98's layout (grey bevelled frame and buttons, a navy-to-blue title running left to right, a teal desktop) with
@@ -531,6 +588,26 @@ pub static NINES: Theme = Theme {
         footer: None,
         footer_h: 0,
         separator: 0x0080_8080,
+    },
+    // 98's: the grey face, bevelled buttons and headers, the title's navy for the selection.
+    widgets: Widgets {
+        face: 0x00D4_D0C8,
+        fg: 0x0000_0000,
+        dim_fg: 0x0080_8080,
+        field: 0x00FF_FFFF,
+        field_border: 0x0080_8080,
+        selection: 0x000A_246A,
+        selection_fg: 0x00FF_FFFF,
+        selection_idle: 0x00D4_D0C8,
+        selection_idle_fg: 0x0000_0000,
+        focus: 0x0000_0000,
+        button: Button::Bevel { face: 0x00D4_D0C8, light: 0x00FF_FFFF, dark: 0x0040_4040 },
+        button_fg: 0x0000_0000,
+        header: Button::Bevel { face: 0x00D4_D0C8, light: 0x00FF_FFFF, dark: 0x0080_8080 },
+        header_fg: 0x0000_0000,
+        sidebar: 0x00FF_FFFF,
+        sidebar_fg: 0x0000_0000,
+        splitter: 0x00D4_D0C8,
     },
 };
 

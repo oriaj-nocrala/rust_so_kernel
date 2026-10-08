@@ -79,6 +79,8 @@ hangs from one of these six. Build a backbone once, in the layer that owns the i
 - **Where:** `gui` crate (host-tested), compositor, `userspace::gfx`; the three.js runtime's UI
   helper must emit nodes too (otherwise generated apps are invisible to the agent).
 - **First step:** a tree for the panel and `term`; `agentd` reads it.
+- **Status:** the mechanism exists (`gui::semantic`, `semantics_node`/`get_semantics`, `docs/reference/graphics.md`): the `ui` widgets
+  publish it and `gui-tree` reads it. Not yet: the panel, `term` and `gfx` clients, files under P7.2, actions (only listed).
 - **Why now:** retrofitting accessibility is the classic mistake of the big OSes; the GUI
   libraries are still small.
 

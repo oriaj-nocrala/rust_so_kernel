@@ -184,6 +184,10 @@ impl Mapping {
         Ok(Mapping { addr: a, len })
     }
 
+    pub fn as_ptr(&self) -> *const u8 {
+        self.addr as *const u8
+    }
+
     /// The mapping as `0x00RRGGBB` pixels (`len / 4` of them).
     pub fn pixels(&mut self) -> &mut [u32] {
         unsafe { std::slice::from_raw_parts_mut(self.addr as *mut u32, self.len / 4) }

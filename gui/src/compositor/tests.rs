@@ -1934,3 +1934,81 @@ fn a_transparent_window_shows_neither_its_frame_nor_its_bar_through() {
     assert_ne!(h.px(r.x + 50, r.y - 5), h.desktop(r.x + 50, r.y - 5), "the bar is above it");
     assert_ne!(h.px(r.x - 1, r.y + 30), h.desktop(r.x - 1, r.y + 30), "the frame is around it");
 }
+
+fn sem(id: u32, parent: u32, role: crate::semantic::Role, name: &str) -> Node {
+    let mut n = Node::new(id, parent, role, Rect::new(1, 2, 30, 4));
+    n.name = name.into();
+    n
+}
+
+/// The `get_semantics` answer as (window title, focused, node names).
+fn semantics_dump(h: &mut H_, asker: ClientId, cb: u32) -> Vec<(std::string::String, bool, Vec<std::string::String>)> {
+    h.send(asker, &[R::GetSemantics { id: cb }]);
+    let mut out: Vec<(std::string::String, bool, Vec<std::string::String>)> = Vec::new();
+    let mut done = false;
+    for e in h.events_for(asker) {
+        match e {
+            Event::SemanticsWindow { callback, title, focused, .. } if callback == cb => out.push((title, focused, Vec::new())),
+            Event::SemanticsNode { callback, node } if callback == cb => out.last_mut().unwrap().2.push(node.name),
+            Event::Done { callback, .. } if callback == cb => done = true,
+            Event::DeleteId { id } if id == cb => assert!(done, "delete_id before done"),
+            _ => {}
+        }
+    }
+    assert!(done, "no done");
+    out
+}
+
+#[test]
+fn semantic_tree_applies_at_commit_and_is_dumped_per_window() {
+    use crate::semantic::Role;
+    let mut h = H_::new();
+    let a = h.window(40, 30, 0x00FF_0000);
+    let b = h.window(40, 30, 0x0000_FF00);
+    h.send(a, &[R::SetTitle { surface: 4, title: "A".into() }]);
+    h.send(b, &[R::SetTitle { surface: 4, title: "B".into() }]);
+    h.send(a, &[
+        R::SemanticsNode { surface: 4, node: sem(1, 0, Role::Window, "root") },
+        R::SemanticsNode { surface: 4, node: sem(2, 1, Role::Button, "Open") },
+    ]);
+    let asker = h.comp.add_client();
+    // not committed yet: nothing
+    assert_eq!(semantics_dump(&mut h, asker, 9), vec![("A".into(), false, vec![]), ("B".into(), true, vec![])]);
+    h.send(a, &[R::Commit { surface: 4 }]);
+    let d = semantics_dump(&mut h, asker, 9); // the id is free again after delete_id
+    assert_eq!(d[0], ("A".into(), false, vec!["root".into(), "Open".into()]));
+    // a commit without nodes keeps the tree; new nodes replace it whole
+    h.send(a, &[R::Commit { surface: 4 }]);
+    assert_eq!(semantics_dump(&mut h, asker, 9)[0].2, vec!["root", "Open"]);
+    h.send(a, &[R::SemanticsNode { surface: 4, node: sem(1, 0, Role::Window, "root2") }, R::Commit { surface: 4 }]);
+    assert_eq!(semantics_dump(&mut h, asker, 9)[0].2, vec!["root2"]);
+    // the whole node survives the trip
+    h.send(asker, &[R::GetSemantics { id: 10 }]);
+    let n = h.events_for(asker).into_iter().find_map(|e| if let Event::SemanticsNode { node, .. } = e { Some(node) } else { None });
+    assert_eq!(n, Some(sem(1, 0, Role::Window, "root2")));
+    // the window's box on the screen
+    h.send(asker, &[R::GetSemantics { id: 11 }]);
+    let wbox = h.events_for(asker).into_iter().find_map(|e| match e {
+        Event::SemanticsWindow { x, y, w, h: hh, toplevel, .. } if toplevel == 1 => Some(Rect::new(x, y, w, hh)),
+        _ => None,
+    });
+    assert_eq!(wbox, h.comp.window_content(a, 4));
+}
+
+#[test]
+fn semantic_nodes_are_checked() {
+    use crate::semantic::{Role, MAX_NODES};
+    let mut h = H_::new();
+    let a = h.window(40, 30, 0x00FF_0000);
+    h.send(a, &[R::SemanticsNode { surface: 4, node: sem(0, 0, Role::Window, "zero") }]);
+    assert!(h.events_for(a).iter().any(|e| matches!(e, Event::Error { message, .. } if message.contains("id 0"))));
+    assert!(!h.comp.has_client(a));
+
+    let a = h.window(40, 30, 0x00FF_0000);
+    let many: Vec<Request> = (1..=MAX_NODES as u32).map(|i| R::SemanticsNode { surface: 4, node: sem(i, 0, Role::Label, "") }).collect();
+    h.send(a, &many);
+    assert!(h.comp.has_client(a), "MAX_NODES nodes are allowed");
+    h.send(a, &[R::SemanticsNode { surface: 4, node: sem(1, 0, Role::Label, "") }]);
+    assert!(h.events_for(a).iter().any(|e| matches!(e, Event::Error { code: 2, .. })));
+    assert!(!h.comp.has_client(a));
+}

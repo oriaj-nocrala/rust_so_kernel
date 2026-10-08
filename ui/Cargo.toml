@@ -1,0 +1,27 @@
+[package]
+name = "ui"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+edition = "2021"
+
+# Widgets for programs' windows (stage 7 of docs/ux/handoff-capabilities-to-files.md): label, button, text field, a virtualized list
+# with columns (also the sidebar), scroll area, split pane, image, pane. The app describes its window each frame as a `Widget` tree;
+# `State` keeps focus, selections, scroll and text, turns input into `Action`s, and renders the tree as `Paint` operations plus the
+# semantic tree (`gui::semantic`, AccessKit's schema). Looks come from `gui::theme`'s `Widgets`. no_std + alloc, no syscalls, no fonts:
+# text is measured through the `Measure` trait — `cd ui && cargo test`. The `render` feature adds the painter (pixels, the `text` crate).
+# Its own workspace, like `gui`.
+[workspace]
+
+[dependencies]
+gui = { path = "../gui" }
+# The US keymap (`vt::keymap`): the same keys give the same characters as in `term`.
+vt = { path = "../vt" }
+text = { path = "../text", optional = true }
+draw = { path = "../draw", optional = true }
+
+[features]
+render = ["dep:text", "dep:draw"]
+
+[[test]]
+name = "render"
+required-features = ["render"]

@@ -166,6 +166,10 @@ const DISK_PIE_PROGRAMS: &[&str] = &["pie_test"];
 const STD_PROGRAMS: &[(&str, &str)] = &[
     // A window under the compositor from std (stage 6 of docs/ux/handoff-capabilities-to-files.md).
     ("gui-client", "hello-window"),
+    // Prints every window's semantic tree (gui::semantic); `gui-e2e.sh ui` reads it.
+    ("gui-client", "gui-tree"),
+    // The `ui` widgets (stage 7).
+    ("ui-demo", "ui-demo"),
 ];
 
 /// Not built here at all — see the busybox.elf handling below, which
@@ -306,7 +310,7 @@ fn main() {
     watch_dir_recursive(&workspace_root.join("quake-port"));
     // The library crates userspace links by path: an edit to one of them
     // (a `draw` blit, an `img` decoder fix) must rebuild the programs.
-    for krate in ["gui", "vt", "draw", "text", "img", "sched"] {
+    for krate in ["gui", "vt", "draw", "text", "img", "sched", "ui"] {
         println!("cargo:rerun-if-changed={}", workspace_root.join(krate).join("Cargo.toml").display());
         watch_dir_recursive(&workspace_root.join(krate).join("src"));
     }

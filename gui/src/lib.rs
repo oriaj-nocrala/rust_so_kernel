@@ -16,6 +16,7 @@
 //!   names, as typed requests and events over `wire`.
 //! - [`compositor`]: clients, their objects, surfaces with pending and
 //!   current state, stacking, focus, the pointer, and `compose`.
+//! - [`semantic`]: the semantic tree a window publishes (AccessKit's schema), for tests and agents.
 //! - [`theme`]: the looks a GPU host's draw list can take (shapes: gradients,
 //!   rounded corners, shadows).
 
@@ -26,5 +27,6 @@ extern crate alloc;
 pub mod compositor;
 pub mod protocol;
 pub mod region;
+pub mod semantic;
 pub mod theme;
 pub mod wire;

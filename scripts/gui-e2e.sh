@@ -77,6 +77,22 @@
 #       is drawn under the pointer.
 #   S3. A left click and two keys reach it.
 #   S4. Esc ends it with exit(0) and the window goes; the console comes back.
+#   scripts/gui-e2e.sh ui       # the `ui` widgets and the semantic tree (stage 7)
+#
+# `ui` mode runs `compositor /mnt/bin/ui-demo term` and reads ui-demo's
+# semantic tree with `gui-tree` typed in term (term is dragged below
+# ui-demo first; clicking term's title bar, then ui-demo's, moves the
+# keyboard between them):
+#   U1. The tree has the window, the button, the field, the places and a
+#       10000-row list of which only the shown rows are nodes.
+#   U2. Tab moves the focus to the field; typed text and Enter reach it
+#       (Submitted, the field's value in the tree).
+#   U3. Tab to the list, End: the last row is selected and in view, still
+#       only the shown rows; "d" finds "date 00003"; the status label says
+#       so; the selected row is the theme's selection colour on screen.
+#   U4. A click on the button (its bounds from the tree) is a click; a
+#       double click on a row opens it.
+#   U5. Esc ends ui-demo with exit(0); the console comes back.
 # Exit status: number of failed checks.
 set -u
 MODE=${1:-demo}
@@ -389,6 +405,88 @@ if [ "$MODE" = std ]; then
     grep -aq "KERNEL PANIC" "$STATE/serial.log" && bad "kernel panic in the log"
     $Q stop >/dev/null 2>&1
     echo "gui-e2e std: $([ $fails = 0 ] && echo PASS || echo "FAIL ($fails)")"
+    exit $fails
+fi
+
+if [ "$MODE" = ui ]; then
+    PX=640; PY=400                      # the pointer starts at the centre; moves are 1:1
+    mv() { $Q mouse-move $(($1 - PX)) $(($2 - PY)) >/dev/null; PX=$1; PY=$2; sleep 0.3; }
+    clk() { mv "$1" "$2"; $Q mouse-button 1 >/dev/null; $Q mouse-button 0 >/dev/null; sleep 0.5; }
+    n=0
+    tree() { # tree: runs gui-tree in term, prints its lines (each prefixed "T<n> " on the serial log)
+        n=$((n + 1))
+        clk 700 468                     # term's title bar (moved below ui-demo's window)
+        # to a file first: the compositor's "client gone" when gui-tree exits would interleave with lines piped to the console
+        $Q send "gui-tree > /tmp/t$n; sed 's/^/T$n /' /tmp/t$n > /dev/console; echo T$n-DONE > /dev/console" && $Q enter
+        $Q wait-for "T$n-DONE" 20 >/dev/null || echo "  (gui-tree $n did not finish)" >&2
+        grep -a "T$n " "$STATE/serial.log" | sed "s/.*T$n //"
+        clk 300 80                      # ui-demo's title bar: the keyboard back to it
+    }
+    node() { grep -m1 -- "$1"; }        # node <pattern> < tree
+    # screen box of a node line: the window's content origin + its @x,y wxh
+    scr() { # scr <tree file> <node pattern> -> "x y" of its centre on the screen
+        python3 - "$1" "$2" <<'PY'
+import re, sys
+lines = open(sys.argv[1]).read().splitlines()
+win = next(l for l in lines if l.startswith('window ') and '"ui-demo"' in l)
+wx, wy = map(int, re.search(r' at (-?\d+),(-?\d+) ', win).groups())
+l = next(l for l in lines if re.search(sys.argv[2], l))
+x, y, w, h = map(int, re.search(r'@(-?\d+),(-?\d+) (\d+)x(\d+)', l).groups())
+print(wx + x + w // 2, wy + y + h // 2, wx + x + w - 20)
+PY
+    }
+    $Q send "compositor /mnt/bin/ui-demo term" && $Q enter
+    $Q wait-for "ui-demo: ready" 60 >/dev/null || bad "U1 ui-demo never got ready"
+    $Q wait-for "term: 80x25" 30 >/dev/null || bad "U1 term never started"
+    sleep 2
+    # term (40,40, 720 wide) is under ui-demo (72,72): drag it down out of the way, so clicking one never covers the other
+    mv 700 48; $Q mouse-button 1 >/dev/null; mv 700 258; mv 700 468; $Q mouse-button 0 >/dev/null; sleep 1
+    tree > "$OUT/t1"
+    grep -q '^window [0-9]* "ui-demo" at ' "$OUT/t1" && ok "U1 gui-tree lists ui-demo's window" || bad "U1 no ui-demo window in: $(head -3 "$OUT/t1")"
+    node 'Button#10 "Add"' < "$OUT/t1" | grep -q "{Click,Focus}" && ok "U1 the Add button" || bad "U1 no Add button"
+    node 'TextInput#11 "Search"' < "$OUT/t1" >/dev/null && ok "U1 the Search field" || bad "U1 no Search field"
+    [ "$(grep -c 'ListBoxOption.*"/' "$OUT/t1")" = 5 ] && ok "U1 five places" || bad "U1 places: $(grep -c 'ListBoxOption.*"/' "$OUT/t1")"
+    rows=$(grep -c 'ListBoxOption.*/10000)' "$OUT/t1")
+    node 'ListBox#12 "Items"' < "$OUT/t1" | grep -q "(of 10000)" && [ "$rows" -ge 8 ] && [ "$rows" -le 14 ] \
+        && ok "U1 a 10000-row list, $rows rows in the tree" || bad "U1 list: $(node 'ListBox#12' < "$OUT/t1"), $rows rows"
+
+    $Q key tab; $Q key tab; sleep 0.5      # Add, then Search
+    $Q send "hola"; $Q enter; sleep 1
+    $Q wait-for "ui-demo: action Submitted.11." 10 >/dev/null && ok "U2 Enter in the field: Submitted" || bad "U2 no Submitted"
+    $Q key tab; $Q key tab; sleep 0.5      # Places, Items
+    $Q key end; sleep 1
+    $Q wait-for "ui-demo: action Selected { list: 12, row: 9999 }" 10 >/dev/null && ok "U3 End selects the last row" || bad "U3 End"
+    tree > "$OUT/t2"
+    node 'TextInput#11' < "$OUT/t2" | grep -q '= "hola"' && ok "U2 the field's value is in the tree" || bad "U2 field: $(node 'TextInput#11' < "$OUT/t2")"
+    rows=$(grep -c 'ListBoxOption.*/10000)' "$OUT/t2")
+    node '(10000/10000)' < "$OUT/t2" | grep -q '"date 09999".*\[selected\]' && [ "$rows" -le 14 ] \
+        && ok "U3 row 10000 selected and in the tree, $rows rows" || bad "U3 last row: $(node '(10000/10000)' < "$OUT/t2")"
+    $Q send "d"; sleep 1.5
+    s=$(shot u3)
+    tree > "$OUT/t3"
+    node 'ListBoxOption' < <(grep '\[selected\]' "$OUT/t3" | grep '/10000)') | grep -q '"date 00003".*(4/10000)' \
+        && ok "U3 typing d found date 00003" || bad "U3 find: $(grep '/10000).*selected' "$OUT/t3")"
+    node 'Label#13' < "$OUT/t3" | grep -q '"selected date 00003"' && ok "U3 the status label says so" || bad "U3 label: $(node 'Label#13' < "$OUT/t3")"
+    read -r cx cy rx <<< "$(scr "$OUT/t3" 'date 00003.*selected')"
+    [ "$(px "$s" "$rx" "$cy")" = "49,106,197" ] && ok "U3 the row is Luna's selection blue on screen" || bad "U3 row pixel at $rx,$cy: $(px "$s" "$rx" "$cy")"
+
+    read -r bx by _ <<< "$(scr "$OUT/t3" 'Button#10')"
+    clk "$bx" "$by"
+    $Q wait-for "ui-demo: action Clicked.10." 10 >/dev/null && ok "U4 a click on the button" || bad "U4 no Clicked"
+    read -r cx cy _ <<< "$(scr "$OUT/t3" 'ListBoxOption.*"cherry 00006"')"
+    mv "$cx" "$cy"; $Q mouse-button 1 >/dev/null; $Q mouse-button 0 >/dev/null; $Q mouse-button 1 >/dev/null; $Q mouse-button 0 >/dev/null
+    $Q wait-for "ui-demo: action Activated { list: 12, row: 6 }" 10 >/dev/null && ok "U4 a double click opens the row" || bad "U4 no Activated (row 6)"
+
+    $Q key esc
+    $Q wait-for "ui-demo: bye" 15 >/dev/null && ok "U5 Esc ends it" || bad "U5 ui-demo did not quit"
+    sleep 1
+    grep -aq "Killed PID [0-9]* (ui-demo): exit(0)" "$STATE/serial.log" || bad "U5 exit: $(grep -a 'Killed PID [0-9]* (ui-demo' "$STATE/serial.log" | tail -1)"
+    $Q key ctrl-alt-backspace; sleep 2
+    $Q send "echo console-is-back" && $Q enter
+    $Q wait-for "^.fb. console-is-back" 10 >/dev/null && ok "U5 console and keyboard back" || bad "U5 typing does not reach ash"
+    grep -aq "KERNEL PANIC" "$STATE/serial.log" && bad "kernel panic in the log"
+    $Q stop >/dev/null 2>&1
+    echo "gui-e2e ui: $([ $fails = 0 ] && echo PASS || echo "FAIL ($fails)")"
     exit $fails
 fi
 

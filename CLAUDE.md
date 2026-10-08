@@ -42,7 +42,7 @@ cd kernel && cargo build --target x86_64-unknown-none  # the kernel crate alone
 | `kernel/src/ipc/` + crates `usock`, `tty` | pipes, AF_UNIX, ptys | `docs/reference/ipc.md` |
 | `kernel/src/fs/`, `block/` + crates `vfs`, `ext2` | VFS, mounts, procfs, ext2, block devices | `docs/reference/filesystems.md` |
 | `kernel/src/drivers/`, `pci.rs`, `ac97.rs` | `/dev` files, PCI, audio | `docs/reference/drivers.md` |
-| `kernel/src/framebuffer.rs`, `drivers/framebuffer_console.rs` + crates `gui`, `vt`, `draw`, `text`, `img` | framebuffer, console, `/dev/fb0`, compositor, GUI libraries, PNG + alpha blits | `docs/reference/graphics.md` |
+| `kernel/src/framebuffer.rs`, `drivers/framebuffer_console.rs` + crates `gui`, `vt`, `draw`, `text`, `img`, `ui`, `gui-client` | framebuffer, console, `/dev/fb0`, compositor, GUI libraries, widgets + semantic tree, PNG + alpha blits | `docs/reference/graphics.md` |
 | `kernel/src/gpu/`, `interrupts/msi.rs`, `memory/dma.rs`, `firmware.rs`, `bootopts.rs` + crate `nvgpu` | NVIDIA GA106 driver (behind `gpu=`, off by default), MSI vectors, DMA buffers, firmware loading, boot options (`/mnt/etc/kernel.conf`) | `docs/reference/gpu.md`, plan `docs/gpu/gpu-plan.md` |
 | `kernel/src/network/` + crate `net`, `hal/src/virtio.rs` | virtio-net driver (MSI-X, polled fallback), Realtek RTL8168 driver behind `nic=` (works on the Ryzen, MSI-X interrupts: `docs/net/rtl8168.md`), smoltcp stack, DHCP, AF_INET UDP, TCP and raw ICMP sockets | `docs/reference/net.md`, plan `docs/net/net-plan.md` |
 | `kernel/src/usb/` | xHCI keyboard, mouse, mass storage | `docs/reference/usb.md` |

@@ -17,6 +17,8 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use gui::protocol::{Event as Wire, Interface, Request, COMPOSITOR_ID, FORMAT_XRGB8888};
+use gui::region::Rect;
+pub use gui::semantic::{self, Node, Role};
 use gui::wire::{Decoder, Encoder};
 
 const POOL: u32 = 2;
@@ -130,6 +132,19 @@ impl Window {
         }
         let n = self.width * self.height;
         Ok(&mut self.pool.pixels()[..n])
+    }
+
+    /// The window's semantic tree (`gui::semantic`, parents first), shown with the next [`Window::present`]: what tests and agents read.
+    pub fn set_semantics(&mut self, nodes: &[Node]) -> io::Result<()> {
+        if nodes.len() > semantic::MAX_NODES {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{} semantic nodes, at most {}", nodes.len(), semantic::MAX_NODES)));
+        }
+        // in batches, each well under the wire's 64 KiB message size
+        for chunk in nodes.chunks(64) {
+            let reqs: Vec<Request> = chunk.iter().map(|n| Request::SemanticsNode { surface: SURFACE, node: n.clone() }).collect();
+            send(&self.sock, &reqs)?;
+        }
+        Ok(())
     }
 
     /// Shows the frame.
@@ -291,6 +306,50 @@ fn read_one(sock: &UnixStream, dec: &mut Decoder) -> io::Result<Wire> {
             return Err(gone());
         }
         dec.push_bytes(&buf[..n]);
+    }
+}
+
+/// One window's semantic tree as the compositor has it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowTree {
+    pub toplevel: u32,
+    pub title: String,
+    /// The content on the screen; node bounds are relative to its top left.
+    pub content: Rect,
+    pub focused: bool,
+    pub nodes: Vec<Node>,
+}
+
+/// Every window's semantic tree, from the compositor `$GUI_DISPLAY` names (bottom window first).
+pub fn semantics() -> io::Result<Vec<WindowTree>> {
+    let path = std::env::var_os("GUI_DISPLAY")
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "GUI_DISPLAY is not set: run this inside the compositor (from term)"))?;
+    let sock = UnixStream::connect(&path).map_err(|e| {
+        io::Error::new(e.kind(), format!("cannot connect to the compositor at {}: {}", path.to_string_lossy(), e))
+    })?;
+    semantics_on(&sock)
+}
+
+/// [`semantics`] on an already connected socket.
+pub fn semantics_on(sock: &UnixStream) -> io::Result<Vec<WindowTree>> {
+    const CB: u32 = 2;
+    send(sock, &[Request::GetSemantics { id: CB }])?;
+    let mut dec = Decoder::new();
+    let mut out: Vec<WindowTree> = Vec::new();
+    loop {
+        match read_one(sock, &mut dec)? {
+            Wire::SemanticsWindow { callback: CB, toplevel, title, x, y, w, h, focused } => {
+                out.push(WindowTree { toplevel, title, content: Rect::new(x, y, w, h), focused, nodes: Vec::new() })
+            }
+            Wire::SemanticsNode { callback: CB, node } => match out.last_mut() {
+                Some(w) => w.nodes.push(node),
+                None => return Err(io::Error::new(io::ErrorKind::InvalidData, "a semantic node before any window")),
+            },
+            Wire::Done { callback: CB, .. } => return Ok(out),
+            Wire::Error { code, message, .. } => return Err(compositor_error(code, &message)),
+            _ => {}
+        }
     }
 }
 

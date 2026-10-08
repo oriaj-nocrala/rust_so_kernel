@@ -6,11 +6,11 @@
 //!
 //! | interface  | requests (opcode)                                                        | events (opcode) |
 //! |------------|--------------------------------------------------------------------------|-----------------|
-//! | compositor | create_pool(id, fd, size) 0, create_surface(id) 1, sync(id) 2, create_gpu_buffer(id, fd, size, w, h, stride, format) 3 | error(obj, code, msg) 0, delete_id(id) 1 |
+//! | compositor | create_pool(id, fd, size) 0, create_surface(id) 1, sync(id) 2, create_gpu_buffer(id, fd, size, w, h, stride, format) 3, get_semantics(id) 4 | error(obj, code, msg) 0, delete_id(id) 1 |
 //! | pool       | create_buffer(id, offset, w, h, stride, format) 0, destroy 1             | — |
 //! | buffer     | destroy 0                                                                | release 0 |
-//! | surface    | attach(buffer) 0, damage(x, y, w, h) 1, frame(id) 2, commit 3, set_title(s) 4, destroy 5, lock_pointer(on) 6, set_resizable(min_w, min_h) 7, set_panel(height) 8, activate(toplevel) 9, set_popup(parent, x, y) 10, set_theme(name) 11 | configure(w, h) 0, focus(in) 1, key(code, state) 2, motion(x, y) 3, button(code, state) 4, relative_motion(dx, dy) 5, resize(w, h) 6, close 7, toplevel(id, title) 8, toplevel_focus(id) 9, toplevel_gone(id) 10, theme(name) 11, popup_done 12 |
-//! | callback   | —                                                                        | done(ms) 0 |
+//! | surface    | attach(buffer) 0, damage(x, y, w, h) 1, frame(id) 2, commit 3, set_title(s) 4, destroy 5, lock_pointer(on) 6, set_resizable(min_w, min_h) 7, set_panel(height) 8, activate(toplevel) 9, set_popup(parent, x, y) 10, set_theme(name) 11, semantics_node(node) 12 | configure(w, h) 0, focus(in) 1, key(code, state) 2, motion(x, y) 3, button(code, state) 4, relative_motion(dx, dy) 5, resize(w, h) 6, close 7, toplevel(id, title) 8, toplevel_focus(id) 9, toplevel_gone(id) 10, theme(name) 11, popup_done 12 |
+//! | callback   | —                                                                        | done(ms) 0, semantics_window(toplevel, title, x, y, w, h, focused) 1, semantics_node(node) 2 |
 //!
 //! `create_gpu_buffer` makes a buffer (a `buffer` object: `destroy`, `release`) out of a GPU
 //! buffer the client exports as a descriptor (`/dev/nvgpu`'s `BO_EXPORT`): the compositor does not
@@ -24,6 +24,12 @@
 //! `relative_motion` are Wayland's pointer-constraints and relative-pointer
 //! extensions folded in the same way (see `Compositor`'s pointer lock). Pixel formats, `wl_shm`'s values:
 //! `XRGB8888` (1), and for pool buffers `ARGB8888` (0), **premultiplied** as Wayland's is, shown "over" what is under the surface.
+//!
+//! The semantic tree (`semantic`): `semantics_node`'s `node` is the arguments id, parent, role, flags, actions, x, y, w, h, pos, set_size,
+//! name, value (uints, ints, then two strings); the nodes sent before a `commit` replace the surface's tree at it. `get_semantics` makes a
+//! callback object and answers on it: for every window (stacking order, bottom first) `semantics_window` with its toplevel id, title,
+//! content box on the screen and focus, then that window's nodes; then `done`, and the id is deleted. Any client may ask (as any client
+//! may connect: the socket is the boundary today).
 //!
 //! Window management (phase 4): `set_resizable` is `xdg_toplevel`'s
 //! `set_min_size` and the opt-in to `resize` (and to F11 fullscreen), a *request* for a content of
@@ -43,7 +49,9 @@
 
 use alloc::string::String;
 
-use crate::wire::{Decoder, Encoder, Message, WireError};
+use crate::region::Rect;
+use crate::semantic::{Node, Role};
+use crate::wire::{Args, Decoder, Encoder, Message, WireError};
 
 pub const COMPOSITOR_ID: u32 = 1;
 /// `wl_shm`'s `XRGB8888`: 32 bits per pixel, `0x00RRGGBB`.
@@ -114,6 +122,10 @@ pub enum Request {
     SetPopup { surface: u32, parent: u32, x: i32, y: i32 },
     /// From the panel: the compositor's look (`gui::theme`'s names).
     SetTheme { surface: u32, name: String },
+    /// One node of the surface's next semantic tree (`semantic`).
+    SemanticsNode { surface: u32, node: Node },
+    /// Every window's semantic tree, answered on the new callback `id`.
+    GetSemantics { id: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,6 +161,24 @@ pub enum Event {
     /// next commit with a buffer.
     PopupDone { surface: u32 },
     Done { callback: u32, ms: u32 },
+    /// Answering `get_semantics`: a window; its nodes follow. `x, y, w, h`: its content on the screen.
+    SemanticsWindow { callback: u32, toplevel: u32, title: String, x: i32, y: i32, w: i32, h: i32, focused: bool },
+    /// Answering `get_semantics`: a node of the last window announced.
+    SemanticsNode { callback: u32, node: Node },
+}
+
+fn encode_node(e: &mut Encoder, n: &Node) {
+    let b = n.bounds;
+    e.uint(n.id).uint(n.parent).uint(n.role as u32).uint(n.flags).uint(n.actions);
+    e.int(b.x).int(b.y).int(b.w).int(b.h).uint(n.pos).uint(n.set_size).string(&n.name).string(&n.value);
+}
+
+fn decode_node(a: &mut Args) -> Result<Node, WireError> {
+    let (id, parent, role, flags, actions) = (a.uint()?, a.uint()?, Role::from_u32(a.uint()?), a.uint()?, a.uint()?);
+    let bounds = Rect::new(a.int()?, a.int()?, a.int()?, a.int()?);
+    let (pos, set_size) = (a.uint()?, a.uint()?);
+    let (name, value) = (a.string()?, a.string()?);
+    Ok(Node { id, parent, role, flags, actions, bounds, pos, set_size, name, value })
 }
 
 /// Why a message could not be turned into a request or event.
@@ -179,6 +209,7 @@ impl Request {
                 Request::CreatePool { id, fd, size }
             }
             (Interface::Compositor, 1) => Request::CreateSurface { id: a.uint()? },
+            (Interface::Compositor, 4) => Request::GetSemantics { id: a.uint()? },
             (Interface::Compositor, 2) => Request::Sync { id: a.uint()? },
             (Interface::Compositor, 3) => {
                 let (id, size) = (a.uint()?, a.uint()?);
@@ -210,6 +241,7 @@ impl Request {
             (Interface::Surface, 9) => Request::Activate { surface: obj, toplevel: a.uint()? },
             (Interface::Surface, 10) => Request::SetPopup { surface: obj, parent: a.uint()?, x: a.int()?, y: a.int()? },
             (Interface::Surface, 11) => Request::SetTheme { surface: obj, name: a.string()? },
+            (Interface::Surface, 12) => Request::SemanticsNode { surface: obj, node: decode_node(&mut a)? },
             _ => return Err(DecodeError::UnknownOpcode),
         };
         a.finish()?;
@@ -246,6 +278,12 @@ impl Request {
             Request::Activate { surface, toplevel } => e.begin(*surface, 9).uint(*toplevel),
             Request::SetPopup { surface, parent, x, y } => e.begin(*surface, 10).uint(*parent).int(*x).int(*y),
             Request::SetTheme { surface, name } => e.begin(*surface, 11).string(name),
+            Request::GetSemantics { id } => e.begin(COMPOSITOR_ID, 4).uint(*id),
+            Request::SemanticsNode { surface, node } => {
+                e.begin(*surface, 12);
+                encode_node(e, node);
+                e
+            }
         }
         .end();
     }
@@ -273,6 +311,17 @@ impl Event {
             (Interface::Surface, 11) => Event::Theme { surface: obj, name: a.string()? },
             (Interface::Surface, 12) => Event::PopupDone { surface: obj },
             (Interface::Callback, 0) => Event::Done { callback: obj, ms: a.uint()? },
+            (Interface::Callback, 1) => Event::SemanticsWindow {
+                callback: obj,
+                toplevel: a.uint()?,
+                title: a.string()?,
+                x: a.int()?,
+                y: a.int()?,
+                w: a.int()?,
+                h: a.int()?,
+                focused: a.uint()? != 0,
+            },
+            (Interface::Callback, 2) => Event::SemanticsNode { callback: obj, node: decode_node(&mut a)? },
             _ => return Err(DecodeError::UnknownOpcode),
         };
         a.finish()?;
@@ -298,6 +347,14 @@ impl Event {
             Event::Theme { surface, name } => e.begin(*surface, 11).string(name),
             Event::PopupDone { surface } => e.begin(*surface, 12),
             Event::Done { callback, ms } => e.begin(*callback, 0).uint(*ms),
+            Event::SemanticsWindow { callback, toplevel, title, x, y, w, h, focused } => {
+                e.begin(*callback, 1).uint(*toplevel).string(title).int(*x).int(*y).int(*w).int(*h).uint(*focused as u32)
+            }
+            Event::SemanticsNode { callback, node } => {
+                e.begin(*callback, 2);
+                encode_node(e, node);
+                e
+            }
         }
         .end();
     }
@@ -320,7 +377,7 @@ impl Event {
             | Event::ToplevelGone { surface, .. }
             | Event::Theme { surface, .. }
             | Event::PopupDone { surface } => *surface,
-            Event::Done { callback, .. } => *callback,
+            Event::Done { callback, .. } | Event::SemanticsWindow { callback, .. } | Event::SemanticsNode { callback, .. } => *callback,
         }
     }
 }
@@ -331,6 +388,17 @@ mod tests {
     use super::*;
     use std::vec;
     use std::vec::Vec;
+
+    fn sample_node() -> Node {
+        let mut n = Node::new(0xdead_beef, 7, Role::ListBoxOption, Rect::new(-3, 20, 300, 22));
+        n.flags = crate::semantic::flag::SELECTED;
+        n.actions = crate::semantic::action::CLICK | crate::semantic::action::FOCUS;
+        n.pos = 9_999;
+        n.set_size = 10_000;
+        n.name = "reporte final.png".into();
+        n.value = "12 KiB".into();
+        n
+    }
 
     fn requests() -> Vec<(Interface, Request)> {
         vec![
@@ -354,6 +422,8 @@ mod tests {
             (Interface::Surface, Request::Activate { surface: 3, toplevel: 7 }),
             (Interface::Surface, Request::SetPopup { surface: 3, parent: 4, x: -2, y: -300 }),
             (Interface::Surface, Request::SetTheme { surface: 3, name: "9x".into() }),
+            (Interface::Compositor, Request::GetSemantics { id: 12 }),
+            (Interface::Surface, Request::SemanticsNode { surface: 3, node: sample_node() }),
         ]
     }
 
@@ -395,6 +465,11 @@ mod tests {
             (Interface::Surface, Event::Theme { surface: 3, name: "luna".into() }),
             (Interface::Surface, Event::PopupDone { surface: 3 }),
             (Interface::Callback, Event::Done { callback: 8, ms: 1234 }),
+            (
+                Interface::Callback,
+                Event::SemanticsWindow { callback: 8, toplevel: 2, title: "Files".into(), x: 40, y: 60, w: 320, h: -1, focused: true },
+            ),
+            (Interface::Callback, Event::SemanticsNode { callback: 8, node: sample_node() }),
         ];
         let mut e = Encoder::new();
         for (_, ev) in &evs {

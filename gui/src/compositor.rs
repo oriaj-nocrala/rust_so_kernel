@@ -83,6 +83,7 @@ use alloc::vec::Vec;
 
 use crate::protocol::{DecodeError, ErrorCode, Event, Interface, Request, FORMAT_ARGB8888, FORMAT_XRGB8888, MAX_TITLE};
 use crate::region::{Rect, Region};
+use crate::semantic::{self, Node};
 use crate::theme::{self, Button, Shape, Theme};
 use crate::wire::{Decoder, WireError};
 
@@ -318,6 +319,9 @@ struct Surface<M> {
     version: u64,
     pending_damage: Region,
     pending_frames: Vec<u32>,
+    /// The semantic tree (`semantic`): what the last commit applied, and the nodes sent since (`None`: none, the tree stays).
+    semantics: Vec<Node>,
+    pending_semantics: Option<Vec<Node>>,
     title: String,
     /// Current content, `w x h`, row-major.
     store: Vec<u32>,
@@ -697,6 +701,8 @@ impl<M: PoolMem> Compositor<M> {
                     version: 0,
                     pending_damage: Region::new(),
                     pending_frames: Vec::new(),
+                    semantics: Vec::new(),
+                    pending_semantics: None,
                     title: String::new(),
                     store: Vec::new(),
                     w: 0,
@@ -896,6 +902,45 @@ impl<M: PoolMem> Compositor<M> {
                     }
                 }
             }
+            Request::SemanticsNode { surface, node } => {
+                let Some(s) = self.surface_mut((c, surface)) else {
+                    return self.fail(c, surface, ErrorCode::InvalidObject, "not a surface");
+                };
+                let pending = s.pending_semantics.get_or_insert_with(Vec::new);
+                if node.id == 0 {
+                    return self.fail(c, surface, ErrorCode::InvalidMethod, "semantic node id 0");
+                }
+                if pending.len() >= semantic::MAX_NODES {
+                    return self.fail(c, surface, ErrorCode::NoMemory, "more than MAX_NODES semantic nodes in one commit");
+                }
+                pending.push(node);
+            }
+            Request::GetSemantics { id } => {
+                if !self.new_object(c, id, Object::Callback) {
+                    return;
+                }
+                let th = self.th;
+                let focus = self.focus;
+                let mut out = Vec::new();
+                for &key in &self.stack {
+                    let Some(s) = self.surface(key) else { continue };
+                    let b = s.content(th);
+                    out.push(Event::SemanticsWindow {
+                        callback: id,
+                        toplevel: s.tid,
+                        title: s.title.clone(),
+                        x: b.x,
+                        y: b.y,
+                        w: b.w,
+                        h: b.h,
+                        focused: focus == Some(key),
+                    });
+                    out.extend(s.semantics.iter().map(|n| Event::SemanticsNode { callback: id, node: n.clone() }));
+                }
+                self.events.extend(out.into_iter().map(|e| (c, e)));
+                self.events.push((c, Event::Done { callback: id, ms: self.now_ms }));
+                self.destroy_object(c, id);
+            }
             Request::DestroySurface { surface } => {
                 let key = (c, surface);
                 let mg = self.decor_margin();
@@ -925,6 +970,9 @@ impl<M: PoolMem> Compositor<M> {
             (at.x + x, at.y + y)
         });
         let s = self.surface_mut(key).unwrap();
+        if let Some(tree) = s.pending_semantics.take() {
+            s.semantics = tree;
+        }
         let frames = core::mem::take(&mut s.pending_frames);
         let damage = core::mem::take(&mut s.pending_damage);
         let mut screen_damage = Region::new();

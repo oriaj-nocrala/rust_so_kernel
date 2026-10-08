@@ -1,0 +1,19 @@
+[package]
+name = "ui-demo"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+edition = "2021"
+
+# The `ui` widgets in a window (Rust std, `gui-client`): a button, a field, a sidebar and a 10 000-row list in a split, publishing the
+# semantic tree. `scripts/gui-e2e.sh ui` drives it and reads its tree with `gui-tree`. Built by kernel/build.rs (`STD_PROGRAMS`).
+[workspace]
+
+[dependencies]
+gui = { path = "../gui" }
+gui-client = { path = "../gui-client" }
+ui = { path = "../ui", features = ["render"] }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+strip = true

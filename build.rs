@@ -597,7 +597,7 @@ fn build_kernel() -> PathBuf {
     // `userspace::text`, likewise.
     watch_dir_recursive(&manifest_dir.join("text/src"));
     // The std programs' crates (kernel/build.rs's STD_PROGRAMS).
-    for krate in ["gui-client"] {
+    for krate in ["gui-client", "ui", "ui-demo"] {
         watch_dir_recursive(&manifest_dir.join(krate).join("src"));
         println!("cargo:rerun-if-changed={}", manifest_dir.join(krate).join("Cargo.toml").display());
     }

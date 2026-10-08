@@ -14,6 +14,8 @@
 /diag/target/
 /gui-capi/target/
 /gui-client/target/
+/ui/target/
+/ui-demo/target/
 /vk-comp/target/
 /sched/target/
 /usock/target/

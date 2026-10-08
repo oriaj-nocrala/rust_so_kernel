@@ -13,3 +13,7 @@ edition = "2021"
 [workspace]
 
 [dependencies]
+
+[dev-dependencies]
+# Only to check that `semantic` mirrors AccessKit's names (roles, actions); the crate itself does not depend on it.
+accesskit = { version = "=0.24.1", default-features = false }

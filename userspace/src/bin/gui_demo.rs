@@ -181,7 +181,7 @@ fn main(args: Args) -> i32 {
                     println!("gui_demo: error {} on {}: {}", code, object, message);
                     return 1;
                 }
-                Event::DeleteId { .. } | Event::Done { .. } => {}
+                Event::DeleteId { .. } | Event::Done { .. } | Event::SemanticsWindow { .. } | Event::SemanticsNode { .. } => {}
             }
         }
     }

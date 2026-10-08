@@ -152,6 +152,21 @@ impl Keyboard {
         *self = Keyboard { caps: self.caps, ..Keyboard::new() };
     }
 
+    /// A Shift key is held.
+    pub fn shift(&self) -> bool {
+        self.lshift || self.rshift
+    }
+
+    /// A Ctrl key is held.
+    pub fn ctrl(&self) -> bool {
+        self.lctrl || self.rctrl
+    }
+
+    /// An Alt key is held.
+    pub fn alt(&self) -> bool {
+        self.lalt || self.ralt
+    }
+
     /// One key event. `app_cursor` is the grid's `DECCKM`.
     pub fn key(&mut self, c: u32, pressed: bool, app_cursor: bool) -> KeyBytes {
         let slot = match c {
