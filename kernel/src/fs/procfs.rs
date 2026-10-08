@@ -542,6 +542,7 @@ impl Inode for ProcDirInode {
             "dispstate" => Ok(Arc::new(RenderedInode { ino: 215, render: crate::gpu::render_dispstate })),
             "nic" => Ok(Arc::new(RenderedInode { ino: 216, render: crate::network::render_nic })),
             "capdenials" => Ok(Arc::new(RenderedInode { ino: 217, render: render_capdenials })),
+            "sysprof" => Ok(Arc::new(RenderedInode { ino: 218, render: crate::sysprof::render })),
             _ => {
                 let pid: usize = name.parse().map_err(|_| Errno::ENOENT)?;
                 if crate::process::scheduler::exe_name_for_pid(pid).is_some() {
@@ -574,13 +575,14 @@ impl Inode for ProcDirInode {
             16 => Ok(Some(DirEntry::new(215, FileType::Regular, b"dispstate"))),
             17 => Ok(Some(DirEntry::new(216, FileType::Regular, b"nic"))),
             18 => Ok(Some(DirEntry::new(217, FileType::Regular, b"capdenials"))),
+            19 => Ok(Some(DirEntry::new(218, FileType::Regular, b"sysprof"))),
             n => {
                 // Live pids, appended after the always-present entries above
                 // — this is what makes `ls /proc` / BusyBox `ps`'s
                 // `opendir("/proc")` scan see every process (previously
                 // direct lookup like `cat /proc/3/exe` worked but nothing
                 // enumerated them, see this module's top doc comment).
-                let idx = (n - 19) as usize;
+                let idx = (n - 20) as usize;
                 let pids = crate::process::scheduler::all_pids();
                 let Some(&pid) = pids.get(idx) else { return Ok(None); };
                 let name = format!("{}", pid);

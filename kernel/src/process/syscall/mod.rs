@@ -202,7 +202,10 @@ extern "C" fn syscall_handler_asm(regs: &SavedRegisters) -> i64 {
     // rather than as a double fault on the *next* `syscall`, which would
     // then load its stack through the user's GS_BASE.
     crate::cpu::percpu::check_gs_invariant();
+    // The frame's `rip` is the user return address, the same on every pass of a call that blocked and was rewound.
+    crate::sysprof::enter(regs.rax, unsafe { (*tf_ptr).rip });
     let ret = syscall_handler(regs.rax, regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9);
+    crate::sysprof::exit();
 
     // Deliver pending signals before returning to user mode. This is the
     // one "about to iretq into a process" point with no natural

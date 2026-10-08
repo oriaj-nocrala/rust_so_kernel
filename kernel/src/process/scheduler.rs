@@ -2209,6 +2209,14 @@ fn proc_stat_snapshot_locked(pid: usize) -> Option<(ProcStatSnapshot, Arc<Addres
     snap
 }
 
+/// The name of process `pid`, or `None` once it is gone. Any IF state: the
+/// previous one is restored.
+pub fn process_name(pid: usize) -> Option<[u8; 16]> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        local_scheduler().iter_all().find(|p| p.pid.0 == pid).map(|p| p.name)
+    })
+}
+
 /// The address space of process `pid` (a thread's is its group's), for `/proc/<pid>/maps`.
 pub fn address_space_of(pid: usize) -> Option<Arc<AddressSpace>> {
     proc_stat_snapshot_locked(pid).map(|(_, space)| space)

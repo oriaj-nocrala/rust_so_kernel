@@ -90,6 +90,19 @@ pub(super) fn sys_kdebug_ctl(cmd: u64, name_ptr: u64, enable: u64) -> SyscallRes
         4 => {
             if crate::cpu::idle::set_c2(enable != 0) { 0 } else { errno::ENODEV }
         }
+        // The syscall profile (`sysprof`, `/proc/sysprof`): `enable` 0 =
+        // off, 1 = on, 2 = forget what was counted. `kdebug sysprof on|off|reset`.
+        5 => match enable {
+            0 | 1 => {
+                crate::sysprof::set_enabled(enable == 1);
+                0
+            }
+            2 => {
+                crate::sysprof::reset();
+                0
+            }
+            _ => errno::EINVAL,
+        },
         _ => errno::EINVAL,
     }
 }

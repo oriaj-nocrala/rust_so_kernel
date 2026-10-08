@@ -33,6 +33,7 @@ static void usage(void) {
     printf("       kdebug panic              panic the kernel on purpose (tests the panic path)\n");
     printf("       kdebug tlbtest            TLB-shootdown self-test against every AP\n");
     printf("       kdebug idle <hlt|c2>      how idle CPUs wait (see idle: in /proc/kdebug)\n");
+    printf("       kdebug sysprof <on|off|reset>  per-program syscall profile, read in /proc/sysprof\n");
 }
 
 // The stage-5 TLB-shootdown self-test (kernel/src/tlb_selftest.rs). The
@@ -93,6 +94,20 @@ int main(int argc, char **argv) {
             return 1;
         }
         printf("kdebug: idle -> %s\n", argv[2]);
+        return 0;
+    }
+
+    if (argc == 3 && strcmp(argv[1], "sysprof") == 0) {
+        int how = strcmp(argv[2], "off") == 0 ? 0 : strcmp(argv[2], "on") == 0 ? 1 : strcmp(argv[2], "reset") == 0 ? 2 : -1;
+        if (how < 0) {
+            usage();
+            return 1;
+        }
+        long r = raw_syscall(SYS_KDEBUG_CTL, 5, 0, how);
+        if (r < 0) {
+            printf("kdebug: sysprof %s failed (%ld)\n", argv[2], r);
+            return 1;
+        }
         return 0;
     }
 

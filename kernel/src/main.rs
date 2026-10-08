@@ -50,6 +50,7 @@ mod rtc;
 mod serial;
 mod smp;
 mod sync;
+mod sysprof;
 #[cfg(test)]
 mod test_framework;
 mod time;

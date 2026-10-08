@@ -1028,6 +1028,8 @@ fn exec_from(from: ExecFrom, argv_ptr: usize, envp_ptr: usize) -> SyscallResult 
         }
     }
 
+    crate::sysprof::exec(crate::process::scheduler::current_pid_fast());
+
     crate::ktrace!(crate::debug::SCHED, "exec: load_elf done, going cli");
     // `_irq` is deliberately never dropped on the success path — this
     // function always ends in `jump_to_user` (`-> !`), so interrupts

@@ -3,7 +3,8 @@
 #   scripts/run-abi-suite.sh [--no-build] [--keep-going] [test ...]     (no test names = the standard regression list)
 # FAILS FAST: it stops at the first `FAIL` line (unless --keep-going), a kernel panic, a test that runs longer than
 # TEST_TIMEOUT seconds (default 90), or no output at all for STALL seconds (default 60) — and names the test that was running.
-# Prints every FAIL line and a `name=exit` line per finished test; exit status 1 if anything was not clean.
+# Prints scripts/abi-suite-report.py's summary (a clean run is two lines: time and verdict; a test that was not clean gets
+# its FAIL lines, syscall profile and backtraces) and exits 1 if anything was not clean. Exit codes: /tmp/abi-suite.results.
 # Needs the tests on the disk image (a normal `cargo build`; `--no-build` skips that build).
 set -u
 cd "$(dirname "$0")/.."
@@ -51,16 +52,19 @@ while :; do
     if [ $((SECONDS - last_change)) -gt "$stall" ]; then verdict="no output for ${stall}s during ${cur:-boot}"; break; fi
 done
 
-grep -E "^\[fb\].*FAIL" "$log"
-grep -oE "SUITE_RESULT [a-z0-9_]+=[0-9]+" "$log" | sed 's/SUITE_RESULT //' | sort -u | tee /tmp/abi-suite.results
-if [ -n "$verdict" ]; then
-    echo "--- last output ---"; grep -E "^\[fb\]" "$log" | tail -8
-fi
+grep -oE "SUITE_RESULT [a-z0-9_]+=[0-9]+" "$log" | sed 's/SUITE_RESULT //' | sort -u > /tmp/abi-suite.results
+# For a hang or a panic, what the console said last (a FAIL is shown per test by the report below).
+case "$verdict" in
+    ""|"first FAIL"*) ;;
+    *) echo "--- last output ---"; grep -E "^\[fb\]" "$log" | grep -v "SUITE_" | tail -8 ;;
+esac
 [ "${KEEP_ALIVE:-0}" = 1 ] || $Q stop >/dev/null 2>&1   # KEEP_ALIVE=1: leave the guest running to inspect a hang
-bad=$(grep -vc "=0$" /tmp/abi-suite.results)
-# A test that prints FAIL but exits 0 is still a failure.
-bad=$((bad + $(grep -cE "^\[fb\].*FAIL" "$log")))
+# The slowest tests, and for each test that was not clean (or was running when this gave up): its FAIL lines, its syscall
+# profile and its user backtraces as function:line. Every exit code: /tmp/abi-suite.results; profiles: /tmp/abi-suite.sysprof.
+python3 scripts/abi-suite-report.py "$log" "$([ -n "$verdict" ] && echo "$cur")" > /tmp/abi-suite.report
+grep -v "^SUITE_BAD" /tmp/abi-suite.report
+bad=$(sed -n 's/^SUITE_BAD //p' /tmp/abi-suite.report)
 total=$(wc -l < /tmp/abi-suite.results)
 [ -n "$verdict" ] && { echo "abi-suite: ABORTED — $verdict ($total tests finished)"; exit 1; }
-echo "abi-suite: $total tests, $bad not clean"
-[ "$bad" = 0 ]
+echo "abi-suite: $total tests, ${bad:-?} not clean"
+[ "${bad:-1}" = 0 ]

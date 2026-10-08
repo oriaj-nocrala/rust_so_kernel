@@ -78,11 +78,13 @@
 
 extern crate alloc;
 
+pub mod backtrace;
 pub mod dirlock;
 pub mod fbstat;
 pub mod ifviolation;
 pub mod irqmutex;
 pub mod lock;
+pub mod sysprof;
 pub mod tfrewind;
 pub mod tracked;
 

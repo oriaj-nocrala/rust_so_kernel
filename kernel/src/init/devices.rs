@@ -318,9 +318,43 @@ fn user_fault(tf: &mut TrapFrame, sig: u32, si_code: i32, addr: u64, reason: &st
         }
     };
     if !delivered {
+        report_user_backtrace(tf);
         kill_current_user_process(reason, sig);
         // unreachable — kill_current_user_process diverges
     }
+}
+
+/// `user backtrace: pid N (name) rip=.. #0 .. #1 ..`: a frame-pointer walk
+/// (`diag::backtrace`) of the process about to be killed, read through its
+/// address space. The C programs keep frame pointers; `scripts/run-abi-suite.sh`
+/// turns the addresses into function:line. Returns before the kill so that
+/// nothing here (the address-space `Arc`) is alive across the `-> !` call.
+fn report_user_backtrace(tf: &TrapFrame) {
+    use core::fmt::Write;
+    let found = {
+        let mut sched = crate::process::scheduler::local_scheduler();
+        sched.running_mut().map(|p| (p.pid.0, p.name, p.address_space.clone()))
+    };
+    let Some((pid, name, space)) = found else { return };
+    let read = |addr: u64| {
+        space.find_vma(addr)?;
+        let mut b = [0u8; 8];
+        // SAFETY: a read of the faulting process's own mapped memory, through its page tables.
+        (unsafe { space.copy_from_user(addr, &mut b) } == 8).then(|| u64::from_le_bytes(b))
+    };
+    let frames = diag::backtrace::walk(tf.rip, tf.rbp, read);
+    let mut line = StackStr::<512>::new();
+    let _ = write!(
+        line,
+        "user backtrace: pid {} ({}) rsp={:#x}",
+        pid,
+        core::str::from_utf8(&name).unwrap_or("?").trim_end_matches('\0'),
+        tf.rsp
+    );
+    for (i, pc) in frames.as_slice().iter().enumerate() {
+        let _ = write!(line, " #{} {:#x}", i, pc);
+    }
+    serial_println!("{}", line.as_str());
 }
 
 /// A fixed-size string on the stack, for a kill reason built from numbers: unlike a `String` it has no `Drop`, so it may be

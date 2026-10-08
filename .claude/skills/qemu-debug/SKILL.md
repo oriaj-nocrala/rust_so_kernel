@@ -54,7 +54,8 @@ Iterating on metal costs a physical reboot per try. Make QEMU look like the Ryze
 
 ## KVM and timing
 
-- `qemu-debug.sh` runs QEMU in software emulation (TCG) unless told otherwise: syscalls cost ~10 us and a pipe round trip ~900 us, ~30x KVM's (`QEMU_DEBUG_EXTRA_ARGS="-enable-kvm"`: 0.56 us and ~30 us). Measure latency and throughput with KVM, and run the suite both ways: KVM's speed exposes tests that assume a slow guest (spin counts). `scripts/run-abi-suite.sh latency_bench` prints wake-up latencies.
+- `qemu-debug.sh` (and `run-kernel-tests.sh`, `cargo run`) use KVM whenever `/dev/kvm` is usable: syscalls ~0.56 us, a pipe round trip ~30 us. `QEMU_ACCEL=tcg` forces software emulation, ~30x slower (~10 us, ~900 us): only for `-d int` traces (`dlog` is empty under KVM), a CPU feature KVM's host lacks, or a bug that needs a slow guest to show. Never quote TCG numbers as performance. `scripts/run-abi-suite.sh latency_bench` prints wake-up latencies.
+- Where a test or program spends its time: `kdebug sysprof on`, run it, `cat /proc/sysprof` (calls, wall time and slowest call per syscall per program, and the call each live process is in right now). `run-abi-suite.sh` does this for every test (`kernel-testing` skill).
 
 ## gdb
 

@@ -402,6 +402,15 @@ fn main() {
     // (constanos_gfx.h: a window under the compositor, the console
     // otherwise).
     let c_include = c_dir.join("include");
+    // Frame pointers and debug info: a C program the kernel kills for a fault
+    // gets a `user backtrace:` (frame-pointer walk, `init/devices.rs`), which
+    // `scripts/run-abi-suite.sh` turns into function:line with the unstripped
+    // copy `keep_syms` leaves in target/userspace-syms/.
+    let syms_dir = workspace_root.join("target/userspace-syms");
+    std::fs::create_dir_all(&syms_dir).expect("create target/userspace-syms");
+    let keep_syms = |stem: &str, built: &Path| {
+        let _ = std::fs::copy(built, syms_dir.join(stem));
+    };
     let build_c_program = |stem: &str, dst: &Path| {
         let src = c_dir.join(format!("{}.c", stem));
         let status = Command::new("clang")
@@ -409,7 +418,8 @@ fn main() {
                 "--target=x86_64-constanos-elf",
                 "-ffreestanding",
                 "-fno-stack-protector",
-                "-fomit-frame-pointer",
+                "-fno-omit-frame-pointer",
+                "-g",
                 "-mno-red-zone",
                 "-O2",
                 "-static",
@@ -442,6 +452,7 @@ fn main() {
     for stem in DISK_C_PROGRAMS {
         let dst = disk_bin_dir.join(stem);
         build_c_program(stem, &dst);
+        keep_syms(stem, &dst);
         strip_elf(strip, &dst);
         println!("cargo:warning=userspace(c, disk): {}.c -> disk-image-root/bin/{}", stem, stem);
     }

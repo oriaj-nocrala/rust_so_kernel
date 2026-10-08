@@ -49,7 +49,7 @@ cd kernel && cargo build --target x86_64-unknown-none  # the kernel crate alone
 | `kernel/src/cpu/`, `smp.rs`, `interrupts/`, `time/` | per-CPU init, APs, APIC, TLB shootdown, time, sensors | `docs/reference/cpu.md` |
 | `kernel/src/klog.rs`, `autorun.rs`, `watchdog.rs`, `block/logpart.rs` | kernel log, log partition, unattended runs | `docs/reference/metal.md` |
 | `userspace/`, `mlibc-port/`, `busybox-config/`, `*-port/` | programs, libc, BusyBox, DOOM/Quake | `docs/reference/userspace.md` |
-| `kernel/src/debug.rs` + crate `diag` | tracing, counters, lock diagnostics, `IrqMutex` | `qemu-debug` skill |
+| `kernel/src/debug.rs`, `sysprof.rs` + crate `diag` | tracing, counters, lock diagnostics, `IrqMutex`, per-program syscall profile (`/proc/sysprof`), user backtraces on fault kills | `qemu-debug`, `kernel-testing` skills |
 | `hal/` | hardware seams (`PortIo`/`PhysMem`/`BlockDevice`) + pure driver logic | `kernel-drivers` skill |
 
 - **Only `so2` (the root crate: build script + QEMU launcher) and `kernel` form the Cargo workspace.** Every other crate is its own workspace, so its `cargo test` can unwind (the root profile is `panic = "abort"`), and is pulled in by `path` dependency.

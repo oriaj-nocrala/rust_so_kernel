@@ -13,7 +13,7 @@ Code: `kernel/src/fs/`, crates `vfs/` and `ext2/` (host tests: `cd vfs && cargo 
 | `/proc` | procfs | Synthetic, regenerated on every open |
 
 - `ls /` lists the other mounts via `fs::vfs::direct_children`; the mount table redirects traversal into them.
-- **procfs contents**: `meminfo`, `stat`, `uptime`, `loadavg`, `cpuinfo`, `<pid>/{stat,statm,cmdline,exe,maps}` (Linux formats, backing `ps`/`top`; `maps` is one line per VMA, `start-end perms 00000000 00:00 0 [stack]`: no file mappings, and `x` shows because anonymous memory is mapped without NX), `self`, `dmesg` (klog), `kdebug`, `fbinfo`, `pci`, `sensors`, `acpi`. Pid listing: `scheduler::all_pids()`, which takes `SCHEDULER` itself, so never call it while holding that lock.
+- **procfs contents**: `meminfo`, `stat`, `uptime`, `loadavg`, `cpuinfo`, `<pid>/{stat,statm,cmdline,exe,maps}` (Linux formats, backing `ps`/`top`; `maps` is one line per VMA, `start-end perms 00000000 00:00 0 [stack]`: no file mappings, and `x` shows because anonymous memory is mapped without NX), `self`, `dmesg` (klog), `kdebug`, `sysprof` (syscall profile per program, `kdebug sysprof on`), `fbinfo`, `pci`, `sensors`, `acpi`. Pid listing: `scheduler::all_pids()`, which takes `SCHEDULER` itself, so never call it while holding that lock.
 
 ## VFS (`vfs` crate, adapter `kernel/src/fs/vfs.rs`)
 
