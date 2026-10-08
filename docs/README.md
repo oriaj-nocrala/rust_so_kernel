@@ -39,7 +39,8 @@ docs/
 │   ├── README.md             ← driver-docs index
 │   ├── architecture.md       ← where we are: the trait/seam design, today
 │   └── roadmap.md            ← where we're going: toward a Linux-class driver model
-├── gui/files-plan.md          ← the file manager, first app on the UX principles (not started)
+├── gui/files-plan.md          ← the file manager, first app on the UX principles (v1 done)
+├── gui/files-handoff.md       ← Files: what is next (measure the slowness, page cache, run programs)
 ├── gui/compositor-visual-plan.md ← vk_comp looks: renderer primitives → themes (Luna 2026 / 9x) → glass → icons → real 3D icons
 ├── ux/                       ← UX principles (read first for anything user-facing), backbones, idea inventory, design audit
 ├── ai/                       ← direction: `software-on-demand.md` (north star), `education.md`; handoffs, not started: `llm-as-ui-plan.md` (agent interface layer), `threejs-runtime-plan.md` (unmodified three.js on wgpu/NVK), `capabilities-plan.md` (Capsicum-style, first security model)

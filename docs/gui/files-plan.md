@@ -1,6 +1,6 @@
 # Files: the first app built on the UX principles
 
-Status: **step 1 done** (2026-10-08, `docs/reference/graphics.md` "Files"), with step 4's providers in capability mode already (through `cap-exec`); not yet: multi-selection, a pinned layout, `filesd`. Executable path: [`../ux/handoff-capabilities-to-files.md`](../ux/handoff-capabilities-to-files.md). The file manager is where the principles were
+Status: **step 1 done** (2026-10-08, `docs/reference/graphics.md` "Files"; what is next: [`files-handoff.md`](files-handoff.md)), with step 4's providers in capability mode already (through `cap-exec`); not yet: multi-selection, a pinned layout, `filesd`. Executable path: [`../ux/handoff-capabilities-to-files.md`](../ux/handoff-capabilities-to-files.md). The file manager is where the principles were
 first worked out, and the first app that exercises the backbones. Principles:
 [`../ux/principles.md`](../ux/principles.md); ideas F1-F16, K1, U7 in [`../ux/ideas.md`](../ux/ideas.md).
 
