@@ -322,6 +322,47 @@ pub(super) fn sys_openat(dirfd: i64, path_ptr: usize, flags: i32, _mode: u32) ->
     open_at(dirfd, path_ptr, flags)
 }
 
+/// openat2(437): `(dirfd, path, how, size)`. `how` is `struct open_how { flags, mode, resolve }`, validated as Linux does
+/// (`vfs::resolve::OpenHow::parse`: `E2BIG`/`EINVAL`). With `resolve == 0` it is `openat`. `RESOLVE_BENEATH` and
+/// `RESOLVE_NO_SYMLINKS` go through the bounded walk (`MountTable::resolve_at`), which checks every `..` and symlink
+/// against the dirfd's directory (`EXDEV`/`ELOOP`); the other `RESOLVE_*` bits are `EINVAL` for now.
+pub(super) fn sys_openat2(dirfd: i64, path_ptr: usize, how_ptr: usize, size: usize) -> SyscallResult {
+    if size > vfs::resolve::OPEN_HOW_SIZE_MAX {
+        return errno::E2BIG;
+    }
+    if size < vfs::resolve::OPEN_HOW_SIZE_VER0 {
+        return errno::EINVAL;
+    }
+    if let Err(e) = validate_user_buffer(how_ptr as u64, size) {
+        return e;
+    }
+    let mut how_bytes = alloc::vec![0u8; size];
+    unsafe { core::ptr::copy_nonoverlapping(how_ptr as *const u8, how_bytes.as_mut_ptr(), size) };
+    let how = match vfs::resolve::OpenHow::parse(&how_bytes) { Ok(h) => h, Err(e) => return e.as_i64() };
+    let flags = how.flags as i32;
+    if how.resolve == 0 {
+        return open_at(dirfd, path_ptr, flags);
+    }
+
+    if let Err(e) = validate_user_buffer(path_ptr as u64, 1) {
+        return e;
+    }
+    let raw = read_user_str(path_ptr);
+    if raw.is_empty() {
+        return errno::ENOENT;
+    }
+    let base = if dirfd == AT_FDCWD {
+        current_cwd()
+    } else {
+        match dir_path_of(dirfd) { Ok(p) => p, Err(e) => return e }
+    };
+    crate::ktrace!(crate::debug::FS, "sys_openat2: base={} path={} flags={:#x} resolve={:#x}", base, raw, flags, how.resolve);
+    match crate::fs::vfs::open_at(&base, raw, crate::fs::types::OpenFlags(flags), how.resolve) {
+        Ok((handle, path)) => install_fd(handle, flags, path),
+        Err(e) => e.as_i64(),
+    }
+}
+
 fn open_at(dirfd: i64, path_ptr: usize, flags: i32) -> SyscallResult {
     // Validation BEFORE cli — no lock needed
     let path = match user_path_at(dirfd, path_ptr, errno::EINVAL) { Ok(p) => p, Err(e) => return e };
@@ -333,6 +374,12 @@ fn open_at(dirfd: i64, path_ptr: usize, flags: i32) -> SyscallResult {
         Ok(h)  => h,
         Err(e) => { crate::ktrace!(crate::debug::FS, "sys_open: {} -> Err({:?})", path, e); return e.as_i64(); }
     };
+    install_fd(handle, flags, path)
+}
+
+/// Put a freshly opened handle in the calling process's fd table, honouring `O_NONBLOCK` and `O_CLOEXEC`, and record
+/// `path` for later `*at` calls through it.
+fn install_fd(handle: alloc::boxed::Box<dyn crate::process::file::FileHandle>, flags: i32, path: alloc::string::String) -> SyscallResult {
     // `O_NONBLOCK` at open, for the handles that honour it (sockets, ptys);
     // the rest ignore it, as they ignore `F_SETFL` (see `sys_fcntl`).
     if flags as i64 & O_NONBLOCK != 0 {

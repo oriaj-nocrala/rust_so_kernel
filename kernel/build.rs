@@ -106,6 +106,7 @@ const DISK_C_PROGRAMS: &[&str] = &[
     "pidfd_test",
     "maps_test",
     "at_test",
+    "openat2_test",
     "fdlock_test",
     "latency_bench",
     "timer_test",

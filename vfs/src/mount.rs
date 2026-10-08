@@ -318,6 +318,184 @@ impl MountTable {
         }
         Ok(())
     }
+
+    // ── openat2: the bounded walk ────────────────────────────────────────
+
+    /// Resolve `path` relative to the directory `base` (an absolute path, the dirfd's or the
+    /// cwd), honouring openat2's `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS` (`resolve` bits,
+    /// `crate::resolve`). Unlike `resolve`, this walks the raw path itself, component by
+    /// component, on a stack of the directories it went through: `..` pops that stack (the
+    /// physical parent, also after a symlink or out of a mount root), and a symlink's target
+    /// is pushed in front of the remaining components. So the bound is checked against what
+    /// the walk really visits, not against a string prefix.
+    ///
+    /// With `RESOLVE_BENEATH`, the walk fails with `EXDEV` (Linux's error) on an absolute
+    /// `path`, an absolute symlink target, and any `..` taken at `base` itself. With
+    /// `RESOLVE_NO_SYMLINKS`, any symlink met (final component included) is `ELOOP`.
+    /// `base` is canonicalized first (its own symlinks followed), so the bound is the
+    /// directory it names.
+    ///
+    /// A missing final component is not an error: `Walked::Missing` hands back its parent
+    /// (already checked against the bound), for `O_CREAT`.
+    pub fn resolve_at(&self, base: &str, path: &str, follow_final: bool, resolve: u64) -> Result<Walked, Errno> {
+        if resolve & !crate::resolve::RESOLVE_SUPPORTED != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let no_symlinks = resolve & crate::resolve::RESOLVE_NO_SYMLINKS != 0;
+        let mut stack = self.walk_root()?;
+        if !path.starts_with('/') {
+            // The base is trusted (it is the caller's own dirfd or cwd): walk it unbounded.
+            match self.walk(&mut stack, base, true, None, false)? {
+                None => {}
+                Some(_) => return Err(Errno::ENOENT),
+            }
+            if stack.last().unwrap().1.file_type() != FileType::Directory {
+                return Err(Errno::ENOTDIR);
+            }
+        } else if resolve & crate::resolve::RESOLVE_BENEATH != 0 {
+            return Err(Errno::EXDEV);
+        }
+        let bound = (resolve & crate::resolve::RESOLVE_BENEATH != 0).then_some(stack.len());
+        match self.walk(&mut stack, path, follow_final, bound, no_symlinks)? {
+            None => {
+                let path = stack_path(&stack);
+                Ok(Walked::Found { node: stack.pop().unwrap().1, path })
+            }
+            Some(leaf) => {
+                let mut path = stack_path(&stack);
+                if path.len() > 1 {
+                    path.push('/');
+                }
+                path.push_str(&leaf);
+                Ok(Walked::Missing { parent: stack.pop().unwrap().1, path, leaf })
+            }
+        }
+    }
+
+    /// `openat2`: `resolve_at`, then open (or, with `O_CREAT`, create) what it found. Returns
+    /// the handle and the canonical absolute path of the file, which is what the fd table
+    /// should record for a later `*at` call through this fd. `O_NOFOLLOW` on a final symlink
+    /// is `ELOOP`; `O_CREAT|O_EXCL` on an existing name is `EEXIST`.
+    pub fn open_at(&self, base: &str, path: &str, flags: OpenFlags, resolve: u64) -> Result<(Box<dyn FileHandle>, String), Errno> {
+        const O_EXCL: i32 = 0o200;
+        const O_NOFOLLOW: i32 = 0o400000;
+        let creat = flags.0 & OpenFlags::CREAT.0 != 0;
+        match self.resolve_at(base, path, flags.0 & O_NOFOLLOW == 0, resolve)? {
+            Walked::Found { .. } if creat && flags.0 & O_EXCL != 0 => Err(Errno::EEXIST),
+            Walked::Found { node, .. } if node.file_type() == FileType::Symlink => Err(Errno::ELOOP),
+            Walked::Found { node, path } => Ok((node.open(flags)?, path)),
+            Walked::Missing { parent, path, leaf } if creat => Ok((parent.create(&leaf)?.open(flags)?, path)),
+            Walked::Missing { .. } => Err(Errno::ENOENT),
+        }
+    }
+
+    /// The walk's starting stack: the root of the filesystem mounted at `/`.
+    fn walk_root(&self) -> Result<Vec<(String, Arc<dyn Inode>)>, Errno> {
+        let (_, fs) = self.find("/").ok_or(Errno::ENOENT)?;
+        Ok(alloc::vec![(String::new(), fs.root()?)])
+    }
+
+    /// Walk `path` from the top of `stack` (from the root if `path` is absolute), pushing each
+    /// directory entered. `bound`: the stack depth `..` may not go below (`EXDEV`); `None`
+    /// lets `..` stop at `/` as usual. Returns `Some(leaf)` when only the final component is
+    /// missing (the stack then ends at its parent), `None` when the stack's top is the result.
+    fn walk(
+        &self,
+        stack: &mut Vec<(String, Arc<dyn Inode>)>,
+        path: &str,
+        follow_final: bool,
+        bound: Option<usize>,
+        no_symlinks: bool,
+    ) -> Result<Option<String>, Errno> {
+        // Components still to walk, last one first (a symlink's target goes on top).
+        let mut todo: Vec<String> = path.split('/').filter(|c| !c.is_empty()).rev().map(String::from).collect();
+        if path.starts_with('/') {
+            stack.truncate(1);
+        }
+        let mut symlinks = 0;
+        while let Some(name) = todo.pop() {
+            match name.as_str() {
+                "." => {}
+                ".." => {
+                    if stack.last().unwrap().1.file_type() != FileType::Directory {
+                        return Err(Errno::ENOTDIR);
+                    }
+                    if Some(stack.len()) == bound {
+                        return Err(Errno::EXDEV);
+                    }
+                    if stack.len() > 1 {
+                        stack.pop();
+                    }
+                }
+                _ => {
+                    let dir = &stack.last().unwrap().1;
+                    if dir.file_type() != FileType::Directory {
+                        return Err(Errno::ENOTDIR);
+                    }
+                    let mut child_path = stack_path(stack);
+                    if child_path.len() > 1 {
+                        child_path.push('/');
+                    }
+                    child_path.push_str(&name);
+                    // A mount point: its filesystem's root replaces whatever the parent has there.
+                    let node = match self.find(&child_path) {
+                        Some((prefix, fs)) if prefix == child_path => fs.root()?,
+                        _ => match dir.lookup(&name) {
+                            Ok(node) => node,
+                            Err(Errno::ENOENT) if todo.is_empty() => return Ok(Some(name)),
+                            Err(e) => return Err(e),
+                        },
+                    };
+                    let is_final = todo.is_empty();
+                    if node.file_type() == FileType::Symlink && (no_symlinks || !is_final || follow_final) {
+                        if no_symlinks {
+                            return Err(Errno::ELOOP);
+                        }
+                        symlinks += 1;
+                        if symlinks > MAX_WALK_SYMLINKS {
+                            return Err(Errno::ELOOP);
+                        }
+                        let target = node.readlink()?;
+                        if target.starts_with('/') {
+                            if bound.is_some() {
+                                return Err(Errno::EXDEV);
+                            }
+                            stack.truncate(1);
+                        }
+                        todo.extend(target.split('/').filter(|c| !c.is_empty()).rev().map(String::from));
+                    } else {
+                        stack.push((name, node));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Symlinks one `resolve_at` walk may follow in total (Linux's `MAXSYMLINKS`).
+const MAX_WALK_SYMLINKS: u32 = 40;
+
+/// The absolute path of the top of a walk stack.
+fn stack_path(stack: &[(String, Arc<dyn Inode>)]) -> String {
+    if stack.len() == 1 {
+        return String::from("/");
+    }
+    let mut path = String::new();
+    for (name, _) in &stack[1..] {
+        path.push('/');
+        path.push_str(name);
+    }
+    path
+}
+
+/// What `MountTable::resolve_at` found.
+pub enum Walked {
+    /// The path names `node`, whose canonical absolute path is `path`.
+    Found { node: Arc<dyn Inode>, path: String },
+    /// Everything but the final component exists: `leaf` is missing from `parent`;
+    /// `path` is where it would be.
+    Missing { parent: Arc<dyn Inode>, path: String, leaf: String },
 }
 
 impl Default for MountTable {
@@ -1355,5 +1533,187 @@ mod tests {
             .expect("old.txt must be restored by rollback, not lost");
         let file = restored.as_any().downcast_ref::<TestFile>().expect("TestFile");
         assert_eq!(&file.content.lock()[..], b"payload");
+    }
+
+    // ── resolve_at (openat2) ─────────────────────────────────────────────
+
+    use crate::resolve::{RESOLVE_BENEATH as BENEATH, RESOLVE_NO_SYMLINKS as NO_SYMLINKS};
+
+    /// `/etc/passwd`, `/jail/{f, sub/{g, deep/}}`, `/real/x`, `/lnk -> /real`.
+    fn jail() -> MountTable {
+        let table = MountTable::new();
+        let deep = TestDir::new();
+        let sub = TestDir::new().with("g", TestFile::new(b"g")).with("deep", deep as Arc<dyn Inode>);
+        let jail = TestDir::new().with("f", TestFile::new(b"f")).with("sub", sub as Arc<dyn Inode>);
+        let etc = TestDir::new().with("passwd", TestFile::new(b"secret"));
+        let real = TestDir::new().with("x", TestFile::new(b"x"));
+        let root = TestDir::new()
+            .with("etc", etc as Arc<dyn Inode>)
+            .with("jail", jail as Arc<dyn Inode>)
+            .with("real", real as Arc<dyn Inode>)
+            .with("lnk", TestLink::new("/real"));
+        mount_root_with(&table, root);
+        table
+    }
+
+    fn found(table: &MountTable, base: &str, path: &str, resolve: u64) -> Result<String, Errno> {
+        match table.resolve_at(base, path, true, resolve)? {
+            Walked::Found { path, .. } => Ok(path),
+            Walked::Missing { path, .. } => Ok(alloc::format!("missing:{path}")),
+        }
+    }
+
+    #[test]
+    fn beneath_resolves_inside_the_bound() {
+        let t = jail();
+        assert_eq!(found(&t, "/jail", "f", BENEATH), Ok("/jail/f".into()));
+        assert_eq!(found(&t, "/jail", "sub/g", BENEATH), Ok("/jail/sub/g".into()));
+        assert_eq!(found(&t, "/jail", "sub/../f", BENEATH), Ok("/jail/f".into()));
+        assert_eq!(found(&t, "/jail", ".", BENEATH), Ok("/jail".into()));
+    }
+
+    #[test]
+    fn beneath_dotdot_at_the_bound_is_exdev() {
+        let t = jail();
+        assert_eq!(found(&t, "/jail", "..", BENEATH), Err(Errno::EXDEV));
+        assert_eq!(found(&t, "/jail", "../etc/passwd", BENEATH), Err(Errno::EXDEV));
+        assert_eq!(found(&t, "/jail", "sub/../..", BENEATH), Err(Errno::EXDEV));
+        assert_eq!(found(&t, "/jail/sub", "..", BENEATH), Err(Errno::EXDEV));
+        // Without the flag, the same walk leaves the directory.
+        assert_eq!(found(&t, "/jail", "../etc/passwd", 0), Ok("/etc/passwd".into()));
+    }
+
+    #[test]
+    fn beneath_absolute_path_is_exdev() {
+        let t = jail();
+        assert_eq!(found(&t, "/jail", "/etc/passwd", BENEATH), Err(Errno::EXDEV));
+        // Even one that would land inside the bound.
+        assert_eq!(found(&t, "/jail", "/jail/f", BENEATH), Err(Errno::EXDEV));
+        assert_eq!(found(&t, "/jail", "/etc/passwd", 0), Ok("/etc/passwd".into()));
+    }
+
+    #[test]
+    fn beneath_absolute_symlink_is_exdev_even_pointing_inside() {
+        let t = jail();
+        let jail = t.resolve("/jail").unwrap();
+        jail.symlink("toetc", "/etc").unwrap();
+        jail.symlink("toself", "/jail/f").unwrap();
+        assert_eq!(found(&t, "/jail", "toetc/passwd", BENEATH), Err(Errno::EXDEV));
+        assert_eq!(found(&t, "/jail", "toself", BENEATH), Err(Errno::EXDEV));
+        assert_eq!(found(&t, "/jail", "toetc/passwd", 0), Ok("/etc/passwd".into()));
+    }
+
+    #[test]
+    fn beneath_relative_symlink_climbing_out_is_exdev() {
+        let t = jail();
+        t.resolve("/jail/sub").unwrap().symlink("up", "../../etc").unwrap();
+        assert_eq!(found(&t, "/jail", "sub/up/passwd", BENEATH), Err(Errno::EXDEV));
+        assert_eq!(found(&t, "/jail", "sub/up/passwd", 0), Ok("/etc/passwd".into()));
+    }
+
+    #[test]
+    fn beneath_relative_symlink_staying_inside_resolves() {
+        let t = jail();
+        t.resolve("/jail/sub").unwrap().symlink("sib", "../f").unwrap();
+        assert_eq!(found(&t, "/jail", "sub/sib", BENEATH), Ok("/jail/f".into()));
+    }
+
+    #[test]
+    fn dotdot_after_a_symlink_is_the_physical_parent() {
+        // sub/deep reached through a symlink: `..` goes to sub (where deep really is), not
+        // back to the directory that held the symlink. A lexical `..` would give /jail.
+        let t = jail();
+        t.resolve("/jail").unwrap().symlink("d", "sub/deep").unwrap();
+        assert_eq!(found(&t, "/jail", "d/..", BENEATH), Ok("/jail/sub".into()));
+        assert_eq!(found(&t, "/jail", "d/../g", BENEATH), Ok("/jail/sub/g".into()));
+        // One level more is the bound, two is out.
+        assert_eq!(found(&t, "/jail", "d/../..", BENEATH), Ok("/jail".into()));
+        assert_eq!(found(&t, "/jail", "d/../../..", BENEATH), Err(Errno::EXDEV));
+    }
+
+    #[test]
+    fn beneath_crosses_a_mount_under_the_bound_and_back() {
+        let t = jail();
+        t.mount("/jail/m", TestFs::new(TestDir::new().with("h", TestFile::new(b"h"))));
+        assert_eq!(found(&t, "/jail", "m/h", BENEATH), Ok("/jail/m/h".into()));
+        assert_eq!(found(&t, "/jail", "m/../f", BENEATH), Ok("/jail/f".into()));
+        assert_eq!(found(&t, "/jail", "m/../..", BENEATH), Err(Errno::EXDEV));
+        // A dirfd on the mount root itself: `..` is the bound.
+        assert_eq!(found(&t, "/jail/m", "..", BENEATH), Err(Errno::EXDEV));
+        assert_eq!(found(&t, "/jail/m", "..", 0), Ok("/jail".into()));
+    }
+
+    #[test]
+    fn base_with_a_symlink_is_canonicalized() {
+        // `/lnk -> /real`: the bound is /real, and the reported path is canonical.
+        let t = jail();
+        assert_eq!(found(&t, "/lnk", "x", BENEATH), Ok("/real/x".into()));
+        assert_eq!(found(&t, "/lnk", "..", BENEATH), Err(Errno::EXDEV));
+    }
+
+    #[test]
+    fn no_symlinks_refuses_every_symlink() {
+        let t = jail();
+        t.resolve("/jail").unwrap().symlink("sib", "f").unwrap();
+        t.resolve("/jail").unwrap().symlink("dl", "sub").unwrap();
+        assert_eq!(found(&t, "/jail", "sib", NO_SYMLINKS), Err(Errno::ELOOP));
+        assert_eq!(found(&t, "/jail", "dl/g", NO_SYMLINKS), Err(Errno::ELOOP));
+        assert_eq!(t.resolve_at("/jail", "sib", false, NO_SYMLINKS).err(), Some(Errno::ELOOP));
+        assert_eq!(found(&t, "/", "lnk/x", NO_SYMLINKS), Err(Errno::ELOOP));
+        assert_eq!(found(&t, "/jail", "sub/g", NO_SYMLINKS | BENEATH), Ok("/jail/sub/g".into()));
+        assert_eq!(found(&t, "/jail", "sib", 0), Ok("/jail/f".into()));
+    }
+
+    #[test]
+    fn missing_leaf_comes_back_with_its_parent_but_not_outside_the_bound() {
+        let t = jail();
+        assert_eq!(found(&t, "/jail", "sub/new", BENEATH), Ok("missing:/jail/sub/new".into()));
+        assert_eq!(found(&t, "/jail", "../new", BENEATH), Err(Errno::EXDEV));
+        // A missing intermediate component is ENOENT, not "missing".
+        assert_eq!(found(&t, "/jail", "nope/new", BENEATH), Err(Errno::ENOENT));
+        // A dangling symlink: the leaf it names, checked against the bound too.
+        t.resolve("/jail").unwrap().symlink("dang", "sub/later").unwrap();
+        t.resolve("/jail").unwrap().symlink("dangout", "../later").unwrap();
+        assert_eq!(found(&t, "/jail", "dang", BENEATH), Ok("missing:/jail/sub/later".into()));
+        assert_eq!(found(&t, "/jail", "dangout", BENEATH), Err(Errno::EXDEV));
+    }
+
+    #[test]
+    fn file_in_the_middle_is_enotdir() {
+        let t = jail();
+        assert_eq!(found(&t, "/jail", "f/x", BENEATH), Err(Errno::ENOTDIR));
+        assert_eq!(found(&t, "/jail", "f/..", BENEATH), Err(Errno::ENOTDIR));
+        assert_eq!(found(&t, "/jail/f", "x", BENEATH), Err(Errno::ENOTDIR));
+    }
+
+    #[test]
+    fn symlink_loop_is_eloop() {
+        let t = jail();
+        t.resolve("/jail").unwrap().symlink("a", "b").unwrap();
+        t.resolve("/jail").unwrap().symlink("b", "a").unwrap();
+        assert_eq!(found(&t, "/jail", "a", BENEATH), Err(Errno::ELOOP));
+    }
+
+    #[test]
+    fn unsupported_resolve_bits_are_einval() {
+        let t = jail();
+        assert_eq!(found(&t, "/jail", "f", crate::resolve::RESOLVE_IN_ROOT), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn open_at_create_excl_and_nofollow() {
+        let t = jail();
+        t.resolve("/jail").unwrap().symlink("sib", "f").unwrap();
+        // O_CREAT of a missing leaf creates it in the bounded parent.
+        assert!(matches!(t.open_at("/jail", "sub/new", OpenFlags::CREAT, BENEATH), Err(Errno::ENOSYS)));
+        assert!(t.resolve("/jail/sub/new").is_ok(), "created under /jail/sub");
+        // ... and never outside it.
+        assert_eq!(t.open_at("/jail", "../new", OpenFlags::CREAT, BENEATH).err(), Some(Errno::EXDEV));
+        assert_eq!(t.resolve("/new").err(), Some(Errno::ENOENT));
+        // O_EXCL on an existing name.
+        assert_eq!(t.open_at("/jail", "f", OpenFlags(0o100 | 0o200), BENEATH).err(), Some(Errno::EEXIST));
+        // O_NOFOLLOW on a final symlink.
+        assert_eq!(t.open_at("/jail", "sib", OpenFlags(0o400000), BENEATH).err(), Some(Errno::ELOOP));
+        assert_eq!(t.open_at("/jail", "nope", OpenFlags::RDONLY, BENEATH).err(), Some(Errno::ENOENT));
     }
 }

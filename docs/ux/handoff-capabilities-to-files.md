@@ -1,6 +1,6 @@
 # Handoff: from capabilities to the file manager (v1)
 
-Status: **not started** (written 2026-10-08). For a fresh agent session: everything needed is
+Status: **stage 1 done** (openat2, 2026-10-08); next: stage 2 (NX). Written 2026-10-08. For a fresh agent session: everything needed is
 here or linked. Work stage by stage; each stage ends in a commit and leaves everything that
 worked still working. Estimates are guesses in sessions (one long working session each).
 

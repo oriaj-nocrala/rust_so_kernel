@@ -19,6 +19,7 @@ impl Errno {
     pub const ENOENT:  Self = Self(2);
     pub const EIO:     Self = Self(5);
     pub const ENXIO:   Self = Self(6);
+    pub const E2BIG:   Self = Self(7);
     pub const EBADF:   Self = Self(9);
     pub const ENOMEM:  Self = Self(12);
     pub const EFAULT:  Self = Self(14);

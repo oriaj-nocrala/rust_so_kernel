@@ -127,5 +127,6 @@ pub mod inode;
 pub mod lock;
 pub mod mount;
 pub mod path;
+pub mod resolve;
 pub mod ramfs;
 pub mod types;

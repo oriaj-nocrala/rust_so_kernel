@@ -62,6 +62,12 @@ pub fn resolve_no_follow(path: &str) -> Result<Arc<dyn Inode>, Errno> {
     MOUNTS.resolve_no_follow(path)
 }
 
+/// openat2: open `path` relative to the directory `base` under `RESOLVE_*` bits; also returns
+/// the file's canonical path. See `MountTable::open_at`.
+pub fn open_at(base: &str, path: &str, flags: OpenFlags, resolve: u64) -> Result<(Box<dyn FileHandle>, alloc::string::String), Errno> {
+    MOUNTS.open_at(base, path, flags, resolve)
+}
+
 /// Resolve `path` and open it, returning an FD-ready `FileHandle`.
 pub fn open(path: &str, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
     MOUNTS.open(path, flags)

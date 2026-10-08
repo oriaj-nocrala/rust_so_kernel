@@ -1,6 +1,6 @@
 # Capabilities: the kernel's first security model
 
-Status: **not started; cornerstone** (handoff written 2026-10-07; promoted 2026-10-08 to backbone B3
+Status: **started (openat2 + `RESOLVE_BENEATH`, stage 1 of `../ux/handoff-capabilities-to-files.md`); cornerstone** (handoff written 2026-10-07; promoted 2026-10-08 to backbone B3
 of [`../ux/backbones.md`](../ux/backbones.md), ahead of the other `docs/ai/` plans).
 Principles served: P6 (nothing escapes its box), P2.7 (ask once, then show), P3
 ([`../ux/principles.md`](../ux/principles.md)).
@@ -80,7 +80,7 @@ resource-and-effect capabilities for coding agents") but not read.
 
 ## Steps
 
-1. `openat2` with `RESOLVE_BENEATH` (+ `RESOLVE_NO_SYMLINKS`), raw C test proven by sabotage
+1. **Done.** `openat2` with `RESOLVE_BENEATH` (+ `RESOLVE_NO_SYMLINKS`), raw C test proven by sabotage
    (`linux-abi` skill).
 2. NX / `PROT_EXEC`.
 3. Rights masks on fds + `cap_rights_limit`, host-testable where the logic allows (`vfs`).

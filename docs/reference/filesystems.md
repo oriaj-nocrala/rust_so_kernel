@@ -19,6 +19,7 @@ Code: `kernel/src/fs/`, crates `vfs/` and `ext2/` (host tests: `cd vfs && cargo 
 
 - Traits `Inode`/`Filesystem`/`FileHandle`, `MountTable`, `normalize_path`.
 - `resolve()` follows symlinks at every component (open/stat). `resolve_no_follow()` leaves the last one (lstat/readlink). Both stop after 8 hops with `ELOOP`.
+- `resolve_at(base, path, follow, resolve)` (openat2) is a second walk: raw path, a stack of visited directories (`..` = physical parent, mount roots crossed both ways), bound checks for `RESOLVE_BENEATH` (`EXDEV`) and `RESOLVE_NO_SYMLINKS` (`ELOOP`), 40 symlinks in total. `resolve()` callers normalize `..` lexically first. Replacing `resolve_inner` with this walk (one mechanism, P5) is open: it changes `..`-after-symlink for every path syscall.
 - Mutations (`create`/`mkdir`/`symlink`/`mksocket`/…) default to `EROFS`; only ramfs and ext2 implement them. `Inode::link_child` (hard links) defaults to `EPERM`; `MountTable::link` checks the mount (`EXDEV`) and that the source is not a directory.
 - Open ext2 handles keep their own copy of the inode; the two paths that change a link count (`link_child`, `unlink`) update every live copy (`OPEN_RAWS`), because a handle would otherwise report the old count to `fstat` and write it back on its next write.
 - vfs locks call a relax hook (`vfs::lock::set_relax_hook`) so a spinning CPU still answers TLB shootdowns. `vfs::clock::set_clock` gives ramfs wall time.
