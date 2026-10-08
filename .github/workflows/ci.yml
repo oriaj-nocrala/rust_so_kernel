@@ -28,8 +28,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Installs what rust-toolchain.toml names, its targets included (the musl std for STD_PROGRAMS); a no-op when present.
       - name: Rust toolchain (rust-toolchain.toml)
-        run: rustup show active-toolchain || rustup toolchain install
+        run: rustup toolchain install --no-self-update && rustup target list --installed
 
       - uses: actions/cache@v4
         with:
@@ -78,8 +79,9 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           if [ -w /dev/kvm ]; then echo "KVM: usable"; else echo "::warning::/dev/kvm not writable: QEMU runs under TCG"; fi
 
+      # Installs what rust-toolchain.toml names, its targets included (the musl std for STD_PROGRAMS); a no-op when present.
       - name: Rust toolchain (rust-toolchain.toml)
-        run: rustup show active-toolchain || rustup toolchain install
+        run: rustup toolchain install --no-self-update && rustup target list --installed
 
       # Only what cargo itself keeps coherent, plus downloads pinned by their scripts.
       # The C builds (mlibc, BusyBox, ncurses, DOOM, Quake) run from scratch every time:

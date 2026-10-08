@@ -1,3 +1,5 @@
 [toolchain]
 channel = "nightly-2026-03-08"
 components = ["rust-src"]
+# The std programs (kernel/build.rs STD_PROGRAMS: gui-client, probes) are ordinary static musl binaries.
+targets = ["x86_64-unknown-linux-musl"]
