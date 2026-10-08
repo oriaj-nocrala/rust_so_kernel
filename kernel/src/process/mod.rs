@@ -196,6 +196,10 @@ pub struct Process {
     pub continued_pending: bool,
     /// uids, gids and supplementary groups (`creds.rs`): bookkeeping only, inherited by `fork`/`clone`, kept by `exec`.
     pub creds: creds::Creds,
+    /// Capability mode (`cap_enter`, `vfs::capmode`): set once, never cleared. Shared by the threads of a process (one
+    /// `Arc`, so a sibling's `cap_enter` closes this thread's next syscall too), copied into a new `Arc` by `fork`, kept by
+    /// `exec`. The scheduler publishes a pointer to it per CPU (`scheduler::in_capmode`) so the dispatcher reads it without a lock.
+    pub cap_mode: Arc<core::sync::atomic::AtomicBool>,
 
     /// FS segment base (used for TLS via arch_prctl ARCH_SET_FS).
     /// Saved/restored on every context switch so mlibc's TLS works correctly.
@@ -436,6 +440,7 @@ impl Process {
             stop_reported: false,
             continued_pending: false,
             creds: creds::Creds::default(),
+            cap_mode: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             fs_base: 0,
             fpu_state: Box::new(fpu::default_state()),
             is_thread: false,
@@ -536,6 +541,7 @@ impl Process {
             stop_reported: false,
             continued_pending: false,
             creds: creds::Creds::default(),
+            cap_mode: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             fs_base: 0,
             fpu_state: Box::new(fpu::default_state()),
             is_thread: false,
@@ -627,6 +633,7 @@ impl Process {
             stop_reported: false,
             continued_pending: false,
             creds: creds::Creds::default(),
+            cap_mode: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             fs_base: 0,
             fpu_state,
             is_thread: false,
@@ -746,6 +753,7 @@ impl Process {
             stop_reported: false,
             continued_pending: false,
             creds: creds::Creds::default(),
+            cap_mode: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             fs_base: 0,
             fpu_state: Box::new(fpu::default_state()),
             is_thread: true,

@@ -39,6 +39,12 @@ fn pid_stat_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 8 + 2 }
 fn pid_cmdline_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 8 + 3 }
 fn pid_statm_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 8 + 4 }
 fn pid_maps_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 8 + 5 }
+fn pid_capdenials_ino(pid: usize) -> u64 { 1000 + (pid as u64) * 8 + 6 }
+
+/// `/proc/capdenials`: recent capability refusals of every process, `<pid> <why>` per line (`vfs::capmode::DenialLog`).
+fn render_capdenials() -> String {
+    crate::process::syscall::CAP_DENIALS.with(|log| log.render(None))
+}
 
 // ── Filesystem ───────────────────────────────────────────────────────────────
 
@@ -535,6 +541,7 @@ impl Inode for ProcDirInode {
             "displays" => Ok(Arc::new(RenderedInode { ino: 214, render: crate::gpu::render_displays })),
             "dispstate" => Ok(Arc::new(RenderedInode { ino: 215, render: crate::gpu::render_dispstate })),
             "nic" => Ok(Arc::new(RenderedInode { ino: 216, render: crate::network::render_nic })),
+            "capdenials" => Ok(Arc::new(RenderedInode { ino: 217, render: render_capdenials })),
             _ => {
                 let pid: usize = name.parse().map_err(|_| Errno::ENOENT)?;
                 if crate::process::scheduler::exe_name_for_pid(pid).is_some() {
@@ -566,13 +573,14 @@ impl Inode for ProcDirInode {
             15 => Ok(Some(DirEntry::new(214, FileType::Regular, b"displays"))),
             16 => Ok(Some(DirEntry::new(215, FileType::Regular, b"dispstate"))),
             17 => Ok(Some(DirEntry::new(216, FileType::Regular, b"nic"))),
+            18 => Ok(Some(DirEntry::new(217, FileType::Regular, b"capdenials"))),
             n => {
                 // Live pids, appended after the always-present entries above
                 // — this is what makes `ls /proc` / BusyBox `ps`'s
                 // `opendir("/proc")` scan see every process (previously
                 // direct lookup like `cat /proc/3/exe` worked but nothing
                 // enumerated them, see this module's top doc comment).
-                let idx = (n - 18) as usize;
+                let idx = (n - 19) as usize;
                 let pids = crate::process::scheduler::all_pids();
                 let Some(&pid) = pids.get(idx) else { return Ok(None); };
                 let name = format!("{}", pid);
@@ -774,6 +782,7 @@ impl Inode for ProcPidDirInode {
             "cmdline" => Ok(Arc::new(ProcCmdlineInode { pid: self.pid })),
             "statm" => Ok(Arc::new(ProcStatmInode { pid: self.pid })),
             "maps" => Ok(Arc::new(ProcMapsInode { pid: self.pid })),
+            "capdenials" => Ok(Arc::new(ProcCapDenialsInode { pid: self.pid })),
             _ => Err(Errno::ENOENT),
         }
     }
@@ -788,8 +797,35 @@ impl Inode for ProcPidDirInode {
             4 => Ok(Some(DirEntry::new(pid_cmdline_ino(self.pid), FileType::Regular, b"cmdline"))),
             5 => Ok(Some(DirEntry::new(pid_statm_ino(self.pid), FileType::Regular, b"statm"))),
             6 => Ok(Some(DirEntry::new(pid_maps_ino(self.pid), FileType::Regular, b"maps"))),
+            7 => Ok(Some(DirEntry::new(pid_capdenials_ino(self.pid), FileType::Regular, b"capdenials"))),
             _ => Ok(None),
         }
+    }
+}
+
+/// `/proc/<pid>/capdenials`: that process's lines of `/proc/capdenials`.
+struct ProcCapDenialsInode {
+    pid: usize,
+}
+
+impl ProcCapDenialsInode {
+    fn render(&self) -> String {
+        crate::process::syscall::CAP_DENIALS.with(|log| log.render(Some(self.pid)))
+    }
+}
+
+impl Inode for ProcCapDenialsInode {
+    fn as_any(&self) -> &dyn core::any::Any { self }
+
+    fn stat(&self) -> Stat {
+        Stat::regular(pid_capdenials_ino(self.pid), self.render().len() as i64)
+    }
+
+    fn open(&self, flags: OpenFlags) -> Result<Box<dyn FileHandle>, Errno> {
+        if flags.is_write() {
+            return Err(Errno::EROFS);
+        }
+        Ok(Box::new(ProcFile { data: self.render().into_bytes(), offset: 0 }))
     }
 }
 
@@ -915,12 +951,18 @@ impl Inode for ProcCmdlineInode {
     }
 }
 
+#[derive(Clone)]
 struct ProcPidDirHandle {
     pid:    usize,
     offset: u64,
 }
 
 impl FileHandle for ProcPidDirHandle {
+    /// A copy at the same listing position (its own offset from here on, not a shared one: the listing is a snapshot);
+    /// lets a directory fd survive `fork`, `dup` and `SCM_RIGHTS`, which a capability (a dirfd) must.
+    fn dup(&self) -> Option<Box<dyn FileHandle>> {
+        Some(Box::new(self.clone()))
+    }
     fn read(&mut self, _buf: &mut [u8]) -> FileResult<usize> {
         Err(FileError::InvalidArgument)
     }
@@ -1006,11 +1048,17 @@ impl FileHandle for ProcFile {
 }
 
 /// Directory handle: keeps a readdir cursor and serves `getdents64`.
+#[derive(Clone)]
 struct ProcDirHandle {
     offset: u64,
 }
 
 impl FileHandle for ProcDirHandle {
+    /// A copy at the same listing position (its own offset from here on, not a shared one: the listing is a snapshot);
+    /// lets a directory fd survive `fork`, `dup` and `SCM_RIGHTS`, which a capability (a dirfd) must.
+    fn dup(&self) -> Option<Box<dyn FileHandle>> {
+        Some(Box::new(self.clone()))
+    }
     fn read(&mut self, _buf: &mut [u8]) -> FileResult<usize> {
         Err(FileError::InvalidArgument) // directories use getdents64
     }

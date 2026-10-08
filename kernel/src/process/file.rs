@@ -185,9 +185,9 @@ impl FileDescriptorTable {
 
     /// dup(2): install a clone of `fd`'s handle at the first free slot
     /// `>= min_fd`. Relies on `FileHandle::dup()` — fds backed by a handle
-    /// that doesn't implement it (returns `None`) can't be dup'd; today
-    /// that's only directory handles (opendir), which nothing needs to
-    /// dup in practice.
+    /// that doesn't implement it (returns `None`) can't be dup'd. Directory
+    /// handles do (a copy of their listing): a dirfd is a capability and must
+    /// survive `dup`, `fork` and `SCM_RIGHTS`.
     pub fn dup(&mut self, fd: usize, min_fd: usize) -> FileResult<usize> {
         self.dup_with(fd, min_fd, false)
     }

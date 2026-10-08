@@ -194,6 +194,10 @@ static CURRENT_AS_PTR: [AtomicUsize; crate::cpu::MAX_CPUS] =
     [const { AtomicUsize::new(0) }; crate::cpu::MAX_CPUS];
 static CURRENT_PID_FAST: [AtomicUsize; crate::cpu::MAX_CPUS] =
     [const { AtomicUsize::new(0) }; crate::cpu::MAX_CPUS];
+/// `Arc::as_ptr` of the running process's `cap_mode` flag (0: none), for `in_capmode`. Valid while that process runs on
+/// this CPU, like `CURRENT_AS_PTR`.
+static CURRENT_CAPMODE_PTR: [AtomicUsize; crate::cpu::MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; crate::cpu::MAX_CPUS];
 
 /// Re-sync the per-CPU fast-path pointers for the already-running process.
 ///
@@ -221,6 +225,7 @@ fn update_current_fast(proc: &Process) {
         Ordering::Release,
     );
     CURRENT_PID_FAST[cpu].store(proc.pid.0, Ordering::Release);
+    CURRENT_CAPMODE_PTR[cpu].store(alloc::sync::Arc::as_ptr(&proc.cap_mode) as usize, Ordering::Release);
 }
 
 /// Clear the per-CPU fast-path pointers (no process running on this CPU).
@@ -229,6 +234,7 @@ fn clear_current_fast() {
     let cpu = crate::cpu::cpu_id();
     CURRENT_AS_PTR[cpu].store(0, Ordering::Release);
     CURRENT_PID_FAST[cpu].store(0, Ordering::Release);
+    CURRENT_CAPMODE_PTR[cpu].store(0, Ordering::Release);
 }
 
 // The tick-accounting constants (`BASE_QUANTUM`, `PRIORITY_QUANTUM_BONUS`,
@@ -2232,6 +2238,16 @@ pub unsafe fn current_as_fast() -> Option<&'static AddressSpace> {
 }
 
 /// Fast PID read for logging (no Mutex).
+/// Whether the process running on this CPU is in capability mode. Lock-free; any IF state (the CPU id and the pointer
+/// are read with interrupts off, so a migration cannot pair one CPU's id with another's process).
+pub fn in_capmode() -> bool {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let ptr = CURRENT_CAPMODE_PTR[crate::cpu::cpu_id()].load(Ordering::Acquire);
+        // SAFETY: the flag of the process running here; its `Arc` lives at least as long as it runs on this CPU.
+        ptr != 0 && unsafe { (*(ptr as *const core::sync::atomic::AtomicBool)).load(Ordering::Acquire) }
+    })
+}
+
 pub fn current_pid_fast() -> usize {
     CURRENT_PID_FAST[crate::cpu::cpu_id()].load(Ordering::Relaxed)
 }

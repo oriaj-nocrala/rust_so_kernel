@@ -1,6 +1,6 @@
 # Handoff: from capabilities to the file manager (v1)
 
-Status: **stages 1-3 done** (openat2, NX, rights on fds; 2026-10-08); next: stage 4 (capability mode). Written 2026-10-08. For a fresh agent session: everything needed is
+Status: **stages 1-4 done** (openat2, NX, rights on fds, capability mode; 2026-10-08); next: stage 5 (`cap-exec`; exec is denied in capability mode, so it needs an "enter at exec" step or `fexecve`). Written 2026-10-08. For a fresh agent session: everything needed is
 here or linked. Work stage by stage; each stage ends in a commit and leaves everything that
 worked still working. Estimates are guesses in sessions (one long working session each).
 

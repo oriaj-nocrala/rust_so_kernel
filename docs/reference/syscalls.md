@@ -13,8 +13,8 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 
 - `sigset_t` arrives in Linux layout (bit N-1 = signal N) and is shifted to the kernel's bit-N masks by `signal::mask_from_user`.
 - termios/winsize use this port's own layout (`tty` crate), not Linux's.
-- Custom numbers above the Linux range: 400 `uptime_ms`, 401 `uptime_sec`, 402 `meminfo_kb`, 403 `kdebug_ctl`, 404 `statvfs`, 405 `cap_rights_limit`, 406 `cap_rights_get` (Linux has no Capsicum calls; C header `userspace/c/include/constanos_capsicum.h`).
-- Errors outside Linux's range (which ends at 133): 134 `ENOTCAPABLE` (a descriptor lacks a capability right), 135 `ECAPMODE` (reserved for capability mode). libc's `strerror` does not know them; the kernel log names every refusal (`capability: PID n <call> on fd N refused: no CAP_X`).
+- Custom numbers above the Linux range: 400 `uptime_ms`, 401 `uptime_sec`, 402 `meminfo_kb`, 403 `kdebug_ctl`, 404 `statvfs`, 405 `cap_rights_limit`, 406 `cap_rights_get`, 407 `cap_enter`, 408 `cap_getmode` (Linux has no Capsicum calls; C header `userspace/c/include/constanos_capsicum.h`).
+- Errors outside Linux's range (which ends at 133): 134 `ENOTCAPABLE` (a descriptor lacks a capability right), 135 `ECAPMODE` (not allowed in capability mode). libc's `strerror` does not know them; the kernel log names every refusal (`capability: PID n <call> on fd N refused: no CAP_X`).
 
 ## Capability rights on descriptors (`vfs::rights`)
 
@@ -23,6 +23,24 @@ Code: `kernel/src/process/syscall/` (dispatcher, `SyscallNumber` is the authorit
 - A dirfd used with a relative path (`fs::user_path_at`) needs `CAP_LOOKUP` plus: openat/openat2 `CAP_READ`/`CAP_WRITE` by access mode, `CAP_CREATE` for `O_CREAT`, `CAP_FTRUNCATE` for `O_TRUNC`; fstatat/statx/faccessat `CAP_FSTAT`; mkdirat `CAP_MKDIRAT`; unlinkat `CAP_UNLINKAT`; symlinkat `CAP_SYMLINKAT`; linkat `CAP_LINKAT_SOURCE`/`_TARGET`; renameat `CAP_RENAMEAT_SOURCE`/`_TARGET`; fchmodat `CAP_FCHMOD`; utimensat `CAP_FUTIMES`; readlinkat nothing more. `AT_EMPTY_PATH` and `futimens` check the fd itself. An absolute path or `AT_FDCWD` uses no descriptor and needs nothing (capability mode will close that).
 - `poll` reports `POLLNVAL` for an fd without `CAP_EVENT` (FreeBSD's answer).
 - The check and the call take the fd-table lock separately: a sibling thread's `dup2` in between swaps the descriptor, which only gives it what it already holds. Test: `cap_rights_test`.
+- Directory handles implement `dup` (a copy of the open-time listing at the same position, with its own offset from then on), so a dirfd survives `fork`, `dup` and `SCM_RIGHTS`. Before, `fork` silently dropped every directory fd.
+
+## Capability mode (`cap_enter`, `vfs::capmode`)
+
+- `cap_enter` (407) puts the whole process in capability mode for good; `cap_getmode` (408) writes 1 or 0 to a `u32`. The flag is `Process::cap_mode`, an `Arc<AtomicBool>` shared by the threads of a process (a sibling's `cap_enter` covers the next syscall of every thread), copied by `fork`/`clone` into the child's own flag, kept by `exec`. The scheduler publishes a pointer to it per CPU (`scheduler::in_capmode`), so the dispatcher reads it without a lock.
+- The dispatcher applies `vfs::capmode::rule(nr)` before anything else. **A number with no rule is denied**, and the kernel test `every_implemented_syscall_has_a_capability_mode_rule` fails until a new syscall is classified.
+- `PathAt` calls (the `*at` family): `AT_FDCWD` or an absolute path is `ECAPMODE`; a relative path through a held dirfd is walked beneath it (`MountTable::resolve_at` with `RESOLVE_BENEATH`, following the final symlink only where the call does) and the call runs on the canonical path that walk found. A `..` or symlink that leaves the dirfd is `ENOTCAPABLE`. `openat2` gets `RESOLVE_BENEATH` added. The walk and the call resolve separately: a rename in between by another process could swap what the canonical path names.
+- `/proc` (and `/proc/self`) is unreachable in capability mode: no path reaches it without an absolute path or a procfs dirfd, and none is handed out.
+- Every refusal (`ECAPMODE`, and `ENOTCAPABLE` from either the mode or a descriptor's rights) is one log line and one entry in a 128-entry ring readable from outside the process: `/proc/capdenials` (`<pid> <why>` per line, all processes, survives the process) and `/proc/<pid>/capdenials`. Test: `capmode_test`.
+
+| Rule | Syscalls |
+|------|----------|
+| Allow (descriptors, memory, signals on oneself, time, own ids, new anonymous objects, sockets already held, fork/clone/wait/exit, epoll, futex, this kernel's info and rights calls) | read write close fstat poll lseek mmap mprotect munmap brk rt_sigaction rt_sigprocmask rt_sigreturn ioctl writev pipe sched_yield dup dup2 pause nanosleep getitimer alarm setitimer getpid socket accept recvfrom recvmsg shutdown listen getsockname getpeername socketpair setsockopt getsockopt clone fork vfork exit wait4 fcntl ftruncate fchdir fchmod getrusage sysinfo times getuid getgid geteuid getegid getppid setsid getgroups getresuid getresgid rt_sigsuspend sigaltstack prctl arch_prctl sync gettid futex epoll_create clock_gettime clock_getres clock_nanosleep exit_group epoll_wait epoll_ctl getdents64 set_tid_address epoll_pwait eventfd accept4 eventfd2 epoll_create1 dup3 pipe2 getrandom memfd_create pidfd_send_signal; 400 401 402 405 406 407 408 |
+| Deny: paths from `/` or the cwd | open stat lstat access getcwd chdir rename mkdir rmdir link unlink symlink readlink chmod; 404 statvfs |
+| Deny: other | execve (by path; no fexecve yet), connect, bind, setuid setgid setreuid setregid setgroups setresuid setresgid setfsuid setfsgid, reboot, pidfd_open; 403 kdebug_ctl |
+| PathAt | openat mkdirat newfstatat unlinkat renameat linkat symlinkat readlinkat fchmodat faccessat utimensat renameat2 statx openat2 faccessat2 fchmodat2 |
+| Own process only | kill tkill tgkill (the caller's tgid; tkill its tid); setpgid getpgid getsid sched_getaffinity (also 0) |
+| No destination address | sendto (`dest_addr` NULL), sendmsg (`msg_name` NULL) |
 
 ## Table
 

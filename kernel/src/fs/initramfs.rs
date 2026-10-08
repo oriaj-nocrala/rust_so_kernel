@@ -374,6 +374,7 @@ impl FileHandle for RamFile {
 /// Directory handle: keeps a readdir cursor and serves `getdents64`, shared
 /// by `RootDirInode`, `BinDirInode`, `EtcDirInode` and every
 /// `MountPointDirInode` (only their `readdir` differs).
+#[derive(Clone)]
 enum DirKind {
     Root,
     Bin,
@@ -381,12 +382,18 @@ enum DirKind {
     MountPoint(u64),
 }
 
+#[derive(Clone)]
 struct DirHandle {
     kind:   DirKind,
     offset: u64,
 }
 
 impl FileHandle for DirHandle {
+    /// A copy at the same listing position (its own offset from here on, not a shared one: the listing is a snapshot);
+    /// lets a directory fd survive `fork`, `dup` and `SCM_RIGHTS`, which a capability (a dirfd) must.
+    fn dup(&self) -> Option<Box<dyn FileHandle>> {
+        Some(Box::new(self.clone()))
+    }
     fn read(&mut self, _buf: &mut [u8]) -> FileResult<usize> {
         Err(FileError::InvalidArgument) // directories use getdents64
     }

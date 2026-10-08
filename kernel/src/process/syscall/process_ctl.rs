@@ -555,7 +555,7 @@ fn fork_impl(child_stack: u64, tls: Option<u64>, vfork: bool, share: Share) -> S
                 // stale if `arch_prctl` ran since — same reasoning as the
                 // live `fpu::save` above.
                 (proc.address_space.clone(), crate::process::Pid(proc.tgid), crate::process::scheduler::read_fs_base(), proc.files.clone(), tf_copy, proc.cwd.clone(), (proc.pgid, proc.sid, proc.ctty), proc.exe_name.clone(),
-                    (proc.signal_handlers, proc.sig_restart, proc.blocked_signals, proc.sig_extra, proc.altstack), (proc.name, proc.cmdline.clone(), proc.creds.clone()))
+                    (proc.signal_handlers, proc.sig_restart, proc.blocked_signals, proc.sig_extra, proc.altstack), (proc.name, proc.cmdline.clone(), (proc.creds.clone(), proc.cap_mode.load(core::sync::atomic::Ordering::Acquire))))
             }
             None => return errno::ESRCH,
         }
@@ -616,7 +616,10 @@ fn fork_impl(child_stack: u64, tls: Option<u64>, vfork: bool, share: Share) -> S
         // as `[child]`.
         child.name = parent_comm;
         child.cmdline = parent_cmdline;
+        // Capability mode is inherited, in the child's own flag (its later `cap_enter` must not reach the parent).
+        let (parent_creds, parent_cap_mode) = parent_creds;
         child.creds = parent_creds;
+        child.cap_mode = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(parent_cap_mode));
         if vfork {
             child.vfork_parent = caller_tid;
         }
@@ -696,7 +699,7 @@ pub(super) fn sys_clone(flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) 
         let sched = crate::process::scheduler::local_scheduler();
         match sched.running_ref() {
             Some(proc) => ((proc.tgid, proc.parent_pid), proc.address_space.clone(), proc.files.clone(), proc.cwd.clone(), (proc.pgid, proc.sid, proc.ctty), proc.exe_name.clone(),
-                (proc.signal_handlers, proc.sig_restart, proc.blocked_signals, proc.sig_extra), (proc.name, proc.cmdline.clone(), proc.creds.clone())),
+                (proc.signal_handlers, proc.sig_restart, proc.blocked_signals, proc.sig_extra), (proc.name, proc.cmdline.clone(), (proc.creds.clone(), proc.cap_mode.clone()))),
             None => return errno::ESRCH,
         }
     };
@@ -742,7 +745,10 @@ pub(super) fn sys_clone(flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) 
     // A thread starts with its creator's name and command line, as on Linux.
     thread.name = parent_comm;
     thread.cmdline = parent_cmdline;
+    // A thread shares its process's capability mode (one flag for the group).
+    let (parent_creds, parent_cap_mode) = parent_creds;
     thread.creds = parent_creds;
+    thread.cap_mode = parent_cap_mode;
     scheduler.add_process(thread);
     pid.0 as SyscallResult
 }

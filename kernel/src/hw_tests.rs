@@ -1437,3 +1437,15 @@ fn raw_icmp_pings_the_gateway() {
         other => panic!("unexpected reply {:?}", other),
     }
 }
+
+/// Capability mode denies a syscall number it has no rule for (`vfs::capmode::rule`), so a syscall added without being
+/// classified is silently closed in capability mode. This makes it loud instead: every number the dispatcher implements
+/// must have a rule.
+#[test_case]
+fn every_implemented_syscall_has_a_capability_mode_rule() {
+    for nr in 0..1024u64 {
+        if crate::process::syscall::SyscallNumber::from_u64(nr).is_some() {
+            assert!(vfs::capmode::rule(nr).is_some(), "syscall {} has no capability-mode rule in vfs/src/capmode.rs", nr);
+        }
+    }
+}

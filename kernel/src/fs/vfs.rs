@@ -62,6 +62,12 @@ pub fn resolve_no_follow(path: &str) -> Result<Arc<dyn Inode>, Errno> {
     MOUNTS.resolve_no_follow(path)
 }
 
+/// The bounded walk of `path` from the directory `base` (`MountTable::resolve_at`): openat2's `RESOLVE_*` bits, and
+/// capability mode's `*at` calls.
+pub fn resolve_at(base: &str, path: &str, follow_final: bool, resolve: u64) -> Result<vfs::mount::Walked, Errno> {
+    MOUNTS.resolve_at(base, path, follow_final, resolve)
+}
+
 /// openat2: open `path` relative to the directory `base` under `RESOLVE_*` bits; also returns
 /// the file's canonical path. See `MountTable::open_at`.
 pub fn open_at(base: &str, path: &str, flags: OpenFlags, resolve: u64) -> Result<(Box<dyn FileHandle>, alloc::string::String), Errno> {

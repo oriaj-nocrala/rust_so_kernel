@@ -189,11 +189,17 @@ impl Inode for InputDirInode {
     }
 }
 
+#[derive(Clone)]
 struct InputDirHandle {
     offset: u64,
 }
 
 impl FileHandle for InputDirHandle {
+    /// A copy at the same listing position (its own offset from here on, not a shared one: the listing is a snapshot);
+    /// lets a directory fd survive `fork`, `dup` and `SCM_RIGHTS`, which a capability (a dirfd) must.
+    fn dup(&self) -> Option<Box<dyn FileHandle>> {
+        Some(Box::new(self.clone()))
+    }
     fn read(&mut self, _buf: &mut [u8]) -> FileResult<usize> {
         Err(FileError::InvalidArgument)
     }
@@ -254,11 +260,17 @@ impl Inode for PtsDirInode {
     }
 }
 
+#[derive(Clone)]
 struct PtsDirHandle {
     offset: u64,
 }
 
 impl FileHandle for PtsDirHandle {
+    /// A copy at the same listing position (its own offset from here on, not a shared one: the listing is a snapshot);
+    /// lets a directory fd survive `fork`, `dup` and `SCM_RIGHTS`, which a capability (a dirfd) must.
+    fn dup(&self) -> Option<Box<dyn FileHandle>> {
+        Some(Box::new(self.clone()))
+    }
     fn read(&mut self, _buf: &mut [u8]) -> FileResult<usize> {
         Err(FileError::InvalidArgument)
     }
@@ -315,11 +327,17 @@ impl Inode for DevInode {
 
 // ── Directory handle ─────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct DevDirHandle {
     offset: u64,
 }
 
 impl FileHandle for DevDirHandle {
+    /// A copy at the same listing position (its own offset from here on, not a shared one: the listing is a snapshot);
+    /// lets a directory fd survive `fork`, `dup` and `SCM_RIGHTS`, which a capability (a dirfd) must.
+    fn dup(&self) -> Option<Box<dyn FileHandle>> {
+        Some(Box::new(self.clone()))
+    }
     fn read(&mut self, _buf: &mut [u8]) -> FileResult<usize> {
         Err(FileError::InvalidArgument)
     }

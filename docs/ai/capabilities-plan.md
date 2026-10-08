@@ -85,8 +85,8 @@ resource-and-effect capabilities for coding agents") but not read.
 2. **Done.** NX / `PROT_EXEC` (`nx_test`).
 3. **Done.** Rights masks on fds + `cap_rights_limit` (405) / `cap_rights_get` (406); pure rules in `vfs::rights`, the
    per-syscall table in `syscall::fd_rights_needed` (`cap_rights_test`).
-4. `cap_enter` + `ECAPMODE` on every global-namespace syscall: audit the syscall table
-   (`kernel/src/process/syscall/`) and list each one as allowed / denied / fd-relative.
+4. **Done.** `cap_enter` + `ECAPMODE` on every global-namespace syscall: the audit is `vfs::capmode::rule` (table in
+   `docs/reference/syscalls.md`), unclassified numbers denied; refusals in `/proc/capdenials` (`capmode_test`).
 5. Launcher integration (`agentd`, compositor, `filesd`'s preview providers).
 6. IOMMU: per-device DMA domains, before the first userland driver that does DMA
    (`docs/drivers/roadmap.md` phase 4).
@@ -97,7 +97,7 @@ a socket path, and every attempt fails; sabotage each check and see the test fai
 
 ## Unknowns
 
-- How many syscalls need a cap-mode decision (count from the table).
-- Whether procfs (`/proc/self`) is allowed in cap mode (FreeBSD has no procfs there).
+- ~~How many syscalls need a cap-mode decision~~: all 145 implemented numbers have a rule (`vfs::capmode::rule`).
+- ~~Whether procfs (`/proc/self`) is allowed in cap mode~~: decided, denied (unreachable without an absolute path; no procfs dirfd is handed out). Revisit if a sandboxed program needs its own `/proc/self/maps`.
 - How the runtime-level sandbox (the three.js runtime's API) and kernel caps compose: probably
   the runtime runs in cap mode with only its app dir and compositor socket.

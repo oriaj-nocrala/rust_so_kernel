@@ -383,6 +383,8 @@ pub enum SyscallNumber {
     Statvfs = 404,
     CapRightsLimit = 405,
     CapRightsGet = 406,
+    CapEnter = 407,
+    CapGetmode = 408,
 }
 
 impl SyscallNumber {
@@ -531,6 +533,8 @@ impl SyscallNumber {
             404 => Some(Self::Statvfs),
             405 => Some(Self::CapRightsLimit),
             406 => Some(Self::CapRightsGet),
+            407 => Some(Self::CapEnter),
+            408 => Some(Self::CapGetmode),
             _ => None,
         }
     }
@@ -559,6 +563,8 @@ pub mod errno {
     pub const ENOTDIR: i64 = -20;
     /// Not Linux: `vfs::rights::ENOTCAPABLE` (134), a descriptor lacks a capability right.
     pub const ENOTCAPABLE: i64 = -134;
+    /// Not Linux: `vfs::rights::ECAPMODE` (135), not allowed in capability mode.
+    pub const ECAPMODE: i64 = -135;
     pub const EINVAL: i64 = -22;
     pub const EROFS: i64 = -30;
     pub const ENOTTY: i64 = -25;
@@ -767,17 +773,86 @@ pub(super) fn require_rights(syscall: SyscallNumber, fd: i64, need: vfs::rights:
     }
 }
 
+/// Recent capability refusals of every process (`vfs::capmode::DenialLog`), shown by `/proc/capdenials` and
+/// `/proc/<pid>/capdenials`. An `IrqMutex`: pushing allocates.
+pub(crate) static CAP_DENIALS: diag::IrqMutex<vfs::capmode::DenialLog, crate::allocator::KernelIrq> =
+    diag::IrqMutex::new(vfs::capmode::DenialLog::new(128));
+
+/// The running process's (pid, tgid). Leaves IF as it was.
+fn current_ids() -> (usize, usize) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        super::scheduler::local_scheduler().running_ref().map_or((0, 0), |p| (p.pid.0, p.tgid))
+    })
+}
+
+/// Record a refusal (log line + `CAP_DENIALS`) and return `err`.
+pub(super) fn record_denial(why: core::fmt::Arguments, err: i64) -> i64 {
+    let (pid, _) = current_ids();
+    let text = alloc::format!("{}", why);
+    crate::serial_println!("capability: PID {} {}", pid, text);
+    CAP_DENIALS.with(|log| log.push(pid, text));
+    err
+}
+
+/// Apply `vfs::capmode::rule` to a call made in capability mode: `ECAPMODE` (recorded) unless the rule lets it through.
+/// `PathAt` calls are let through here and finished by `fs::user_path_at`.
+fn capmode_gate(nr: u64, syscall: SyscallNumber, a: [u64; 6]) -> Result<(), i64> {
+    use vfs::capmode::Rule;
+    let refuse = |what: core::fmt::Arguments| Err(record_denial(format_args!("{:?}: {}: ECAPMODE (capability mode)", syscall, what), errno::ECAPMODE));
+    match vfs::capmode::rule(nr) {
+        Some(Rule::Allow) | Some(Rule::PathAt) => Ok(()),
+        Some(Rule::Deny) => refuse(format_args!("a global namespace")),
+        None => refuse(format_args!("not classified for capability mode")),
+        Some(Rule::OwnPid { arg, zero_ok }) => {
+            let target = a[arg] as i64;
+            let (pid, tgid) = current_ids();
+            // `tkill` names a thread, the others a process (its thread group).
+            let own = if matches!(syscall, SyscallNumber::Tkill) { pid } else { tgid };
+            if target == own as i64 || (zero_ok && target == 0) {
+                Ok(())
+            } else {
+                refuse(format_args!("pid {} is not this process", target))
+            }
+        }
+        Some(Rule::ZeroArg { arg }) => {
+            if a[arg] == 0 { Ok(()) } else { refuse(format_args!("a destination address")) }
+        }
+        Some(Rule::SendmsgNoName) => {
+            // `struct msghdr` starts with `msg_name`.
+            if validate_user_buffer(a[1], 8).is_err() {
+                return Ok(()); // the call itself says EFAULT
+            }
+            let name = unsafe { core::ptr::read_unaligned(a[1] as *const u64) };
+            if name == 0 { Ok(()) } else { refuse(format_args!("a destination address")) }
+        }
+    }
+}
+
+/// cap_enter(407): put the calling process (all its threads) in capability mode, for good (`vfs::capmode`). Not Linux
+/// (Capsicum's call; this kernel's number).
+fn sys_cap_enter() -> SyscallResult {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(p) = super::scheduler::local_scheduler().running_ref() {
+            p.cap_mode.store(true, core::sync::atomic::Ordering::Release);
+        }
+    });
+    0
+}
+
+/// cap_getmode(408): `(*u32)`, 1 in capability mode, 0 otherwise.
+fn sys_cap_getmode(out: u64) -> SyscallResult {
+    if let Err(e) = validate_user_buffer(out, 4) {
+        return e;
+    }
+    let mode = crate::process::scheduler::in_capmode() as u32;
+    unsafe { core::ptr::write_unaligned(out as *mut u32, mode) };
+    0
+}
+
 /// Say why a call was refused for a missing right (P1.1: a program only prints "unknown error 134"): one log line with the
 /// pid, the call, the fd and the right. Returns `ENOTCAPABLE`. No lock held; IF is left as it was.
 pub(super) fn note_denied(what: core::fmt::Arguments, fd: i64, right: &str) -> i64 {
-    crate::serial_println!(
-        "capability: PID {} {} on fd {} refused: no {}",
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            super::scheduler::local_scheduler().running_ref().map_or(0, |p| p.pid.0)
-        }),
-        what, fd, right
-    );
-    errno::ENOTCAPABLE
+    record_denial(format_args!("{} on fd {} refused: no {}", what, fd, right), errno::ENOTCAPABLE)
 }
 
 pub fn syscall_handler(
@@ -808,6 +883,13 @@ pub fn syscall_handler(
             return errno::ENOSYS;
         }
     };
+
+    // Capability mode (`vfs::capmode`): the rule for this number, before anything else looks at the arguments.
+    if crate::process::scheduler::in_capmode() {
+        if let Err(e) = capmode_gate(syscall_num, syscall, [arg1, arg2, arg3, arg4, arg5, arg6]) {
+            return e;
+        }
+    }
 
     // Capability rights of the descriptors this call names in fixed argument positions (`fd_rights_needed`). An fd that is
     // not open is left to the call itself (EBADF). The `*at` dirfds are checked where the path is known to be relative
@@ -960,6 +1042,8 @@ pub fn syscall_handler(
         SyscallNumber::Statvfs => fs::sys_statvfs(arg1 as usize, arg2 as usize),
         SyscallNumber::CapRightsLimit => fs::sys_cap_rights_limit(arg1 as i32, arg2),
         SyscallNumber::CapRightsGet => fs::sys_cap_rights_get(arg1 as i32, arg2),
+        SyscallNumber::CapEnter => sys_cap_enter(),
+        SyscallNumber::CapGetmode => sys_cap_getmode(arg1),
         SyscallNumber::Utimensat => fs::sys_utimensat(arg1 as i64, arg2, arg3, arg4),
         SyscallNumber::Sync => misc::sys_sync(),
         SyscallNumber::Reboot => misc::sys_reboot(arg1 as u32, arg2 as u32, arg3 as u32),

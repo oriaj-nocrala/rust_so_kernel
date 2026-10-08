@@ -260,6 +260,7 @@ impl Stat {
 /// An in-kernel directory entry, produced by `Inode::readdir`.
 ///
 /// Converted to `linux_dirent64` on-the-fly by `getdents64()`.
+#[derive(Clone)]
 pub struct DirEntry {
     pub ino:      u64,
     pub kind:     FileType,

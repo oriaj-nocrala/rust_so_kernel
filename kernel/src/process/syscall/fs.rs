@@ -352,6 +352,15 @@ pub(super) fn sys_openat2(dirfd: i64, path_ptr: usize, how_ptr: usize, size: usi
     if raw.is_empty() {
         return errno::ENOENT;
     }
+    // Capability mode: only beneath a real dirfd (`vfs::capmode`).
+    let mut resolve = how.resolve;
+    if crate::process::scheduler::in_capmode() {
+        if dirfd == AT_FDCWD || raw.starts_with('/') {
+            let from = if raw.starts_with('/') { "/" } else { "the cwd" };
+            return super::record_denial(format_args!("openat2: path '{}' from {}: ECAPMODE (capability mode)", raw, from), errno::ECAPMODE);
+        }
+        resolve |= vfs::resolve::RESOLVE_BENEATH;
+    }
     // Through a real dirfd: that fd's rights must allow the open, and the new fd gets them (as `openat`).
     let (base, inherited) = if dirfd == AT_FDCWD || raw.starts_with('/') {
         (current_cwd(), rights::CAP_ALL)
@@ -359,7 +368,7 @@ pub(super) fn sys_openat2(dirfd: i64, path_ptr: usize, how_ptr: usize, size: usi
         match dir_path_of(dirfd, rights::openat_needs(flags), "openat2") { Ok(p) => p, Err(e) => return e }
     };
     crate::ktrace!(crate::debug::FS, "sys_openat2: base={} path={} flags={:#x} resolve={:#x}", base, raw, flags, how.resolve);
-    match crate::fs::vfs::open_at(&base, raw, crate::fs::types::OpenFlags(flags), how.resolve) {
+    match crate::fs::vfs::open_at(&base, raw, crate::fs::types::OpenFlags(flags), resolve) {
         Ok((handle, path)) => install_fd(handle, flags, path, inherited),
         Err(e) => e.as_i64(),
     }
@@ -367,7 +376,7 @@ pub(super) fn sys_openat2(dirfd: i64, path_ptr: usize, how_ptr: usize, size: usi
 
 fn open_at(dirfd: i64, path_ptr: usize, flags: i32) -> SyscallResult {
     // Validation BEFORE cli — no lock needed
-    let (path, inherited) = match user_path_at_rights(dirfd, path_ptr, errno::EINVAL, rights::openat_needs(flags), "openat") {
+    let (path, inherited) = match user_path_at_rights(dirfd, path_ptr, errno::EINVAL, rights::openat_needs(flags), "openat", flags & 0o400000 == 0) {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -460,7 +469,7 @@ fn stat_impl(dirfd: i64, path_ptr: usize, stat_ptr: usize, follow: bool) -> Sysc
     use crate::fs::types::Stat;
     if let Err(e) = validate_user_buffer(stat_ptr as u64, core::mem::size_of::<Stat>()) { return e; }
 
-    let path = match user_path_at(dirfd, path_ptr, errno::ENOENT, rights::CAP_FSTAT, "fstatat") { Ok(p) => p, Err(e) => return e };
+    let path = match user_path_at(dirfd, path_ptr, errno::ENOENT, rights::CAP_FSTAT, "fstatat", follow) { Ok(p) => p, Err(e) => return e };
     let result = if follow { crate::fs::stat(&path) } else { crate::fs::lstat(&path) };
     match result {
         Err(e)   => e.as_i64(),
@@ -492,7 +501,7 @@ pub(super) fn sys_statx(dirfd: i64, path_ptr: usize, flags: u64, mask: u32, buf:
         if let Err(e) = require_fd(dirfd, rights::CAP_FSTAT, "statx") { return e; }
         with_fd_table(|t| t.get(dirfd as usize).ok().and_then(|f| f.stat())).flatten().ok_or(errno::EBADF)
     } else {
-        match user_path_at(dirfd, path_ptr, errno::ENOENT, rights::CAP_FSTAT, "statx") {
+        match user_path_at(dirfd, path_ptr, errno::ENOENT, rights::CAP_FSTAT, "statx", flags & AT_SYMLINK_NOFOLLOW == 0) {
             Err(e) => Err(e),
             Ok(path) => {
                 let r = if flags & AT_SYMLINK_NOFOLLOW == 0 { crate::fs::stat(&path) } else { crate::fs::lstat(&path) };
@@ -561,7 +570,7 @@ pub(super) fn sys_mkdirat(dirfd: i64, path_ptr: usize, _mode: u32) -> SyscallRes
 }
 
 fn mkdir_at(dirfd: i64, path_ptr: usize) -> SyscallResult {
-    let path = match user_path_at(dirfd, path_ptr, errno::EINVAL, rights::CAP_MKDIRAT, "mkdirat") { Ok(p) => p, Err(e) => return e };
+    let path = match user_path_at(dirfd, path_ptr, errno::EINVAL, rights::CAP_MKDIRAT, "mkdirat", false) { Ok(p) => p, Err(e) => return e };
     match crate::fs::vfs::mkdir(&path) {
         Ok(())  => 0,
         Err(e)  => e.as_i64(),
@@ -574,7 +583,7 @@ pub(super) fn sys_rmdir(path_ptr: usize) -> SyscallResult {
 }
 
 fn rmdir_at(dirfd: i64, path_ptr: usize) -> SyscallResult {
-    let path = match user_path_at(dirfd, path_ptr, errno::EINVAL, rights::CAP_UNLINKAT, "unlinkat") { Ok(p) => p, Err(e) => return e };
+    let path = match user_path_at(dirfd, path_ptr, errno::EINVAL, rights::CAP_UNLINKAT, "unlinkat", false) { Ok(p) => p, Err(e) => return e };
     match crate::fs::vfs::rmdir(&path) {
         Ok(())  => 0,
         Err(e)  => e.as_i64(),
@@ -596,7 +605,7 @@ pub(super) fn sys_unlinkat(dirfd: i64, path_ptr: usize, flags: u64) -> SyscallRe
 }
 
 fn unlink_at(dirfd: i64, path_ptr: usize) -> SyscallResult {
-    let path = match user_path_at(dirfd, path_ptr, errno::EINVAL, rights::CAP_UNLINKAT, "unlinkat") { Ok(p) => p, Err(e) => return e };
+    let path = match user_path_at(dirfd, path_ptr, errno::EINVAL, rights::CAP_UNLINKAT, "unlinkat", false) { Ok(p) => p, Err(e) => return e };
     match crate::fs::vfs::unlink(&path) {
         Ok(())  => 0,
         Err(e)  => e.as_i64(),
@@ -619,7 +628,7 @@ pub(super) fn sys_readlinkat(dirfd: i64, path_ptr: usize, buf_ptr: usize, bufsiz
 
 fn readlink_at(dirfd: i64, path_ptr: usize, buf_ptr: usize, bufsiz: usize) -> SyscallResult {
     if let Err(e) = validate_user_buffer(buf_ptr as u64, bufsiz) { return e; }
-    let path = match user_path_at(dirfd, path_ptr, errno::EINVAL, 0, "readlinkat") { Ok(p) => p, Err(e) => return e };
+    let path = match user_path_at(dirfd, path_ptr, errno::EINVAL, 0, "readlinkat", false) { Ok(p) => p, Err(e) => return e };
     match crate::fs::readlink(&path) {
         Ok(target) => {
             let bytes = target.as_bytes();
@@ -653,7 +662,7 @@ fn symlink_at(target_ptr: usize, dirfd: i64, linkpath_ptr: usize) -> SyscallResu
     if let Err(e) = validate_user_buffer(target_ptr as u64, 1) { return e; }
     let target = read_user_str(target_ptr);
     if target.is_empty() { return errno::EINVAL; }
-    let linkpath = match user_path_at(dirfd, linkpath_ptr, errno::EINVAL, rights::CAP_SYMLINKAT, "symlinkat") { Ok(p) => p, Err(e) => return e };
+    let linkpath = match user_path_at(dirfd, linkpath_ptr, errno::EINVAL, rights::CAP_SYMLINKAT, "symlinkat", false) { Ok(p) => p, Err(e) => return e };
     match crate::fs::vfs::symlink(&target, &linkpath) {
         Ok(()) => 0,
         Err(e) => e.as_i64(),
@@ -675,8 +684,8 @@ fn link_at(olddirfd: i64, old_ptr: usize, newdirfd: i64, new_ptr: usize, flags: 
     if flags & !AT_SYMLINK_FOLLOW != 0 {
         return errno::EINVAL;
     }
-    let old_path = match user_path_at(olddirfd, old_ptr, errno::ENOENT, rights::CAP_LINKAT_SOURCE, "linkat") { Ok(p) => p, Err(e) => return e };
-    let new_path = match user_path_at(newdirfd, new_ptr, errno::ENOENT, rights::CAP_LINKAT_TARGET, "linkat") { Ok(p) => p, Err(e) => return e };
+    let old_path = match user_path_at(olddirfd, old_ptr, errno::ENOENT, rights::CAP_LINKAT_SOURCE, "linkat", flags & AT_SYMLINK_FOLLOW != 0) { Ok(p) => p, Err(e) => return e };
+    let new_path = match user_path_at(newdirfd, new_ptr, errno::ENOENT, rights::CAP_LINKAT_TARGET, "linkat", false) { Ok(p) => p, Err(e) => return e };
     match crate::fs::vfs::link(&old_path, &new_path, flags & AT_SYMLINK_FOLLOW != 0) {
         Ok(()) => 0,
         Err(e) => e.as_i64(),
@@ -713,7 +722,7 @@ pub(super) fn sys_faccessat(dirfd: i64, path_ptr: usize, mode: i32) -> SyscallRe
 }
 
 fn access_at(dirfd: i64, path_ptr: usize, mode: i32) -> SyscallResult {
-    let path = match user_path_at(dirfd, path_ptr, errno::EINVAL, rights::CAP_FSTAT, "faccessat") { Ok(p) => p, Err(e) => return e };
+    let path = match user_path_at(dirfd, path_ptr, errno::EINVAL, rights::CAP_FSTAT, "faccessat", true) { Ok(p) => p, Err(e) => return e };
 
     const W_OK: i32 = 2;
 
@@ -747,8 +756,8 @@ pub(super) fn sys_renameat(olddirfd: i64, old_ptr: usize, newdirfd: i64, new_ptr
 }
 
 fn rename_at(olddirfd: i64, old_path_ptr: usize, newdirfd: i64, new_path_ptr: usize) -> SyscallResult {
-    let old_path = match user_path_at(olddirfd, old_path_ptr, errno::EINVAL, rights::CAP_RENAMEAT_SOURCE, "renameat") { Ok(p) => p, Err(e) => return e };
-    let new_path = match user_path_at(newdirfd, new_path_ptr, errno::EINVAL, rights::CAP_RENAMEAT_TARGET, "renameat") { Ok(p) => p, Err(e) => return e };
+    let old_path = match user_path_at(olddirfd, old_path_ptr, errno::EINVAL, rights::CAP_RENAMEAT_SOURCE, "renameat", false) { Ok(p) => p, Err(e) => return e };
+    let new_path = match user_path_at(newdirfd, new_path_ptr, errno::EINVAL, rights::CAP_RENAMEAT_TARGET, "renameat", false) { Ok(p) => p, Err(e) => return e };
     match crate::fs::vfs::rename(&old_path, &new_path) {
         Ok(())  => 0,
         Err(e)  => e.as_i64(),
@@ -822,22 +831,42 @@ pub(super) fn sys_fchdir(fd: i32) -> SyscallResult {
 ///
 /// Capability rights: a relative path through a real `dirfd` needs `CAP_LOOKUP | need` on it (`ENOTCAPABLE`, logged for
 /// `what`). An absolute path or `AT_FDCWD` uses no descriptor, so needs nothing (capability mode, stage 4, closes that).
-fn user_path_at(dirfd: i64, ptr: usize, empty_err: i64, need: Rights, what: &str) -> Result<alloc::string::String, i64> {
-    user_path_at_rights(dirfd, ptr, empty_err, need, what).map(|(path, _)| path)
+///
+/// Capability mode (`vfs::capmode`): `AT_FDCWD` and absolute paths are `ECAPMODE`; a relative path is walked beneath the
+/// dirfd (`MountTable::resolve_at`, `RESOLVE_BENEATH`; `follow`: whether the call follows a final symlink) and the call uses
+/// the canonical path that walk found, so neither `..` nor a symlink can leave the directory (`ENOTCAPABLE`). Every refusal
+/// is recorded (`syscall::record_denial`).
+fn user_path_at(dirfd: i64, ptr: usize, empty_err: i64, need: Rights, what: &str, follow: bool) -> Result<alloc::string::String, i64> {
+    user_path_at_rights(dirfd, ptr, empty_err, need, what, follow).map(|(path, _)| path)
 }
 
 /// `user_path_at`, also returning the rights a descriptor opened by that path gets: the dirfd's when it went through one
 /// (Capsicum), all of them otherwise.
-fn user_path_at_rights(dirfd: i64, ptr: usize, empty_err: i64, need: Rights, what: &str) -> Result<(alloc::string::String, Rights), i64> {
+fn user_path_at_rights(dirfd: i64, ptr: usize, empty_err: i64, need: Rights, what: &str, follow: bool) -> Result<(alloc::string::String, Rights), i64> {
     validate_user_buffer(ptr as u64, 1)?;
     let raw = read_user_str(ptr);
     if raw.is_empty() {
         return Err(empty_err);
     }
+    let capmode = crate::process::scheduler::in_capmode();
     if raw.starts_with('/') || dirfd == AT_FDCWD {
+        if capmode {
+            let from = if raw.starts_with('/') { "/" } else { "the cwd" };
+            return Err(super::record_denial(format_args!("{}: path '{}' from {}: ECAPMODE (capability mode)", what, raw, from), errno::ECAPMODE));
+        }
         return Ok((resolve_path(raw), rights::CAP_ALL));
     }
     let (base, have) = dir_path_of(dirfd, rights::CAP_LOOKUP | need, what)?;
+    if capmode {
+        return match crate::fs::vfs::resolve_at(&base, raw, follow, vfs::resolve::RESOLVE_BENEATH) {
+            Ok(vfs::mount::Walked::Found { path, .. }) | Ok(vfs::mount::Walked::Missing { path, .. }) => Ok((path, have)),
+            Err(e) if e == crate::fs::types::Errno::EXDEV => Err(super::record_denial(
+                format_args!("{}: path '{}' leaves directory fd {}: ENOTCAPABLE (capability mode)", what, raw, dirfd),
+                errno::ENOTCAPABLE,
+            )),
+            Err(e) => Err(e.as_i64()),
+        };
+    }
     Ok((crate::fs::vfs::normalize_path(&base, raw), have))
 }
 
@@ -984,7 +1013,7 @@ pub(super) fn sys_utimensat(dirfd: i64, path_ptr: u64, times_ptr: u64, flags: u6
         };
     }
 
-    let path = match user_path_at(dirfd, path_ptr as usize, errno::ENOENT, rights::CAP_FUTIMES, "utimensat") { Ok(p) => p, Err(e) => return e };
+    let path = match user_path_at(dirfd, path_ptr as usize, errno::ENOENT, rights::CAP_FUTIMES, "utimensat", flags & AT_SYMLINK_NOFOLLOW == 0) { Ok(p) => p, Err(e) => return e };
     let inode = if flags & AT_SYMLINK_NOFOLLOW != 0 {
         crate::fs::vfs::resolve_no_follow(&path)
     } else {
@@ -1834,7 +1863,7 @@ pub(super) fn sys_fchmodat(dirfd: i64, path_ptr: usize, mode: u32) -> SyscallRes
 }
 
 fn chmod_at(dirfd: i64, path_ptr: usize, mode: u32) -> SyscallResult {
-    let path = match user_path_at(dirfd, path_ptr, errno::EINVAL, rights::CAP_FCHMOD, "fchmodat") { Ok(p) => p, Err(e) => return e };
+    let path = match user_path_at(dirfd, path_ptr, errno::EINVAL, rights::CAP_FCHMOD, "fchmodat", true) { Ok(p) => p, Err(e) => return e };
     match crate::fs::vfs::resolve(&path).and_then(|inode| inode.chmod(mode)) {
         Ok(()) => 0,
         Err(e) => e.as_i64(),
