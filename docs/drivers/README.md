@@ -10,10 +10,9 @@ heading.
   hardware seams, the `Driver` trait + boot registry, and the testing story. Read this to
   understand *how the pieces fit and why*.
 - **[roadmap.md](roadmap.md)** — the *trajectory*: the phased plan from today's thin trait
-  layer toward a Linux-class device model, and the honest long-term ambitions beyond that
-  (a stable driver contract, foreign-driver compatibility à la BSD, and — as a north star —
-  running proprietary/Nvidia drivers). Read this to understand *what each step is buying and
-  where it leads*.
+  layer toward a Linux-class device model, then foreign and LLM-generated drivers in userland
+  driver hosts (capabilities, device fds, IOMMU, a risk ladder), and the NVIDIA driver the
+  project wrote itself. Read this to understand *what each step is buying and where it leads*.
 
 ## Related, elsewhere in the repo
 

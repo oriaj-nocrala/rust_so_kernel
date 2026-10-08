@@ -770,6 +770,27 @@ Minimizar y escritorios virtuales, redimensionar en vivo, mover y redimensionar 
 de `constanos_gfx.h` variables, portapapeles, arrastrar y soltar,
 transparencia y sombras, varios monitores, y arrancar la GUI al inicio.
 
+### Pendiente según los principios de UX (2026-10-08)
+
+Revisión de la fase 4 contra `docs/ux/principles.md` (`docs/ux/audit-2026-10.md`, puntos
+12-15). Lo decidido sigue en pie (decoraciones del servidor, redimensionar al soltar, panel
+aparte, lanzador en un archivo de texto); faltaba esto:
+
+- **Política de foco (P2.1, P2.4; idea C1).** Una ventana nueva no recibe el teclado si el
+  usuario escribió en el último segundo, salvo que la abriera una acción suya (clic o atajo en
+  esa app); un diálogo recién aparecido ignora Enter unos 500 ms; un clic en una ventana
+  inactiva solo la enfoca y no llega al control que hay debajo. Va en la máquina de estados
+  de `gui/src/compositor/`, con tests de host y sabotaje como el resto.
+- **Cliente que no responde (P1.2, P6.3; idea E2).** Si un cliente ignora `close` o deja de
+  leer eventos, tras un plazo el marco lo dice ("no responde") y ofrece terminarlo; cuando
+  exista el registro de atribución (B2), también dice qué está esperando.
+- **Portapapeles y arrastrar y soltar (P5.2, P6.1; ideas K1, K2).** Siguen fuera de esta fase,
+  pero no son extras: son el portapapeles del sistema (carpeta con historial, pegado semántico)
+  y el *powerbox* (arrastrar un archivo a una app le concede ese fd). Se diseñan juntos, como
+  un solo mecanismo, cuando lleguen.
+- **Abrir una ventana no mueve ni cambia el tamaño de las otras (P2.3; idea C13).** Hoy se
+  cumple (cascada); queda como regla para cualquier modo de mosaico futuro.
+
 ## Registro
 
 ### Fase 1 (2026-09-25)

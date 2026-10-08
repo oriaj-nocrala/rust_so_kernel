@@ -3,7 +3,9 @@
 Status: **idea, not started** (handoff written 2026-10-07). Nothing here is measured yet;
 every "unverified" below is a question for the first session.
 Related: [`llm-as-ui-plan.md`](llm-as-ui-plan.md) (this is its app runtime),
-[`capabilities-plan.md`](capabilities-plan.md) (why this runtime does not need them yet).
+[`capabilities-plan.md`](capabilities-plan.md) (the runtime runs in capability mode with only its
+app directory and the compositor socket), [`software-on-demand.md`](software-on-demand.md)
+(the app format). Principles: P6.1, P7.3, B5 ([`../ux/principles.md`](../ux/principles.md)).
 
 ## Goal
 
@@ -77,7 +79,11 @@ app.js  ──►  three.js (three/webgpu, unmodified, MIT)
 Model-written three.js puts UI in HTML: a `<div>` for the score, buttons, menus, an `<input>`.
 Options, cheapest first:
 1. System prompt: "no DOM; draw UI in the scene" plus a tiny helper (`ui.text(x, y, str)`,
-   `ui.button(...)`) drawn by us as an overlay with the `text` and `draw` crates.
+   `ui.button(...)`) drawn by us as an overlay with the `text` and `draw` crates. **Every helper
+   call also emits a semantic-tree node** (role, name, state, action; backbone B5 in
+   `../ux/backbones.md`). Without it a generated app is invisible to the agent that must test it
+   and to a screen reader. Scene objects the app marks as interactive (`ui.target(mesh, name)`)
+   get nodes too.
 2. A `CanvasRenderingContext2D` subset (fillRect, fillText, drawImage) on `draw`/`text`, so
    `CanvasTexture` and sprite labels work. Models use this a lot for text.
 3. A real HTML subset: only if 1-2 prove insufficient. Do not start here.
@@ -97,8 +103,9 @@ Options, cheapest first:
    linked statically, present path, input.
 3. **Ryzen** (`metal-run` skill): fps, per-frame hitch counts (a stutter the user
    sees outranks a good average), GPU clocks.
-4. Package as an app the launcher shows (`/mnt/etc/gui/apps`, icons in
-   `/mnt/usr/share/icons`), which is what `llm-as-ui-plan.md` installs into.
+4. Package as an app in the format of [`software-on-demand.md`](software-on-demand.md) (launcher
+   line and icon derived from the manifest), which is what `llm-as-ui-plan.md` installs into;
+   the runtime enters capability mode before running the app's code.
 
 ## Unverified (answer these first)
 

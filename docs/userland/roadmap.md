@@ -25,6 +25,11 @@ Use musl's `ld.so`; the kernel side is small but three things are missing:
 
 Gate for most non-static Linux binaries (and for step 3).
 
+Scope: dynamic linking is for **running foreign Linux binaries**. constanos-native and generated
+apps stay **static** (`docs/ai/software-on-demand.md`): nothing is resolved by name at install
+or load time (no room for slopsquatting), and an app keeps running unchanged for decades
+(P3.4, P6 in `docs/ux/principles.md`).
+
 ## 3. Claude Code (scope first, then decide)
 
 A Bun-compiled binary: needs dynamic linking, JIT (W+X memory: `PROT_EXEC` is ignored and NX is

@@ -132,6 +132,13 @@ Decide by seeing them: build the engine, then switch themes on the real screen.
    console keyboard grab, Ctrl+Alt+Backspace, starting the panel. Until then the CPU compositor is
    a test bench and fallback only: no features of its own (glass is drawn there as its tint,
    without blur).
+2f. **Measured contrast before more glass** (P8.2 in `docs/ux/principles.md`; idea C7). Luna's
+   menu columns are translucent (white 75%, light blue 66%) with text on them, and the taskbar
+   is 78% glass: the failure mode Apple had to roll back in Liquid Glass. The compositor knows
+   the pixels behind each translucent shape: compute the contrast of the text over the
+   blurred backdrop and raise the fill's opacity until it meets a minimum (WCAG 4.5:1 for body
+   text). Test with `host_comp.c` frames whose backdrop is chosen to break contrast. Do this
+   before adding new translucent surfaces.
 3. **Glass / blur behind** — done on the host, not yet on the Ryzen. `cr_shape.backdrop_blur` (and
    `gui::theme::Shape::glass`): at such a shape the renderer pauses the frame, copies the region
    behind it (its box in its clip, grown by the radius) out of the target into a buffer, blurs it
@@ -149,6 +156,7 @@ Decide by seeing them: build the engine, then switch themes on the real screen.
    transparent (or flat, keyed-out) background, one shared prompt (light from the top left, 3/4
    view, same palette) so the set is coherent; store in the theme layout (16/32/48/256).
    Needs step 1's alpha op.
-5. **Real 3D icons** (the user's actual wish, later): small meshes (e.g. glTF/OBJ) rendered by
+5. **Real 3D icons** (the user's actual wish, later; motion only under the pointer, never ambient:
+   movement in the periphery pulls attention, P9.1): small meshes (e.g. glTF/OBJ) rendered by
    the compositor itself with lighting, turning or lifting on hover; a natural bridge to the
    spatial desktop (look 3). Needs a depth buffer and a mesh pipeline in the renderer.

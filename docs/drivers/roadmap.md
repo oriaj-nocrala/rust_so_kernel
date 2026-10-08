@@ -150,64 +150,73 @@ seam and tests, so APIC is built on a tested base with its own tests.
 on a QEMU i440fx machine can easily cost more than it returns. Build only the parts that at
 least two real drivers demand, and let PCI + APIC be the forcing functions.
 
-## Phase 4 — A stable driver contract + foreign-driver compatibility *(long-term, ambitious)*
+## Phase 4 — Drivers out of the kernel *(rewritten 2026-10-08)*
 
-The ambition the project is ultimately curious about: running drivers *not written for this
-kernel*. Two distinct sub-goals, often conflated:
+The previous phase 4 aimed at a stable **in-kernel** ABI so foreign drivers could load into the
+kernel. It is replaced, for one reason with evidence: third-party kernel drivers caused ~70% of
+Windows crashes in Microsoft's own analysis (data to 2004; 85% on Windows XP per Microsoft
+Research), and CrowdStrike 2024 was an out-of-bounds read in a kernel driver. A driver we did
+not write, or one an LLM writes on demand (`docs/ai/software-on-demand.md`), must not share the
+kernel's address space. Principles: P6.2 "risk follows reach, not author", P5.3 "class drivers
+first" (`docs/ux/principles.md`).
 
-### 4a. A stable in-kernel driver API/ABI
+**Rule:** hand-written, reviewed drivers may stay in the kernel (today: storage, USB host,
+network, `nvgpu`). Foreign and generated drivers run in **userland driver hosts**.
 
-Today the "contract" a driver codes against is our own moving traits. To host third-party
-drivers, that contract has to become **stable and documented** — a Kernel Programming
-Interface. Linux famously keeps its internal API *unstable* (drivers live in-tree and are
-rebuilt); the BSDs keep theirs comparatively stable (KPIs), which is part of why BSD is the
-proven ground for compat layers. Whichever we choose, the prerequisite is: the seams and
-traits stop changing casually and gain versioned guarantees.
+What a userland driver host needs from the kernel, in order:
 
-### 4b. Compatibility shims for foreign drivers — the BSD precedents
+1. **Capabilities** (`docs/ai/capabilities-plan.md`, the cornerstone): a driver host starts with
+   nothing and is handed one device.
+2. **Device fds.** A capability-scoped handle to one device: for USB, control/bulk/interrupt
+   transfers to one device (the xHCI stack stays in the kernel); for PCI, its BARs mapped into
+   the host and its MSI/MSI-X vectors delivered as fd events (MSI vectors already exist,
+   `kernel/src/interrupts/msi.rs`).
+3. **IOMMU** (AMD-Vi on the Ryzen; QEMU emulates one): a device can DMA only into buffers its
+   host was given. **Without it, no userland driver may program DMA**: a host that can aim a
+   device's DMA owns all of physical memory.
+4. **Supervision:** a host that crashes is restarted and the device reset, without taking
+   anything else down (`docs/userland/init-plan.md`), and the reason is recorded (P1.2).
 
-BSD is the honest model for "run another OS's drivers on a non-Linux kernel," via two real
-mechanisms worth naming precisely:
+**The ladder** (from `docs/ai/software-on-demand.md`):
 
-- **LinuxKPI (FreeBSD, `linuxkpi`)** — a shim that *implements enough of the Linux kernel API*
-  (memory, DMA, PCI, workqueues, locks, and most consequentially the **DRM** graphics
-  subsystem) that lightly-patched Linux drivers compile and run on FreeBSD. This is how
-  FreeBSD ships modern `amdgpu`/`i915` graphics: the drivers are Linux source, built against
-  LinuxKPI rather than Linux. This is the real template for us — a `linuxkpi`-equivalent is a
-  large but *bounded, incremental* surface: implement each Linux API a target driver calls, one
-  at a time, driven by an actual driver you're trying to bring up.
-- **NDISulator / "Project Evil" (FreeBSD)** — a wrapper that loaded *Windows* NDIS network
-  driver **binaries**. This is the precedent for running a closed-source binary blob from
-  another OS: emulate the ABI it was linked against, thunk its calls into native services. Far
-  hairier (binary, not source; another OS entirely), but it demonstrates the ceiling of what a
-  compat layer can do.
+| Level | What | Where | Written by |
+|---|---|---|---|
+| 0 | Class drivers: USB Audio Class 2, HID, Mass Storage, IPP (network printing) | kernel or a trusted host | hand-written, tested on metal |
+| 1 | Vendor control over USB control transfers (e.g. a Focusrite Scarlett's mixer and routing, on top of the class audio driver) | userland host, no DMA, one device | may be generated on demand |
+| 2 | PCI device with DMA | userland host + IOMMU domain | hand-written or generated, with replay tests |
+| 3 | Kernel code | kernel | hand-written only, never generated on demand |
 
-The trait/seam direction we're on now is *literally the first rung of this ladder*: separating
-"what a driver needs from the kernel" (a contract) from "how this kernel provides it" (the
-implementation) is exactly the seam that a compat layer plugs a foreign contract into.
+**Trust comes from tests, not from the code's author.** A driver at level 1-2 carries recorded
+device traffic (fixtures) and replay tests, as the GPU display work does (`gpu-display` skill:
+oracle → fixture → pure code → replay test → sabotage → adapter) and as the `hal` seams allow.
+A repo entry is request + code + tests + capability manifest.
 
-## Phase 5 — Proprietary / Nvidia *(north star, framed honestly)*
+**Foreign source drivers (the BSD precedents), now in userland:** LinuxKPI (FreeBSD builds Linux
+DRM drivers against a shim of the Linux kernel API) remains the template for porting a Linux
+driver's *source*, but the shim lives inside a userland driver host, not in the kernel; NetBSD's
+rump kernels and Genode's DDE are the prior art for running another kernel's drivers as
+processes. Binary foreign drivers (FreeBSD's NDISulator) are out of scope.
 
-The most ambitious end state, stated without hype so expectations are set correctly.
+**First steps:** (a) a USB device fd with control transfers + a level-1 driver for a real device
+(the Scarlett's mixer, which Geoffrey Bennett's Linux work documents); (b) IOMMU bring-up in QEMU,
+then the Ryzen; (c) a level-2 host for a simple PCI device already supported in the kernel, so the
+two can be compared (the virtio-net or RTL8168 driver is the natural candidate).
 
-"Running the Nvidia driver" is not one thing:
+## Phase 5 — NVIDIA: done our own way, and what is left *(rewritten 2026-10-08)*
 
-- The **proprietary Linux blob** — a large closed kernel module built against Linux's kernel
-  ABI, plus userspace blobs. Running it would require a LinuxKPI-scale compat layer complete
-  enough that the `.ko` binds and runs: memory management, DMA, PCI, interrupts (needs the
-  APIC/IRQ model from Phase 3), the DRM/KMS subsystem, workqueues, mutexes, firmware loading,
-  and more. This is a *multi-year, enormous-surface* effort — the honest ceiling, not a
-  near-term target.
-- The **Nvidia open kernel modules** (open-source since 2022, for Turing and newer GPUs) —
-  meaningfully more tractable: open source, so buildable against a compat KPI the way FreeBSD
-  builds `amdgpu` against LinuxKPI, rather than reverse-engineering a binary. If Nvidia ever
-  becomes realistic here, this is the door, not the closed blob.
+The old phase 5 planned to run NVIDIA's proprietary blob or open kernel modules through a
+LinuxKPI-scale layer. That is not what happened: constanos has **its own driver** for the GA106
+(`nvgpu` crate + `kernel/src/gpu/`): display modeset, GSP-RM boot and RPCs, GPU page tables, GPFIFO
+channels and the copy engine, and a `/dev/nvgpu` device that Mesa's NVK drives from userland, up
+to a Vulkan compositor at 60 fps on the Ryzen (`docs/gpu/gpu-plan.md`, `docs/reference/gpu.md`).
+The firmware (GSP-RM) carries most of the hardware's complexity, which is what made a
+from-scratch driver tractable.
 
-Why keep this on the map at all, given the distance? Because it clarifies the *direction* of
-every earlier phase. The device model (Phase 3), the stable contract (4a), and the compat shim
-(4b) are each independently worthwhile — and they happen to be, in order, exactly the
-prerequisites for this north star. We are not detouring toward it; we are building the things
-worth building anyway, in the order that also happens to point at it.
+What is left belongs to other plans: the cursor channel (`docs/gpu/hw-cursor-plan.md`), the
+graphics stack (`docs/gpu/g5-graphics-stack-plan.md`). Open question for later, once phase 4's
+IOMMU exists: whether parts of `nvgpu` that only talk to GSP-RM over RPC could move into a
+userland host (the firmware does the privileged work; the kernel would keep BAR mapping,
+interrupts and the IOMMU domain).
 
 ---
 
@@ -218,8 +227,8 @@ worth building anyway, in the order that also happens to point at it.
 | 0 | (none) — ad-hoc modules | Fast early progress | done |
 | 1 | `Driver` + `PortIo`/`PhysMem` seams | Host-testable logic, encapsulation | done (ACPI pilot) |
 | 2 | Same, applied to every driver + QEMU test runner | Tests everywhere; pays down test debt | **done** |
-| 3 | `Bus`/`Device`/`probe` device model | Enumeration, resource ownership, lifecycle | next (after APIC migration) |
-| 4 | Stable KPI + LinuxKPI-style compat shim | Run foreign (Linux) drivers | long-term |
-| 5 | Compat surface complete enough to bind Nvidia | Proprietary/GPU drivers | north star |
+| 3 | `Bus`/`Device`/`probe` device model | Enumeration, resource ownership, lifecycle | next (the APIC migration it waited for is done: `apic::init`, `docs/reference/cpu.md`) |
+| 4 | Userland driver hosts: capabilities, device fds, IOMMU, supervision; the risk ladder | Foreign and generated drivers that can't take the system down | direction (needs capabilities) |
+| 5 | Own NVIDIA driver (GSP-RM + NVK) | Vulkan on the GA106 | done; cursor and graphics stack in their own plans |
 
 Each row is the previous row's discipline at larger scope. That is the whole plan.

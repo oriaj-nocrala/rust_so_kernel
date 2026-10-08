@@ -41,7 +41,8 @@ Why this shape:
 - **Our own supervisor only if runit falls short.** The likely reason: start ordering with
   readiness (compositor up before its clients). runit has none; s6's readiness fd
   (`notification-fd`) is the model to copy then.
-- **Capabilities fit without a custom supervisor:** a service's `run` script does
+- **Every service starts with only what it is granted** (capabilities are the cornerstone,
+  `capabilities-plan.md`). **They fit without a custom supervisor:** a service's `run` script does
   `exec cap-exec --dir ... -- program` (a small wrapper, like `chpst`), see
   `capabilities-plan.md`.
 
@@ -76,7 +77,9 @@ test each with a raw C test proven by sabotage (`linux-abi` skill).
 6. Stage 3: a clean shutdown command (`poweroff`/`reboot` applets are off today; PID 1 could
    take a signal, e.g. `SIGTERM` = reboot, `SIGUSR2` = poweroff, as BusyBox init does).
 7. Logs: `svlogd` per service into `/mnt/var/log/<name>` or the kernel log (`/dev/kmsg`-like
-   path if one exists); decide.
+   path if one exists); decide. **When a service dies, record why** (exit status or signal, time,
+   the last log lines) where the UI and `agentd` can read it (P1.2 in `docs/ux/principles.md`):
+   "compositor restarted 3 times: SIGSEGV" beats a silent respawn.
 
 ## Tests
 

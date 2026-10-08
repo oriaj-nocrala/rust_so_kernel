@@ -1,9 +1,11 @@
 # Capabilities: the kernel's first security model
 
-Status: **idea, not started** (handoff written 2026-10-07). Not on the critical path of
-[`llm-as-ui-plan.md`](llm-as-ui-plan.md) or [`threejs-runtime-plan.md`](threejs-runtime-plan.md).
+Status: **not started; cornerstone** (handoff written 2026-10-07; promoted 2026-10-08 to backbone B3
+of [`../ux/backbones.md`](../ux/backbones.md), ahead of the other `docs/ai/` plans).
+Principles served: P6 (nothing escapes its box), P2.7 (ask once, then show), P3
+([`../ux/principles.md`](../ux/principles.md)).
 
-## Verdict: good idea, not urgent
+## Verdict: the cornerstone
 
 - **Today the kernel has no security model at all.** Credentials are bookkeeping only: files
   have no owners (`stat` says 0/0), nothing refuses an open, kill or exec for an id, everything
@@ -12,13 +14,18 @@ Status: **idea, not started** (handoff written 2026-10-07). Not on the critical 
 - So the choice is not "capabilities instead of Unix permissions": it is **which model to build
   first**. Building Unix DAC (owners, modes) first would add exactly the ambient authority
   that the critique of Linux is about. Capabilities first is the cleaner order.
-- **Not urgent** because the generated apps run as scripts in the three.js runtime, and there
-  the runtime is the sandbox (like a browser or Deno): a script touches only what the runtime
-  exposes. Kernel capabilities matter when:
-  - the agent runs native code it wrote (TinyCC, a host-built binary from the app repo);
-  - the agent's own tools run inside constanos with a shell;
-  - apps are fetched from a shared repo (untrusted);
-  - there is more than one user.
+- **Why it comes first** (decided 2026-10-08): the script runtime can sandbox three.js apps, but
+  almost everything else the direction needs depends on kernel capabilities:
+  - sandboxed preview providers and thumbnailers (untrusted parsers, P6.4; `docs/gui/files-plan.md`);
+  - native code the agent writes or fetches, and the shared repo
+    ([`software-on-demand.md`](software-on-demand.md): the manifest is enforced here);
+  - userland drivers (the driver ladder, `docs/drivers/roadmap.md` phase 4), with the IOMMU;
+  - the powerbox: drag-to-grant and the system open/save dialog (idea K1);
+  - children's accounts as missing capabilities, not bypassable locks
+    ([`education.md`](education.md));
+  - the agent's own tools running inside constanos with a shell; more than one user.
+- The three.js runtime is still a sandbox of its own; it runs **in** capability mode with only
+  its app directory and the compositor socket (see "Unknowns").
 
 ## Where the idea came from
 
@@ -65,6 +72,9 @@ resource-and-effect capabilities for coding agents") but not read.
   options) and say so in `docs/reference/syscalls.md`.
 - **Credibility prerequisite:** turn NX on and honour `PROT_EXEC` (W^X). Not part of
   capabilities, but any security claim is weak without it.
+- **DMA:** a process that can program a device's DMA reaches all physical memory, whatever its
+  fd rights. Userland drivers need the **IOMMU** (AMD-Vi on the Ryzen; QEMU emulates
+  `amd-iommu`/`intel-iommu`) so a device sees only the buffers its driver was granted.
 
 ## Steps
 
@@ -74,7 +84,9 @@ resource-and-effect capabilities for coding agents") but not read.
 3. Rights masks on fds + `cap_rights_limit`, host-testable where the logic allows (`vfs`).
 4. `cap_enter` + `ECAPMODE` on every global-namespace syscall: audit the syscall table
    (`kernel/src/process/syscall/`) and list each one as allowed / denied / fd-relative.
-5. Launcher integration (`agentd`, compositor).
+5. Launcher integration (`agentd`, compositor, `filesd`'s preview providers).
+6. IOMMU: per-device DMA domains, before the first userland driver that does DMA
+   (`docs/drivers/roadmap.md` phase 4).
 
 **Test that proves it** (outreach rule: claim only what is tested): a process in capability
 mode tries to open `/etc/...`, `/dev/...`, `..` from its dir fd, `kill` another pid, connect to
