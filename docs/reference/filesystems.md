@@ -9,7 +9,7 @@ Code: `kernel/src/fs/`, crates `vfs/` and `ext2/` (host tests: `cd vfs && cargo 
 | `/` | initramfs | The embedded programs in `/bin` (with `sh`: BusyBox again, for `#!/bin/sh`), plus `/etc` (`ETC_FILES`: `localtime` (UTC TZif), `passwd`, `group`, `hosts`, `services`, plus a `resolv.conf` rendered from the DHCP lease on every open). mlibc's `localtime()` **panics** without `/etc/localtime` |
 | `/dev` | devfs | Flat, except the hardcoded `/dev/input/` and `/dev/pts/` |
 | `/tmp` | ramfs (`vfs::ramfs::RamFs`) | Writable. The only FS with symlink creation *and* socket nodes. `busybox --install -s /tmp/bin` puts the applet symlinks here at boot |
-| `/mnt` | ext2 | From the USB stick (read-write, `sync(2)` flushes the stick's cache), else the ATA disk on the secondary IDE channel (read-write): its `constanos-data` GPT partition when it is a whole GPT disk (the release image in a VM, `block::ata_data_partition`, primary GPT only), else a bare ext2 from LBA 0 (`disk.img`). Best effort: may be absent, and then a `kalert!` says how to attach the disk |
+| `/mnt` | ext2 | From the USB stick (read-write, `sync(2)` flushes the stick's cache), else a virtio-blk disk (what `qemu-debug.sh` and `cargo run` attach `disk.img` as), else the ATA disk on the secondary IDE channel (`QEMU_DEBUG_DISK_IF=ide`, VirtualBox): on either, its `constanos-data` GPT partition when it is a whole GPT disk (the release image in a VM, `block::gpt_data_partition`, primary GPT only), else a bare ext2 from LBA 0 (`disk.img`). Best effort: may be absent, and then a `kalert!` says how to attach the disk |
 | `/proc` | procfs | Synthetic, regenerated on every open |
 
 - `ls /` lists the other mounts via `fs::vfs::direct_children`; the mount table redirects traversal into them.
@@ -40,13 +40,14 @@ Code: `kernel/src/fs/`, crates `vfs/` and `ext2/` (host tests: `cd vfs && cargo 
 ## Block devices
 
 - Seam: `hal::block::BlockDevice` (512-byte sectors). Implementations:
-  - `AtaBlockDevice` (`kernel/src/block/`): ATA. Not itself seamed onto `PortIo`.
+  - `AtaBlockDevice` (`kernel/src/block/`): ATA PIO. Not itself seamed onto `PortIo`. Every 16-bit word is a port read: under KVM a VM exit each (mounting `disk.img` took 36 s), and every write ends in a CACHE FLUSH.
+  - `VirtioBlkDevice` (`kernel/src/block/virtio_blk.rs`, pure half in `hal::virtio`, transport shared with virtio-net in `kernel/src/virtio_pci.rs`): polled, one request in flight, a 128 KiB bounce buffer copied with `DmaBuf::copy_in`/`copy_out` (the per-byte volatile `read`/`write` made the TCG mount take 34 s). Accepts `VIRTIO_BLK_F_FLUSH` (declining it makes QEMU write through, a host fdatasync per write) and flushes only on `sync(2)` and reboot: a completed write is in the host's page cache, which survives the guest and QEMU dying. `/proc/kdebug` `virtio_blk:` counts requests, wait time and flushes; boot logs the mount's share.
   - `UsbBlockDevice` (`kernel/src/block/usb.rs`, USB mass storage).
   - `hal::block::MemDisk`: RAM, for tests.
 - `hal::block::Partition` adds an offset and **refuses** any request outside its window (never clamps).
 - **Block cache** (`hal::blockcache::CachedDevice`, installed by `Ext2Core::mount`): write-through, 4 KiB chunks, CLOCK eviction, up to 64 KiB of read-ahead. The ceiling is an eighth of RAM between 32 and 512 MiB (`hal::blockcache::default_cache_chunks`, chosen in `fs/ext2.rs`; storage is allocated only as it fills, and never given back), and `ext2cache=<MiB>` in `kernel.conf` replaces it (`CachedDevice::set_max_chunks`; shrinking drops the surplus at once). A fixed 32 MiB did not hold two 16 MB Vulkan programs. `/proc/kdebug`: `ext2_cache:` (`held_mib`/`max_mib` too). **Nothing may write a mounted partition except through `Ext2Core::device`**, or the cache goes stale.
   - **Locking:** the cache's `spin::Mutex` is never held across a device request: a miss notes `write_gen`, unlocks, reads, and caches what it read only if no write finished meanwhile; a chunk another miss cached in between is not cached twice. Writes must be serialized by the caller (`EXT2_LOCK`). The lock is taken through `hal::blockcache::set_lock_hooks` (installed by `fs::ext2::init`): IF=0 while held, `tlb::service_pending` while spinning. Host tests prove each of the three by sabotage (`the_device_is_read_without_the_lock`, `a_read_racing_a_write_…`, `a_chunk_cached_during_a_miss_…`). Before, a holder doing a 64 KiB ATA PIO read left the other CPUs spinning with IF=0 for over a second (TLB-shootdown panic in VirtualBox within seconds; a hang with one CPU).
-  - `block::ata` takes `ATA_LOCK` with interrupts off (a preempted holder left all four CPUs spinning for it with IF=0: gdb, `tlb-stress.sh`) and its wait loops call `tlb::service_pending`.
+  - `block::ata` takes `ATA_LOCK` (and `block::virtio_blk` its `VBLK`) with interrupts off (a preempted holder left all four CPUs spinning for it with IF=0: gdb, `tlb-stress.sh`) and its wait loops call `tlb::service_pending`.
 
 ## ext2 (`ext2` crate + adapter `kernel/src/fs/ext2.rs`)
 

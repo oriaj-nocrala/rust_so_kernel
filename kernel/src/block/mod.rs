@@ -1,8 +1,9 @@
 // kernel/src/block/mod.rs
 //
-// Block device layer. `ata` is the (only, real-hardware) driver;
-// `AtaBlockDevice` is the thin `hal::block::BlockDevice` face `fs::ext2`
-// mounts against at real boot. `hal::block::MemDisk` (re-exported below) is
+// Block device layer. `ata` (legacy IDE: VirtualBox, older QEMU setups),
+// `virtio_blk` (QEMU's default disk here) and `usb` (the pendrive, real
+// hardware) are the drivers; `AtaBlockDevice` and `VirtioBlkDevice` are the
+// thin `hal::block::BlockDevice` faces `fs::ext2` mounts against. `hal::block::MemDisk` (re-exported below) is
 // the other implementation of that same trait — a `Vec<u8>`-backed disk
 // used by `fs::ext2`'s QEMU integration test (`kernel/src/hw_tests.rs`) to
 // exercise the read-write ext2 path without touching real hardware or
@@ -17,6 +18,7 @@
 pub mod ata;
 pub mod logpart;
 pub mod usb;
+pub mod virtio_blk;
 
 pub use hal::block::{BlockDevice, Partition, SECTOR_SIZE};
 
@@ -51,18 +53,18 @@ impl BlockDevice for AtaBlockDevice {
     }
 }
 
-/// The `constanos-data` partition of the ATA disk, when that disk is a whole
-/// GPT image (the release image attached to a VM's IDE controller) rather
-/// than a bare ext2 filesystem (QEMU's `disk.img`, whose LBA 1 holds no GPT
-/// signature). Only the primary GPT is read: the driver issues no IDENTIFY,
-/// so it does not know where the backup copy sits.
-pub fn ata_data_partition() -> Option<Partition> {
-    let table = hal::gpt::read_gpt(&AtaBlockDevice, 0).ok()?;
+/// The `constanos-data` partition of `disk`, when that disk is a whole GPT
+/// image (the release image attached to a VM) rather than a bare ext2
+/// filesystem (QEMU's `disk.img`, whose LBA 1 holds no GPT signature). Only
+/// the primary GPT is read: the ATA driver issues no IDENTIFY, so it does
+/// not know where the backup copy sits.
+pub fn gpt_data_partition<D: BlockDevice + Copy + 'static>(disk: D, name: &str) -> Option<Partition> {
+    let table = hal::gpt::read_gpt(&disk, 0).ok()?;
     let part = hal::gpt::select(&table, usb::DATA_PARTITION_NAME).ok()?;
     crate::serial_println!(
-        "ata: GPT disk: using partition {} at LBA {} ({} sectors)",
-        part.index, part.first_lba, part.sectors()
+        "{}: GPT disk: using partition {} at LBA {} ({} sectors)",
+        name, part.index, part.first_lba, part.sectors()
     );
     // `select` already refused anything past 32-bit LBAs.
-    Partition::new(alloc::boxed::Box::new(AtaBlockDevice), part.first_lba as u32, part.sectors() as u32, false)
+    Partition::new(alloc::boxed::Box::new(disk), part.first_lba as u32, part.sectors() as u32, false)
 }

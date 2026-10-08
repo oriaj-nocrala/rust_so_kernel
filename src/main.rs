@@ -18,16 +18,18 @@ fn main() {
         cmd.arg("-drive")
            .arg(format!("format=raw,file={}", uefi_path));
 
-    // ext2 disk (kernel::fs::ext2, mounted read-only at /mnt). Attached
-    // explicitly to the secondary IDE channel (`ide.1`) via `-device`,
-    // rather than a plain `-drive`, so it can never land on whatever
-    // channel/slot the UEFI boot drive above ends up on — the kernel's ATA
-    // driver (kernel/src/block/ata.rs) only ever looks at the secondary
-    // channel's fixed ports (0x170/0x376), no PCI/bus enumeration needed.
+    // ext2 disk (kernel::fs::ext2, mounted at /mnt), as a virtio-blk device
+    // (kernel/src/block/virtio_blk.rs). QEMU_DEBUG_DISK_IF=ide attaches it to
+    // the secondary IDE channel (`ide.1`) instead, the one the kernel's ATA
+    // driver (kernel/src/block/ata.rs) polls at its fixed ports (0x170/0x376).
     if std::path::Path::new(ext2_disk_path).exists() {
         cmd.arg("-drive")
            .arg(format!("file={},format=raw,if=none,id=ext2disk", ext2_disk_path));
-        cmd.arg("-device").arg("ide-hd,drive=ext2disk,bus=ide.1");
+        if std::env::var("QEMU_DEBUG_DISK_IF").as_deref() == Ok("ide") {
+            cmd.arg("-device").arg("ide-hd,drive=ext2disk,bus=ide.1");
+        } else {
+            cmd.arg("-device").arg("virtio-blk-pci,drive=ext2disk,disable-legacy=on");
+        }
     }
 
     // Add some useful QEMU options

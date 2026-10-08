@@ -41,6 +41,8 @@
 #                            exercise physical addresses a real machine has
 #                            and every QEMU default here does not
 #   QEMU_DEBUG_NO_DISK=1     omit the ext2 disk (no ATA on the target board)
+#   QEMU_DEBUG_DISK_IF=ide   attach the ext2 disk to IDE (ATA PIO driver)
+#                            instead of virtio-blk (the default)
 #   QEMU_DEBUG_NO_AC97=1     omit the AC97 codec (target board has HDA)
 #   QEMU_DEBUG_NO_USB=1      omit the xHCI USB controller
 #   QEMU_DEBUG_NO_PS2=1      omit the legacy 8042 (PS/2) controller — the
@@ -313,7 +315,12 @@ cmd_start() {
         case "$ext2_disk" in
             *.qcow2) ext2_fmt="qcow2" ;;
         esac
-        qemu_args+=(-drive "file=$ext2_disk,format=$ext2_fmt,if=none,id=ext2disk" -device "ide-hd,drive=ext2disk,bus=ide.1")
+        # virtio-blk by default (kernel/src/block/virtio_blk.rs);
+        # QEMU_DEBUG_DISK_IF=ide puts it on the secondary IDE channel, where
+        # the ATA PIO driver finds it (VirtualBox's shape; slow under KVM).
+        local ext2_dev="virtio-blk-pci,drive=ext2disk,disable-legacy=on"
+        [ "${QEMU_DEBUG_DISK_IF:-virtio}" = ide ] && ext2_dev="ide-hd,drive=ext2disk,bus=ide.1"
+        qemu_args+=(-drive "file=$ext2_disk,format=$ext2_fmt,if=none,id=ext2disk" -device "$ext2_dev")
     fi
 
     if [ -n "${QEMU_DEBUG_EXTRA_ARGS:-}" ]; then

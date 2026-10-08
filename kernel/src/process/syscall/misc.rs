@@ -99,7 +99,8 @@ pub(super) fn sys_kdebug_ctl(cmd: u64, name_ptr: u64, enable: u64) -> SyscallRes
 /// (ext2 writes are synchronous), so what `sync` does here is the one
 /// thing that *is* buffered: copy the kernel log ring to the USB stick's
 /// `constanos-log` partition (`block::logpart`), the "write it now" before
-/// rebooting the machine to read it.
+/// rebooting the machine to read it. It also flushes the disks' own write
+/// caches (the stick's, a virtio-blk device's).
 ///
 /// Unlike Linux's `sync`, which cannot fail, this reports what happened —
 /// `kdebug sync` prints it: `ENODEV` when there is no log partition in
@@ -110,6 +111,7 @@ pub(super) fn sys_sync() -> SyscallResult {
     // implement the command is not an error for sync.
     let flushed = flush(hal::logpart::Reason::Sync);
     let _ = crate::block::usb::sync_stick();
+    let _ = crate::block::virtio_blk::flush();
     match flushed {
         Ok(_) => 0,
         Err(FlushError::NoPartition) => errno::ENODEV,

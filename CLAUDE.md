@@ -40,11 +40,11 @@ cd kernel && cargo build --target x86_64-unknown-none  # the kernel crate alone
 | `kernel/src/process/` + crate `sched` | processes, scheduler, context switch, signals, waits, CPU time | `docs/reference/processes-and-scheduling.md` |
 | `kernel/src/process/syscall/` | syscall entry and table | `docs/reference/syscalls.md` |
 | `kernel/src/ipc/` + crates `usock`, `tty` | pipes, AF_UNIX, ptys | `docs/reference/ipc.md` |
-| `kernel/src/fs/`, `block/` + crates `vfs`, `ext2` | VFS, mounts, procfs, ext2, block devices | `docs/reference/filesystems.md` |
+| `kernel/src/fs/`, `block/` + crates `vfs`, `ext2` | VFS, mounts, procfs, ext2, block devices (ATA PIO, virtio-blk, USB) | `docs/reference/filesystems.md` |
 | `kernel/src/drivers/`, `pci.rs`, `ac97.rs` | `/dev` files, PCI, audio | `docs/reference/drivers.md` |
 | `kernel/src/framebuffer.rs`, `drivers/framebuffer_console.rs` + crates `gui`, `vt`, `draw`, `text`, `img`, `ui`, `gui-client` | framebuffer, console, `/dev/fb0`, compositor, GUI libraries, widgets + semantic tree, PNG + alpha blits | `docs/reference/graphics.md` |
 | `kernel/src/gpu/`, `interrupts/msi.rs`, `memory/dma.rs`, `firmware.rs`, `bootopts.rs` + crate `nvgpu` | NVIDIA GA106 driver (behind `gpu=`, off by default), MSI vectors, DMA buffers, firmware loading, boot options (`/mnt/etc/kernel.conf`) | `docs/reference/gpu.md`, plan `docs/gpu/gpu-plan.md` |
-| `kernel/src/network/` + crate `net`, `hal/src/virtio.rs` | virtio-net driver (MSI-X, polled fallback), Realtek RTL8168 driver behind `nic=` (works on the Ryzen, MSI-X interrupts: `docs/net/rtl8168.md`), smoltcp stack, DHCP, AF_INET UDP, TCP and raw ICMP sockets | `docs/reference/net.md`, plan `docs/net/net-plan.md` |
+| `kernel/src/network/` + crate `net`, `hal/src/virtio.rs`, `virtio_pci.rs` (transport shared with virtio-blk) | virtio-net driver (MSI-X, polled fallback), Realtek RTL8168 driver behind `nic=` (works on the Ryzen, MSI-X interrupts: `docs/net/rtl8168.md`), smoltcp stack, DHCP, AF_INET UDP, TCP and raw ICMP sockets | `docs/reference/net.md`, plan `docs/net/net-plan.md` |
 | `kernel/src/usb/` | xHCI keyboard, mouse, mass storage | `docs/reference/usb.md` |
 | `kernel/src/cpu/`, `smp.rs`, `interrupts/`, `time/` | per-CPU init, APs, APIC, TLB shootdown, time, sensors | `docs/reference/cpu.md` |
 | `kernel/src/klog.rs`, `autorun.rs`, `watchdog.rs`, `block/logpart.rs` | kernel log, log partition, unattended runs | `docs/reference/metal.md` |
@@ -66,7 +66,7 @@ cd kernel && cargo build --target x86_64-unknown-none  # the kernel crate alone
 4. ACPI; boot screen; PIC + PIT; PS/2 mouse; AC97 (best effort, bounded waits).
 5. TSC calibration, cpufreq/temp/idle probes; `apic::init` (LAPIC timer + I/O APIC, falls back to 8259 + PIT).
 6. `cpu::init_this_cpu(0)`; `smp::start_aps()` (the APs park in `hlt`).
-7. `time::init` (RTC); USB; `fs::init` (mounts `/mnt` from USB, else ATA); `autorun::detect`; `watchdog::settle`; `logpart::init`.
+7. `time::init` (RTC); USB; `fs::init` (mounts `/mnt` from USB, else virtio-blk, else ATA); `autorun::detect`; `watchdog::settle`; `logpart::init`.
 8. `fpu::init` (FXSAVE template, needed before the first process); `processes::init_all` (one idle process per CPU + PID 1).
 9. `start_first_process`: release the APs, enable interrupts, jump to PID 1.
 

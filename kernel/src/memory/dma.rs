@@ -100,6 +100,16 @@ impl DmaBuf {
         }
     }
 
+    /// Like [`read`](Self::read) for large copies (a 128 KiB disk read):
+    /// plain `memcpy` instead of one volatile load per byte. The device must
+    /// be done writing the range, and the caller must have observed that
+    /// with an acquire (a used-ring read does).
+    pub fn copy_out(&self, offset: usize, out: &mut [u8]) {
+        assert!(offset.checked_add(out.len()).is_some_and(|end| end <= self.len()));
+        // SAFETY: in range per the assert; the block is ours and the device is done with it.
+        unsafe { core::ptr::copy_nonoverlapping(self.virt().add(offset), out.as_mut_ptr(), out.len()) };
+    }
+
     /// Returns the block to the allocator. The device must no longer be
     /// able to touch it.
     pub fn free(self) {

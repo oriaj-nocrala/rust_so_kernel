@@ -305,8 +305,8 @@ pub fn is_read_only() -> bool {
 }
 
 /// Mount the ext2 filesystem: the USB boot pendrive's data partition if
-/// there is one (read-write, with the same repair passes as ATA), else the real ATA disk
-/// (`crate::block::AtaBlockDevice`). Call once, before the VFS mounts
+/// there is one (read-write, with the same repair passes as ATA), else a
+/// virtio-blk disk, else the real ATA disk (`crate::block::AtaBlockDevice`). Call once, before the VFS mounts
 /// `/mnt`. Returns `Err`
 /// (not panics) on any problem — a missing or unreadable disk shouldn't
 /// take down boot, just leave `/mnt` unmounted.
@@ -347,11 +347,29 @@ pub fn init() -> Result<(), &'static str> {
         }
     }
 
+    // A virtio-blk disk next: what QEMU runs attach `disk.img` as (under
+    // KVM the ATA path below costs a VM exit per 16-bit word).
+    match crate::block::virtio_blk::init() {
+        Ok(()) => {
+            use crate::block::virtio_blk::VirtioBlkDevice;
+            let device: Box<dyn BlockDevice> = match crate::block::gpt_data_partition(VirtioBlkDevice, "virtio-blk") {
+                Some(part) => Box::new(part),
+                None => Box::new(VirtioBlkDevice),
+            };
+            mount_and_repair(device)?;
+            let (reqs, ns) = crate::block::virtio_blk::stats();
+            crate::serial_println!("virtio-blk: mount took {} requests, {} us waiting", reqs, ns / 1000);
+            return Ok(());
+        }
+        Err(crate::virtio_pci::InitError::NoDevice) => {}
+        Err(e) => crate::kalert!("virtio-blk: sin iniciar: {:?}", e),
+    }
+
     let device: Box<dyn BlockDevice> = Box::new(crate::block::AtaBlockDevice);
     if !device.present() {
         return Err("no disk on the secondary IDE channel");
     }
-    let device: Box<dyn BlockDevice> = match crate::block::ata_data_partition() {
+    let device: Box<dyn BlockDevice> = match crate::block::gpt_data_partition(crate::block::AtaBlockDevice, "ata") {
         Some(part) => Box::new(part),
         None => device,
     };

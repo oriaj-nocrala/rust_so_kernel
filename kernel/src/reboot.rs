@@ -62,6 +62,9 @@ fn prepare(what: &str) {
         Ok(false) => {}
         Err(e) => serial_println!("reboot: {}", e),
     }
+    if let Err(e) = crate::block::virtio_blk::flush() {
+        serial_println!("reboot: {}", e);
+    }
 }
 
 /// Logs which method is about to be tried and gets that line onto the

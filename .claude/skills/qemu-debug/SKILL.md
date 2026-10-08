@@ -37,7 +37,8 @@ scripts/qemu-debug.sh stop
 |----------|--------|
 | `QEMU_DEBUG_MEM=8G` | RAM (default 512M; every real machine has more) |
 | `QEMU_DEBUG_SMP=N` | CPUs |
-| `QEMU_DEBUG_NO_DISK=1` / `NO_AC97=1` / `NO_PS2=1` / `NO_USB=1` | remove the ATA disk / AC97 / 8042 / xHCI |
+| `QEMU_DEBUG_NO_DISK=1` / `NO_AC97=1` / `NO_PS2=1` / `NO_USB=1` | remove the ext2 disk / AC97 / 8042 / xHCI |
+| `QEMU_DEBUG_DISK_IF=ide` | attach `disk.img` to IDE (the ATA PIO driver, VirtualBox's shape) instead of virtio-blk; ATA is ~6x slower to mount under KVM |
 | `QEMU_USB_KBD=1`, `QEMU_USB_MOUSE=1`, `QEMU_USB_STORAGE=<img>` | USB devices |
 | `QEMU_DEBUG_EXTRA_ARGS` | anything else (e.g. `-no-reboot`, `-cpu max,-apic`) |
 | `QEMU_AUDIODEV=wav,id=snd0,path=x.wav` | capture audio |

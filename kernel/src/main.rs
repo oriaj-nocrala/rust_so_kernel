@@ -56,6 +56,7 @@ mod time;
 mod tlb_selftest;
 mod tty;
 mod usb;
+mod virtio_pci;
 mod watchdog;
 
 use bootloader_api::{BootInfo, BootloaderConfig, config::Mapping, entry_point};

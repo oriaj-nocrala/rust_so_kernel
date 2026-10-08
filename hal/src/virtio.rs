@@ -175,6 +175,88 @@ pub fn net_status_link_up(status: u16) -> bool {
     status & NET_S_LINK_UP != 0
 }
 
+// ── virtio-blk (§5.2) ───────────────────────────────────────────────────────
+
+pub const PCI_DEVICE_BLK_TRANSITIONAL: u16 = 0x1001;
+/// Modern-only block device (`0x1040 + device type 2`).
+pub const PCI_DEVICE_BLK_MODERN: u16 = 0x1042;
+
+pub fn is_blk(vendor: u16, device: u16) -> bool {
+    vendor == PCI_VENDOR && (device == PCI_DEVICE_BLK_TRANSITIONAL || device == PCI_DEVICE_BLK_MODERN)
+}
+
+/// `VIRTIO_BLK_F_RO`: the device refuses writes.
+pub const BLK_F_RO: u64 = 1 << 5;
+/// `VIRTIO_BLK_F_FLUSH`: the device has a write-back cache and takes
+/// `BLK_T_FLUSH`. Worth accepting even with no use for the cache: QEMU
+/// falls back to write-through (a host fdatasync per write) when the driver
+/// declines it.
+pub const BLK_F_FLUSH: u64 = 1 << 9;
+
+pub const BLK_WANTED_FEATURES: u64 = F_VERSION_1 | BLK_F_RO | BLK_F_FLUSH;
+
+/// The feature set to write back to a block device. `None` without
+/// `VERSION_1` (legacy framing is not implemented).
+pub fn negotiate_blk(device_features: u64) -> Option<u64> {
+    let chosen = device_features & BLK_WANTED_FEATURES;
+    if chosen & F_VERSION_1 == 0 {
+        return None;
+    }
+    Some(chosen)
+}
+
+/// Device config: `capacity` (u64, in 512-byte sectors whatever the
+/// device's block size) at 0.
+pub const BLK_CFG_CAPACITY: usize = 0;
+/// The only queue used: requestq1.
+pub const BLK_QUEUE: u16 = 0;
+
+pub const BLK_T_IN: u32 = 0;
+pub const BLK_T_OUT: u32 = 1;
+pub const BLK_T_FLUSH: u32 = 4;
+
+pub const BLK_S_OK: u8 = 0;
+pub const BLK_S_IOERR: u8 = 1;
+pub const BLK_S_UNSUPP: u8 = 2;
+
+/// `struct virtio_blk_req`'s head: `type` (u32), `reserved` (u32),
+/// `sector` (u64).
+pub const BLK_HDR_LEN: usize = 16;
+
+pub fn blk_header(req_type: u32, sector: u64) -> [u8; BLK_HDR_LEN] {
+    let mut h = [0u8; BLK_HDR_LEN];
+    h[0..4].copy_from_slice(&req_type.to_le_bytes());
+    h[8..16].copy_from_slice(&sector.to_le_bytes());
+    h
+}
+
+/// How many sectors a `BlockDevice` request for `count` sectors at `lba`
+/// moves (`count == 0` is 256, the LBA28 convention), or `None` when it
+/// runs past `capacity` sectors.
+pub fn blk_range(lba: u32, count: u8, capacity: u64) -> Option<usize> {
+    let n = if count == 0 { 256 } else { count as usize };
+    if lba as u64 + n as u64 > capacity {
+        return None;
+    }
+    Some(n)
+}
+
+/// The descriptor chain of one request (§5.2.6): the header
+/// (device-readable), then the data — device-writable for a read
+/// (`BLK_T_IN`), device-readable otherwise — then the one-byte status
+/// (device-writable). `data` is `None` for a flush. Returns the buffers and
+/// how many of them are used.
+pub fn blk_chain(req_type: u32, hdr: u64, data: Option<(u64, u32)>, status: u64) -> ([Buf; 3], usize) {
+    let mut bufs = [Buf { addr: hdr, len: BLK_HDR_LEN as u32, write: false }; 3];
+    let mut n = 1;
+    if let Some((addr, len)) = data {
+        bufs[n] = Buf { addr, len, write: req_type == BLK_T_IN };
+        n += 1;
+    }
+    bufs[n] = Buf { addr: status, len: 1, write: true };
+    (bufs, n + 1)
+}
+
 // ── Split virtqueue (§2.6) ──────────────────────────────────────────────────
 
 pub const DESC_F_NEXT: u16 = 1;
@@ -567,5 +649,99 @@ mod tests {
         assert!(is_net(0x1AF4, 0x1000));
         assert!(!is_net(0x1AF4, 0x1042));
         assert!(!is_net(0x8086, 0x1041));
+    }
+
+    #[test]
+    fn identifies_blk_devices() {
+        assert!(is_blk(0x1AF4, 0x1042));
+        assert!(is_blk(0x1AF4, 0x1001));
+        assert!(!is_blk(0x1AF4, 0x1041));
+        assert!(!is_blk(0x1AF4, 0x1000));
+        assert!(!is_blk(0x8086, 0x1042));
+    }
+
+    #[test]
+    fn negotiate_blk_keeps_flush_and_ro_and_needs_version_1() {
+        let qemu = F_VERSION_1 | BLK_F_FLUSH | (1 << 1) | (1 << 2) | (1 << 6) | (1 << 13);
+        assert_eq!(negotiate_blk(qemu), Some(F_VERSION_1 | BLK_F_FLUSH));
+        assert_eq!(negotiate_blk(F_VERSION_1 | BLK_F_RO), Some(F_VERSION_1 | BLK_F_RO));
+        assert_eq!(negotiate_blk(BLK_F_FLUSH), None);
+    }
+
+    #[test]
+    fn blk_header_layout() {
+        let h = blk_header(BLK_T_OUT, 0x1122_3344_5566_7788);
+        assert_eq!(&h[0..4], &1u32.to_le_bytes());
+        assert_eq!(&h[4..8], &[0; 4]);
+        assert_eq!(&h[8..16], &0x1122_3344_5566_7788u64.to_le_bytes());
+    }
+
+    #[test]
+    fn blk_range_checks_capacity_and_the_zero_count() {
+        assert_eq!(blk_range(0, 8, 8), Some(8));
+        assert_eq!(blk_range(1, 8, 8), None);
+        assert_eq!(blk_range(0, 0, 256), Some(256));
+        assert_eq!(blk_range(1, 0, 256), None);
+        assert_eq!(blk_range(u32::MAX, 1, u64::MAX), Some(1));
+        assert_eq!(blk_range(u32::MAX, 1, u32::MAX as u64), None);
+    }
+
+    #[test]
+    fn blk_chains_set_the_device_writable_flags() {
+        let (b, n) = blk_chain(BLK_T_IN, 0x1000, Some((0x2000, 1024)), 0x3000);
+        assert_eq!(n, 3);
+        assert_eq!(b[0], Buf { addr: 0x1000, len: 16, write: false });
+        assert_eq!(b[1], Buf { addr: 0x2000, len: 1024, write: true });
+        assert_eq!(b[2], Buf { addr: 0x3000, len: 1, write: true });
+
+        let (b, n) = blk_chain(BLK_T_OUT, 0x1000, Some((0x2000, 512)), 0x3000);
+        assert_eq!(n, 3);
+        assert!(!b[1].write, "the device reads the data of a write");
+
+        let (b, n) = blk_chain(BLK_T_FLUSH, 0x1000, None, 0x3000);
+        assert_eq!(n, 2);
+        assert_eq!(b[1], Buf { addr: 0x3000, len: 1, write: true });
+    }
+
+    /// A whole read request through the ring, with a fake device on the
+    /// other side that serves it from a byte image: what the kernel adapter
+    /// does, minus the MMIO.
+    #[test]
+    fn blk_read_request_round_trip() {
+        let (mut sq, mut mem) = q(8);
+        // Guest "physical memory": header at 0x100, data at 0x200, status at 0x700.
+        let mut ram = alloc::vec![0u8; 0x800];
+        ram[0x100..0x110].copy_from_slice(&blk_header(BLK_T_IN, 2));
+        ram[0x700] = 0xFF;
+        let disk: Vec<u8> = (0..4096u32).map(|i| (i / 512) as u8).collect();
+        let (bufs, n) = blk_chain(BLK_T_IN, 0x100, Some((0x200, 1024)), 0x700);
+        let head = sq.push(&mut mem, &bufs[..n]).unwrap();
+        assert_eq!(sq.free_descriptors(), 5);
+
+        // The device: walk the chain from the available ring.
+        let slot = sq.layout.avail + 4;
+        let mut d = rd16(&mem, slot) as usize;
+        let desc = |mem: &[u8], i: usize| {
+            let o = i * 16;
+            (u64::from_le_bytes(mem[o..o + 8].try_into().unwrap()) as usize, rd32(mem, o + 8) as usize, rd16(mem, o + 12), rd16(mem, o + 14))
+        };
+        let (h, hl, hf, next) = desc(&mem, d);
+        assert_eq!((hl, hf & DESC_F_WRITE), (16, 0));
+        let sector = u64::from_le_bytes(ram[h + 8..h + 16].try_into().unwrap()) as usize;
+        d = next as usize;
+        let (data, dl, df, next) = desc(&mem, d);
+        assert_ne!(df & DESC_F_WRITE, 0);
+        ram[data..data + dl].copy_from_slice(&disk[sector * 512..sector * 512 + dl]);
+        let (st, sl, sf, _) = desc(&mem, next as usize);
+        assert_eq!((sl, sf & (DESC_F_WRITE | DESC_F_NEXT)), (1, DESC_F_WRITE));
+        ram[st] = BLK_S_OK;
+        let mut used_idx = 0;
+        device_complete(&sq, &mut mem, &mut used_idx, head, (dl + 1) as u32);
+
+        assert_eq!(sq.pop_used(&mut mem), Some((head, 1025)));
+        assert_eq!(sq.free_descriptors(), 8);
+        assert_eq!(ram[0x700], BLK_S_OK);
+        assert!(ram[0x200..0x400].iter().all(|&b| b == 2));
+        assert!(ram[0x400..0x600].iter().all(|&b| b == 3));
     }
 }

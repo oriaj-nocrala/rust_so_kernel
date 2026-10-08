@@ -6,7 +6,8 @@ Status: steps 1-2b of `docs/net/net-plan.md`. A virtio-net driver (MSI-X, with p
 
 - `net/` (own workspace, host tests): `Nic` trait (`recv`/`send` of raw Ethernet frames, never blocks) and `NicDevice<N>`, a smoltcp `Device` over it. Checksums are done in software both ways. smoltcp is re-exported as `net::smoltcp`.
 - `hal/src/virtio.rs` (host tests): virtio-PCI capability decoding, feature negotiation, split-virtqueue layout and `SplitQueue::{push,pop_used}` over a plain `&mut [u8]`, virtio-net header size. No pointers inside.
-- `kernel/src/network/virtio_net.rs`: the part that needs hardware: BAR mapping (`memory::mmio::map`, boot-only), `DmaBuf` for the rings and buffers, the reset/feature handshake, doorbells. Implements `net::Nic`. `network::init()` runs at boot after USB and stores the device in `network::NIC`.
+- `kernel/src/virtio_pci.rs` (shared with `block::virtio_blk`): BAR mapping (`memory::mmio::map`, boot-only), the reset/feature handshake, queue setup, doorbells.
+- `kernel/src/network/virtio_net.rs`: `DmaBuf` for the rings and buffers, the RX/TX slots. Implements `net::Nic`. `network::init()` runs at boot after USB and stores the device in `network::NIC`.
 - Kernel module is `network`, not `net`, so it does not shadow the crate.
 
 ## Sockets (`net/src/stack.rs`, `kernel/src/network/mod.rs`, `process/syscall/inet.rs`)
